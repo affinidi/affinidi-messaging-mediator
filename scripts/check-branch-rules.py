@@ -17,7 +17,9 @@ Into `main`:
 
 "The workspace version" is lockstep (scripts/release_lib.py): the root
 `[workspace.package] version`, plus any member that sets a literal
-`[package] version` instead of inheriting it.
+`[package] version` instead of inheriting it. A base that has no workspace
+version yet (the repository's bootstrap) has nothing to protect, so the
+version rules don't apply to the PR that creates it.
 
 Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names).
 """
@@ -61,8 +63,14 @@ def main():
     labels = set(json.loads(os.environ.get("LABELS") or "[]"))
     changed = git("diff", "--name-only", "HEAD^1", "HEAD").split()
 
+    # A base with no `[workspace.package] version` has no workspace version to
+    # protect: this is the PR that creates the workspace (the repository's
+    # bootstrap), and it necessarily sets every crate's version. Once it lands,
+    # every later PR is checked as normal.
+    bootstrap = version_of(manifest("HEAD^1", "Cargo.toml"), "Cargo.toml") is None
+
     versions = []
-    for path in changed:
+    for path in ([] if bootstrap else changed):
         if path == "Cargo.toml" or path.endswith("/Cargo.toml"):
             before = version_of(manifest("HEAD^1", path), path)
             after = version_of(manifest("HEAD", path), path)
