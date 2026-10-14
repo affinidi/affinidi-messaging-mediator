@@ -2,9 +2,9 @@ name: Publish crates
 
 # THE FILENAME OF THIS FILE IS LOAD-BEARING. crates.io Trusted Publishing is
 # configured per crate against a repository + workflow FILENAME (+ the
-# `crates-io` environment below). Every crate in this workspace is registered
+# `release` environment below). Every crate in this workspace is registered
 # against `affinidi/affinidi-messaging-mediator`, `publish.yml`, environment
-# `crates-io`. Renaming the file makes the OIDC exchange fail before anything
+# `release`. Renaming the file makes the OIDC exchange fail before anything
 # publishes (verifiable-trust-infrastructure learnt this the hard way).
 #
 # Publishes the workspace to crates.io from a release branch (RELEASES.md):
@@ -68,7 +68,7 @@ jobs:
     # dependents unpublished. Larger runner when configured, and capped rustc
     # parallelism either way.
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
-    environment: crates-io
+    environment: release
     timeout-minutes: 240
     permissions:
       # OIDC token exchange with crates.io (Trusted Publishing).
