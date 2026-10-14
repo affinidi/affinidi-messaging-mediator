@@ -153,7 +153,7 @@ publisher. `publish.yml` stops with an explanation. To add a crate:
    `git switch --detach v<version> && cargo publish -p <crate>`.
 2. On crates.io → the crate → Settings → Trusted Publishing, add GitHub
    repository `affinidi/affinidi-messaging-mediator`, workflow `publish.yml`,
-   environment `crates-io`.
+   environment `release`.
 3. Re-run `publish.yml` on the release branch for anything that waited on it.
 
 ### End of life
@@ -171,8 +171,9 @@ Settings, not files:
   sign-off`.
 - **Ruleset on `nightly`:** block force pushes and deletion; only the
   workflow's identity may update it.
-- **Environment `crates-io`** — `publish.yml` runs in it; restrict it to
-  `release/**` branches. Each crate's Trusted Publisher on crates.io names this
+- **Environment `release`** — `publish.yml` (crates.io) and the ECR mirror in
+  `publish-images.yaml` run in it; restrict it to `release/*` branches and
+  `v*` tags. Each crate's Trusted Publisher on crates.io names this
   repository, `publish.yml` and this environment.
 - **`RELEASE_TOKEN`** (required for backports and preps) — a fine-grained PAT
   or GitHub App token on this repository with contents and pull-requests
