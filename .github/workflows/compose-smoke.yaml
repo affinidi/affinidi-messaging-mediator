@@ -1,13 +1,16 @@
 name: compose-smoke
-# Composed-stack smoke test (TI3): builds the mediator image, brings up
-# docker-compose.test.yml (mediator + Redis + static did:web), and runs a full
-# DIDComm round-trip against it.
+# Composed-stack smoke test (TI3): builds the production mediator image
+# (docker/mediator.Dockerfile), brings up docker-compose.test.yml (mediator +
+# Redis + static did:web), and runs a full DIDComm round-trip against it
+# (docker/smoke/smoke.sh, driving the test-mediator `docker_smoke` example).
 #
 # NOT run per-PR — the mediator image is a full release build, too heavy for
-# every push. Runs on demand (workflow_dispatch) and nightly.
+# every push. Runs on demand (workflow_dispatch) and nightly. PRs that touch
+# docker/ can opt into an image build + boot probe with the `ci:image` label
+# (publish-images.yaml).
 #
 # Runs on `vars.CI_RUNNER_LARGE` when that repo variable is set, else
-# `ubuntu-latest`. See docs/ci-cost.md.
+# `ubuntu-24.04`.
 
 on:
   workflow_dispatch:
@@ -15,25 +18,33 @@ on:
     # 04:00 UTC nightly.
     - cron: "0 4 * * *"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-smoke
+  cancel-in-progress: false
+
 jobs:
   smoke:
     name: composed-stack smoke
-    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install native deps (libdbus for keyring, libssl)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev pkg-config
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
 
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: compose-smoke
 

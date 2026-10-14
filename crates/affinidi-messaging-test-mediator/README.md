@@ -1,7 +1,7 @@
 # affinidi-messaging-test-mediator
 
 [![Crates.io](https://img.shields.io/crates/v/affinidi-messaging-test-mediator.svg)](https://crates.io/crates/affinidi-messaging-test-mediator)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/affinidi/affinidi-tdk-rs/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)
 
 Embedded mediator fixture for integration tests against
 [`affinidi-messaging-mediator`]. Spins up a fully-functional mediator
@@ -371,17 +371,16 @@ in `tests/common` is a retained no-op that always returns `false`.
 
 ## Cross-workspace consumption
 
-When using this crate from outside the `affinidi-tdk-rs` workspace
-(via crates.io or git pin), be aware of the
-[`[patch.crates-io]` gotcha](../README.md#using-affinidi--crates-from-outside-this-workspace)
-documented in the workspace README. In short: consumers using *any*
-affinidi-* crate via git/path need to mirror the workspace's patch
-table so the type graph stays unified across the dependency closure.
-The crates.io build is self-consistent and needs no patches.
+This workspace takes every TDK crate (`affinidi-messaging-sdk`,
+`affinidi-tdk`, `affinidi-messaging-didcomm`, …) from crates.io and carries no
+`[patch.crates-io]` table, so a consumer that also uses those crates from
+crates.io gets one copy of each and needs no patches. If you pin the TDK by
+git or path instead, patch it consistently for every `affinidi-*` crate in
+your dependency closure, or the type graph splits into two copies.
 
 ## License
 
-[Apache-2.0](https://github.com/affinidi/affinidi-tdk-rs/blob/main/LICENSE)
+[Apache-2.0](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)
 
 [`affinidi-messaging-mediator`]: https://crates.io/crates/affinidi-messaging-mediator
 [`TestMediatorBuilder::store`]: https://docs.rs/affinidi-messaging-test-mediator/latest/affinidi_messaging_test_mediator/struct.TestMediatorBuilder.html#method.store

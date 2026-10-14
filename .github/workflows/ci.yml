@@ -1,0 +1,506 @@
+name: CI
+
+# The whole suite lives in this one file on purpose: nightly.yml advances
+# `nightly` only to a main commit on which EVERY job of this workflow passed,
+# so a check kept in a separate workflow would be invisible to that gate.
+#
+# Ported from affinidi-tdk-rs (checks / checks-storage / checks-features /
+# publish-dry-run / release-guards), where the mediator lived until it moved
+# here. Every crate in this workspace is the mediator or is built around it, so
+# the storage / protocol / secrets matrices run on every PR rather than behind
+# path filters.
+#
+# Heavy jobs (anything that builds and runs test binaries, or verifies a
+# publish) use `vars.CI_RUNNER_LARGE` when that repo variable is set, else the
+# standard runner. `cargo check`-only matrices stay on the standard runner.
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+# Supersede a PR's in-flight run when new commits land on the same ref.
+#
+# Deliberately NOT cancelled for `push`: a run on main / release/** is the
+# build-of-record for that commit (nightly.yml reads it), and cancelling it
+# leaves a commit with no green tick even though it was never actually tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # `--cfg tracing_unstable` everywhere so the `valuable` feature on `tracing`
+  # resolves the same way in every job (and in the published crates' builds).
+  RUSTFLAGS: "-D warnings --cfg tracing_unstable"
+  RUSTDOCFLAGS: "-D warnings --cfg tracing_unstable"
+  # File and line numbers in backtraces without full debug info. A full-debug
+  # test build of the mediator graph was near the hosted runner's disk in
+  # affinidi-tdk-rs (#940). Set via the profile rather than RUSTFLAGS so every
+  # job keeps the same RUSTFLAGS fingerprint.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # Native deps, installed per job: libdbus (keyring), libssl (aws-lc /
+  # native-tls paths), libchafa (mediator-tui image rendering), pkg-config.
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    # The workspace suite with default features, which includes the
+    # test-mediator e2e suite on its default MemoryStore (what TDK ran as
+    # `test-mediator (memory)`). Redis is provided for the mediator's
+    # default `redis-backend` tests that look for REDIS_URL.
+    name: cargo test (workspace)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      # `--locked`: Cargo.lock must match the manifests exactly, so a
+      # transitive bump cannot land quietly through the test job.
+      - run: cargo test --workspace --locked
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: cargo doc --workspace --no-deps --locked
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+
+  guards:
+    # Cheap, build-free guards that protect the release pipeline. No compile:
+    # `cargo metadata` / `cargo tree` and Python only.
+    name: release guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # The base commit, for "RELEASE never moves backwards".
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      # Toolchain sync, lockstep versions, CHANGELOG / RELEASE consistency.
+      - name: Release guards
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/check-release-guards.py ${BASE_SHA:+--base-sha "$BASE_SHA"}
+      # A workspace member also resolved from crates.io (through a TDK or VTI
+      # crate depending on it) builds two copies of its types; see the script.
+      - name: Workspace duplicate guard
+        run: bash scripts/check-workspace-duplicates.sh
+      # The advanceable TestClock must never reach the mediator binary.
+      - name: Test-clock isolation guard
+        run: bash scripts/check-test-clock-isolation.sh
+
+  publish-dry-run:
+    # Catches "green on every check but fails to publish" before release time.
+    # `cargo publish --workspace --dry-run` packages every publishable crate
+    # and verify-builds each tarball in isolation, with DEFAULT features, under
+    # -D warnings, resolving registry dependencies from crates.io — a
+    # combination the workspace build never reproduces (feature unification
+    # hides missing cfg gates). Unpublished sibling versions resolve from the
+    # local packages, so lockstep bumps verify too. `publish = false` crates
+    # (mediator-setup) are skipped.
+    name: publish dry-run
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      # Mediator publish verification OOMed the default runner at full
+      # parallelism in affinidi-tdk-rs (exit 143). Cap rustc parallelism.
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: publish-dry-run
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: cargo publish --workspace --dry-run --locked
+
+  semver:
+    # Patch releases must be semver-compatible. Every PR into a release branch
+    # (a backport, a `release-direct` fix, a prep PR) is checked against the
+    # branch tip it merges into — not against crates.io, whose newest version
+    # may belong to a later release line.
+    name: semver (patch-compatible)
+    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/')
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "4"
+      # Rustdoc JSON for the baseline and the PR; warnings are not this job's
+      # concern (clippy / doc own them).
+      RUSTFLAGS: "--cfg tracing_unstable"
+      RUSTDOCFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: semver
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: cargo semver-checks --release-type patch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cargo semver-checks --workspace \
+            --release-type patch \
+            --baseline-rev "$BASE_SHA"
+
+  # ---------------------------------------------------------------------------
+  # Mediator storage backends and the dual-protocol (DIDComm / TSP) axis.
+  # From affinidi-tdk-rs checks-storage.yaml. `redis-backend` is the default
+  # and runs in `test` above; these cover the non-default backends, a combined
+  # build, and the protocol features that are off by default (without which
+  # every `#[cfg(feature = "...")]` test compiles out and says nothing).
+  # ---------------------------------------------------------------------------
+
+  backend-matrix:
+    name: ${{ matrix.backend.short }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Catching missing cfg gates is the point, not lint cleanliness.
+      RUSTFLAGS: "--cfg tracing_unstable"
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - short: memory
+            feature: memory-backend
+            test_module: memory_store
+          - short: fjall
+            feature: fjall-backend
+            test_module: fjall_store
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: storage-${{ matrix.backend.short }}
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: cargo check --no-default-features --features didcomm,${{ matrix.backend.feature }}
+        run: |
+          cargo check \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,${{ matrix.backend.feature }}"
+      - name: cargo test ${{ matrix.backend.short }} backend
+        # Only the per-backend store tests: most other mediator tests assume
+        # the Redis-backed default and are not gated on the storage feature.
+        run: |
+          cargo test \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,${{ matrix.backend.feature }}" \
+            --lib \
+            "store::${{ matrix.backend.test_module }}"
+
+  storage-secrets-matrix:
+    # Representative storage x secrets pairs (not the full cross-product): a
+    # non-default storage backend with a non-default secrets backend, so a gate
+    # that silently assumes the default of the other axis fails here.
+    name: ${{ matrix.combo.short }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - short: fjall + aws
+            storage: fjall-backend
+            secret: secrets-aws
+          - short: fjall + vault
+            storage: fjall-backend
+            secret: secrets-vault
+          - short: memory + gcp
+            storage: memory-backend
+            secret: secrets-gcp
+          - short: redis + azure
+            storage: redis-backend
+            secret: secrets-azure
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: storage-secrets-${{ matrix.combo.storage }}-${{ matrix.combo.secret }}
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: cargo check --features didcomm,${{ matrix.combo.storage }},${{ matrix.combo.secret }}
+        run: |
+          cargo check \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,${{ matrix.combo.storage }},${{ matrix.combo.secret }}"
+
+  redis-conformance:
+    # The store-conformance suite against a real Redis, so the Lua-based
+    # Redis logic stays aligned with the Rust memory/fjall backends. Gated on
+    # REDIS_URL; each check runs on its own logical DB.
+    name: redis conformance
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: redis-conformance
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: cargo test store_conformance against Redis
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: |
+          cargo test \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,redis-backend" \
+            --test store_conformance
+
+  test-mediator-fjall:
+    # The e2e suite against the on-disk Fjall backend (each store in its own
+    # TempDir). The MemoryStore run is part of `test`.
+    name: test-mediator (fjall)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: test-mediator-fjall
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: cargo test -p affinidi-messaging-test-mediator --features fjall-backend --tests --locked
+
+  test-mediator-tsp:
+    # The dual-protocol axis. `tsp` is not a default feature of the fixture,
+    # so without this job every `#[cfg(feature = "tsp")]` e2e test (delivery,
+    # auth, websocket, pickup, federation, cross-mediator routing, capability
+    # discovery, recipient-side ACL gates) compiles out.
+    #
+    # This job also carries what affinidi-tdk-rs ran as `didcomm-service (tsp)`:
+    # the affinidi-messaging-didcomm-service tests that need a live mediator
+    # (`soft_restart_websocket`, `tsp_live_stream`, `tsp_transport_adapter`,
+    # `tsp_invite_then_payload`). They moved into this fixture's tests when the
+    # mediator left the TDK (a dev-dependency there on this crate would be a
+    # cross-repository cycle). They run as their own step first so a failure
+    # names them, then the rest of the suite runs in the same build.
+    name: test-mediator (tsp) + didcomm-service (tsp)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: test-mediator-tsp
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: didcomm-service (tsp) against a live mediator
+        run: |
+          cargo test -p affinidi-messaging-test-mediator --features tsp --locked \
+            --test soft_restart_websocket \
+            --test tsp_live_stream \
+            --test tsp_transport_adapter \
+            --test tsp_invite_then_payload
+      - name: test-mediator e2e suite with tsp
+        run: cargo test -p affinidi-messaging-test-mediator --features tsp --tests --locked
+
+  test-mediator-didcomm-v1:
+    # `didcomm-v1` is not a default feature, and `credo_mediation_interop.rs`
+    # is `#![cfg(feature = "didcomm-v1")]`: without this job the Credo
+    # coordinate-mediation / message-pickup conformance suite builds to zero
+    # tests.
+    name: test-mediator (didcomm-v1)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: test-mediator-didcomm-v1
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: cargo test -p affinidi-messaging-test-mediator --features didcomm-v1 --tests --locked
+
+  all-backends-compile:
+    # Every backend feature at once, plus `tsp`: proves the feature-gated
+    # modules do not conflict when bundled together.
+    name: all-backends compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: all-backends-compile
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - run: |
+          cargo check \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,tsp,redis-backend,fjall-backend,memory-backend"
+
+  feature-matrix:
+    # `cargo check --no-default-features --features secrets-<X>` for each
+    # secrets backend against the mediator runtime and the setup wizard, so a
+    # cfg gate that misses a backend fails here rather than in an operator's
+    # lean per-backend install. From affinidi-tdk-rs checks-features.yaml.
+    name: ${{ matrix.crate.short }} / ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The wizard has pre-existing dead_code lints; this matrix's job is
+      # missing `cfg(feature = "secrets-*")` gates, not lint cleanliness.
+      RUSTFLAGS: "--cfg tracing_unstable"
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [keyring, aws, gcp, azure, vault, k8s]
+        crate:
+          - short: mediator
+            package: affinidi-messaging-mediator
+            # Keep a protocol on so the check matches a real deployment
+            # build rather than a protocol-less binary.
+            extra_features: "didcomm,"
+          - short: setup
+            package: affinidi-messaging-mediator-setup
+            # The wizard has no protocol feature; the backend is the only
+            # moving piece.
+            extra_features: ""
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: features-${{ matrix.crate.short }}-${{ matrix.backend }}
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: cargo check -p ${{ matrix.crate.package }} --features ${{ matrix.crate.extra_features }}secrets-${{ matrix.backend }}
+        run: |
+          cargo check \
+            -p ${{ matrix.crate.package }} \
+            --no-default-features \
+            --features "${{ matrix.crate.extra_features }}secrets-${{ matrix.backend }}"

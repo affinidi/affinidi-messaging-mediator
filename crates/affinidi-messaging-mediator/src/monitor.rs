@@ -622,7 +622,7 @@ struct Subscription {
 }
 
 /// The forwarding processor's report of each relay attempt, correlated with
-/// the `stored` event of [`TrafficMonitor::queued_for_relay`] by `msgId`:
+/// the `stored` event of `TrafficMonitor::queued_for_relay` by `msgId`:
 ///
 /// - accepted by the peer → `forwarded`, with the time spent queued;
 /// - failed, to be retried → `forwarded` with outcome `forwardingRetry`;

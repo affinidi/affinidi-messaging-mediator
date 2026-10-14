@@ -19,7 +19,7 @@ use affinidi_messaging_mediator_config::{ConfigRaw, env::parse_config};
 
 /// `docker/conf/mediator.toml`, relative to this crate's manifest.
 fn container_config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../docker/conf/mediator.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docker/conf/mediator.toml")
 }
 
 #[test]

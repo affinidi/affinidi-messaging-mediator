@@ -1,0 +1,71 @@
+[workspace]
+members = [
+  "crates/affinidi-messaging-mediator",
+  "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common",
+  "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config",
+  "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-processors",
+  "crates/affinidi-messaging-mediator/tools/mediator-setup",
+  "crates/affinidi-messaging-test-mediator",
+  "crates/affinidi-messaging-mediator-admin",
+  "crates/affinidi-messaging-mediator-tui",
+]
+resolver = "3"
+
+[workspace.package]
+# Lockstep: every crate in this workspace carries this version, and every
+# internal dependency requires it exactly. `scripts/release_lib.py` moves both
+# together; never bump one crate on its own.
+version = "0.42.0"
+description = "Affinidi Messaging Mediator: a DIDComm v2 and TSP mediator, its admin client and console, and an in-process test mediator."
+edition = "2024"
+authors = ["Glenn Gore <glenn@affinidi.com>"]
+readme = "README.md"
+homepage = "https://affinidi.com/"
+license = "Apache-2.0"
+keywords = ["ssi", "affinidi", "didcomm", "mediator"]
+repository = "https://github.com/affinidi/affinidi-messaging-mediator"
+publish = true
+rust-version = "1.95.0"
+
+[workspace.dependencies]
+tokio = "1"
+
+# Upper bound on `aws-smithy-types`, which nothing in this workspace calls.
+#
+# **This is here to constrain the resolver, not because anything uses it.**
+# `aws-smithy-types` 1.7.0 changed `Document::Object` from
+# `HashMap<String, Document>` to a new `DocumentObject`, and added a variant to
+# an enum that is `#[non_exhaustive]` — a breaking change shipped as a MINOR
+# bump. `aws-smithy-json` 0.63.0 declares `aws-smithy-types = "^1.6.1"`, which
+# admits 1.7.0 and then fails to compile against it, inside the registry source:
+#
+#   error[E0308]: expected `DocumentObject`, found `HashMap<String, Document>`
+#   error[E0004]: non-exhaustive patterns: `&_` not covered
+#
+# Cargo unifies `aws-smithy-types` to one version across the graph but keeps
+# both `aws-smithy-json` 0.63 and 0.64 (0.x minors are incompatible majors), so
+# the two coexist and only the 0.63 copy breaks. We have both because the newer
+# `aws-sdk-*` releases moved to json `^0.64.0` while `aws-config` 1.12.0 — its
+# newest release — still wants `^0.63.0`, and `aws-config` is what every AWS
+# feature here pulls.
+#
+# The committed `Cargo.lock` holds a working set for this workspace, but nobody
+# who depends on these crates from crates.io uses it: their own resolve takes
+# the break. The manifest is the only place the constraint reaches them. A
+# `[workspace.dependencies]` entry alone constrains nothing, though — Cargo
+# honours a requirement only from a crate that *declares* the dependency, so
+# each crate whose subtree pulls `aws-config` names it below, under the same
+# feature.
+#
+# **Remove this the moment `aws-config` ships a release on json 0.64.** The
+# bound is `< 1.7` rather than `= 1.6.3` so patch releases in the working line
+# are still picked up; it is an exclusion of the break, not a freeze.
+aws-smithy-types = ">=1.6.1, <1.7"
+
+[profile.release]
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+
+[workspace.lints.clippy]
+uninlined_format_args = "warn"

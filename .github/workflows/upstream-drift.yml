@@ -1,0 +1,112 @@
+# Upstream drift canary.
+#
+# Every job in ci.yml passes `--locked`, so CI only ever builds the exact
+# dependency set recorded in Cargo.lock. That is what we want for PR checks:
+# a green PR should mean "this diff is good", not "nobody published a bad
+# crate in the last hour".
+#
+# The cost is a blind spot. `cargo install affinidi-messaging-mediator` — how
+# many operators install the binary — and every downstream crate depending on
+# the published mediator crates ignore our Cargo.lock and re-resolve to the
+# newest semver-compatible versions. Our upstreams (the TDK crates, vta-sdk,
+# trust-tasks-rs, the AWS SDK) have shipped source-breaking changes in
+# semver-compatible releases (see the aws-smithy-types bound in Cargo.toml).
+# Those slip straight past a `--locked` pipeline.
+#
+# This job closes the gap by resolving the way `cargo install` does. It runs on
+# a schedule rather than on PRs, so upstream churn shows up as its own alert
+# instead of failing somebody's unrelated review.
+#
+# When it goes red, the upstream has drifted. Reproduce with
+# `cargo update && cargo check --workspace --all-targets`, then either absorb
+# the change or constrain the requirement in the affected Cargo.toml.
+name: Upstream drift
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Explicit least privilege (SEC-3897): this job only reads the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # No `-D warnings` here, unlike ci.yml: a new upstream deprecation should
+  # not page anyone; only a genuine compile failure — the thing that breaks
+  # `cargo install` — should turn this red.
+  RUSTFLAGS: "--cfg tracing_unstable"
+
+jobs:
+  unlocked-resolve:
+    name: cargo check (unlocked resolve)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    steps:
+      # Restrict runner egress (SEC-3897). This job resolves dependencies
+      # UNLOCKED and then builds, running third-party build scripts against the
+      # freshest possible graph. Block every network destination except the ones
+      # the resolve/build and the age-gate legitimately need, so a compromised
+      # upstream cannot exfiltrate from the runner.
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            codeload.github.com:443
+            release-assets.githubusercontent.com:443
+            crates.io:443
+            static.crates.io:443
+            index.crates.io:443
+            static.rust-lang.org:443
+            azure.archive.ubuntu.com:80
+            security.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+
+      # Deliberately NOT cached: the cache is keyed on Cargo.lock, which this
+      # job rewrites. A hit would defeat the point of the check.
+      - name: Re-resolve dependencies to newest semver-compatible versions
+        run: cargo update
+
+      - name: Show what moved
+        run: git --no-pager diff --stat Cargo.lock
+
+      # Version-age heads-up (SEC-3897), non-blocking. Flags any registry
+      # version `cargo update` pulled that is younger than 48h, the window in
+      # which a compromised crate is usually still live before being yanked.
+      # WARN mode on purpose: newest-resolve pulls fresh crates most days, so a
+      # hard abort would keep this canary permanently red. The enforcing
+      # control here is the egress block above. Scoped to the versions that
+      # moved vs the committed lock.
+      - name: Age-gate drifted dependencies (<48h, non-blocking)
+        run: python3 .github/scripts/dep-age-gate.py --lock Cargo.lock --baseline-ref HEAD --max-age-hours 48 --mode warn
+
+      - name: Build workspace against the re-resolved graph
+        run: cargo check --workspace --all-targets
+
+      # Every published crate as a downstream user builds it: default features,
+      # its own resolve. The workspace check above unifies features across
+      # members, which can hide a crate that no longer compiles on its own.
+      - name: Build each publishable crate on its own
+        run: |
+          set -euo pipefail
+          for c in $(cargo metadata --format-version 1 --no-deps \
+                      | python3 -c 'import json,sys; m=json.load(sys.stdin); print(" ".join(p["name"] for p in m["packages"] if p["publish"] is None))'); do
+            echo "::group::cargo check -p $c"
+            cargo check -p "$c"
+            echo "::endgroup::"
+          done

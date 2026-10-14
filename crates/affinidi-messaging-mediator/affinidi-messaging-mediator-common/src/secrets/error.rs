@@ -1,4 +1,4 @@
-//! Errors produced by the [`SecretStore`](crate::SecretStore) trait and its
+//! Errors produced by the [`SecretStore`](crate::secrets::SecretStore) trait and its
 //! backends.
 
 use thiserror::Error;

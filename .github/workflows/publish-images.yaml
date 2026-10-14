@@ -9,21 +9,29 @@ name: publish-images
 #
 # The image is a full `cargo build --release`, so it is NOT built on every push —
 # it runs only when it can pay for itself:
-#   * release tag           -> build, verify, publish
+#   * release tag `vX.Y.Z` / `vX.Y.Z-rc.N`
+#                           -> build, verify, publish. release-tag.yml creates
+#                              the tag and dispatches this workflow on it (a tag
+#                              made with GITHUB_TOKEN triggers no `push` run);
+#                              a tag pushed by a person triggers `push: tags`.
 #   * workflow_dispatch     -> build, verify, publish (version input optional)
 #   * PR labelled `ci:image`-> build + verify only (opt-in; no publish)
 # Add the `ci:image` label to any PR that touches docker/ or this workflow.
+#
+# Image tags: always `:<version>` (e.g. `:v0.42.1`, `:v0.42.0-rc.2`). `:latest`
+# moves only for a GA/patch release tag that is the highest released version —
+# never for a release candidate, and never for a dispatch from a branch.
 
 on:
   push:
     tags:
-      - "affinidi-messaging-mediator-v*"
+      - "v*"
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag to publish (e.g. v0.16.36). Defaults to the crate version on the checked-out ref."
+        description: "Image version tag to publish (e.g. v0.42.1). Defaults to the workspace version on the checked-out ref."
         required: false
         type: string
 
@@ -56,14 +64,26 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # resolve-version.sh already keeps pre-releases (`-rc.N`) off :latest.
+      # On top of that, :latest is only ever taken from a release TAG ref: a
+      # dispatch from main or a release branch publishes `:<version>` only.
       - id: v
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          CRATE_MANIFEST: crates/messaging/affinidi-messaging-mediator/Cargo.toml
-        run: bash docker/ci/resolve-version.sh
+        run: |
+          set -euo pipefail
+          resolved="$RUNNER_TEMP/resolved-version"
+          GITHUB_OUTPUT="$resolved" bash docker/ci/resolve-version.sh
+          version=$(sed -n 's/^version=//p' "$resolved")
+          is_latest=$(sed -n 's/^is_latest=//p' "$resolved")
+          case "$version" in *-*) is_latest=false ;; esac
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) is_latest=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "is_latest=$is_latest" >> "$GITHUB_OUTPUT"
+          echo "Image version: $version (latest=$is_latest)"
 
   # Build the PRODUCTION image (docker/mediator.Dockerfile) and prove it boots
   # with the expected feature set. This is the gate that catches a broken

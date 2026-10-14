@@ -753,7 +753,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
 
     /// List messages in a folder (inbox or outbox) with stream-ID range
     /// filtering. Returns lightweight metadata only — bodies are fetched
-    /// separately via [`fetch_messages`] or [`get_message`].
+    /// separately via [`fetch_messages`](Self::fetch_messages) or [`get_message`](Self::get_message).
     ///
     /// `range = None` is equivalent to `("-", "+")` (the full stream).
     async fn list_messages(
@@ -1177,7 +1177,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ///
     /// The default implementation is the unoptimised two-call version, so
     /// third-party backends keep working unchanged. Backends that can batch
-    /// should override it — [`RedisStore`] already pipelines the membership
+    /// should override it — `RedisStore` already pipelines the membership
     /// probe and the ACL read into a single round trip, and the in-process
     /// backends read one record.
     async fn delivery_decision(
@@ -1484,7 +1484,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
 
     /// Read up to `count` queued messages, blocking up to `block` waiting
     /// for new entries. Reads claim ownership of returned entries until
-    /// they're acked (see [`forward_queue_ack`]) or autoclaimed.
+    /// they're acked (see [`forward_queue_ack`](Self::forward_queue_ack)) or autoclaimed.
     ///
     /// The backend lazily creates the consumer group on first call; no
     /// separate `ensure_group` step is required.
@@ -1650,7 +1650,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ///
     /// Backends with native TTL (Redis `EXPIRE`) reclaim expired
     /// sessions themselves, so the default is a no-op. Backends without
-    /// (Fjall, memory) expire sessions lazily on [`get_session`], which
+    /// (Fjall, memory) expire sessions lazily on [`get_session`](Self::get_session), which
     /// means a session that is created but never read again — e.g. a
     /// one-off DID that runs `/authenticate/challenge` and disappears —
     /// lingers on disk/in the map indefinitely. The session processor
@@ -1704,7 +1704,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Legacy: promote up to `accounts.len()` standard accounts to
-    /// `Admin`. Default impl loops over [`setup_admin_account`].
+    /// `Admin`. Default impl loops over [`setup_admin_account`](Self::setup_admin_account).
     async fn add_admin_accounts(
         &self,
         accounts: Vec<String>,
@@ -1719,7 +1719,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Legacy: demote up to `accounts.len()` admin accounts to
-    /// `Standard`. Default impl loops over [`account_set_role`].
+    /// `Standard`. Default impl loops over [`account_set_role`](Self::account_set_role).
     async fn strip_admin_accounts(&self, accounts: Vec<String>) -> Result<i32, MediatorError> {
         let mut count: i32 = 0;
         for did_hash in &accounts {
@@ -1731,7 +1731,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Legacy: `create_session` was the original challenge-creation
-    /// entry point. Maps onto [`put_session`] with the standard 15-minute
+    /// entry point. Maps onto [`put_session`](Self::put_session) with the standard 15-minute
     /// TTL and bumps the `SessionsCreated` counter (which the original
     /// implementation did inline).
     async fn create_session(&self, session: &Session) -> Result<(), MediatorError> {

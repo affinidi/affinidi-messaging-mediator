@@ -5,7 +5,7 @@
 //! anything the mediator authors. This is that host side: the same
 //! [`didcomm_compat::pack_encrypted`] that every protocol reply goes through
 //! (see `messages::store`, `messages::protocols::routing::rewrap_for_relay`),
-//! reached through the [`SystemMessagePacker`] trait instead of a direct call
+//! reached through the [`SystemMessagePacker`](affinidi_messaging_mediator_common::tasks::forwarding::SystemMessagePacker) trait instead of a direct call
 //! — `mediator-common` is a dependency of this crate, so the call has to go the
 //! other way.
 //!

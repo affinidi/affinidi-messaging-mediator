@@ -947,7 +947,7 @@ fn secret_entries_to_secrets(
 /// DIDComm traffic with its existing keys. Pre-populating it at
 /// wizard time means first-boot survives VTA unavailability.
 ///
-/// Returns `None` for [`VtaReply::AdminOnly`] sessions — those don't
+/// Returns `None` for [`VtaReply::AdminOnly`](crate::vta::VtaReply::AdminOnly) sessions — those don't
 /// carry a VTA-provisioned integration DID (the mediator brought its
 /// own via the Did step), so there's nothing for the VTA cache to
 /// seed. `TemplateBootstrap` and `ContextProvision` replies both map
@@ -1980,7 +1980,7 @@ fn build_cargo_args(features: &[&str], needs_explicit: bool) -> Vec<String> {
 }
 
 /// Find the workspace root by walking up from the current directory
-/// looking for a Cargo.toml that contains [workspace].
+/// looking for a Cargo.toml that contains `[workspace]`.
 fn find_workspace_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
 
@@ -2093,7 +2093,7 @@ fn build_install_args(
     let mut args = vec![
         "install".to_string(),
         "--path".to_string(),
-        "crates/messaging/affinidi-messaging-mediator".to_string(),
+        "crates/affinidi-messaging-mediator".to_string(),
         // `cargo install` re-resolves every dependency and ignores the
         // workspace lockfile unless it is told not to. That is not a
         // preference: an unlocked resolve is what took `aws-smithy-types`

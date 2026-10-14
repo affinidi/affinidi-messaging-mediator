@@ -391,8 +391,8 @@ impl MediatorSecrets {
     }
 
     /// Read-only reachability probe (no mutation). See
-    /// [`SecretStore::probe_readonly`]. A success is reused for
-    /// [`PROBE_READONLY_REUSE`]; the first call always reaches the backend.
+    /// [`SecretStore::probe_readonly`](crate::secrets::SecretStore::probe_readonly). A success is reused for
+    /// `PROBE_READONLY_REUSE`; the first call always reaches the backend.
     pub async fn probe_readonly(&self) -> Result<()> {
         if let Ok(last) = self.last_probe_ok.lock()
             && last.is_some_and(|at| at.elapsed() < PROBE_READONLY_REUSE)

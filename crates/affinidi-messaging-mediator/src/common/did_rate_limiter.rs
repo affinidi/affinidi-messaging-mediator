@@ -3,7 +3,7 @@
 //! Unlike the per-IP rate limiter (which runs as Tower middleware), this limiter
 //! operates at the application level because the DID is only known after JWT
 //! validation. It is charged in exactly one place:
-//! [`authenticate_token`](crate::common::jwt_auth::authenticate_token), once the
+//! `authenticate_token`, once the
 //! token has been fully validated. That covers every route that authenticates a
 //! caller — `/inbound` (DIDComm and TSP), `/outbound`, `/fetch`, `/list`,
 //! `/delete`, `/whoami`, `/oob` and the `/ws` upgrade — and a

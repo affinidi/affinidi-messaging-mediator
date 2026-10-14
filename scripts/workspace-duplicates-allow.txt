@@ -1,0 +1,14 @@
+# Workspace members knowingly shadowed by a crates.io copy
+# (scripts/check-workspace-duplicates.sh).
+#
+# One crate name per line. Every entry is a debt marker, not a resolution:
+# it means local edits to that crate are NOT what the workspace builds against
+# in the affected subtree, and two copies of its types exist in the graph.
+#
+# Only add an entry when the duplicate cannot be fixed from this repository,
+# with a note saying what pulls the registry copy and what clears it. A missing
+# `[patch.crates-io]` entry is fixable here and does not belong.
+#
+# The history of the entries that lived here while the mediator was part of
+# affinidi-tdk-rs (the vta-sdk "crossings") is in that repository's copy of
+# this file.

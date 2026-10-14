@@ -12,7 +12,7 @@
 //! Phase machine:
 //!   `EnterDid` → `EnterContext` → (FullSetup) `EnterMediatorUrl` →
 //!   `AwaitingAcl` → `Testing` → either `Connected`, the
-//!   `TransportFallbackPrompt` (interactive [F]/[R]/[O]/[B] choice
+//!   `TransportFallbackPrompt` (interactive \[F\]/\[R\]/\[O\]/\[B\] choice
 //!   when the alternate transport is still viable), or the
 //!   `RecoveryPrompt` (post-auth failure, exhausted attempts, or
 //!   no advertised transport).

@@ -84,7 +84,7 @@ if grep -qiE "could not open secret backend '(keyring|file)" "$log2"; then
   exit 1
 fi
 # `initializing AWS SDK` is logged by config::TryFrom when an AWS scheme is seen
-# (crates/messaging/affinidi-messaging-mediator/src/common/config/mod.rs). If that
+# (crates/affinidi-messaging-mediator/src/common/config/mod.rs). If that
 # line is reworded, update it here too.
 if ! grep -qiE "initializing AWS SDK" "$log2"; then
   echo "::error::image never initialised the AWS SDK — secrets-aws likely not compiled" >&2

@@ -32,7 +32,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/mediator /usr/local/bin/mediator
-COPY --from=builder /build/crates/messaging/affinidi-messaging-mediator/conf /etc/mediator/conf
+COPY --from=builder /build/crates/affinidi-messaging-mediator/conf /etc/mediator/conf
 
 WORKDIR /etc/mediator
 

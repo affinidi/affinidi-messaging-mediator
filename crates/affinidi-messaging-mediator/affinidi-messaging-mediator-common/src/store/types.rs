@@ -296,7 +296,7 @@ impl MetadataStats {
     }
 }
 
-/// Counter that [`MediatorStore::stats_increment`] understands. Adding a
+/// Counter that [`MediatorStore::stats_increment`](crate::store::MediatorStore::stats_increment) understands. Adding a
 /// variant requires teaching every backend to recognise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatCounter {

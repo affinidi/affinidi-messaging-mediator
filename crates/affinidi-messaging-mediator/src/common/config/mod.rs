@@ -141,7 +141,7 @@ pub struct Config {
     pub mediator_did_doc: Option<String>,
     /// Typed copy of the mediator's own DID document, parsed once during
     /// config load (`from_raw`). Carried so the request-time server
-    /// resolver can preload it via [`preload_self_did`] without
+    /// resolver can preload it via `preload_self_did` without
     /// re-deserialising `mediator_did_doc`. `Some` whenever this mediator
     /// self-hosts a document; `None` for builder-constructed configs,
     /// which set only the string form (the server then parses that as a

@@ -16,8 +16,8 @@
 //! Recording is best-effort in the same spirit: a failed write never fails the
 //! message or the authentication that caused it. It is not silent, though —
 //! every failure increments
-//! [`ACCOUNT_ACTIVITY_WRITE_FAILURES_TOTAL`](crate::common::metrics::names::ACCOUNT_ACTIVITY_WRITE_FAILURES_TOTAL)
-//! and warns at most once per [`WARN_EVERY`], so a store that has stopped
+//! [`ACCOUNT_ACTIVITY_WRITE_FAILURES_TOTAL`]
+//! and warns at most once per `WARN_EVERY`, so a store that has stopped
 //! accepting these writes is visible to an operator rather than showing up as
 //! account times that quietly stopped moving.
 

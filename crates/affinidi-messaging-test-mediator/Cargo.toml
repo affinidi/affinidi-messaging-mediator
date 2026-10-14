@@ -1,6 +1,6 @@
 [package]
 name = "affinidi-messaging-test-mediator"
-version = "0.22.0"
+version.workspace = true
 description = "Embedded mediator fixture for integration tests against affinidi-messaging-mediator"
 edition.workspace = true
 authors.workspace = true
@@ -28,17 +28,17 @@ didcomm-v1 = ["affinidi-messaging-mediator/didcomm-v1", "dep:affinidi-messaging-
 
 [dependencies]
 ## Optional: v1 message construction for the didcomm-v1 e2e tests.
-affinidi-messaging-didcomm-v1 = { path = "../affinidi-messaging-didcomm-v1", version = "0.2", optional = true }
+affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
 # ── Mediator: the thing we're spawning ───────────────────────────────────
 ##
 ## Sister-crate path deps carry an explicit `version =` so the package
 ## is publishable to crates.io while still using the in-tree path for
 ## workspace dev-builds. Pins follow the workspace's caret-pin policy
 ## (major.minor only) so transitive patch fixes resolve automatically.
-affinidi-messaging-mediator = { version = "0.41", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
+affinidi-messaging-mediator = { version = "0.42.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
 # `test-clock` compiles the advanceable `TestClock` this fixture injects via
 # `TestMediatorBuilder::clock` for fast expiry/TTL tests.
-affinidi-messaging-mediator-common = { version = "0.17", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
+affinidi-messaging-mediator-common = { version = "0.42.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
   "test-clock",
 ] }
 
@@ -49,12 +49,12 @@ tempfile = { version = "3", optional = true }
 
 # ── DID + key generation ────────────────────────────────────────────────
 ## Used for `DID::generate_did_peer` (Ed25519 + X25519, with service URI).
-affinidi-tdk = { version = "0.26", path = "../../tdk/affinidi-tdk", default-features = false, features = ["did-peer"] }
-affinidi-secrets-resolver = { version = "0.5", path = "../../core/affinidi-secrets-resolver" }
-affinidi-did-resolver-cache-sdk = { version = "0.8", path = "../../identity/affinidi-did-resolver-cache-sdk" }
+affinidi-tdk = { version = "0.26", default-features = false, features = ["did-peer"] }
+affinidi-secrets-resolver = "0.5"
+affinidi-did-resolver-cache-sdk = "0.8"
 
 # ── SDK client (for the e2e test environment) ───────────────────────────
-affinidi-messaging-sdk = { version = "0.36", path = "../affinidi-messaging-sdk" }
+affinidi-messaging-sdk = "0.36.1"
 
 # ── JWT signing key generation for the test mediator's session tokens ───
 ring = { version = "0.17", features = ["std"] }
@@ -82,19 +82,19 @@ sha256 = "1"
 ## forwarding helper, which constructs the routing-2.0 double forward in
 ## library code (the SDK doesn't re-export `Message`).
 serde_json = "1"
-affinidi-messaging-didcomm = { version = "0.15", path = "../affinidi-messaging-didcomm" }
+affinidi-messaging-didcomm = "0.15"
 
 [dev-dependencies]
 ## Drive the SDK's DIDComm transport as the delivery layer does.
-affinidi-messaging-core = { version = "0.1.11", path = "../affinidi-messaging-core" }
+affinidi-messaging-core = "0.1.11"
 ## Build hand-written authcrypt envelopes for the sender-binding tests.
-affinidi-crypto = { version = "0.2", path = "../../core/affinidi-crypto", features = ["jose"] }
-affinidi-did-common = { version = "0.4", path = "../../identity/affinidi-did-common" }
+affinidi-crypto = { version = "0.2", features = ["jose"] }
+affinidi-did-common = "0.4"
 ## Used by integration tests to hit the mediator's HTTP endpoints
 ## without going through the SDK.
 reqwest = { version = "0.13", features = ["rustls", "json"] }
 ## TSP control-message types named by the TSP control-relay integration test.
-affinidi-tsp = { version = "0.2", path = "../affinidi-tsp" }
+affinidi-tsp = "0.2"
 ## Re-encode raw qb2 bytes from a flushed TSP websocket Binary frame back to
 ## the stored base64url form so the SDK can unpack it (tsp_websocket test).
 base64 = "0.23"
@@ -116,6 +116,14 @@ futures-util = "0.3"
 tokio = { workspace = true, features = ["io-util"] }
 ## The stub remote mediator in `tests/forwarding_processor.rs`.
 axum = "0.8"
+## The didcomm-service tests that run it against a live mediator
+## (`soft_restart_websocket`, `tsp_*`). They lived in that crate's own tests
+## until the mediator moved out of affinidi-tdk-rs; a dev-dependency there on
+## this crate would make a cross-repository cycle, so they run here instead.
+affinidi-messaging-didcomm-service = { version = "0.21", features = ["tsp"] }
+## `affinidi_tdk::messaging::ATM` for the TSP transport-adapter test.
+affinidi-tdk = { version = "0.26", default-features = false, features = ["did-peer", "messaging"] }
+affinidi-tdk-common = "0.7"
 
 [lints]
 workspace = true

@@ -145,7 +145,7 @@ impl Database {
     ///
     /// Returns true if it exists, false otherwise
     ///
-    /// Expressed in terms of [`Self::delivery_decision`] so the mode
+    /// Expressed in terms of `Self::delivery_decision` so the mode
     /// interpretation lives in exactly one place. Preserves the fail-closed
     /// contract: a missing account or a backend error is `false`.
     pub async fn access_list_allowed(&self, to_hash: &str, from_hash: Option<&str>) -> bool {

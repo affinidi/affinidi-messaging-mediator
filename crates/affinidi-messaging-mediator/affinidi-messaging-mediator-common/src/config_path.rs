@@ -12,7 +12,7 @@
 //! Switching the rule outright would move where a running deployment finds its
 //! TLS private key, so the old behaviour is kept as a **fallback**: a path that
 //! is absent beside the config file but present relative to the working
-//! directory still resolves, and says so through [`PathSource::WorkingDir`] so
+//! directory still resolves, and says so through [`PathSource::WorkingDir`](crate::config_path::PathSource::WorkingDir) so
 //! the caller can warn. This module logs nothing: config is read before the
 //! tracing subscriber exists, and a warning emitted then is silently dropped.
 //! Callers warn once logging is up.

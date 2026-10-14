@@ -1,6 +1,6 @@
 [package]
 name = "affinidi-messaging-mediator-setup"
-version = "0.1.38"
+version.workspace = true
 description = "Interactive TUI setup wizard for Affinidi Messaging Mediator"
 edition.workspace = true
 authors.workspace = true
@@ -65,8 +65,8 @@ url = "2"
 # ── Affinidi TDK (DID generation, secrets, crypto) ──────────────────────
 ## Uses did-peer feature for did:peer generation. Does NOT depend on the
 ## mediator crate itself — only writes config files the mediator reads.
-affinidi-tdk = { path = "../../../../tdk/affinidi-tdk", default-features = false, features = ["did-peer"] }
-affinidi-secrets-resolver = { path = "../../../../core/affinidi-secrets-resolver" }
+affinidi-tdk = { version = "0.26", default-features = false, features = ["did-peer"] }
+affinidi-secrets-resolver = "0.5"
 ## did:key helpers used by the sealed-handoff full-setup path to derive
 ## the `client_did` from the ephemeral Ed25519 pubkey when signing a
 ## VP-framed `provision_integration::BootstrapRequest`. Small, no cycles.
@@ -79,7 +79,7 @@ affinidi-crypto = "0.2"
 ## mediator finds them at startup without any inline config plumbing.
 ## Backend selection flows through the wizard's own `secrets-*` features
 ## declared at the top of this file; no hardcoded list here.
-affinidi-messaging-mediator-common = { path = "../../affinidi-messaging-mediator-common", default-features = false, features = [
+affinidi-messaging-mediator-common = { version = "0.42.0", path = "../../affinidi-messaging-mediator-common", default-features = false, features = [
   "server",
 ] }
 
@@ -101,7 +101,7 @@ vta-sdk = { version = "0.68", features = ["provision-client"] }
 ## Used to resolve the VTA's DID document and extract VTARest /
 ## DIDCommMessaging service endpoints without the operator having to paste
 ## URLs.
-affinidi-did-resolver-cache-sdk = { path = "../../../../identity/affinidi-did-resolver-cache-sdk" }
+affinidi-did-resolver-cache-sdk = "0.8"
 
 # ── HTTP ─────────────────────────────────────────────────────────────────
 ## Used for REST fallback + future trust-ping of service endpoints.
@@ -210,7 +210,7 @@ serial_test = "4"
 wiremock = "0.6"
 ## Round-trip guard: the config-writer tests parse the wizard's generated TOML
 ## into the mediator's shared `ConfigRaw` schema so the two can't drift apart.
-affinidi-messaging-mediator-config = { path = "../../affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.42.0", path = "../../affinidi-messaging-mediator-config" }
 
 [lints]
 workspace = true

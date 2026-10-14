@@ -15,7 +15,7 @@
 //!    access.
 //! 5. Mint a fresh Ed25519 did:key locally.
 //! 6. `POST /acl` with the new DID and the mirrored scope.
-//! 7. Write the new [`AdminCredential`] into the unified backend
+//! 7. Write the new [`AdminCredential`](affinidi_messaging_mediator_common::AdminCredential) into the unified backend
 //!    (replacing the old well-known entry).
 //! 8. `DELETE /acl/{old_did}` to revoke the previous identity. If the
 //!    backend write succeeded but the delete fails, the new entry is

@@ -1,7 +1,7 @@
 ### ****************************************************************************************************************************
 ### Container profile — this is the config baked into the published image.
 ###
-### It differs from the annotated template (crates/messaging/affinidi-messaging-mediator/conf/mediator.toml)
+### It differs from the annotated template (crates/affinidi-messaging-mediator/conf/mediator.toml)
 ### in exactly three ways, all of them deliberate:
 ###
 ###   1. No identity is baked in. `mediator_did` and `admin_did` are empty: a

@@ -42,7 +42,7 @@ RUN cargo build --release -p affinidi-messaging-mediator-setup \
 # digest is the only thing fixing what ships. Bump it to pick up CVE fixes.
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
 ARG PORT
-LABEL org.opencontainers.image.source="https://github.com/affinidi/affinidi-tdk-rs" \
+LABEL org.opencontainers.image.source="https://github.com/affinidi/affinidi-messaging-mediator" \
       org.opencontainers.image.title="messaging-mediator" \
       org.opencontainers.image.description="Affinidi Secure Messaging Mediator (DIDComm v2 + TSP)" \
       org.opencontainers.image.licenses="Apache-2.0"
@@ -51,7 +51,7 @@ WORKDIR /app
 # Template assets (atm-functions.lua and friends), then the container config
 # overwrites the template's mediator.toml — the mediator defaults to
 # `-c conf/mediator.toml` relative to WORKDIR, so this is the file it reads.
-COPY crates/messaging/affinidi-messaging-mediator/conf conf
+COPY crates/affinidi-messaging-mediator/conf conf
 COPY docker/conf/mediator.toml conf/mediator.toml
 COPY --from=builder /app/target/release/mediator /usr/local/bin
 COPY --from=builder /app/target/release/mediator-setup /usr/local/bin

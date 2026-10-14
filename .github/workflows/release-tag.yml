@@ -1,0 +1,85 @@
+name: Tag a release
+
+# A push to a release branch that moves RELEASE (the cut, or a merged prep PR)
+# tags `v<RELEASE>` and opens its GitHub Release (RELEASES.md). An rc
+# (`vX.Y.Z-rc.N`) is a prerelease and never "latest". Its notes are the
+# version's CHANGELOG.md section where it has one, otherwise generated.
+#
+# Then it starts publish-images.yaml for the tag. The tag is created with
+# GITHUB_TOKEN, and a ref GITHUB_TOKEN creates triggers no workflow, so the
+# image build is dispatched explicitly (workflow_dispatch is the documented
+# exception). Exactly one image run per release either way; a tag pushed by a
+# person still triggers publish-images.yaml through its own `push: tags`.
+#
+# Crates are published by publish.yml on the same push (GA and patch only).
+on:
+  push:
+    branches: ["release/**"]
+    paths: [RELEASE]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag v<RELEASE>
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      # gh workflow run publish-images.yaml
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag and publish the GitHub Release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < RELEASE)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::RELEASE holds '$version', not major.minor.patch[-rc.N]"
+            exit 1
+          fi
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::warning::$tag already exists; not moving it"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The version's own CHANGELOG section, heading excluded.
+          : > "$RUNNER_TEMP/notes.md"
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$version" '
+              $0 ~ "^## " v "( |$)" { on = 1; next }
+              on && /^## / { exit }
+              on { print }
+            ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          fi
+          args=(--target "$SHA" --title "$tag")
+          case "$version" in
+            *-rc.*) args+=(--prerelease --latest=false) ;;
+          esac
+          if [ -s "$RUNNER_TEMP/notes.md" ]; then
+            args+=(--notes-file "$RUNNER_TEMP/notes.md")
+          else
+            args+=(--generate-notes)
+          fi
+          gh release create "$tag" "${args[@]}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+      - name: Build and publish the image for the tag
+        if: steps.tag.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: gh workflow run publish-images.yaml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f version="$TAG"

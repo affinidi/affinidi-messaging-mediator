@@ -17,11 +17,11 @@
 //! Two bounds, because this runs against a live store on every statistics tick
 //! and a naive "scan every queue" would be worse than the blindness it fixes:
 //!
-//! - at most [`MAX_ACCOUNTS_PER_SURVEY`] account records are read, in pages via
+//! - at most `MAX_ACCOUNTS_PER_SURVEY` account records are read, in pages via
 //!   the existing `account_list` cursor. Account records already carry the
 //!   depth counters, so the entire depth half of the survey costs one paged
 //!   walk and no per-queue reads at all;
-//! - at most [`MAX_AGE_PROBES`] queues *per folder* are then probed for age,
+//! - at most `MAX_AGE_PROBES` queues *per folder* are then probed for age,
 //!   chosen as the deepest ones seen. Each probe is a single range-read of one
 //!   entry.
 //!

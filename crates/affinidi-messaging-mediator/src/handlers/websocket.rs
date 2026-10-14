@@ -193,11 +193,11 @@ fn ws_origin_allowed(policy: &CorsOriginPolicy, origin: Option<&HeaderValue>) ->
 /// 2. The `bearer.<jwt>` entry of the `Sec-WebSocket-Protocol` request
 ///    header — the browser-friendly path (browsers can't set request
 ///    headers on a WebSocket upgrade). See
-///    [`WS_BEARER_SUBPROTOCOL_PREFIX`].
+///    `WS_BEARER_SUBPROTOCOL_PREFIX`.
 ///
 /// Both channels validate the token identically via
-/// [`authenticate_token`]; the resulting [`Session`] (and therefore the
-/// per-connection JWT-expiry timeout enforced in [`handle_socket`]) is
+/// `authenticate_token`; the resulting [`Session`] (and therefore the
+/// per-connection JWT-expiry timeout enforced in `handle_socket`) is
 /// the same regardless of how the token arrived. If neither channel
 /// yields a valid token the upgrade is rejected, exactly as before.
 pub async fn websocket_handler(

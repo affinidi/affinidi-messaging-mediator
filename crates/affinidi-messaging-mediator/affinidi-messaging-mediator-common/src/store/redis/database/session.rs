@@ -1,6 +1,6 @@
 //! Session storage on the Redis backend.
 //!
-//! Session type definitions live in [`crate::common::session`] —
+//! Session type definitions live in `crate::common::session` —
 //! they're backend-agnostic (used by the JWT middleware regardless of
 //! storage). This file only carries the Redis-specific persistence
 //! methods on `Database`.
