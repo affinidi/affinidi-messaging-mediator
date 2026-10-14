@@ -3,7 +3,7 @@
 //! recipient; honest forwards still deliver.
 
 mod common;
-#[path = "../../affinidi-messaging-didcomm/tests/support/forge.rs"]
+#[path = "support/forge.rs"]
 mod forge;
 
 use affinidi_crypto::jose::{Curve, PrivateKeyAgreement, PublicKeyAgreement};

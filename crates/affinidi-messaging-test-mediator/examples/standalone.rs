@@ -4,7 +4,7 @@
 //! for local DIDComm testing. Prints the mediator DID + endpoints, then blocks
 //! until the process is killed.
 //!
-//! Run from the affinidi-tdk-rs workspace:
+//! Run from the workspace root:
 //!   cargo run -p affinidi-messaging-test-mediator --example standalone
 //!
 //! ## Environment

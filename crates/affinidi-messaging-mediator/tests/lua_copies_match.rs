@@ -24,7 +24,7 @@
 const CANONICAL: &str = include_str!("../conf/atm-functions.lua");
 
 /// The copy `docker/test/conf/mediator.toml` points `functions_file` at.
-const DOCKER_TEST: &str = include_str!("../../../../docker/test/conf/atm-functions.lua");
+const DOCKER_TEST: &str = include_str!("../../../docker/test/conf/atm-functions.lua");
 
 #[test]
 fn the_docker_test_lua_matches_the_canonical_one() {

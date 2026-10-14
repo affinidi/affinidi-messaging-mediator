@@ -5,8 +5,9 @@
 #   EVENT_NAME     - github.event_name (push | workflow_dispatch | pull_request)
 #   REF_NAME       - github.ref_name (the tag name on a push)
 #   INPUT_VERSION  - workflow_dispatch 'version' input (optional)
-#   CRATE_MANIFEST - mediator Cargo.toml for the crate-version fallback
-#                    (default: crates/messaging/affinidi-messaging-mediator/Cargo.toml)
+#   CRATE_MANIFEST - manifest holding the lockstep version, for the fallback
+#                    (default: the workspace root Cargo.toml, whose first
+#                    `version = "..."` is `[workspace.package]`'s)
 #
 # Output: appends `version=` and `is_latest=` to $GITHUB_OUTPUT (or stdout when
 # unset, so the script is runnable locally). Diagnostics go to stderr.
@@ -15,15 +16,16 @@ set -euo pipefail
 : "${EVENT_NAME:=}"
 : "${REF_NAME:=}"
 : "${INPUT_VERSION:=}"
-: "${CRATE_MANIFEST:=crates/messaging/affinidi-messaging-mediator/Cargo.toml}"
+: "${CRATE_MANIFEST:=Cargo.toml}"
 
 if [ "$EVENT_NAME" = "push" ]; then
-  version="${REF_NAME#affinidi-messaging-mediator-}"
+  # Release tags are the workspace-wide `vX.Y.Z` / `vX.Y.Z-rc.N`.
+  version="$REF_NAME"
 elif [ -n "$INPUT_VERSION" ]; then
   version="$INPUT_VERSION"
 else
-  # Default to the crate version on the checked-out ref. awk (not GNU-only
-  # `sed '0,/re/'`) grabs the first `version = "..."`, i.e. the [package] one.
+  # Default to the workspace version on the checked-out ref. awk (not GNU-only
+  # `sed '0,/re/'`) grabs the first `version = "..."`, i.e. [workspace.package]'s.
   version="$(awk -F'"' '/^version[[:space:]]*=[[:space:]]*"/{print $2; exit}' "$CRATE_MANIFEST")"
   if [ -z "$version" ]; then
     echo "::error::could not read crate version from $CRATE_MANIFEST" >&2
@@ -40,16 +42,17 @@ esac
 # one, so re-publishing an older version never moves :latest backwards.
 #
 # Pre-releases are excluded from the comparison AND never take :latest: `sort -V`
-# orders `v1.0.0-rc1` AFTER `v1.0.0`, so leaving them in would let an rc claim
+# orders `v1.0.0-rc.1` AFTER `v1.0.0`, so leaving them in would let an rc claim
 # :latest and would then stop the stable release from claiming it back.
-highest="$(git tag --list 'affinidi-messaging-mediator-v*' \
-  | sed 's/^affinidi-messaging-mediator-//' \
-  | grep -v -- '-' \
+# `|| true`: before the first GA there is nothing to compare against, and an
+# empty grep must not trip `pipefail`.
+highest="$(git tag --list 'v*' \
+  | { grep -v -- '-' || true; } \
   | sort -V | tail -1)"
 
 case "$version" in
   *-*)
-    # Pre-release (e.g. v1.0.0-rc1).
+    # Pre-release (e.g. v1.0.0-rc.1).
     is_latest=false
     ;;
   *)

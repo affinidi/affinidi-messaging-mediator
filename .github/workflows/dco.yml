@@ -1,0 +1,56 @@
+name: DCO
+
+# Every commit in a PR carries a `Signed-off-by:` trailer (the Developer
+# Certificate of Origin, https://developercertificate.org). CONTRIBUTING.md
+# explains `git commit -s`. Release tooling and the backport bot sign off
+# their own commits (cut-release.py, release-prep.yml, cherry-picks keep the
+# original trailer), so they pass without exceptions.
+#
+# Its own workflow so it re-runs in seconds on a force-push that fixes the
+# sign-off, without rebuilding anything. Reads commit metadata only; checks
+# out no PR code.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every commit is signed off
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$REPO/pulls/$PR/commits?per_page=100" \
+            --jq '.[] | [.sha, (.parents | length | tostring), .commit.author.email, (.commit.message | @base64)] | @tsv' \
+            > commits.tsv
+          bad=0
+          while IFS=$'\t' read -r sha parents email msg64; do
+            # Merge commits (e.g. "Update branch") carry no authored change.
+            [ "$parents" -gt 1 ] && continue
+            msg=$(printf '%s' "$msg64" | base64 -d)
+            if ! printf '%s\n' "$msg" | grep -qiE '^Signed-off-by: .+ <[^>]+>$'; then
+              echo "::error::commit ${sha:0:12} ($email) has no Signed-off-by trailer"
+              bad=1
+            fi
+          done < commits.tsv
+          if [ "$bad" -ne 0 ]; then
+            cat <<'EOF'
+          Sign off every commit (CONTRIBUTING.md, "DCO sign-off"):
+
+            git rebase --signoff origin/<base-branch>
+            git push --force-with-lease
+          EOF
+            exit 1
+          fi
+          echo "all $(wc -l < commits.tsv | tr -d ' ') commit(s) signed off"

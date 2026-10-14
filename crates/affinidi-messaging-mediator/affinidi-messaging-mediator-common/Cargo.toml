@@ -1,6 +1,6 @@
 [package]
 name = "affinidi-messaging-mediator-common"
-version = "0.17.7"
+version.workspace = true
 description = "Shared types for the Affinidi Messaging Mediator (errors, database handler, config)"
 edition.workspace = true
 authors.workspace = true
@@ -117,7 +117,7 @@ test-clock = [
 # ── Always-on ───────────────────────────────────────────────────────
 ## The protocol types, re-exported as `types`. They live in their own crate
 ## so the client SDK can depend on them without depending on this one.
-affinidi-messaging-mediator-types = { version = "0.1", path = "../../affinidi-messaging-mediator-types" }
+affinidi-messaging-mediator-types = "0.1"
 ## Used by the always-built helpers (`did_web`, `parameter_store`, …) and
 ## the `server` modules.
 serde = { version = "1", features = ["derive", "rc"] }

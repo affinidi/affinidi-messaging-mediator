@@ -1,6 +1,6 @@
 [package]
 name = "affinidi-messaging-mediator-admin"
-version = "0.11.0"
+version.workspace = true
 description = "Headless client for operating an Affinidi messaging mediator over Trust Tasks — mediator-wide administration or an account's own queues, plus the live traffic monitor. The engine behind the mediator console; embeddable in any application."
 edition.workspace = true
 authors.workspace = true
@@ -12,9 +12,9 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-affinidi-messaging-sdk = { version = "0.36", path = "../affinidi-messaging-sdk" }
-affinidi-messaging-didcomm = { version = "0.15", path = "../affinidi-messaging-didcomm" }
-affinidi-tdk-common = { version = "0.7", path = "../../tdk/affinidi-tdk-common" }
+affinidi-messaging-sdk = "0.36.1"
+affinidi-messaging-didcomm = "0.15"
+affinidi-tdk-common = "0.7"
 affinidi-secrets-resolver = "0.5"
 trust-tasks-rs = "0.31"
 async-trait = "0.1"
@@ -27,8 +27,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
-affinidi-messaging-test-mediator = { path = "../affinidi-messaging-test-mediator" }
-affinidi-messaging-mediator-common = { path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
+affinidi-messaging-test-mediator = { version = "0.42.0", path = "../affinidi-messaging-test-mediator" }
+affinidi-messaging-mediator-common = { version = "0.42.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 

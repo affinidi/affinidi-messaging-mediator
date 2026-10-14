@@ -2093,7 +2093,7 @@ fn build_install_args(
     let mut args = vec![
         "install".to_string(),
         "--path".to_string(),
-        "crates/messaging/affinidi-messaging-mediator".to_string(),
+        "crates/affinidi-messaging-mediator".to_string(),
         // `cargo install` re-resolves every dependency and ignores the
         // workspace lockfile unless it is told not to. That is not a
         // preference: an unlocked resolve is what took `aws-smithy-types`

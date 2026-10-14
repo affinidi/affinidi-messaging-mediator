@@ -1,7 +1,7 @@
 # affinidi-messaging-mediator
 
-[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/affinidi/affinidi-tdk-rs/tree/main/crates/messaging/affinidi-messaging-mediator)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/affinidi/affinidi-tdk-rs/blob/main/LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/affinidi/affinidi-messaging-mediator/tree/main/crates/affinidi-messaging-mediator)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)
 
 A mediator and relay service supporting
 [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/) and
@@ -340,4 +340,4 @@ More examples are in [affinidi-messaging-helpers](../affinidi-messaging-helpers/
 
 ## License
 
-[Apache-2.0](https://github.com/affinidi/affinidi-tdk-rs/blob/main/LICENSE)
+[Apache-2.0](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)

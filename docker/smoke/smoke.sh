@@ -56,6 +56,6 @@ fi
 echo "    resolved $did_id"
 
 echo "==> SDK round-trip (authenticate + trust-ping) via docker_smoke"
-cargo run --quiet -p affinidi-messaging-helpers --example docker_smoke
+cargo run --quiet -p affinidi-messaging-test-mediator --example docker_smoke
 
 echo "==> SMOKE PASSED"
