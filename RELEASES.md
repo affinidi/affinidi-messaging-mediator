@@ -66,7 +66,7 @@ first lockstep release from this repository.
 | Release | Branch | First RC | GA | Latest | Status |
 |---|---|---|---|---|---|
 | ≤ 0.41 | — | — | — | `0.41.x` | released from affinidi-tdk-rs, per-crate versions |
-| 0.42 | `release/0.42` | 2026-10-14 | TBD | `0.42.0-rc.0` | release candidate |
+| 0.42 | `release/0.42` | 2026-10-14 | 2026-10-14 | `0.42.0` | supported (N) |
 | 0.43 | — | TBD | TBD | — | in development on `main` |
 
 ## Support
