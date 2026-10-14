@@ -8,6 +8,8 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+## 0.42.0 (release/0.42)
+
 ### Moved — the mediator has its own repository
 
 - The mediator, `affinidi-messaging-mediator-common`, `-config`,
