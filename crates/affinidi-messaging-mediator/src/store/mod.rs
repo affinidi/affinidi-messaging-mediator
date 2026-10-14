@@ -2,7 +2,7 @@
 //!
 //! Each impl is feature-gated so deployments only compile the backend
 //! they actually use:
-//! - [`redis_store`] (`redis-backend`): multi-mediator clusters with
+//! - `redis_store` (`redis-backend`): multi-mediator clusters with
 //!   cross-process pub/sub. Wraps the existing `Database` + Lua flow.
 //! - `fjall_store` (`fjall-backend`): single-node persistence, embedded
 //!   LSM. Lands in a later commit.

@@ -1,7 +1,7 @@
 //! Config file reading + environment-variable overrides.
 //!
 //! `read_config_file` reads `mediator.toml`, deserializes it into
-//! [`ConfigRaw`](crate::ConfigRaw), and applies env-var overrides (env wins
+//! [`ConfigRaw`], and applies env-var overrides (env wins
 //! over the file). Runtime resolution (secrets, DID resolver, VTA) happens
 //! later, in the mediator binary.
 

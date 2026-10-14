@@ -375,7 +375,7 @@ impl MemoryStore {
     /// when it is overwritten `capacity` sends later. So the ring is a *standing*
     /// reservation of `capacity x message_size` bytes, not a transient queue, and
     /// the capacity must be derived from a byte budget rather than picked by feel.
-    /// See [`pubsub_capacity_for`].
+    /// See `pubsub_capacity_for`.
     pub fn with_pubsub_capacity(mut self, capacity: usize) -> Self {
         self.pubsub_capacity = capacity.max(1);
         self

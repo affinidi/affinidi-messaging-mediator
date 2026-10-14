@@ -9,7 +9,7 @@
 //!    the cache stays within TTL as long as the VTA is reachable, so
 //!    a reboot during a temporary VTA outage still has a usable cache.
 //!
-//! 2. **Circular-bootstrap convergence** — when [`vta_bootstrap`]
+//! 2. **Circular-bootstrap convergence** — when `vta_bootstrap`
 //!    detected a VTA self-mediation loop and booted from cache without
 //!    contacting the VTA, this task is the path that re-fetches once
 //!    the listener is up (DIDComm to ourselves now resolves cleanly).
@@ -22,8 +22,6 @@
 //!   (no expiry), defaults to 6 hours.
 //! - On failure: log a warning, wait the next interval. No exponential
 //!   backoff — the cadence is already conservative.
-//!
-//! [`vta_bootstrap`]: crate::common::config::vta_bootstrap
 
 use crate::common::config::vta_cache::MediatorSecretCache;
 use crate::common::metrics::names;
@@ -65,8 +63,8 @@ pub(crate) fn interval_for_ttl(cache_ttl_secs: u64) -> Duration {
 }
 
 /// Inputs the refresh task needs. Built at config-load time and held
-/// in `Config` until [`server::serve_internal`] spawns the task.
-/// Cloneable so [`Config`] can stay `Clone` (every inner field is
+/// in `Config` until [`server::serve_internal`](crate::server::serve_internal) spawns the task.
+/// Cloneable so [`Config`](crate::common::config::Config) can stay `Clone` (every inner field is
 /// cheap to clone — the secrets resolver is `Arc`, the credential is
 /// reference-counted strings, etc.).
 #[derive(Clone)]
@@ -78,7 +76,7 @@ pub struct VtaRefresher {
     pub interval: Duration,
     /// This mediator's own DID. Compared against the VTA's advertised DIDComm
     /// mediator each tick to detect the self-mediated topology — see
-    /// [`Self::tick_config`].
+    /// `Self::tick_config`.
     pub mediator_did: String,
 }
 
@@ -105,7 +103,7 @@ impl VtaRefresher {
     }
 
     /// Tell the refresher this mediator's own DID, enabling the self-mediation
-    /// check in [`Self::tick_config`]. Without it, refresh ticks use the
+    /// check in `Self::tick_config`. Without it, refresh ticks use the
     /// configured transport preference unchanged.
     pub fn with_mediator_did(mut self, mediator_did: String) -> Self {
         self.mediator_did = mediator_did;

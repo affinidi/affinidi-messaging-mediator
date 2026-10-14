@@ -275,7 +275,7 @@ impl VtaConnectState {
     }
 
     /// Identify the most recently completed attempt and which
-    /// transport ran it. Used by [`apply_event`] to decide between
+    /// transport ran it. Used by [`apply_event`](Self::apply_event) to decide between
     /// `TransportFallbackPrompt` (recent attempt was pre-auth) and
     /// `RecoveryPrompt` (post-auth, or no fallback target).
     pub fn last_attempt(&self) -> Option<(Protocol, &AttemptResult)> {

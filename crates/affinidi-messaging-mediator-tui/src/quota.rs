@@ -153,7 +153,7 @@ impl Widget for QuotaBar {
     }
 }
 
-/// The same bar as a [`Line`] of styled spans, for places a widget cannot go
+/// The same bar as a [`Line`](ratatui::text::Line) of styled spans, for places a widget cannot go
 /// — a table cell, a line of text.
 pub fn quota_line(
     ratio: Option<f64>,

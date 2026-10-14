@@ -102,7 +102,7 @@ pub struct Args {
     pub vta_context: Option<String>,
 
     /// Public URL the mediator will serve at (e.g.
-    /// https://mediator.example.com). Passed to the VTA's
+    /// <https://mediator.example.com>). Passed to the VTA's
     /// `didcomm-mediator` template as the `URL` variable during
     /// provisioning. Required for Phase 2 (`--setup-key-file`).
     #[arg(long, value_name = "URL")]

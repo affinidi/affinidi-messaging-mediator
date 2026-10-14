@@ -49,7 +49,7 @@
 //! tests that need different semantics:
 //!
 //! - **Fjall** (on-disk LSM) — compile with the `fjall-backend` feature
-//!   and call [`TestMediatorBuilder::fjall_backend`]. The fixture
+//!   and call `TestMediatorBuilder::fjall_backend`. The fixture
 //!   manages a temp directory whose lifetime is tied to the handle, so
 //!   no partition files leak.
 //! - **Redis** — supply an `Arc<RedisStore>` via `store(...)`. Useful
@@ -410,7 +410,7 @@ impl Default for TestMediatorBuilder {
 
 impl TestMediatorBuilder {
     /// Supply a pre-built store. Default is a fresh
-    /// [`MemoryStore`](affinidi_messaging_mediator::store::MemoryStore)
+    /// [`MemoryStore`]
     /// constructed on spawn.
     ///
     /// Pass an `Arc<RedisStore>` here when a test specifically needs
@@ -1140,7 +1140,7 @@ impl TestMediatorHandle {
         self.mint_user(alias.into(), acl::allow_all()).await
     }
 
-    /// Mint a fresh `did:peer:2.*` user (same shape as [`add_user`])
+    /// Mint a fresh `did:peer:2.*` user (same shape as [`add_user`](Self::add_user))
     /// but register it with `acls` instead of the typed `ALLOW_ALL`
     /// preset. Useful for testing denied paths without reaching into
     /// the underlying store.

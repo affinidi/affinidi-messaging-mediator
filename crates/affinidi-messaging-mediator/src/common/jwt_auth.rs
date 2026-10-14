@@ -422,9 +422,9 @@ fn anonymous_session_for(
 /// When a valid `Authorization: Bearer` token is present the inner `Session`
 /// is fully populated (i.e. `session.authenticated == true`). When the header
 /// is *absent* the request is accepted — as an anonymous session carrying a
-/// minimal relay-scoped ACL (see [`relay_anonymous_acls`]) — only if the
+/// minimal relay-scoped ACL (see `relay_anonymous_acls`) — only if the
 /// mediator is configured as an inter-mediator relay (see
-/// [`anonymous_session_for`]). A *present but invalid/expired/blocked* token,
+/// `anonymous_session_for`). A *present but invalid/expired/blocked* token,
 /// or a backend error, is propagated unchanged, so a mediator with the shipped
 /// secure default keeps rejecting unauthenticated `/inbound` requests.
 pub struct MaybeSession(pub Session);

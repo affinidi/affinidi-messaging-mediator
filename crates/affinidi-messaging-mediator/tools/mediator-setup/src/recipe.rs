@@ -867,7 +867,7 @@ pub fn from_wizard_config(config: &WizardConfig) -> String {
 /// Accepts both the bare scheme (backward compat with pre-cloud-config
 /// recipes — e.g. `aws_secrets://` with no body) and a fully-formed URL
 /// (`aws_secrets://us-east-1/mediator/`). Full URLs are parsed via
-/// `mediator-common`'s [`affinidi_messaging_mediator_common::parse_url`]
+/// `mediator-common`'s [`affinidi_messaging_mediator_common::parse_url`](affinidi_messaging_mediator_common::secrets::parse_url)
 /// and the per-backend fields (region / project / vault / endpoint /
 /// mount) are populated so a recipe replay restores the operator's full
 /// choice without re-prompting.

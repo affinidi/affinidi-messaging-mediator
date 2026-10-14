@@ -7,7 +7,7 @@
  closed so only the most recent one receives messages.
 
  The recipient's undelivered inbox is redelivered (see
- [`spawn_inbox_redelivery`]) at **two** points, for the same underlying
+ `spawn_inbox_redelivery`) at **two** points, for the same underlying
  reason: the store both live-pushes *and* persists every non-ephemeral
  message, but nothing ever streams a message that was persisted without
  being pushed. A client relying on live delivery then hangs until timeout
@@ -123,7 +123,7 @@ pub enum StreamingUpdateState {
         did: String,
         /// Set by this task when a live notification for the DID had to be
         /// dropped, and observed by the socket handler that owns the
-        /// connection. See [`ClientEntry::resync`].
+        /// connection. See `ClientEntry::resync`.
         resync: Arc<AtomicBool>,
     },
     /// Enable live delivery for the socket owned by `session_id`.

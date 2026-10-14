@@ -13,9 +13,9 @@
 //! | `k8s://`         | `k8s://<namespace>/<secret-name>`           | `k8s://affinidi/mediator-secrets`          |
 //!
 //! The `vault://` scheme accepts optional query parameters selecting a
-//! non-default auth method and transport options — see [`parse_vault`].
+//! non-default auth method and transport options — see `parse_vault`.
 //! The `k8s://` scheme stores every mediator key inside one namespaced
-//! `Secret` object — see [`parse_k8s`].
+//! `Secret` object — see `parse_k8s`.
 //!
 //! `string://` is intentionally not supported — inline secrets in
 //! `mediator.toml` would defeat the whole point. CI scripts that used to

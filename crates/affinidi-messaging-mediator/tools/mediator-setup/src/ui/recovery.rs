@@ -1,4 +1,4 @@
-//! Renderer for [`ConnectPhase::RecoveryPrompt`].
+//! Renderer for [`ConnectPhase::RecoveryPrompt`](crate::vta::ConnectPhase::RecoveryPrompt).
 //!
 //! Layout mirrors `render_diagnostics`: title/description header,
 //! an action box with the retry / offline / back options, and a

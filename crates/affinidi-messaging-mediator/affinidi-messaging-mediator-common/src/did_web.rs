@@ -16,7 +16,7 @@
 //!   whose `id` (and every key / service self-reference) matches
 //!   `did:web:{domain}` (the `did.jsonl` log stream stays verbatim);
 //! - the `mediator-setup` wizard, which writes a standalone `did-web.json`
-//!   operator artefact via [`webvh_log_to_did_web`].
+//!   operator artefact via [`webvh_log_to_did_web`](crate::did_web::webvh_log_to_did_web).
 
 use serde_json::Value;
 use thiserror::Error;

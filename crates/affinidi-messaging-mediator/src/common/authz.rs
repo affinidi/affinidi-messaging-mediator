@@ -4,16 +4,16 @@
 //! semantics live in one greppable, unit-tested place rather than being
 //! re-derived inline at each handler. Today it owns:
 //!
-//! - [`require_capability`] — does a DID's [`MediatorACLSet`] grant a given
-//!   [`Capability`]? The single source for per-capability gating.
-//! - [`check_access_list`] — may a given sender deliver to a given
+//! - `require_capability` — does a DID's [`MediatorACLSet`] grant a given
+//!   `Capability`? The single source for per-capability gating.
+//! - `check_access_list` — may a given sender deliver to a given
 //!   recipient, under that recipient's allowlist/denylist mode?
-//! - [`effective_acls`] — the ACL set governing a DID: its stored ACLs, or
+//! - `effective_acls` — the ACL set governing a DID: its stored ACLs, or
 //!   the configured `global_acl_default` when it has no account record.
-//! - [`authentication_check`] — the pre-auth "can this DID connect?" check
+//! - `authentication_check` — the pre-auth "can this DID connect?" check
 //!   (resolves the ACL set from the session, the store, or the configured
 //!   default, then applies the blocked gate).
-//! - [`check_permissions`] — may this session act on these DIDs (admin, or
+//! - `check_permissions` — may this session act on these DIDs (admin, or
 //!   its own DID only), with the admin-signature check where configured?
 //!
 //! Every handler, routing and storage ACL gate now resolves through this
@@ -61,7 +61,7 @@ pub(crate) enum Capability {
     AnonReceive,
 }
 
-/// Returned when an ACL set does not grant a required [`Capability`].
+/// Returned when an ACL set does not grant a required `Capability`.
 /// Callers map this to their layer's error type (`AuthError`,
 /// `MediatorError` problem report, …) so the HTTP/DIDComm surface is
 /// unchanged.
