@@ -85,7 +85,7 @@ use affinidi_messaging_sdk::{
     },
 };
 use async_trait::async_trait;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use serde::{Deserialize, Serialize};
 use sha256::digest;
 use std::{
@@ -119,6 +119,8 @@ pub struct FjallTuning {
     /// Journal ceiling, in bytes. The only *effective* global bound on unflushed
     /// memory — see the field docs on the config type.
     pub max_journal: u64,
+    /// When a write the mediator acknowledges reaches the disk.
+    pub durability: FjallDurability,
 }
 
 impl Default for FjallTuning {
@@ -127,8 +129,24 @@ impl Default for FjallTuning {
             block_cache: 16 * 1024 * 1024,
             write_buffer: 32 * 1024 * 1024,
             max_journal: 128 * 1024 * 1024,
+            durability: FjallDurability::default(),
         }
     }
+}
+
+/// When a write the mediator acknowledges — a stored message, an enqueued
+/// forward — is durable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FjallDurability {
+    /// Every commit reaches the OS before it is acknowledged: a crash of the
+    /// mediator process loses nothing, a power loss or kernel crash can lose
+    /// what the OS had not yet written out.
+    #[default]
+    Buffered,
+    /// Acknowledged writes are also synced to disk (`fsync`) first, so they
+    /// survive a power loss. Costs a disk sync per acknowledged write;
+    /// concurrent writers share syncs.
+    Sync,
 }
 
 /// Relative share of the write-buffer budget each keyspace gets.
@@ -266,6 +284,9 @@ struct StoredOutboxReceipt {
 pub struct FjallStore {
     /// Top-level Fjall database. Cloned cheaply (internal `Arc`).
     db: Database,
+    /// Whether acknowledged writes are synced to disk first (see
+    /// [`FjallDurability`]).
+    durability: FjallDurability,
     /// On-disk path the database was opened from. Kept for diagnostics
     /// and for `Debug` output.
     path: PathBuf,
@@ -798,6 +819,7 @@ impl FjallStore {
             outbox_receipt_expiry: open_partition(PARTITION_OUTBOX_RECEIPT_EXPIRY)?,
             audit_log,
             db,
+            durability: tuning.durability,
             path,
             write_lock: Arc::new(Mutex::new(())),
             last_stream_ms: AtomicU64::new(0),
@@ -851,6 +873,21 @@ impl FjallStore {
             "fjall".into(),
             format!("FjallStore::{method} failed: {e}"),
         )
+    }
+
+    /// Make every commit so far survive a power loss, if the store is
+    /// configured to before acknowledging writes ([`FjallDurability::Sync`]).
+    ///
+    /// Called after `write_lock` is released: the sync covers every write
+    /// committed before it, so concurrent writers waiting here share syncs
+    /// instead of queueing one each behind the lock.
+    fn sync_if_durable(&self, method: &str) -> Result<(), MediatorError> {
+        if self.durability == FjallDurability::Sync {
+            self.db
+                .persist(PersistMode::SyncAll)
+                .map_err(|e| Self::db_err(method, e))?;
+        }
+        Ok(())
     }
 
     /// Remove the session if it is still expired, under the write lock —
@@ -1038,10 +1075,13 @@ impl MediatorStore for FjallStore {
 
     async fn shutdown(&self) -> Result<(), MediatorError> {
         // Drop in-process broadcast channels; subscribers see Closed.
-        // The Fjall database itself is dropped when `FjallStore` is
-        // dropped — there's no separate flush API call needed.
         self.broadcast_channels.lock().await.clear();
-        Ok(())
+        // Sync whatever the OS still holds, whatever the durability setting:
+        // a clean shutdown should not leave the last writes exposed to a
+        // power loss that follows it.
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| Self::db_err("shutdown:persist", e))
     }
 
     // ─── Messages ───────────────────────────────────────────────────────────
@@ -1201,7 +1241,11 @@ impl MediatorStore for FjallStore {
         // function's atomic scope).
         let _ = self.bump_global("RECEIVED_BYTES", bytes as i64);
         let _ = self.bump_global("RECEIVED_COUNT", 1);
+        drop(_guard);
 
+        // Before the store reports success: the caller acknowledges the
+        // message to its sender on it.
+        self.sync_if_durable("store_message:persist")?;
         Ok(msg_id)
     }
 
@@ -2953,6 +2997,7 @@ impl MediatorStore for FjallStore {
         self.forward_queue_len
             .store(current + 1 - removed, Ordering::Release);
         drop(_guard);
+        self.sync_if_durable("forward_queue_enqueue:persist")?;
         self.forward_notify.notify_waiters();
         Ok(stream_id)
     }
@@ -3968,6 +4013,35 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(report.already_deleted, 0);
+    }
+
+    /// With `durability = "sync"` an acknowledged message and forward are
+    /// synced before the call returns; the store still behaves the same.
+    #[tokio::test]
+    async fn sync_durability_stores_and_reopens() {
+        let dir = TempDir::new().expect("tempdir");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let tuning = FjallTuning {
+            durability: FjallDurability::Sync,
+            ..FjallTuning::default()
+        };
+        let id = {
+            let store = FjallStore::open_with_tuning(dir.path(), 5, 30, tuning).expect("open");
+            let id = store
+                .store_message("s", "synced", &alice, Some(&bob), 0, 0)
+                .await
+                .expect("store");
+            store
+                .forward_queue_enqueue(&forward_entry(), 0)
+                .await
+                .expect("enqueue");
+            store.shutdown().await.expect("shutdown");
+            id
+        };
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        assert!(store.messages.contains_key(id.as_bytes()).unwrap());
+        assert_eq!(store.forward_queue_len().await.unwrap(), 1);
     }
 
     #[tokio::test]

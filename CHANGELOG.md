@@ -8,6 +8,17 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — `[storage.fjall] durability`
+
+- `durability = "buffered"` (default, unchanged behaviour) or `"sync"`
+  (`STORAGE_FJALL_DURABILITY`). With `"sync"`, a stored message and an
+  enqueued forward are synced to disk before the store reports success, so
+  an accepted message survives a power loss, not only a process crash. An
+  unrecognised value is treated as `"sync"`. Shutdown now always syncs.
+- **API:** `FjallTuning` and `FjallConfig` gain a `durability` field, and
+  `FjallDurability` is new. Code that builds either struct with a literal
+  needs `..Default::default()` or the new field.
+
 ### Fixed — Fjall store crash safety and races
 
 - Forwarding: finishing with an entry now acks and deletes it in one write

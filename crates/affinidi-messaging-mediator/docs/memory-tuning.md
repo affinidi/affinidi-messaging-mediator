@@ -111,6 +111,16 @@ ring holds `pubsub_buffer / message_size` messages (16 at the defaults).
 **Many distinct DIDs** — raise `did_resolver.cache_capacity` (a count, not bytes;
 each cached DID document is roughly 1–10 KB).
 
+### Durability is a separate setting
+
+`[storage.fjall] durability` does not affect memory, but it does affect write
+throughput. With the default `"buffered"`, an acknowledged message has reached
+the OS: it survives a crash of the mediator process but not a power loss. With
+`"sync"`, each acknowledged message or forward is also synced to disk before the
+sender is told it was accepted, which costs a disk sync per write (concurrent
+writes share syncs). Choose `"sync"` when an accepted message must never be
+lost. See the comments in `conf/mediator.toml`.
+
 ## What happens when a budget is exhausted
 
 **No messages are lost.** Every message is durably stored in the recipient's
