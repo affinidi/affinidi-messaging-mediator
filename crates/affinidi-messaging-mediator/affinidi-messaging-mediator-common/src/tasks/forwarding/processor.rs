@@ -536,14 +536,11 @@ impl ForwardingProcessor {
             }
             if let Err(e) = self
                 .database
-                .forward_queue_ack(&self.config.consumer_group, &expired_ids)
+                .forward_queue_ack_and_delete(&self.config.consumer_group, &expired_ids)
                 .await
             {
-                warn!("Failed to ACK {} expired entries: {}", expired_ids.len(), e);
-            }
-            if let Err(e) = self.database.forward_queue_delete(&expired_ids).await {
                 warn!(
-                    "Failed to delete {} expired entries: {}",
+                    "Failed to ACK and delete {} expired entries: {}",
                     expired_ids.len(),
                     e
                 );
@@ -667,13 +664,13 @@ impl ForwardingProcessor {
             let count = succeeded.len();
             if let Err(e) = self
                 .database
-                .forward_queue_ack(&self.config.consumer_group, &succeeded)
+                .forward_queue_ack_and_delete(&self.config.consumer_group, &succeeded)
                 .await
             {
-                warn!("Failed to ACK {} succeeded entries: {}", count, e);
-            }
-            if let Err(e) = self.database.forward_queue_delete(&succeeded).await {
-                warn!("Failed to delete {} succeeded entries: {}", count, e);
+                warn!(
+                    "Failed to ACK and delete {} succeeded entries: {}",
+                    count, e
+                );
             }
             debug!("ACKed {} forwarded messages for {}", count, endpoint_url);
 
@@ -713,13 +710,10 @@ impl ForwardingProcessor {
                     let ids = [msg.stream_id.as_str()];
                     if let Err(e) = self
                         .database
-                        .forward_queue_ack(&self.config.consumer_group, &ids)
+                        .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
                         .await
                     {
-                        warn!("Failed to ACK abandoned entry: {e}");
-                    }
-                    if let Err(e) = self.database.forward_queue_delete(&ids).await {
-                        warn!("Failed to delete abandoned entry: {e}");
+                        warn!("Failed to ACK and delete abandoned entry: {e}");
                     }
                     self.observe(
                         msg,
@@ -737,38 +731,37 @@ impl ForwardingProcessor {
                     let mut retry_entry = msg.clone();
                     retry_entry.retry_count += 1;
 
-                    // ACK the old entry
-                    let ids = [msg.stream_id.as_str()];
-                    if let Err(e) = self
-                        .database
-                        .forward_queue_ack(&self.config.consumer_group, &ids)
-                        .await
-                    {
-                        warn!("Failed to ACK retry entry: {e}");
-                    }
-                    if let Err(e) = self.database.forward_queue_delete(&ids).await {
-                        warn!("Failed to delete retry entry: {e}");
-                    }
-
-                    // Enqueue new entry with incremented retry count.
+                    // Enqueue the retry before releasing the old entry. In the
+                    // other order a crash between the two loses the message;
+                    // in this one it leaves the old entry claimed, so
+                    // autoclaim redelivers it (at least once, never zero).
+                    //
                     // `max_len = 0` keeps the legacy unbounded behaviour
                     // for retries; the inbound enqueue path applies the
                     // queue limit instead.
                     match self.database.forward_queue_enqueue(&retry_entry, 0).await {
-                        Ok(_) => self.observe(
-                            msg,
-                            ForwardOutcome::Retrying {
-                                attempt: msg.retry_count + 1,
-                                max_retries: self.config.max_retries,
-                            },
-                        ),
-                        Err(e) => {
-                            error!("Failed to re-enqueue retry entry (message may be lost): {e}");
+                        Ok(_) => {
                             self.observe(
                                 msg,
-                                ForwardOutcome::Abandoned {
-                                    attempts: msg.retry_count + 1,
+                                ForwardOutcome::Retrying {
+                                    attempt: msg.retry_count + 1,
+                                    max_retries: self.config.max_retries,
                                 },
+                            );
+                            let ids = [msg.stream_id.as_str()];
+                            if let Err(e) = self
+                                .database
+                                .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
+                                .await
+                            {
+                                warn!("Failed to ACK and delete retried entry: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            // The old entry stays claimed, so autoclaim picks
+                            // it up again once it has been idle long enough.
+                            error!(
+                                "Failed to re-enqueue retry entry; leaving it claimed for autoclaim: {e}"
                             );
                         }
                     }

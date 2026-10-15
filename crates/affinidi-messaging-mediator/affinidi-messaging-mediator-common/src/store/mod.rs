@@ -1514,6 +1514,21 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// of acked-but-not-yet-deleted entries.
     async fn forward_queue_delete(&self, stream_ids: &[&str]) -> Result<(), MediatorError>;
 
+    /// [`Self::forward_queue_ack`] then [`Self::forward_queue_delete`], for
+    /// a consumer that is finished with the entries. A backend that can
+    /// commit both as one write should: a crash between a separate ack and
+    /// delete leaves an entry that no consumer holds and the group has read
+    /// past, so it is never read, claimed or deleted again. The default runs
+    /// the two in turn.
+    async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        self.forward_queue_ack(group_name, stream_ids).await?;
+        self.forward_queue_delete(stream_ids).await
+    }
+
     /// Reclaim entries idle for longer than `min_idle` (typical: a
     /// crashed/timed-out consumer). The reclaiming consumer becomes the
     /// new owner of the returned entries.

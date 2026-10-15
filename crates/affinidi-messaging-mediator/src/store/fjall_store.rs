@@ -853,8 +853,24 @@ impl FjallStore {
         )
     }
 
-    /// Atomically read-modify-write a counter in the `globals`
-    /// partition. Counters are stored as little-endian `i64`.
+    /// Remove the session if it is still expired, under the write lock —
+    /// the read that found it expired was not, and the session may have
+    /// been refreshed since. Best effort: the sweeper retries.
+    async fn remove_session_if_expired(&self, session_id: &str, now: u64) {
+        let _guard = self.write_lock.lock().await;
+        let still_expired = matches!(
+            self.sessions.get(session_id.as_bytes()),
+            Ok(Some(raw)) if Self::decode::<StoredSession>(&raw)
+                .is_ok_and(|s| s.expires_at_unix > 0 && s.expires_at_unix <= now)
+        );
+        if still_expired {
+            let _ = self.sessions.remove(session_id.as_bytes());
+        }
+    }
+
+    /// Read-modify-write a counter in the `globals` partition. Counters are
+    /// stored as little-endian `i64`. Not atomic on its own: the caller holds
+    /// `write_lock`, or two bumps can read the same value and lose one.
     fn bump_global(&self, name: &str, by: i64) -> Result<(), MediatorError> {
         let key = name.as_bytes();
         let current: i64 = self
@@ -1874,7 +1890,7 @@ impl MediatorStore for FjallStore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
-            let _ = self.sessions.remove(session_id.as_bytes());
+            self.remove_session_if_expired(session_id, now).await;
             return Err(MediatorError::SessionError(
                 14,
                 session_id.into(),
@@ -2157,6 +2173,20 @@ impl MediatorStore for FjallStore {
         batch
             .commit()
             .map_err(|e| Self::db_err("account_remove:commit", e))?;
+        drop(_guard);
+
+        // A message stored while the inbox was being purged — the steps above
+        // each take the lock on their own — would otherwise outlive the
+        // account, with no row left to count it against.
+        self.purge_folder_by(
+            "",
+            did_hash,
+            Folder::Inbox,
+            DeletionAuthority::Admin {
+                admin_did_hash: did_hash.to_string(),
+            },
+        )
+        .await?;
         Ok(true)
     }
 
@@ -2785,6 +2815,7 @@ impl MediatorStore for FjallStore {
             did_hash: did_hash.to_string(),
             expires_at_unix: expires_at,
         };
+        let _guard = self.write_lock.lock().await;
         self.oob_invites
             .insert(invite_hash.as_bytes(), Self::encode(&stored)?)
             .map_err(|e| Self::db_err("oob_discovery_store:insert", e))?;
@@ -2808,6 +2839,7 @@ impl MediatorStore for FjallStore {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let _guard = self.write_lock.lock().await;
         if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
             // Expired — remove and report missing.
             let _ = self.oob_invites.remove(oob_id.as_bytes());
@@ -2818,6 +2850,9 @@ impl MediatorStore for FjallStore {
     }
 
     async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
+        // Under the lock, so of two concurrent deletes exactly one reports
+        // that the invite existed.
+        let _guard = self.write_lock.lock().await;
         let existed = self
             .oob_invites
             .contains_key(oob_id.as_bytes())
@@ -3051,6 +3086,38 @@ impl MediatorStore for FjallStore {
         Ok(())
     }
 
+    async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        // One batch: a crash between a separate ack and delete would leave an
+        // entry no consumer holds and the group cursor has passed — never
+        // read, claimed or deleted again.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut removed = 0usize;
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                let key = encode_stream_id(sid.0, sid.1).to_vec();
+                if self
+                    .forward_queue
+                    .contains_key(&key)
+                    .map_err(|e| Self::db_err("forward_queue_ack_and_delete:contains", e))?
+                {
+                    removed += 1;
+                    batch.remove(&self.forward_queue, key);
+                }
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_ack_and_delete:commit", e))?;
+        self.forward_queue_len.fetch_sub(removed, Ordering::AcqRel);
+        Ok(())
+    }
+
     async fn forward_queue_autoclaim(
         &self,
         group_name: &str,
@@ -3097,6 +3164,18 @@ impl MediatorStore for FjallStore {
         let mut batch = self.db.batch();
         let mut out = Vec::with_capacity(stale.len());
         for (sid, claim) in stale {
+            let Some(raw) = self
+                .forward_queue
+                .get(encode_stream_id(sid.0, sid.1))
+                .map_err(|e| Self::db_err("forward_queue_autoclaim:fetch", e))?
+            else {
+                // The entry is gone (trimmed, or deleted after a crash between
+                // ack and delete): nothing left to deliver, so drop the claim
+                // rather than re-claiming it forever — as Redis's XAUTOCLAIM
+                // does for deleted entries.
+                batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                continue;
+            };
             let new_claim = StoredPendingClaim {
                 consumer: consumer_name.to_string(),
                 claimed_at_ms: now,
@@ -3107,14 +3186,7 @@ impl MediatorStore for FjallStore {
                 pending_key(group_name, sid),
                 Self::encode(&new_claim)?,
             );
-            if let Some(raw) = self
-                .forward_queue
-                .get(encode_stream_id(sid.0, sid.1))
-                .map_err(|e| Self::db_err("forward_queue_autoclaim:fetch", e))?
-            {
-                let entry: ForwardQueueEntry = Self::decode(&raw)?;
-                out.push(entry);
-            }
+            out.push(Self::decode(&raw)?);
         }
         batch
             .commit()
@@ -3158,6 +3230,9 @@ impl MediatorStore for FjallStore {
         mediator_uuid: &str,
         state: StreamingClientState,
     ) -> Result<(), MediatorError> {
+        // Under the lock, so it cannot interleave with `streaming_clean_start`'s
+        // scan-then-remove and lose a registration made meanwhile.
+        let _guard = self.write_lock.lock().await;
         match state {
             StreamingClientState::Deregistered => {
                 self.streaming_clients
@@ -3355,7 +3430,7 @@ impl MediatorStore for FjallStore {
         end.extend_from_slice(&[0xFFu8; 64]);
 
         let mut report = ExpiryReport::default();
-        let mut to_delete = Vec::new();
+        let mut to_delete: Vec<(Vec<u8>, String)> = Vec::new();
         let mut last_ts: Option<u64> = None;
         for guard in self.expiry.range(start..=end) {
             let (key, _v) = guard
@@ -3372,11 +3447,17 @@ impl MediatorStore for FjallStore {
             }
             let msg_id = String::from_utf8(key[8..].to_vec()).unwrap_or_default();
             if !msg_id.is_empty() {
-                to_delete.push(msg_id);
+                to_delete.push((key.to_vec(), msg_id));
             }
         }
 
-        for msg_id in to_delete {
+        // Index keys whose message is gone once this sweep has run. A message
+        // can have more than one key — `mark_delivered` adds a delivered-TTL
+        // deadline beside the original — and `delete_message` removes only the
+        // one its record names, so the others must be dropped here or they are
+        // rescanned on every sweep for good.
+        let mut swept_keys = Vec::new();
+        for (key, msg_id) in to_delete {
             let meta = match on_expired {
                 Some(_) => self.get_message_metadata("expiry", &msg_id).await.ok(),
                 None => None,
@@ -3395,9 +3476,35 @@ impl MediatorStore for FjallStore {
                     if let (Some(observe), Some(meta)) = (on_expired, &meta) {
                         observe(&msg_id, meta);
                     }
+                    swept_keys.push((key, msg_id));
                 }
-                Err(_) => report.already_deleted += 1,
+                Err(e) if ops::is_delete_not_found(&e) => {
+                    report.already_deleted += 1;
+                    swept_keys.push((key, msg_id));
+                }
+                // A store error: keep the key, so the next sweep retries it.
+                Err(e) => {
+                    tracing::warn!(msg_id, error = %e, "expiry sweep could not delete message")
+                }
             }
+        }
+        if !swept_keys.is_empty() {
+            let _guard = self.write_lock.lock().await;
+            let mut batch = self.db.batch();
+            for (key, msg_id) in swept_keys {
+                // Re-checked under the lock: a message stored again with the
+                // same bytes since keeps its key.
+                if !self
+                    .messages
+                    .contains_key(msg_id.as_bytes())
+                    .map_err(|e| Self::db_err("sweep_expired_messages:contains", e))?
+                {
+                    batch.remove(&self.expiry, key);
+                }
+            }
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("sweep_expired_messages:commit", e))?;
         }
         self.sweep_expired_outbox_receipts(now_secs).await?;
         Ok(report)
@@ -3411,10 +3518,10 @@ impl MediatorStore for FjallStore {
         // TTL has elapsed first, then remove them. Collecting before
         // removing avoids mutating the partition mid-iteration, and
         // keeps the (potentially large) scan off the cross-partition
-        // `write_lock` — the removes below are single-key and
-        // self-consistent. `expires_at_unix == 0` means "no expiry"
-        // and is never swept, matching the lazy-expiry guard in
-        // `get_session`.
+        // `write_lock`. The removes take the lock and re-read each
+        // session first: one refreshed since the scan is kept.
+        // `expires_at_unix == 0` means "no expiry" and is never swept,
+        // matching the lazy-expiry guard in `get_session`.
         let mut report = SessionSweepReport::default();
         let mut to_remove: Vec<Vec<u8>> = Vec::new();
         for guard in self.sessions.iter() {
@@ -3428,12 +3535,28 @@ impl MediatorStore for FjallStore {
             }
         }
 
-        for key in to_remove {
-            self.sessions
-                .remove(&key)
-                .map_err(|e| Self::db_err("sweep_expired_sessions:remove", e))?;
-            report.expired += 1;
+        if to_remove.is_empty() {
+            return Ok(report);
         }
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        for key in to_remove {
+            let Some(raw) = self
+                .sessions
+                .get(&key)
+                .map_err(|e| Self::db_err("sweep_expired_sessions:get", e))?
+            else {
+                continue;
+            };
+            let stored: StoredSession = Self::decode(&raw)?;
+            if stored.expires_at_unix > 0 && stored.expires_at_unix <= now_secs {
+                batch.remove(&self.sessions, key);
+                report.expired += 1;
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("sweep_expired_sessions:commit", e))?;
         Ok(report)
     }
 }
@@ -3788,6 +3911,63 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(list.len(), 1);
+    }
+
+    /// A delivered-TTL deadline is a second expiry key beside the message's
+    /// own. Once the message is gone, sweeping past either key removes it, so
+    /// the index does not keep entries that are rescanned on every sweep.
+    #[tokio::test]
+    async fn sweep_drops_expiry_keys_whose_message_is_gone() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Expires in an hour; delivery brings a deadline 10s out.
+        let id = store
+            .store_message("s", "delivered", &alice, Some(&bob), now + 3_600, 0)
+            .await
+            .expect("store");
+        store
+            .mark_delivered(std::slice::from_ref(&id), now * 1_000, 10)
+            .await
+            .expect("mark");
+        assert_eq!(
+            store.expiry.iter().count(),
+            2,
+            "own key + delivered deadline"
+        );
+
+        // The recipient deletes it: its own key goes, the deadline key stays.
+        store
+            .delete_message(
+                &id,
+                DeletionAuthority::Owner {
+                    did_hash: alice.clone(),
+                },
+            )
+            .await
+            .expect("delete");
+        assert_eq!(store.expiry.iter().count(), 1);
+
+        // Sweeping past the deadline finds the message gone and drops the key.
+        let report = store
+            .sweep_expired_messages(now + 20, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.already_deleted, 1);
+        assert_eq!(store.expiry.iter().count(), 0, "no stale expiry keys left");
+
+        // And a later sweep has nothing to rescan.
+        let report = store
+            .sweep_expired_messages(now + 30, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.already_deleted, 0);
     }
 
     #[tokio::test]
@@ -4618,6 +4798,78 @@ mod tests {
             .expect("autoclaim");
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].stream_id, id);
+    }
+
+    fn forward_entry() -> ForwardQueueEntry {
+        ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "msg".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+        }
+    }
+
+    /// Ack and delete land together: the claim and the entry are both gone,
+    /// and the queue length follows.
+    #[tokio::test]
+    async fn forward_queue_ack_and_delete_releases_claim_and_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let id = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        let read = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 1);
+
+        store
+            .forward_queue_ack_and_delete("g", &[id.as_str()])
+            .await
+            .expect("ack and delete");
+        assert_eq!(store.forward_queue.iter().count(), 0);
+        assert_eq!(store.forward_pending.iter().count(), 0);
+        assert_eq!(store.forward_queue_len().await.unwrap(), 0);
+    }
+
+    /// A claim whose entry is gone (trimmed, or deleted after a crash between
+    /// a separate ack and delete) is dropped by autoclaim, not re-claimed
+    /// forever.
+    #[tokio::test]
+    async fn autoclaim_drops_claims_whose_entry_is_gone() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let id = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        store
+            .forward_queue_delete(&[id.as_str()])
+            .await
+            .expect("delete without ack");
+        assert_eq!(store.forward_pending.iter().count(), 1, "orphaned claim");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reclaimed = store
+            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10)
+            .await
+            .expect("autoclaim");
+        assert!(reclaimed.is_empty());
+        assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
     }
 
     #[tokio::test]
