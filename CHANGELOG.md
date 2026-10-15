@@ -89,6 +89,17 @@ mediator-tui 0.11.0); they are no longer updated.
 - During a rolling upgrade, live deliveries published by an older instance
   are not reported as `delivered`.
 
+### Fixed — monitor batches no longer lost at a live-stream timeout
+
+- `Cargo.lock` takes `affinidi-messaging-sdk` 0.36.2
+  ([affinidi-tdk-rs#954](https://github.com/affinidi/affinidi-tdk-rs/pull/954)).
+  A frame arriving just as a `live_stream_next` wait timed out could be
+  discarded by the SDK. A monitor batch is never stored, so one lost there
+  was gone for good. This made
+  `the_monitor_follows_a_message_from_arrival_to_deletion` fail about one run
+  in ten (now 0 of 30). The requirement stays `0.36`; only the lockfile, and
+  therefore the mediator binary and images, change.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository
