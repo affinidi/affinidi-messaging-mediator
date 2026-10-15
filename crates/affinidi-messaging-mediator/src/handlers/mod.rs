@@ -13,11 +13,11 @@ use axum::{
 use http::StatusCode;
 use tracing::warn;
 
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub mod authenticate;
 pub mod inbox_fetch;
 pub mod message_delete;
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub mod message_inbound;
 pub mod message_list;
 pub mod message_outbound;
@@ -41,7 +41,6 @@ fn inbound_body_limit(shared_data: &SharedData) -> usize {
 }
 
 pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router {
-    #[cfg_attr(not(feature = "didcomm"), allow(unused_mut))]
     let mut app = Router::new()
         // Outbound message handling to ATM clients
         .route(
@@ -65,8 +64,9 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
             get(well_known_did_fetch::well_known_did_fetch_handler),
         );
 
-    // DIDComm-specific routes
-    #[cfg(feature = "didcomm")]
+    // Shared by both protocols: inbound messages (the handler sniffs DIDComm
+    // from TSP) and the authentication challenge every client starts from.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
     {
         app = app
             // Inbound message handling from ATM clients
@@ -79,7 +79,13 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
             .route(
                 "/authenticate/challenge",
                 post(authenticate::authentication_challenge),
-            )
+            );
+    }
+
+    // DIDComm-specific routes
+    #[cfg(feature = "didcomm")]
+    {
+        app = app
             // Authentication step 2/2 - Client sends encrypted challenge to server
             .route("/authenticate", post(authenticate::authentication_response))
             .route(
@@ -93,9 +99,9 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
     }
 
     // TSP clients reuse `/authenticate/challenge`, then prove control of their VID
-    // by signing the challenge (Ed25519) and posting it here. Requires both
-    // protocols — it mints the same DIDComm JWT session for a TSP-authenticated VID.
-    #[cfg(all(feature = "didcomm", feature = "tsp"))]
+    // by signing the challenge (Ed25519) and posting it here. It mints the same JWT
+    // session the DIDComm flow does, and is how a TSP-only mediator's clients log in.
+    #[cfg(feature = "tsp")]
     {
         app = app.route(
             "/tsp/authenticate",

@@ -8,6 +8,8 @@
 //! Tests exercise the full `didcomm_compat::pack_encrypted` → `didcomm_compat::unpack`
 //! round-trip with real cryptographic operations on the test DIDs from `common.rs`.
 
+#![cfg(feature = "didcomm")]
+
 mod common;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};

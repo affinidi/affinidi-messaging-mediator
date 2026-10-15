@@ -20,6 +20,8 @@
 //! The HTTP + `FORWARD_Q` plumbing around this is unchanged from the (merged)
 //! blind-relay path and is not re-exercised here.
 
+#![cfg(feature = "didcomm")]
+
 mod common;
 
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};

@@ -1091,6 +1091,7 @@ async fn handle_socket(
                     }
                     continue;
                 }
+                #[cfg(feature = "didcomm")]
                 match _package_status(&state, &session).await {
                     Ok(packed) => {
                         if let Err(e) = socket.send(Message::Text(packed.into())).await {
@@ -1506,6 +1507,7 @@ async fn _package_problem_report(
 /// than that *something* was missed. A client already understands this message
 /// — it is the same one it gets for a `status-request` — so the resync needs no
 /// new protocol on the client side.
+#[cfg(feature = "didcomm")]
 async fn _package_status(state: &SharedData, session: &Session) -> Result<String, MediatorError> {
     let status = state.database.inbox_status(&session.did_hash).await?;
 

@@ -130,6 +130,23 @@ mediator-tui 0.11.0); they are no longer updated.
   Redis. Anything within `message_size` must arrive byte for byte; anything
   over must be refused in a way the sender sees.
 
+### Fixed — a TSP-only mediator builds and serves TSP clients
+
+- **`tsp` without `didcomm` did not compile**, although the features were
+  documented as independent. Trust Tasks, mediator administration, monitor
+  subscriptions and the authentication challenge were gated on `didcomm`
+  even where TSP uses them. They now build with either protocol; only the
+  DIDComm bindings stay `didcomm`-only. `tsp` now pulls in the Trust Task
+  dependencies (`trust-tasks-rs`, `trust-tasks-proof`,
+  `affinidi-data-integrity`).
+- **A TSP-only mediator now has the routes a pure-TSP client needs.**
+  `/inbound` and `/authenticate/challenge` exist whenever either protocol is
+  built, and `/tsp/authenticate` whenever `tsp` is (it used to need both).
+  `/authenticate`, `/authenticate/refresh` and `/oob` remain DIDComm-only.
+  Builds with `didcomm` serve exactly the routes they did before.
+- CI gains a `tsp-only` job (clippy over all targets for each backend, and
+  the unit tests), since every other job builds with `didcomm` on.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository

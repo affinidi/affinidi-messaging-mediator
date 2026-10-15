@@ -1,3 +1,4 @@
+#![cfg(feature = "didcomm")]
 use std::time::SystemTime;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;

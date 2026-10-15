@@ -6,7 +6,7 @@ use crate::messages::MessageHandler;
 use crate::messages::protocols::routing::rewrap_inner_attachment;
 // Shared by the DIDComm re-wrap peel and the TSP routed-relay peer allowlist.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
-use crate::messages::protocols::routing::relay_peer_trusted;
+use crate::messages::protocols::relay_peer_trusted;
 use crate::{SharedData, common::session::Session};
 // Shared by both the DIDComm direct-delivery path and the TSP delivery path.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]

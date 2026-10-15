@@ -347,6 +347,7 @@ async fn _live_stream(
 /// - expires_at: Option<u64>
 ///   - None: use default expiry
 ///   - Some: use the provided expiry time in seconds
+#[cfg(feature = "didcomm")]
 pub(crate) async fn store_forwarded_message(
     state: &SharedData,
     session: &Session,

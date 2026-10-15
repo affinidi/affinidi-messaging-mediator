@@ -22,12 +22,7 @@
 /// tell a sender its message was accepted when it was dropped — the failure
 /// R1.1 exists to prevent, and the one this repository treats as the most
 /// consequential lie a transport can tell.
-///
-/// Gated on `didcomm` rather than on both protocols because every supported
-/// build has it: `default` includes `didcomm`, and `tsp` is additive on top.
-/// A `tsp`-without-`didcomm` build does not compile for unrelated reasons
-/// already, so widening this would buy nothing.
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub(crate) fn delivery_refused(
     session: &Session,
     message_id: Option<String>,
@@ -103,31 +98,34 @@ use self::protocols::ping;
 #[cfg(feature = "didcomm")]
 use self::protocols::trust_tasks;
 #[cfg(feature = "didcomm")]
+use crate::SharedData;
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+use crate::common::session::Session;
+#[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
 #[cfg(feature = "didcomm")]
 use crate::messages::protocols::discover_features;
-#[cfg(feature = "didcomm")]
-use crate::{SharedData, common::session::Session};
 #[cfg(feature = "didcomm")]
 use affinidi_did_common::service::Endpoint;
 #[cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::{PackEncryptedMetadata, UnpackMetadata};
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::{
-    known::MessageType as SDKMessageType,
-    problem_report::{ProblemReport, ProblemReportScope, ProblemReportSorter},
+    known::MessageType as SDKMessageType, problem_report::ProblemReport,
 };
 #[cfg(feature = "didcomm")]
 use affinidi_secrets_resolver::SecretsResolver;
 #[cfg(feature = "didcomm")]
 use ahash::AHashSet as HashSet;
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
@@ -139,7 +137,7 @@ pub mod error_response;
 pub mod inbound;
 #[cfg(feature = "didcomm-v1")]
 pub mod inbound_v1;
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub mod protocols;
 pub(crate) mod queue_limits;
 pub(crate) mod store;

@@ -93,12 +93,17 @@ didcomm = [
 ## feature alone does not yet make the mediator usable by a stock Credo wallet.
 didcomm-v1 = ["didcomm", "dep:affinidi-messaging-didcomm-v1"]
 
-## TSP (Trust Spanning Protocol) — ON by default, additive alongside DIDComm. Carries TSP
-## Direct / Routed / Nested / Control messages, the TSP↔DIDComm bridge, Trust Tasks over
-## TSP, and advertises a TSPTransport service for discovery. Run together with `didcomm`:
-## TSP currently reuses the DIDComm-authenticated session, so a `tsp`-only build has no
-## auth path yet (pure-TSP `/tsp/authenticate` is pending).
-tsp = ["dep:affinidi-tsp"]
+## TSP (Trust Spanning Protocol) — ON by default, additive alongside DIDComm, and
+## complete without it. Carries TSP Direct / Routed / Nested / Control messages, the
+## TSP↔DIDComm bridge, Trust Tasks over TSP, and advertises a TSPTransport service for
+## discovery. A `tsp`-only build authenticates clients with `POST /tsp/authenticate`.
+## The Trust Task stack comes with it, since Trust Tasks run over TSP too.
+tsp = [
+  "dep:affinidi-tsp",
+  "dep:trust-tasks-rs",
+  "dep:trust-tasks-proof",
+  "dep:affinidi-data-integrity",
+]
 
 ## Secret storage backends — forwarded to `mediator-common`'s `secrets-*`
 ## features. Enabled per-deployment so operators only compile the backends
@@ -331,6 +336,9 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 tikv-jemallocator = { version = "0.7", optional = true }
 
 [dev-dependencies]
+## The `/tsp/authenticate` unit test builds a `did:key` multikey; without
+## `didcomm` nothing else pulls this in.
+affinidi-encoding = "0.1"
 lazy_static = "1"
 ## `FjallStore` smoke tests open a temp directory.
 tempfile = "3"

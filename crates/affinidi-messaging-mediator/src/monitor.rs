@@ -263,6 +263,7 @@ pub(crate) async fn with_channel<F: std::future::Future>(channel: Channel, f: F)
 }
 
 /// The channel the current inbound frame arrived on; `Internal` outside one.
+#[cfg(feature = "didcomm")]
 pub(crate) fn current_channel() -> Channel {
     CHANNEL.try_with(|c| *c).unwrap_or(Channel::Internal)
 }
@@ -588,6 +589,7 @@ struct Settings {
 #[derive(Clone, Debug)]
 pub(crate) enum Delivery {
     /// Authcrypt to the subscriber and push over its live connection.
+    #[cfg(feature = "didcomm")]
     DidComm,
     /// Seal to the subscriber's VID as the mediator, and push the frame.
     #[cfg(feature = "tsp")]
@@ -714,7 +716,8 @@ impl TrafficMonitor {
     }
 
     /// Every event on the bus, unfiltered — for tests of the code that emits.
-    #[cfg(test)]
+    /// Its one caller, the streaming task's tests, needs the memory store.
+    #[cfg(all(test, feature = "memory-backend"))]
     pub(crate) fn tap(&self) -> broadcast::Receiver<Arc<TrafficEvent>> {
         self.tx.subscribe()
     }
@@ -731,7 +734,7 @@ impl TrafficMonitor {
     /// Open a subscription, or renew and re-filter an existing one owned by
     /// the same account. `filter` must already be narrowed to what the owner
     /// may see (see `mediator_ops::consume_monitor_subscribe`).
-    #[cfg(feature = "didcomm")]
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn subscribe(
         &self,
@@ -847,7 +850,7 @@ impl TrafficMonitor {
 }
 
 /// One subscription's filter-rate-batch-deliver loop.
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 struct DeliveryTask {
     state: SharedData,
     subscription_id: String,
@@ -863,7 +866,7 @@ struct DeliveryTask {
     subscriptions: Arc<DashMap<String, Subscription>>,
 }
 
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 impl DeliveryTask {
     async fn run(mut self) {
         let mut batch: Vec<Value> = Vec::new();
@@ -974,6 +977,7 @@ impl DeliveryTask {
             }
         };
         let published = match self.delivery {
+            #[cfg(feature = "didcomm")]
             Delivery::DidComm => {
                 self.state
                     .database
@@ -1005,16 +1009,23 @@ impl DeliveryTask {
         }
     }
 
-    /// Sign the `monitor/event` document as the mediator and authcrypt it in
-    /// the Trust Tasks DIDComm binding envelope to the subscriber.
+    /// Sign the `monitor/event` document as the mediator and wrap it for the
+    /// subscriber's transport.
     async fn pack(&self, doc: Value) -> Result<String, String> {
         let signed = crate::messages::protocols::trust_task_sign::sign_response(doc, &self.state)
             .await
             .map_err(|e| e.to_string())?;
-        #[cfg(feature = "tsp")]
-        if let Delivery::Tsp { encryption_key } = &self.delivery {
-            return self.seal_tsp(&signed, encryption_key).await;
+        match &self.delivery {
+            #[cfg(feature = "tsp")]
+            Delivery::Tsp { encryption_key } => self.seal_tsp(&signed, encryption_key).await,
+            #[cfg(feature = "didcomm")]
+            Delivery::DidComm => self.pack_didcomm(signed).await,
         }
+    }
+
+    /// Authcrypt a signed batch in the Trust Tasks DIDComm binding envelope.
+    #[cfg(feature = "didcomm")]
+    async fn pack_didcomm(&self, signed: Value) -> Result<String, String> {
         let now = Utc::now().timestamp().max(0) as u64;
         let mediator_did = &self.state.config.mediator_did;
         let message = Message::build(
@@ -1209,6 +1220,7 @@ mod tests {
         assert_eq!(frame_recipient(b"not json", Protocol::DidComm), None);
     }
 
+    #[cfg(feature = "didcomm")]
     #[tokio::test]
     async fn the_inbound_channel_is_visible_inside_its_scope_only() {
         assert_eq!(current_channel(), Channel::Internal);

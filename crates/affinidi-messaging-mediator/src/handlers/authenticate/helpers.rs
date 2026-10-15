@@ -1,18 +1,23 @@
+#[cfg(feature = "didcomm")]
 use crate::SharedData;
 use crate::common::session::SessionClaims;
 // Production token creation now takes `now` from the injected clock; the only
 // remaining caller of this helper is the test module below.
 #[cfg(test)]
 use crate::common::time::unix_timestamp_secs;
+#[cfg(feature = "didcomm")]
 use crate::didcomm_compat::MetaEnvelope;
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use http::StatusCode;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rand::{RngExt, distr::Alphanumeric};
 use sha256::digest;
+#[cfg(feature = "didcomm")]
 use tracing::debug;
 
 /// Unpack an authentication envelope and enforce the signed-AND-encrypted
@@ -24,6 +29,7 @@ use tracing::debug;
 /// different parse-error codes there, so that step stays handler-local) and
 /// retains it for any post-unpack checks; this borrows it, so it remains
 /// usable afterwards.
+#[cfg(feature = "didcomm")]
 pub(crate) async fn unpack_auth_message(
     envelope: &MetaEnvelope,
     state: &SharedData,

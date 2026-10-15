@@ -1,3 +1,4 @@
+#![cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator::didcomm_compat;
