@@ -914,13 +914,6 @@ pub async fn serve_internal(
                 .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(RequestBodyLimitLayer::new(config.limits.http_size))
-        // `RequestBodyLimitLayer` bounds the stream, but a handler that takes
-        // the body as `Bytes` also applies axum's own default of 2 MiB, which
-        // refused every larger body whatever `http_size` and `message_size`
-        // said. Make that limit the configured one too.
-        .layer(axum::extract::DefaultBodyLimit::max(
-            config.limits.http_size,
-        ))
         .layer(RateLimitLayer::new(rate_limiter))
         .layer(RequestIdLayer::new())
         .merge(probe_routes(

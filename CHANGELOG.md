@@ -104,14 +104,15 @@ mediator-tui 0.11.0); they are no longer updated.
 
 - **REST `/inbound` refused every body over 2 MiB**, whatever `http_size` and
   `message_size` said. The handler takes the body as axum's `Bytes`, which
-  applies axum's own 2 MiB default on top of `RequestBodyLimitLayer`. The
-  router now sets `DefaultBodyLimit` to `http_size`. Only deployments that
-  raised `message_size` above 2 MiB were affected.
+  applies axum's own 2 MiB default on top of `RequestBodyLimitLayer`.
+  `/inbound` now buffers up to `message_size` when that is larger (other
+  routes keep axum's default), so default deployments are unchanged. Only
+  deployments that raised `message_size` above 2 MiB were affected.
 - **A message refused on a raw-TSP websocket was dropped silently.** The
   sender's write had already succeeded and a raw-TSP socket has no error
   frame, so it was never told (R1.1). The mediator now closes the socket with
   a code saying why: **1009** for a message over `message_size`, **1013** to
-  retry later, **1011** for a server error, **1008** for any other refusal.
+  retry later (any server-side failure), **1008** for any other refusal.
   A TSP frame refused on a DIDComm websocket now gets a problem report, as a
   DIDComm message there already did. **Behaviour change (R3.6):** a raw-TSP
   client that sends an unacceptable message now sees its socket closed and

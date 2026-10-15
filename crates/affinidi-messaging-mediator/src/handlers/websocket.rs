@@ -475,7 +475,9 @@ mod close_code {
 /// The close a raw-TSP socket sends when the mediator refuses a message on it.
 ///
 /// The code is the client's cue: 1009 (too big) and 1008 (refused) mean
-/// resending the same message will not help; 1013 and 1011 mean it may.
+/// resending the same message will not help; 1013 means it may. Every
+/// server-side failure is the same 1013, so the close tells a client whether to
+/// retry and nothing about the state of the mediator behind it.
 #[cfg(feature = "tsp")]
 fn tsp_refusal_close(error: &MediatorError) -> (u16, &'static str) {
     let status = match error {
@@ -487,11 +489,10 @@ fn tsp_refusal_close(error: &MediatorError) -> (u16, &'static str) {
             close_code::MESSAGE_TOO_BIG,
             "TSP message exceeds the mediator's message size limit",
         ),
-        502 | 503 => (
+        500..=599 => (
             close_code::TRY_AGAIN_LATER,
             "TSP message not accepted now; try again later",
         ),
-        500..=599 => (close_code::SERVER_ERROR, "TSP message could not be stored"),
         _ => (close_code::POLICY, "TSP message refused"),
     }
 }

@@ -251,6 +251,7 @@ fn report(rows: &[Row]) {
 
 // ─── Payloads ─────────────────────────────────────────────────────────────
 
+#[cfg(feature = "tsp")]
 fn payload_bytes(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 251) as u8).collect()
 }
@@ -302,6 +303,7 @@ fn check_text(msg: &Message, text: &str) -> Outcome {
     }
 }
 
+#[cfg(feature = "tsp")]
 fn check_bytes(got: &[u8], sent: &[u8]) -> Outcome {
     if got == sent {
         Outcome::Delivered
