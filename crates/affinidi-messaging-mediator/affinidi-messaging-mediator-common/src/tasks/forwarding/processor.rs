@@ -286,6 +286,11 @@ enum AckFailure {
     Transport(String),
 }
 
+/// Abandonment reports whose live notification could not be published. The
+/// report itself is stored, so this counts delayed notices, not lost ones.
+const METRIC_FORWARD_REPORT_LIVE_PUBLISH_FAILED_TOTAL: &str =
+    "forward_problem_report_live_publish_failed_total";
+
 /// The forwarding processor that reads from FORWARD_Q and delivers to remote mediators
 pub struct ForwardingProcessor {
     config: ForwardingConfig,
@@ -914,6 +919,9 @@ impl ForwardingProcessor {
                         .streaming_publish_message(&msg.from_did_hash, &stream_uuid, &packed, false)
                         .await
                 {
+                    // Counted as well as logged, so a streaming outage shows
+                    // as a rate rather than scattered warnings (R6).
+                    metrics::counter!(METRIC_FORWARD_REPORT_LIVE_PUBLISH_FAILED_TOTAL).increment(1);
                     warn!(
                         "FORWARD_PROBLEM_REPORT: live notification for sender {} not published \
                          (the report waits in the inbox): {}",
