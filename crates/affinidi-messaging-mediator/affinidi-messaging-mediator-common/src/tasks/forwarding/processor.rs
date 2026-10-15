@@ -902,6 +902,24 @@ impl ForwardingProcessor {
                     "FORWARD_PROBLEM_REPORT: stored problem report {} for sender {}",
                     hash, msg.from_did_hash
                 );
+                // Notify after the store, as every other inbox write does: a
+                // live socket only learns of the report from this, and a
+                // raw-TSP socket answers it by draining the inbox.
+                if let Some(stream_uuid) = self
+                    .database
+                    .streaming_is_client_live(&msg.from_did_hash, false)
+                    .await
+                    && let Err(e) = self
+                        .database
+                        .streaming_publish_message(&msg.from_did_hash, &stream_uuid, &packed, false)
+                        .await
+                {
+                    warn!(
+                        "FORWARD_PROBLEM_REPORT: live notification for sender {} not published \
+                         (the report waits in the inbox): {}",
+                        msg.from_did_hash, e
+                    );
+                }
             }
             Err(e) => {
                 error!(
