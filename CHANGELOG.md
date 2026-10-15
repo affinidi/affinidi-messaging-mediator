@@ -51,6 +51,27 @@ mediator-tui 0.11.0); they are no longer updated.
   it. **Behaviour change (R3.6):** live DIDComm clients now receive this
   report as a pushed message rather than only on pickup.
 
+### Fixed — live notification is published after the message is stored
+
+- **Behaviour change in delivery ordering (R3.6).** The mediator now stores a
+  message before publishing its live notification, for client deliveries,
+  mediator replies and forwarded messages alike. Previously the notification
+  went first, so a raw-TSP websocket — which drains its inbox on the
+  notification — could drain before the store landed and leave the message
+  stranded until an unrelated wake-up (often a ~30 s client timeout).
+- Consequences consumers may notice:
+  - A live frame now always refers to a stored message, so an `auto_delete`
+    of a live-delivered message can no longer race the store and miss.
+  - If the store fails, no live frame is sent (previously the recipient could
+    receive a frame for a message that was never stored). This includes
+    `force_live_delivery` pickup replies. The sender still gets the store
+    error.
+- The traffic monitor reports a `delivered` event for a stored message only
+  when its live notification was actually published; a failed publish now
+  shows as stored only (R1.1).
+- `MemoryStore::with_store_delay` adds random per-store latency for tests;
+  it panics on an inverted range.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository

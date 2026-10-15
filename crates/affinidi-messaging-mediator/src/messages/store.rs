@@ -20,34 +20,21 @@ use tracing::{Instrument, debug, error, span, warn};
 
 use super::{ProcessMessageResponse, WrapperType};
 
+/// Store `data` for `to_did_hash`, then publish the live notification.
+///
+/// The order matters: a raw-TSP socket answers the notification by draining
+/// the inbox, so a notification that beats the store wakes a drain that finds
+/// nothing and strands the message. Every path that stores into a local inbox
+/// and notifies goes through here so the order can't drift between them.
 async fn _store_message(
     state: &SharedData,
     session: &Session,
-    response: &ProcessMessageResponse,
+    force_live_delivery: bool,
     data: &str,
     to_did_hash: &str,
     from_did_hash: Option<&str>,
     expiry: u64,
 ) -> Result<String, MediatorError> {
-    // Live stream the message?
-    let live = if let Some(stream_uuid) = state
-        .database
-        .streaming_is_client_live(to_did_hash, response.force_live_delivery)
-        .await
-    {
-        _live_stream(
-            &state.database,
-            to_did_hash,
-            &stream_uuid,
-            data,
-            response.force_live_delivery,
-        )
-        .await;
-        true
-    } else {
-        false
-    };
-
     let msg_id = state
         .database
         .store_message(
@@ -59,6 +46,25 @@ async fn _store_message(
             state.limits().queue_stream_maxlen(),
         )
         .await?;
+
+    // Only a notification that was actually published counts as live.
+    let live = match state
+        .database
+        .streaming_is_client_live(to_did_hash, force_live_delivery)
+        .await
+    {
+        Some(stream_uuid) => {
+            _live_stream(
+                &state.database,
+                to_did_hash,
+                &stream_uuid,
+                data,
+                force_live_delivery,
+            )
+            .await
+        }
+        None => false,
+    };
     state
         .monitor
         .stored(&msg_id, from_did_hash, to_did_hash, data, live);
@@ -169,7 +175,7 @@ pub(crate) async fn store_message(
                         match _store_message(
                             state,
                             session,
-                            response,
+                            response.force_live_delivery,
                             &packed,
                             &digest(recipient),
                             Some(&state.config.mediator_did_hash),
@@ -218,7 +224,7 @@ pub(crate) async fn store_message(
                     match _store_message(
                         state,
                         session,
-                        response,
+                        response.force_live_delivery,
                         message,
                         &to_hash,
                         Some(&session.did_hash),
@@ -303,21 +309,28 @@ pub(crate) async fn store_message(
     .await
 }
 
-/// If live streaming is enabled, this function will send the message to the live stream
-/// Ok to ignore errors here
+/// Publish the live notification for a message. A failure loses nothing — the
+/// message is in the inbox — so it is not an error, but it is not a live
+/// delivery either: returns whether the notification was published.
 async fn _live_stream(
     database: &Arc<dyn MediatorStore>,
     did_hash: &str,
     stream_uuid: &str,
     message: &str,
     force_live_delivery: bool,
-) {
-    if database
+) -> bool {
+    match database
         .streaming_publish_message(did_hash, stream_uuid, message, force_live_delivery)
         .await
-        .is_ok()
     {
-        debug!("Live streaming message to UUID: {}", stream_uuid);
+        Ok(()) => {
+            debug!("Live streaming message to UUID: {}", stream_uuid);
+            true
+        }
+        Err(err) => {
+            warn!("Live notification for did_hash({did_hash}) not published: {err}");
+            false
+        }
     }
 }
 
@@ -346,25 +359,6 @@ pub(crate) async fn store_forwarded_message(
 
     async move {
         let recipient_did_hash = digest(recipient);
-        // Live stream the message?
-        let live = if let Some(stream_uuid) = state
-            .database
-            .streaming_is_client_live(&recipient_did_hash, false)
-            .await
-        {
-            _live_stream(
-                &state.database,
-                &recipient_did_hash,
-                &stream_uuid,
-                message,
-                false,
-            )
-            .await;
-            debug!("Live streaming message to did_hash: {}", recipient_did_hash);
-            true
-        } else {
-            false
-        };
 
         let expires_at = if let Some(expires_at) = expires_at {
             let now = state.clock.unix_secs();
@@ -378,30 +372,18 @@ pub(crate) async fn store_forwarded_message(
             state.clock.unix_secs() + state.limits().message_expiry_seconds
         };
 
-        match state
-            .database
-            .store_message(
-                &session.session_id,
-                message,
-                &recipient_did_hash,
-                sender_hash,
-                expires_at,
-                state.limits().queue_stream_maxlen(),
-            )
-            .await
+        match _store_message(
+            state,
+            session,
+            false,
+            message,
+            &recipient_did_hash,
+            sender_hash,
+            expires_at,
+        )
+        .await
         {
             Ok(msg_id) => {
-                state
-                    .monitor
-                    .stored(&msg_id, sender_hash, &recipient_did_hash, message, live);
-                state.activity.received(state, &recipient_did_hash).await;
-                crate::account_stats::count_stored(
-                    state,
-                    sender_hash,
-                    &recipient_did_hash,
-                    message,
-                )
-                .await;
                 debug!(
                     "message id({}) stored successfully recipient({})",
                     msg_id, recipient
