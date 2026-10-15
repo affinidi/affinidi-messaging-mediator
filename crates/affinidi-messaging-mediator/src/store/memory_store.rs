@@ -385,10 +385,21 @@ impl MemoryStore {
 
     /// Delay every `store_message` by a random duration in `delay`, to mimic a
     /// networked store's latency and expose store-ordering races in tests.
+    ///
+    /// The delay runs before the store takes its lock, so concurrent stores
+    /// can commit out of submission order — as they can against Redis.
+    ///
+    /// # Panics
+    ///
+    /// If `delay` is inverted (start after end).
     pub fn with_store_delay(
         mut self,
         delay: std::ops::RangeInclusive<std::time::Duration>,
     ) -> Self {
+        assert!(
+            delay.start() <= delay.end(),
+            "with_store_delay: inverted range {delay:?}"
+        );
         self.store_delay = delay;
         self
     }
