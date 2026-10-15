@@ -43,6 +43,14 @@ mediator-tui 0.11.0); they are no longer updated.
   OOB-invite counters, `oob_discovery_delete` and `streaming_set_state` take
   the write lock.
 
+### Fixed — forwarding-abandonment reports reach live senders
+
+- When the forwarding processor gives up on a relay, the problem report it
+  stores in the sender's inbox now also gets a live notification. A sender
+  with an open websocket used to see nothing until an unrelated message woke
+  it. **Behaviour change (R3.6):** live DIDComm clients now receive this
+  report as a pushed message rather than only on pickup.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository
