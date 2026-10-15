@@ -759,3 +759,17 @@ enabled = "true"
 ### Scale: raise to reduce flush frequency (better write throughput, more RSS);
 ### lower to clamp memory harder at the cost of more disk I/O.
 # max_journal = "134217728"
+
+### Env: STORAGE_FJALL_DURABILITY
+### When a write the mediator acknowledges (a stored message, an enqueued
+### forward) is durable. Default "buffered".
+###   "buffered": the write has reached the OS before it is acknowledged. A
+###               crash of the mediator process loses nothing; a power loss or
+###               kernel crash can lose what the OS had not yet written out.
+###   "sync":     the write is also synced to disk (fsync) first, so it survives
+###               a power loss too. Costs a disk sync per acknowledged write;
+###               concurrent writes share syncs. Choose this when an accepted
+###               message must never be lost, e.g. on hosts without a
+###               battery-backed write cache.
+### An unrecognised value is treated as "sync". Shutdown always syncs.
+# durability = "buffered"

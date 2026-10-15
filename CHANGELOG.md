@@ -8,6 +8,41 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — `[storage.fjall] durability`
+
+- `durability = "buffered"` (default, unchanged behaviour) or `"sync"`
+  (`STORAGE_FJALL_DURABILITY`). With `"sync"`, a stored message and an
+  enqueued forward are synced to disk before the store reports success, so
+  an accepted message survives a power loss, not only a process crash. An
+  unrecognised value is treated as `"sync"`. Shutdown now always syncs.
+- **API:** `FjallTuning` and `FjallConfig` gain a `durability` field, and
+  `FjallDurability` is new. Code that builds either struct with a literal
+  needs `..Default::default()` or the new field.
+
+### Fixed — Fjall store crash safety and races
+
+- Forwarding: finishing with an entry now acks and deletes it in one write
+  (`MediatorStore::forward_queue_ack_and_delete`, a new provided method that
+  Fjall overrides with one batch; other backends keep running the two steps
+  in turn). A crash between a separate ack and delete used to strand the
+  entry, unread, until the queue trim.
+- Forwarding retries enqueue the next attempt **before** releasing the old
+  entry. In the old order a crash between the two lost the message; now it
+  can at worst be delivered twice. If the re-enqueue fails the old entry stays
+  claimed for autoclaim instead of being reported abandoned.
+- Fjall: autoclaim drops a claim whose queue entry is gone rather than
+  re-claiming it forever.
+- Fjall: the expiry sweep removes expiry-index keys whose message is gone
+  (the delivered-TTL deadline outlived its message and was rescanned on every
+  sweep). A store error during the sweep now keeps the key for the next sweep
+  instead of being counted as already deleted.
+- Fjall: session expiry (the sweep and the lazy check in `get_session`)
+  re-reads the session under the write lock, so a session refreshed since the
+  scan is not removed.
+- Fjall: `account_remove` purges messages stored while it was running; the
+  OOB-invite counters, `oob_discovery_delete` and `streaming_set_state` take
+  the write lock.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository
