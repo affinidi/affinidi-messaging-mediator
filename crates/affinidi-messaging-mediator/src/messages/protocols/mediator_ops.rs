@@ -785,6 +785,7 @@ pub(crate) async fn consume_monitor_subscribe(
     // rather than per batch also means a VID the mediator cannot resolve is
     // refused at subscribe time instead of quietly dropping every batch.
     let delivery = match transport {
+        #[cfg(feature = "didcomm")]
         super::trust_tasks::TaskTransport::DidComm => Delivery::DidComm,
         #[cfg(feature = "tsp")]
         super::trust_tasks::TaskTransport::Tsp => {

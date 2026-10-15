@@ -141,14 +141,6 @@ pub(crate) fn rewrap_inner_attachment(mediator_did: &str, msg: &Message) -> Opti
     String::from_utf8(bytes).ok()
 }
 
-/// Whether `from` (the authcrypt sender of a re-wrap layer) is an allowed relay
-/// peer. An empty allowlist accepts any peer (the relay capability is still
-/// gated by ACLs); a non-empty list admits only its members, and rejects an
-/// anonymous (`None`) peer outright.
-pub(crate) fn relay_peer_trusted(allow: &ahash::AHashSet<String>, from: Option<&str>) -> bool {
-    allow.is_empty() || matches!(from, Some(did) if allow.contains(did))
-}
-
 /// Process a forward message, run checks and then if accepted place into FORWARD_TASKS stream
 /// Parse the `next` hop DID from a routing-2.0 forward body.
 fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorError> {
@@ -1110,8 +1102,8 @@ async fn service_endpoint_for_remote(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointHop, classify_endpoint, didcomm_endpoints, parse_next_did, relay_peer_trusted,
-        relay_sender_acls, rewrap_inner_attachment, uri_points_at_self,
+        EndpointHop, classify_endpoint, didcomm_endpoints, parse_next_did, relay_sender_acls,
+        rewrap_inner_attachment, uri_points_at_self,
     };
     use crate::common::session::Session;
     use crate::server::{compute_self_authorities_from, normalize_host};
@@ -1120,26 +1112,6 @@ mod tests {
     use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
     use base64::prelude::*;
     use std::collections::HashSet;
-
-    fn allowlist(entries: &[&str]) -> ahash::AHashSet<String> {
-        entries.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn relay_peer_trusted_empty_allowlist_accepts_any() {
-        let empty = ahash::AHashSet::new();
-        assert!(relay_peer_trusted(&empty, Some("did:peer:anyone")));
-        assert!(relay_peer_trusted(&empty, None));
-    }
-
-    #[test]
-    fn relay_peer_trusted_nonempty_allowlist_is_membership_only() {
-        let allow = allowlist(&["did:peer:alice_mediator", "did:peer:bob_mediator"]);
-        assert!(relay_peer_trusted(&allow, Some("did:peer:alice_mediator")));
-        assert!(!relay_peer_trusted(&allow, Some("did:peer:stranger")));
-        // A non-empty allowlist rejects an anonymous relaying peer.
-        assert!(!relay_peer_trusted(&allow, None));
-    }
 
     fn forward_to(next: &str, attachment_bytes: &[u8]) -> Message {
         let att = Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode(attachment_bytes)).finalize();

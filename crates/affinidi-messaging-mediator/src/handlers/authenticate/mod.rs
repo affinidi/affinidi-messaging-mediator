@@ -8,16 +8,25 @@
 //!
 //! NOTE: All errors handled in the handlers are returned as a Problem Report messages
 
+//!
+//! A pure-TSP client takes the challenge from step 1 and proves control of its
+//! VID by signing it (`tsp`), so the challenge and token minting build with
+//! either protocol; the DIDComm response and refresh need DIDComm.
+
 mod challenge;
 mod helpers;
+#[cfg(feature = "didcomm")]
 mod refresh;
+#[cfg(feature = "didcomm")]
 mod response;
 #[cfg(feature = "tsp")]
 pub mod tsp;
 
 pub use challenge::*;
 pub use helpers::create_random_string;
+#[cfg(feature = "didcomm")]
 pub use refresh::*;
+#[cfg(feature = "didcomm")]
 pub use response::*;
 
 use affinidi_messaging_sdk::messages::GenericDataStruct;

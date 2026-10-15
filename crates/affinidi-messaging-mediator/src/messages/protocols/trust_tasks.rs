@@ -21,6 +21,7 @@
 //!
 //! [Trust Task]: https://trusttasks.org
 
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::types::accounts::{Account, AccountType};
@@ -28,6 +29,7 @@ use affinidi_messaging_mediator_common::types::acls::{
     ACLError, AccessListModeType, MediatorACLSet,
 };
 use affinidi_messaging_mediator_common::types::audit::{AuditAction, AuditLogEntry};
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use http::StatusCode;
@@ -52,6 +54,7 @@ use crate::common::authz::check_permissions;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::{mediator_ops, trust_task_sign, trust_task_verify};
+#[cfg(feature = "didcomm")]
 use crate::messages::{ProcessMessageResponse, WrapperType};
 
 /// DIDComm `type` URI of a Trust Tasks binding envelope.
@@ -96,6 +99,9 @@ impl ProofVerifier for NoProof {
 }
 
 /// Consume an inbound Trust Tasks envelope and produce the response.
+/// The DIDComm binding: a Trust Task carried in a DIDComm envelope, answered
+/// in one. The TSP binding is `inbound::dispatch_tsp_trust_task`.
+#[cfg(feature = "didcomm")]
 pub(crate) async fn process(
     message: &Message,
     state: &SharedData,
@@ -179,6 +185,7 @@ pub(crate) fn vid_of(kid: &str) -> String {
 /// batches are sealed and delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskTransport {
+    #[cfg(feature = "didcomm")]
     DidComm,
     #[cfg(feature = "tsp")]
     Tsp,

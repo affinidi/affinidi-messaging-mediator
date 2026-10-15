@@ -23,6 +23,7 @@
 //! shows up as a warning rather than as a silently inert permission bit.
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_mediator_common::store::MediatorStore;
 use affinidi_messaging_sdk::protocols::mediator::{accounts::AccountType, acls::MediatorACLSet};
 use subtle::ConstantTimeEq;
@@ -41,6 +42,10 @@ use crate::{SharedData, common::session::Session};
 /// capability the mediator advertises but never enforces. That is precisely
 /// how `ReceiveMessages` stayed inert — settable, reported over the wire and
 /// documented, but consulted by nothing. Let the dead-code warning fire.
+// Except in a TSP-only build: it has no forwarding, invites or anonymous DIDComm
+// delivery, so three capabilities have nothing to enforce and the warning would
+// be noise. Every build with DIDComm still gets it.
+#[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Capability {
     /// The DID is not blocked from the mediator.
@@ -97,6 +102,7 @@ pub(crate) fn require_capability(
 }
 
 /// Returned when a recipient's access list denies a sender.
+#[cfg(feature = "didcomm")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AccessListDenied;
 
@@ -106,6 +112,7 @@ pub(crate) struct AccessListDenied;
 /// `access_list_allowed`, so the allow/deny verdict and its error mapping
 /// live alongside the rest of the authz vocabulary. `sender_hash` is `None`
 /// for an anonymous sender.
+#[cfg(feature = "didcomm")]
 pub(crate) async fn check_access_list(
     store: &dyn MediatorStore,
     recipient_hash: &str,
