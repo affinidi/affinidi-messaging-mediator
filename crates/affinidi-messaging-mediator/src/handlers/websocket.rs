@@ -463,10 +463,38 @@ mod close_code {
     pub const GOING_AWAY: u16 = 1001;
     /// Policy violation — auth expired, per-DID cap, duplicate displacement.
     pub const POLICY: u16 = 1008;
+    /// A message larger than the mediator accepts.
+    #[cfg(feature = "tsp")]
+    pub const MESSAGE_TOO_BIG: u16 = 1009;
     /// Unexpected server-side condition.
     pub const SERVER_ERROR: u16 = 1011;
     /// Transient capacity limit — try again later.
     pub const TRY_AGAIN_LATER: u16 = 1013;
+}
+
+/// The close a raw-TSP socket sends when the mediator refuses a message on it.
+///
+/// The code is the client's cue: 1009 (too big) and 1008 (refused) mean
+/// resending the same message will not help; 1013 means it may. Every
+/// server-side failure is the same 1013, so the close tells a client whether to
+/// retry and nothing about the state of the mediator behind it.
+#[cfg(feature = "tsp")]
+fn tsp_refusal_close(error: &MediatorError) -> (u16, &'static str) {
+    let status = match error {
+        MediatorError::MediatorError(_, _, _, _, status, _) => *status,
+        _ => 500,
+    };
+    match status {
+        413 => (
+            close_code::MESSAGE_TOO_BIG,
+            "TSP message exceeds the mediator's message size limit",
+        ),
+        500..=599 => (
+            close_code::TRY_AGAIN_LATER,
+            "TSP message not accepted now; try again later",
+        ),
+        _ => (close_code::POLICY, "TSP message refused"),
+    }
 }
 
 /// How long an anonymous inter-mediator relay socket may stay open.
@@ -876,6 +904,22 @@ async fn handle_socket(
                                         if let Err(e) = crate::monitor::with_channel(Channel::Websocket, handle_inbound_tsp(&state, &session, &msg)).await {
                                             state.monitor.refused(&session.did_hash, Channel::Websocket, Protocol::Tsp, &msg, &e);
                                             warn!("WebSocket TSP inbound error: {}", e);
+                                            // The sender's write already succeeded, so a refusal that is
+                                            // only logged leaves it believing the message went (R1.1).
+                                            // A raw-TSP socket has no in-band error frame: the one thing
+                                            // it can say is why it is closing.
+                                            if tsp_mode {
+                                                close_reason = tsp_refusal_close(&e);
+                                                break;
+                                            }
+                                            // A DIDComm socket can carry the problem report itself.
+                                            #[cfg(feature = "didcomm")]
+                                            if let MediatorError::MediatorError(_, _, msg_id, problem_report, _, _) = e
+                                                && let Ok(report) = _package_problem_report(&state, &session, msg_id, *problem_report).await
+                                                && let Err(e) = socket.send(Message::Text(report.into())).await
+                                            {
+                                                warn!("Failed to send problem report to WebSocket client: {e}");
+                                            }
                                         }
                                         continue;
                                     }

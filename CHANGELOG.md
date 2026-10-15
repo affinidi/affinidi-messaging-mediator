@@ -100,6 +100,36 @@ mediator-tui 0.11.0); they are no longer updated.
   in ten (now 0 of 30). The requirement stays `0.36`; only the lockfile, and
   therefore the mediator binary and images, change.
 
+### Fixed — REST messages over 2 MiB, and silent raw-TSP refusals
+
+- **REST `/inbound` refused every body over 2 MiB**, whatever `http_size` and
+  `message_size` said. The handler takes the body as axum's `Bytes`, which
+  applies axum's own 2 MiB default on top of `RequestBodyLimitLayer`.
+  `/inbound` now buffers up to `message_size` when that is larger (other
+  routes keep axum's default), so default deployments are unchanged. Only
+  deployments that raised `message_size` above 2 MiB were affected.
+- **A message refused on a raw-TSP websocket was dropped silently.** The
+  sender's write had already succeeded and a raw-TSP socket has no error
+  frame, so it was never told (R1.1). The mediator now closes the socket with
+  a code saying why: **1009** for a message over `message_size`, **1013** to
+  retry later (any server-side failure), **1008** for any other refusal.
+  A TSP frame refused on a DIDComm websocket now gets a problem report, as a
+  DIDComm message there already did. **Behaviour change (R3.6):** a raw-TSP
+  client that sends an unacceptable message now sees its socket closed and
+  must reconnect.
+
+### Added — test-mediator size limits, Redis, and a message-size sweep
+
+- `TestMediatorBuilder::message_size`, the in-process equivalent of
+  `LIMIT_MESSAGE_SIZE` (raising `http_size`/`ws_size` to match).
+- A `redis-backend` feature on `affinidi-messaging-test-mediator`, so a test
+  can run the in-process mediator on a `RedisStore`.
+- `tests/size_sweep.rs` (opt-in, `--ignored`): DIDComm and TSP at sizes from
+  1 KB to past the limit, over REST, websocket, raw-TSP socket, live delivery,
+  pickup and cross-mediator paths, on memory, Fjall and (with `REDIS_URL`)
+  Redis. Anything within `message_size` must arrive byte for byte; anything
+  over must be refused in a way the sender sees.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository
