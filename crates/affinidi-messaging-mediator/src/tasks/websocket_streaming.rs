@@ -536,6 +536,7 @@ impl StreamingTask {
             message,
             force_delivery,
             verbatim,
+            stored,
         } = payload;
         match clients.get(&did_hash) {
             Some(entry) => {
@@ -558,9 +559,27 @@ impl StreamingTask {
                             error!("Error deregistering dead client ({did_hash}): {e}");
                         }
                     } else {
+                        // A stored message's delivery is reported here, once
+                        // it is actually queued to the socket (R1.1). Taken
+                        // before the body is moved into the queue.
+                        let report = stored.map(|stored| {
+                            let body = self.monitor.is_active().then(|| message.clone());
+                            (stored, message.len() as u64, body)
+                        });
                         // Moved, not cloned: the body already exists in the
                         // broadcast ring slot, and `payload` is owned here.
-                        deliver_live(entry, &self.send_budget, &did_hash, message, verbatim);
+                        if deliver_live(entry, &self.send_budget, &did_hash, message, verbatim)
+                            && let Some((stored, size, body)) = report
+                        {
+                            self.monitor.delivered(
+                                &stored.msg_id,
+                                stored.from_did_hash.as_deref(),
+                                Some(&did_hash),
+                                size,
+                                crate::monitor::Channel::Websocket,
+                                body.as_deref(),
+                            );
+                        }
                     }
                 } else {
                     debug!("pub/sub msg received for did_hash({did_hash}) but it is not active");
@@ -1135,6 +1154,66 @@ mod tests {
         assert!(
             resync.load(Ordering::Relaxed),
             "a dropped notification must raise resync, or the client never learns"
+        );
+    }
+
+    /// A stored message's live delivery is reported when its notification is
+    /// queued to the socket, and not when the push is dropped (R1.1). Untagged
+    /// pushes — monitor batches, ephemeral messages — report nothing, or the
+    /// monitor would report its own batches.
+    #[tokio::test]
+    async fn delivered_is_reported_only_for_a_queued_stored_message() {
+        use affinidi_messaging_mediator_common::store::StoredMessageRef;
+
+        let task = streaming_task();
+        let mut events = task.monitor.tap();
+        let database = MemoryStore::new();
+        // One slot, never read: the first push is queued, the next is dropped.
+        let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
+        let mut clients = HashMap::from([(
+            "bob".to_string(),
+            ClientEntry {
+                tx,
+                session_id: "S".to_string(),
+                active: true,
+                registered_at: Instant::now(),
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+            },
+        )]);
+        let record = |msg_id: Option<&str>| PubSubRecord {
+            did_hash: "bob".to_string(),
+            message: "body".to_string(),
+            force_delivery: false,
+            verbatim: false,
+            stored: msg_id.map(|msg_id| StoredMessageRef {
+                msg_id: msg_id.to_string(),
+                from_did_hash: Some("alice".to_string()),
+            }),
+        };
+
+        task.dispatch_payload(&database, &mut clients, record(Some("m1")))
+            .await;
+        let event = events.try_recv().expect("the queued push is reported");
+        assert_eq!(event.stage, crate::monitor::Stage::Delivered);
+        assert_eq!(event.msg_id.as_deref(), Some("m1"));
+        assert_eq!(event.from.as_deref(), Some("alice"));
+        assert_eq!(event.to.as_deref(), Some("bob"));
+
+        task.dispatch_payload(&database, &mut clients, record(Some("m2")))
+            .await;
+        assert!(
+            events.try_recv().is_err(),
+            "a dropped push must not be reported as delivered"
+        );
+
+        let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
+        clients.get_mut("bob").expect("bob").tx = tx;
+        task.dispatch_payload(&database, &mut clients, record(None))
+            .await;
+        assert!(
+            events.try_recv().is_err(),
+            "an untagged push is not a stored message's delivery"
         );
     }
 

@@ -220,6 +220,24 @@ pub struct PubSubRecord {
     /// predates this field still deserialises behind a shared Redis.
     #[serde(default)]
     pub verbatim: bool,
+    /// The stored message this notification is for, when it is for one. The
+    /// streaming task reports a `delivered` monitor event only for a tagged
+    /// record, and only once the notification is queued to the socket, so a
+    /// push that is dropped (or never published) is not reported as
+    /// delivered. Monitor batches and ephemeral pushes are untagged.
+    ///
+    /// `#[serde(default)]`: a record from an instance that predates this
+    /// field deserialises untagged, and an older instance ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<StoredMessageRef>,
+}
+
+/// Identifies a stored message carried by a [`PubSubRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMessageRef {
+    pub msg_id: String,
+    /// The sender's DID hash, when the message has one.
+    pub from_did_hash: Option<String>,
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────

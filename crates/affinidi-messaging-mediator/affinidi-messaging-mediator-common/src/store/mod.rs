@@ -304,7 +304,7 @@ pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueEntry,
     InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RemovalReason,
     SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport, StatCounter,
-    StoreHealth, StreamingClientState,
+    StoreHealth, StoredMessageRef, StreamingClientState,
 };
 
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
@@ -1586,6 +1586,28 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         message: &str,
         force_delivery: bool,
     ) -> Result<(), MediatorError>;
+
+    /// [`streaming_publish_message`](Self::streaming_publish_message) for a
+    /// message that is in the recipient's inbox, tagged with `stored` so the
+    /// streaming task can report its delivery once the notification is
+    /// actually queued to the socket (R1.1).
+    ///
+    /// The default publishes an untagged notification: delivery is
+    /// unaffected, but no `delivered` monitor event is reported for it —
+    /// under-reporting rather than claiming a delivery nobody saw. Every
+    /// built-in backend implements it.
+    async fn streaming_publish_stored(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        stored: StoredMessageRef,
+    ) -> Result<(), MediatorError> {
+        let _ = stored;
+        self.streaming_publish_message(did_hash, mediator_uuid, message, force_delivery)
+            .await
+    }
 
     /// Publish a frame to be delivered to the client **as it is**, rather
     /// than as a notification to go and fetch what is stored.
