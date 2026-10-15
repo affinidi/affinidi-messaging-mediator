@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_sdk::messages::fetch::FetchOptions;
-use affinidi_messaging_test_mediator::TestTopology;
+use affinidi_messaging_test_mediator::{TestTopology, TestUser};
 use common::init_tracing;
 use serde_json::json;
 use uuid::Uuid;
@@ -55,33 +55,11 @@ async fn await_port_closed(addr: std::net::SocketAddr) {
     .expect("the downed mediator's port never closed");
 }
 
-#[tokio::test]
-async fn abandoned_forward_report_unpacks_under_the_default_policy() {
-    init_tracing();
-
-    // `max_retries = 0` abandons on the first delivery failure: the retry ladder
-    // is real `sleep` inside the processor task, and the production default
-    // (5 retries doubling from 1s) would put ~31s of it in front of the only
-    // event this test cares about.
-    let topology = TestTopology::builder()
-        .mediators(2)
-        .configure_each(|b| {
-            b.forwarding_retry_policy(0, Duration::from_millis(50), Duration::from_millis(100))
-        })
-        .spawn()
-        .await
-        .expect("spawn 2-mediator topology");
-
-    // Users are added through the node directly rather than
-    // `TestTopology::add_user`, which brings up a live WebSocket. The report is
-    // written straight into the inbox by the forwarding processor (no live
-    // push), and this test wants to read it exactly as a client would on
-    // pickup.
+/// Take node 1 down, then have `alice` (on node 0) send `bob` (on node 1) a
+/// routing-2.0 double forward. Node 0 accepts it and can never relay it.
+async fn send_doomed_forward(topology: &TestTopology, alice: &TestUser, bob: &TestUser) {
     let node_a = topology.node(0).expect("node 0");
     let node_b = topology.node(1).expect("node 1");
-    let alice = node_a.add_user("Alice").await.expect("add Alice on node 0");
-    let bob = node_b.add_user("Bob").await.expect("add Bob on node 1");
-
     let mediator_a_did = node_a.mediator.did().to_string();
     let mediator_b_did = node_b.mediator.did().to_string();
     let mediator_b_addr = node_b.mediator.bound_addr();
@@ -151,6 +129,42 @@ async fn abandoned_forward_report_unpacks_under_the_default_policy() {
         .send_message(&alice.profile, &outer_fwd, &msg_id, false, false)
         .await
         .expect("send outer forward to Alice's own mediator");
+}
+
+/// A topology whose forwarding gives up on the first failed attempt.
+async fn spawn_topology() -> TestTopology {
+    // `max_retries = 0` abandons on the first delivery failure: the retry ladder
+    // is real `sleep` inside the processor task, and the production default
+    // (5 retries doubling from 1s) would put ~31s of it in front of the only
+    // event these tests care about.
+    TestTopology::builder()
+        .mediators(2)
+        .configure_each(|b| {
+            b.forwarding_retry_policy(0, Duration::from_millis(50), Duration::from_millis(100))
+        })
+        .spawn()
+        .await
+        .expect("spawn 2-mediator topology")
+}
+
+#[tokio::test]
+async fn abandoned_forward_report_unpacks_under_the_default_policy() {
+    init_tracing();
+
+    let topology = spawn_topology().await;
+
+    // Users are added through the node directly rather than
+    // `TestTopology::add_user`, which brings up a live WebSocket: this test
+    // wants to read the report exactly as a client would on pickup.
+    let node_a = topology.node(0).expect("node 0");
+    let node_b = topology.node(1).expect("node 1");
+    let alice = node_a.add_user("Alice").await.expect("add Alice on node 0");
+    let bob = node_b.add_user("Bob").await.expect("add Bob on node 1");
+
+    let mediator_a_did = node_a.mediator.did().to_string();
+    let mediator_b_did = node_b.mediator.did().to_string();
+
+    send_doomed_forward(&topology, &alice, &bob).await;
 
     // Alice picks up whatever her mediator left for her.
     let stored = tokio::time::timeout(Duration::from_secs(30), async {
@@ -216,6 +230,60 @@ async fn abandoned_forward_report_unpacks_under_the_default_policy() {
             ),
         "the report names the next hop that could not be reached: {:?}",
         report.body
+    );
+
+    topology.shutdown().await.expect("shutdown topology");
+}
+
+/// A sender with a live socket hears about the abandonment as it happens.
+///
+/// The report used to be written into the inbox with no live notification, so
+/// a connected client — which only learns of new messages from that
+/// notification — saw nothing until some unrelated message woke it.
+#[tokio::test]
+async fn abandoned_forward_report_reaches_a_live_sender() {
+    init_tracing();
+
+    let topology = spawn_topology().await;
+    let alice = topology.add_user(0, "Alice").await.expect("add live Alice");
+    let bob = topology
+        .node(1)
+        .expect("node 1")
+        .add_user("Bob")
+        .await
+        .expect("add Bob on node 1");
+    let node_a = topology.node(0).expect("node 0");
+
+    send_doomed_forward(&topology, &alice, &bob).await;
+
+    // Well under the ~30 s a stranded message waits for an unrelated wake-up.
+    // Other traffic (status replies) can share the stream, so skip it.
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let found = loop {
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let next = node_a
+            .atm
+            .message_pickup()
+            .live_stream_next(&alice.profile, Some(remaining), false)
+            .await
+            .expect("live stream");
+        let Some((message, _)) = next else {
+            break false;
+        };
+        if message.body.get("code").and_then(|c| c.as_str())
+            == Some("e.p.me.res.forwarding.abandoned")
+        {
+            break true;
+        }
+        seen.push(message.typ);
+    };
+    assert!(
+        found,
+        "the abandonment report was never pushed to Alice's live socket; saw {seen:?}"
     );
 
     topology.shutdown().await.expect("shutdown topology");

@@ -190,6 +190,23 @@ pub struct FjallConfig {
     /// Lower = tighter memory, more frequent flushes (more write amplification).
     #[serde(default = "default_fjall_max_journal")]
     pub max_journal: String,
+    /// When a write the mediator acknowledges (a stored message, an enqueued
+    /// forward) is durable. Default `"buffered"`.
+    ///
+    /// - `"buffered"`: the write has reached the OS before it is
+    ///   acknowledged. Survives a crash of the mediator process; a power loss
+    ///   or kernel crash can lose what the OS had not written out yet.
+    /// - `"sync"`: the write is also synced to disk first, so it survives a
+    ///   power loss too, at the cost of a disk sync per acknowledged write
+    ///   (concurrent writes share syncs).
+    ///
+    /// An unrecognised value is treated as `"sync"`.
+    #[serde(default = "default_fjall_durability")]
+    pub durability: String,
+}
+
+fn default_fjall_durability() -> String {
+    "buffered".to_string()
 }
 
 /// 16 MiB.
@@ -213,6 +230,7 @@ impl Default for FjallConfig {
             block_cache: default_fjall_block_cache(),
             write_buffer: default_fjall_write_buffer(),
             max_journal: default_fjall_max_journal(),
+            durability: default_fjall_durability(),
         }
     }
 }

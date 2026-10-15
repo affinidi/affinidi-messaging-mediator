@@ -205,7 +205,8 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         if storage.fjall.is_none()
             && (std::env::var("STORAGE_FJALL_BLOCK_CACHE").is_ok()
                 || std::env::var("STORAGE_FJALL_WRITE_BUFFER").is_ok()
-                || std::env::var("STORAGE_FJALL_MAX_JOURNAL").is_ok())
+                || std::env::var("STORAGE_FJALL_MAX_JOURNAL").is_ok()
+                || std::env::var("STORAGE_FJALL_DURABILITY").is_ok())
         {
             // Any one of the knobs being set means the operator wants to tune;
             // materialise the section at its defaults so the override lands.
@@ -215,6 +216,7 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
             env_override!(fjall.block_cache, "STORAGE_FJALL_BLOCK_CACHE");
             env_override!(fjall.write_buffer, "STORAGE_FJALL_WRITE_BUFFER");
             env_override!(fjall.max_journal, "STORAGE_FJALL_MAX_JOURNAL");
+            env_override!(fjall.durability, "STORAGE_FJALL_DURABILITY");
         }
     }
 

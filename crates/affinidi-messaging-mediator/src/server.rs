@@ -53,7 +53,7 @@ use url::Url;
 fn fjall_tuning_from_raw(
     raw: Option<&affinidi_messaging_mediator_config::FjallConfig>,
 ) -> crate::store::FjallTuning {
-    use crate::store::FjallTuning;
+    use crate::store::{FjallDurability, FjallTuning};
 
     let defaults = FjallTuning::default();
     let Some(raw) = raw else { return defaults };
@@ -65,10 +65,22 @@ fn fjall_tuning_from_raw(
         })
     };
 
+    // An unrecognised durability falls back to the *stronger* setting: a typo
+    // in a request for durability must not quietly weaken it.
+    let durability = match raw.durability.trim().to_ascii_lowercase().as_str() {
+        "buffered" => FjallDurability::Buffered,
+        "sync" => FjallDurability::Sync,
+        other => {
+            warn!("Could not parse storage.fjall.durability ('{other}'), using \"sync\"");
+            FjallDurability::Sync
+        }
+    };
+
     FjallTuning {
         block_cache: parse("block_cache", &raw.block_cache, defaults.block_cache),
         write_buffer: parse("write_buffer", &raw.write_buffer, defaults.write_buffer),
         max_journal: parse("max_journal", &raw.max_journal, defaults.max_journal),
+        durability,
     }
 }
 
@@ -1467,5 +1479,42 @@ mod rate_limit_tests {
             ip_rate_limiter(&limits(0, 0)).source(),
             Some(RATE_LIMIT_SOURCE)
         );
+    }
+}
+
+#[cfg(all(test, feature = "fjall-backend"))]
+mod fjall_tuning_tests {
+    use super::fjall_tuning_from_raw;
+    use crate::store::FjallDurability;
+    use affinidi_messaging_mediator_config::FjallConfig;
+
+    fn durability(value: &str) -> FjallDurability {
+        let raw = FjallConfig {
+            durability: value.to_string(),
+            ..FjallConfig::default()
+        };
+        fjall_tuning_from_raw(Some(&raw)).durability
+    }
+
+    #[test]
+    fn durability_defaults_to_buffered() {
+        assert_eq!(
+            fjall_tuning_from_raw(None).durability,
+            FjallDurability::Buffered
+        );
+        assert_eq!(durability("buffered"), FjallDurability::Buffered);
+    }
+
+    #[test]
+    fn durability_sync_is_recognised_case_insensitively() {
+        assert_eq!(durability("sync"), FjallDurability::Sync);
+        assert_eq!(durability(" SYNC "), FjallDurability::Sync);
+    }
+
+    /// A typo in a request for durability must not quietly weaken it.
+    #[test]
+    fn an_unrecognised_durability_is_treated_as_sync() {
+        assert_eq!(durability("fsync"), FjallDurability::Sync);
+        assert_eq!(durability(""), FjallDurability::Sync);
     }
 }
