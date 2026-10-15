@@ -352,6 +352,8 @@ pub struct TestMediatorBuilder {
     did_rate_limit: Option<(u32, u32)>,
     /// Override for `LimitsConfig.queued_send_messages_per_peer`.
     queue_send_limit_per_peer: Option<i32>,
+    /// See [`TestMediatorBuilder::message_size`].
+    message_size: Option<usize>,
     /// Stable admin identity for the mediator. `None` mints the
     /// historical opaque `did:key:z6Mk{uuid}` shape with no usable
     /// secrets — suitable for tests that don't authenticate as admin.
@@ -400,6 +402,7 @@ impl Default for TestMediatorBuilder {
             max_websocket_connections_per_did: None,
             did_rate_limit: None,
             queue_send_limit_per_peer: None,
+            message_size: None,
             clock: None,
             admin_identity: None,
             #[cfg(feature = "fjall-backend")]
@@ -643,6 +646,15 @@ impl TestMediatorBuilder {
     /// fifty real messages. `-1` disables the gate.
     pub fn queue_send_limit_per_peer(mut self, limit: i32) -> Self {
         self.queue_send_limit_per_peer = Some(limit);
+        self
+    }
+
+    /// Override `LimitsConfig.message_size` — the largest message the mediator
+    /// accepts — as `LIMIT_MESSAGE_SIZE` does in production. Defaults to the
+    /// production default (1 MiB). `http_size` and `ws_size` are raised to
+    /// match when they are smaller, as the production config requires.
+    pub fn message_size(mut self, bytes: usize) -> Self {
+        self.message_size = Some(bytes);
         self
     }
 
@@ -921,6 +933,11 @@ impl TestMediatorBuilder {
         }
         if let Some(limit) = self.queue_send_limit_per_peer {
             limits.queued_send_messages_per_peer = limit;
+        }
+        if let Some(bytes) = self.message_size {
+            limits.message_size = bytes;
+            limits.http_size = limits.http_size.max(bytes);
+            limits.ws_size = limits.ws_size.max(bytes);
         }
         if let Some((per_second, burst)) = self.did_rate_limit {
             limits.did_rate_limit_per_second = per_second;

@@ -6,7 +6,7 @@ use affinidi_messaging_mediator_common::errors::AppError;
 use affinidi_messaging_sdk::messages::SuccessResponse;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     response::IntoResponse,
     routing::{delete, get, post},
 };
@@ -25,6 +25,20 @@ pub mod message_outbound;
 pub(crate) mod oob_discovery;
 pub mod websocket;
 pub mod well_known_did_fetch;
+
+/// How much of an `/inbound` body is buffered before the handler sees it.
+///
+/// The handler takes the body as `Bytes`, which applies axum's own 2 MiB
+/// default on top of `http_size`: a mediator configured for messages larger
+/// than that refused every one of them. The body *is* the message, so a larger
+/// `message_size` needs the same here; nothing smaller than the 2 MiB default
+/// is useful, because a body between `message_size` and 2 MiB is still read so
+/// the sender gets the `message.size.exceeded` problem report. Every other
+/// route keeps axum's default.
+fn inbound_body_limit(shared_data: &SharedData) -> usize {
+    const AXUM_DEFAULT: usize = 2 * 1024 * 1024;
+    shared_data.config.limits.message_size.max(AXUM_DEFAULT)
+}
 
 pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router {
     let mut app = Router::new()
@@ -56,7 +70,11 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
     {
         app = app
             // Inbound message handling from ATM clients
-            .route("/inbound", post(message_inbound::message_inbound_handler))
+            .route(
+                "/inbound",
+                post(message_inbound::message_inbound_handler)
+                    .layer(DefaultBodyLimit::max(inbound_body_limit(shared_data))),
+            )
             // Authentication step 1/2 - Client requests challenge from server
             .route(
                 "/authenticate/challenge",

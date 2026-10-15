@@ -25,6 +25,13 @@ tsp = ["affinidi-messaging-mediator/tsp", "affinidi-messaging-sdk/tsp"]
 ## Spawn the mediator with DIDComm v1 (Aries RFC 0019) support so the e2e suite
 ## can exercise forward ingress, coordinate-mediation and message pickup.
 didcomm-v1 = ["affinidi-messaging-mediator/didcomm-v1", "dep:affinidi-messaging-didcomm-v1"]
+## Compile in `RedisStore` so the size sweep (`tests/size_sweep.rs`) can run
+## against a real Redis named by `REDIS_URL`. Nothing else here needs Redis.
+redis-backend = [
+  "affinidi-messaging-mediator/redis-backend",
+  "affinidi-messaging-mediator-common/redis-backend",
+  "dep:redis",
+]
 
 [dependencies]
 ## Optional: v1 message construction for the didcomm-v1 e2e tests.
@@ -46,6 +53,10 @@ affinidi-messaging-mediator-common = { version = "0.43.0", path = "../affinidi-m
 ## Wraps each FjallStore in a temp directory that's cleaned up when the
 ## handle drops, so tests don't leak partition files on disk.
 tempfile = { version = "3", optional = true }
+
+# ── Optional: Redis backend support (gated on `redis-backend`) ──────────
+## `FLUSHDB` between size-sweep runs, so each starts from an empty keyspace.
+redis = { version = "1.1", optional = true, features = ["tokio-comp"] }
 
 # ── DID + key generation ────────────────────────────────────────────────
 ## Used for `DID::generate_did_peer` (Ed25519 + X25519, with service URI).
