@@ -366,8 +366,17 @@ isn't default, a fully green CI run had been saying nothing at all
 about the TSP transport. If you add a test behind a new feature gate,
 add the matching job too, or it will not run.
 
-Note that no part of this suite requires Redis. `skip_if_no_redis()`
-in `tests/common` is a retained no-op that always returns `false`.
+Note that no part of the default suite requires Redis. `skip_if_no_redis()`
+in `tests/common` is a retained no-op that always returns `false`. The
+opt-in message-size sweep can also run on Redis:
+
+```sh
+cargo test -p affinidi-messaging-test-mediator --features tsp,fjall-backend \
+    --test size_sweep -- --ignored --nocapture
+# with Redis too (a server with at least 8 databases):
+REDIS_URL=redis://127.0.0.1:6379 cargo test -p affinidi-messaging-test-mediator \
+    --features tsp,fjall-backend,redis-backend --test size_sweep -- --ignored --nocapture
+```
 
 ## Cross-workspace consumption
 
