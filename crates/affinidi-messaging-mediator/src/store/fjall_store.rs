@@ -66,7 +66,7 @@ use affinidi_messaging_mediator_common::{
         ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
         OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         SentMessageState, Session, SessionState, SessionSweepReport, StatCounter, StoreHealth,
-        StreamingClientState, TrustTaskClaim, ops,
+        StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -647,6 +647,7 @@ impl FjallStore {
         message: &str,
         force_delivery: bool,
         verbatim: bool,
+        stored: Option<StoredMessageRef>,
     ) -> Result<(), MediatorError> {
         let channels = self.broadcast_channels.lock().await;
         if let Some(sender) = channels.get(mediator_uuid) {
@@ -655,6 +656,7 @@ impl FjallStore {
                 message: message.to_string(),
                 force_delivery,
                 verbatim,
+                stored,
             });
         }
         Ok(())
@@ -3322,8 +3324,34 @@ impl MediatorStore for FjallStore {
         // the broadcast channel works — it lets in-process subscribers
         // receive notifications. The cross-process aspect (which Fjall
         // can't do) stays unsupported.
-        self.publish_record(did_hash, mediator_uuid, message, force_delivery, false)
-            .await
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn streaming_publish_stored(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        stored: StoredMessageRef,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            Some(stored),
+        )
+        .await
     }
 
     async fn streaming_publish_verbatim(
@@ -3332,7 +3360,7 @@ impl MediatorStore for FjallStore {
         mediator_uuid: &str,
         message: &str,
     ) -> Result<(), MediatorError> {
-        self.publish_record(did_hash, mediator_uuid, message, true, true)
+        self.publish_record(did_hash, mediator_uuid, message, true, true, None)
             .await
     }
 

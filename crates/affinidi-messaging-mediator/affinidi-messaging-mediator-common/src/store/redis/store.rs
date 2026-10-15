@@ -18,7 +18,8 @@ use crate::store::redis::database::{
     store::MessageMetaData as InnerMessageMetaData,
 };
 use crate::store::{
-    DeliveryDecision, DeliveryMarkReport, DeliveryState, OutboxReceipt, SentMessageState, ops,
+    DeliveryDecision, DeliveryMarkReport, DeliveryState, OutboxReceipt, SentMessageState,
+    StoredMessageRef, ops,
 };
 use crate::types::{
     accounts::{
@@ -1553,13 +1554,32 @@ impl MediatorStore for RedisStore {
             .await
     }
 
+    async fn streaming_publish_stored(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        stored: StoredMessageRef,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            Some(stored),
+        )
+        .await
+    }
+
     async fn streaming_publish_verbatim(
         &self,
         did_hash: &str,
         mediator_uuid: &str,
         message: &str,
     ) -> Result<(), MediatorError> {
-        self.publish_record(did_hash, mediator_uuid, message, true, true)
+        self.publish_record(did_hash, mediator_uuid, message, true, true, None)
             .await
     }
 

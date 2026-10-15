@@ -477,18 +477,14 @@ impl TrafficMonitor {
         });
     }
 
-    /// A message was stored for `to`, and — when `live` — handed to its live
-    /// stream as well.
-    pub(crate) fn stored(
-        &self,
-        msg_id: &str,
-        from: Option<&str>,
-        to: &str,
-        body: &str,
-        live: bool,
-    ) {
+    /// A message was stored for `to`.
+    ///
+    /// Its live delivery, if any, is reported separately by the streaming task
+    /// once the notification is queued to the recipient's socket — not here,
+    /// where a publish can still be dropped (R1.1).
+    pub(crate) fn stored(&self, msg_id: &str, from: Option<&str>, to: &str, body: &str) {
         let protocol = Protocol::detect(body);
-        let base = || TrafficEvent {
+        self.emit(|| TrafficEvent {
             msg_id: Some(msg_id.to_string()),
             from: from.map(str::to_string),
             to: Some(to.to_string()),
@@ -499,17 +495,7 @@ impl TrafficMonitor {
                 Channel::Internal,
                 protocol,
             )
-        };
-        self.emit(base);
-        if live {
-            self.emit(|| TrafficEvent {
-                direction: Direction::Outbound,
-                stage: Stage::Delivered,
-                channel: Channel::Websocket,
-                latency_ms: Some(0),
-                ..base()
-            });
-        }
+        });
     }
 }
 
@@ -725,6 +711,12 @@ impl TrafficMonitor {
     /// work (a store read) to fill an event in.
     pub fn is_active(&self) -> bool {
         self.tx.receiver_count() > 0
+    }
+
+    /// Every event on the bus, unfiltered — for tests of the code that emits.
+    #[cfg(test)]
+    pub(crate) fn tap(&self) -> broadcast::Receiver<Arc<TrafficEvent>> {
+        self.tx.subscribe()
     }
 
     /// Emit an event if anyone is listening. `build` runs only then, so an

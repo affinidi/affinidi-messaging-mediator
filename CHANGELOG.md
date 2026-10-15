@@ -72,6 +72,23 @@ mediator-tui 0.11.0); they are no longer updated.
 - `MemoryStore::with_store_delay` adds random per-store latency for tests;
   it panics on an inverted range.
 
+### Fixed — monitor reports a live delivery only once it is queued to the socket
+
+- The traffic monitor's `delivered` event for a live-streamed message is now
+  emitted by the streaming task when the notification is actually queued to
+  the recipient's socket, instead of at store time (R1.1). A push dropped for
+  a full send queue or byte budget, or never published, is no longer
+  reported as delivered. Behind a shared Redis the event now comes from the
+  instance holding the socket.
+- **API (mediator-common):** `PubSubRecord` gains `stored:
+  Option<StoredMessageRef>` (`#[serde(default)]`, wire-compatible across
+  versions in both directions); code building it with a literal needs the
+  new field. `MediatorStore::streaming_publish_stored` is a new provided
+  method; its default publishes untagged, so a third-party store keeps
+  delivering but reports no live `delivered` events until it implements it.
+- During a rolling upgrade, live deliveries published by an older instance
+  are not reported as `delivered`.
+
 ## 0.42.0 (release/0.42)
 
 ### Moved — the mediator has its own repository

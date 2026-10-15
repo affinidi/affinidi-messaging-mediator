@@ -1,4 +1,7 @@
-use crate::{errors::MediatorError, store::types::PubSubRecord};
+use crate::{
+    errors::MediatorError,
+    store::types::{PubSubRecord, StoredMessageRef},
+};
 use redis::{Value, from_redis_value};
 use tracing::{Level, debug, error, event};
 
@@ -124,7 +127,7 @@ impl Database {
         message: &str,
         force_delivery: bool,
     ) -> Result<(), MediatorError> {
-        self.publish_record(did_hash, stream_uuid, message, force_delivery, false)
+        self.publish_record(did_hash, stream_uuid, message, force_delivery, false, None)
             .await
     }
 
@@ -137,12 +140,14 @@ impl Database {
         message: &str,
         force_delivery: bool,
         verbatim: bool,
+        stored: Option<StoredMessageRef>,
     ) -> Result<(), MediatorError> {
         let record = match serde_json::to_string(&PubSubRecord {
             did_hash: did_hash.to_string(),
             message: message.to_string(),
             force_delivery,
             verbatim,
+            stored,
         }) {
             Ok(record) => record,
             Err(err) => {

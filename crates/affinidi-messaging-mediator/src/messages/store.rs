@@ -5,7 +5,7 @@ use crate::messages::MessageHandler;
 #[cfg(feature = "didcomm")]
 use crate::messages::PackOptions;
 use affinidi_messaging_mediator_common::errors::MediatorError;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::{MediatorStore, StoredMessageRef};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::PackEncryptedMetadata;
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
@@ -47,27 +47,31 @@ async fn _store_message(
         )
         .await?;
 
-    // Only a notification that was actually published counts as live.
-    let live = match state
+    state
+        .monitor
+        .stored(&msg_id, from_did_hash, to_did_hash, data);
+    // Tagged with the stored message, so the streaming task reports the
+    // delivery when (and only if) it queues the notification to the socket.
+    if let Some(stream_uuid) = state
         .database
         .streaming_is_client_live(to_did_hash, force_live_delivery)
         .await
-    {
-        Some(stream_uuid) => {
-            _live_stream(
-                &state.database,
+        && let Err(err) = state
+            .database
+            .streaming_publish_stored(
                 to_did_hash,
                 &stream_uuid,
                 data,
                 force_live_delivery,
+                StoredMessageRef {
+                    msg_id: msg_id.clone(),
+                    from_did_hash: from_did_hash.map(str::to_string),
+                },
             )
             .await
-        }
-        None => false,
-    };
-    state
-        .monitor
-        .stored(&msg_id, from_did_hash, to_did_hash, data, live);
+    {
+        warn!("Live notification for did_hash({to_did_hash}) not published: {err}");
+    }
     state.activity.received(state, to_did_hash).await;
     crate::account_stats::count_stored(state, from_did_hash, to_did_hash, data).await;
     Ok(msg_id)
