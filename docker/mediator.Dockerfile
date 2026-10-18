@@ -33,21 +33,10 @@ COPY . .
 # didcomm + redis-backend + jemalloc come from defaults; add tsp + secrets-aws
 # (secrets-aws pulls in the `aws` feature required by aws_secrets:// /
 # aws_parameter_store://).
-#
+RUN cargo build --release -p affinidi-messaging-mediator --features tsp,secrets-aws
 # mediator-setup: only the AWS backends the cloud deployment uses.
-#
-# `target/` and the registry live in BuildKit cache mounts, never in a layer:
-# a release `target/` is several GB, and as a layer it was written once into the
-# builder stage, again into the docker store by `load: true` and again into the
-# GHA cache by `cache-to: mode=max` — enough to exhaust a standard runner's disk
-# and get the job killed mid-build. Only the two binaries leave this RUN.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release --locked -p affinidi-messaging-mediator --features tsp,secrets-aws \
-    && cargo build --release --locked -p affinidi-messaging-mediator-setup \
-        --no-default-features --features secrets-aws,publish-aws \
-    && mkdir -p /out \
-    && cp target/release/mediator target/release/mediator-setup /out/
+RUN cargo build --release -p affinidi-messaging-mediator-setup \
+    --no-default-features --features secrets-aws,publish-aws
 
 # Runtime base pinned by digest: nothing here is rebuilt from source, so the
 # digest is the only thing fixing what ships. Bump it to pick up CVE fixes.
@@ -64,8 +53,8 @@ WORKDIR /app
 # `-c conf/mediator.toml` relative to WORKDIR, so this is the file it reads.
 COPY crates/affinidi-messaging-mediator/conf conf
 COPY docker/conf/mediator.toml conf/mediator.toml
-COPY --from=builder /out/mediator /usr/local/bin
-COPY --from=builder /out/mediator-setup /usr/local/bin
+COPY --from=builder /app/target/release/mediator /usr/local/bin
+COPY --from=builder /app/target/release/mediator-setup /usr/local/bin
 RUN groupadd -r lowPrivGroup && useradd -r -g lowPrivGroup lowPrivUser
 USER lowPrivUser
 EXPOSE $PORT
