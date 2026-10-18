@@ -27,8 +27,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
-affinidi-messaging-test-mediator = { version = "0.43.0", path = "../affinidi-messaging-test-mediator" }
-affinidi-messaging-mediator-common = { version = "0.43.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
+affinidi-messaging-test-mediator = { version = "0.44.0", path = "../affinidi-messaging-test-mediator" }
+affinidi-messaging-mediator-common = { version = "0.44.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 
