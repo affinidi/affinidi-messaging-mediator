@@ -8,6 +8,25 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — trust-tasks-rs 0.32, affinidi-messaging-sdk 0.37 (breaking)
+
+- Moves to `trust-tasks-rs` / `trust-tasks-proof` 0.32,
+  `affinidi-messaging-sdk` 0.37, `affinidi-tdk` 0.27 and (test-mediator's
+  dev-dependency) `affinidi-messaging-didcomm-service` 0.22. 0.32
+  (trustoverip/dtgwg-trust-tasks-tf#818) is breaking: `SealedRecord` gains a
+  `version` (#816), the device `Capability` enum gains `sign-document` (#819),
+  and rooms `register` 0.2 and `group/remove` 0.3 are new. None of it touches
+  the mediator. No source change.
+- **API:** the generated Trust Task types are in the public API —
+  mediator-admin re-exports `trust_tasks_rs::specs::messaging` as `specs` and
+  takes an `ATM` — so consumers must move to `trust-tasks-rs` 0.32 and
+  `affinidi-messaging-sdk` 0.37 with this release.
+- `vta-sdk` 0.68 (the optional `vta` feature, and mediator-setup) still pulls
+  `affinidi-messaging-sdk` 0.36 / `affinidi-tdk` 0.26 / `trust-tasks-rs` 0.31
+  beside these until verifiable-trust-infrastructure publishes a `vta-sdk` on
+  0.37 / 0.27 / 0.32. No `trust-tasks-rs` type crosses between `vta-sdk` and
+  the mediator, so it builds.
+
 ### Added — `[storage.fjall] durability`
 
 - `durability = "buffered"` (default, unchanged behaviour) or `"sync"`

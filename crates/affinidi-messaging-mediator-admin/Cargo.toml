@@ -12,11 +12,11 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-affinidi-messaging-sdk = "0.36.1"
+affinidi-messaging-sdk = "0.37"
 affinidi-messaging-didcomm = "0.15"
 affinidi-tdk-common = "0.7"
 affinidi-secrets-resolver = "0.5"
-trust-tasks-rs = "0.31"
+trust-tasks-rs = "0.32"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
