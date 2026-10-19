@@ -8,6 +8,15 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — vta-sdk 0.72
+
+- `vta-sdk` 0.68 → 0.72 (mediator's optional `vta` feature, and mediator-setup).
+  0.72 is the release on `trust-tasks-rs` 0.32 / `affinidi-messaging-sdk` 0.37 /
+  `affinidi-tdk` 0.27, so the lockfile holds one copy of each again. 0.43.0
+  linked a second (0.31 / 0.36 / 0.26) through vta-sdk 0.68; a release
+  `rustc` of `trust-tasks-rs` peaks at ~6.7 GB, and two compiling at once ran a
+  16 GB runner out of memory. No source change.
+
 ## 0.43.0 (release/0.43)
 
 ### Changed — trust-tasks-rs 0.32, affinidi-messaging-sdk 0.37 (breaking)
