@@ -1,0 +1,47 @@
+name: pipeline-rust trial
+
+# Trial run of affinidi/pipeline-rust's shared jobs next to ci.yml, to compare
+# results and timings before adopting them. Not a gate; do not merge.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # fmt, cargo check, clippy, cargo-deny, cargo-audit and the Snyk rust-scan.
+  checks:
+    uses: affinidi/pipeline-rust/.github/workflows/checks-no-test.yaml@17a43382bad782bf481ab4da13f7656532e42200
+    secrets: inherit
+    permissions:
+      contents: read
+      issues: write # cargo-audit
+    with:
+      toolchain: "1.95.0"
+      rustflags: "-D warnings --cfg tracing_unstable"
+      ubuntu-rust-deps: "libdbus-1-dev libssl-dev libchafa-dev pkg-config"
+      runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+
+  test:
+    uses: affinidi/pipeline-rust/.github/workflows/test.yaml@17a43382bad782bf481ab4da13f7656532e42200
+    with:
+      toolchain: "1.95.0"
+      rustflags: "-D warnings --cfg tracing_unstable"
+      ubuntu-rust-deps: "libdbus-1-dev libssl-dev libchafa-dev pkg-config"
+      useRedis: true
+      lean-debuginfo: true
+      runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+
+  # Report mode: threshold 0, reports a number and never fails on it.
+  coverage:
+    uses: affinidi/pipeline-rust/.github/workflows/coverage.yaml@17a43382bad782bf481ab4da13f7656532e42200
+    with:
+      toolchain: "1.95.0"
+      rustflags: "--cfg tracing_unstable"
+      ubuntu-rust-deps: "libdbus-1-dev libssl-dev libchafa-dev pkg-config"
+      coverage: 0
+      useRedis: true
+      runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
