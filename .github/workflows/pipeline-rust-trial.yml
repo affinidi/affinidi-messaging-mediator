@@ -19,6 +19,8 @@ jobs:
     permissions:
       contents: read
       issues: write # cargo-audit
+      # deprecation-check asks for it; checked at startup even while disabled.
+      pull-requests: write
     with:
       toolchain: "1.95.0"
       rustflags: "-D warnings --cfg tracing_unstable"
