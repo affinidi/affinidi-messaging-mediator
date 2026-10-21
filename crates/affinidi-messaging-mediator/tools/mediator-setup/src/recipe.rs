@@ -124,6 +124,15 @@ pub struct IdentitySection {
     /// DIDs; ignored otherwise.
     #[serde(default)]
     pub save_did_web: bool,
+    /// The identity a locally generated did:webvh log is presented as:
+    /// `webvh` (default) or `scid`, its did:scid:vh:1 DID. Only meaningful
+    /// for `did_method = "did:webvh"`.
+    #[serde(default)]
+    pub present_as: Option<String>,
+    /// List the did:scid alias in the generated log's `alsoKnownAs`. Default
+    /// `true`; `false` is refused with `present_as = "scid"`.
+    #[serde(default)]
+    pub scid_also_known_as: Option<bool>,
     /// Extra key suites to mint alongside the mandatory Ed25519 + X25519
     /// pair, e.g. `["p256"]`. Empty by default (Curve25519 only). Applies
     /// to the local `did:peer` / `did:webvh` generators.
@@ -157,6 +166,8 @@ impl Default for IdentitySection {
             did_method: default_did_method(),
             public_url: None,
             save_did_web: false,
+            present_as: None,
+            scid_also_known_as: None,
             extra_key_suites: Vec::new(),
         }
     }
@@ -556,6 +567,26 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         config.public_url = url.clone();
     }
     config.save_did_web = recipe.identity.save_did_web;
+    config.present_as_scid = match recipe.identity.present_as.as_deref() {
+        None | Some("webvh") | Some("did:webvh") => false,
+        Some("scid") | Some("did:scid") => true,
+        Some(other) => {
+            anyhow::bail!("Invalid identity.present_as '{other}': expected 'webvh' or 'scid'")
+        }
+    };
+    config.scid_also_known_as = recipe.identity.scid_also_known_as.unwrap_or(true);
+    if config.present_as_scid && config.did_method != DID_WEBVH {
+        anyhow::bail!(
+            "identity.present_as = 'scid' applies to did_method = 'did:webvh' (a locally \
+             generated log)"
+        );
+    }
+    if config.present_as_scid && !config.scid_also_known_as {
+        anyhow::bail!(
+            "identity.present_as = 'scid' needs the did:scid alias: \
+             scid_also_known_as cannot be false"
+        );
+    }
     config.key_suite = parse_extra_key_suites(&recipe.identity.extra_key_suites)?;
 
     // Secrets — accept either the bare scheme (backward compat with
@@ -776,6 +807,12 @@ pub fn from_wizard_config(config: &WizardConfig) -> String {
     out.push_str(&format!("did_method = \"{did_method}\"\n"));
     if !config.public_url.is_empty() {
         out.push_str(&format!("public_url = \"{}\"\n", config.public_url));
+    }
+    if config.present_as_scid {
+        out.push_str("present_as = \"scid\"\n");
+    }
+    if !config.scid_also_known_as {
+        out.push_str("scid_also_known_as = false\n");
     }
     out.push('\n');
 
@@ -1278,6 +1315,74 @@ ssl = "none"
     fn test_invalid_protocol_errors() {
         let mut recipe = minimal_recipe();
         recipe.deployment.protocols = vec!["grpc".into()];
+        assert!(to_wizard_config(&recipe).is_err());
+    }
+
+    fn webvh_recipe() -> BuildRecipe {
+        let mut recipe = minimal_recipe();
+        recipe.identity.did_method = "did:webvh".into();
+        recipe.identity.public_url = Some("https://example.com".into());
+        recipe
+    }
+
+    #[test]
+    fn present_as_defaults_to_webvh_with_the_scid_alias() {
+        let config = to_wizard_config(&webvh_recipe()).unwrap();
+        assert!(!config.present_as_scid);
+        assert!(config.scid_also_known_as);
+    }
+
+    #[test]
+    fn present_as_scid_is_read() {
+        for value in ["scid", "did:scid"] {
+            let mut recipe = webvh_recipe();
+            recipe.identity.present_as = Some(value.into());
+            let config = to_wizard_config(&recipe).unwrap();
+            assert!(config.present_as_scid, "{value}");
+            assert!(config.scid_also_known_as);
+        }
+    }
+
+    #[test]
+    fn scid_alias_can_be_turned_off_for_webvh() {
+        let mut recipe = webvh_recipe();
+        recipe.identity.scid_also_known_as = Some(false);
+        assert!(!to_wizard_config(&recipe).unwrap().scid_also_known_as);
+    }
+
+    #[test]
+    fn present_as_scid_and_alias_round_trip() {
+        let mut recipe = webvh_recipe();
+        recipe.identity.present_as = Some("scid".into());
+        let toml = from_wizard_config(&to_wizard_config(&recipe).unwrap());
+        assert!(toml.contains("present_as = \"scid\""));
+        let replayed = to_wizard_config(&toml::from_str::<BuildRecipe>(&toml).unwrap()).unwrap();
+        assert!(replayed.present_as_scid);
+
+        let mut recipe = webvh_recipe();
+        recipe.identity.scid_also_known_as = Some(false);
+        let toml = from_wizard_config(&to_wizard_config(&recipe).unwrap());
+        assert!(toml.contains("scid_also_known_as = false"));
+
+        // Defaults write nothing new.
+        let toml = from_wizard_config(&to_wizard_config(&webvh_recipe()).unwrap());
+        assert!(!toml.contains("present_as") && !toml.contains("scid_also_known_as"));
+    }
+
+    #[test]
+    fn present_as_scid_is_refused_without_the_alias_or_off_webvh() {
+        let mut recipe = webvh_recipe();
+        recipe.identity.present_as = Some("scid".into());
+        recipe.identity.scid_also_known_as = Some(false);
+        assert!(to_wizard_config(&recipe).is_err());
+
+        let mut recipe = minimal_recipe();
+        recipe.identity.did_method = "did:peer".into();
+        recipe.identity.present_as = Some("scid".into());
+        assert!(to_wizard_config(&recipe).is_err());
+
+        let mut recipe = webvh_recipe();
+        recipe.identity.present_as = Some("web".into());
         assert!(to_wizard_config(&recipe).is_err());
     }
 

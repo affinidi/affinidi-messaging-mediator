@@ -39,6 +39,19 @@ pub struct Args {
     #[arg(long)]
     pub save_did_web: bool,
 
+    /// Present a locally generated did:webvh log as its did:scid:vh:1 DID: an
+    /// identity that keeps its name when the log moves host. The log, and
+    /// what the mediator serves, are the same. Requires
+    /// `--did-method webvh` and the did:scid alias.
+    #[arg(long, conflicts_with = "no_scid_alias")]
+    pub present_as_scid: bool,
+
+    /// Leave the did:scid:vh:1 alias out of a locally generated did:webvh
+    /// log's `alsoKnownAs`. It is listed by default, so peers can recognise
+    /// the identity under either name.
+    #[arg(long)]
+    pub no_scid_alias: bool,
+
     /// Extra cryptographic key suite(s) to provision *in addition to* the
     /// mandatory Ed25519 (signing) + X25519 (key-agreement) pair.
     /// Repeatable: `--key-suite p256`. Counterparties that can't speak

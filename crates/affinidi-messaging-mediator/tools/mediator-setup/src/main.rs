@@ -269,6 +269,12 @@ fn apply_cli_args(args: &Args, config: &mut WizardConfig) {
     if args.save_did_web {
         config.save_did_web = true;
     }
+    if args.present_as_scid {
+        config.present_as_scid = true;
+    }
+    if args.no_scid_alias {
+        config.scid_also_known_as = false;
+    }
     if !args.key_suite.is_empty() {
         config.key_suite = args.key_suite.clone();
     }
@@ -335,6 +341,11 @@ pub(crate) fn build_config_from_args(args: &Args) -> anyhow::Result<WizardConfig
     // Validate required fields for did:webvh
     if config.did_method == DID_WEBVH && config.public_url.is_empty() {
         anyhow::bail!("--public-url is required when using did:webvh in non-interactive mode");
+    }
+    if config.present_as_scid && config.did_method != DID_WEBVH {
+        anyhow::bail!(
+            "--present-as-scid applies to a locally generated did:webvh (--did-method webvh)"
+        );
     }
 
     Ok(config)
@@ -1347,11 +1358,15 @@ async fn mint_did_material(
             };
             let address = strip_url_path_owned(&raw_url);
             let service_url = combine_url_prefix(&address, &config.api_prefix);
-            let result = generators::did_webvh::generate_did_webvh(
+            let result = generators::did_webvh::generate_did_webvh_as(
                 &address,
                 &service_url,
                 &config.key_suite,
                 config.tsp_enabled,
+                generators::did_webvh::WebvhIdentity {
+                    present_as_scid: config.present_as_scid,
+                    scid_also_known_as: config.scid_also_known_as,
+                },
             )
             .await?;
             (result.did, result.secrets, Some(result.did_doc), None)
@@ -1727,8 +1742,17 @@ fn write_config_artefacts(
         // have no scid to drop, so we skip with a note rather than emit a
         // misleading file.
         if config.save_did_web {
-            if artefacts.mediator_did.starts_with("did:webvh:") {
-                write_did_web_json(&config.config_path, doc, &artefacts.mediator_did);
+            // A did:scid mediator's log is still a did:webvh log; bridge
+            // from the log's own did:webvh DID.
+            let webvh_did = if artefacts.mediator_did.starts_with("did:webvh:") {
+                Some(artefacts.mediator_did.clone())
+            } else if artefacts.mediator_did.starts_with("did:scid:") {
+                generators::did_webvh::log_webvh_did(doc)
+            } else {
+                None
+            };
+            if let Some(webvh_did) = webvh_did {
+                write_did_web_json(&config.config_path, doc, &webvh_did);
             } else {
                 eprintln!(
                     "  \x1b[33mNote:\x1b[0m --save-did-web requested but the mediator DID \
