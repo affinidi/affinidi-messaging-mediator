@@ -8,6 +8,21 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — trust-tasks-rs 0.33, affinidi-messaging-sdk 0.38 (breaking)
+
+- `trust-tasks-rs` / `trust-tasks-proof` 0.32 → 0.33, `affinidi-messaging-sdk`
+  0.38, `affinidi-tdk` 0.28 and (test-mediator's dev-dependency)
+  `affinidi-messaging-didcomm-service` 0.23. 0.33
+  (trustoverip/dtgwg-trust-tasks-tf#858) adds a linking form to
+  `persona/contact/put/1.1` and makes `subjectDid` optional in its `get`/`list`
+  1.1 responses; none of it touches the mediator. No source change.
+  mediator-admin re-exports `trust_tasks_rs::specs::messaging` and takes an
+  `ATM`, so consumers move to `trust-tasks-rs` 0.33 and `affinidi-messaging-sdk`
+  0.38 with this release. The lockfile holds `affinidi-messaging-sdk` 0.37 /
+  `trust-tasks-rs` 0.32 beside these until verifiable-trust-infrastructure
+  publishes a `vta-sdk` on 0.38 / 0.33; no type crosses between `vta-sdk` and
+  the mediator, so it builds.
+
 ### Changed — vta-sdk 0.72
 
 - `vta-sdk` 0.68 → 0.72 (mediator's optional `vta` feature, and mediator-setup).
