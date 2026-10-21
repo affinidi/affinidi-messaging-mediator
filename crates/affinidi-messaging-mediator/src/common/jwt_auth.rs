@@ -20,7 +20,6 @@ use http::{StatusCode, request::Parts};
 use jsonwebtoken::{TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha256::digest;
 use std::{
     fmt::{Debug, Display},
     net::SocketAddr,
@@ -174,7 +173,7 @@ pub(crate) async fn authenticate_token(
 
     let session_id = token_data.claims.session_id.clone();
     let did = token_data.claims.sub.clone();
-    let did_hash = digest(&did);
+    let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
 
     // Everything has passed token wise - expensive database operations happen here
     let mut saved_session: Session = state
@@ -199,7 +198,7 @@ pub(crate) async fn authenticate_token(
     // record (legacy data, schema drift). Either way the handler
     // would silently see the wrong DID — surface as InvalidToken
     // here so the failure is loud and the client re-authenticates.
-    if saved_session.did != did {
+    if !affinidi_messaging_mediator_common::did_identity::same_account(&saved_session.did, &did) {
         warn!(
             session_id = %session_id,
             jwt_did = %did,

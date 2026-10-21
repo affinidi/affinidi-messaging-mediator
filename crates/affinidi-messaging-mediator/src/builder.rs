@@ -19,7 +19,6 @@ use affinidi_messaging_mediator_common::{
 };
 use affinidi_secrets_resolver::ThreadedSecretsResolver;
 use axum_server::tls_rustls::RustlsConfig;
-use sha256::digest;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -324,7 +323,9 @@ impl MediatorBuilder {
     /// Set the mediator's DID. Required.
     pub fn mediator_did(mut self, did: impl Into<String>) -> Self {
         self.config.mediator_did = did.into();
-        self.config.mediator_did_hash = digest(self.config.mediator_did.as_str());
+        self.config.mediator_did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(
+            self.config.mediator_did.as_str(),
+        );
         self
     }
 

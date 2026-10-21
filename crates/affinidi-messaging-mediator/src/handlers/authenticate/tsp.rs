@@ -86,7 +86,8 @@ pub async fn tsp_authentication_response(
             )
             .into());
         }
-        if session.did != body.vid {
+        if !affinidi_messaging_mediator_common::did_identity::same_account(&session.did, &body.vid)
+        {
             return Err(MediatorError::problem(
                 33,
                 &body.session_id,

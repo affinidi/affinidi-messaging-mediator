@@ -188,7 +188,10 @@ pub(crate) async fn handle_inbound_tsp(
     //     recipient to pick up (Direct/Routed/Nested/Control are all just carried).
     //   * receiver == this mediator → we hold the key, so unpack to learn the kind
     //     and act as the relay hop (Routed) / metadata-privacy intermediary (Nested).
-    if meta.receiver != state.config.mediator_did {
+    if !affinidi_messaging_mediator_common::did_identity::same_account(
+        &meta.receiver,
+        &state.config.mediator_did,
+    ) {
         // Direct delivery, and subject to the same two gates the DIDComm
         // direct-delivery branch applies. `docs/acls.md` §6 documents this flow
         // as "Direct delivery (DIDComm and TSP)" and has always promised both.
@@ -218,7 +221,11 @@ pub(crate) async fn handle_inbound_tsp(
         // WebSocket ingress gates only on LOCAL at upgrade, so without this a DID
         // whose SEND_MESSAGES was revoked could still post TSP frames over a
         // socket.
-        let from_acls = authz::effective_acls(state, &digest(meta.sender.as_bytes())).await?;
+        let from_acls = authz::effective_acls(
+            state,
+            &affinidi_messaging_mediator_common::did_identity::did_hash(&meta.sender),
+        )
+        .await?;
         if authz::require_capability(&from_acls, Capability::SendMessages).is_err() {
             return Err(tsp_problem(
                 session,
@@ -327,7 +334,11 @@ pub(crate) async fn handle_inbound_tsp(
             TspMessageType::Routed | TspMessageType::Nested
         )
     {
-        let from_acls = authz::effective_acls(state, &digest(meta.sender.as_bytes())).await?;
+        let from_acls = authz::effective_acls(
+            state,
+            &affinidi_messaging_mediator_common::did_identity::did_hash(&meta.sender),
+        )
+        .await?;
         if authz::require_capability(&from_acls, Capability::SendForwarded).is_err() {
             return Err(tsp_problem(
                 session,
@@ -619,8 +630,8 @@ async fn deliver_opaque(
     from_vid: &str,
     bytes: &[u8],
 ) -> Result<InboundMessageResponse, MediatorError> {
-    let to_hash = digest(to_vid.as_bytes());
-    let from_hash = digest(from_vid.as_bytes());
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_vid);
+    let from_hash = affinidi_messaging_mediator_common::did_identity::did_hash(from_vid);
 
     // Recipient-side ACL checks, mirroring DIDComm direct delivery: existence,
     // RECEIVE_MESSAGES and the access-list verdict all come from one lookup.
@@ -703,7 +714,9 @@ async fn forward_to_next(
 ) -> Result<InboundMessageResponse, MediatorError> {
     if state
         .database
-        .account_exists(&digest(next.as_bytes()))
+        .account_exists(&affinidi_messaging_mediator_common::did_identity::did_hash(
+            next,
+        ))
         .await?
     {
         // Local delivery works entirely on hashes and persists no plaintext
@@ -762,8 +775,8 @@ async fn forward_tsp_remote(
     let entry = ForwardQueueEntry {
         stream_id: String::new(),
         message: BASE64_URL_SAFE_NO_PAD.encode(bytes),
-        to_did_hash: digest(next.as_bytes()),
-        from_did_hash: digest(from_vid.as_bytes()),
+        to_did_hash: affinidi_messaging_mediator_common::did_identity::did_hash(next),
+        from_did_hash: affinidi_messaging_mediator_common::did_identity::did_hash(from_vid),
         from_did: from_vid.to_string(),
         // §5.3.3: an endpoint-to-endpoint VID is not written to the queue. The
         // hash and the resolved endpoint above are all delivery uses; the
@@ -1145,7 +1158,7 @@ async fn handle_inbound_didcomm(
                     // and the access-list verdict — comes from one lookup. The
                     // three facts all derive from the same stored record, so
                     // asking for them separately cost three reads of it.
-                    let to_hash = digest(to_did);
+                    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
                     let from_hash = envelope.from_did.as_ref().map(digest);
                     let Some(recipient) = state
                         .database
@@ -1392,7 +1405,7 @@ fn check_session_sender_match(
 ) -> Result<(), MediatorError> {
     if let Some(kid) = sender_kid
         && let Some((did, _fragment)) = kid.split_once('#')
-        && did == session.did
+        && affinidi_messaging_mediator_common::did_identity::same_account(did, &session.did)
     {
         return Ok(());
     }

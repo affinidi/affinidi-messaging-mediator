@@ -28,6 +28,12 @@ pub use affinidi_messaging_mediator_types as types;
 /// the `mediator-setup` wizard (writing the `did-web.json` artefact).
 pub mod did_web;
 
+/// The account a DID names, and its hash. Pure, always built: every place
+/// the mediator keys storage, sessions or access control by a DID goes
+/// through it, so a did:scid identity is one account whether or not the
+/// DID URL it presents carries a `src` locator.
+pub mod did_identity;
+
 /// `aws_parameter_store://` target parsing. Pure (no AWS SDK), always
 /// built: shared by the mediator runtime (reading `mediator_did` from a
 /// parameter) and the `mediator-setup` wizard (publishing the minted DID

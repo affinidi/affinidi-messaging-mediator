@@ -1952,7 +1952,7 @@ impl MediatorStore for FjallStore {
         // Join with account record for ACLs + role (matches the
         // Redis path's "session HMGET + DID HMGET" pipeline).
         if !did.is_empty() {
-            let did_hash = digest(did);
+            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
             if let Some(v) = self
                 .accounts
                 .get(did_hash.as_bytes())
@@ -1992,7 +1992,7 @@ impl MediatorStore for FjallStore {
         did: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
-        let did_hash = digest(did);
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2212,7 +2212,9 @@ impl MediatorStore for FjallStore {
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| Self::db_err("account_remove:v1keys.iter", e))?;
-            if sha256::digest(value.as_ref()) == did_hash {
+            if std::str::from_utf8(value.as_ref()).is_ok_and(|owner| {
+                affinidi_messaging_mediator_common::did_identity::did_hash(owner) == did_hash
+            }) {
                 batch.remove(&self.v1_routing_keys, key.as_ref());
             }
         }
@@ -2303,7 +2305,9 @@ impl MediatorStore for FjallStore {
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| Self::db_err("v1_routing_keys_for:iter", e))?;
-            if sha256::digest(value.as_ref()) == did_hash {
+            if std::str::from_utf8(value.as_ref()).is_ok_and(|owner| {
+                affinidi_messaging_mediator_common::did_identity::did_hash(owner) == did_hash
+            }) {
                 keys.push(String::from_utf8_lossy(key.as_ref()).into_owned());
             }
         }

@@ -1797,7 +1797,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         did: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
-        let did_hash = sha256::digest(did);
+        let did_hash = crate::did_identity::did_hash(did);
         let mut session = self
             .get_session(old_session_id, did)
             .await

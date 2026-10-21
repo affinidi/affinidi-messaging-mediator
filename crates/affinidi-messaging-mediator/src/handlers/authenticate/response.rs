@@ -16,7 +16,6 @@ use affinidi_messaging_sdk::messages::{
 use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
 use axum::{Json, extract::State};
 use http::StatusCode;
-use sha256::digest;
 use tracing::{Instrument, Level, debug, info, span};
 
 /// POST /authenticate
@@ -93,7 +92,13 @@ pub async fn authentication_response(
         let from_did = match &envelope.from_did {
             Some(from_did) => {
                 // Check if DID is allowed to connect
-                match authz::authentication_check(&state, &digest(from_did), None).await {
+                match authz::authentication_check(
+                    &state,
+                    &affinidi_messaging_mediator_common::did_identity::did_hash(from_did),
+                    None,
+                )
+                .await
+                {
                     Ok((allowed, _)) => {
                         if allowed {
                             from_did.to_string()
@@ -291,7 +296,10 @@ pub async fn authentication_response(
 
         // check that the DID matches from what was given for the initial challenge request to what was used for the message response
         if let Some(from_did) = &msg.from
-            && from_did != &session.did
+            && !affinidi_messaging_mediator_common::did_identity::same_account(
+                from_did,
+                &session.did,
+            )
         {
             return Err(MediatorError::problem_with_log(
                 33,

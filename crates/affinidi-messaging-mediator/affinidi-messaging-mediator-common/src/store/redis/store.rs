@@ -972,7 +972,7 @@ impl MediatorStore for RedisStore {
         did: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
-        let did_hash = sha256::digest(did);
+        let did_hash = crate::did_identity::did_hash(did);
         // Inherent method on RedisStore (in `database/session.rs`)
         // that issues RENAME + HSET in one pipelined transaction.
         self.update_session_authenticated(

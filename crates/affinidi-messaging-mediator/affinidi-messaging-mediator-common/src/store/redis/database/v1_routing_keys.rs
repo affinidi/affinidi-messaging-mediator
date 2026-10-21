@@ -42,7 +42,7 @@ impl RedisStore {
         verkey: &str,
         did: &str,
     ) -> Result<(), MediatorError> {
-        let did_hash = sha256::digest(did.as_bytes());
+        let did_hash = crate::did_identity::did_hash(did);
         let _span = span!(Level::DEBUG, "v1_routing_key_bind", verkey, did_hash);
         async move {
             let mut con = self.get_connection().await?;
@@ -149,7 +149,7 @@ impl RedisStore {
             .cmd("DEL")
             .arg(key_owner(verkey))
             .cmd("SREM")
-            .arg(key_owned(&sha256::digest(owner.as_bytes())))
+            .arg(key_owned(&crate::did_identity::did_hash(&owner)))
             .arg(verkey);
         pipe.exec_async(&mut con).await.map_err(|err| {
             MediatorError::DatabaseError(

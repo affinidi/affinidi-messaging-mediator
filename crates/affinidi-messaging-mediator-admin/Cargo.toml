@@ -13,6 +13,9 @@ repository.workspace = true
 
 [dependencies]
 affinidi-messaging-sdk = "0.38"
+## The account a did:scid names: its `src` locator is not part of the
+## identity (`scid` module, 0.4.4).
+affinidi-did-common = "0.4"
 affinidi-messaging-didcomm = "0.15"
 affinidi-tdk-common = "0.7"
 affinidi-secrets-resolver = "0.5"

@@ -108,7 +108,7 @@ async fn client_account(
     sender: &Verkey,
 ) -> Result<ClientAccount, MediatorError> {
     let did = sender.to_did_key();
-    let did_hash = digest(did.as_bytes());
+    let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
 
     if !state.database.account_exists(&did_hash).await? {
         // Same gate as `handlers::authenticate::response`: in explicit-allow

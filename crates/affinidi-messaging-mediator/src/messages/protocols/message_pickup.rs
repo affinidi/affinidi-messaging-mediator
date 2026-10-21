@@ -19,7 +19,6 @@ use affinidi_messaging_sdk::{
 use base64::prelude::*;
 use http::StatusCode;
 use serde_json::json;
-use sha256::digest;
 use tracing::{Instrument, debug, info, span, warn};
 use uuid::Uuid;
 
@@ -55,7 +54,10 @@ pub(crate) async fn status_request(
             serde_json::from_value::<MessagePickupStatusRequest>(msg.body.to_owned())
         {
             if let Some(recipient_did) = body.recipient_did {
-                if recipient_did != session.did {
+                if !affinidi_messaging_mediator_common::did_identity::same_account(
+                    &recipient_did,
+                    &session.did,
+                ) {
                     debug!(
                         "recipient_did: ({}) doesn't match session.did!",
                         recipient_did
@@ -73,7 +75,7 @@ pub(crate) async fn status_request(
                         "recipient_did doesn't match session.did",
                     ));
                 } else {
-                    digest(recipient_did)
+                    affinidi_messaging_mediator_common::did_identity::did_hash(&recipient_did)
                 }
             } else {
                 session.did_hash.clone()
@@ -323,7 +325,8 @@ pub(crate) async fn delivery_request(
         let (recipient_did, limit): (String, usize) =
             _parse_and_validate_delivery_request_body(session, msg)?;
 
-        let recipient_did_hash = digest(recipient_did.clone());
+        let recipient_did_hash =
+            affinidi_messaging_mediator_common::did_identity::did_hash(recipient_did.clone());
 
         debug!(
             "Body: recipient_did: {}, limit: {}",
@@ -522,7 +525,8 @@ fn _parse_and_validate_delivery_request_body(
             }
         };
 
-    if session.did != recipient_did {
+    if !affinidi_messaging_mediator_common::did_identity::same_account(&session.did, &recipient_did)
+    {
         return Err(MediatorError::problem_with_log(
             52,
             &session.session_id,
@@ -617,7 +621,10 @@ fn _validate_msg(
     };
 
     // Must be addressed to Mediator
-    if to != state.config.mediator_did {
+    if !affinidi_messaging_mediator_common::did_identity::same_account(
+        &to,
+        &state.config.mediator_did,
+    ) {
         debug!(
             "to: ({}) doesn't match Mediator DID ({})",
             to, state.config.mediator_did

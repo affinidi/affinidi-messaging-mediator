@@ -188,9 +188,9 @@ pub(crate) async fn authentication_check(
 /// matches the session DID. The `sender_kid` is a key ID like `did:...#key-N`.
 pub(crate) fn check_admin_signature(session: &Session, sender_kid: &Option<String>) -> bool {
     match sender_kid {
-        Some(kid) => kid
-            .split_once('#')
-            .is_some_and(|(did, _)| did == session.did),
+        Some(kid) => kid.split_once('#').is_some_and(|(did, _)| {
+            affinidi_messaging_mediator_common::did_identity::same_account(did, &session.did)
+        }),
         None => false,
     }
 }

@@ -200,7 +200,7 @@ pub(crate) async fn check(
     // 2. Identity. The in-band issuer, when present, must be the sender the
     //    transport authenticated; an absent issuer is filled from the transport.
     if let Some(issuer) = doc.issuer.as_deref()
-        && issuer != sender_did
+        && !affinidi_messaging_mediator_common::did_identity::same_account(issuer, sender_did)
     {
         return Err(Rejection::IdentityMismatch {
             issuer: issuer.to_string(),
