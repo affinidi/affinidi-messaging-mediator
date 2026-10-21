@@ -462,6 +462,20 @@ pub(crate) async fn preload_self_did(
     doc: &Document,
 ) {
     resolver.add_did_document(mediator_did, doc.clone()).await;
+    // A did:scid identity is the bare DID; the resolver finds its log through
+    // a source. Record ours — from the configured DID URL, or the location the
+    // document names for itself — so a cache expiry re-resolves our own DID
+    // instead of failing for want of a `src`.
+    if mediator_did.starts_with("did:scid:") {
+        let identity = affinidi_messaging_mediator_common::did_identity::account_did(mediator_did);
+        let located = format!("{identity}?src=");
+        let source = std::iter::once(mediator_did)
+            .chain(doc.also_known_as.iter().map(String::as_str))
+            .find(|did| did.starts_with(&located));
+        if let Some(source) = source {
+            resolver.scid_sources().add_source(source);
+        }
+    }
     info!("Preloaded mediator DID into resolver cache: {mediator_did}");
 }
 
@@ -731,6 +745,35 @@ mod tests {
         assert_eq!(cached.doc, doc);
     }
 
+    /// A did:scid mediator records its own source, so its bare DID resolves
+    /// again after the preloaded document leaves the cache.
+    #[tokio::test]
+    async fn preload_self_did_records_a_did_scid_source() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+
+        const DID: &str = "did:scid:vh:1:QmScid";
+        let doc: affinidi_did_common::Document = serde_json::from_value(serde_json::json!({
+            "id": DID,
+            "alsoKnownAs": [
+                "did:scid:vh:1:QmScid?src=mediator.example.com",
+                "did:webvh:QmScid:mediator.example.com"
+            ]
+        }))
+        .unwrap();
+
+        for mediator_did in [DID.to_string(), format!("{DID}?src=mediator.example.com")] {
+            let mut resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .unwrap();
+            super::preload_self_did(&mut resolver, &mediator_did, &doc).await;
+            assert_eq!(
+                resolver.scid_sources().source(DID).as_deref(),
+                Some("mediator.example.com")
+            );
+            assert_eq!(resolver.resolve(DID).await.unwrap().doc.id.as_str(), DID);
+        }
+    }
+
     /// The boot guard passes when a loaded operating secret matches a published
     /// `keyAgreement` verification-method id — the mediator can decrypt inbound
     /// DIDComm.
@@ -818,10 +861,9 @@ mod tests {
     /// guard is vacuously satisfied even with an empty secret set.
     #[tokio::test]
     async fn coverage_guard_vacuous_when_no_key_agreement() {
-        use affinidi_did_common::Document;
         use affinidi_secrets_resolver::ThreadedSecretsResolver;
 
-        let doc: Document = serde_json::from_value(serde_json::json!({
+        let doc: affinidi_did_common::Document = serde_json::from_value(serde_json::json!({
             "@context": ["https://www.w3.org/ns/did/v1"],
             "id": "did:example:no-key-agreement",
         }))

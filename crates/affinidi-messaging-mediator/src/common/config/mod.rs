@@ -51,7 +51,6 @@ pub(crate) type AwsConfig = aws_config::SdkConfig;
 #[cfg(not(feature = "aws"))]
 pub(crate) type AwsConfig = ();
 use serde::Serialize;
-use sha256::digest;
 use std::{collections::HashMap, env, fmt, path::Path, sync::Arc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
@@ -822,7 +821,8 @@ impl TryFrom<ConfigRaw> for Config {
             ..Config::default(secrets_resolver)
         };
 
-        config.mediator_did_hash = digest(&config.mediator_did);
+        config.mediator_did_hash =
+            affinidi_messaging_mediator_common::did_identity::did_hash(&config.mediator_did);
 
         // Initialise a mutable did document for later use on validation and resolver loading
         let mut did_document: Option<Document> = None;
@@ -832,7 +832,7 @@ impl TryFrom<ConfigRaw> for Config {
             let document_json = read_document(&path, &aws_config).await?;
 
             let (did_json, did_jsonl, parsed_document) =
-                split_self_hosted_did_source(document_json)?;
+                split_self_hosted_did_source(document_json, &config.mediator_did)?;
             config.mediator_did_doc = Some(did_json);
             config.mediator_did_log = did_jsonl;
 
@@ -945,8 +945,16 @@ impl TryFrom<ConfigRaw> for Config {
 /// (`Some` only for did:webvh sources) and the typed Document both stay
 /// verbatim (real did:webvh) for did:webvh resolvers and the mediator's own
 /// DID.
+///
+/// When the mediator presents its identity as a `did:scid:vh:1` DID
+/// (`mediator_did`), the log is still served verbatim at `did.jsonl` (it *is*
+/// the did:scid's verification metadata) and `did.json` still bridges to
+/// did:web, but the typed Document is the did:scid's own: `id` the bare
+/// did:scid DID and every self-reference under it, so the resolver preload
+/// answers for the identity the mediator packs and unpacks as.
 fn split_self_hosted_did_source(
     document_json: String,
+    mediator_did: &str,
 ) -> Result<(String, Option<String>, Document), MediatorError> {
     // Validate and parse as LogEntry (webvh format) first, then fall back to
     // a direct DID Document (did:web source).
@@ -1002,6 +1010,12 @@ fn split_self_hosted_did_source(
                 )
             })?;
 
+            let did_doc_value = if mediator_did.starts_with("did:scid:") {
+                scid_document(&did_doc_value, mediator_did)?
+            } else {
+                did_doc_value
+            };
+
             let typed = serde_json::from_value(did_doc_value).map_err(|err| {
                 error!("Couldn't convert DID Document value to Document struct. Reason: {err}");
                 MediatorError::ConfigError(
@@ -1028,6 +1042,38 @@ fn split_self_hosted_did_source(
             Ok((document_json, None, typed))
         }
     }
+}
+
+/// The did:scid's own document for a self-hosted did:webvh log, refusing a log
+/// whose SCID is not the one `mediator_did` names.
+fn scid_document(
+    webvh_document: &serde_json::Value,
+    mediator_did: &str,
+) -> Result<serde_json::Value, MediatorError> {
+    let document = didwebvh_rs::did_web::to_scid_did_document(webvh_document).map_err(|err| {
+        error!("Couldn't express the did:webvh log as did:scid {mediator_did}. Reason: {err}");
+        MediatorError::ConfigError(
+            12,
+            "NA".into(),
+            format!("Couldn't express the did:webvh log as did:scid {mediator_did}. Reason: {err}"),
+        )
+    })?;
+    let identity = affinidi_messaging_mediator_common::did_identity::account_did(mediator_did);
+    if document.get("id").and_then(serde_json::Value::as_str) != Some(identity.as_ref()) {
+        error!("The self-hosted did:webvh log is not the log of {mediator_did}");
+        return Err(MediatorError::ConfigError(
+            12,
+            "NA".into(),
+            format!(
+                "mediator_did is {mediator_did}, but the self-hosted log is {}",
+                document
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing an id")
+            ),
+        ));
+    }
+    Ok(document)
 }
 
 /// Ensure the mediator's DID document advertises a `TSPTransport` service so peers can
@@ -1379,7 +1425,7 @@ mod self_hosted_did_tests {
     #[test]
     fn webvh_source_rewrites_did_json_only() {
         let (did_json, did_jsonl, typed) =
-            split_self_hosted_did_source(WEBVH_LOG.to_string()).unwrap();
+            split_self_hosted_did_source(WEBVH_LOG.to_string(), WEBVH_DID).unwrap();
 
         // did.json: rewritten to did:web, no webvh traces anywhere.
         let doc: serde_json::Value = serde_json::from_str(&did_json).unwrap();
@@ -1405,11 +1451,52 @@ mod self_hosted_did_tests {
         );
     }
 
+    const WEBVH_DID: &str = "did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com";
+    const SCID_DID: &str = "did:scid:vh:1:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg";
+
+    /// A mediator presenting its log as did:scid: did.jsonl and did.json are
+    /// served exactly as for did:webvh, and the typed Document — what the
+    /// resolver is preloaded with — is the did:scid's own.
+    #[test]
+    fn scid_identity_gets_its_own_document() {
+        for mediator_did in [SCID_DID.to_string(), format!("{SCID_DID}?src=example.com")] {
+            let (did_json, did_jsonl, typed) =
+                split_self_hosted_did_source(WEBVH_LOG.to_string(), &mediator_did).unwrap();
+
+            assert_eq!(did_jsonl.as_deref(), Some(WEBVH_LOG));
+            let web: serde_json::Value = serde_json::from_str(&did_json).unwrap();
+            assert_eq!(web["id"], "did:web:example.com");
+
+            assert_eq!(typed.id.as_str(), SCID_DID);
+            let typed = serde_json::to_value(&typed).unwrap();
+            assert_eq!(
+                typed["verificationMethod"][0]["id"],
+                format!("{SCID_DID}#P5RDjVJG")
+            );
+            assert_eq!(typed["authentication"][0], format!("{SCID_DID}#P5RDjVJG"));
+            let aliases = typed["alsoKnownAs"].as_array().unwrap();
+            assert!(aliases.contains(&serde_json::json!(format!("{SCID_DID}?src=example.com"))));
+            assert!(aliases.contains(&serde_json::json!(WEBVH_DID)));
+        }
+    }
+
+    /// A did:scid naming another SCID than the log's is a misconfiguration.
+    #[test]
+    fn scid_identity_must_match_the_log() {
+        assert!(
+            split_self_hosted_did_source(
+                WEBVH_LOG.to_string(),
+                "did:scid:vh:1:QmSomeOtherScid?src=example.com"
+            )
+            .is_err()
+        );
+    }
+
     /// did:web source: served verbatim at did.json, no did.jsonl log.
     #[test]
     fn web_source_served_verbatim_without_log() {
         let (did_json, did_jsonl, typed) =
-            split_self_hosted_did_source(WEB_DOC.to_string()).unwrap();
+            split_self_hosted_did_source(WEB_DOC.to_string(), "did:web:example.com").unwrap();
 
         assert_eq!(did_json, WEB_DOC);
         assert!(did_jsonl.is_none());
