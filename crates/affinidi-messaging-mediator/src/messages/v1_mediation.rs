@@ -35,7 +35,6 @@ use affinidi_messaging_mediator_common::types::messages::{FetchDeletePolicy, Fet
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
 use http::StatusCode;
-use sha256::digest;
 use tracing::{debug, warn};
 
 use crate::SharedData;

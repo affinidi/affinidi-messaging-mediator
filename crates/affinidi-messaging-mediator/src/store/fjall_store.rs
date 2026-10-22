@@ -31,6 +31,8 @@
 //!   expires_at }`
 //! - `trust_task_claims`  — claim key → JSON `{ digest, retain_until }`; the
 //!   Trust Task duplicate-execution record, swept once `retain_until` passes
+//! - `scid_sources`       — did:scid account hash → the resolver's serialised
+//!   source record (sources and latest verified log version, VTI-KEY-162)
 //! - `forward_queue`      — `stream_id` → JSON-serialised
 //!   [`ForwardQueueEntry`]
 //! - `forward_pending`    — `{group}:{stream_id}` → claim metadata
@@ -208,6 +210,7 @@ const PARTITION_ADMINS: &str = "admins";
 const PARTITION_V1_ROUTING_KEYS: &str = "v1_routing_keys";
 const PARTITION_OOB_INVITES: &str = "oob_invites";
 const PARTITION_TRUST_TASK_CLAIMS: &str = "trust_task_claims";
+const PARTITION_SCID_SOURCES: &str = "scid_sources";
 const PARTITION_FORWARD_QUEUE: &str = "forward_queue";
 const PARTITION_FORWARD_PENDING: &str = "forward_pending";
 const PARTITION_GLOBALS: &str = "globals";
@@ -305,6 +308,8 @@ pub struct FjallStore {
     v1_routing_keys: Keyspace,
     oob_invites: Keyspace,
     trust_task_claims: Keyspace,
+    /// did:scid account hash → serialised source record.
+    scid_sources: Keyspace,
     forward_queue: Keyspace,
     forward_pending: Keyspace,
     globals: Keyspace,
@@ -812,6 +817,7 @@ impl FjallStore {
             v1_routing_keys: open_partition(PARTITION_V1_ROUTING_KEYS)?,
             oob_invites: open_partition(PARTITION_OOB_INVITES)?,
             trust_task_claims: open_partition(PARTITION_TRUST_TASK_CLAIMS)?,
+            scid_sources: open_partition(PARTITION_SCID_SOURCES)?,
             forward_queue,
             forward_pending: open_partition(PARTITION_FORWARD_PENDING)?,
             globals: open_partition(PARTITION_GLOBALS)?,
@@ -2195,6 +2201,7 @@ impl MediatorStore for FjallStore {
             }
         }
         batch.remove(&self.globals, stats_key(did_hash).as_bytes());
+        batch.remove(&self.scid_sources, did_hash.as_bytes());
         // Delete all access-list entries for this DID.
         let prefix = did_hash.as_bytes();
         for guard in self.access_lists.prefix(prefix) {
@@ -2851,6 +2858,24 @@ impl MediatorStore for FjallStore {
             }
         }
         Ok(removed)
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        self.scid_sources
+            .insert(did_hash.as_bytes(), record.as_bytes())
+            .map_err(|e| Self::db_err("scid_source_put", e))?;
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        let mut records = Vec::new();
+        for guard in self.scid_sources.iter() {
+            let (_, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("scid_source_list:iter", e))?;
+            records.push(String::from_utf8_lossy(&value).into_owned());
+        }
+        Ok(records)
     }
 
     async fn oob_discovery_store(

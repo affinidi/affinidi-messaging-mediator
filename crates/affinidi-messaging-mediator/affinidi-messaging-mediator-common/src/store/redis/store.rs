@@ -1112,6 +1112,14 @@ impl MediatorStore for RedisStore {
             {
                 warn!("account {did_hash} removed, but not its activity or counters: {e}");
             }
+            if let Err(e) = redis::cmd("HDEL")
+                .arg("SCID_SOURCES")
+                .arg(did_hash)
+                .exec_async(&mut conn)
+                .await
+            {
+                warn!("account {did_hash} removed, but not its did:scid source record: {e}");
+            }
         }
         Ok(removed)
     }
@@ -1326,6 +1334,31 @@ impl MediatorStore for RedisStore {
                 }
             }
         })
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let _: () = redis::cmd("HSET")
+            .arg("SCID_SOURCES")
+            .arg(did_hash)
+            .arg(record)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("scid_source_put: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("HVALS")
+            .arg("SCID_SOURCES")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("scid_source_list: {e}"))
+            })
     }
 
     async fn oob_discovery_store(

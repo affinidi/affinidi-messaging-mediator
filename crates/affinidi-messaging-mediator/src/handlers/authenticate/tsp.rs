@@ -201,6 +201,7 @@ pub async fn tsp_authentication_response(
             .await?;
 
         debug!("TSP client authenticated: {}", session.did);
+        crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;
         state
             .activity
             .authenticated(&state, &session.did_hash)

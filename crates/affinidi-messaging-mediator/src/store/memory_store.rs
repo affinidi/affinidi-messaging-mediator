@@ -250,6 +250,8 @@ struct MemoryState {
     // ─── Trust Task duplicate-execution record ──────────────────────
     /// key → (digest, retain_until unix secs).
     trust_task_claims: HashMap<String, (String, u64)>,
+    /// did:scid account hash → serialised source record (VTI-KEY-162).
+    scid_sources: HashMap<String, String>,
 
     // ─── Forward queue ──────────────────────────────────────────────
     forward_queue: BTreeMap<StreamId, ForwardQueueEntry>,
@@ -1175,6 +1177,7 @@ impl MediatorStore for MemoryStore {
         state.accounts.remove(did_hash);
         state.activity.remove(did_hash);
         state.stats.remove(did_hash);
+        state.scid_sources.remove(did_hash);
         state.access_lists.remove(did_hash);
         state.admins.remove(did_hash);
         state.known_dids.retain(|d| d != did_hash);
@@ -1595,6 +1598,25 @@ impl MediatorStore for MemoryStore {
         let before = state.trust_task_claims.len();
         state.trust_task_claims.retain(|_, (_, until)| *until > now);
         Ok(before - state.trust_task_claims.len())
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state
+            .scid_sources
+            .insert(did_hash.to_string(), record.to_string());
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .scid_sources
+            .values()
+            .cloned()
+            .collect())
     }
 
     async fn oob_discovery_store(

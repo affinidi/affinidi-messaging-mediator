@@ -179,7 +179,7 @@ humantime = "2"
 ## had no subcommand surface so `main.rs` skipped clap.
 clap = { version = "4", features = ["derive"] }
 ## DID resolution with in-memory cache (capacity: 1000 DIDs, TTL: 300s)
-affinidi-did-resolver-cache-sdk = { version = "0.8.42", features = ["network"] }
+affinidi-did-resolver-cache-sdk = { version = "0.8.43", features = ["network"] }
 affinidi-did-common = "0.4.4"
 affinidi-secrets-resolver = "0.5"
 ## Shared background-task supervision (restart-on-failure + health registry)
