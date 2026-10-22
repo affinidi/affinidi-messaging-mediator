@@ -42,7 +42,7 @@ const PENDING_WRITES: usize = 1024;
 
 /// How often the writer re-reads the resolver's records and writes any that
 /// changed since it last wrote them.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The largest serialised record stored or seeded. A record holds a DID, at
 /// most `ScidSourceBook::MAX_SOURCES` sources and one version, so a genuine
