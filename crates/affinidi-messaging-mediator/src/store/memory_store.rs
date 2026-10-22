@@ -1177,6 +1177,7 @@ impl MediatorStore for MemoryStore {
         state.accounts.remove(did_hash);
         state.activity.remove(did_hash);
         state.stats.remove(did_hash);
+        state.scid_sources.remove(did_hash);
         state.access_lists.remove(did_hash);
         state.admins.remove(did_hash);
         state.known_dids.retain(|d| d != did_hash);

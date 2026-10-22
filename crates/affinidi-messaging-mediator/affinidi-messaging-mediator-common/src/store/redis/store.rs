@@ -1112,6 +1112,14 @@ impl MediatorStore for RedisStore {
             {
                 warn!("account {did_hash} removed, but not its activity or counters: {e}");
             }
+            if let Err(e) = redis::cmd("HDEL")
+                .arg("SCID_SOURCES")
+                .arg(did_hash)
+                .exec_async(&mut conn)
+                .await
+            {
+                warn!("account {did_hash} removed, but not its did:scid source record: {e}");
+            }
         }
         Ok(removed)
     }

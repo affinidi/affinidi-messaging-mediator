@@ -2201,6 +2201,7 @@ impl MediatorStore for FjallStore {
             }
         }
         batch.remove(&self.globals, stats_key(did_hash).as_bytes());
+        batch.remove(&self.scid_sources, did_hash.as_bytes());
         // Delete all access-list entries for this DID.
         let prefix = did_hash.as_bytes();
         for guard in self.access_lists.prefix(prefix) {

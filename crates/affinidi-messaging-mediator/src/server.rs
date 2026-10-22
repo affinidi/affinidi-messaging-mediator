@@ -716,7 +716,7 @@ pub async fn serve_internal(
     // did:scid floors survive a restart (VTI-KEY-162): seed what was stored,
     // before any connection is accepted, then persist every change for an
     // account's did:scid (or our own) as the resolver verifies it.
-    crate::scid_sources::seed(&*store, &did_resolver).await;
+    crate::scid_sources::seed(&*store, &did_resolver).await?;
     let _scid_source_writer = crate::scid_sources::persist(
         store.clone(),
         &did_resolver,

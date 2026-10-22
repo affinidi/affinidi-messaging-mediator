@@ -1401,7 +1401,8 @@ async fn check_config_overrides(store: Arc<dyn MediatorStore>) {
 }
 
 /// did:scid source records (VTI-KEY-162): stored per account, replaced on a
-/// later put, and listed back for seeding the resolver at boot.
+/// later put, listed back for seeding the resolver at boot, and removed with
+/// the account.
 async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
     assert!(store.scid_source_list().await.unwrap().is_empty());
 
@@ -1427,6 +1428,27 @@ async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
             r#"{"did":"a","v":2}"#.to_string(),
             r#"{"did":"b","v":1}"#.to_string(),
         ]
+    );
+
+    // Removing an account removes its record, so the store never holds more
+    // records than there are accounts.
+    store
+        .account_add("hash-b", &allow_all(), None)
+        .await
+        .expect("account_add");
+    store
+        .scid_source_put("hash-b", r#"{"did":"b","v":2}"#)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .account_remove(&admin_session("admin_hash"), "hash-b")
+            .await
+            .expect("account_remove")
+    );
+    assert_eq!(
+        store.scid_source_list().await.unwrap(),
+        vec![r#"{"did":"a","v":2}"#.to_string()]
     );
 }
 
