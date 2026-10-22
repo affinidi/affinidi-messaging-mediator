@@ -12,7 +12,6 @@ use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use affinidi_messaging_sdk::messages::sending::{InboundMessageList, InboundMessageResponse};
 use http::StatusCode;
-use sha256::digest;
 use std::sync::Arc;
 #[cfg(feature = "didcomm")]
 use tracing::trace;
@@ -181,7 +180,7 @@ pub(crate) async fn store_message(
                             session,
                             response.force_live_delivery,
                             &packed,
-                            &digest(recipient),
+                            &affinidi_messaging_mediator_common::did_identity::did_hash(recipient),
                             Some(&state.config.mediator_did_hash),
                             expires_at,
                         )
@@ -216,7 +215,8 @@ pub(crate) async fn store_message(
                     // store with no depth limit at all — the hole that let a
                     // direct sender fill any inbox without bound, and that the
                     // per-relationship gate for VTI-29 did not reach.
-                    let to_hash = digest(to_did);
+                    let to_hash =
+                        affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
                     crate::messages::queue_limits::validate_store_queue_limits(
                         state,
                         session,
@@ -363,7 +363,8 @@ pub(crate) async fn store_forwarded_message(
     );
 
     async move {
-        let recipient_did_hash = digest(recipient);
+        let recipient_did_hash =
+            affinidi_messaging_mediator_common::did_identity::did_hash(recipient);
 
         let expires_at = if let Some(expires_at) = expires_at {
             let now = state.clock.unix_secs();

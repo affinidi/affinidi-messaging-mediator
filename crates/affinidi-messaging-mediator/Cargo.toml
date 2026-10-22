@@ -133,7 +133,7 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-ty
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.38"
+affinidi-messaging-sdk = "0.38.1"
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
 affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
@@ -179,8 +179,8 @@ humantime = "2"
 ## had no subcommand surface so `main.rs` skipped clap.
 clap = { version = "4", features = ["derive"] }
 ## DID resolution with in-memory cache (capacity: 1000 DIDs, TTL: 300s)
-affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
-affinidi-did-common = "0.4"
+affinidi-did-resolver-cache-sdk = { version = "0.8.42", features = ["network"] }
+affinidi-did-common = "0.4.4"
 affinidi-secrets-resolver = "0.5"
 ## Shared background-task supervision (restart-on-failure + health registry)
 affinidi-task-utils = "0.1"
@@ -226,7 +226,7 @@ redis = { version = "1.2", features = [
 fjall = { version = "3.1", optional = true }
 
 # ── DID Infrastructure ───────────────────────────────────────────────────
-didwebvh-rs = "0.8"
+didwebvh-rs = "0.8.1"
 
 # ── AWS Integration (optional, behind `aws` feature) ────────────────────
 ## Used for Secrets Manager (aws_secrets://), Parameter Store (aws_parameter_store://)

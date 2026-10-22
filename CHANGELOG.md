@@ -8,6 +8,43 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — did:scid identities
+
+A `did:scid:vh:1` identity is the DID `did:scid:vh:1:<scid>`; `?src=…` only
+says where its did:webvh log is published (VTI-KEY-160 of the VTI
+specification). Requires affinidi-did-common 0.4.4 (`scid`),
+affinidi-did-resolver-cache-sdk 0.8.42 (native did:scid resolution) and
+didwebvh-rs 0.8.1 (`did_web::to_scid_did_document`,
+`DIDWebVHState::convert_scid_id_to_webvh_id`).
+
+- **Behaviour:** accounts, sessions, ACLs, routing, queues and the admin DID are
+  keyed by `did_identity::did_hash` (mediator-common), the SHA-256 of the DID
+  with a did:scid `src` locator removed, so
+  `did:scid:vh:1:<scid>?src=a.example`, `?src=b.example` and the bare DID are
+  one account. Every other DID hashes exactly as before: no existing account,
+  session or ACL moves. DIDs a party presents are checked against a session,
+  the mediator's own DID or a sender with `did_identity::same_account`, which
+  ignores the same locator and nothing else.
+- **Added:** the mediator's own DID may be a did:scid. With a self-hosted
+  did:webvh log (`did_web_self_hosted`) the log is served at `did.jsonl` and
+  bridged to did:web at `did.json` exactly as before, and the resolver is
+  preloaded with the did:scid's own document (its `id` the bare DID, every
+  self-reference under it) and seeded with its source. A log whose SCID is not
+  the configured did:scid's is refused at boot.
+- **Added (mediator-setup):** `--present-as-scid` / `[identity] present_as =
+  "scid"` / a Did-step prompt present a locally generated did:webvh log as its
+  did:scid: `mediator_did` is the did:scid DID URL with `src`, and the runtime
+  secrets are keyed under the bare did:scid's key ids. The did:webvh default is
+  unchanged.
+- **Behaviour (mediator-setup):** a locally generated did:webvh log now lists
+  its `did:scid:vh:1:<scid>?src=…` alias in `alsoKnownAs` (VTI-KEY-166).
+  `--no-scid-alias` / `scid_also_known_as = false` leaves it out. A
+  VTA-managed DID is unchanged: vta-sdk 0.72 requests `vta/webvh/dids/create`
+  1.1, which carries neither choice.
+- **Fixed (mediator-setup):** `did_web_self_hosted` is activated for a did:scid
+  mediator DID whose `src` host is the public URL's, as for did:webvh, and
+  `--save-did-web` bridges its log.
+
 ## 0.44.0 (release/0.44)
 
 ### Changed — trust-tasks-rs 0.33, affinidi-messaging-sdk 0.38 (breaking)

@@ -141,6 +141,26 @@ pub fn render_summary(
             value_style,
         );
     }
+    // did:scid presentation — only surfaced when it differs from the default.
+    if config.did_method == crate::consts::DID_WEBVH {
+        if config.present_as_scid {
+            add_field(
+                &mut lines,
+                "  Identity",
+                "did:scid (host-independent; same did:webvh log)",
+                label_style,
+                value_style,
+            );
+        } else if !config.scid_also_known_as {
+            add_field(
+                &mut lines,
+                "  did:scid alias",
+                "Not listed",
+                label_style,
+                value_style,
+            );
+        }
+    }
     // did:web export — only surfaced when the operator opted in. The file
     // (`did-web.json`) is written only if the minted DID is a did:webvh.
     if config.save_did_web {

@@ -894,6 +894,9 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                     DidPhase::SaveDidWebChoice => {
                         unreachable!("SaveDidWebChoice runs in Selecting mode, not TextInput")
                     }
+                    DidPhase::IdentityFormChoice => {
+                        unreachable!("IdentityFormChoice runs in Selecting mode, not TextInput")
+                    }
                 };
                 prompt::render_prompt(
                     frame,

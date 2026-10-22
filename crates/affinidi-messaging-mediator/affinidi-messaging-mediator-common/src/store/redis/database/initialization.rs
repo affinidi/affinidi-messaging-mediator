@@ -7,7 +7,6 @@ use crate::errors::MediatorError;
 use crate::store::redis::RedisStore;
 use crate::store::redis::init::RedisInitConfig;
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
-use sha256::digest;
 
 impl RedisStore {
     /// Run schema migrations and seed the mediator + root-admin
@@ -39,7 +38,7 @@ impl RedisStore {
 
         // Set up the administration account if it doesn't exist
         self.setup_admin_account(
-            &digest(&config.admin_did),
+            &crate::did_identity::did_hash(&config.admin_did),
             AccountType::RootAdmin,
             &config.global_acl_default,
         )

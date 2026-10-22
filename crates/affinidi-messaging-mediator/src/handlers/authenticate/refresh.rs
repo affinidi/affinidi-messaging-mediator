@@ -266,7 +266,7 @@ pub async fn authentication_refresh(
 
         // Does the Global ACL still allow them to connect?
         if authz::require_capability(&session_check.acls, Capability::NotBlocked).is_err() {
-            info!("DID({}) is blocked from connecting", digest(&session_check.did));
+            info!("DID({}) is blocked from connecting", affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did));
             return Err(MediatorError::problem(
                 25,
                 "",
@@ -365,7 +365,7 @@ pub async fn authentication_refresh(
         info!(
             "{}: JWT tokens refreshed for DID({})",
             session_check.session_id,
-            digest(&session_check.did)
+            affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did)
         );
 
         Ok((

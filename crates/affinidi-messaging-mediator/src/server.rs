@@ -1361,7 +1361,8 @@ pub(crate) async fn seed_privileged_accounts(
         )
         .await?;
     if !config.admin_did.is_empty() {
-        let admin_hash = sha256::digest(&config.admin_did);
+        let admin_hash =
+            affinidi_messaging_mediator_common::did_identity::did_hash(&config.admin_did);
         store
             .setup_admin_account(
                 &admin_hash,
@@ -1391,7 +1392,7 @@ fn did_rate_limiter(config: &Config) -> DidRateLimiter {
         if config.admin_did.is_empty() {
             String::new()
         } else {
-            sha256::digest(&config.admin_did)
+            affinidi_messaging_mediator_common::did_identity::did_hash(&config.admin_did)
         },
     ])
 }

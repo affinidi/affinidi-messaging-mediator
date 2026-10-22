@@ -15,7 +15,6 @@ use affinidi_messaging_sdk::{
 };
 use axum::{Json, extract::State};
 use http::StatusCode;
-use sha256::digest;
 use tracing::{Instrument, Level, debug, info, span};
 
 /// POST /authenticate/challenge
@@ -51,7 +50,7 @@ pub async fn authentication_challenge(
         challenge: create_random_string(32),
         state: SessionState::ChallengeSent,
         did: body.did.clone(),
-        did_hash: digest(body.did),
+        did_hash: affinidi_messaging_mediator_common::did_identity::did_hash(&body.did),
         authenticated: false,
         acls: MediatorACLSet::default(), // this will be updated later
         account_type: AccountType::Standard,

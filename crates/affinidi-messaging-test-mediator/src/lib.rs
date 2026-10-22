@@ -114,7 +114,6 @@ use affinidi_tdk::dids::{
     DID, KeyType, OneOrMany, PeerKeyRole, PeerService, PeerServiceEndpoint, PeerServiceEndpointLong,
 };
 use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
-use sha256::digest;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -241,7 +240,7 @@ impl TestMediatorUser {
     /// management Trust Tasks (e.g. `account_update`, `access_list_update`,
     /// `account_remove`) that operate on hashed DIDs.
     pub fn did_hash(&self) -> String {
-        digest(&self.did)
+        affinidi_messaging_mediator_common::did_identity::did_hash(&self.did)
     }
 }
 
@@ -1207,7 +1206,7 @@ impl TestMediatorHandle {
     /// admin-authenticated SDK profile and use [`Self::get_acl`] to read back
     /// the result.
     pub async fn set_acl(&self, did: &str, acls: MediatorACLSet) -> Result<(), TestMediatorError> {
-        let did_hash = digest(did);
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
         self.store.set_did_acl(&did_hash, &acls).await?;
         Ok(())
     }
@@ -1215,7 +1214,7 @@ impl TestMediatorHandle {
     /// Read the current ACL bitmask for `did`. Returns `None` when the
     /// DID has no account record on the mediator.
     pub async fn get_acl(&self, did: &str) -> Result<Option<MediatorACLSet>, TestMediatorError> {
-        let did_hash = digest(did);
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
         Ok(self.store.get_did_acl(&did_hash).await?)
     }
 }
@@ -1366,7 +1365,7 @@ async fn register_local_did_with_acl(
     did: &str,
     acls: &MediatorACLSet,
 ) -> Result<(), TestMediatorError> {
-    let did_hash = digest(did);
+    let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
     if store.account_exists(&did_hash).await? {
         return Ok(());
     }

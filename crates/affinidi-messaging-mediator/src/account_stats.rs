@@ -42,7 +42,9 @@ pub(crate) async fn count_stored(
     to_did_hash: &str,
     body: &str,
 ) {
-    let mediator = sha256::digest(state.config.mediator_did.as_str());
+    let mediator = affinidi_messaging_mediator_common::did_identity::did_hash(
+        state.config.mediator_did.as_str(),
+    );
     if from_did_hash == Some(mediator.as_str()) || to_did_hash == mediator {
         return;
     }

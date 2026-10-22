@@ -116,7 +116,7 @@ impl TestUser {
     /// admin-protocol calls (e.g. `acls_set`, `access_list_add`,
     /// `account_remove`) that operate on hashed DIDs.
     pub fn did_hash(&self) -> String {
-        sha256::digest(&self.did)
+        affinidi_messaging_mediator_common::did_identity::did_hash(&self.did)
     }
 }
 

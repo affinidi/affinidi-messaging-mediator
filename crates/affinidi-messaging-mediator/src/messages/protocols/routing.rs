@@ -30,7 +30,6 @@ use affinidi_messaging_sdk::{
 use base64::prelude::*;
 use http::StatusCode;
 use serde::Deserialize;
-use sha256::digest;
 use tracing::{Instrument, debug, info, span, warn};
 use uuid::Uuid;
 
@@ -584,7 +583,13 @@ async fn resolve_forward_sender(
         )
     })?;
     if let Some(from) = &sender {
-        let from_account = match state.database.account_get(&digest(from.as_str())).await {
+        let from_account = match state
+            .database
+            .account_get(&affinidi_messaging_mediator_common::did_identity::did_hash(
+                from.as_str(),
+            ))
+            .await
+        {
             Ok(Some(from_account)) => from_account,
             Ok(None) => {
                 // First time we've seen this forwarding sender. Persist it
@@ -606,7 +611,11 @@ async fn resolve_forward_sender(
                 let from_acl_seed = relay_sender_acls(&state.config.security.global_acl_default);
                 state
                     .database
-                    .account_add(&digest(from.as_str()), &from_acl_seed, None)
+                    .account_add(
+                        &affinidi_messaging_mediator_common::did_identity::did_hash(from.as_str()),
+                        &from_acl_seed,
+                        None,
+                    )
                     .await
                     .map_err(|e| {
                         MediatorError::problem_with_log(
@@ -711,7 +720,7 @@ pub(crate) async fn process(
         };
 
         let next = parse_next_did(msg, session)?;
-        let next_did_hash = sha256::digest(next.as_bytes());
+        let next_did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&next);
 
         // ****************************************************
         // Get the next account (registering it on first contact).

@@ -26,8 +26,31 @@ use vta_sdk::did_templates::{TemplateVars, load_embedded};
 
 use crate::cli::KeySuite;
 
+/// How a generated did:webvh log is presented (VTI-KEY-165, VTI-KEY-166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebvhIdentity {
+    /// Present the identity as the log's `did:scid:vh:1` DID rather than its
+    /// did:webvh DID. The log is the same either way.
+    pub present_as_scid: bool,
+    /// List the `did:scid:vh:1:<scid>?src=…` DID URL in the first log entry's
+    /// `alsoKnownAs`. Required when `present_as_scid`.
+    pub scid_also_known_as: bool,
+}
+
+impl Default for WebvhIdentity {
+    /// did:webvh, with the did:scid alias listed.
+    fn default() -> Self {
+        Self {
+            present_as_scid: false,
+            scid_also_known_as: true,
+        }
+    }
+}
+
 pub struct DidWebvhResult {
-    /// The final DID string (resolved from the WebVH log entry).
+    /// The mediator's DID as presented: the did:webvh DID, or — presenting as
+    /// did:scid — the `did:scid:vh:1:<scid>?src=…` DID URL, which carries the
+    /// locator a peer needs on first contact.
     pub did: String,
     /// Private keys the mediator needs at runtime — Ed25519 signing, X25519
     /// key-agreement, plus any opt-in extra-suite keys (e.g. P-256 signing +
@@ -52,12 +75,41 @@ pub struct DidWebvhResult {
 /// Should be the mediator's full public URL including any HTTP API
 /// prefix (`https://mediator.example.com/mediator/v1`) so clients
 /// resolving the DID hit the actual mediator routes.
+#[cfg(test)]
 pub async fn generate_did_webvh(
     address: &str,
     service_url: &str,
     key_suites: &[KeySuite],
     tsp_enabled: bool,
 ) -> anyhow::Result<DidWebvhResult> {
+    generate_did_webvh_as(
+        address,
+        service_url,
+        key_suites,
+        tsp_enabled,
+        WebvhIdentity::default(),
+    )
+    .await
+}
+
+/// Generate a did:webvh DID for the mediator, presenting the identity as
+/// `identity` says.
+///
+/// Presenting as did:scid, the runtime secrets are keyed under the bare
+/// `did:scid:vh:1:<scid>` DID — the ids its own document lists (VTI-KEY-161) —
+/// and the result's `did` is its DID URL with `src`.
+pub async fn generate_did_webvh_as(
+    address: &str,
+    service_url: &str,
+    key_suites: &[KeySuite],
+    tsp_enabled: bool,
+    identity: WebvhIdentity,
+) -> anyhow::Result<DidWebvhResult> {
+    if identity.present_as_scid && !identity.scid_also_known_as {
+        anyhow::bail!(
+            "a mediator presented as did:scid must list its did:scid alias in alsoKnownAs"
+        );
+    }
     let address = if address.starts_with("http://") || address.starts_with("https://") {
         address.to_string()
     } else {
@@ -237,6 +289,7 @@ pub async fn generate_did_webvh(
         .authorization_key(auth_key)
         .did_document(did_document)
         .parameters(parameters)
+        .also_known_as_scid(identity.scid_also_known_as)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build webvh config: {e}"))?;
 
@@ -244,7 +297,20 @@ pub async fn generate_did_webvh(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create did:webvh: {e}"))?;
 
-    let final_did = result.did().to_string();
+    let webvh_did = result.did().to_string();
+    let scid_url = didwebvh_rs::DIDWebVHState::convert_webvh_id_to_scid_id(&webvh_did);
+    // The DID the runtime secrets are keyed under: the one whose document
+    // lists these keys.
+    let final_did = if identity.present_as_scid {
+        affinidi_did_common::scid::strip_scid_src(&scid_url).into_owned()
+    } else {
+        webvh_did.clone()
+    };
+    let presented_did = if identity.present_as_scid {
+        scid_url
+    } else {
+        webvh_did.clone()
+    };
 
     // Align runtime secret IDs with the resolved DID. `#key-0` is the
     // signing slot, `#key-1` is the key-agreement slot — matches the
@@ -279,10 +345,22 @@ pub async fn generate_did_webvh(
     let did_doc = serde_json::to_string(result.log_entry())?;
 
     Ok(DidWebvhResult {
-        did: final_did,
+        did: presented_did,
         secrets,
         did_doc,
     })
+}
+
+/// The did:webvh DID of a generated log (`did.jsonl` content): the `state.id`
+/// of its last entry. `None` when it has none.
+pub fn log_webvh_did(log: &str) -> Option<String> {
+    let entry: serde_json::Value = serde_json::from_str(log.lines().last()?).ok()?;
+    entry
+        .get("state")?
+        .get("id")?
+        .as_str()
+        .filter(|id| id.starts_with("did:webvh:"))
+        .map(str::to_string)
 }
 
 /// Inject secp256k1 signing (`#key-4`) and key-agreement (`#key-5`)
@@ -443,6 +521,120 @@ pub use affinidi_messaging_mediator_common::did_web::webvh_log_to_did_web;
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    fn aliases(did_doc: &str) -> Vec<String> {
+        let entry: Value = serde_json::from_str(did_doc).unwrap();
+        entry["state"]["alsoKnownAs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// By default the log lists its did:scid alias, and the mediator is
+    /// presented as did:webvh with its secrets keyed under that DID.
+    #[tokio::test]
+    async fn default_lists_the_did_scid_alias() {
+        let result = generate_did_webvh(
+            "https://mediator.example.com",
+            "https://mediator.example.com/mediator/v1",
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        let webvh_did = log_webvh_did(&result.did_doc).unwrap();
+        assert!(result.did.starts_with("did:webvh:"));
+        assert_eq!(result.did, webvh_did);
+        assert_eq!(
+            aliases(&result.did_doc),
+            vec![didwebvh_rs::DIDWebVHState::convert_webvh_id_to_scid_id(
+                &webvh_did
+            )]
+        );
+        assert_eq!(result.secrets[0].id, format!("{webvh_did}#key-0"));
+    }
+
+    #[tokio::test]
+    async fn the_alias_can_be_left_out() {
+        let result = generate_did_webvh_as(
+            "https://mediator.example.com",
+            "https://mediator.example.com/mediator/v1",
+            &[],
+            false,
+            WebvhIdentity {
+                present_as_scid: false,
+                scid_also_known_as: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(aliases(&result.did_doc).is_empty());
+    }
+
+    /// Presented as did:scid: the DID is the did:scid DID URL with `src`, and
+    /// the runtime secrets are keyed under the bare did:scid — the key ids its
+    /// own document lists — while the log itself is the same did:webvh log.
+    #[tokio::test]
+    async fn presenting_as_did_scid_keys_secrets_under_the_bare_did() {
+        let result = generate_did_webvh_as(
+            "https://mediator.example.com",
+            "https://mediator.example.com/mediator/v1",
+            &[KeySuite::P256],
+            false,
+            WebvhIdentity {
+                present_as_scid: true,
+                scid_also_known_as: true,
+            },
+        )
+        .await
+        .unwrap();
+        let webvh_did = log_webvh_did(&result.did_doc).unwrap();
+        let scid = webvh_did.split(':').nth(2).unwrap();
+        let bare = format!("did:scid:vh:1:{scid}");
+        assert_eq!(result.did, format!("{bare}?src=mediator.example.com"));
+        assert!(aliases(&result.did_doc).contains(&result.did));
+        let ids: Vec<&str> = result.secrets.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["key-0", "key-1", "key-2", "key-3"]
+                .iter()
+                .map(|k| format!("{bare}#{k}"))
+                .collect::<Vec<_>>()
+        );
+
+        // The native document lists exactly these key ids.
+        let entry: Value = serde_json::from_str(&result.did_doc).unwrap();
+        let native = didwebvh_rs::did_web::to_scid_did_document(&entry["state"]).unwrap();
+        let vm_ids: Vec<&str> = native["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vm| vm["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(vm_ids, ids);
+    }
+
+    #[tokio::test]
+    async fn presenting_as_did_scid_needs_the_alias() {
+        assert!(
+            generate_did_webvh_as(
+                "https://mediator.example.com",
+                "https://mediator.example.com/mediator/v1",
+                &[],
+                false,
+                WebvhIdentity {
+                    present_as_scid: true,
+                    scid_also_known_as: false,
+                },
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn webvh_matches_canonical_mediator_template() {

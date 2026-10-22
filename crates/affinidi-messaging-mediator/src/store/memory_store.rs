@@ -1069,7 +1069,7 @@ impl MediatorStore for MemoryStore {
 
         // Join with account for ACLs/role (matches Redis path).
         if !did.is_empty() {
-            let did_hash = digest(did);
+            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
             if let Some(account) = state.accounts.get(&did_hash) {
                 session.acls = account.acls.clone();
                 session.account_type = account.role;
@@ -1208,7 +1208,10 @@ impl MediatorStore for MemoryStore {
             None => {
                 state.v1_routing_keys.insert(
                     verkey.to_string(),
-                    (did.to_string(), sha256::digest(did.as_bytes())),
+                    (
+                        did.to_string(),
+                        affinidi_messaging_mediator_common::did_identity::did_hash(did),
+                    ),
                 );
                 Ok(())
             }

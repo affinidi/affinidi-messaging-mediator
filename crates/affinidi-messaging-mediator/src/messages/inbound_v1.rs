@@ -254,7 +254,7 @@ async fn deliver_v1_forward(
         ));
     };
 
-    let to_hash = digest(to_did.as_bytes());
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&to_did);
 
     // The forward is anonymous by construction, so there is no sender to apply
     // an access list against — `None` makes the recipient's access-list check

@@ -9,7 +9,6 @@ use crate::errors::MediatorError;
 use crate::store::types::{Session, SessionState};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
-use sha256::digest;
 use tracing::{debug, warn};
 
 use super::Database;
@@ -61,7 +60,7 @@ impl Database {
             .cmd("HGETALL")
             .arg(format!("SESSION:{session_id}"))
             .cmd("HMGET")
-            .arg(["DID:", &digest(did)].concat())
+            .arg(["DID:", &crate::did_identity::did_hash(did)].concat())
             .arg("ROLE_TYPE")
             .arg("ACLS")
             .query_async(&mut con)
@@ -85,7 +84,7 @@ impl Database {
             warn!(
                 "Session ({}): No challenge found, did_hash={}",
                 session_id,
-                digest(did)
+                crate::did_identity::did_hash(did)
             );
             return Err(MediatorError::SessionError(
                 20,
@@ -135,7 +134,7 @@ impl Database {
 
         if let Some(did) = session_db.get("did") {
             session.did = did.into();
-            session.did_hash = digest(did);
+            session.did_hash = crate::did_identity::did_hash(did);
         } else {
             warn!("Session ({}): No DID found", session_id);
             return Err(MediatorError::SessionError(

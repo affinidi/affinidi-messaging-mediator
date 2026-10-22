@@ -164,7 +164,7 @@ impl MediatorConsole {
         let live = LiveStream::start(atm.clone(), profile.clone());
 
         Ok(Self {
-            did_hash: sha256::digest(&identity.did),
+            did_hash: crate::address_book::account_hash(&identity.did),
             did: identity.did,
             mediator_did,
             atm,

@@ -46,13 +46,15 @@ impl AddressEntry {
 }
 
 /// The mediator's account identifier for `did`: lowercase hex SHA-256 of the
-/// DID string. A value that already is one is returned as it is (lowercased).
+/// DID string, with a did:scid `src` locator removed (as the mediator does,
+/// in `affinidi_messaging_mediator_common::did_identity`). A value that
+/// already is one is returned as it is (lowercased).
 pub fn account_hash(did: &str) -> String {
     let did = did.trim();
     if is_account_hash(did) {
         did.to_ascii_lowercase()
     } else {
-        sha256::digest(did)
+        sha256::digest(affinidi_did_common::scid::strip_scid_src(did).as_bytes())
     }
 }
 

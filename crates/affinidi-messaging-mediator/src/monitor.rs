@@ -53,7 +53,6 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha256::digest;
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -280,7 +279,9 @@ pub(crate) fn frame_recipient(frame: &[u8], protocol: Protocol) -> Option<String
         Protocol::Tsp => affinidi_tsp::MetaEnvelope::parse(frame).ok()?.receiver,
         _ => return None,
     };
-    Some(digest(did.as_str()))
+    Some(affinidi_messaging_mediator_common::did_identity::did_hash(
+        did.as_str(),
+    ))
 }
 
 /// The DID of a DIDComm JWE's first recipient: `recipients[0].header.kid` in the
@@ -803,7 +804,9 @@ impl TrafficMonitor {
             subscription_id: id.clone(),
             owner_did: owner_did.to_string(),
             owner_did_hash: owner_did_hash.to_string(),
-            mediator_did_hash: digest(&state.config.mediator_did),
+            mediator_did_hash: affinidi_messaging_mediator_common::did_identity::did_hash(
+                &state.config.mediator_did,
+            ),
             delivery,
             settings,
             cancel,
@@ -1193,7 +1196,7 @@ mod tests {
         let frame = br#"{"protected":"x","recipients":[{"header":{"kid":"did:example:bob#key-1"},"encrypted_key":"x"}],"iv":"x","ciphertext":"x","tag":"x"}"#;
         assert_eq!(
             frame_recipient(frame, Protocol::DidComm),
-            Some(digest("did:example:bob"))
+            Some(sha256::digest("did:example:bob"))
         );
     }
 
@@ -1205,7 +1208,7 @@ mod tests {
         let frame = format!("{header}.a.b.c.d");
         assert_eq!(
             frame_recipient(frame.as_bytes(), Protocol::DidComm),
-            Some(digest("did:example:carol"))
+            Some(sha256::digest("did:example:carol"))
         );
     }
 

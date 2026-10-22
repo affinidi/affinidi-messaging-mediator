@@ -1075,7 +1075,7 @@ async fn consume_account_remove(
         .ct_eq(target_hash.as_bytes())
         .unwrap_u8()
         == 1
-        || digest(&state.config.admin_did)
+        || affinidi_messaging_mediator_common::did_identity::did_hash(&state.config.admin_did)
             .as_bytes()
             .ct_eq(target_hash.as_bytes())
             .unwrap_u8()

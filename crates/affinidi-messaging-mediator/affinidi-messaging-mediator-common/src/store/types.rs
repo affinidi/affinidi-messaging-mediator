@@ -15,7 +15,6 @@ use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
 use num_format::{Locale, ToFormattedString};
 use serde::{Deserialize, Serialize};
-use sha256::digest;
 use std::fmt::{self, Display, Formatter};
 
 // ─── Sessions ────────────────────────────────────────────────────────────────
@@ -115,7 +114,7 @@ impl Session {
             _ => return None,
         };
         let did = fields.get("did")?.clone();
-        let did_hash = digest(did.as_str());
+        let did_hash = crate::did_identity::did_hash(did.as_str());
 
         Some(Session {
             session_id: session_id.to_string(),

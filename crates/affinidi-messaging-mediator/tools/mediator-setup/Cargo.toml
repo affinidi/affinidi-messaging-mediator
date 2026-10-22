@@ -84,7 +84,10 @@ affinidi-messaging-mediator-common = { version = "0.45.0", path = "../../affinid
 ] }
 
 # ── DID:webvh ────────────────────────────────────────────────────────────
-didwebvh-rs = "0.8"
+didwebvh-rs = "0.8.1"
+## did:scid presentation of the generated log: the bare DID its secrets are
+## keyed under (`scid` module, 0.4.4).
+affinidi-did-common = "0.4.4"
 
 # ── VTA Integration ──────────────────────────────────────────────────────
 ## provision-client: orchestration layer that drives setup-key minting,

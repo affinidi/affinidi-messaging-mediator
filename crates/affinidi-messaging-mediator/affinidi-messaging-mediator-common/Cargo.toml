@@ -46,7 +46,6 @@ server = [
   "dep:num-format",
   "dep:rand",
   "dep:semver",
-  "dep:sha256",
   "dep:tokio",
   "dep:tracing",
   # axum-flavored error types (`AppError`, `IntoResponse` impls)
@@ -123,6 +122,10 @@ affinidi-messaging-mediator-types = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
+## The account a DID names (`did_identity`): a did:scid DID URL's `src`
+## locator is not part of the identity. Needs 0.4.4 (the `scid` module).
+affinidi-did-common = "0.4.4"
+sha256 = "1"
 
 # ── Secrets module: core (gated on `server`) ────────────────────────
 async-trait = { version = "0.1", optional = true }
@@ -260,7 +263,6 @@ ahash = { version = "0.8", features = ["serde"], optional = true }
 num-format = { version = "0.4", optional = true }
 rand = { version = "0.10", optional = true }
 semver = { version = "1", optional = true }
-sha256 = { version = "1", optional = true }
 tracing = { version = "0.1", features = ["valuable"], optional = true }
 
 # ── Metrics (CircuitBreaker gauge + counter) ────────────────────────

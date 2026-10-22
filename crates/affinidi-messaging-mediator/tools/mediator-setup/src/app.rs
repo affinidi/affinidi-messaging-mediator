@@ -271,6 +271,10 @@ pub enum DidPhase {
     SelectWebvhHost,
     /// Text input for a different self-host base URL.
     EnterCustomUrl,
+    /// Selection: after a local did:webvh URL is captured, choose whether
+    /// the mediator presents the log as its did:webvh DID (default) or its
+    /// did:scid:vh:1 DID.
+    IdentityFormChoice,
     /// Yes/No selection: after a local did:webvh is configured, offer to
     /// also export a did:web (`did-web.json`) copy of the DID document.
     SaveDidWebChoice,
@@ -387,6 +391,15 @@ pub struct WizardConfig {
     /// of the DID document to `did-web.json`. Collected via the
     /// `DidPhase::SaveDidWebChoice` prompt or the `--save-did-web` flag.
     pub save_did_web: bool,
+    /// Present a locally generated did:webvh log as its `did:scid:vh:1` DID
+    /// (VTI-KEY-165). Collected via `DidPhase::IdentityFormChoice`,
+    /// `--present-as-scid`, or the recipe's `[identity] present_as = "scid"`.
+    pub present_as_scid: bool,
+    /// List the did:scid alias in a locally generated did:webvh log's
+    /// `alsoKnownAs` (VTI-KEY-166). On by default; `--no-scid-alias` or the
+    /// recipe's `scid_also_known_as = false` turns it off. Required when
+    /// `present_as_scid`.
+    pub scid_also_known_as: bool,
     /// Extra key suites (beyond the mandatory Ed25519 + X25519 pair) to mint
     /// for the mediator identity. Empty by default. Only consulted by the
     /// local generators (`did:peer`, `did:webvh`); VTA-managed DIDs derive
@@ -613,6 +626,8 @@ impl Default for WizardConfig {
             did_method: String::new(),
             public_url: String::new(),
             save_did_web: false,
+            present_as_scid: false,
+            scid_also_known_as: true,
             key_suite: Vec::new(),
             secret_storage: String::new(),
             secret_file_path: DEFAULT_SECRET_FILE_PATH.into(),
@@ -2367,6 +2382,18 @@ impl WizardApp {
                 ]
             }
             WizardStep::Did => {
+                if self.did_phase == Some(DidPhase::IdentityFormChoice) {
+                    return vec![
+                        SelectionOption::new(
+                            "did:webvh (recommended)",
+                            "The mediator's DID names its host. What every peer expects today.",
+                        ),
+                        SelectionOption::new(
+                            "did:scid",
+                            "The same log, presented as a did:scid:vh:1 DID: the identity keeps its name if the log moves to another host. Peers need did:scid support.",
+                        ),
+                    ];
+                }
                 // After a local did:webvh URL is captured, offer the
                 // did:web export as a Yes/No pick (index 0 = Yes).
                 if self.did_phase == Some(DidPhase::SaveDidWebChoice) {
@@ -2710,6 +2737,14 @@ impl WizardApp {
                 _ => String::new(),
             },
             WizardStep::Did => {
+                if self.did_phase == Some(DidPhase::IdentityFormChoice) {
+                    return "Both choices write the same did:webvh log, served at the same URL, and \
+                            list both names in it. did:webvh names the host in the DID itself; \
+                            did:scid does not, so the log can move without the identity \
+                            changing — but a peer must support did:scid to reach this mediator \
+                            by it."
+                        .into();
+                }
                 if self.did_phase == Some(DidPhase::SaveDidWebChoice) {
                     return "Most deployments should pick \"No\" — the did:webvh log is \
                             always written and is all you need. Only choose \"Yes\" if you \
@@ -3001,6 +3036,16 @@ impl WizardApp {
             WizardStep::Did => {
                 // The did:web export Yes/No pick rides on the same
                 // selection-list UI. Record the choice and advance.
+                if self.did_phase == Some(DidPhase::IdentityFormChoice) {
+                    // Index 0 = did:webvh, index 1 = did:scid (which needs
+                    // the alias listed).
+                    self.config.present_as_scid = self.selection_index == 1;
+                    if self.config.present_as_scid {
+                        self.config.scid_also_known_as = true;
+                    }
+                    self.enter_save_did_web_choice();
+                    return;
+                }
                 if self.did_phase == Some(DidPhase::SaveDidWebChoice) {
                     // Index 0 = "No (recommended)", index 1 = "Yes".
                     self.config.save_did_web = self.selection_index == 1;
@@ -3877,6 +3922,12 @@ impl WizardApp {
     /// step). Index 0 = "No (recommended)", index 1 = "Yes" — pre-selects
     /// the operator's current choice, defaulting to the recommended "No"
     /// so the export stays opt-in.
+    fn enter_identity_form_choice(&mut self) {
+        self.did_phase = Some(DidPhase::IdentityFormChoice);
+        self.mode = InputMode::Selecting;
+        self.selection_index = usize::from(self.config.present_as_scid);
+    }
+
     fn enter_save_did_web_choice(&mut self) {
         self.did_phase = Some(DidPhase::SaveDidWebChoice);
         self.mode = InputMode::Selecting;
@@ -3975,7 +4026,7 @@ impl WizardApp {
                 // the Vta sub-flow above and never reach this prompt; pass
                 // --save-did-web for those.)
                 if self.config.did_method == DID_WEBVH {
-                    self.enter_save_did_web_choice();
+                    self.enter_identity_form_choice();
                     return;
                 }
                 self.mode = InputMode::Selecting;
@@ -4358,8 +4409,12 @@ impl WizardApp {
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.public_url.clone());
                 }
-                Some(DidPhase::SaveDidWebChoice) => {
-                    // Back from the did:web pick → re-edit the mediator URL.
+                Some(DidPhase::SaveDidWebChoice) if self.config.did_method == DID_WEBVH => {
+                    // Back from the did:web pick → the identity-form pick.
+                    self.enter_identity_form_choice();
+                }
+                Some(DidPhase::SaveDidWebChoice) | Some(DidPhase::IdentityFormChoice) => {
+                    // Back → re-edit the mediator URL.
                     self.did_phase = None;
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.public_url.clone());
@@ -5196,6 +5251,10 @@ mod tests {
 
         app.text_input = tui_input::Input::new("https://mediator.example.com".into());
         app.confirm_text_input();
+        // The identity-form pick comes first; keep the did:webvh default.
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
+        app.select_current();
+        assert!(!app.config.present_as_scid);
 
         assert_eq!(app.did_phase, Some(DidPhase::SaveDidWebChoice));
         assert_eq!(app.mode, InputMode::Selecting);
@@ -5215,6 +5274,10 @@ mod tests {
         app.select_current();
         app.text_input = tui_input::Input::new("https://mediator.example.com".into());
         app.confirm_text_input();
+        // The identity-form pick comes first; keep the did:webvh default.
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
+        app.select_current();
+        assert!(!app.config.present_as_scid);
 
         // Pick "Yes" (index 1; index 0 is the recommended "No").
         app.selection_index = 1;
@@ -5234,6 +5297,10 @@ mod tests {
         app.select_current();
         app.text_input = tui_input::Input::new("https://mediator.example.com".into());
         app.confirm_text_input();
+        // The identity-form pick comes first; keep the did:webvh default.
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
+        app.select_current();
+        assert!(!app.config.present_as_scid);
 
         // Pick "No" (the default highlight).
         app.select_current();
@@ -5251,13 +5318,45 @@ mod tests {
         app.select_current();
         app.text_input = tui_input::Input::new("https://mediator.example.com".into());
         app.confirm_text_input();
+        // The identity-form pick comes first; keep the did:webvh default.
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
+        app.select_current();
+        assert!(!app.config.present_as_scid);
         assert_eq!(app.did_phase, Some(DidPhase::SaveDidWebChoice));
 
+        // Back to the identity-form pick, then to the URL.
+        app.go_back();
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
         app.go_back();
         assert!(app.did_phase.is_none());
         assert_eq!(app.mode, InputMode::TextInput);
         assert_eq!(app.current_step, WizardStep::Did);
         assert_eq!(app.text_input.value(), "https://mediator.example.com");
+    }
+
+    #[test]
+    fn identity_form_choice_scid_presents_as_did_scid() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.config.use_vta = false;
+        app.config.scid_also_known_as = false;
+        app.current_step = WizardStep::Did;
+        app.mode = InputMode::Selecting;
+        app.selection_index = 0;
+        app.select_current();
+        app.text_input = tui_input::Input::new("https://mediator.example.com".into());
+        app.confirm_text_input();
+
+        assert_eq!(app.did_phase, Some(DidPhase::IdentityFormChoice));
+        assert_eq!(app.current_options().len(), 2);
+        // did:webvh is the highlighted default.
+        assert_eq!(app.selection_index, 0);
+        app.selection_index = 1;
+        app.select_current();
+
+        assert!(app.config.present_as_scid);
+        // did:scid needs its alias in the log, whatever was set before.
+        assert!(app.config.scid_also_known_as);
+        assert_eq!(app.did_phase, Some(DidPhase::SaveDidWebChoice));
     }
 
     #[test]

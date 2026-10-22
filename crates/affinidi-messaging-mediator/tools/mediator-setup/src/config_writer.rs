@@ -307,9 +307,15 @@ fn self_host_domain_match(mediator_did: &str, public_url: &str) -> bool {
 
 /// Extract the host segment from a `did:webvh:SCID:host[:port][:path…]`
 /// DID. The webvh spec puts the SCID at position 2 and the host at
-/// position 3; everything after that is path. Returns `None` for
-/// non-webvh DIDs or malformed inputs.
+/// position 3; everything after that is path. A `did:scid:vh:1` DID URL
+/// names its log's did:webvh form in its `src`, so its host is that form's.
+/// Returns `None` for other DIDs, a did:scid with no `src`, or malformed
+/// inputs.
 fn webvh_did_host(did: &str) -> Option<String> {
+    if did.starts_with("did:scid:") {
+        let webvh = didwebvh_rs::DIDWebVHState::convert_scid_id_to_webvh_id(did)?;
+        return webvh_did_host(&webvh);
+    }
     let stripped = did.strip_prefix("did:webvh:")?;
     let mut parts = stripped.splitn(3, ':');
     let _scid = parts.next()?;
@@ -1497,6 +1503,24 @@ storage = "keyring://affinidi-mediator"
             webvh_did_host("did:webvh:QmScid:mediator.example.com:tenant:abc"),
             Some("mediator.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn webvh_did_host_reads_a_did_scid_src() {
+        assert_eq!(
+            webvh_did_host("did:scid:vh:1:QmScid?src=mediator.example.com"),
+            Some("mediator.example.com".into())
+        );
+        assert_eq!(
+            webvh_did_host("did:scid:vh:1:QmScid?src=localhost:8000/tenant"),
+            Some("localhost".into())
+        );
+        // A bare did:scid names no host.
+        assert_eq!(webvh_did_host("did:scid:vh:1:QmScid"), None);
+        assert!(self_host_domain_match(
+            "did:scid:vh:1:QmScid?src=mediator.example.com",
+            "https://mediator.example.com/mediator/v1"
+        ));
     }
 
     #[test]

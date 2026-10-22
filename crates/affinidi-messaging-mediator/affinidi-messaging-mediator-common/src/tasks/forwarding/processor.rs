@@ -22,7 +22,6 @@ use crate::tasks::forwarding::packer::SystemMessagePacker;
 use crate::time::{unix_timestamp_millis, unix_timestamp_secs};
 use affinidi_net_guard::{EgressPolicy, guarded_dns_resolver};
 use futures_util::{SinkExt, StreamExt};
-use sha256::digest;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -896,7 +895,7 @@ impl ForwardingProcessor {
                 // record — the same `from` hash its protocol replies carry.
                 // (This slot used to hold the literal string "SYSTEM", which
                 // is not a DID hash and gave the report an outbox of its own.)
-                Some(&digest(packer.mediator_did())),
+                Some(&crate::did_identity::did_hash(packer.mediator_did())),
                 now + Self::PROBLEM_REPORT_TTL_SECS,
                 0, // No MAXLEN for system-generated problem reports
             )

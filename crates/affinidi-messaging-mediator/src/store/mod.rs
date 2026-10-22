@@ -88,7 +88,6 @@ pub fn encode_oob_invite(invite: &Message) -> Result<String, MediatorError> {
 #[cfg(all(test, any(feature = "fjall-backend", feature = "memory-backend")))]
 pub(crate) mod auth_flow_harness {
     use affinidi_messaging_mediator_common::store::{MediatorStore, Session, SessionState};
-    use sha256::digest;
 
     /// Drive `create_session` → `update_session_authenticated` →
     /// `get_session(new, did)` → refresh-hash rotation → `delete_session`,
@@ -97,7 +96,7 @@ pub(crate) mod auth_flow_harness {
     /// resolving.
     pub(crate) async fn run_auth_session_flow<S: MediatorStore>(store: &S) {
         let did = "did:peer:2.authflow";
-        let did_hash = digest(did);
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
         let old_sid = "challenge-sid-0";
         let new_sid = "auth-sid-0";
 
