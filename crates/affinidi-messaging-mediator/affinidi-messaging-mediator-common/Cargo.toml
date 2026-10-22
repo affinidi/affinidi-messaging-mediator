@@ -124,7 +124,7 @@ serde_json = "1"
 thiserror = "2"
 ## The account a DID names (`did_identity`): a did:scid DID URL's `src`
 ## locator is not part of the identity. Needs 0.4.4 (the `scid` module).
-affinidi-did-common = "0.4"
+affinidi-did-common = "0.4.4"
 sha256 = "1"
 
 # ── Secrets module: core (gated on `server`) ────────────────────────
