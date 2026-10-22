@@ -65,7 +65,7 @@ url = "2"
 # ── Affinidi TDK (DID generation, secrets, crypto) ──────────────────────
 ## Uses did-peer feature for did:peer generation. Does NOT depend on the
 ## mediator crate itself — only writes config files the mediator reads.
-affinidi-tdk = { version = "0.28", default-features = false, features = ["did-peer"] }
+affinidi-tdk = { version = "0.31", default-features = false, features = ["did-peer"] }
 affinidi-secrets-resolver = "0.5"
 ## did:key helpers used by the sealed-handoff full-setup path to derive
 ## the `client_did` from the ephemeral Ed25519 pubkey when signing a

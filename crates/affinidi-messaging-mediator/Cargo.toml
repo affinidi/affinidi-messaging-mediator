@@ -133,7 +133,7 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-ty
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.38.1"
+affinidi-messaging-sdk = "0.39"
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
 affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
@@ -147,7 +147,7 @@ affinidi-data-integrity = { version = "0.8", optional = true }
 ## Optional: JOSE key-agreement types for the didcomm compat layer (#327)
 affinidi-crypto = { version = "0.2", features = ["jose"], optional = true }
 ## Optional: Trust Spanning Protocol (activated by `tsp` feature)
-affinidi-tsp = { version = "0.2", optional = true }
+affinidi-tsp = { version = "0.3", optional = true }
 ## Multibase/multicodec encoding helpers (needed by didcomm for key encoding)
 affinidi-encoding = { version = "0.1", optional = true }
 ## Shared types: DatabaseHandler, errors, config structs, secret storage.
