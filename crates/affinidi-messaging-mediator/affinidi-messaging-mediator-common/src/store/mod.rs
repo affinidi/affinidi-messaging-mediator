@@ -1354,6 +1354,34 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(0)
     }
 
+    // ─── did:scid source records ────────────────────────────────────────────
+
+    /// Record where the did:scid account `did_hash` has been found, and the
+    /// latest version of its log verified — `record` is the resolver's
+    /// serialised `ScidSourceRecord`, opaque here — replacing any earlier one.
+    ///
+    /// This is the floor VTI-KEY-162 requires a node to persist for every
+    /// did:scid identity it authorises: seeded back into the resolver at boot,
+    /// it keeps a restart from accepting an older copy of the log (a moved log's
+    /// former host can serve its pre-move state under the same did:scid).
+    ///
+    /// **The default refuses**, as the floor is then not durable; the caller
+    /// logs it. Every built-in backend overrides it.
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let _ = (did_hash, record);
+        Err(MediatorError::InternalError(
+            14,
+            "NA".into(),
+            "this store keeps no did:scid source records".into(),
+        ))
+    }
+
+    /// Every did:scid source record [`Self::scid_source_put`] stored, for
+    /// seeding the resolver at boot. The default holds none.
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        Ok(Vec::new())
+    }
+
     // ─── Account activity ───────────────────────────────────────────────────
 
     /// Record that the account `did_hash` did `kind` at `at` (Unix epoch

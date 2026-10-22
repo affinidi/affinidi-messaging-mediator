@@ -1400,10 +1400,41 @@ async fn check_config_overrides(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// did:scid source records (VTI-KEY-162): stored per account, replaced on a
+/// later put, and listed back for seeding the resolver at boot.
+async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
+    assert!(store.scid_source_list().await.unwrap().is_empty());
+
+    store
+        .scid_source_put("hash-a", r#"{"did":"a","v":1}"#)
+        .await
+        .unwrap();
+    store
+        .scid_source_put("hash-b", r#"{"did":"b","v":1}"#)
+        .await
+        .unwrap();
+    // A later record for the same account replaces the earlier one.
+    store
+        .scid_source_put("hash-a", r#"{"did":"a","v":2}"#)
+        .await
+        .unwrap();
+
+    let mut listed = store.scid_source_list().await.unwrap();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            r#"{"did":"a","v":2}"#.to_string(),
+            r#"{"did":"b","v":1}"#.to_string(),
+        ]
+    );
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
 async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
+    check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
     check_outbox_receipts(store.clone()).await;
@@ -1479,6 +1510,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn trust_task_claim() {
                 check_trust_task_claim(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn scid_sources() {
+                check_scid_sources(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn expiry_sweep_reports_each_message() {

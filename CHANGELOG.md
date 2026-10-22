@@ -13,7 +13,8 @@ mediator-tui 0.11.0); they are no longer updated.
 A `did:scid:vh:1` identity is the DID `did:scid:vh:1:<scid>`; `?src=…` only
 says where its did:webvh log is published (VTI-KEY-160 of the VTI
 specification). Requires affinidi-did-common 0.4.4 (`scid`),
-affinidi-did-resolver-cache-sdk 0.8.42 (native did:scid resolution) and
+affinidi-did-resolver-cache-sdk 0.8.43 (native did:scid resolution, durable
+version floors) and
 didwebvh-rs 0.8.1 (`did_web::to_scid_did_document`,
 `DIDWebVHState::convert_scid_id_to_webvh_id`).
 
@@ -25,6 +26,15 @@ didwebvh-rs 0.8.1 (`did_web::to_scid_did_document`,
   session or ACL moves. DIDs a party presents are checked against a session,
   the mediator's own DID or a sender with `did_identity::same_account`, which
   ignores the same locator and nothing else.
+- **Added (security):** did:scid version floors survive a restart
+  (VTI-KEY-162). A moved portable log's former host can serve its pre-move
+  log, with keys since rotated away, under the same did:scid; the resolver
+  refuses that only after it has verified a newer version. The mediator now
+  stores the resolver's source record (sources and latest verified version)
+  of every did:scid account, and of its own DID, and seeds them back into the
+  resolver at boot. New `MediatorStore::scid_source_put` / `scid_source_list`
+  (memory, fjall keyspace `scid_sources`, Redis hash `SCID_SOURCES`); a store
+  that does not implement them refuses the write, which is logged.
 - **Added:** the mediator's own DID may be a did:scid. With a self-hosted
   did:webvh log (`did_web_self_hosted`) the log is served at `did.jsonl` and
   bridged to did:web at `did.json` exactly as before, and the resolver is

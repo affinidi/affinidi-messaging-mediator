@@ -45,7 +45,6 @@ use affinidi_messaging_sdk::messages::{
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use http::StatusCode;
-use sha256::digest;
 use tracing::{Instrument, Level, debug, span, warn};
 
 use crate::SharedData;
