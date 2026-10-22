@@ -269,7 +269,10 @@ async fn claim(
 
     let digest = document_digest(doc)
         .map_err(|e| Rejection::PolicyViolation(format!("document digest: {e}")))?;
-    let key = sha256::digest(format!("{sender_did}\n{}", doc.id));
+    // Keyed on the sender's account, so a did:scid sender's claims do not split
+    // across the `?src=` forms it may present; every other DID is unchanged.
+    let sender = affinidi_messaging_mediator_common::did_identity::account_did(sender_did);
+    let key = sha256::digest(format!("{sender}\n{}", doc.id));
     let verdict = state
         .database
         .trust_task_claim(

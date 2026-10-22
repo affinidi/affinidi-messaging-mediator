@@ -1952,7 +1952,7 @@ impl MediatorStore for FjallStore {
         // Join with account record for ACLs + role (matches the
         // Redis path's "session HMGET + DID HMGET" pipeline).
         if !did.is_empty() {
-            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
+            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
             if let Some(v) = self
                 .accounts
                 .get(did_hash.as_bytes())
@@ -1992,7 +1992,7 @@ impl MediatorStore for FjallStore {
         did: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
-        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&did);
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())

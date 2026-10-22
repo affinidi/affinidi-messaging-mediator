@@ -29,8 +29,6 @@ use affinidi_tsp::MetaEnvelope as TspMetaEnvelope;
 #[cfg(feature = "tsp")]
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use http::StatusCode;
-#[cfg(any(feature = "didcomm", feature = "tsp"))]
-use sha256::digest;
 #[cfg(feature = "didcomm")]
 use tracing::{Instrument, debug, span};
 
@@ -1159,7 +1157,10 @@ async fn handle_inbound_didcomm(
                     // three facts all derive from the same stored record, so
                     // asking for them separately cost three reads of it.
                     let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
-                    let from_hash = envelope.from_did.as_ref().map(digest);
+                    let from_hash = envelope
+                        .from_did
+                        .as_ref()
+                        .map(affinidi_messaging_mediator_common::did_identity::did_hash);
                     let Some(recipient) = state
                         .database
                         .delivery_decision(&to_hash, from_hash.as_deref())
