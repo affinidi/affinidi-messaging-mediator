@@ -8,6 +8,27 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — TSP 1.0: affinidi-tsp 0.3, affinidi-messaging-sdk 0.39 (breaking)
+
+- `affinidi-tsp` 0.2 → 0.3, `affinidi-messaging-sdk` 0.39, `affinidi-tdk`
+  0.31 and (test-mediator's dev-dependency) `affinidi-messaging-didcomm-service`
+  0.24 (affinidi/affinidi-tdk-rs#967). These speak TSP 1.0 (`YTSP-BAA`,
+  trustoverip/tswg-tsp-specification#86) in place of Rev 3 (`YTSP-AAC`).
+  No source change.
+- **Routing reads every TSP version.** Ingress and the monitor address a TSP
+  message with `MetaEnvelope::parse`, which in `affinidi-tsp` 0.3 no longer
+  gates on MAJOR. A mediator on this release therefore keeps routing Rev 3
+  traffic between endpoints that have not upgraded, as well as 1.0 traffic.
+  A mediator still on `affinidi-tsp` 0.2 refuses 1.0 messages at ingress, so
+  **the mediator upgrades first**, before the VTA and the wallet move to 1.0.
+- **A TSP message addressed to the mediator itself must be 1.0.** It is opened
+  with `direct::unpack`, which refuses a Rev 3 frame (`RevisionMismatch`) and,
+  per 1.0, a confidential payload whose ESSR sender is NULL.
+- mediator-admin takes an `ATM`, so consumers move to `affinidi-messaging-sdk`
+  0.39 with this release. The lockfile holds `affinidi-messaging-sdk` 0.37 /
+  `affinidi-tdk` 0.27 beside these through `vta-sdk` 0.72, as before, without
+  the `tsp` feature; no type crosses between `vta-sdk` and the mediator.
+
 ### Added — did:scid identities
 
 A `did:scid:vh:1` identity is the DID `did:scid:vh:1:<scid>`; `?src=…` only
