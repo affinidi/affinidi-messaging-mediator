@@ -305,7 +305,7 @@ fn decode_first_attachment(
 
 /// Deliver an accepted forward to its next hop: live-stream it (ephemeral),
 /// enqueue it for a remote mediator (re-wrapping it in `Rewrap` relay mode),
-/// or store it locally. Also reads the inner envelope to enforce the
+/// or store it locally. Also reads the inner envelope to enforce a local
 /// recipient's anonymous-message policy before routing.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_forward(
@@ -320,6 +320,7 @@ async fn deliver_forward(
     delay_milli: i64,
     expires_at: u64,
     ephemeral: bool,
+    remote_endpoint: Option<String>,
 ) -> Result<(), MediatorError> {
     // Check attached message for routing information
     let next_envelope = match MetaEnvelope::new(data, &state.did_resolver).await {
@@ -340,7 +341,9 @@ async fn deliver_forward(
         }
     };
 
-    if next_envelope.from_did.is_none()
+    // A remote recipient's ANON_RECEIVE is checked by its own mediator.
+    if remote_endpoint.is_none()
+        && next_envelope.from_did.is_none()
         && authz::require_capability(next_acls, Capability::AnonReceive).is_err()
     {
         return Err(crate::messages::delivery_refused(
@@ -370,34 +373,6 @@ async fn deliver_forward(
             debug!("Live streaming message to UUID: {}", stream_uuid);
         }
     } else {
-        // Determine if the next hop is local or remote by resolving the DID Document
-        let remote_endpoint = if state.config.processors.forwarding.external_forwarding {
-            match state.did_resolver.resolve(next).await {
-                Ok(resolve_response) => {
-                    match service_endpoint_for_remote(state, next, &resolve_response.doc).await {
-                        Some(endpoint_url) => {
-                            debug!("Next hop ({}) is remote, endpoint: {}", next, endpoint_url);
-                            Some(endpoint_url)
-                        }
-                        None => {
-                            debug!("Next hop ({}) is local to this mediator", next);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Can't resolve the DID — treat as local (store normally)
-                    warn!(
-                        "Couldn't resolve DID document for {}: {}. Treating as local.",
-                        next, e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         if let Some(endpoint_url) = remote_endpoint {
             // Remote destination — enqueue to FORWARD_Q for the forwarding processor
 
@@ -503,6 +478,37 @@ async fn deliver_forward(
     }
 
     Ok(())
+}
+
+/// The endpoint to relay to when `next` is hosted by another mediator, or
+/// `None` when it is local (or external forwarding is off). Resolves `next`'s
+/// DID document; a DID that can't be resolved is treated as local.
+async fn remote_endpoint_for(state: &SharedData, next: &str) -> Option<String> {
+    if !state.config.processors.forwarding.external_forwarding {
+        return None;
+    }
+    match state.did_resolver.resolve(next).await {
+        Ok(resolve_response) => {
+            match service_endpoint_for_remote(state, next, &resolve_response.doc).await {
+                Some(endpoint_url) => {
+                    debug!("Next hop ({}) is remote, endpoint: {}", next, endpoint_url);
+                    Some(endpoint_url)
+                }
+                None => {
+                    debug!("Next hop ({}) is local to this mediator", next);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            // Can't resolve the DID — treat as local (store normally)
+            warn!(
+                "Couldn't resolve DID document for {}: {}. Treating as local.",
+                next, e
+            );
+            None
+        }
+    }
 }
 
 /// Fetch the next-hop account, registering it with the global default ACL on
@@ -769,22 +775,26 @@ pub(crate) async fn process(
         let from_account = resolve_forward_sender(state, session, msg, metadata).await?;
 
         // ****************************************************
+        // A remote next hop's account here is a placeholder: its access list
+        // and ANON_RECEIVE are enforced by the mediator that holds its inbox,
+        // not by this relay (`docs/multi-mediator.md` §6).
+        let remote_endpoint = if ephemeral {
+            None
+        } else {
+            remote_endpoint_for(state, &next).await
+        };
 
         // ****************************************************
-        // Is the sending DID allowed by the next DID access_list and ACL?
-        if authz::check_access_list(
-            state.database.as_ref(),
-            &next_did_hash,
-            Some(&from_account.did_hash),
-        )
-        .await
-        .is_ok()
+        // Is the sending DID allowed by a local next DID's access_list?
+        if remote_endpoint.is_none()
+            && authz::check_access_list(
+                state.database.as_ref(),
+                &next_did_hash,
+                Some(&from_account.did_hash),
+            )
+            .await
+            .is_err()
         {
-            debug!(
-                "Sender DID ({}) is allowed to send to next DID ({})",
-                from_account.did_hash, next_did_hash
-            );
-        } else {
             return Err(crate::messages::delivery_refused(
                 session,
                 Some(msg.id.to_string()),
@@ -934,6 +944,7 @@ pub(crate) async fn process(
             delay_milli,
             expires_at,
             ephemeral,
+            remote_endpoint,
         )
         .await?;
 

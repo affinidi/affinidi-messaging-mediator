@@ -76,6 +76,21 @@ didwebvh-rs 0.8.1 (`did_web::to_scid_did_document`,
   mediator DID whose `src` host is the public URL's, as for did:webvh, and
   `--save-did-web` bridges its log.
 
+### Fixed — a relay leaves a remote recipient's access list to its own mediator
+
+- **Behaviour change (R3.6).** A forward whose next hop is hosted by another
+  mediator is no longer checked against the next hop's access list or
+  `ANON_RECEIVE` on the relaying mediator. The account a relay holds for a
+  remote next hop is a placeholder made from its `global_acl_default`, so
+  under a closed default (`MODE_EXPLICIT_ALLOW`) every cross-mediator forward
+  was refused with `73 delivery.refused`, both single (`next` = recipient) and
+  double (`next` = recipient's mediator). The recipient's mediator enforces
+  both, as `docs/multi-mediator.md` §6 lays out. A local next hop is checked
+  as before.
+- The relay now resolves `next` before the access-list check rather than
+  after it. A DID that cannot be resolved is treated as local, so it is still
+  checked.
+
 ## 0.44.0 (release/0.44)
 
 ### Changed — trust-tasks-rs 0.33, affinidi-messaging-sdk 0.38 (breaking)
