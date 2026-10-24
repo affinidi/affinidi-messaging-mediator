@@ -123,8 +123,8 @@ opens a `chore(release): v…` PR from `release-prep/<major.minor>/<version>`.
 **Merging it is the release.** On that push to the release branch:
 
 - `release-tag.yml` tags `v<RELEASE>`, opens the GitHub Release (notes = that
-  version's changelog section; an rc is a prerelease) and dispatches
-  `publish-images.yaml` for the tag (`ghcr.io/affinidi/messaging-mediator`,
+  version's changelog section; an rc is a prerelease). The tag, created by
+  the release-bot app, triggers `publish-images.yaml` (`ghcr.io/affinidi/messaging-mediator`,
   multi-arch, signed build provenance; mirrored to ECR Public when
   `AWS_ROLE_ARN` is set).
 - `publish.yml` publishes the crates for a GA or patch (below).
