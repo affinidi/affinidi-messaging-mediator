@@ -15,7 +15,7 @@ resolver = "3"
 # Lockstep: every crate in this workspace carries this version, and every
 # internal dependency requires it exactly. `scripts/release_lib.py` moves both
 # together; never bump one crate on its own.
-version = "0.45.0"
+version = "0.46.0"
 description = "Affinidi Messaging Mediator: a DIDComm v2 and TSP mediator, its admin client and console, and an in-process test mediator."
 edition = "2024"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
