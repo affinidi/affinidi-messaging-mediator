@@ -20,9 +20,9 @@ mediator-tui 0.11.0); they are no longer updated.
   `affinidi-messaging-sdk` 0.40 and `trust-tasks-rs` 0.34 with this release.
   The lockfile still holds `affinidi-messaging-sdk` 0.37 / `trust-tasks-rs`
   0.32 beside these through `vta-sdk` 0.72, as before.
-- **mediator-setup no longer enables `aws-sdk-s3`'s `sigv4a`.** SigV4a is for
-  S3 Multi-Region Access Points; `did_log_target` takes a plain
-  `s3://<bucket>/<key>`. It was the only path to `crypto-bigint` 0.5.5
+- **The mediator (`aws` feature) and mediator-setup no longer enable
+  `aws-sdk-s3`'s `sigv4a`.** SigV4a is for S3 Multi-Region Access Points; an
+  `s3://` target is a plain bucket and key. It was the only path to `crypto-bigint` 0.5.5
   (RUSTSEC-2026-0387, secret-dependent timing, no 0.5.x fix), which
   `cargo deny` now refuses. Lockfile: `tokio` 1.54.1, `ctutils` 0.4.5 and
   `crypto-bigint` 0.7.6 (RUSTSEC-2026-0386, -0385, -0387).

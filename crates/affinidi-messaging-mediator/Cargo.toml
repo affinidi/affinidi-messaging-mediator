@@ -263,7 +263,12 @@ aws-sdk-ssm = { version = "1", optional = true, default-features = false, featur
 # bypasses) and RUSTSEC-2026-0104 (reachable panic in CRL parsing).
 # Dropping `rustls` leaves the aws-lc-rs stack, which is the provider
 # this workspace prefers anyway.
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+#
+# Also minus `sigv4a`: SigV4a signing exists for S3 Multi-Region Access
+# Points, and an `s3://` target is a plain bucket and key (`parse_s3_target`).
+# It pulls p256 0.13 / crypto-bigint 0.5.5, which carries RUSTSEC-2026-0387
+# (secret-dependent timing) with no 0.5.x fix.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 
 # ── Cryptography & Security ─────────────────────────────────────────────
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
