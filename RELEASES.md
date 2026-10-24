@@ -172,16 +172,23 @@ Settings, not files:
   sign-off`.
 - **Ruleset on `nightly`:** block force pushes and deletion; only the
   workflow's identity may update it.
-- **Environment `release`** — `publish.yml` (crates.io) and the ECR mirror in
-  `publish-images.yaml` run in it; restrict it to `release/*` branches and
-  `v*` tags. Each crate's Trusted Publisher on crates.io names this
-  repository, `publish.yml` and this environment.
-- **`RELEASE_TOKEN`** (required for backports and preps) — a fine-grained PAT
-  or GitHub App token on this repository with contents and pull-requests
-  write and actions read. The enterprise does not allow `GITHUB_TOKEN` to
-  open pull requests, so without it `backport.yml` and `release-prep.yml`
-  fail at the PR step. (A PR opened with `GITHUB_TOKEN` would trigger no CI
-  anyway.) `nightly.yml`, `release-tag.yml` and `publish.yml` need no secret.
+- **Ruleset `tags_managed`** (all tags): blocks creation, update and
+  deletion; admins and the `affinidi-semantic-release` app bypass it. That
+  app is the identity `release-tag.yml` tags with — `GITHUB_TOKEN` (the
+  GitHub Actions app) is not on the bypass list.
+- **Environment `release`** — `publish.yml` (crates.io), the ECR mirror in
+  `publish-images.yaml`, and the release-bot steps of `release-tag.yml`,
+  `release-prep.yml` and `backport.yml` run in it. Restrict it to `main`
+  (backports run there), `release/*` branches and `v*` tags. Each crate's
+  Trusted Publisher on crates.io names this repository, `publish.yml` and
+  this environment.
+- **`RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`** (environment `release`
+  secrets) — the `affinidi-semantic-release` app, installed org-wide with
+  contents write, as in affinidi-trust-registry-rs. Its token creates the
+  tags and GitHub Releases, and opens the prep and backport PRs: the
+  enterprise does not allow `GITHUB_TOKEN` to open pull requests, and a PR it
+  opened would trigger no CI anyway. `nightly.yml` and `publish.yml` need no
+  secret.
 - **`CI_RUNNER_LARGE`** (variable, optional) — a larger runner label for the
   heavy CI jobs and `publish.yml`; `ubuntu-24.04` otherwise.
 - **`AWS_ROLE_ARN`** (variable, optional) — enables the ECR Public mirror in

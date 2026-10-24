@@ -27,6 +27,7 @@ concurrency:
 jobs:
   tag:
     name: Tag v<RELEASE>
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -34,6 +35,15 @@ jobs:
       # gh workflow run publish-images.yaml
       actions: write
     steps:
+      # The release-bot app (affinidi-semantic-release) is on the tags_managed
+      # ruleset's bypass list and may open PRs; GITHUB_TOKEN is neither. Its
+      # secrets live in the `release` environment, as in affinidi-trust-registry-rs.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
@@ -41,7 +51,7 @@ jobs:
       - name: Tag and publish the GitHub Release
         id: tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
