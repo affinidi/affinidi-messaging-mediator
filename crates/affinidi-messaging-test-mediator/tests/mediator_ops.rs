@@ -2,6 +2,10 @@
 //! (`messaging/stats/show`, `messaging/queue/list`), sent through the SDK to a
 //! live in-process mediator.
 
+// Exercises the 0.1 `messaging/*` tasks the mediator serves; `trust-tasks-rs`
+// 0.35 marks them superseded (dtgwg-trust-tasks-tf#921).
+#![allow(deprecated)]
+
 mod common;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

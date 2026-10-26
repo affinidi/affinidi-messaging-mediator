@@ -21,6 +21,12 @@
 //!
 //! [Trust Task]: https://trusttasks.org
 
+// The mediator serves the 0.1 versions of the `messaging/*` and `audit/list`
+// tasks. `trust-tasks-rs` 0.35 marks them superseded by 0.2
+// (dtgwg-trust-tasks-tf#921); serving 0.2 beside 0.1 is follow-up work, due
+// before 0.1 is withdrawn.
+#![allow(deprecated)]
+
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;

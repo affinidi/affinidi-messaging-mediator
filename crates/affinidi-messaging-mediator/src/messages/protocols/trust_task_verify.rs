@@ -21,6 +21,12 @@
 //! [`TrustTaskVerification`]: `warn` during the transition while clients start
 //! signing, `enforce` once they do.
 
+// The mediator serves the 0.1 versions of the `messaging/*` and `audit/list`
+// tasks. `trust-tasks-rs` 0.35 marks them superseded by 0.2
+// (dtgwg-trust-tasks-tf#921); serving 0.2 beside 0.1 is follow-up work, due
+// before 0.1 is withdrawn.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use affinidi_data_integrity::VerifyOptions;
