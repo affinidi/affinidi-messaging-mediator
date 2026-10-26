@@ -12,14 +12,14 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-affinidi-messaging-sdk = "0.40"
+affinidi-messaging-sdk = "0.41"
 ## The account a did:scid names: its `src` locator is not part of the
 ## identity (`scid` module, 0.4.4).
 affinidi-did-common = "0.4.4"
 affinidi-messaging-didcomm = "0.15"
 affinidi-tdk-common = "0.7"
 affinidi-secrets-resolver = "0.5"
-trust-tasks-rs = "0.34"
+trust-tasks-rs = "0.35"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }

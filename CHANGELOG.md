@@ -8,6 +8,22 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — trust-tasks-rs 0.35, affinidi-messaging-sdk 0.41 (breaking)
+
+- `trust-tasks-rs` / `trust-tasks-proof` 0.34 → 0.35
+  (trustoverip/dtgwg-trust-tasks-tf#910, #912, #917), and with them
+  `affinidi-messaging-sdk` 0.41, `affinidi-tdk` 0.33 and (test-mediator's
+  dev-dependency) `affinidi-messaging-didcomm-service` 0.26
+  (affinidi/affinidi-tdk-rs#975), which require 0.35. mediator-admin and
+  test-mediator expose these types, so this is a breaking change for them.
+- 0.35 marks superseded spec versions deprecated
+  (trustoverip/dtgwg-trust-tasks-tf#921), including the `messaging/*` and
+  `audit/list` 0.1 tasks this mediator serves and the admin console calls.
+  Nothing changes on the wire: the mediator still serves 0.1, and the modules
+  that do so allow the deprecation, with a note. A superseded version is
+  withdrawn about 90 days later, so the mediator must serve the 0.2 versions
+  beside 0.1 before then (around late January 2027).
+
 ## 0.45.0 (release/0.45)
 
 ### Changed — trust-tasks-rs 0.34, affinidi-messaging-sdk 0.40 (breaking)

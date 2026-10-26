@@ -6,6 +6,10 @@
 //! the mediator's `trust_tasks` consumer → response → the SDK's typed reply — over
 //! a real in-process HTTP mediator (memory backend, no Redis).
 
+// Exercises the 0.1 `messaging/*` tasks the mediator serves; `trust-tasks-rs`
+// 0.35 marks them superseded (dtgwg-trust-tasks-tf#921).
+#![allow(deprecated)]
+
 use affinidi_messaging_mediator::common::config::limits::LimitsConfig;
 use affinidi_messaging_test_mediator::TestEnvironment;
 

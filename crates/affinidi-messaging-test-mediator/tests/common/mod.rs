@@ -1,5 +1,9 @@
 //! Shared helpers for the e2e integration tests.
 
+// The mediator serves the 0.1 `messaging/*` tasks these helpers read, which
+// `trust-tasks-rs` 0.35 marks superseded (dtgwg-trust-tasks-tf#921).
+#![allow(deprecated)]
+
 use std::sync::Once;
 
 /// Legacy Redis-availability gate — kept as `false` always since the
