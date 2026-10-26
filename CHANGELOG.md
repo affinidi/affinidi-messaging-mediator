@@ -8,6 +8,42 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Fixed — a relay leaves a remote recipient's access list to its own mediator
+
+- **Behaviour change (R3.6).** A forward whose next hop is hosted by another
+  mediator is no longer checked against the next hop's access list or
+  `ANON_RECEIVE` on the relaying mediator. The account a relay holds for a
+  remote next hop is a placeholder made from its `global_acl_default`, so
+  under a closed default (`MODE_EXPLICIT_ALLOW`) every cross-mediator forward
+  was refused with `73 delivery.refused`, both single (`next` = recipient) and
+  double (`next` = recipient's mediator). The recipient's mediator enforces
+  both, as `docs/multi-mediator.md` §6 lays out. A local next hop is checked
+  as before.
+- The relay now resolves `next` before the access-list check rather than
+  after it. A DID that cannot be resolved is treated as local, so it is still
+  checked.
+
+## 0.45.0 (release/0.45)
+
+### Changed — trust-tasks-rs 0.34, affinidi-messaging-sdk 0.40 (breaking)
+
+- `trust-tasks-rs` / `trust-tasks-proof` 0.33 → 0.34
+  (trustoverip/dtgwg-trust-tasks-tf#884, #901), and with them
+  `affinidi-messaging-sdk` 0.40, `affinidi-tdk` 0.32 and (test-mediator's
+  dev-dependency) `affinidi-messaging-didcomm-service` 0.25
+  (affinidi/affinidi-tdk-rs#972). The SDK requires 0.34, so the two move
+  together. None of 0.34 touches anything here; no source change.
+- mediator-admin takes an `ATM`, so consumers move to
+  `affinidi-messaging-sdk` 0.40 and `trust-tasks-rs` 0.34 with this release.
+  The lockfile still holds `affinidi-messaging-sdk` 0.37 / `trust-tasks-rs`
+  0.32 beside these through `vta-sdk` 0.72, as before.
+- **The mediator (`aws` feature) and mediator-setup no longer enable
+  `aws-sdk-s3`'s `sigv4a`.** SigV4a is for S3 Multi-Region Access Points; an
+  `s3://` target is a plain bucket and key. It was the only path to `crypto-bigint` 0.5.5
+  (RUSTSEC-2026-0387, secret-dependent timing, no 0.5.x fix), which
+  `cargo deny` now refuses. Lockfile: `tokio` 1.54.1, `ctutils` 0.4.5 and
+  `crypto-bigint` 0.7.6 (RUSTSEC-2026-0386, -0385, -0387).
+
 ### Changed — TSP 1.0: affinidi-tsp 0.3, affinidi-messaging-sdk 0.39 (breaking)
 
 - `affinidi-tsp` 0.2 → 0.3, `affinidi-messaging-sdk` 0.39, `affinidi-tdk`
@@ -75,21 +111,6 @@ didwebvh-rs 0.8.1 (`did_web::to_scid_did_document`,
 - **Fixed (mediator-setup):** `did_web_self_hosted` is activated for a did:scid
   mediator DID whose `src` host is the public URL's, as for did:webvh, and
   `--save-did-web` bridges its log.
-
-### Fixed — a relay leaves a remote recipient's access list to its own mediator
-
-- **Behaviour change (R3.6).** A forward whose next hop is hosted by another
-  mediator is no longer checked against the next hop's access list or
-  `ANON_RECEIVE` on the relaying mediator. The account a relay holds for a
-  remote next hop is a placeholder made from its `global_acl_default`, so
-  under a closed default (`MODE_EXPLICIT_ALLOW`) every cross-mediator forward
-  was refused with `73 delivery.refused`, both single (`next` = recipient) and
-  double (`next` = recipient's mediator). The recipient's mediator enforces
-  both, as `docs/multi-mediator.md` §6 lays out. A local next hop is checked
-  as before.
-- The relay now resolves `next` before the access-list check rather than
-  after it. A DID that cannot be resolved is treated as local, so it is still
-  checked.
 
 ## 0.44.0 (release/0.44)
 

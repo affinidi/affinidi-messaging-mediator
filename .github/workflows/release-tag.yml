@@ -5,11 +5,11 @@ name: Tag a release
 # (`vX.Y.Z-rc.N`) is a prerelease and never "latest". Its notes are the
 # version's CHANGELOG.md section where it has one, otherwise generated.
 #
-# Then it starts publish-images.yaml for the tag. The tag is created with
-# GITHUB_TOKEN, and a ref GITHUB_TOKEN creates triggers no workflow, so the
-# image build is dispatched explicitly (workflow_dispatch is the documented
-# exception). Exactly one image run per release either way; a tag pushed by a
-# person still triggers publish-images.yaml through its own `push: tags`.
+# The tag is created with the release-bot app's token, so it triggers
+# publish-images.yaml through that workflow's own `push: tags`, exactly as a
+# tag pushed by a person does: one image run per release, nothing dispatched
+# from here. (A tag created with GITHUB_TOKEN would trigger nothing, which is
+# why an earlier version dispatched the image build itself.)
 #
 # Crates are published by publish.yml on the same push (GA and patch only).
 on:
@@ -27,21 +27,28 @@ concurrency:
 jobs:
   tag:
     name: Tag v<RELEASE>
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write
-      # gh workflow run publish-images.yaml
-      actions: write
+      contents: read
     steps:
+      # The release-bot app (affinidi-semantic-release) is on the tags_managed
+      # ruleset's bypass list and may open PRs; GITHUB_TOKEN is neither. Its
+      # secrets live in the `release` environment, as in affinidi-trust-registry-rs.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Tag and publish the GitHub Release
-        id: tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -51,10 +58,8 @@ jobs:
             exit 1
           fi
           tag="v$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             echo "::warning::$tag already exists; not moving it"
-            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # The version's own CHANGELOG section, heading excluded.
@@ -76,10 +81,3 @@ jobs:
             args+=(--generate-notes)
           fi
           gh release create "$tag" "${args[@]}"
-          echo "created=true" >> "$GITHUB_OUTPUT"
-      - name: Build and publish the image for the tag
-        if: steps.tag.outputs.created == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: gh workflow run publish-images.yaml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f version="$TAG"

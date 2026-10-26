@@ -133,16 +133,16 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-ty
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.39"
+affinidi-messaging-sdk = "0.40"
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
 affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
 affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
 ## Trust Tasks framework core — consumes Trust Task documents (the messaging
 ## ping / account / acl / access-list tasks) carried over the binding envelope.
-trust-tasks-rs = { version = "0.33", optional = true }
+trust-tasks-rs = { version = "0.34", optional = true }
 # Verifies Trust Task proofs (eddsa-jcs-2022) before any handler runs.
-trust-tasks-proof = { version = "0.33", default-features = false, features = ["affinidi"], optional = true }
+trust-tasks-proof = { version = "0.34", default-features = false, features = ["affinidi"], optional = true }
 affinidi-data-integrity = { version = "0.8", optional = true }
 ## Optional: JOSE key-agreement types for the didcomm compat layer (#327)
 affinidi-crypto = { version = "0.2", features = ["jose"], optional = true }
@@ -163,7 +163,7 @@ affinidi-encoding = { version = "0.1", optional = true }
 # names a version that no longer exists locally either, so the guard's "waiting
 # on a sibling" exemption — which requires the requirement to match the local
 # sibling exactly — stops applying and a `wait` becomes a `FAIL`.
-affinidi-messaging-mediator-common = { version = "0.45.0", path = "affinidi-messaging-mediator-common" }
+affinidi-messaging-mediator-common = { version = "0.46.0", path = "affinidi-messaging-mediator-common" }
 ## Raw TOML config schema — the `*ConfigRaw` types are defined here and the
 ## mediator re-exports them; the runtime `Config` + conversions stay local.
 # An EXACT version, not `0.4`: the runtime config reads
@@ -171,7 +171,7 @@ affinidi-messaging-mediator-common = { version = "0.45.0", path = "affinidi-mess
 # looser requirement resolves an older published config crate in
 # `cargo publish --dry-run` and fails to compile on the missing field. Bump in
 # lockstep with that crate's own version.
-affinidi-messaging-mediator-config = { version = "0.45.0", path = "affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.46.0", path = "affinidi-messaging-mediator-config" }
 ## Humantime for the VTA cache TTL (`[secrets].cache_ttl = "30d"`).
 humantime = "2"
 ## CLI parsing for the mediator binary's subcommands (`mediator`,
@@ -263,7 +263,12 @@ aws-sdk-ssm = { version = "1", optional = true, default-features = false, featur
 # bypasses) and RUSTSEC-2026-0104 (reachable panic in CRL parsing).
 # Dropping `rustls` leaves the aws-lc-rs stack, which is the provider
 # this workspace prefers anyway.
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+#
+# Also minus `sigv4a`: SigV4a signing exists for S3 Multi-Region Access
+# Points, and an `s3://` target is a plain bucket and key (`parse_s3_target`).
+# It pulls p256 0.13 / crypto-bigint 0.5.5, which carries RUSTSEC-2026-0387
+# (secret-dependent timing) with no 0.5.x fix.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 
 # ── Cryptography & Security ─────────────────────────────────────────────
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }

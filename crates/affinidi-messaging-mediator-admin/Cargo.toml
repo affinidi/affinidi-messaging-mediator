@@ -12,14 +12,14 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-affinidi-messaging-sdk = "0.39"
+affinidi-messaging-sdk = "0.40"
 ## The account a did:scid names: its `src` locator is not part of the
 ## identity (`scid` module, 0.4.4).
 affinidi-did-common = "0.4.4"
 affinidi-messaging-didcomm = "0.15"
 affinidi-tdk-common = "0.7"
 affinidi-secrets-resolver = "0.5"
-trust-tasks-rs = "0.33"
+trust-tasks-rs = "0.34"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,8 +30,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
-affinidi-messaging-test-mediator = { version = "0.45.0", path = "../affinidi-messaging-test-mediator" }
-affinidi-messaging-mediator-common = { version = "0.45.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
+affinidi-messaging-test-mediator = { version = "0.46.0", path = "../affinidi-messaging-test-mediator" }
+affinidi-messaging-mediator-common = { version = "0.46.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 
