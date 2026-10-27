@@ -129,11 +129,16 @@ the forward handler in tests, never for a federated deployment.
 | Peer allowlist usable? | no | yes |
 | Both sides must agree? | — | **yes**, both mediators must run `rewrap` |
 
-In rewrap mode A calls `rewrap_for_relay`, and B peels the layer in
+In rewrap mode A calls `rewrap_for_relay`, which encrypts the layer to the
+DID that terminates the hop: the peer mediator B. For a double forward that is
+`next` itself; for a single forward (`next` = Bob) it is the mediator Bob's
+DID document names, not Bob. B peels the layer in
 `peel_relay_rewrap_layers` (`src/messages/inbound.rs`) before processing:
 unpack, confirm `next == B`, check the peer allowlist, decode the attachment,
 repeat. The peel loop is bounded by `max_hops`; exceeding it is error 94,
-`protocol.forwarding.loop_detected`.
+`protocol.forwarding.loop_detected`. Because the layer is peeled before any
+recipient check, Bob's access list on B is checked against Alice, not against
+A. (Test: `rewrap_relay_honours_recipients_access_list`.)
 
 `hop_count` is carried across the re-wrap rather than reset, so loop detection
 survives the mode.
@@ -195,7 +200,7 @@ federation both roles apply to both mediators.
 | `processors.forwarding.max_hops` | applies | applies | default 10; `PROCESSOR_FORWARDING_MAX_HOPS` |
 | `processors.forwarding.blocked_forwarding_dids` | JSON array string | — | own DID + every service URI in its document are added automatically |
 | `security.enable_inter_mediator_relay` | — | `true` | admits the anonymous `/inbound` hop |
-| `security.global_acl_default` | must grant `RECEIVE_FORWARDED` (§6) | must grant `SEND_FORWARDED` (§6) | a relay deployment typically runs `ALLOW_ALL`; see [`acls.md` §7](./acls.md#7-recipes) |
+| `security.global_acl_default` | grants Alice `SEND_FORWARDED` if she has no account of her own (§6) | must grant `SEND_FORWARDED` (§6) | a relay deployment typically runs `ALLOW_ALL`; see [`acls.md` §7](./acls.md#7-recipes) |
 | `security.local_direct_delivery_allowed` | — | `true` for single-forward relays (§1b) | not needed for the double forward |
 | `server.local_endpoints` | required behind a hostname/LB | required behind a hostname/LB | otherwise the mediator relays to itself; `LOCAL_ENDPOINTS`, comma-separated |
 | `processors.forwarding.ws_threshold_msgs_per_10s` | rate at which the relay socket engages | — | default 1; see §7 for what the rate actually measures |
@@ -218,12 +223,32 @@ that refused logs the specific reason against the session (see
 | Account | Capability | Enforced by | Error |
 |---|---|---|---|
 | Alice | `SEND_FORWARDED` | `resolve_forward_sender` | 60 `authorization.send_forwarded` |
-| the next hop — **B's DID** for a double forward, **Bob's DID** for a single forward | `RECEIVE_FORWARDED` | forward gate | 73 `delivery.refused` |
+| a **local** next hop | `RECEIVE_FORWARDED`, its access list, `ANON_RECEIVE`, its receive-queue limit | `check_local_next_hop` / `deliver_forward` | 73 `delivery.refused` |
+| a **remote** next hop — **B's DID** for a double forward, **Bob's DID** for a single forward | none, unless it already holds an account on A with access-list entries; that list is applied | `check_remote_next_hop` | 73 `delivery.refused` |
 
-The next-hop account is auto-created on first contact with A's
-`global_acl_default` (`resolve_next_account`). **This is why a relay mediator
-needs a default that grants `RECEIVE_FORWARDED`**: the peer mediator's DID has
-to hold an account on A, and nothing else creates it.
+A does not apply recipient policy to a remote next hop, and does not register
+an account for it. Its inbox, and so its real policy, is on B; anything A held
+would be invented from A's `global_acl_default`, and under a closed default
+(`MODE_EXPLICIT_ALLOW`) it refused every cross-mediator forward. Local versus
+remote is decided first (§2), after A's own cheap checks (sender, queue
+limits, attachments, `delay_milli`, `FORWARD_Q` capacity), so that DID
+resolution is not spent on a forward A would reject anyway.
+
+The one exception is a remote next hop that does hold an account on A with a
+non-empty access list. That list is something an owner or operator set, and A
+honours it. It covers the misconfiguration where a local user's document
+points at a hostname missing from `server.local_endpoints` (§2), which would
+otherwise class the user as remote and skip their list on A. An account with
+an empty list (the placeholder earlier versions registered) is ignored.
+
+When B refuses the relay with a 4xx other than 408, 425 or 429, A does not
+retry it. It drops the entry, reports `forwarded` with outcome
+`e.p.me.res.forwarding.refused` to the monitor, and sends the sender a problem
+report with the same code and args `[destination, http_status, endpoint]`.
+Otherwise a refused message could be delivered later, if the recipient's
+policy changed while A was still retrying. Timeouts, rate limits, 5xx and
+connection errors are still retried until `max_retries`, then abandoned with
+`e.p.me.res.forwarding.abandoned`.
 
 **On B (recipient's mediator):**
 
@@ -395,7 +420,8 @@ mediator **DIDs**, not URLs).
 | Message loops back to A | A's public hostname doesn't match its bind address | set `server.local_endpoints` to every public URL in A's DID document |
 | B returns `401` on `/inbound` | B isn't configured as a relay | `security.enable_inter_mediator_relay = "true"` on B |
 | Error 60 `authorization.send_forwarded` at B | B's `global_acl_default` doesn't grant `SEND_FORWARDED`, so the auto-registered sender got nothing | widen B's default (§6) |
-| Error 73 `delivery.refused` at A, logged as "recipient is not accepting forwarded messages" | the peer mediator's auto-created account on A lacks `RECEIVE_FORWARDED` | A's `global_acl_default` must grant `RECEIVE_FORWARDED` |
+| Error 73 `delivery.refused` at A for a remote recipient | the recipient holds an account on A with an access list that doesn't admit the sender (§6) | remove that account or list on A, or check whether A wrongly classes a local user as remote (`server.local_endpoints`) |
+| `FORWARD_REFUSED` in A's logs; sender gets `e.p.me.res.forwarding.refused` | B refused the relay with a 4xx, typically a recipient-side check on Bob | B's log names the reason; the message is not retried |
 | Error 73 `delivery.refused` at B | a recipient-side check on Bob failed (§6) | B's log names the reason |
 | Error 60 `authorization.relay.untrusted_peer` | B's `relay_trusted_mediators` doesn't name A | add A's DID, or empty the list; confirm both sides run `rewrap` |
 | Error 71 `direct_delivery.denied` at B | a single-forward relay landed as a direct delivery | `local_direct_delivery_allowed = "true"` on B, or send the double forward |
