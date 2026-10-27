@@ -15,6 +15,8 @@ mediator-tui 0.11.0); they are no longer updated.
   continues to use the socket peer; malformed or untrusted forwarded headers
   safely fall back to the socket peer.
 
+## 0.47.0 (release/0.47)
+
 ### Changed — affinidi-messaging-sdk 0.43: the admin console speaks 0.2 (breaking)
 
 - `affinidi-messaging-sdk` 0.43 (affinidi/affinidi-tdk-rs#977), `affinidi-tdk`
