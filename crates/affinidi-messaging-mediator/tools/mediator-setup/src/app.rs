@@ -509,6 +509,8 @@ pub struct WizardConfig {
     /// the DID document points at the same URLs the mediator actually
     /// serves. Empty / `/` means "serve at host root".
     pub api_prefix: String,
+    /// Written to `[server] trust_xff_cidrs`; empty = `X-Forwarded-For` ignored.
+    pub trust_xff_cidrs: Vec<String>,
     /// Publish target for the minted DID string (recipe `[output].did_target`;
     /// never prompted). `None` = don't publish.
     pub did_target: Option<String>,
@@ -665,6 +667,7 @@ impl Default for WizardConfig {
             admin_did_mode: String::new(),
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             api_prefix: DEFAULT_API_PREFIX.into(),
+            trust_xff_cidrs: Vec::new(),
             did_target: None,
             did_log_target: None,
         }

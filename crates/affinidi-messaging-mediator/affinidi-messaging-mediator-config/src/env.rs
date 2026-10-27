@@ -299,6 +299,32 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     env_override_opt!(config.secrets.cache_ttl, "MEDIATOR_SECRETS_CACHE_TTL");
 }
 
+/// Override `[server] trust_xff_cidrs` from a comma-separated `TRUST_XFF_CIDRS`
+/// value.
+///
+/// Unlike the plain string lists this one is parsed, and a bad entry is an
+/// error: silently dropping a typo would leave every client behind the proxy
+/// sharing one rate-limit bucket with no sign why. `""` clears the list.
+fn apply_trust_xff_cidrs_override(
+    config: &mut ConfigRaw,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    config.server.trust_xff_cidrs = split_list(&value)
+        .iter()
+        .map(|entry| {
+            entry.parse().map_err(|err| {
+                ConfigError::Parse(format!(
+                    "TRUST_XFF_CIDRS entry '{entry}' is not a CIDR range: {err}"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(())
+}
+
 /// Read the primary configuration file for the mediator.
 /// Returns a [`ConfigRaw`] with env var overrides applied.
 ///
@@ -334,6 +360,7 @@ pub fn read_config_file_with_unknown_keys(
     })?;
 
     apply_env_overrides(&mut config);
+    apply_trust_xff_cidrs_override(&mut config, std::env::var("TRUST_XFF_CIDRS").ok())?;
 
     Ok((config, unknown_keys))
 }
@@ -433,7 +460,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config, split_list, unknown_key_message};
+    use super::{apply_trust_xff_cidrs_override, parse_config, split_list, unknown_key_message};
 
     const SHIPPED: &str = include_str!("../../conf/mediator.toml");
 
@@ -555,5 +582,34 @@ mod tests {
         assert!(split_list("").is_empty());
         assert!(split_list("  ").is_empty());
         assert!(split_list(",,").is_empty());
+    }
+
+    #[test]
+    fn test_trust_xff_cidrs_env_overrides_the_file() {
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        apply_trust_xff_cidrs_override(&mut config, Some("10.0.0.0/8, 2001:db8::/32".into()))
+            .expect("valid list");
+        assert_eq!(config.server.trust_xff_cidrs.len(), 2);
+
+        apply_trust_xff_cidrs_override(&mut config, Some(String::new())).expect("empty clears");
+        assert!(config.server.trust_xff_cidrs.is_empty());
+    }
+
+    #[test]
+    fn test_trust_xff_cidrs_env_absent_keeps_the_file_value() {
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        config.server.trust_xff_cidrs = vec!["10.0.0.0/8".parse().expect("cidr")];
+        apply_trust_xff_cidrs_override(&mut config, None).expect("no-op");
+        assert_eq!(config.server.trust_xff_cidrs.len(), 1);
+    }
+
+    #[test]
+    fn test_trust_xff_cidrs_env_rejects_a_bad_entry() {
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        let result = apply_trust_xff_cidrs_override(&mut config, Some("10.0.0.0/8,nope".into()));
+        match result {
+            Err(crate::error::ConfigError::Parse(msg)) => assert!(msg.contains("nope")),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
     }
 }

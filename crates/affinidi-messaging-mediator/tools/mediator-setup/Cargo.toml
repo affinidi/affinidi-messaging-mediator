@@ -39,6 +39,7 @@ secrets-k8s = ["affinidi-messaging-mediator-common/secrets-k8s"]
 publish-aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-types"]
 
 [dependencies]
+ipnetwork = { version = "0.21", features = ["serde"] }
 # ── TUI Framework ────────────────────────────────────────────────────────
 ## Workspace-wide pin — ratatui 0.29 carries `unicode-width = "=0.2.0"`
 ## so every workspace consumer of ratatui (here, text-client,

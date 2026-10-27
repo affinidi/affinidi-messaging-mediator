@@ -1,6 +1,7 @@
 use crate::{
     SharedData,
     builder::{MediatorHandle, StartOpts, TlsMode, TracingMode},
+    common::rate_limit::TrustedProxyRateLimitLayer,
     common::{
         config::{
             Config, LimitsConfig,
@@ -26,7 +27,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
-use affinidi_rate_limit::{RateLimitLayer, RateLimiterState, Refusal};
+use affinidi_rate_limit::{RateLimiterState, Refusal};
 use axum::{Router, routing::get};
 use std::{
     collections::HashSet, env, net::SocketAddr, sync::Arc, sync::atomic::AtomicUsize,
@@ -893,15 +894,9 @@ pub async fn serve_internal(
 
     let app: Router = application_routes(&api_prefix, &shared_state);
 
-    // The `RATE_LIMITED_TOTAL` metric used to be emitted inside the limiter
-    // itself. It now rides on the refusal callback, so the shared crate stays
-    // free of any metrics dependency.
-    let rate_limiter = ip_rate_limiter(&config.limits).on_refused(|refusal| {
-        if matches!(refusal, Refusal::RateLimited { .. }) {
-            ::metrics::counter!(crate::common::metrics::names::RATE_LIMITED_TOTAL, "scope" => "ip")
-                .increment(1);
-        }
-    });
+    // The local layer owns refusal responses so it also receives the metric
+    // callback that the upstream layer used to invoke.
+    let rate_limiter = ip_rate_limiter(&config.limits);
     rate_limiter.spawn_gc(shutdown_token.clone());
     if config.limits.rate_limit_per_ip > 0 {
         info!(
@@ -925,7 +920,18 @@ pub async fn serve_internal(
                 .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(RequestBodyLimitLayer::new(config.limits.http_size))
-        .layer(RateLimitLayer::new(rate_limiter))
+        .layer(
+            TrustedProxyRateLimitLayer::new(rate_limiter, config.trust_xff_cidrs.clone())
+                .on_refused(|refusal| {
+                    if matches!(refusal, Refusal::RateLimited { .. }) {
+                        ::metrics::counter!(
+                            crate::common::metrics::names::RATE_LIMITED_TOTAL,
+                            "scope" => "ip"
+                        )
+                        .increment(1);
+                    }
+                }),
+        )
         .layer(RequestIdLayer::new())
         .merge(probe_routes(
             &api_prefix,
@@ -1432,6 +1438,55 @@ mod rate_limit_tests {
         request
     }
 
+    fn request_via(peer: [u8; 4], forwarded: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri("/ws")
+            .header("x-forwarded-for", forwarded)
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((peer, 5000))));
+        request
+    }
+
+    /// Behind a trusted proxy each forwarded client gets its own bucket, while
+    /// an untrusted peer cannot choose its bucket by sending the header.
+    #[tokio::test]
+    async fn trusted_proxy_buckets_clients_by_forwarded_address() {
+        let app = Router::new()
+            .route("/ws", get(|| async { "upgrade" }))
+            .layer(TrustedProxyRateLimitLayer::new(
+                ip_rate_limiter(&limits(1, 1)),
+                vec!["10.0.0.0/8".parse().unwrap()],
+            ));
+        let status = |app: Router, req: Request<Body>| async move {
+            app.oneshot(req).await.unwrap().status()
+        };
+
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.1")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.2")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.1")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Untrusted peer: the header is ignored, so rotating it does not help.
+        assert_eq!(
+            status(app.clone(), request_via([192, 0, 2, 9], "198.51.100.1")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app, request_via([192, 0, 2, 9], "198.51.100.2")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
     /// A mediator `429` carries the attribution contract, and the SDK reads it
     /// back as a typed rate-limit refusal naming the mediator. Both ends of the
     /// contract in one test, so neither can drift from the other.
@@ -1440,7 +1495,10 @@ mod rate_limit_tests {
         let app = Router::new()
             .route("/inbound", axum::routing::post(|| async { "accepted" }))
             .route("/ws", get(|| async { "upgrade" }))
-            .layer(RateLimitLayer::new(ip_rate_limiter(&limits(1, 1))));
+            .layer(TrustedProxyRateLimitLayer::new(
+                ip_rate_limiter(&limits(1, 1)),
+                Vec::new(),
+            ));
 
         assert_eq!(
             app.clone().oneshot(request("/ws")).await.unwrap().status(),

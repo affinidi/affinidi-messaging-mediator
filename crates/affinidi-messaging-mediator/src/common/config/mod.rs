@@ -161,6 +161,8 @@ pub struct Config {
     /// hostname (e.g., LB-fronted deployments).
     #[serde(default)]
     pub local_endpoints: Vec<String>,
+    /// Trusted reverse-proxy CIDRs used for `X-Forwarded-For` rate-limit attribution.
+    pub trust_xff_cidrs: Vec<ipnetwork::IpNetwork>,
     pub streaming_enabled: bool,
     pub streaming_uuid: String,
     pub database: DatabaseConfig,
@@ -267,6 +269,7 @@ impl Config {
             mediator_did_log: None,
             admin_did: "".into(),
             local_endpoints: Vec::new(),
+            trust_xff_cidrs: Vec::new(),
             database: DatabaseConfig::default(),
             streaming_enabled: true,
             streaming_uuid: "".into(),
@@ -748,6 +751,7 @@ impl TryFrom<ConfigRaw> for Config {
             mediator_did,
             admin_did: read_did_config(&raw.server.admin_did, &aws_config, "admin_did").await?,
             local_endpoints: raw.server.local_endpoints,
+            trust_xff_cidrs: raw.server.trust_xff_cidrs,
             database: database_config_from_raw(raw.database),
             streaming_enabled: raw.streaming.enabled.parse().unwrap_or_else(|_| {
                 warn!(
