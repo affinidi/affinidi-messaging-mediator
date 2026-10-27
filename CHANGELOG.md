@@ -8,6 +8,40 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — the 0.2 versions are served beside 0.1
+
+- The mediator serves `messaging/ping`, `messaging/account/{get,list,add,update}`,
+  `audit/list` and `messaging/message/status` at 0.2 as well as 0.1. A client
+  is answered in the version it sent. Each 0.2 request is accepted under its
+  own spec's rules, run through the task's one handler, and its reply is
+  checked against the 0.2 response schema before it is signed. What differs:
+  ping's `serverTime` → `respondedAt`; an account's `lastReceivedAt` /
+  `lastAuthenticatedAt` are RFC 3339 strings rather than Unix seconds;
+  `audit/list` pages with `limit` / `nextCursor` and drops `truncated`;
+  `message/status`'s `at` → `reachedAt`. The TSP arm claims the 0.2 types too.
+- `messaging/monitor/event` stays at 0.1: the mediator pushes it on a
+  subscription that names no event version.
+
+### Changed — Trust Task types generated at build time (breaking)
+
+- The mediator pins the 31 task versions it serves in `trust-tasks.lock`
+  (vendored bundles under `trust-tasks/`, checked by digest) and generates
+  their types in `build.rs` with `trust-tasks-build`, as
+  `affinidi_messaging_mediator::task_specs`. `trust-tasks-rs` /
+  `trust-tasks-proof` 0.35.3 are runtime only (`default-features = false`),
+  so the ~900 prebuilt specification modules are no longer compiled.
+- mediator-admin and test-mediator take the types they exchange with the SDK
+  from `affinidi_messaging_sdk::tasks` (`affinidi-messaging-sdk` 0.42,
+  affinidi/affinidi-tdk-rs#976), with `affinidi-tdk` 0.34 and
+  `affinidi-messaging-didcomm-service` 0.27. mediator-admin's `specs`
+  re-export is now `affinidi_messaging_sdk::tasks::messaging`.
+- Wildcard arms over the wire enums (account role, access-list mode) are gone:
+  the enums come from a pinned bundle, so a new variant arrives only with a pin
+  move, and the match then fails to compile until it is mapped.
+- The optional VTA integration still brings `vta-sdk` 0.72, and with it
+  `trust-tasks-rs` 0.32 with every family, until it moves to a `vta-sdk` on
+  0.35.
+
 ### Changed — trust-tasks-rs 0.35, affinidi-messaging-sdk 0.41 (breaking)
 
 - `trust-tasks-rs` / `trust-tasks-proof` 0.34 → 0.35

@@ -7,8 +7,8 @@
 //! out — and refuses, removing nothing, if the queue no longer matches the
 //! count the user confirmed.
 
+use affinidi_messaging_sdk::tasks::messaging::queue::purge::v0_1::Queue;
 use chrono::{DateTime, Utc};
-use trust_tasks_rs::specs::messaging::queue::purge::v0_1::Queue;
 
 use crate::console::Target;
 

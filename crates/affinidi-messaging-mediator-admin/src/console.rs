@@ -9,14 +9,14 @@
 use std::sync::Arc;
 
 use affinidi_messaging_didcomm::message::Message;
+use affinidi_messaging_sdk::tasks::messaging::{account, message, queue, stats};
+use affinidi_messaging_sdk::tasks::{audit, config};
 use affinidi_messaging_sdk::{
     ATM, config::ATMConfig, messages::compat::UnpackMetadata, profiles::ATMProfile,
 };
 use affinidi_secrets_resolver::SecretsResolver;
 use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
-use trust_tasks_rs::specs::messaging::{account, message, queue, stats};
-use trust_tasks_rs::specs::{audit, config};
 
 use crate::error::{ConsoleError, Result};
 use crate::identity::Identity;
@@ -378,7 +378,7 @@ impl MediatorConsole {
     pub async fn patch_config(
         &self,
         overrides: serde_json::Map<String, Value>,
-    ) -> Result<trust_tasks_rs::specs::config::patch::v0_1::Response> {
+    ) -> Result<affinidi_messaging_sdk::tasks::config::patch::v0_1::Response> {
         if !self.capabilities.root {
             return Err(ConsoleError::NotPermitted(
                 "changing the mediator's configuration needs a rootAdmin",

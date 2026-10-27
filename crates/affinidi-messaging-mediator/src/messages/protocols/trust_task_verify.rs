@@ -373,7 +373,7 @@ mod tests {
     }
 
     fn policy_of(doc: &Value) -> SpecPolicy {
-        use trust_tasks_rs::specs::messaging::account;
+        use crate::task_specs::messaging::account;
         match doc["type"].as_str().unwrap() {
             ACCOUNT_UPDATE => SpecPolicy::of::<account::update::v0_1::Payload>(),
             ACCOUNT_GET => SpecPolicy::of::<account::get::v0_1::Payload>(),
@@ -398,7 +398,7 @@ mod tests {
     }
 
     fn account_update_policy() -> SpecPolicy {
-        SpecPolicy::of::<trust_tasks_rs::specs::messaging::account::update::v0_1::Payload>()
+        SpecPolicy::of::<crate::task_specs::messaging::account::update::v0_1::Payload>()
     }
 
     #[test]
