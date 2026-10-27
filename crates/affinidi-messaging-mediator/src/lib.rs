@@ -37,6 +37,13 @@ pub mod monitor;
 pub mod scid_sources;
 pub mod server;
 pub mod store;
+/// The Trust Task types this mediator serves, generated at build time from the
+/// versions pinned in this crate's `trust-tasks.lock` (see `build.rs`). Module
+/// paths match `trust_tasks_rs::specs`, e.g. `task_specs::messaging::ping::v0_2`.
+/// A task with two pinned versions is served at both.
+pub mod task_specs {
+    include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));
+}
 pub mod tasks;
 #[cfg(feature = "tsp")]
 pub mod tsp_identity;

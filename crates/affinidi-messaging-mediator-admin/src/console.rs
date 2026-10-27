@@ -1,16 +1,22 @@
 //! A connected console session.
 
+// The admin console speaks the 0.1 versions of the `messaging/*`,
+// `audit/list` and `monitor/event` tasks, which is what this mediator serves.
+// `trust-tasks-rs` 0.35 marks them superseded by 0.2 (dtgwg-trust-tasks-tf#921);
+// the console moves when the mediator serves 0.2.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use affinidi_messaging_didcomm::message::Message;
+use affinidi_messaging_sdk::tasks::messaging::{account, message, queue, stats};
+use affinidi_messaging_sdk::tasks::{audit, config};
 use affinidi_messaging_sdk::{
     ATM, config::ATMConfig, messages::compat::UnpackMetadata, profiles::ATMProfile,
 };
 use affinidi_secrets_resolver::SecretsResolver;
 use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
-use trust_tasks_rs::specs::messaging::{account, message, queue, stats};
-use trust_tasks_rs::specs::{audit, config};
 
 use crate::error::{ConsoleError, Result};
 use crate::identity::Identity;
@@ -72,7 +78,7 @@ pub struct MediatorConsole {
     did: String,
     did_hash: String,
     mediator_did: String,
-    account: account::get::v0_1::Account,
+    account: account::get::v0_2::Account,
     mode: Mode,
     capabilities: Capabilities,
     live: LiveStream,
@@ -230,7 +236,7 @@ impl MediatorConsole {
         &self.capabilities
     }
     /// The account as the mediator reported it at connect time.
-    pub fn account(&self) -> &account::get::v0_1::Account {
+    pub fn account(&self) -> &account::get::v0_2::Account {
         &self.account
     }
 
@@ -296,7 +302,7 @@ impl MediatorConsole {
         &self,
         cursor: Option<String>,
         limit: Option<u32>,
-    ) -> Result<account::list::v0_1::Response> {
+    ) -> Result<account::list::v0_2::Response> {
         self.require_admin("the account list")?;
         self.atm
             .trust_tasks()
@@ -343,7 +349,7 @@ impl MediatorConsole {
         &self,
         cursor: Option<String>,
         page_size: Option<u32>,
-    ) -> Result<audit::list::v0_1::Response> {
+    ) -> Result<audit::list::v0_2::Response> {
         self.require_admin("the audit log")?;
         self.atm
             .trust_tasks()
@@ -372,7 +378,7 @@ impl MediatorConsole {
     pub async fn patch_config(
         &self,
         overrides: serde_json::Map<String, Value>,
-    ) -> Result<trust_tasks_rs::specs::config::patch::v0_1::Response> {
+    ) -> Result<affinidi_messaging_sdk::tasks::config::patch::v0_1::Response> {
         if !self.capabilities.root {
             return Err(ConsoleError::NotPermitted(
                 "changing the mediator's configuration needs a rootAdmin",
@@ -409,7 +415,7 @@ impl MediatorConsole {
 
     // ─── One account (self, or any for an administrator) ────────────────
 
-    pub async fn account_of(&self, target: Target) -> Result<account::get::v0_1::Account> {
+    pub async fn account_of(&self, target: Target) -> Result<account::get::v0_2::Account> {
         self.require_target(&target, "another account")?;
         self.atm
             .trust_tasks()
@@ -546,10 +552,10 @@ impl MediatorConsole {
     pub async fn update_account(
         &self,
         target: Target,
-        role: Option<account::update::v0_1::AccountType>,
-        acl: Option<account::update::v0_1::MediatorAcl>,
-        limits: Option<account::update::v0_1::QueueLimits>,
-    ) -> Result<account::update::v0_1::Account> {
+        role: Option<account::update::v0_2::AccountType>,
+        acl: Option<account::update::v0_2::MediatorAcl>,
+        limits: Option<account::update::v0_2::QueueLimits>,
+    ) -> Result<account::update::v0_2::Account> {
         self.require_target(&target, "another account")?;
         if role.is_some() {
             self.require_admin("changing a role")?;
@@ -588,7 +594,7 @@ impl Drop for MediatorConsole {
 }
 
 /// Mode and capabilities from the mediator's record of the account.
-fn classify(account: &account::get::v0_1::Account) -> (Mode, Capabilities) {
+fn classify(account: &account::get::v0_2::Account) -> (Mode, Capabilities) {
     let role = serde_json::to_value(account.account_type).unwrap_or(Value::Null);
     let role = role.as_str().unwrap_or("standard");
     let admin = matches!(role, "admin" | "rootAdmin");
@@ -667,7 +673,7 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
 
-    fn account(role: &str, acl: Value) -> account::get::v0_1::Account {
+    fn account(role: &str, acl: Value) -> account::get::v0_2::Account {
         serde_json::from_value(serde_json::json!({
             "did": "abc",
             "accountType": role,

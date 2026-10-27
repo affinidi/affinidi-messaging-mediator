@@ -120,6 +120,10 @@ secrets-k8s = ["affinidi-messaging-mediator-common/secrets-k8s"]
 ## store). Enabled automatically by `secrets-aws`.
 aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-types"]
 
+[build-dependencies]
+# Generates `crate::task_specs` from trust-tasks.lock and the bundles in trust-tasks/.
+trust-tasks-build = "0.1.2"
+
 [dependencies]
 # ── Affinidi Crates ──────────────────────────────────────────────────────
 # 0.18.61+: reconnect backoff no longer resets on a socket that is immediately
@@ -133,16 +137,17 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-ty
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.40"
+affinidi-messaging-sdk = "0.43"
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
 affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
 affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
-## Trust Tasks framework core — consumes Trust Task documents (the messaging
-## ping / account / acl / access-list tasks) carried over the binding envelope.
-trust-tasks-rs = { version = "0.34", optional = true }
+## Trust Tasks runtime — consumes Trust Task documents carried over the binding
+## envelope. The task types are generated at build time from trust-tasks.lock
+## (see build.rs and `crate::task_specs`), so no prebuilt spec module is compiled.
+trust-tasks-rs = { version = "0.35.3", default-features = false, optional = true }
 # Verifies Trust Task proofs (eddsa-jcs-2022) before any handler runs.
-trust-tasks-proof = { version = "0.34", default-features = false, features = ["affinidi"], optional = true }
+trust-tasks-proof = { version = "0.35.3", default-features = false, features = ["affinidi"], optional = true }
 affinidi-data-integrity = { version = "0.8", optional = true }
 ## Optional: JOSE key-agreement types for the didcomm compat layer (#327)
 affinidi-crypto = { version = "0.2", features = ["jose"], optional = true }
@@ -163,7 +168,7 @@ affinidi-encoding = { version = "0.1", optional = true }
 # names a version that no longer exists locally either, so the guard's "waiting
 # on a sibling" exemption — which requires the requirement to match the local
 # sibling exactly — stops applying and a `wait` becomes a `FAIL`.
-affinidi-messaging-mediator-common = { version = "0.46.0", path = "affinidi-messaging-mediator-common" }
+affinidi-messaging-mediator-common = { version = "0.47.0", path = "affinidi-messaging-mediator-common" }
 ## Raw TOML config schema — the `*ConfigRaw` types are defined here and the
 ## mediator re-exports them; the runtime `Config` + conversions stay local.
 # An EXACT version, not `0.4`: the runtime config reads
@@ -171,7 +176,7 @@ affinidi-messaging-mediator-common = { version = "0.46.0", path = "affinidi-mess
 # looser requirement resolves an older published config crate in
 # `cargo publish --dry-run` and fails to compile on the missing field. Bump in
 # lockstep with that crate's own version.
-affinidi-messaging-mediator-config = { version = "0.46.0", path = "affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.47.0", path = "affinidi-messaging-mediator-config" }
 ## Humantime for the VTA cache TTL (`[secrets].cache_ttl = "30d"`).
 humantime = "2"
 ## CLI parsing for the mediator binary's subcommands (`mediator`,

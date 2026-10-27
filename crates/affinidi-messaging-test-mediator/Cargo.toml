@@ -42,10 +42,10 @@ affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
 ## is publishable to crates.io while still using the in-tree path for
 ## workspace dev-builds. Pins follow the workspace's caret-pin policy
 ## (major.minor only) so transitive patch fixes resolve automatically.
-affinidi-messaging-mediator = { version = "0.46.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
+affinidi-messaging-mediator = { version = "0.47.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
 # `test-clock` compiles the advanceable `TestClock` this fixture injects via
 # `TestMediatorBuilder::clock` for fast expiry/TTL tests.
-affinidi-messaging-mediator-common = { version = "0.46.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
+affinidi-messaging-mediator-common = { version = "0.47.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
   "test-clock",
 ] }
 
@@ -60,12 +60,12 @@ redis = { version = "1.1", optional = true, features = ["tokio-comp"] }
 
 # ── DID + key generation ────────────────────────────────────────────────
 ## Used for `DID::generate_did_peer` (Ed25519 + X25519, with service URI).
-affinidi-tdk = { version = "0.32", default-features = false, features = ["did-peer"] }
+affinidi-tdk = { version = "0.35", default-features = false, features = ["did-peer"] }
 affinidi-secrets-resolver = "0.5"
 affinidi-did-resolver-cache-sdk = "0.8"
 
 # ── SDK client (for the e2e test environment) ───────────────────────────
-affinidi-messaging-sdk = "0.40"
+affinidi-messaging-sdk = "0.43"
 
 # ── JWT signing key generation for the test mediator's session tokens ───
 ring = { version = "0.17", features = ["std"] }
@@ -96,6 +96,8 @@ serde_json = "1"
 affinidi-messaging-didcomm = "0.15"
 
 [dev-dependencies]
+## `issuedAt` on the hand-built Trust Task documents in tests/trust_tasks.rs.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ## Drive the SDK's DIDComm transport as the delivery layer does.
 affinidi-messaging-core = "0.1.11"
 ## Build hand-written authcrypt envelopes for the sender-binding tests.
@@ -110,9 +112,9 @@ affinidi-tsp = "0.3"
 ## the stored base64url form so the SDK can unpack it (tsp_websocket test).
 base64 = "0.23"
 ## Trust Tasks payload types named by the Trust Tasks integration tests.
-trust-tasks-rs = "0.34"
+trust-tasks-rs = { version = "0.35.3", default-features = false }
 ## Verifies the mediator's signed Trust Task responses.
-trust-tasks-proof = { version = "0.34", default-features = false, features = ["affinidi"] }
+trust-tasks-proof = { version = "0.35.3", default-features = false, features = ["affinidi"] }
 affinidi-data-integrity = "0.8"
 ## Tracing subscriber for test diagnostics.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -131,9 +133,9 @@ axum = "0.8"
 ## (`soft_restart_websocket`, `tsp_*`). They lived in that crate's own tests
 ## until the mediator moved out of affinidi-tdk-rs; a dev-dependency there on
 ## this crate would make a cross-repository cycle, so they run here instead.
-affinidi-messaging-didcomm-service = { version = "0.25", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.28", features = ["tsp"] }
 ## `affinidi_tdk::messaging::ATM` for the TSP transport-adapter test.
-affinidi-tdk = { version = "0.32", default-features = false, features = ["did-peer", "messaging"] }
+affinidi-tdk = { version = "0.35", default-features = false, features = ["did-peer", "messaging"] }
 affinidi-tdk-common = "0.7"
 
 [lints]

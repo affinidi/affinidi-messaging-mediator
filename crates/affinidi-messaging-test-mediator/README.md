@@ -281,7 +281,7 @@ let admin_user = env.add_admin(admin).await.expect("add_admin");
 // Trust Task. Accounts are addressed by hashed DID, exposed on
 // TestUser / TestMediatorUser as `did_hash()`.
 let alice = env.add_user("alice").await.expect("add alice");
-let acl: account::update::v0_1::MediatorAcl = account::update::v0_1::MediatorAcl::builder()
+let acl: account::update::v0_2::MediatorAcl = account::update::v0_2::MediatorAcl::builder()
     .send_messages(Some(false))
     .receive_messages(Some(false))
     .try_into()

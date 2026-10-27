@@ -8,6 +8,51 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — affinidi-messaging-sdk 0.43: the admin console speaks 0.2 (breaking)
+
+- `affinidi-messaging-sdk` 0.43 (affinidi/affinidi-tdk-rs#977), `affinidi-tdk`
+  0.35 and (test-mediator's dev-dependency) `affinidi-messaging-didcomm-service`
+  0.28. The SDK speaks `ping`, `account/{get,list,add,update}`, `audit/list` and
+  `message/status` at 0.2, falling back to 0.1 for a mediator before 0.47.0, and
+  returns only the 0.2 types.
+- mediator-admin's console and the TUI move to those types: account activity
+  times are timestamps rather than Unix seconds, and `audit/list` pages by
+  `next_cursor`. mediator-admin exposes them, so this is breaking for it.
+
+### Added — the 0.2 versions are served beside 0.1
+
+- The mediator serves `messaging/ping`, `messaging/account/{get,list,add,update}`,
+  `audit/list` and `messaging/message/status` at 0.2 as well as 0.1. A client
+  is answered in the version it sent. Each 0.2 request is accepted under its
+  own spec's rules, run through the task's one handler, and its reply is
+  checked against the 0.2 response schema before it is signed. What differs:
+  ping's `serverTime` → `respondedAt`; an account's `lastReceivedAt` /
+  `lastAuthenticatedAt` are RFC 3339 strings rather than Unix seconds;
+  `audit/list` pages with `limit` / `nextCursor` and drops `truncated`;
+  `message/status`'s `at` → `reachedAt`. The TSP arm claims the 0.2 types too.
+- `messaging/monitor/event` stays at 0.1: the mediator pushes it on a
+  subscription that names no event version.
+
+### Changed — Trust Task types generated at build time (breaking)
+
+- The mediator pins the 31 task versions it serves in `trust-tasks.lock`
+  (vendored bundles under `trust-tasks/`, checked by digest) and generates
+  their types in `build.rs` with `trust-tasks-build`, as
+  `affinidi_messaging_mediator::task_specs`. `trust-tasks-rs` /
+  `trust-tasks-proof` 0.35.3 are runtime only (`default-features = false`),
+  so the ~900 prebuilt specification modules are no longer compiled.
+- mediator-admin and test-mediator take the types they exchange with the SDK
+  from `affinidi_messaging_sdk::tasks` (`affinidi-messaging-sdk` 0.42,
+  affinidi/affinidi-tdk-rs#976), with `affinidi-tdk` 0.34 and
+  `affinidi-messaging-didcomm-service` 0.27. mediator-admin's `specs`
+  re-export is now `affinidi_messaging_sdk::tasks::messaging`.
+- Wildcard arms over the wire enums (account role, access-list mode) are gone:
+  the enums come from a pinned bundle, so a new variant arrives only with a pin
+  move, and the match then fails to compile until it is mapped.
+- The optional VTA integration still brings `vta-sdk` 0.72, and with it
+  `trust-tasks-rs` 0.32 with every family, until it moves to a `vta-sdk` on
+  0.35.
+
 ### Fixed — a relay leaves a remote recipient's policy to its own mediator
 
 - **Behaviour change (R3.6).** A forward whose next hop is hosted by another
@@ -44,6 +89,24 @@ mediator-tui 0.11.0); they are no longer updated.
   mediator. The receiving mediator therefore could not peel it, and it checked
   the recipient's policy against the relaying mediator's DID. The layer is now
   encrypted to the peer mediator the recipient's DID document names.
+
+## 0.46.0 (release/0.46)
+
+### Changed — trust-tasks-rs 0.35, affinidi-messaging-sdk 0.41 (breaking)
+
+- `trust-tasks-rs` / `trust-tasks-proof` 0.34 → 0.35
+  (trustoverip/dtgwg-trust-tasks-tf#910, #912, #917), and with them
+  `affinidi-messaging-sdk` 0.41, `affinidi-tdk` 0.33 and (test-mediator's
+  dev-dependency) `affinidi-messaging-didcomm-service` 0.26
+  (affinidi/affinidi-tdk-rs#975), which require 0.35. mediator-admin and
+  test-mediator expose these types, so this is a breaking change for them.
+- 0.35 marks superseded spec versions deprecated
+  (trustoverip/dtgwg-trust-tasks-tf#921), including the `messaging/*` and
+  `audit/list` 0.1 tasks this mediator serves and the admin console calls.
+  Nothing changes on the wire: the mediator still serves 0.1, and the modules
+  that do so allow the deprecation, with a note. A superseded version is
+  withdrawn about 90 days later, so the mediator must serve the 0.2 versions
+  beside 0.1 before then (around late January 2027).
 
 ## 0.45.0 (release/0.45)
 

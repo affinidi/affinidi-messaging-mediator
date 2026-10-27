@@ -16,6 +16,7 @@ pub mod ping;
 pub mod routing;
 pub(crate) mod trust_task_sign;
 pub(crate) mod trust_task_verify;
+pub(crate) mod trust_task_versions;
 pub mod trust_tasks;
 
 /// Whether `from` may relay through this mediator, given the configured relay

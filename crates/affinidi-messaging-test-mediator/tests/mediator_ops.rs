@@ -2,6 +2,10 @@
 //! (`messaging/stats/show`, `messaging/queue/list`), sent through the SDK to a
 //! live in-process mediator.
 
+// Exercises the 0.1 `messaging/*` tasks the mediator serves; `trust-tasks-rs`
+// 0.35 marks them superseded (dtgwg-trust-tasks-tf#921).
+#![allow(deprecated)]
+
 mod common;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -325,7 +329,7 @@ async fn promoted(env: &TestEnvironment, alias: &str, role: AccountType) -> Test
 
 #[tokio::test]
 async fn an_account_lists_and_reads_its_own_messages() {
-    use trust_tasks_rs::specs::messaging::message::list::v0_1::Queue;
+    use affinidi_messaging_sdk::tasks::messaging::message::list::v0_1::Queue;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -401,7 +405,7 @@ async fn an_account_lists_and_reads_its_own_messages() {
 
 #[tokio::test]
 async fn only_a_root_admin_reads_another_accounts_message_and_it_is_audited() {
-    use trust_tasks_rs::specs::messaging::message::list::v0_1::Queue;
+    use affinidi_messaging_sdk::tasks::messaging::message::list::v0_1::Queue;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -449,7 +453,7 @@ async fn only_a_root_admin_reads_another_accounts_message_and_it_is_audited() {
 }
 
 async fn receive_ids(env: &TestEnvironment, user: &TestUser) -> Vec<String> {
-    use trust_tasks_rs::specs::messaging::message::list::v0_1::Queue;
+    use affinidi_messaging_sdk::tasks::messaging::message::list::v0_1::Queue;
     env.atm
         .trust_tasks()
         .message_list(&user.profile, None, Queue::Receive, None, None, None)
@@ -533,7 +537,7 @@ async fn deleting_another_accounts_messages_needs_admin_and_is_audited() {
 
 #[tokio::test]
 async fn a_privileged_accounts_queue_needs_a_root_admin() {
-    use trust_tasks_rs::specs::messaging::queue::purge::v0_1::Queue;
+    use affinidi_messaging_sdk::tasks::messaging::queue::purge::v0_1::Queue;
 
     let env = direct_env().await;
     let admin = promoted(&env, "admin", AccountType::Admin).await;
@@ -572,7 +576,7 @@ async fn a_privileged_accounts_queue_needs_a_root_admin() {
 
 #[tokio::test]
 async fn a_dry_run_counts_and_the_real_purge_removes_only_the_filtered_peer() {
-    use trust_tasks_rs::specs::messaging::queue::purge::v0_1::Queue;
+    use affinidi_messaging_sdk::tasks::messaging::queue::purge::v0_1::Queue;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -628,7 +632,7 @@ async fn a_dry_run_counts_and_the_real_purge_removes_only_the_filtered_peer() {
 
 #[tokio::test]
 async fn an_admin_watches_a_message_arrive_live() {
-    use trust_tasks_rs::specs::messaging::monitor::subscribe::v0_1::MonitorFilter;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -691,7 +695,7 @@ async fn an_admin_watches_a_message_arrive_live() {
 #[tokio::test]
 async fn the_monitor_follows_a_message_from_arrival_to_deletion() {
     use affinidi_messaging_sdk::messages::{DeleteMessageRequest, fetch::FetchOptions};
-    use trust_tasks_rs::specs::messaging::monitor::subscribe::v0_1::MonitorFilter;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -760,9 +764,9 @@ async fn the_monitor_follows_a_message_from_arrival_to_deletion() {
 /// parties and its size.
 #[tokio::test]
 async fn the_monitor_sees_a_message_expire() {
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
     use affinidi_messaging_test_mediator::{TestClock, TestMediator};
     use std::sync::Arc;
-    use trust_tasks_rs::specs::messaging::monitor::subscribe::v0_1::MonitorFilter;
 
     let clock = TestClock::now();
     let mediator = TestMediator::builder()
@@ -821,7 +825,7 @@ async fn the_monitor_sees_a_message_expire() {
 
 #[tokio::test]
 async fn a_standard_account_monitors_only_itself() {
-    use trust_tasks_rs::specs::messaging::monitor::subscribe::v0_1::MonitorFilter;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");
@@ -1094,7 +1098,7 @@ async fn a_patch_survives_a_restart() {
 /// messages its recipient collected — and nobody else learns anything.
 #[tokio::test]
 async fn a_sender_learns_which_of_its_messages_were_collected() {
-    use trust_tasks_rs::specs::messaging::message::status::v0_1::MessageState;
+    use affinidi_messaging_sdk::tasks::messaging::message::status::v0_2::MessageState;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");

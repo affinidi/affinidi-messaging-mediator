@@ -7,18 +7,24 @@
 //! `next` reader sees it. Anything else pushed to the console (it is not a
 //! mail client) is left in the queue, untouched.
 
+// The admin console speaks the 0.1 versions of the `messaging/*`,
+// `audit/list` and `monitor/event` tasks, which is what this mediator serves.
+// `trust-tasks-rs` 0.35 marks them superseded by 0.2 (dtgwg-trust-tasks-tf#921);
+// the console moves when the mediator serves 0.2.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use affinidi_messaging_sdk::tasks::messaging::monitor;
 use affinidi_messaging_sdk::{
     ATM, profiles::ATMProfile, protocols::trust_tasks::decode_monitor_event,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use trust_tasks_rs::specs::messaging::monitor;
 
 use crate::error::{ConsoleError, Result};
 

@@ -21,6 +21,12 @@
 //! [`TrustTaskVerification`]: `warn` during the transition while clients start
 //! signing, `enforce` once they do.
 
+// The mediator serves the 0.1 versions of the `messaging/*` and `audit/list`
+// tasks. `trust-tasks-rs` 0.35 marks them superseded by 0.2
+// (dtgwg-trust-tasks-tf#921); serving 0.2 beside 0.1 is follow-up work, due
+// before 0.1 is withdrawn.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use affinidi_data_integrity::VerifyOptions;
@@ -367,7 +373,7 @@ mod tests {
     }
 
     fn policy_of(doc: &Value) -> SpecPolicy {
-        use trust_tasks_rs::specs::messaging::account;
+        use crate::task_specs::messaging::account;
         match doc["type"].as_str().unwrap() {
             ACCOUNT_UPDATE => SpecPolicy::of::<account::update::v0_1::Payload>(),
             ACCOUNT_GET => SpecPolicy::of::<account::get::v0_1::Payload>(),
@@ -392,7 +398,7 @@ mod tests {
     }
 
     fn account_update_policy() -> SpecPolicy {
-        SpecPolicy::of::<trust_tasks_rs::specs::messaging::account::update::v0_1::Payload>()
+        SpecPolicy::of::<crate::task_specs::messaging::account::update::v0_1::Payload>()
     }
 
     #[test]

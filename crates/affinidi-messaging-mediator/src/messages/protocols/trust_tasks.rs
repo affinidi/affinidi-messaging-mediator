@@ -21,6 +21,15 @@
 //!
 //! [Trust Task]: https://trusttasks.org
 
+// The handlers here are written against the 0.1 types. Seven of them also
+// serve 0.2 (see `trust_task_versions`); the 0.1 types are marked superseded,
+// and stay until 0.1 is withdrawn.
+#![allow(deprecated)]
+
+use crate::task_specs::messaging::{
+    access_list, account, acl, message, monitor, ping, queue, stats,
+};
+use crate::task_specs::{audit, config};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
@@ -38,10 +47,6 @@ use sha256::digest;
 use std::collections::HashSet;
 use std::str::FromStr;
 use subtle::ConstantTimeEq;
-use trust_tasks_rs::specs::messaging::{
-    access_list, account, acl, message, monitor, ping, queue, stats,
-};
-use trust_tasks_rs::specs::{audit, config};
 use trust_tasks_rs::{
     ConsumeChecks, ConsumeOutcome, NoValidator, Payload, PayloadPolicy, ProofPolicy, ProofVerifier,
     SpecPolicy, TransportContext, TransportHandler, TrustTask, TypeUri, VerificationError,
@@ -53,6 +58,7 @@ use crate::SharedData;
 use crate::common::authz::check_permissions;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
+use crate::messages::protocols::trust_task_versions::NewerVersion;
 use crate::messages::protocols::{mediator_ops, trust_task_sign, trust_task_verify};
 #[cfg(feature = "didcomm")]
 use crate::messages::{ProcessMessageResponse, WrapperType};
@@ -223,13 +229,21 @@ pub(crate) async fn consume(
     // Route by task type. The match is exhaustive over `ServedTask`, so a type
     // registered in `served_tasks!` without a handler here fails to compile.
     let sk = Some(sender_kid.clone());
-    let Some(task) = ServedTask::from_type_uri(&doc.type_uri) else {
-        return Err(tt_problem(
-            session,
-            "protocol.trust_task.unsupported",
-            format!("unsupported Trust Task type: {}", doc.type_uri),
-            StatusCode::NOT_IMPLEMENTED,
-        ));
+    // A 0.2 request is served by its 0.1 task's handler (`newer` says which
+    // version was asked for; see `trust_task_versions`).
+    let (task, newer) = match ServedTask::from_type_uri(&doc.type_uri) {
+        Some(task) => (task, None),
+        None => match NewerVersion::from_type_uri(&doc.type_uri) {
+            Some(newer) => (newer.base(), Some(newer)),
+            None => {
+                return Err(tt_problem(
+                    session,
+                    "protocol.trust_task.unsupported",
+                    format!("unsupported Trust Task type: {}", doc.type_uri),
+                    StatusCode::NOT_IMPLEMENTED,
+                ));
+            }
+        },
     };
     // The §7.2 acceptance checks (freshness, issuer binding, proof, spec
     // policy) for every management task. `ping` keeps its own pipeline: it is
@@ -238,7 +252,8 @@ pub(crate) async fn consume(
         trust_task_verify::accept(
             &doc,
             raw,
-            task.spec_policy(),
+            // Accepted under the rules of the version that was sent.
+            newer.map_or_else(|| task.spec_policy(), NewerVersion::spec_policy),
             &sender_did,
             now,
             state,
@@ -246,6 +261,11 @@ pub(crate) async fn consume(
         )
         .await?;
     }
+
+    let doc = match newer {
+        Some(newer) => newer.to_v0_1_request(doc),
+        None => doc,
+    };
 
     let response_value: Value = match task {
         ServedTask::Ping => {
@@ -464,6 +484,14 @@ pub(crate) async fn consume(
         }
     };
 
+    // Answer in the version that was asked for, before signing.
+    let response_value = match newer {
+        Some(newer) => newer
+            .to_v0_2_response(response_value)
+            .map_err(serialize_err_msg)?,
+        None => response_value,
+    };
+
     // Every success response is signed as the mediator (see `trust_task_sign`).
     let response_value = trust_task_sign::sign_response(response_value, state).await?;
 
@@ -556,7 +584,9 @@ impl ServedTask {
 #[cfg(feature = "tsp")]
 pub(crate) fn parse_if_served(payload: &[u8]) -> Option<TrustTask<Value>> {
     let doc: TrustTask<Value> = serde_json::from_slice(payload).ok()?;
-    ServedTask::from_type_uri(&doc.type_uri).map(|_| doc)
+    let served = ServedTask::from_type_uri(&doc.type_uri).is_some()
+        || NewerVersion::from_type_uri(&doc.type_uri).is_some();
+    served.then_some(doc)
 }
 
 /// The canonical request type URI of a generated payload `P`.
@@ -706,11 +736,10 @@ async fn consume_account_list(
             WireType::Admin => AccountType::Admin,
             WireType::RootAdmin => AccountType::RootAdmin,
             WireType::Mediator => AccountType::Mediator,
-            // The wire enum is `#[non_exhaustive]`: a peer on a newer registry
-            // can name a role added after this binary was built. As a *filter*
-            // that selects nothing, which is the honest answer — widening it to
-            // `Standard` would return a confident list of the wrong accounts.
-            _ => AccountType::Unknown,
+            // No wildcard: the wire enum is generated in this crate from the
+            // pinned bundle, so a role added to the spec only arrives with a
+            // pin move, and then this match fails to compile until it is
+            // mapped. (A role this build does not know cannot be decoded.)
         }
     });
 
@@ -828,28 +857,17 @@ async fn consume_account_update(
         ));
     }
 
-    // Fallible, unlike the read-side filter: this one *writes* the role, and
-    // silently storing something the caller did not ask for is worse than
-    // telling them this mediator cannot set it.
-    let new_type = typed
-        .payload
-        .account_type
-        .as_ref()
-        .map(|t| match t {
-            WireType::Standard => Ok(AccountType::Standard),
-            WireType::Admin => Ok(AccountType::Admin),
-            WireType::RootAdmin => Ok(AccountType::RootAdmin),
-            WireType::Mediator => Ok(AccountType::Mediator),
-            _ => Err(tt_problem(
-                session,
-                "message.trust_task.rejected",
-                "unrecognised accountType: this mediator cannot set a role added \
-                 to the registry after it was built"
-                    .to_string(),
-                StatusCode::BAD_REQUEST,
-            )),
-        })
-        .transpose()?;
+    // This one *writes* the role, so it must never store something the caller
+    // did not ask for. No wildcard: the wire enum is generated in this crate
+    // from the pinned bundle, so a role added to the spec only arrives with a
+    // pin move, and then this match fails to compile until it is mapped. A
+    // role this build does not know cannot be decoded at all.
+    let new_type = typed.payload.account_type.as_ref().map(|t| match t {
+        WireType::Standard => AccountType::Standard,
+        WireType::Admin => AccountType::Admin,
+        WireType::RootAdmin => AccountType::RootAdmin,
+        WireType::Mediator => AccountType::Mediator,
+    });
     if let Some(new_type) = &new_type {
         // Must be an admin to change roles at all.
         if !state
@@ -1140,18 +1158,10 @@ async fn consume_account_add(
         WireType::Admin => AccountType::Admin,
         WireType::RootAdmin => AccountType::RootAdmin,
         WireType::Mediator => AccountType::Mediator,
-        // Creating an account with a role this mediator does not know would
-        // store a privilege level it cannot reason about. Refuse.
-        _ => {
-            return Err(tt_problem(
-                session,
-                "message.trust_task.rejected",
-                "unrecognised accountType: this mediator cannot create an account \
-                 with a role added to the registry after it was built"
-                    .to_string(),
-                StatusCode::BAD_REQUEST,
-            ));
-        }
+        // No wildcard: a role added to the spec only arrives with a pin move,
+        // and then this match fails to compile until the role is mapped. A
+        // role this build does not know cannot be decoded, so it is never
+        // stored as a privilege level the mediator cannot reason about.
     };
     let is_admin = matches!(
         session.account_type,
@@ -2038,18 +2048,10 @@ fn merge_wire_acl(
         let mode = match mode {
             MediatorAclAccessListMode::ExplicitAllow => AccessListModeType::ExplicitAllow,
             MediatorAclAccessListMode::ExplicitDeny => AccessListModeType::ExplicitDeny,
-            // The access-list mode decides whether the list is an allow-list or
-            // a deny-list. Guessing it inverts the ACL, so a mode this build
-            // does not know refuses the whole update.
-            _ => {
-                return Err(MediatorError::InternalError(
-                    14,
-                    "NA".to_string(),
-                    "unrecognised accessListMode: refusing rather than guessing \
-                     whether the access list allows or denies"
-                        .to_string(),
-                ));
-            }
+            // No wildcard: the mode decides whether the list allows or denies,
+            // and a mode this build does not know cannot be decoded, so it is
+            // never guessed. A new mode arrives only with a pin move, and then
+            // this match fails to compile until it is mapped.
         };
         let self_change = base.get_access_list_mode().1;
         base.set_access_list_mode(mode, self_change, true)
@@ -2372,6 +2374,19 @@ mod tsp_dispatch_tests {
             assert!(
                 parse_if_served(&doc_json(&uri.to_string())).is_some(),
                 "{task:?} is served but the TSP arm would file it as mail"
+            );
+        }
+    }
+
+    #[test]
+    fn every_newer_version_is_claimed() {
+        // A 0.2 request is served beside its 0.1, so the TSP arm must claim it
+        // too, not file it into the mediator's inbox.
+        for &newer in NewerVersion::ALL {
+            let uri = newer.type_uri().to_string();
+            assert!(
+                parse_if_served(&doc_json(&uri)).is_some(),
+                "{newer:?} is served but the TSP arm would file it as mail"
             );
         }
     }

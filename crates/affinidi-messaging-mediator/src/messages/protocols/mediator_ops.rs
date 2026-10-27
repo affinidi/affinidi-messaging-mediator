@@ -7,9 +7,16 @@
 //! messages for its controller. Dispatch, acceptance checks and response
 //! signing are shared with the account/ACL tasks in [`super::trust_tasks`].
 
+// The mediator serves the 0.1 versions of the `messaging/*` and `audit/list`
+// tasks. `trust-tasks-rs` 0.35 marks them superseded by 0.2
+// (dtgwg-trust-tasks-tf#921); serving 0.2 beside 0.1 is follow-up work, due
+// before 0.1 is withdrawn.
+#![allow(deprecated)]
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::task_specs::messaging::{message, monitor, queue, stats};
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     DeletionAuthority, DeliveryState, SentMessageState,
@@ -23,7 +30,6 @@ use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use trust_tasks_rs::TrustTask;
-use trust_tasks_rs::specs::messaging::{message, monitor, queue, stats};
 use uuid::Uuid;
 
 use crate::SharedData;
@@ -1383,7 +1389,7 @@ fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, MediatorError> {
 /// A `null` value removes a key's override, returning it to the file/env value.
 /// Nothing is applied unless the store kept the overrides.
 pub(crate) async fn consume_config_patch(
-    typed: TrustTask<trust_tasks_rs::specs::config::patch::v0_1::Payload>,
+    typed: TrustTask<crate::task_specs::config::patch::v0_1::Payload>,
     state: &SharedData,
     session: &Session,
     mediator_did: &str,
@@ -1507,7 +1513,7 @@ pub(crate) async fn consume_config_patch(
         .await;
     }
 
-    let response: trust_tasks_rs::specs::config::patch::v0_1::Response =
+    let response: crate::task_specs::config::patch::v0_1::Response =
         serde_json::from_value(json!({
             "applied": applied,
             "pendingRestart": pending_restart,
@@ -1527,7 +1533,7 @@ pub(crate) async fn consume_config_patch(
 /// whose value changed take effect now and are reported in `keysReloaded`;
 /// restart-gated keys that changed apply from the next start and are logged.
 pub(crate) async fn consume_config_reload(
-    typed: TrustTask<trust_tasks_rs::specs::config::reload::v0_1::Payload>,
+    typed: TrustTask<crate::task_specs::config::reload::v0_1::Payload>,
     state: &SharedData,
     session: &Session,
     mediator_did: &str,
@@ -1611,7 +1617,7 @@ pub(crate) async fn consume_config_reload(
     )
     .await;
 
-    let response: trust_tasks_rs::specs::config::reload::v0_1::Response =
+    let response: crate::task_specs::config::reload::v0_1::Response =
         serde_json::from_value(json!({ "keysReloaded": plan.reloaded })).map_err(serialize_err)?;
     serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
         .map_err(serialize_err)

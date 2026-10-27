@@ -6,6 +6,10 @@
 //! the mediator's `trust_tasks` consumer → response → the SDK's typed reply — over
 //! a real in-process HTTP mediator (memory backend, no Redis).
 
+// Exercises the 0.1 `messaging/*` tasks the mediator serves; `trust-tasks-rs`
+// 0.35 marks them superseded (dtgwg-trust-tasks-tf#921).
+#![allow(deprecated)]
+
 use affinidi_messaging_mediator::common::config::limits::LimitsConfig;
 use affinidi_messaging_test_mediator::TestEnvironment;
 
@@ -105,7 +109,7 @@ async fn account_list_denies_a_non_admin() {
 
 #[tokio::test]
 async fn account_update_queue_limits_self_applies_caps_and_persists() {
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::QueueLimits;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::QueueLimits;
 
     let env = TestEnvironment::spawn()
         .await
@@ -220,7 +224,7 @@ async fn account_remove_self_removes_the_account() {
 
 #[tokio::test]
 async fn account_update_role_denies_a_non_admin() {
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::AccountType;
 
     // A role change through `account/update` is admin-only. A standard account
     // must be refused.
@@ -282,7 +286,7 @@ async fn acl_get_self_returns_the_decoded_acl() {
 
 #[tokio::test]
 async fn account_update_acl_denies_a_non_admin() {
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     // A non-admin may set its *own* ACL (self-service, covered below), but never
     // another account's. (The reverse mapping is covered by the mediator's
@@ -312,7 +316,7 @@ async fn account_update_acl_denies_a_non_admin() {
 
 #[tokio::test]
 async fn account_add_self_register_creates_a_standard_account() {
-    use trust_tasks_rs::specs::messaging::account::add::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
 
     // The fixture defaults to `ExplicitDeny`, so a standard account may add accounts.
     let env = TestEnvironment::spawn()
@@ -344,7 +348,7 @@ async fn account_add_self_register_creates_a_standard_account() {
 
 #[tokio::test]
 async fn account_add_denies_a_non_admin_creating_an_admin() {
-    use trust_tasks_rs::specs::messaging::account::add::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
 
     let env = TestEnvironment::spawn()
         .await
@@ -488,7 +492,7 @@ async fn audit_and_config_readers_deny_a_non_admin() {
 
 #[tokio::test]
 async fn account_update_acl_self_service_changes_a_self_manageable_flag() {
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     let env = TestEnvironment::spawn()
         .await
@@ -526,7 +530,7 @@ async fn account_update_acl_self_service_changes_a_self_manageable_flag() {
 
 #[tokio::test]
 async fn account_update_acl_self_service_refuses_an_admin_only_flag() {
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     let env = TestEnvironment::spawn()
         .await
@@ -561,8 +565,8 @@ async fn a_signed_task_is_accepted_when_the_mediator_enforces_proofs() {
     // profile's Ed25519 key, and the mediator verifies that proof against the
     // profile's DID document. If either side drifted, this refuses with
     // `message.trust_task.proof_required` / `proof_invalid`.
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::QueueLimits;
     use affinidi_messaging_test_mediator::{TestMediator, TrustTaskVerification};
-    use trust_tasks_rs::specs::messaging::account::update::v0_1::QueueLimits;
 
     let mediator = TestMediator::builder()
         .trust_task_verification(TrustTaskVerification::Enforce)
@@ -757,4 +761,112 @@ async fn request_response_survives_a_concurrent_live_stream_reader() {
         stolen.is_empty(),
         "no reply was handed to the reader: {stolen:?}"
     );
+}
+
+/// Send one Trust Task document by hand, as alice, and return the reply body.
+/// Used to speak a version the SDK does not send yet.
+async fn send_raw_task(
+    env: &TestEnvironment,
+    alice: &affinidi_messaging_test_mediator::TestUser,
+    type_uri: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    use affinidi_messaging_didcomm::message::Message;
+    use affinidi_messaging_sdk::protocols::trust_tasks::ENVELOPE_TYPE;
+    use affinidi_messaging_sdk::transports::SendMessageResponse;
+
+    let mediator_did = env.mediator.did().to_string();
+    let now = chrono::Utc::now();
+    let task = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": type_uri,
+        "issuer": alice.did,
+        "recipient": mediator_did,
+        "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": payload,
+    });
+    let secs = now.timestamp() as u64;
+    let msg = Message::build(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ENVELOPE_TYPE.to_string(),
+        task,
+    )
+    .to(mediator_did.clone())
+    .from(alice.did.clone())
+    .created_time(secs)
+    .expires_time(secs + 60)
+    .finalize();
+    let msg_id = msg.id.clone();
+    let (packed, _) = env
+        .atm
+        .pack_encrypted(&msg, &mediator_did, Some(&alice.did), None)
+        .await
+        .expect("authcrypt the task");
+    let SendMessageResponse::Message(reply) = env
+        .atm
+        .send_message(&alice.profile, &packed, &msg_id, true, true)
+        .await
+        .expect("the mediator answers")
+    else {
+        panic!("expected a response message");
+    };
+    reply.body
+}
+
+#[tokio::test]
+async fn ping_is_served_at_0_2_beside_0_1() {
+    let env = TestEnvironment::spawn()
+        .await
+        .expect("spawn test environment");
+    let alice = env.add_user("alice").await.expect("add alice");
+    env.atm
+        .profile_add(&alice.profile, true)
+        .await
+        .expect("enable websocket for alice");
+
+    const V0_2: &str = "https://trusttasks.org/spec/messaging/ping/0.2";
+    let body = send_raw_task(&env, &alice, V0_2, serde_json::json!({"nonce": "n-0.2"})).await;
+    assert_eq!(body["type"], format!("{V0_2}#response"), "{body}");
+    assert_eq!(body["payload"]["nonce"], "n-0.2");
+    assert!(body["payload"]["respondedAt"].is_string(), "{body}");
+    assert!(body["payload"].get("serverTime").is_none(), "{body}");
+    assert!(body.get("proof").is_some(), "a 0.2 response is signed too");
+
+    // A 0.1 client is still answered in 0.1.
+    const V0_1: &str = "https://trusttasks.org/spec/messaging/ping/0.1";
+    let body = send_raw_task(&env, &alice, V0_1, serde_json::json!({"nonce": "n-0.1"})).await;
+    assert_eq!(body["type"], format!("{V0_1}#response"), "{body}");
+    assert!(body["payload"]["serverTime"].is_string(), "{body}");
+    assert!(body["payload"].get("respondedAt").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn account_get_is_served_at_0_2() {
+    let env = TestEnvironment::spawn()
+        .await
+        .expect("spawn test environment");
+    let alice = env.add_user("alice").await.expect("add alice");
+    env.atm
+        .profile_add(&alice.profile, true)
+        .await
+        .expect("enable websocket for alice");
+
+    const V0_2: &str = "https://trusttasks.org/spec/messaging/account/get/0.2";
+    let body = send_raw_task(
+        &env,
+        &alice,
+        V0_2,
+        serde_json::json!({"did": alice.did_hash()}),
+    )
+    .await;
+    assert_eq!(body["type"], format!("{V0_2}#response"), "{body}");
+    let account = &body["payload"]["account"];
+    assert_eq!(account["did"], alice.did_hash().as_str());
+    for key in ["lastReceivedAt", "lastAuthenticatedAt"] {
+        let v = &account[key];
+        assert!(
+            v.is_null() || v.is_string(),
+            "{key} is an RFC 3339 string at 0.2: {v}"
+        );
+    }
 }

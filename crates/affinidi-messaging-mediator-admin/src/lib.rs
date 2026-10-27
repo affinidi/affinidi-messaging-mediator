@@ -35,4 +35,4 @@ pub use live::{MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate};
 pub use purge::{PurgePlan, PurgeRequest};
 
 /// The generated Trust Task types the console's calls take and return.
-pub use trust_tasks_rs::specs::messaging as specs;
+pub use affinidi_messaging_sdk::tasks::messaging as specs;
