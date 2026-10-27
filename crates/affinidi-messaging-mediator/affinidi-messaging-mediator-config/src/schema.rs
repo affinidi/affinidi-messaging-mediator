@@ -28,6 +28,11 @@ pub struct ServerConfig {
     pub listen_address: String,
     pub api_prefix: String,
     pub admin_did: String,
+    /// Reverse proxies whose `X-Forwarded-For` header may be trusted.
+    ///
+    /// An empty list keeps the socket peer as the rate-limit key.
+    #[serde(default)]
+    pub trust_xff_cidrs: Vec<ipnetwork::IpNetwork>,
     pub did_web_self_hosted: Option<String>,
     /// Additional URL aliases the mediator should treat as
     /// pointing at *itself* when resolving a routing-2.0 next-hop.

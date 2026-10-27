@@ -76,6 +76,14 @@ api_prefix = "/mediator/v1/"
 ### NOTE: You can add additional admin DIDs after startup via the DIDComm admin protocol
 admin_did = "did://did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.EzQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3"
 
+### Env: TRUST_XFF_CIDRS — comma-separated (the TOML form is an array);
+### a malformed entry fails startup.
+### CIDR ranges for reverse proxies trusted to provide X-Forwarded-For.
+### The header is ignored for requests whose socket peer is outside these
+### ranges. Set this to your load balancer's ranges, or every client behind
+### it shares one per-IP rate-limit bucket.
+trust_xff_cidrs = []
+
 ### Env: DID_WEB_SELF_HOSTED
 ### Path to the self-hosted DID Document
 ### Supported formats:

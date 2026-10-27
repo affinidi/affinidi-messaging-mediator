@@ -110,6 +110,11 @@ fn generate_toml(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::
     if let Some(server) = doc.get_mut("server") {
         server["listen_address"] = toml_edit::value(&config.listen_address);
         server["api_prefix"] = toml_edit::value(&config.api_prefix);
+        let mut cidrs = toml_edit::Array::new();
+        for cidr in &config.trust_xff_cidrs {
+            cidrs.push(cidr.as_str());
+        }
+        server["trust_xff_cidrs"] = toml_edit::value(cidrs);
 
         if let Some(ref admin_did) = generated.admin_did {
             server["admin_did"] = toml_edit::value(format!("did://{admin_did}"));
@@ -1240,6 +1245,19 @@ storage = "keyring://affinidi-mediator"
     fn has_active_did_web_self_hosted(toml: &str) -> bool {
         toml.lines()
             .any(|line| line.trim_start().starts_with("did_web_self_hosted"))
+    }
+
+    #[test]
+    fn test_trust_xff_cidrs_are_written_to_the_server_section() {
+        let config = WizardConfig {
+            trust_xff_cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+            ..WizardConfig::default()
+        };
+        let toml = generate_toml(&config, &test_generated()).unwrap();
+        assert!(toml.contains("trust_xff_cidrs = [\"10.0.0.0/8\", \"2001:db8::/32\"]"));
+
+        let default = generate_toml(&WizardConfig::default(), &test_generated()).unwrap();
+        assert!(default.contains("trust_xff_cidrs = []"));
     }
 
     #[test]

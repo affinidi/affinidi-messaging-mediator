@@ -8,6 +8,7 @@ pub mod jwt_auth;
 #[cfg(feature = "redis-backend")]
 pub mod lua_integrity;
 pub mod metrics;
+pub mod rate_limit;
 pub mod request_id;
 pub mod request_metrics;
 pub mod session;

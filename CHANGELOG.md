@@ -8,6 +8,13 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — trusted-proxy rate-limit attribution
+
+- Mediators can opt in to client attribution from `X-Forwarded-For` with
+  `[server].trust_xff_cidrs` or `TRUST_XFF_CIDRS`. When unset, rate limiting
+  continues to use the socket peer; malformed or untrusted forwarded headers
+  safely fall back to the socket peer.
+
 ### Changed — affinidi-messaging-sdk 0.43: the admin console speaks 0.2 (breaking)
 
 - `affinidi-messaging-sdk` 0.43 (affinidi/affinidi-tdk-rs#977), `affinidi-tdk`

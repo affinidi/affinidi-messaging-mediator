@@ -347,6 +347,11 @@ pub struct OutputSection {
     /// reverse proxy.
     #[serde(default = "default_api_prefix")]
     pub api_prefix: String,
+    /// Reverse-proxy / load-balancer CIDR ranges whose `X-Forwarded-For` the
+    /// mediator trusts for per-IP rate limiting (`[server] trust_xff_cidrs`).
+    /// Empty (default) = header ignored.
+    #[serde(default)]
+    pub trust_xff_cidrs: Vec<String>,
     /// Optional target to publish the minted public DID string to after
     /// provisioning (`aws_parameter_store://<name>[?region=<region>]` or
     /// `file://<path>`). `None` (default) = don't publish.
@@ -397,6 +402,7 @@ impl Default for OutputSection {
             config_path: default_config_path(),
             listen_address: default_listen_address(),
             api_prefix: default_api_prefix(),
+            trust_xff_cidrs: Vec::new(),
             did_target: None,
             did_log_target: None,
         }
@@ -685,6 +691,11 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     config.config_path = recipe.output.config_path.clone();
     config.listen_address = recipe.output.listen_address.clone();
     config.api_prefix = recipe.output.api_prefix.clone();
+    for cidr in &recipe.output.trust_xff_cidrs {
+        cidr.parse::<ipnetwork::IpNetwork>()
+            .map_err(|e| anyhow::anyhow!("invalid [output].trust_xff_cidrs entry '{cidr}': {e}"))?;
+    }
+    config.trust_xff_cidrs = recipe.output.trust_xff_cidrs.clone();
     config.did_target = recipe.output.did_target.clone();
     config.did_log_target = recipe.output.did_log_target.clone();
 
@@ -884,6 +895,14 @@ pub fn from_wizard_config(config: &WizardConfig) -> String {
     out.push_str(&format!("config_path = \"{}\"\n", config.config_path));
     out.push_str(&format!("listen_address = \"{}\"\n", config.listen_address));
     out.push_str(&format!("api_prefix = \"{}\"\n", config.api_prefix));
+    if !config.trust_xff_cidrs.is_empty() {
+        let list: Vec<String> = config
+            .trust_xff_cidrs
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect();
+        out.push_str(&format!("trust_xff_cidrs = [{}]\n", list.join(", ")));
+    }
     if let Some(target) = &config.did_target {
         out.push_str(&format!("did_target = \"{target}\"\n"));
     }
