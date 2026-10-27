@@ -42,6 +42,8 @@ mediator-tui 0.11.0); they are no longer updated.
   `trust-tasks-rs` 0.32 with every family, until it moves to a `vta-sdk` on
   0.35.
 
+## 0.46.0 (release/0.46)
+
 ### Changed — trust-tasks-rs 0.35, affinidi-messaging-sdk 0.41 (breaking)
 
 - `trust-tasks-rs` / `trust-tasks-proof` 0.34 → 0.35
