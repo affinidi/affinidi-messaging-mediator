@@ -8,6 +8,17 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — affinidi-messaging-sdk 0.43: the admin console speaks 0.2 (breaking)
+
+- `affinidi-messaging-sdk` 0.43 (affinidi/affinidi-tdk-rs#977), `affinidi-tdk`
+  0.35 and (test-mediator's dev-dependency) `affinidi-messaging-didcomm-service`
+  0.28. The SDK speaks `ping`, `account/{get,list,add,update}`, `audit/list` and
+  `message/status` at 0.2, falling back to 0.1 for a mediator before 0.47.0, and
+  returns only the 0.2 types.
+- mediator-admin's console and the TUI move to those types: account activity
+  times are timestamps rather than Unix seconds, and `audit/list` pages by
+  `next_cursor`. mediator-admin exposes them, so this is breaking for it.
+
 ### Added — the 0.2 versions are served beside 0.1
 
 - The mediator serves `messaging/ping`, `messaging/account/{get,list,add,update}`,
