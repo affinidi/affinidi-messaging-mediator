@@ -1098,7 +1098,7 @@ async fn a_patch_survives_a_restart() {
 /// messages its recipient collected — and nobody else learns anything.
 #[tokio::test]
 async fn a_sender_learns_which_of_its_messages_were_collected() {
-    use affinidi_messaging_sdk::tasks::messaging::message::status::v0_1::MessageState;
+    use affinidi_messaging_sdk::tasks::messaging::message::status::v0_2::MessageState;
 
     let env = direct_env().await;
     let alice = env.add_user("alice").await.expect("alice");

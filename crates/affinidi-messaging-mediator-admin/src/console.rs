@@ -78,7 +78,7 @@ pub struct MediatorConsole {
     did: String,
     did_hash: String,
     mediator_did: String,
-    account: account::get::v0_1::Account,
+    account: account::get::v0_2::Account,
     mode: Mode,
     capabilities: Capabilities,
     live: LiveStream,
@@ -236,7 +236,7 @@ impl MediatorConsole {
         &self.capabilities
     }
     /// The account as the mediator reported it at connect time.
-    pub fn account(&self) -> &account::get::v0_1::Account {
+    pub fn account(&self) -> &account::get::v0_2::Account {
         &self.account
     }
 
@@ -302,7 +302,7 @@ impl MediatorConsole {
         &self,
         cursor: Option<String>,
         limit: Option<u32>,
-    ) -> Result<account::list::v0_1::Response> {
+    ) -> Result<account::list::v0_2::Response> {
         self.require_admin("the account list")?;
         self.atm
             .trust_tasks()
@@ -349,7 +349,7 @@ impl MediatorConsole {
         &self,
         cursor: Option<String>,
         page_size: Option<u32>,
-    ) -> Result<audit::list::v0_1::Response> {
+    ) -> Result<audit::list::v0_2::Response> {
         self.require_admin("the audit log")?;
         self.atm
             .trust_tasks()
@@ -415,7 +415,7 @@ impl MediatorConsole {
 
     // ─── One account (self, or any for an administrator) ────────────────
 
-    pub async fn account_of(&self, target: Target) -> Result<account::get::v0_1::Account> {
+    pub async fn account_of(&self, target: Target) -> Result<account::get::v0_2::Account> {
         self.require_target(&target, "another account")?;
         self.atm
             .trust_tasks()
@@ -552,10 +552,10 @@ impl MediatorConsole {
     pub async fn update_account(
         &self,
         target: Target,
-        role: Option<account::update::v0_1::AccountType>,
-        acl: Option<account::update::v0_1::MediatorAcl>,
-        limits: Option<account::update::v0_1::QueueLimits>,
-    ) -> Result<account::update::v0_1::Account> {
+        role: Option<account::update::v0_2::AccountType>,
+        acl: Option<account::update::v0_2::MediatorAcl>,
+        limits: Option<account::update::v0_2::QueueLimits>,
+    ) -> Result<account::update::v0_2::Account> {
         self.require_target(&target, "another account")?;
         if role.is_some() {
             self.require_admin("changing a role")?;
@@ -594,7 +594,7 @@ impl Drop for MediatorConsole {
 }
 
 /// Mode and capabilities from the mediator's record of the account.
-fn classify(account: &account::get::v0_1::Account) -> (Mode, Capabilities) {
+fn classify(account: &account::get::v0_2::Account) -> (Mode, Capabilities) {
     let role = serde_json::to_value(account.account_type).unwrap_or(Value::Null);
     let role = role.as_str().unwrap_or("standard");
     let admin = matches!(role, "admin" | "rootAdmin");
@@ -673,7 +673,7 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
 
-    fn account(role: &str, acl: Value) -> account::get::v0_1::Account {
+    fn account(role: &str, acl: Value) -> account::get::v0_2::Account {
         serde_json::from_value(serde_json::json!({
             "did": "abc",
             "accountType": role,

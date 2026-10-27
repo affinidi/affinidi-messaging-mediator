@@ -109,7 +109,7 @@ async fn account_list_denies_a_non_admin() {
 
 #[tokio::test]
 async fn account_update_queue_limits_self_applies_caps_and_persists() {
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::QueueLimits;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::QueueLimits;
 
     let env = TestEnvironment::spawn()
         .await
@@ -224,7 +224,7 @@ async fn account_remove_self_removes_the_account() {
 
 #[tokio::test]
 async fn account_update_role_denies_a_non_admin() {
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::AccountType;
 
     // A role change through `account/update` is admin-only. A standard account
     // must be refused.
@@ -286,7 +286,7 @@ async fn acl_get_self_returns_the_decoded_acl() {
 
 #[tokio::test]
 async fn account_update_acl_denies_a_non_admin() {
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     // A non-admin may set its *own* ACL (self-service, covered below), but never
     // another account's. (The reverse mapping is covered by the mediator's
@@ -316,7 +316,7 @@ async fn account_update_acl_denies_a_non_admin() {
 
 #[tokio::test]
 async fn account_add_self_register_creates_a_standard_account() {
-    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
 
     // The fixture defaults to `ExplicitDeny`, so a standard account may add accounts.
     let env = TestEnvironment::spawn()
@@ -348,7 +348,7 @@ async fn account_add_self_register_creates_a_standard_account() {
 
 #[tokio::test]
 async fn account_add_denies_a_non_admin_creating_an_admin() {
-    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_1::AccountType;
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
 
     let env = TestEnvironment::spawn()
         .await
@@ -492,7 +492,7 @@ async fn audit_and_config_readers_deny_a_non_admin() {
 
 #[tokio::test]
 async fn account_update_acl_self_service_changes_a_self_manageable_flag() {
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     let env = TestEnvironment::spawn()
         .await
@@ -530,7 +530,7 @@ async fn account_update_acl_self_service_changes_a_self_manageable_flag() {
 
 #[tokio::test]
 async fn account_update_acl_self_service_refuses_an_admin_only_flag() {
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::MediatorAcl;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::MediatorAcl;
 
     let env = TestEnvironment::spawn()
         .await
@@ -565,7 +565,7 @@ async fn a_signed_task_is_accepted_when_the_mediator_enforces_proofs() {
     // profile's Ed25519 key, and the mediator verifies that proof against the
     // profile's DID document. If either side drifted, this refuses with
     // `message.trust_task.proof_required` / `proof_invalid`.
-    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_1::QueueLimits;
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::QueueLimits;
     use affinidi_messaging_test_mediator::{TestMediator, TrustTaskVerification};
 
     let mediator = TestMediator::builder()

@@ -64,6 +64,10 @@ async fn authenticating_and_receiving_are_recorded() {
         .expect("read activity");
     let after = unix_secs();
     let within = |t: Option<u64>| t.is_some_and(|t| (before..=after).contains(&t));
+    // Over the wire (0.2) the same times are RFC 3339 timestamps.
+    let within_at = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        within(t.and_then(|t| u64::try_from(t.timestamp()).ok()))
+    };
 
     assert!(
         within(got[0].last_authenticated),
@@ -101,12 +105,12 @@ async fn authenticating_and_receiving_are_recorded() {
         .await
         .expect("bob reads his own account, asking for activity");
     assert!(
-        within(asked.last_received_at),
+        within_at(asked.last_received_at),
         "the message alice sent: {:?}",
         asked.last_received_at
     );
     assert!(
-        within(asked.last_authenticated_at),
+        within_at(asked.last_authenticated_at),
         "bob authenticated: {:?}",
         asked.last_authenticated_at
     );

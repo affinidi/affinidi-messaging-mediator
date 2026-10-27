@@ -1044,7 +1044,7 @@ impl App {
 
     /// Send an account edit's changes with `account/update`.
     fn save_account(&mut self, mut edit: AccountEdit) {
-        use specs::account::update::v0_1::{AccountType, MediatorAcl, QueueLimits};
+        use specs::account::update::v0_2::{AccountType, MediatorAcl, QueueLimits};
         let (role, acl, limits) = edit.changes();
         let role: Option<AccountType> = match role.map(serde_json::from_value).transpose() {
             Ok(v) => v,
