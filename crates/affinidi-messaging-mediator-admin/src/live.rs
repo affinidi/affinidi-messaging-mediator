@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use affinidi_messaging_sdk::tasks::messaging::monitor;
 use affinidi_messaging_sdk::{
     ATM, profiles::ATMProfile, protocols::trust_tasks::decode_monitor_event,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use trust_tasks_rs::specs::messaging::monitor;
 
 use crate::error::{ConsoleError, Result};
 

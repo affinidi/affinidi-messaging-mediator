@@ -742,7 +742,7 @@ async fn authenticated_direct_delivery_still_enforces_session_match() {
 /// B — the relay hop's recipient.
 async fn watch_relays_to(env: &TestEnvironment, peer_mediator_did: &str) -> TestUser {
     use affinidi_messaging_mediator_common::types::accounts::AccountType;
-    use trust_tasks_rs::specs::messaging::monitor::subscribe::v0_1::MonitorFilter;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
 
     let admin = env.add_user("admin").await.expect("admin");
     env.mediator
