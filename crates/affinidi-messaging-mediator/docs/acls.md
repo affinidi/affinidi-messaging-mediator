@@ -254,10 +254,18 @@ to admit or refuse.
 
 ```
 ├─ sender has SEND_FORWARDED?                   else 403 authorization.send_forwarded
-├─ next hop has RECEIVE_FORWARDED?              else 403 delivery.refused
-├─ anonymous envelope → next hop has ANON_RECEIVE? else 403 delivery.refused
-└─ next hop's access list admits the sender?    else 403 delivery.refused
+├─ (queue, attachment, delay and forward-queue limits)
+├─ next hop local or remote? (resolves its DID document)
+├─ local next hop:
+│  ├─ has RECEIVE_FORWARDED?                    else 403 delivery.refused
+│  ├─ access list admits the sender?            else 403 delivery.refused
+│  └─ anonymous envelope → has ANON_RECEIVE?    else 403 delivery.refused
+└─ remote next hop: no recipient checks here — its own mediator applies them.
+   Only an access list it already holds here (non-empty) is applied.
 ```
+
+See [`multi-mediator.md` §6](./multi-mediator.md#6-the-acls-that-have-to-line-up)
+for why, and for what happens when the peer mediator refuses the relay.
 
 ### Inter-mediator relay admission
 

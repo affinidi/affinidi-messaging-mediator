@@ -8,20 +8,42 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
-### Fixed — a relay leaves a remote recipient's access list to its own mediator
+### Fixed — a relay leaves a remote recipient's policy to its own mediator
 
 - **Behaviour change (R3.6).** A forward whose next hop is hosted by another
-  mediator is no longer checked against the next hop's access list or
-  `ANON_RECEIVE` on the relaying mediator. The account a relay holds for a
-  remote next hop is a placeholder made from its `global_acl_default`, so
-  under a closed default (`MODE_EXPLICIT_ALLOW`) every cross-mediator forward
-  was refused with `73 delivery.refused`, both single (`next` = recipient) and
+  mediator is no longer checked on the relaying mediator against the next
+  hop's `RECEIVE_FORWARDED`, access list, `ANON_RECEIVE` or receive-queue
+  limit, and the relay no longer registers an account for it. That account
+  was a placeholder made from the relay's `global_acl_default`, so under a
+  closed default (`MODE_EXPLICIT_ALLOW`) every cross-mediator forward was
+  refused with `73 delivery.refused`, both single (`next` = recipient) and
   double (`next` = recipient's mediator). The recipient's mediator enforces
-  both, as `docs/multi-mediator.md` §6 lays out. A local next hop is checked
-  as before.
-- The relay now resolves `next` before the access-list check rather than
-  after it. A DID that cannot be resolved is treated as local, so it is still
-  checked.
+  all of these, as
+  `crates/affinidi-messaging-mediator/docs/multi-mediator.md` §6 lays out. A
+  local next hop is checked as before. A relay deployment no longer needs a
+  `global_acl_default` that grants `RECEIVE_FORWARDED`.
+- An exception: a remote next hop that already holds an account on the relay
+  **with access-list entries** still has that list applied. It covers a local
+  account wrongly classed as remote, such as a hostname missing from
+  `server.local_endpoints`.
+- The relay resolves `next` only after its own cheap checks (sender, queue
+  limits, attachments, `delay_milli`, forward-queue capacity), so a forward it
+  would reject anyway costs no DID resolution. A DID that cannot be resolved
+  is treated as local, so it is still checked.
+- **Behaviour change (R1.1, R3.6).** When the peer mediator refuses a relayed
+  message with a 4xx other than 408, 425 or 429, the forwarding processor
+  drops it at once instead of retrying it until `max_retries`. Before, a
+  refused message could still be delivered if the recipient changed their
+  policy during the retries. The sender gets a problem report with the new
+  code `e.p.me.res.forwarding.refused` (args
+  `[destination, http_status, endpoint]`), and the monitor reports
+  `forwarded` with that outcome. `ForwardOutcome` gains a `Refused { status }`
+  variant (the enum is `#[non_exhaustive]`).
+- **Fixed: `rewrap` relay of a single forward.** The re-wrap layer was
+  encrypted to `next`, which for a single forward is the recipient, not their
+  mediator. The receiving mediator therefore could not peel it, and it checked
+  the recipient's policy against the relaying mediator's DID. The layer is now
+  encrypted to the peer mediator the recipient's DID document names.
 
 ## 0.45.0 (release/0.45)
 
