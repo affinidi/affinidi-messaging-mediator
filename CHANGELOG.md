@@ -12,8 +12,11 @@ mediator-tui 0.11.0); they are no longer updated.
 
 - Mediators can opt in to client attribution from `X-Forwarded-For` with
   `[server].trust_xff_cidrs` or `TRUST_XFF_CIDRS`. When unset, rate limiting
-  continues to use the socket peer; malformed or untrusted forwarded headers
-  safely fall back to the socket peer.
+  continues to use the socket peer; untrusted forwarded headers safely fall
+  back to the socket peer, while malformed or oversized trusted forwarded
+  chains are rejected instead of collapsing clients into a shared bucket.
+  `trust_xff_cidrs` must list only proxies that append to `X-Forwarded-For`,
+  and the mediator must not be reachable except through them.
 
 ## 0.47.0 (release/0.47)
 

@@ -31,6 +31,12 @@ pub struct ServerConfig {
     /// Reverse proxies whose `X-Forwarded-For` header may be trusted.
     ///
     /// An empty list keeps the socket peer as the rate-limit key.
+    ///
+    /// List only proxies that *append* the connecting peer's address to
+    /// `X-Forwarded-For`, and make sure the mediator is reachable only through
+    /// them. The mediator charges the rightmost address that is not listed here,
+    /// so a proxy that forwards a client-supplied header unchanged, or a listener
+    /// exposed directly, lets clients choose their own rate-limit key.
     #[serde(default)]
     pub trust_xff_cidrs: Vec<ipnetwork::IpNetwork>,
     pub did_web_self_hosted: Option<String>,

@@ -20,7 +20,18 @@ use tracing::warn;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const MAX_FORWARDED_ENTRIES: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientIpExtractionError {
+    MissingPeer,
+    InvalidForwardedFor,
+}
+
 /// Extracts a client address from `X-Forwarded-For` only for trusted peers.
+///
+/// Deployment requirement: the trusted CIDRs must cover only proxies that
+/// append to `X-Forwarded-For`, and the mediator must not be reachable except
+/// through them. The rightmost untrusted entry is taken as the client, which is
+/// only the proxy-observed address under that assumption.
 #[derive(Clone, Debug)]
 pub struct TrustedProxyKeyExtractor {
     trusted_cidrs: Vec<IpNetwork>,
@@ -36,38 +47,45 @@ impl TrustedProxyKeyExtractor {
         self.trusted_cidrs.iter().any(|cidr| cidr.contains(ip))
     }
 
-    fn client_from_chain(&self, headers: &http::HeaderMap) -> Option<IpAddr> {
+    fn client_from_chain(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<Option<IpAddr>, ClientIpExtractionError> {
         let mut entries = Vec::new();
         for value in headers.get_all(X_FORWARDED_FOR) {
-            let value = value.to_str().ok()?;
+            let value = value
+                .to_str()
+                .map_err(|_| ClientIpExtractionError::InvalidForwardedFor)?;
             for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
                 if entries.len() == MAX_FORWARDED_ENTRIES {
-                    return None;
+                    return Err(ClientIpExtractionError::InvalidForwardedFor);
                 }
                 entries.push(entry);
             }
         }
 
         for entry in entries.iter().rev() {
-            let ip = parse_forwarded_ip(entry)?;
+            let ip =
+                parse_forwarded_ip(entry).ok_or(ClientIpExtractionError::InvalidForwardedFor)?;
             if !self.is_trusted(ip) {
-                return Some(ip);
+                return Ok(Some(ip));
             }
         }
-        None
+        Ok(None)
     }
 
-    /// Return the address to charge for a request, or `None` when no peer is
-    /// available to provide an unspoofable attribution anchor.
-    pub fn extract<T>(&self, request: &Request<T>) -> Option<IpAddr> {
+    /// Return the address to charge for a request, or reject when no
+    /// unspoofable attribution can be established.
+    fn extract<T>(&self, request: &Request<T>) -> Result<IpAddr, ClientIpExtractionError> {
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| canonical(info.0.ip()))?;
+            .map(|info| canonical(info.0.ip()))
+            .ok_or(ClientIpExtractionError::MissingPeer)?;
         if !self.is_trusted(peer) {
-            return Some(peer);
+            return Ok(peer);
         }
-        Some(self.client_from_chain(request.headers()).unwrap_or(peer))
+        Ok(self.client_from_chain(request.headers())?.unwrap_or(peer))
     }
 }
 
@@ -163,13 +181,21 @@ where
             return Box::pin(async move { inner.call(request).await });
         }
 
-        let Some(ip) = self.extractor.extract(&request) else {
-            warn!("No client IP available; rejecting request");
-            if let Some(callback) = &self.on_refused {
-                callback(&Refusal::NoClientIp);
+        let ip = match self.extractor.extract(&request) {
+            Ok(ip) => ip,
+            Err(ClientIpExtractionError::MissingPeer) => {
+                warn!("No client IP available; rejecting request");
+                if let Some(callback) = &self.on_refused {
+                    callback(&Refusal::NoClientIp);
+                }
+                let response = refusal_response(&Refusal::NoClientIp);
+                return Box::pin(async move { Ok(response) });
             }
-            let response = refusal_response(&Refusal::NoClientIp);
-            return Box::pin(async move { Ok(response) });
+            Err(ClientIpExtractionError::InvalidForwardedFor) => {
+                warn!("Invalid X-Forwarded-For header; rejecting request");
+                let response = invalid_forwarded_for_response();
+                return Box::pin(async move { Ok(response) });
+            }
         };
         if let Err(refusal) = self.state.check(ip) {
             warn!(%ip, "Rate limit exceeded");
@@ -183,6 +209,14 @@ where
         let mut inner = self.inner.clone();
         Box::pin(async move { inner.call(request).await })
     }
+}
+
+fn invalid_forwarded_for_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "Invalid X-Forwarded-For header; request rejected.",
+    )
+        .into_response()
 }
 
 fn refusal_response(refusal: &Refusal) -> Response {
@@ -247,7 +281,7 @@ mod tests {
         let extractor = TrustedProxyKeyExtractor::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
         assert_eq!(
             extractor.extract(&request([192, 0, 2, 1], Some("198.51.100.1"))),
-            Some("192.0.2.1".parse().expect("ip"))
+            Ok("192.0.2.1".parse().expect("ip"))
         );
     }
 
@@ -256,7 +290,28 @@ mod tests {
         let extractor = TrustedProxyKeyExtractor::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
         assert_eq!(
             extractor.extract(&request([10, 0, 0, 1], Some("203.0.113.1, 10.0.0.2"))),
-            Some("203.0.113.1".parse().expect("ip"))
+            Ok("203.0.113.1".parse().expect("ip"))
+        );
+    }
+
+    #[test]
+    fn invalid_forwarded_entry_is_rejected() {
+        let extractor = TrustedProxyKeyExtractor::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
+        assert_eq!(
+            extractor.extract(&request([10, 0, 0, 1], Some("203.0.113.1, not-an-ip"))),
+            Err(ClientIpExtractionError::InvalidForwardedFor)
+        );
+    }
+
+    #[test]
+    fn oversized_forwarded_chain_is_rejected() {
+        let forwarded = std::iter::repeat_n("203.0.113.1", MAX_FORWARDED_ENTRIES + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extractor = TrustedProxyKeyExtractor::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
+        assert_eq!(
+            extractor.extract(&request([10, 0, 0, 1], Some(&forwarded))),
+            Err(ClientIpExtractionError::InvalidForwardedFor)
         );
     }
 }
