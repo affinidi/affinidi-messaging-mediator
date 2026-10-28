@@ -35,7 +35,7 @@ The workspace is versioned in lockstep: `[workspace.package] version` in the
 root `Cargo.toml` is the version of every crate (`version.workspace = true`),
 and every internal dependency requires exactly that version
 (`{ version = "0.42.0", path = "…" }`). Nobody edits either by hand; the
-cut and the prep workflow move them together, and the `release guards` CI job
+cut and prep scripts move them together, and the `release guards` CI job
 fails a tree where they disagree.
 
 On a release branch the current version is its `RELEASE` file; the tag is `v`
@@ -103,8 +103,8 @@ backport or prep PR, or labelled `release-direct`; only the release tooling
 changes the version or `RELEASE`, on any branch. A cut, prep or backport PR
 counts as one only when the release-bot app (`affinidi-semantic-release[bot]`)
 opened it from a branch of this repository: a branch name alone proves nothing.
-While maintainers still cut locally, a cut PR also counts when a person with
-the admin or maintain role opened it.
+While maintainers still cut and prep locally, a cut or prep PR also counts
+when a person with the admin or maintain role opened it.
 
 ## Procedures
 
@@ -128,16 +128,27 @@ before `nightly` exists, is `--from origin/main`.
 Cuts are moving to the release bot: Actions → **Cut a release**
 (`release-cut.yml`) on `main` does the same with the release-bot app's token
 (`dry-run` on by default). Once it is the way to cut, `scripts/cut-release.py`
-and `scripts/release_lib.py` go, and so does the maintainer allowance in
-`branch-rules.yml`.
+goes, and so does the maintainer allowance in `branch-rules.yml` once preps
+move too (below).
 
 ### Release candidate, GA, patch
 
-Actions → **Prepare a release** → choose the release branch as the ref and
-`rc`, `ga` or `patch`. It moves `RELEASE`, writes the changelog (GA: the
-`## Unreleased` section becomes `## 0.42.0 (date)`; patch: a new section listing
-the commits since the last tag), moves the whole workspace for a patch, and
-opens a `chore(release): v…` PR from `release-prep/<major.minor>/<version>`.
+From a clean checkout of `release/<major.minor>`, as a maintainer:
+
+```sh
+python3 scripts/prepare-release.py --kind rc|ga|patch --pr-body /tmp/body.md
+```
+
+It moves `RELEASE`, writes the changelog (GA: the `## Unreleased` section
+becomes `## 0.42.0 (date)`; patch: a new section listing the commits since the
+last tag) and moves the whole workspace for a patch. Commit it signed off as
+`chore(release): v<RELEASE>` on `release-prep/<major.minor>/<RELEASE>` and open
+the PR into the release branch with that body.
+
+Preps are moving to the release bot: Actions → **Prepare a release**
+(`release-prep.yml`) with the release branch as the ref does the same and opens
+the PR with the release-bot app's token. Once cuts and preps both run there,
+`scripts/prepare-release.py` and `scripts/release_lib.py` go.
 
 **Merging it is the release.** On that push to the release branch:
 
