@@ -6,7 +6,7 @@ hold the history from before the move (up to mediator 0.41.2,
 mediator-common 0.17.7, test-mediator 0.22.0, mediator-admin and
 mediator-tui 0.11.0); they are no longer updated.
 
-## Unreleased
+## 0.48.0 (2026-10-28)
 
 ### Changed — trust-tasks-rs 0.36, affinidi-messaging-sdk 0.44, monitor/event 0.2 (breaking)
 
