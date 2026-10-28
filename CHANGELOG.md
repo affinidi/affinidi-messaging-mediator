@@ -8,6 +8,8 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+## 0.48.0 (release/0.48)
+
 ### Changed — trust-tasks-rs 0.36, affinidi-messaging-sdk 0.44, monitor/event 0.2 (breaking)
 
 - `trust-tasks-rs` / `trust-tasks-proof` 0.36, `affinidi-messaging-sdk` 0.44
