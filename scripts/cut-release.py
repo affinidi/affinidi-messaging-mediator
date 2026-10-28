@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Transitional: maintainers still cut locally. Cuts should move to the release
-# bot (the release-cut workflow); then delete this script and release_lib.py.
+# bot (the release-cut workflow); then delete this script, and release_lib.py
+# once prepare-release.py is gone too.
 """Cut a release: create `release/<major.minor>` and move main to the next one.
 
     python3 scripts/cut-release.py 0.42 [--from origin/nightly] [--dry-run]

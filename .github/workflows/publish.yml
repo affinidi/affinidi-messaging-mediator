@@ -61,7 +61,6 @@ jobs:
     permissions:
       # OIDC token exchange with crates.io (Trusted Publishing).
       id-token: write
-      contents: write
     env:
       CARGO_TERM_COLOR: always
     steps:
