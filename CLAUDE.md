@@ -28,7 +28,7 @@ Rules that bite hardest here:
 
 Lockstep versioning: every crate carries `[workspace.package] version`, and
 internal dependencies require it exactly. Never bump one crate on its own —
-use `scripts/release_lib.py` / `scripts/prepare-release.py`. Flow is main →
+use the *Cut a release* / *Prepare a release* workflows. Flow is main →
 nightly → `release/X.Y`; see `RELEASES.md`. Publishing is crates.io Trusted
 Publishing from `publish.yml` only; a brand-new crate needs a manual first
 publish.
