@@ -137,7 +137,7 @@ trust-tasks-build = "0.1.2"
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.43"
+affinidi-messaging-sdk = "0.44"
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
 affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
@@ -145,9 +145,9 @@ affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
 ## Trust Tasks runtime — consumes Trust Task documents carried over the binding
 ## envelope. The task types are generated at build time from trust-tasks.lock
 ## (see build.rs and `crate::task_specs`), so no prebuilt spec module is compiled.
-trust-tasks-rs = { version = "0.35.3", default-features = false, optional = true }
+trust-tasks-rs = { version = "0.36", default-features = false, optional = true }
 # Verifies Trust Task proofs (eddsa-jcs-2022) before any handler runs.
-trust-tasks-proof = { version = "0.35.3", default-features = false, features = ["affinidi"], optional = true }
+trust-tasks-proof = { version = "0.36", default-features = false, features = ["affinidi"], optional = true }
 affinidi-data-integrity = { version = "0.8", optional = true }
 ## Optional: JOSE key-agreement types for the didcomm compat layer (#327)
 affinidi-crypto = { version = "0.2", features = ["jose"], optional = true }
