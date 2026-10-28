@@ -2,8 +2,8 @@ name: Cut a release
 
 # Creates release/<major.minor> from `nightly` and opens the release-cut PR that
 # moves main to the next minor (RELEASES.md). Run it from the Actions tab on
-# main. The branch rules accept a cut PR only when the release-bot app opened
-# it, so a cut runs here rather than from a person's checkout.
+# main. Where cuts are moving: maintainers still cut with
+# scripts/cut-release.py for now.
 on:
   workflow_dispatch:
     inputs:
