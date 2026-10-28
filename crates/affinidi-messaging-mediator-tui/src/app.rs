@@ -2330,7 +2330,10 @@ fn event_line(e: &Value, book: &AddressBook, name_w: usize) -> Line<'static> {
         _ => "·",
     };
     let mut spans = vec![
-        Span::styled(time_of(&s("at")), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            time_of(&s("occurredAt")),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(format!(" {arrow} ")),
         Span::styled(format!("{stage:<9}"), Style::default().fg(color)),
         Span::raw(format!(" {:<9} {:<9} ", s("protocol"), s("channel"))),
@@ -2781,7 +2784,7 @@ mod tests {
         let bob_hash = sha256::digest("did:example:bob");
         let line = event_line(
             &serde_json::json!({
-                "at": "2026-09-21T10:00:00Z", "direction": "inbound", "stage": "stored",
+                "occurredAt": "2026-09-21T10:00:00Z", "direction": "inbound", "stage": "stored",
                 "channel": "rest", "protocol": "didcomm",
                 "from": sha256::digest(alice), "to": bob_hash,
             }),
@@ -2837,7 +2840,7 @@ mod tests {
     fn a_refusal_event_shows_its_code_in_red() {
         let line = event_line(
             &serde_json::json!({
-                "at": "2026-09-21T10:00:00Z", "direction": "inbound", "stage": "refused",
+                "occurredAt": "2026-09-21T10:00:00Z", "direction": "inbound", "stage": "refused",
                 "channel": "rest", "protocol": "tsp", "from": "a", "size": 10,
                 "outcome": { "code": "authorization.send" },
             }),

@@ -141,7 +141,7 @@ async fn a_subscription_opened_over_tsp_delivers_its_batches_over_tsp() {
             let Ok(doc) = serde_json::from_slice::<Value>(&payload) else {
                 continue; // Alice's plain payload, not a Trust Task document.
             };
-            if doc["type"] == "https://trusttasks.org/spec/messaging/monitor/event/0.1" {
+            if doc["type"] == "https://trusttasks.org/spec/messaging/monitor/event/0.2" {
                 assert_eq!(sender, mediator_did, "batches are sealed by the mediator");
                 break doc;
             }

@@ -8,6 +8,20 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — trust-tasks-rs 0.36, affinidi-messaging-sdk 0.44, monitor/event 0.2 (breaking)
+
+- `trust-tasks-rs` / `trust-tasks-proof` 0.36, `affinidi-messaging-sdk` 0.44
+  (affinidi/affinidi-tdk-rs#978), `affinidi-tdk` 0.36 and (test-mediator's
+  dev-dependency) `affinidi-messaging-didcomm-service` 0.29.
+- The mediator pushes `messaging/monitor/event` at 0.2: each event's `at` is
+  now `occurredAt`. SDK 0.44's `decode_monitor_event` reads both versions; a
+  console built on SDK 0.43 or earlier sees no events from this mediator.
+  mediator-admin's `MonitorEvent` is the 0.2 type (`occurred_at`), so this is
+  breaking for it.
+- The seven tasks with a 0.2 (`ping`, `account/{get,list,add,update}`,
+  `audit/list`, `message/status`) are still served at 0.1 beside 0.2: every
+  SDK before 0.43 speaks only 0.1.
+
 ## 0.47.0 (release/0.47)
 
 ### Changed — affinidi-messaging-sdk 0.43: the admin console speaks 0.2 (breaking)
