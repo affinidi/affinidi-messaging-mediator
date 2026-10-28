@@ -35,7 +35,7 @@ The workspace is versioned in lockstep: `[workspace.package] version` in the
 root `Cargo.toml` is the version of every crate (`version.workspace = true`),
 and every internal dependency requires exactly that version
 (`{ version = "0.42.0", path = "…" }`). Nobody edits either by hand; the
-cut and prep workflows move them together, and the `release guards` CI job
+cut and the prep workflow move them together, and the `release guards` CI job
 fails a tree where they disagree.
 
 On a release branch the current version is its `RELEASE` file; the tag is `v`
@@ -103,21 +103,33 @@ backport or prep PR, or labelled `release-direct`; only the release tooling
 changes the version or `RELEASE`, on any branch. A cut, prep or backport PR
 counts as one only when the release-bot app (`affinidi-semantic-release[bot]`)
 opened it from a branch of this repository: a branch name alone proves nothing.
+While maintainers still cut locally, a cut PR also counts when a person with
+the admin or maintain role opened it.
 
 ## Procedures
 
 ### Cut
 
-Actions → **Cut a release** → run on `main` with the `major.minor` (`0.42`).
-`dry-run` (on by default) builds both commits and pushes nothing; run it again
-with `dry-run` off to cut. With the release-bot app's token it pushes
-`release/0.42` (workspace at `0.42.0`, `RELEASE` = `0.42.0-rc.0`, which
-`release-tag.yml` tags and builds an image for), creates the
-`backport release/0.42` label, and opens the `release-cut/0.42` PR that moves
-`main` to `0.43.0` and closes `main`'s `## Unreleased` changelog section under
-`## 0.42.0`. Merge it, then update the schedule table above.
+```sh
+python3 scripts/cut-release.py 0.42 --dry-run   # builds both commits, pushes nothing
+python3 scripts/cut-release.py 0.42
+```
 
-`from` cuts from something other than `origin/nightly`.
+From a clean checkout with push access, Python ≥ 3.11, cargo, and `gh`
+authenticated. It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` =
+`0.42.0-rc.0`, which `release-tag.yml` tags and builds an image for), creates
+the `backport release/0.42` label, and opens the `release-cut/0.42` PR that
+moves `main` to `0.43.0` and closes `main`'s `## Unreleased` changelog section
+under `## 0.42.0`. Merge it, then update the schedule table above.
+
+`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
+before `nightly` exists, is `--from origin/main`.
+
+Cuts are moving to the release bot: Actions → **Cut a release**
+(`release-cut.yml`) on `main` does the same with the release-bot app's token
+(`dry-run` on by default). Once it is the way to cut, `scripts/cut-release.py`
+and `scripts/release_lib.py` go, and so does the maintainer allowance in
+`branch-rules.yml`.
 
 ### Release candidate, GA, patch
 

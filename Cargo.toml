@@ -13,7 +13,7 @@ resolver = "3"
 
 [workspace.package]
 # Lockstep: every crate in this workspace carries this version, and every
-# internal dependency requires it exactly. The release workflows move both
+# internal dependency requires it exactly. The release tooling moves both
 # together (RELEASES.md); never bump one crate on its own.
 version = "0.49.0"
 description = "Affinidi Messaging Mediator: a DIDComm v2 and TSP mediator, its admin client and console, and an in-process test mediator."
