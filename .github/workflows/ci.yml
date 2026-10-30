@@ -131,6 +131,28 @@ jobs:
         with:
           command: check
 
+  security:
+    # cargo-audit and the Snyk scan from pipeline-rust, here so they gate
+    # `nightly`. The workflow also runs its own fmt / check / clippy /
+    # cargo-deny, duplicating the jobs above. Skipped on fork PRs: the Snyk
+    # scan needs secrets a fork does not get.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: affinidi/pipeline-rust/.github/workflows/checks-no-test.yaml@feat/release-branch-actions
+    # Every job the called workflow declares is checked at startup, enabled or not.
+    permissions:
+      contents: read
+      issues: write # cargo-audit files an issue per advisory
+      pull-requests: write # deprecation-check, off here
+    secrets:
+      SNYK_SCANNER_TOKEN: ${{ secrets.SNYK_SCANNER_TOKEN }}
+      SNYK_SCANNER_REGION: ${{ secrets.SNYK_SCANNER_REGION }}
+      SNYK_GLOBAL_POLICY: ${{ secrets.SNYK_GLOBAL_POLICY }}
+    with:
+      toolchain: "1.95.0"
+      rustflags: "-D warnings --cfg tracing_unstable"
+      ubuntu-rust-deps: "libdbus-1-dev libssl-dev libchafa-dev pkg-config"
+      runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+
   guards:
     # Cheap, build-free guards that protect the release pipeline. No compile:
     # `cargo metadata` / `cargo tree` and Python only.
@@ -138,18 +160,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          # The base commit, for "RELEASE never moves backwards".
-          fetch-depth: 0
+      # Checks out the repo. Toolchain sync, lockstep versions, CHANGELOG /
+      # RELEASE consistency, RELEASE never moves backwards.
+      - uses: affinidi/pipeline-rust/.github/actions/release-guards@feat/release-branch-actions
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
-      # Toolchain sync, lockstep versions, CHANGELOG / RELEASE consistency.
-      - name: Release guards
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 scripts/check-release-guards.py ${BASE_SHA:+--base-sha "$BASE_SHA"}
+      # The Dockerfile the mediator-setup wizard writes builds on the pinned toolchain.
+      - name: Setup wizard Dockerfile toolchain
+        run: |
+          set -euo pipefail
+          src=crates/affinidi-messaging-mediator/tools/mediator-setup/src/docker.rs
+          mm=$(sed -nE 's/^channel *= *"([0-9]+\.[0-9]+).*/\1/p' rust-toolchain.toml)
+          [ -n "$mm" ] || { echo "::error::no major.minor channel in rust-toolchain.toml"; exit 1; }
+          if grep -noE 'FROM rust:[0-9]+\.[0-9]+' "$src" | awk -F: -v mm="$mm" '$3 != mm { print; bad = 1 } END { exit !bad }'; then
+            echo "::error::$src: FROM rust:<major.minor> must be rust:$mm (rust-toolchain.toml)"
+            exit 1
+          fi
       # A workspace member also resolved from crates.io (through a TDK or VTI
       # crate depending on it) builds two copies of its types; see the script.
       - name: Workspace duplicate guard

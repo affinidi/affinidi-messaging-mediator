@@ -1,3 +1,4 @@
+# Kept only for cut-release.py and prepare-release.py; see the note at their top.
 """Shared helpers for the release tooling (RELEASES.md).
 
 A release is named `major.minor` (`0.42`) and lives on `release/<major.minor>`.

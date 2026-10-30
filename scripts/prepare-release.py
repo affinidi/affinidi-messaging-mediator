@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Transitional: maintainers still prep locally. Preps should move to the release
+# bot (the release-prep workflow); then delete this script and release_lib.py.
 """Prepare the next rc, GA or patch on a release branch (RELEASES.md).
 
     python3 scripts/prepare-release.py --kind rc|ga|patch [--pr-body FILE]
