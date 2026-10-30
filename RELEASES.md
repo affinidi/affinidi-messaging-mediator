@@ -198,8 +198,9 @@ Settings, not files:
   rules` and `DCO sign-off`, block force pushes and deletion.
 - **Ruleset on `main`:** require a PR, and require `branch rules` and `DCO
   sign-off`.
-- **Ruleset on `nightly`:** block force pushes and deletion; only the
-  workflow's identity may update it.
+- **Ruleset on `nightly`:** block force pushes and deletion; only the release
+  bot (which `nightly.yml` runs as), maintainers and admins may create or
+  update it.
 - **Ruleset `tags_managed`** (all tags): blocks creation, update and
   deletion; admins and the `affinidi-semantic-release` app bypass it. That
   app is the identity `release-tag.yml` tags with — `GITHUB_TOKEN` (the
