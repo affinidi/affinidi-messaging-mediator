@@ -7,12 +7,6 @@
 //! `next` reader sees it. Anything else pushed to the console (it is not a
 //! mail client) is left in the queue, untouched.
 
-// The admin console speaks the 0.1 versions of the `messaging/*`,
-// `audit/list` and `monitor/event` tasks, which is what this mediator serves.
-// `trust-tasks-rs` 0.35 marks them superseded by 0.2 (dtgwg-trust-tasks-tf#921);
-// the console moves when the mediator serves 0.2.
-#![allow(deprecated)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +26,7 @@ use crate::error::{ConsoleError, Result};
 /// type prefixes, failures only).
 pub type MonitorFilter = monitor::subscribe::v0_1::MonitorFilter;
 /// One observed step in a message's life.
-pub type MonitorEvent = monitor::event::v0_1::MonitorEvent;
+pub type MonitorEvent = monitor::event::v0_2::MonitorEvent;
 
 /// Lease requested for a monitor subscription; the feed renews well before it
 /// lapses.
@@ -63,7 +57,7 @@ pub enum MonitorUpdate {
     Ended(String),
 }
 
-type Payload = monitor::event::v0_1::Payload;
+type Payload = monitor::event::v0_2::Payload;
 
 /// The single reader of a console's live stream.
 pub(crate) struct LiveStream {
@@ -319,7 +313,7 @@ mod tests {
         let events: Vec<serde_json::Value> = (0..events)
             .map(|_| {
                 serde_json::json!({
-                    "at": "2026-09-21T00:00:00Z", "direction": "inbound",
+                    "occurredAt": "2026-09-21T00:00:00Z", "direction": "inbound",
                     "stage": "received", "channel": "rest", "protocol": "didcomm",
                 })
             })

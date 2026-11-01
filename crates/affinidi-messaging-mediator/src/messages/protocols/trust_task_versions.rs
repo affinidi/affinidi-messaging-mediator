@@ -23,9 +23,8 @@
 //! | `audit/list` | `limit` → `pageSize` | `cursor` → `nextCursor`; `truncated` removed |
 //! | `messaging/message/status` | — | `statuses[].at` → `reachedAt` |
 //!
-//! `messaging/monitor/event` also has a 0.2 (`at` → `occurredAt`), but the
-//! mediator pushes it on a subscription that names no event version, so it
-//! stays 0.1 until `monitor/subscribe` can ask for one.
+//! `messaging/monitor/event` is pushed at 0.2 only (`at` → `occurredAt`); it
+//! is not served, so there is no 0.1 to keep beside it (see `crate::monitor`).
 
 use std::str::FromStr;
 

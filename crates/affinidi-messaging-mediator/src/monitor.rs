@@ -79,7 +79,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// `messaging/monitor/event` type URI.
-const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/monitor/event/0.1";
+const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/monitor/event/0.2";
 
 /// Which way traffic moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,7 +213,7 @@ impl TrafficEvent {
 
     fn to_json(&self) -> Value {
         let mut v = json!({
-            "at": self.at,
+            "occurredAt": self.at,
             "direction": self.direction.as_str(),
             "stage": self.stage.as_str(),
             "channel": self.channel.as_str(),
