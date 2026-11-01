@@ -10,13 +10,35 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ### Changed — trusted-proxy rate-limit attribution
 
-- Mediators can opt in to client attribution from `X-Forwarded-For` with
-  `[server].trust_xff_cidrs` or `TRUST_XFF_CIDRS`. When unset, rate limiting
-  continues to use the socket peer; untrusted forwarded headers safely fall
-  back to the socket peer, while malformed or oversized trusted forwarded
-  chains are rejected instead of collapsing clients into a shared bucket.
-  `trust_xff_cidrs` must list only proxies that append to `X-Forwarded-For`,
-  and the mediator must not be reachable except through them.
+- **`affinidi-rate-limit` 0.1.3.** The per-IP limiter can now charge clients
+  behind a reverse proxy to themselves. New `[server] trust_xff_cidrs` (env
+  `TRUST_XFF_CIDRS`, comma-separated; default `[]`, which keeps today's
+  behaviour of keying on the socket peer). When the socket peer is inside a
+  listed range, the limiter walks `X-Forwarded-For` from the right, skips
+  listed hops and charges the first address that is not one; a header from any
+  other peer is never read. List only proxies that append to
+  `X-Forwarded-For` (an ALB does), and make sure the mediator is reachable
+  only through them.
+- **Behaviour change:** an unreadable `X-Forwarded-For` chain from a listed
+  proxy (a hop that is not an address, a non-UTF-8 header, more than 64 listed
+  hops) is refused with `400` and `x-rate-limit-source: mediator`, body
+  `{"error":"invalid_forwarded_for","limiter":"mediator","message":…}`, rather
+  than charging the proxy's shared bucket. Only the hops up to the client are
+  read, so junk a client prepends cannot trigger it. Counted in the new
+  `rate_limit_attribution_failures_total{reason="invalid_forwarded_for"}`
+  (also `reason="no_client_ip"` for the existing `403`).
+- **Behaviour change:** per-IP keys are canonical, so a dual-stack listener's
+  `::ffff:a.b.c.d` peer shares the IPv4 client's bucket instead of holding a
+  second one. The `403` for a request with no client IP now also carries
+  `x-rate-limit-source: mediator`.
+- A catch-all range (`0.0.0.0/0`, `::/0`) in `trust_xff_cidrs` fails startup
+  (and setup-wizard recipe loading): it would let any client choose its own
+  rate-limit key. Startup logs which key the limiter uses and the trusted
+  ranges, and warns when `trust_xff_cidrs` is set while per-IP limiting is
+  disabled (`rate_limit_per_ip = 0`), since it then has no effect.
+- `affinidi-messaging-mediator-setup` now depends on
+  `affinidi-messaging-mediator-config` (previously a dev-dependency) to apply
+  the same checks to recipe values.
 
 ## 0.47.0 (release/0.47)
 

@@ -136,6 +136,13 @@ pub mod names {
 
     /// counter: Requests rejected by rate limiter (label: scope = ip|did)
     pub const RATE_LIMITED_TOTAL: &str = "rate_limited_total";
+    /// counter: Requests the per-IP limiter refused because it could not tell
+    /// which client sent them (label: reason = invalid_forwarded_for |
+    /// no_client_ip). `invalid_forwarded_for` is a `400` for an unreadable
+    /// `X-Forwarded-For` chain from a proxy in `server.trust_xff_cidrs`;
+    /// anything above zero points at a proxy or listener misconfiguration, not
+    /// a noisy client.
+    pub const RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL: &str = "rate_limit_attribution_failures_total";
 
     // ── Queue depth ─────────────────────────────────────────────────────────
     //

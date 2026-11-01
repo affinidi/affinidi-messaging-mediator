@@ -1,7 +1,6 @@
 use crate::{
     SharedData,
     builder::{MediatorHandle, StartOpts, TlsMode, TracingMode},
-    common::rate_limit::TrustedProxyRateLimitLayer,
     common::{
         config::{
             Config, LimitsConfig,
@@ -27,7 +26,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
-use affinidi_rate_limit::{RateLimiterState, Refusal};
+use affinidi_rate_limit::{IpNetwork, RateLimitLayer, RateLimiterState, Refusal};
 use axum::{Router, routing::get};
 use std::{
     collections::HashSet, env, net::SocketAddr, sync::Arc, sync::atomic::AtomicUsize,
@@ -894,16 +893,9 @@ pub async fn serve_internal(
 
     let app: Router = application_routes(&api_prefix, &shared_state);
 
-    // The local layer owns refusal responses so it also receives the metric
-    // callback that the upstream layer used to invoke.
-    let rate_limiter = ip_rate_limiter(&config.limits);
+    let rate_limiter = ip_rate_limiter(&config.limits, &config.trust_xff_cidrs)?;
     rate_limiter.spawn_gc(shutdown_token.clone());
-    if config.limits.rate_limit_per_ip > 0 {
-        info!(
-            "Rate limiting enabled: {} req/s per IP, burst: {}",
-            config.limits.rate_limit_per_ip, config.limits.rate_limit_burst,
-        );
-    }
+    log_ip_rate_limiter(&rate_limiter, &config.limits);
 
     let app = Router::new()
         .merge(app)
@@ -920,18 +912,7 @@ pub async fn serve_internal(
                 .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(RequestBodyLimitLayer::new(config.limits.http_size))
-        .layer(
-            TrustedProxyRateLimitLayer::new(rate_limiter, config.trust_xff_cidrs.clone())
-                .on_refused(|refusal| {
-                    if matches!(refusal, Refusal::RateLimited { .. }) {
-                        ::metrics::counter!(
-                            crate::common::metrics::names::RATE_LIMITED_TOTAL,
-                            "scope" => "ip"
-                        )
-                        .increment(1);
-                    }
-                }),
-        )
+        .layer(RateLimitLayer::new(rate_limiter))
         .layer(RequestIdLayer::new())
         .merge(probe_routes(
             &api_prefix,
@@ -1347,9 +1328,91 @@ pub const RATE_LIMIT_SOURCE: &str = "mediator";
 /// It wraps every application route — REST, the websocket upgrade (`/ws`) and
 /// DIDComm/TSP ingress (`/inbound`) — so this is the one place a mediator `429`
 /// is produced, and every one of them says who refused.
-fn ip_rate_limiter(limits: &LimitsConfig) -> RateLimiterState {
+///
+/// `trust_xff_cidrs` names the reverse proxies whose `X-Forwarded-For` the
+/// limiter believes (see `affinidi_rate_limit::RateLimiterState::with_trusted_proxies`).
+/// The config loader already refuses a catch-all range; the error here is the
+/// backstop for a `Config` built in code.
+///
+/// Every refusal is counted: a quota refusal in `rate_limited_total`
+/// (`scope = ip`), and a request the limiter could not attribute to a client in
+/// `rate_limit_attribution_failures_total` (`reason = invalid_forwarded_for |
+/// no_client_ip`). The latter moving means a proxy or listener is misconfigured,
+/// not that a client is noisy.
+fn ip_rate_limiter(
+    limits: &LimitsConfig,
+    trust_xff_cidrs: &[IpNetwork],
+) -> Result<RateLimiterState, MediatorError> {
+    use crate::common::metrics::names::{
+        RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL, RATE_LIMITED_TOTAL,
+    };
+
     RateLimiterState::new(limits.rate_limit_per_ip, limits.rate_limit_burst)
         .with_source(RATE_LIMIT_SOURCE)
+        .on_refused(|refusal| match refusal {
+            Refusal::RateLimited { .. } => {
+                ::metrics::counter!(RATE_LIMITED_TOTAL, "scope" => "ip").increment(1);
+            }
+            Refusal::InvalidForwardedFor => {
+                ::metrics::counter!(
+                    RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL,
+                    "reason" => "invalid_forwarded_for"
+                )
+                .increment(1);
+            }
+            Refusal::NoClientIp => {
+                ::metrics::counter!(
+                    RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL,
+                    "reason" => "no_client_ip"
+                )
+                .increment(1);
+            }
+            _ => {}
+        })
+        .with_trusted_proxies(trust_xff_cidrs.iter().copied())
+        .map_err(|e| {
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("server.trust_xff_cidrs: {e}"),
+            )
+        })
+}
+
+/// Say at startup how the per-IP limiter will attribute requests, so an
+/// operator can see from the log alone whether `X-Forwarded-For` is in play.
+fn log_ip_rate_limiter(limiter: &RateLimiterState, limits: &LimitsConfig) {
+    let trusted = limiter.trusted_proxies();
+    let trusted_list = || {
+        trusted
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !limiter.is_enabled() {
+        if !trusted.is_empty() {
+            warn!(
+                "server.trust_xff_cidrs is set ({}) but per-IP rate limiting is disabled \
+                 (limits.rate_limit_per_ip = 0): X-Forwarded-For is not read and malformed \
+                 chains are not rejected",
+                trusted_list()
+            );
+        }
+        return;
+    }
+    info!(
+        "Rate limiting enabled: {} req/s per IP, burst: {}",
+        limits.rate_limit_per_ip, limits.rate_limit_burst,
+    );
+    if trusted.is_empty() {
+        info!("Per-IP rate limiting keys on the socket peer (server.trust_xff_cidrs is empty)");
+    } else {
+        info!(
+            "Per-IP rate limiting reads X-Forwarded-For from trusted proxies: {}",
+            trusted_list()
+        );
+    }
 }
 
 /// Give the mediator's own DID the `Mediator` role (with the same locked-down
@@ -1456,9 +1519,8 @@ mod rate_limit_tests {
     async fn trusted_proxy_buckets_clients_by_forwarded_address() {
         let app = Router::new()
             .route("/ws", get(|| async { "upgrade" }))
-            .layer(TrustedProxyRateLimitLayer::new(
-                ip_rate_limiter(&limits(1, 1)),
-                vec!["10.0.0.0/8".parse().unwrap()],
+            .layer(RateLimitLayer::new(
+                ip_rate_limiter(&limits(1, 1), &["10.0.0.0/8".parse().unwrap()]).unwrap(),
             ));
         let status = |app: Router, req: Request<Body>| async move {
             app.oneshot(req).await.unwrap().status()
@@ -1482,9 +1544,24 @@ mod rate_limit_tests {
             StatusCode::OK
         );
         assert_eq!(
-            status(app, request_via([192, 0, 2, 9], "198.51.100.2")).await,
+            status(app.clone(), request_via([192, 0, 2, 9], "198.51.100.2")).await,
             StatusCode::TOO_MANY_REQUESTS
         );
+
+        // An unreadable chain from the trusted proxy is refused as the
+        // mediator's, without charging any bucket.
+        let refused = app
+            .oneshot(request_via([10, 0, 0, 1], "203.0.113.3, unknown"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.headers()["x-rate-limit-source"], RATE_LIMIT_SOURCE);
+    }
+
+    #[test]
+    fn a_catch_all_trusted_range_is_a_config_error() {
+        let err = ip_rate_limiter(&limits(1, 1), &["0.0.0.0/0".parse().unwrap()]).unwrap_err();
+        assert!(err.to_string().contains("0.0.0.0/0"), "{err}");
     }
 
     /// A mediator `429` carries the attribution contract, and the SDK reads it
@@ -1495,9 +1572,8 @@ mod rate_limit_tests {
         let app = Router::new()
             .route("/inbound", axum::routing::post(|| async { "accepted" }))
             .route("/ws", get(|| async { "upgrade" }))
-            .layer(TrustedProxyRateLimitLayer::new(
-                ip_rate_limiter(&limits(1, 1)),
-                Vec::new(),
+            .layer(RateLimitLayer::new(
+                ip_rate_limiter(&limits(1, 1), &[]).unwrap(),
             ));
 
         assert_eq!(
@@ -1546,7 +1622,7 @@ mod rate_limit_tests {
     #[test]
     fn the_limiter_is_labelled_even_when_disabled() {
         assert_eq!(
-            ip_rate_limiter(&limits(0, 0)).source(),
+            ip_rate_limiter(&limits(0, 0), &[]).unwrap().source(),
             Some(RATE_LIMIT_SOURCE)
         );
     }

@@ -37,6 +37,11 @@ pub struct ServerConfig {
     /// them. The mediator charges the rightmost address that is not listed here,
     /// so a proxy that forwards a client-supplied header unchanged, or a listener
     /// exposed directly, lets clients choose their own rate-limit key.
+    ///
+    /// A catch-all range (`0.0.0.0/0`, `::/0`) is refused at startup
+    /// (`validate::check_trust_xff_cidrs`). An unreadable chain from a listed
+    /// proxy is refused with `400`. Has no effect when per-IP limiting is
+    /// disabled.
     #[serde(default)]
     pub trust_xff_cidrs: Vec<ipnetwork::IpNetwork>,
     pub did_web_self_hosted: Option<String>,

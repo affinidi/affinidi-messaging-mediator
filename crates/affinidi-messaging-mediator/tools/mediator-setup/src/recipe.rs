@@ -691,10 +691,18 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     config.config_path = recipe.output.config_path.clone();
     config.listen_address = recipe.output.listen_address.clone();
     config.api_prefix = recipe.output.api_prefix.clone();
-    for cidr in &recipe.output.trust_xff_cidrs {
-        cidr.parse::<ipnetwork::IpNetwork>()
-            .map_err(|e| anyhow::anyhow!("invalid [output].trust_xff_cidrs entry '{cidr}': {e}"))?;
-    }
+    let trust_xff_cidrs = recipe
+        .output
+        .trust_xff_cidrs
+        .iter()
+        .map(|cidr| {
+            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
+                anyhow::anyhow!("invalid [output].trust_xff_cidrs entry '{cidr}': {e}")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    affinidi_messaging_mediator_config::validate::check_trust_xff_cidrs(&trust_xff_cidrs)
+        .map_err(|e| anyhow::anyhow!("[output].trust_xff_cidrs: {e}"))?;
     config.trust_xff_cidrs = recipe.output.trust_xff_cidrs.clone();
     config.did_target = recipe.output.did_target.clone();
     config.did_log_target = recipe.output.did_log_target.clone();
@@ -1149,6 +1157,22 @@ mod tests {
             let config = to_wizard_config(&recipe).unwrap();
             assert_eq!(config.deployment_type, expected);
         }
+    }
+
+    #[test]
+    fn test_trust_xff_cidrs_are_validated() {
+        let mut recipe = minimal_recipe();
+        recipe.output.trust_xff_cidrs = vec!["10.0.0.0/8".into(), "::1/128".into()];
+        let config = to_wizard_config(&recipe).unwrap();
+        assert_eq!(config.trust_xff_cidrs, ["10.0.0.0/8", "::1/128"]);
+
+        recipe.output.trust_xff_cidrs = vec!["10.0.0.0/8".into(), "nope".into()];
+        let err = to_wizard_config(&recipe).unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+
+        recipe.output.trust_xff_cidrs = vec!["0.0.0.0/0".into()];
+        let err = to_wizard_config(&recipe).unwrap_err().to_string();
+        assert!(err.contains("0.0.0.0/0"), "{err}");
     }
 
     #[test]
