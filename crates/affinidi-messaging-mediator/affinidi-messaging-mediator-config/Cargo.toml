@@ -21,7 +21,7 @@ toml = "1"
 # under the wrong `[table]`) so the mediator can warn instead of dropping it.
 serde_ignored = "0.1"
 # CIDR validation for trusted reverse-proxy client attribution.
-ipnetwork = { version = "0.21", features = ["serde"] }
+ipnet = { version = "2", features = ["serde"] }
 # Lean error type for config loading (`ConfigError`).
 thiserror = "2"
 # Structured logging in the file-reading helpers, matching the mediator.

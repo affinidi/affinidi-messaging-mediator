@@ -43,7 +43,7 @@ pub struct ServerConfig {
     /// proxy is refused with `400`. Has no effect when per-IP limiting is
     /// disabled.
     #[serde(default)]
-    pub trust_xff_cidrs: Vec<ipnetwork::IpNetwork>,
+    pub trust_xff_cidrs: Vec<ipnet::IpNet>,
     pub did_web_self_hosted: Option<String>,
     /// Additional URL aliases the mediator should treat as
     /// pointing at *itself* when resolving a routing-2.0 next-hop.

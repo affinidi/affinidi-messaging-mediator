@@ -162,7 +162,7 @@ pub struct Config {
     #[serde(default)]
     pub local_endpoints: Vec<String>,
     /// Trusted reverse-proxy CIDRs used for `X-Forwarded-For` rate-limit attribution.
-    pub trust_xff_cidrs: Vec<affinidi_rate_limit::IpNetwork>,
+    pub trust_xff_cidrs: Vec<affinidi_rate_limit::IpNet>,
     pub streaming_enabled: bool,
     pub streaming_uuid: String,
     pub database: DatabaseConfig,

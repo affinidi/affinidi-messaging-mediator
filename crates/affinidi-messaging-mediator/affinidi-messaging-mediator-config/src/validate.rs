@@ -136,8 +136,8 @@ fn require_path<'a>(label: &str, path: Option<&'a str>) -> Result<&'a str, Strin
 /// still all charged to the proxy. It is never what an operator meant, and
 /// the rate limiter refuses it as well; this catches it at load time with the
 /// field named.
-pub fn check_trust_xff_cidrs(cidrs: &[ipnetwork::IpNetwork]) -> Result<(), String> {
-    match cidrs.iter().find(|cidr| cidr.prefix() == 0) {
+pub fn check_trust_xff_cidrs(cidrs: &[ipnet::IpNet]) -> Result<(), String> {
+    match cidrs.iter().find(|cidr| cidr.prefix_len() == 0) {
         Some(cidr) => Err(format!(
             "server.trust_xff_cidrs entry '{cidr}' trusts every address, which lets any \
              client choose its own rate-limit key; list only your reverse proxies' ranges"
@@ -225,7 +225,7 @@ pub fn warn_remote_admin_allowed(block_remote_admin_msgs: bool) -> Option<String
 mod tests {
     #[test]
     fn trust_xff_cidrs_rejects_catch_all_ranges() {
-        let cidrs = |nets: &[&str]| -> Vec<ipnetwork::IpNetwork> {
+        let cidrs = |nets: &[&str]| -> Vec<ipnet::IpNet> {
             nets.iter().map(|n| n.parse().unwrap()).collect()
         };
         assert!(super::check_trust_xff_cidrs(&[]).is_ok());

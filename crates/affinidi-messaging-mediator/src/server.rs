@@ -26,7 +26,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
-use affinidi_rate_limit::{IpNetwork, RateLimitLayer, RateLimiterState, Refusal};
+use affinidi_rate_limit::{IpNet, RateLimitLayer, RateLimiterState, Refusal};
 use axum::{Router, routing::get};
 use std::{
     collections::HashSet, env, net::SocketAddr, sync::Arc, sync::atomic::AtomicUsize,
@@ -893,9 +893,10 @@ pub async fn serve_internal(
 
     let app: Router = application_routes(&api_prefix, &shared_state);
 
-    let rate_limiter = ip_rate_limiter(&config.limits, &config.trust_xff_cidrs)?;
+    let rate_limiter = ip_rate_limiter(&config.limits);
     rate_limiter.spawn_gc(shutdown_token.clone());
-    log_ip_rate_limiter(&rate_limiter, &config.limits);
+    log_ip_rate_limiter(&rate_limiter, &config.limits, &config.trust_xff_cidrs);
+    let rate_limit_layer = ip_rate_limit_layer(rate_limiter, &config.trust_xff_cidrs)?;
 
     let app = Router::new()
         .merge(app)
@@ -912,7 +913,7 @@ pub async fn serve_internal(
                 .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(RequestBodyLimitLayer::new(config.limits.http_size))
-        .layer(RateLimitLayer::new(rate_limiter))
+        .layer(rate_limit_layer)
         .layer(RequestIdLayer::new())
         .merge(probe_routes(
             &api_prefix,
@@ -1329,20 +1330,12 @@ pub const RATE_LIMIT_SOURCE: &str = "mediator";
 /// DIDComm/TSP ingress (`/inbound`) — so this is the one place a mediator `429`
 /// is produced, and every one of them says who refused.
 ///
-/// `trust_xff_cidrs` names the reverse proxies whose `X-Forwarded-For` the
-/// limiter believes (see `affinidi_rate_limit::RateLimiterState::with_trusted_proxies`).
-/// The config loader already refuses a catch-all range; the error here is the
-/// backstop for a `Config` built in code.
-///
 /// Every refusal is counted: a quota refusal in `rate_limited_total`
 /// (`scope = ip`), and a request the limiter could not attribute to a client in
 /// `rate_limit_attribution_failures_total` (`reason = invalid_forwarded_for |
 /// no_client_ip`). The latter moving means a proxy or listener is misconfigured,
 /// not that a client is noisy.
-fn ip_rate_limiter(
-    limits: &LimitsConfig,
-    trust_xff_cidrs: &[IpNetwork],
-) -> Result<RateLimiterState, MediatorError> {
+fn ip_rate_limiter(limits: &LimitsConfig) -> RateLimiterState {
     use crate::common::metrics::names::{
         RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL, RATE_LIMITED_TOTAL,
     };
@@ -1369,7 +1362,20 @@ fn ip_rate_limiter(
             }
             _ => {}
         })
-        .with_trusted_proxies(trust_xff_cidrs.iter().copied())
+}
+
+/// The layer applying [`ip_rate_limiter`], reading `X-Forwarded-For` only from
+/// the reverse proxies in `trust_xff_cidrs` (see
+/// `affinidi_rate_limit::RateLimitLayer::trusted_proxies`).
+///
+/// Config validation already refuses a catch-all range; the error here is the
+/// backstop for a `Config` built in code.
+fn ip_rate_limit_layer(
+    limiter: RateLimiterState,
+    trust_xff_cidrs: &[IpNet],
+) -> Result<RateLimitLayer, MediatorError> {
+    RateLimitLayer::new(limiter)
+        .trusted_proxies(trust_xff_cidrs.to_vec())
         .map_err(|e| {
             MediatorError::ConfigError(
                 error_codes::CONFIG_ERROR,
@@ -1381,8 +1387,7 @@ fn ip_rate_limiter(
 
 /// Say at startup how the per-IP limiter will attribute requests, so an
 /// operator can see from the log alone whether `X-Forwarded-For` is in play.
-fn log_ip_rate_limiter(limiter: &RateLimiterState, limits: &LimitsConfig) {
-    let trusted = limiter.trusted_proxies();
+fn log_ip_rate_limiter(limiter: &RateLimiterState, limits: &LimitsConfig, trusted: &[IpNet]) {
     let trusted_list = || {
         trusted
             .iter()
@@ -1519,9 +1524,13 @@ mod rate_limit_tests {
     async fn trusted_proxy_buckets_clients_by_forwarded_address() {
         let app = Router::new()
             .route("/ws", get(|| async { "upgrade" }))
-            .layer(RateLimitLayer::new(
-                ip_rate_limiter(&limits(1, 1), &["10.0.0.0/8".parse().unwrap()]).unwrap(),
-            ));
+            .layer(
+                ip_rate_limit_layer(
+                    ip_rate_limiter(&limits(1, 1)),
+                    &["10.0.0.0/8".parse().unwrap()],
+                )
+                .unwrap(),
+            );
         let status = |app: Router, req: Request<Body>| async move {
             app.oneshot(req).await.unwrap().status()
         };
@@ -1560,7 +1569,12 @@ mod rate_limit_tests {
 
     #[test]
     fn a_catch_all_trusted_range_is_a_config_error() {
-        let err = ip_rate_limiter(&limits(1, 1), &["0.0.0.0/0".parse().unwrap()]).unwrap_err();
+        let Err(err) = ip_rate_limit_layer(
+            ip_rate_limiter(&limits(1, 1)),
+            &["0.0.0.0/0".parse().unwrap()],
+        ) else {
+            panic!("a catch-all range must be refused");
+        };
         assert!(err.to_string().contains("0.0.0.0/0"), "{err}");
     }
 
@@ -1572,9 +1586,7 @@ mod rate_limit_tests {
         let app = Router::new()
             .route("/inbound", axum::routing::post(|| async { "accepted" }))
             .route("/ws", get(|| async { "upgrade" }))
-            .layer(RateLimitLayer::new(
-                ip_rate_limiter(&limits(1, 1), &[]).unwrap(),
-            ));
+            .layer(ip_rate_limit_layer(ip_rate_limiter(&limits(1, 1)), &[]).unwrap());
 
         assert_eq!(
             app.clone().oneshot(request("/ws")).await.unwrap().status(),
@@ -1622,7 +1634,7 @@ mod rate_limit_tests {
     #[test]
     fn the_limiter_is_labelled_even_when_disabled() {
         assert_eq!(
-            ip_rate_limiter(&limits(0, 0), &[]).unwrap().source(),
+            ip_rate_limiter(&limits(0, 0)).source(),
             Some(RATE_LIMIT_SOURCE)
         );
     }

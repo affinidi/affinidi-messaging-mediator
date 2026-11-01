@@ -696,7 +696,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         .trust_xff_cidrs
         .iter()
         .map(|cidr| {
-            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
+            cidr.parse::<ipnet::IpNet>().map_err(|e| {
                 anyhow::anyhow!("invalid [output].trust_xff_cidrs entry '{cidr}': {e}")
             })
         })

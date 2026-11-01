@@ -20,11 +20,12 @@ mediator-tui 0.11.0); they are no longer updated.
   `X-Forwarded-For` (an ALB does), and make sure the mediator is reachable
   only through them.
 - **Behaviour change:** an unreadable `X-Forwarded-For` chain from a listed
-  proxy (a hop that is not an address, a non-UTF-8 header, more than 64 listed
-  hops) is refused with `400` and `x-rate-limit-source: mediator`, body
+  proxy (a hop from the client rightwards that is not an address, a non-ASCII
+  header, more than 64 entries) is refused with `400` and `x-rate-limit-source: mediator`, body
   `{"error":"invalid_forwarded_for","limiter":"mediator","message":…}`, rather
-  than charging the proxy's shared bucket. Only the hops up to the client are
-  read, so junk a client prepends cannot trigger it. Counted in the new
+  than charging the proxy's shared bucket. Entries left of the client are
+  never parsed, so junk a client prepends is ignored (it still counts towards
+  the 64-entry cap). Counted in the new
   `rate_limit_attribution_failures_total{reason="invalid_forwarded_for"}`
   (also `reason="no_client_ip"` for the existing `403`).
 - **Behaviour change:** per-IP keys are canonical, so a dual-stack listener's
