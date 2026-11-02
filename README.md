@@ -22,7 +22,7 @@ All crates are released together and carry the same version.
 | [`affinidi-messaging-mediator-common`](crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common) | Storage backends (Redis, Fjall, in-memory), secret stores and shared server types. |
 | [`affinidi-messaging-mediator-config`](crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config) | The raw TOML configuration schema. |
 | [`affinidi-messaging-mediator-processors`](crates/affinidi-messaging-mediator/affinidi-messaging-mediator-processors) | Standalone message-expiry and forwarding processors. |
-| [`mediator-setup`](crates/affinidi-messaging-mediator/tools/mediator-setup) | Interactive setup wizard (not published). |
+| [`affinidi-messaging-mediator-setup`](crates/affinidi-messaging-mediator/tools/mediator-setup) | Interactive setup wizard, the `mediator-setup` binary (not published). |
 | [`affinidi-messaging-test-mediator`](crates/affinidi-messaging-test-mediator) | An in-process mediator for integration tests. |
 | [`affinidi-messaging-mediator-admin`](crates/affinidi-messaging-mediator-admin) | Headless administration client over Trust Tasks. |
 | [`affinidi-messaging-mediator-tui`](crates/affinidi-messaging-mediator-tui) | Terminal console (`mediator-console`). |
@@ -35,7 +35,7 @@ handlers unless you ask for them. It returns a `MediatorHandle` with
 `shutdown()` and `join()`.
 
 ```toml
-affinidi-messaging-mediator = { version = "0.42", default-features = false, features = ["didcomm", "memory-backend"] }
+affinidi-messaging-mediator = { version = "0.49", default-features = false, features = ["didcomm", "memory-backend"] }
 ```
 
 Turn the defaults off: they bring in Redis, jemalloc (a binary-only concern;

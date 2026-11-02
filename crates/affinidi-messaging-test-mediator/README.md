@@ -25,7 +25,7 @@ Anywhere you need an in-process mediator for tests:
 ```toml
 # Cargo.toml
 [dev-dependencies]
-affinidi-messaging-test-mediator = "0.1"
+affinidi-messaging-test-mediator = "0.49"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -171,7 +171,7 @@ Then the SDK's `profile_add(_, /* live_stream */ true)` flow completes
 the JWT handshake and opens the WebSocket without hitting the 403.
 
 For finer control over per-user ACLs, use
-[`add_user_with_acl`](TestMediatorHandle::add_user_with_acl) (see
+`TestMediatorHandle::add_user_with_acl` (see
 "Simulating different ACL modes" below).
 
 ## Simulating different ACL modes
@@ -230,7 +230,7 @@ let observed = mediator
 assert_eq!(observed.to_u64(), acl::deny_all().to_u64());
 ```
 
-The [`acl`](crate::acl) module exports `allow_all()` and `deny_all()`
+The `acl` module exports `allow_all()` and `deny_all()`
 as typed equivalents of the production string presets. For
 fine-grained ACLs, build a `MediatorACLSet` directly via
 `MediatorACLSet::default()` plus the bit setters — both
@@ -239,12 +239,12 @@ this crate so consumers don't need a direct dep on
 `affinidi-messaging-mediator-common`.
 
 Other security flags exposed on the builder for completeness:
-[`local_direct_delivery`](TestMediatorBuilder::local_direct_delivery),
-[`block_anonymous_outer_envelope`](TestMediatorBuilder::block_anonymous_outer_envelope),
-[`force_session_did_match`](TestMediatorBuilder::force_session_did_match),
-[`block_remote_admin_msgs`](TestMediatorBuilder::block_remote_admin_msgs),
-[`jwt_expiry`](TestMediatorBuilder::jwt_expiry),
-[`local_endpoints`](TestMediatorBuilder::local_endpoints).
+`TestMediatorBuilder::local_direct_delivery`,
+`TestMediatorBuilder::block_anonymous_outer_envelope`,
+`TestMediatorBuilder::force_session_did_match`,
+`TestMediatorBuilder::block_remote_admin_msgs`,
+`TestMediatorBuilder::jwt_expiry`,
+`TestMediatorBuilder::local_endpoints`.
 
 ## Administration tests
 
@@ -305,7 +305,7 @@ assert!(!observed.get_receive_messages().0);
 ```
 
 **Secrets ownership.** `AdminIdentity::secrets` stays with the caller.
-[`add_admin`](TestEnvironment::add_admin) inserts them into the SDK's
+`TestEnvironment::add_admin` inserts them into the SDK's
 secrets resolver so the SDK can sign on the admin's behalf. The
 mediator's own server-side secrets resolver is **not** touched — that
 resolver holds the mediator's operating keys, not its admin's. The
@@ -344,7 +344,7 @@ that need different semantics:
 
 ## Feature flags and what CI runs
 
-`default = []`, so the two optional features have to be asked for
+`default = []`, so the optional features have to be asked for
 explicitly — and a plain `cargo test` silently compiles their tests
 *out* rather than failing:
 
@@ -352,15 +352,18 @@ explicitly — and a plain `cargo test` silently compiles their tests
 |---|---|
 | `fjall-backend` | `FjallStore` + the tests gated on it |
 | `tsp` | mediator TSP support, `atm.tsp()`, and every `#[cfg(feature = "tsp")]` test (TSP delivery, auth, websocket, pickup, federation, cross-mediator routing, capability discovery) |
+| `didcomm-v1` | mediator DIDComm v1 (Aries RFC 0019) support and its tests: forward ingress, coordinate-mediation and message pickup |
+| `redis-backend` | `RedisStore`, for the size sweep (`tests/size_sweep.rs`) against a real Redis named by `REDIS_URL` |
 
 To run everything locally:
 
 ```sh
-cargo test -p affinidi-messaging-test-mediator --features tsp,fjall-backend --tests
+cargo test -p affinidi-messaging-test-mediator --features tsp,fjall-backend,didcomm-v1 --tests
 ```
 
-CI covers all three axes as separate jobs in `checks-storage.yaml` —
-`test-mediator (memory)`, `(fjall)` and `(tsp)`. The `tsp` job was
+CI covers each axis as a separate job in `.github/workflows/ci.yml` —
+`test-mediator (fjall)`, `(tsp)` and `(didcomm-v1)`, beside the
+workspace `cargo test` that runs the default (memory) build. The `tsp` job was
 added after the feature spent a long time uncovered: because `tsp`
 isn't default, a fully green CI run had been saying nothing at all
 about the TSP transport. If you add a test behind a new feature gate,

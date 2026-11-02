@@ -3,8 +3,9 @@
 Shared code for the Affinidi Messaging Mediator, its setup wizard, and its
 processors:
 
-- `types`: request and response types shared with clients. Take the crate
-  with `default-features = false` to get only these.
+- `types`: request and response types shared with clients, re-exported from
+  `affinidi-messaging-mediator-types`. Client crates should depend on that
+  crate directly rather than on this one.
 - `store`: the `MediatorStore` storage trait and the Redis implementation.
 - `secrets`: the `SecretStore` trait, the secret backends (`file://`,
   `keyring://`, AWS, GCP, Azure, Vault, `k8s://`), and the well-known entries

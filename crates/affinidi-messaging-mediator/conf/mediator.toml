@@ -40,9 +40,15 @@ mediator_did = "did://did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2Z
 ###   file:///<absolute-path>[?encrypt=1]   Local JSON file (plaintext by
 ###                                         default — DEV/TEST ONLY).
 ###   aws_secrets://<region>/<prefix>       AWS Secrets Manager.
-###   gcp_secrets://<project>/<prefix>      GCP Secret Manager (coming soon).
-###   azure_keyvault://<vault>              Azure Key Vault (coming soon).
-###   vault://<host[:port]>/<kv-path>       HashiCorp Vault (coming soon).
+###   gcp_secrets://<project>/<prefix>      GCP Secret Manager.
+###   azure_keyvault://<vault>              Azure Key Vault.
+###   vault://<endpoint>/<mount>[/<prefix>][?auth=…]
+###                                         HashiCorp Vault (KV v2).
+###   k8s://[<namespace>/]<secret-name>     Kubernetes Secret.
+###
+### Only file:// is built in by default; every other backend needs its cargo
+### feature (secrets-keyring, secrets-aws, secrets-gcp, secrets-azure,
+### secrets-vault, secrets-k8s). See docs/secrets-backend.md.
 ###
 ### Env: MEDIATOR_SECRETS_BACKEND
 ### ****************************************************************************************************************************
@@ -541,9 +547,10 @@ oob_invite_ttl = "86400"
 ### Requests per second per IP (0 = disabled). A refusal is HTTP 429 with
 ### `x-rate-limit-source: mediator`, `Retry-After` and a JSON body, so clients
 ### can tell this limit from a proxy's or another service's.
-### Scale: lower to harden against per-IP abuse; RAISE (or disable) when behind a
-### trusted load balancer / NAT where many clients share one source IP, or it
-### will throttle legitimate traffic. Commented out = built-in default (100).
+### Scale: lower to harden against per-IP abuse. Behind a load balancer, set
+### `[server] trust_xff_cidrs` to its ranges so each client is charged to its
+### own address rather than the balancer's; RAISE this only for a NAT where
+### clients really share one source IP. Commented out = built-in default (100).
 # rate_limit_per_ip = "100"
 
 ### Env: LIMIT_RATE_LIMIT_BURST

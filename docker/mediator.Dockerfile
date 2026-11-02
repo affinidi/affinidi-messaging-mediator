@@ -30,10 +30,10 @@ RUN apt-get update \
 FROM rust AS builder
 WORKDIR /app
 COPY . .
-# didcomm + redis-backend + jemalloc come from defaults; add tsp + secrets-aws
-# (secrets-aws pulls in the `aws` feature required by aws_secrets:// /
+# didcomm, tsp, redis-backend, jemalloc and vta come from defaults; add
+# secrets-aws (which pulls in the `aws` feature required by aws_secrets:// /
 # aws_parameter_store://).
-RUN cargo build --release -p affinidi-messaging-mediator --features tsp,secrets-aws
+RUN cargo build --release -p affinidi-messaging-mediator --features secrets-aws
 # mediator-setup: only the AWS backends the cloud deployment uses.
 RUN cargo build --release -p affinidi-messaging-mediator-setup \
     --no-default-features --features secrets-aws,publish-aws

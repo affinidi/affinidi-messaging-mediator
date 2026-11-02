@@ -66,8 +66,8 @@ cargo build --release --locked --features secrets-aws,secrets-vault
 A URL whose backend wasn't compiled in fails at startup with a message naming
 the feature to add, for example *"compiled without the 'secrets-aws'
 feature; rebuild with `cargo build --features secrets-aws` to enable"*. CI
-(`checks-features.yaml`) builds the mediator and the wizard with each
-`secrets-*` feature.
+(the `feature-matrix` job in `.github/workflows/ci.yml`) builds the
+mediator and the wizard with each `secrets-*` feature.
 
 ---
 

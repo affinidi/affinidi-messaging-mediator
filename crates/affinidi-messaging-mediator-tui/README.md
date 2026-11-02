@@ -46,8 +46,10 @@ in another application ([Embedding](#embedding)).
     DID's `DIDCommMessaging` service.
 - **Admin rights, for admin mode.** The console asks the mediator what the
   account is, and the mediator's answer decides the mode. To administer, the
-  account must have the `admin` or `rootAdmin` role (see the mediator's
-  `mediator_administration` tool, or `messaging/account/update`).
+  account must have the `admin` or `rootAdmin` role (`mediator-setup`
+  configures the admin DID; grant the role to others with the
+  `messaging/account/update` Trust Task, or affinidi-tdk-rs's
+  `mediator_administration` tool).
 - **Signing, recommended.** The mediator verifies every Trust Task, including
   its proof, according to `security.trust_task_verification`. The SDK the
   console uses signs every request with the profile's Ed25519 key, so no extra

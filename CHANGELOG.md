@@ -37,6 +37,22 @@ mediator-tui 0.11.0); they are no longer updated.
   (0.37), `affinidi-tdk` (0.27) and `trust-tasks-rs` (0.32) that vta-sdk 0.72
   pulled in are gone.
 
+### Fixed — configuration and documentation
+
+- `LIMIT_QUEUED_SEND_MESSAGES_PER_PEER` now overrides
+  `[limits] queued_send_messages_per_peer`, as the shipped template's
+  `### Env:` label always said; it was silently ignored. A test now fails if
+  any template `### Env:` label has no override behind it.
+- Documentation brought in line with the code: the template lists the GCP,
+  Azure, Vault and Kubernetes secret backends as available (not "coming soon")
+  and names the `secrets-*` feature each needs; the quick start builds with
+  the feature for the wizard's default `keyring://` backend; the
+  `rate_limit_per_ip` guidance and a new README section point load-balanced
+  deployments at `trust_xff_cidrs` (also in the example setup recipe);
+  version snippets say 0.49; links into affinidi-tdk-rs that broke when the
+  mediator moved out are absolute; stale CI workflow names, feature lists and
+  crate docs corrected; the release schedule shows 0.48 GA.
+
 ### Changed — trusted-proxy rate-limit attribution
 
 - **`affinidi-rate-limit` 0.1.3.** The per-IP limiter can now charge clients

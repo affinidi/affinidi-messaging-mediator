@@ -70,9 +70,9 @@ first lockstep release from this repository.
 | 0.43 | `release/0.43` | 2026-10-18 | 2026-10-18 | `0.43.0` | end of life |
 | 0.44 | `release/0.44` | — | 2026-10-21 | `0.44.0` | end of life |
 | 0.45 | `release/0.45` | — | 2026-10-24 | `0.45.0` | end of life |
-| 0.46 | `release/0.46` | 2026-10-26 | 2026-10-26 | `0.46.0` | supported (N-1) |
-| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | supported (N) |
-| 0.48 | `release/0.48` | — | TBD | — | cut 2026-10-28; GA pending |
+| 0.46 | `release/0.46` | 2026-10-26 | 2026-10-26 | `0.46.0` | end of life |
+| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | supported (N-1) |
+| 0.48 | `release/0.48` | — | 2026-10-28 | `0.48.0` | supported (N) |
 | 0.49 | — | TBD | TBD | — | in development on `main` |
 
 ## Support
@@ -113,7 +113,8 @@ authenticated. It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` =
 `0.42.0-rc.0`, which `release-tag.yml` tags and builds an image for), creates
 the `backport release/0.42` label, and opens the `release-cut/0.42` PR that
 moves `main` to `0.43.0` and closes `main`'s `## Unreleased` changelog section
-under `## 0.42.0`. Merge it, then update the schedule table above.
+under `## 0.42.0 (release/0.42)` (the release branch's copy gets its date at
+GA). Merge it, then update the schedule table above.
 
 `--from <rev>` cuts from something other than `origin/nightly` — the first cut,
 before `nightly` exists, is `--from origin/main`.
