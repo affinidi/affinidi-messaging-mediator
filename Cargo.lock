@@ -524,6 +524,7 @@ name = "affinidi-messaging-mediator-config"
 version = "0.49.0"
 dependencies = [
  "affinidi-messaging-mediator-common",
+ "ipnet",
  "serde",
  "serde_ignored",
  "tempfile",
@@ -569,6 +570,7 @@ dependencies = [
  "crossterm",
  "didwebvh-rs",
  "humantime",
+ "ipnet",
  "rand 0.10.3",
  "ratatui",
  "rcgen",
@@ -808,13 +810,14 @@ dependencies = [
 
 [[package]]
 name = "affinidi-rate-limit"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96a7eed66d177bae59e3b4174a47eb6e2c6ccfcb3865b280f1b5722da367a660"
+checksum = "bb219bc4d342f68f68b1be95edd0f458b65f0197327add493acb911c3abc77c8"
 dependencies = [
  "axum",
  "governor",
  "http 1.5.0",
+ "ipnet",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -4592,6 +4595,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"

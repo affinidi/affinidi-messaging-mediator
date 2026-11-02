@@ -51,6 +51,9 @@ listen_address = "0.0.0.0:7037"
 api_prefix = "/mediator/v1/"
 ### The admin identity. Empty on purpose — set ADMIN_DID.
 admin_did = ""
+### Env: TRUST_XFF_CIDRS — comma-separated.
+### CIDR ranges for reverse proxies trusted to provide X-Forwarded-For.
+trust_xff_cidrs = []
 
 [database]
 functions_file = "./conf/atm-functions.lua"

@@ -9,9 +9,9 @@
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_config::validate::{
-    check_did_syntax, check_jwt_expiry, check_tls, warn_admin_is_mediator, warn_implicit_relay,
-    warn_per_peer_not_below_receive_limit, warn_permissive_default_with_denylist_mode,
-    warn_remote_admin_allowed,
+    check_did_syntax, check_jwt_expiry, check_tls, check_trust_xff_cidrs, warn_admin_is_mediator,
+    warn_implicit_relay, warn_per_peer_not_below_receive_limit,
+    warn_permissive_default_with_denylist_mode, warn_remote_admin_allowed,
 };
 use tracing::warn;
 
@@ -38,6 +38,7 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
         config.security.ssl_key_file.as_deref(),
     )
     .map_err(cfg_err)?;
+    check_trust_xff_cidrs(&config.trust_xff_cidrs).map_err(cfg_err)?;
 
     // ── Warnings (legal, but usually a mistake) ──────────────────────
     if let Some(msg) = warn_admin_is_mediator(&config.admin_did, &config.mediator_did) {

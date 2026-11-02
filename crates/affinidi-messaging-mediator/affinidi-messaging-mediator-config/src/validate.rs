@@ -127,6 +127,25 @@ fn require_path<'a>(label: &str, path: Option<&'a str>) -> Result<&'a str, Strin
     }
 }
 
+/// `server.trust_xff_cidrs` must not contain a catch-all range (`0.0.0.0/0`,
+/// `::/0`).
+///
+/// Such a range trusts every peer, so any client that can reach the listener
+/// sets its own rate-limit key with `X-Forwarded-For` — and, because every hop
+/// in the chain is then "trusted" too, IPv4 clients behind a real proxy are
+/// still all charged to the proxy. It is never what an operator meant, and
+/// the rate limiter refuses it as well; this catches it at load time with the
+/// field named.
+pub fn check_trust_xff_cidrs(cidrs: &[ipnet::IpNet]) -> Result<(), String> {
+    match cidrs.iter().find(|cidr| cidr.prefix_len() == 0) {
+        Some(cidr) => Err(format!(
+            "server.trust_xff_cidrs entry '{cidr}' trusts every address, which lets any \
+             client choose its own rate-limit key; list only your reverse proxies' ranges"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Warn when the mediator runs a permissive denylist mode
 /// (`ExplicitDeny`) *and* hands new DIDs an `ALLOW_ALL` default — together
 /// these mean every new account accepts everything from everyone, which is
@@ -204,6 +223,19 @@ pub fn warn_remote_admin_allowed(block_remote_admin_msgs: bool) -> Option<String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trust_xff_cidrs_rejects_catch_all_ranges() {
+        let cidrs = |nets: &[&str]| -> Vec<ipnet::IpNet> {
+            nets.iter().map(|n| n.parse().unwrap()).collect()
+        };
+        assert!(super::check_trust_xff_cidrs(&[]).is_ok());
+        assert!(super::check_trust_xff_cidrs(&cidrs(&["10.0.0.0/8", "::1/128"])).is_ok());
+        for net in ["0.0.0.0/0", "::/0"] {
+            let err = super::check_trust_xff_cidrs(&cidrs(&["10.0.0.0/8", net])).unwrap_err();
+            assert!(err.contains(net), "{err}");
+        }
+    }
+
     use super::*;
 
     #[test]
