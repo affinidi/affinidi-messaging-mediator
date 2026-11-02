@@ -8,6 +8,8 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+## 0.49.0 (release/0.49)
+
 ### Changed — dependencies to latest (breaking)
 
 - **`vta-sdk` 0.77** (from 0.72; the mediator's default `vta` feature and
