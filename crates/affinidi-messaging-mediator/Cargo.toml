@@ -118,7 +118,7 @@ secrets-k8s = ["affinidi-messaging-mediator-common/secrets-k8s"]
 ## AWS integration used by `did_web_self_hosted = "aws_parameter_store://..."`
 ## or `"s3://..."` (still loaded directly by the mediator, not via the secret
 ## store). Enabled automatically by `secrets-aws`.
-aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3", "dep:aws-smithy-types"]
+aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
 
 [build-dependencies]
 # Generates `crate::task_specs` from trust-tasks.lock and the bundles in trust-tasks/.
@@ -200,7 +200,7 @@ affinidi-task-utils = "0.1"
 ## a second `trust-tasks-rs` (0.2.57, from vta-sdk 0.21.6) in this workspace's
 ## lockfile long after everything else had moved to 0.9. A bounded range is a
 ## tax that comes due silently; prefer a caret and move it deliberately.
-vta-sdk = { version = "0.72", features = [
+vta-sdk = { version = "0.77", features = [
   "integration",
 ], optional = true }
 
@@ -236,13 +236,8 @@ didwebvh-rs = "0.8.1"
 # ── AWS Integration (optional, behind `aws` feature) ────────────────────
 ## Used for Secrets Manager (aws_secrets://), Parameter Store (aws_parameter_store://)
 ## To build without: --no-default-features --features didcomm
-aws-config = { version = "1", optional = true }
+aws-config = { version = "1.13", optional = true }
 
-# Not called from this crate — a resolver bound, explained in the workspace
-# manifest. Named here because a `[workspace.dependencies]` entry constrains
-# nothing on its own: only a crate that declares the dependency contributes its
-# version requirement, and this is a subtree that pulls `aws-config`.
-aws-smithy-types = { workspace = true, optional = true }
 # `default-features = false` + the default set MINUS `rustls`.
 # The aws-sdk crates ship BOTH TLS stacks in their defaults:
 #   rustls               -> aws-smithy-runtime/tls-rustls

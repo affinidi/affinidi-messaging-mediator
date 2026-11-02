@@ -301,6 +301,10 @@ pub async fn run_phase2_connect(
                 VtaEvent::Failed(reason) => {
                     last_failure = Some(reason);
                 }
+                // `VtaEvent` is `#[non_exhaustive]` (vta-sdk 0.77+). The
+                // outcome is decided by `Connected` / `Failed` / the runner
+                // finishing, so an event this build doesn't know is skipped.
+                _ => {}
             }
         }
         let _ = runner.await;
@@ -386,6 +390,8 @@ fn format_check_line(c: DiagCheck, status: &DiagStatus) -> String {
         DiagStatus::Ok(d) => format!("[OK] {}  {d}", c.label()),
         DiagStatus::Skipped(d) => format!("[--] {}  {d}", c.label()),
         DiagStatus::Failed(d) => format!("[!!] {}  {d}", c.label()),
+        // `DiagStatus` is `#[non_exhaustive]` (vta-sdk 0.77+).
+        _ => format!("[??] {}", c.label()),
     }
 }
 

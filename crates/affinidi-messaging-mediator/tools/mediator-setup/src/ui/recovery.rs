@@ -147,6 +147,8 @@ fn format_attempt_line(label: &str, result: &AttemptResult) -> Option<Line<'stat
         AttemptResultKind::Connected => return None,
         AttemptResultKind::PreAuthFailure(reason) => ("pre-auth", reason.clone()),
         AttemptResultKind::PostAuthFailure(reason) => ("post-auth", reason.clone()),
+        // `AttemptResultKind` is `#[non_exhaustive]` (vta-sdk 0.77+).
+        _ => ("unrecognised outcome", String::new()),
     };
     Some(Line::from(vec![
         Span::styled(

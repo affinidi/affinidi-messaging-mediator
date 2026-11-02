@@ -8,6 +8,35 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — dependencies to latest (breaking)
+
+- **`vta-sdk` 0.77** (from 0.72; the mediator's default `vta` feature and
+  `mediator-setup`). **Breaking for VTA-linked deployments:** from vta-sdk
+  0.75 the SDK authenticates with `auth/authenticate/0.3` and pages
+  `keys/list/0.2`, and the VTA no longer serves the earlier versions. A
+  mediator built with `vta` now needs a VTA from the same release line (vta-sdk
+  0.75 or later); conversely, mediator 0.48 and earlier cannot authenticate to
+  such a VTA. Upgrade the VTA and the mediator together. Self-hosted mediators
+  (operating secrets from the unified secret backend) and builds without `vta`
+  are unaffected. vta-sdk 0.77 also made `VtaEvent`, `DiagStatus`,
+  `AttemptResultKind` and `VtaIntegrationError` `#[non_exhaustive]`; the
+  mediator and wizard handle an unknown variant by skipping it or reporting it
+  generically.
+- **`kube` 5 / `k8s-openapi` 0.29** (from 4.2 / 0.28; `secrets-k8s`). The
+  `latest` API feature now targets Kubernetes 1.37 (was 1.36); the
+  backend's calls (core/v1 `Secret` get/create/replace) are unchanged.
+- **`aws-config` 1.13**, and the `aws-smithy-types >=1.6.1, <1.7` resolver
+  bound is removed. `aws-config` 1.13 is the first release off
+  `aws-smithy-json` 0.63, whose break against `aws-smithy-types` 1.7 the bound
+  existed to avoid; requiring 1.13 keeps a downstream resolve off the broken
+  pair. `aws-sdk-*` move to their current releases.
+- Lockfile refreshed to the latest compatible versions throughout, including
+  TDK patch releases (`affinidi-did-common` 0.4.5, `affinidi-did-resolver-cache-sdk`
+  0.8.44, `affinidi-messaging-didcomm` 0.15.11), `redis` 1.8 and
+  `trust-tasks-rs` 0.36.6. The second copies of `affinidi-messaging-sdk`
+  (0.37), `affinidi-tdk` (0.27) and `trust-tasks-rs` (0.32) that vta-sdk 0.72
+  pulled in are gone.
+
 ### Changed — trusted-proxy rate-limit attribution
 
 - **`affinidi-rate-limit` 0.1.3.** The per-IP limiter can now charge clients

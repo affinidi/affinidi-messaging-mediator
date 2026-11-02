@@ -340,6 +340,8 @@ fn vta_startup_error(context: &str, err: VtaIntegrationError) -> MediatorError {
              the VTA-side context or DID is misconfigured rather than a network \
              problem."
         ),
+        // `VtaIntegrationError` is `#[non_exhaustive]` (vta-sdk 0.77+).
+        other => format!("VTA integration failed for context '{context}': {other}"),
     };
     error!(
         context = context,
