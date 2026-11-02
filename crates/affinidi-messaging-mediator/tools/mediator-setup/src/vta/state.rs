@@ -480,6 +480,10 @@ impl VtaConnectState {
                     Protocol::Rest => self.attempted.rest = Some(result),
                 }
             }
+            // `VtaEvent` is `#[non_exhaustive]` (vta-sdk 0.77+). Phase
+            // transitions hang off `Connected` / `Failed` / `PreflightDone`,
+            // so an event this build doesn't know changes nothing.
+            _ => {}
         }
     }
 

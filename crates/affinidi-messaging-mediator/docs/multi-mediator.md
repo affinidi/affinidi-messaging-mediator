@@ -358,8 +358,8 @@ Differences from DIDComm that matter:
   explicitly with `TspOps::set_peer_mediator` (the service-less `did:key`
   case). Otherwise it sends Direct via its own mediator.
 
-See [`../../../../docs/tsp/cookbook.md`](../../../../docs/tsp/cookbook.md) for
-the client-side TSP API.
+See the [TSP cookbook](https://github.com/affinidi/affinidi-tdk-rs/blob/main/docs/tsp/cookbook.md) in affinidi-tdk-rs
+for the client-side TSP API.
 
 ---
 
@@ -407,7 +407,7 @@ The tests below are the verified reference for every claim in this document:
 | Relay socket admission and `relay-ack` | `test-mediator/tests/ws_relay_admission.rs` |
 
 A runnable two-mediator demo against real deployments lives in
-`affinidi-messaging-helpers/examples/cross_mediator_forwarding.rs` (pass
+affinidi-tdk-rs, [`affinidi-messaging-helpers/examples/cross_mediator_forwarding.rs`](https://github.com/affinidi/affinidi-tdk-rs/blob/main/crates/messaging/affinidi-messaging-helpers/examples/cross_mediator_forwarding.rs) (pass
 mediator **DIDs**, not URLs).
 
 ---

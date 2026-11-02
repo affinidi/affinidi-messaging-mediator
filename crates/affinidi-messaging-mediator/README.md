@@ -48,12 +48,14 @@ It writes:
 
 ### 3. Build and run
 
-The wizard prints the exact build and run commands when it finishes. For the
-default build:
+The wizard prints the exact build and run commands when it finishes. The
+default build has only the `file://` secret backend, so add the feature for the
+backend you chose (the wizard's default, `keyring://`, needs
+`secrets-keyring`; see [Secret backend](#secret-backend)):
 
 ```bash
-cargo build --release --locked -p affinidi-messaging-mediator
-cargo run --release --locked -p affinidi-messaging-mediator -- -c conf/mediator.toml
+cargo build --release --locked -p affinidi-messaging-mediator --features secrets-keyring
+cargo run --release --locked -p affinidi-messaging-mediator --features secrets-keyring -- -c conf/mediator.toml
 ```
 
 ## Non-interactive setup (CI/CD)
@@ -129,7 +131,7 @@ only if its DID document advertises a `TSPTransport` service:
   warning at startup if TSP is enabled and the service is missing.
 
 For TSP usage (sending, receiving, relationships, WebSocket, auth), see the
-[TSP cookbook](../../../docs/tsp/cookbook.md).
+[TSP cookbook](https://github.com/affinidi/affinidi-tdk-rs/blob/main/docs/tsp/cookbook.md).
 
 ### Storage backend (pick one)
 
@@ -285,6 +287,18 @@ The shipped configuration is open (`explicit_deny`) with
 `global_acl_default = "DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES"`:
 direct messaging only, no relay or invites.
 
+## Behind a load balancer
+
+The per-IP rate limiter (`[limits] rate_limit_per_ip`) keys on the socket peer,
+so behind a reverse proxy every client shares the proxy's bucket. Set
+`[server] trust_xff_cidrs` (env `TRUST_XFF_CIDRS`) to the proxy's ranges and
+the limiter charges each request to the client address in `X-Forwarded-For`
+instead. List only proxies that append to the header, and make sure the
+mediator is reachable only through them. A malformed chain from a listed proxy
+is refused with `400` and counted in
+`rate_limit_attribution_failures_total`; refusals carry
+`x-rate-limit-source: mediator`. See `conf/mediator.toml` for the details.
+
 ## More documentation
 
 | Doc | Covers |
@@ -313,30 +327,31 @@ cargo run --release -p affinidi-messaging-mediator-tui -- --profile conf/admin-m
 
 See [affinidi-messaging-mediator-tui](../affinidi-messaging-mediator-tui/).
 
-For a scripted example, run the mediator, then:
-
-```bash
-cargo run --locked --bin mediator_administration
-```
-
-More examples are in [affinidi-messaging-helpers](../affinidi-messaging-helpers/).
+For headless administration from code, use
+[`affinidi-messaging-mediator-admin`](../affinidi-messaging-mediator-admin/).
+The interactive `mediator_administration` tool and more client examples live
+in [affinidi-messaging-helpers](https://github.com/affinidi/affinidi-tdk-rs/tree/main/crates/messaging/affinidi-messaging-helpers)
+in affinidi-tdk-rs (`cargo run --bin mediator_administration` from that
+repository).
 
 ## Sub-crates
 
 | Crate | Description |
 |---|---|
-| [`mediator-setup`](./tools/mediator-setup/) | Setup wizard (TUI and headless). |
+| [`affinidi-messaging-mediator-setup`](./tools/mediator-setup/) | Setup wizard, the `mediator-setup` binary (TUI and headless). |
 | [`affinidi-messaging-mediator-common`](./affinidi-messaging-mediator-common/) | Shared types, storage traits, secret backends. |
 | [`affinidi-messaging-mediator-config`](./affinidi-messaging-mediator-config/) | The `mediator.toml` schema. |
 | [`affinidi-messaging-mediator-processors`](./affinidi-messaging-mediator-processors/) | Standalone forwarding and expiry processors (Redis). |
 
 ## Related crates
 
-- [`affinidi-messaging-sdk`](../affinidi-messaging-sdk/): client SDK
-- [`affinidi-messaging-didcomm`](../affinidi-messaging-didcomm/): DIDComm protocol
-- [`affinidi-tsp`](../affinidi-tsp/): Trust Spanning Protocol
-- [`affinidi-messaging-core`](../affinidi-messaging-core/): protocol-agnostic messaging traits
-- [`affinidi-did-resolver-cache-sdk`](../../identity/affinidi-did-resolver-cache-sdk/): DID resolution
+All in [affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs):
+
+- [`affinidi-messaging-sdk`](https://crates.io/crates/affinidi-messaging-sdk): client SDK
+- [`affinidi-messaging-didcomm`](https://crates.io/crates/affinidi-messaging-didcomm): DIDComm protocol
+- [`affinidi-tsp`](https://crates.io/crates/affinidi-tsp): Trust Spanning Protocol
+- [`affinidi-messaging-core`](https://crates.io/crates/affinidi-messaging-core): protocol-agnostic messaging traits
+- [`affinidi-did-resolver-cache-sdk`](https://crates.io/crates/affinidi-did-resolver-cache-sdk): DID resolution
 
 ## License
 

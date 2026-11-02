@@ -32,8 +32,8 @@ tracing = "0.1"
 # `schema.rs`) rather than imported from mediator-common's `database` module —
 # that module is `server`-gated in the published mediator-common, so importing it
 # would force this lean crate to require an unpublished mediator-common just to
-# `cargo publish`. Keeping the raw DB schema here (it *is* config schema) lets
-# this crate build against any published 0.15.x.
+# `cargo publish`. Keeping the raw DB schema here (it *is* config schema) keeps
+# this crate independent of mediator-common's server tier.
 affinidi-messaging-mediator-common = { version = "0.49.0", path = "../affinidi-messaging-mediator-common", default-features = false }
 
 [dev-dependencies]

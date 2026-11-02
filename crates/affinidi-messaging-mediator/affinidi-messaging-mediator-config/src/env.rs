@@ -154,6 +154,10 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
     env_override!(config.limits.message_size, "LIMIT_MESSAGE_SIZE");
     env_override!(
+        config.limits.queued_send_messages_per_peer,
+        "LIMIT_QUEUED_SEND_MESSAGES_PER_PEER"
+    );
+    env_override!(
         config.limits.queued_send_messages_soft,
         "LIMIT_QUEUED_SEND_MESSAGES_SOFT"
     );
@@ -470,6 +474,25 @@ mod tests {
     fn the_shipped_config_has_no_unknown_keys() {
         let (_, unknown) = parse_config(SHIPPED).expect("shipped config parses");
         assert!(unknown.is_empty(), "unexpected unknown keys: {unknown:?}");
+    }
+
+    /// The template's header promises every setting can be overridden by the
+    /// environment variable named in its `### Env:` label. A label with no
+    /// override behind it is silently ignored at runtime
+    /// (`LIMIT_QUEUED_SEND_MESSAGES_PER_PEER` was, until 0.49).
+    #[test]
+    fn every_env_label_in_the_shipped_config_is_read() {
+        let source = include_str!("env.rs");
+        let missing: Vec<&str> = SHIPPED
+            .lines()
+            .filter_map(|l| l.strip_prefix("### Env: "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter(|var| !source.contains(&format!("\"{var}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "template names env vars env.rs never reads: {missing:?}"
+        );
     }
 
     /// Keyring VTI-06: a key appended below the last table header is filed

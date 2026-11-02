@@ -54,10 +54,6 @@ pub struct LimitsConfigRaw {
     pub pubsub_buffer: String,
 }
 
-/// 50 — the per-relationship outbound cap. A sender may hold this many
-/// messages for any one recipient; beyond that it is flooding that peer, not
-/// serving it. Defaulted (rather than required) so an existing `mediator.toml`
-/// keeps loading without an edit.
 /// Off. Enabling this shortens how long a delivered-but-unacknowledged message
 /// survives, which is a reduction in durability, so it is never turned on by an
 /// upgrade — only by an operator who has read what it does.
@@ -72,6 +68,10 @@ fn default_pickup_round_robin() -> String {
     "true".to_string()
 }
 
+/// 50 — the per-relationship outbound cap. A sender may hold this many
+/// messages for any one recipient; beyond that it is flooding that peer, not
+/// serving it. Defaulted (rather than required) so an existing `mediator.toml`
+/// keeps loading without an edit.
 fn default_queued_send_messages_per_peer() -> String {
     "50".to_string()
 }

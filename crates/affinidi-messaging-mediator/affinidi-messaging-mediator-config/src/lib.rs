@@ -1,22 +1,25 @@
 //! Raw TOML configuration schema for the Affinidi Messaging Mediator.
 //!
-//! This crate holds **only the serde deserialization types** that mirror the
-//! mediator's `mediator.toml` — the `*ConfigRaw` structs and their plain-serde
-//! sub-structs. Every field is the on-disk shape (mostly `String`, parsed into
-//! typed/runtime values later).
+//! This crate holds the on-disk shape of `mediator.toml` and the logic that
+//! needs nothing beyond it:
 //!
-//! It is intentionally dependency-light (serde + the lean tier of
-//! `affinidi-messaging-mediator-common`, for `DatabaseConfigRaw`). The
-//! **resolved** runtime `Config` — opened secret backends, JWT keys, the
-//! DID-resolver client, the VTA refresher — and all `ConfigRaw → Config`
-//! conversions stay in the mediator binary, which re-exports these types so
-//! existing `crate::common::config::*` paths keep resolving.
+//! - the serde deserialization types: the `*ConfigRaw` structs and their
+//!   plain-serde sub-structs, mostly `String` fields parsed into runtime
+//!   values later;
+//! - [`env`](mod@env): reading the file, unknown-key reporting and the environment
+//!   variable overrides named in the shipped template's `### Env:` labels;
+//! - [`validate`]: boot-time checks on raw values, with a crate-local
+//!   [`ConfigError`].
 //!
-//! The goal (mediator simplification T18) is one schema, two consumers: the
-//! mediator and (later) the `mediator-setup` wizard, which today renders this
-//! TOML by hand with no shared types. Env-var override logic and boot-time
-//! validation move here in a follow-up (T18b), once they carry a crate-local
-//! error type instead of the mediator's server-tier `MediatorError`.
+//! It is intentionally dependency-light: serde, plus the lean tier of
+//! `affinidi-messaging-mediator-common` for the ACL types validation uses. The
+//! **resolved** runtime `Config` (opened secret backends, JWT keys, the
+//! DID-resolver client, the VTA refresher) and all `ConfigRaw → Config`
+//! conversions stay in the mediator, which re-exports these types so
+//! `crate::common::config::*` paths keep resolving.
+//!
+//! One schema, two consumers: the mediator, and the `mediator-setup` wizard,
+//! which applies the same checks to recipe values.
 
 pub mod env;
 pub mod error;

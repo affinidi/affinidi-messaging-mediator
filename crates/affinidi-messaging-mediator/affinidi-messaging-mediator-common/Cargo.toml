@@ -80,7 +80,7 @@ secrets-keyring = [
   "dep:apple-native-keyring-store",
   "dep:linux-keyutils-keyring-store",
 ]
-secrets-aws = ["server", "dep:aws-config", "dep:aws-sdk-secretsmanager", "dep:aws-smithy-types"]
+secrets-aws = ["server", "dep:aws-config", "dep:aws-sdk-secretsmanager"]
 secrets-gcp = [
   "server",
   "dep:google-cloud-secretmanager-v1",
@@ -156,13 +156,8 @@ zeroize = { version = "1", features = ["zeroize_derive"], optional = true }
 # session with an unlocked collection — something a headless mediator host does
 # not have. The per-target store crates are below.
 keyring-core = { version = "1", optional = true }
-aws-config = { version = "1", optional = true }
+aws-config = { version = "1.13", optional = true }
 
-# Not called from this crate — a resolver bound, explained in the workspace
-# manifest. Named here because a `[workspace.dependencies]` entry constrains
-# nothing on its own: only a crate that declares the dependency contributes its
-# version requirement, and this is a subtree that pulls `aws-config`.
-aws-smithy-types = { workspace = true, optional = true }
 # `default-features = false` + the default set MINUS `rustls`.
 # The aws-sdk crates ship BOTH TLS stacks in their defaults:
 #   rustls               -> aws-smithy-runtime/tls-rustls
@@ -201,11 +196,11 @@ rustify = { version = "0.7", default-features = false, optional = true }
 ## (in-cluster ServiceAccount or local kubeconfig); rustls-tls keeps it
 ## on the workspace TLS story. `k8s-openapi` "latest" pins the generated
 ## API types to the newest supported Kubernetes version.
-kube = { version = "4.2", default-features = false, features = [
+kube = { version = "5", default-features = false, features = [
   "client",
   "rustls-tls",
 ], optional = true }
-k8s-openapi = { version = "0.28", features = ["latest"], optional = true }
+k8s-openapi = { version = "0.29", features = ["latest"], optional = true }
 
 # ── Async stream helpers (used by the redis-store pubsub bridge) ─────────
 tokio-stream = { version = "0.1", optional = true }

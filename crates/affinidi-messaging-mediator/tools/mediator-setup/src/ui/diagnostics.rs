@@ -219,6 +219,13 @@ fn diag_line(entry: &DiagEntry) -> Line<'_> {
             Style::default().fg(Color::Red),
             d.clone(),
         ),
+        // `DiagStatus` is `#[non_exhaustive]` (vta-sdk 0.77+).
+        _ => (
+            "?",
+            theme::muted_style(),
+            theme::muted_style(),
+            String::new(),
+        ),
     };
 
     Line::from(vec![

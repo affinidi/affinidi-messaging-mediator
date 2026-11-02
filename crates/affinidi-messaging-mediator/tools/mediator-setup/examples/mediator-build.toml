@@ -146,6 +146,14 @@ config_path = "conf/mediator.toml"
 # Listen address for the mediator (ip:port).
 listen_address = "0.0.0.0:7037"
 
+# Optional: reverse-proxy / load-balancer ranges whose X-Forwarded-For the
+# per-IP rate limiter trusts (written to `[server] trust_xff_cidrs`). Omit
+# (the default) to key on the socket peer. List only proxies that append to
+# X-Forwarded-For (an ALB does), and only when the mediator is reachable solely
+# through them. A catch-all range (0.0.0.0/0, ::/0) is refused.
+#
+#   trust_xff_cidrs = ["10.0.0.0/8"]
+
 # Optional: publish the minted public DID string after provisioning.
 # Omit (the default) to publish nowhere -- interactive/local setups.
 # Either an SSM parameter, or a local file:

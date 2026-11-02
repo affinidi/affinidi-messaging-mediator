@@ -13,8 +13,10 @@
 //!   metrics, etc. Required by the mediator binary and the
 //!   mediator-setup wizard.
 //! - **`redis-backend`** — implies `server`, plus the RedisStore impl.
-//! - **`secrets-{keyring,aws,gcp,azure,vault}`** — each implies `server`
-//!   and pulls in the matching cloud SDK.
+//! - **`secrets-{keyring,aws,gcp,azure,vault,k8s}`** — each implies `server`
+//!   and pulls in the matching cloud SDK or client.
+//! - **`test-clock`** — test-only: `types::clock::TestClock`, a manually
+//!   advanced clock, plus loopback access in `affinidi-net-guard`.
 //!
 //! Client crates (the SDK, third-party tooling) should depend on
 //! `affinidi-messaging-mediator-types` rather than this crate.
