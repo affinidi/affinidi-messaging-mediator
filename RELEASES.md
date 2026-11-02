@@ -71,9 +71,9 @@ first lockstep release from this repository.
 | 0.44 | `release/0.44` | — | 2026-10-21 | `0.44.0` | end of life |
 | 0.45 | `release/0.45` | — | 2026-10-24 | `0.45.0` | end of life |
 | 0.46 | `release/0.46` | 2026-10-26 | 2026-10-26 | `0.46.0` | end of life |
-| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | supported (N-1) |
-| 0.48 | `release/0.48` | — | 2026-10-28 | `0.48.0` | supported (N) |
-| 0.49 | `release/0.49` | 2026-11-02 | TBD | `0.49.0-rc.0` | release candidate |
+| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | end of life |
+| 0.48 | `release/0.48` | — | 2026-10-28 | `0.48.0` | supported (N-1) |
+| 0.49 | `release/0.49` | 2026-11-02 | 2026-11-02 | `0.49.0` | supported (N) |
 | 0.50 | — | TBD | TBD | — | in development on `main` |
 
 ## Support
