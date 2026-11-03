@@ -94,6 +94,19 @@ pub struct DatabaseHandler {
 #[cfg(feature = "redis-backend")]
 const REDIS_VERSION_REQ: &str = ">=7.1, <9.0";
 
+/// Parses `redis_version`, accepting `major.minor` as `major.minor.0`:
+/// ElastiCache Serverless reports `7.2`, which strict semver rejects.
+#[cfg(feature = "redis-backend")]
+fn parse_server_version(version: &str) -> Result<Version, semver::Error> {
+    Version::parse(version).or_else(|err| {
+        if version.matches('.').count() == 1 {
+            Version::parse(&format!("{version}.0"))
+        } else {
+            Err(err)
+        }
+    })
+}
+
 #[cfg(feature = "redis-backend")]
 impl DatabaseHandler {
     /// Creates a new `DatabaseHandler`, establishing a multiplexed connection and verifying
@@ -405,7 +418,7 @@ impl DatabaseHandler {
             .next();
 
         if let Some(version) = server_version {
-            let semver_version: Version = match Version::parse(&version) {
+            let semver_version: Version = match parse_server_version(&version) {
                 Ok(result) => result,
                 Err(err) => {
                     return Err(MediatorError::problem_with_log(
@@ -494,5 +507,32 @@ impl DatabaseHandler {
         if is_tls {
             info!("Redis TLS connection detected (rediss://)");
         }
+    }
+}
+
+#[cfg(all(test, feature = "redis-backend"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_version_with_patch_parses() {
+        assert_eq!(
+            parse_server_version("7.2.4").ok(),
+            Some(Version::new(7, 2, 4))
+        );
+    }
+
+    #[test]
+    fn server_version_without_patch_parses_as_zero() {
+        assert_eq!(
+            parse_server_version("7.2").ok(),
+            Some(Version::new(7, 2, 0))
+        );
+    }
+
+    #[test]
+    fn server_version_garbage_is_rejected() {
+        assert!(parse_server_version("7").is_err());
+        assert!(parse_server_version("seven.two").is_err());
     }
 }
