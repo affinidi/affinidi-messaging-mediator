@@ -688,6 +688,8 @@ async fn redis_backend(db_index: u8) -> Option<Backend> {
         functions_file: Some(functions_file.clone()),
         database_url,
         database_timeout: 2,
+        // CI's cluster job runs the same checks against a cluster-mode server.
+        cluster_mode: std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true"),
         circuit_breaker_threshold: 5,
         circuit_breaker_recovery_secs: 10,
     };

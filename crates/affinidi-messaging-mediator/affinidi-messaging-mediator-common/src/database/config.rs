@@ -14,6 +14,9 @@ pub struct DatabaseConfigRaw {
     pub database_url: String,
     pub database_timeout: String,
     pub scripts_path: Option<String>,
+    /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
+    #[serde(default)]
+    pub cluster_mode: String,
     /// Silently absorbed — pre-0.14 config files set this; the
     /// multiplexed Redis connection doesn't use a pool. The field
     /// stays in the raw struct so deserialisation doesn't error on
@@ -27,6 +30,10 @@ pub struct DatabaseConfig {
     pub functions_file: Option<String>,
     pub database_url: String,
     pub database_timeout: u32,
+    /// Use a cluster client. Startup refuses a server whose cluster mode
+    /// differs (ElastiCache Serverless is always cluster mode).
+    #[serde(default)]
+    pub cluster_mode: bool,
     /// Number of consecutive failures before the circuit breaker opens
     pub circuit_breaker_threshold: u32,
     /// Seconds to wait before probing Redis after circuit opens
@@ -39,6 +46,7 @@ impl Default for DatabaseConfig {
             functions_file: Some("./atm-functions.lua".into()),
             database_url: "redis://127.0.0.1/".into(),
             database_timeout: 2,
+            cluster_mode: false,
             circuit_breaker_threshold: 5,
             circuit_breaker_recovery_secs: 10,
         }
@@ -53,6 +61,7 @@ impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
             functions_file: Some(raw.functions_file),
             database_url: raw.database_url,
             database_timeout: raw.database_timeout.parse().unwrap_or(2),
+            cluster_mode: raw.cluster_mode.parse().unwrap_or(false),
             circuit_breaker_threshold: 5,
             circuit_breaker_recovery_secs: 10,
         })

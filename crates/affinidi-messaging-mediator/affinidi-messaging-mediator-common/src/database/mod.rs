@@ -16,9 +16,14 @@ use axum::http::StatusCode;
 #[cfg(feature = "redis-backend")]
 use config::DatabaseConfig;
 #[cfg(feature = "redis-backend")]
-use redis::AsyncConnectionConfig;
+use redis::aio::{
+    ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection, PubSub,
+};
 #[cfg(feature = "redis-backend")]
-use redis::aio::{ConnectionManager, ConnectionManagerConfig, MultiplexedConnection, PubSub};
+use redis::{
+    AsyncConnectionConfig, Cmd, Pipeline, RedisFuture, Value, cluster::ClusterClientBuilder,
+    cluster_async::ClusterConnection,
+};
 
 #[cfg(feature = "redis-backend")]
 use semver::{Version, VersionReq};
@@ -29,16 +34,59 @@ use tokio::time::sleep;
 #[cfg(feature = "redis-backend")]
 use tracing::{Level, event, info, warn};
 
+/// The mediator's main Redis connection, chosen by `cluster_mode`.
+///
+/// Both variants multiplex concurrent commands and reconnect on their own,
+/// and both are cheap to clone.
+#[cfg(feature = "redis-backend")]
+#[derive(Clone)]
+pub enum RedisConnection {
+    /// Single server (cluster mode disabled).
+    Single(ConnectionManager),
+    /// Cluster-mode server; routes each command to its slot's node.
+    Cluster(ClusterConnection),
+}
+
+#[cfg(feature = "redis-backend")]
+impl ConnectionLike for RedisConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        match self {
+            Self::Single(conn) => conn.req_packed_command(cmd),
+            Self::Cluster(conn) => conn.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        match self {
+            Self::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
+            Self::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Self::Single(conn) => conn.get_db(),
+            Self::Cluster(conn) => conn.get_db(),
+        }
+    }
+}
+
 /// Low-level Redis connection handler used by the mediator.
 ///
-/// Uses a single multiplexed connection (via `ConnectionManager` for auto-reconnect)
-/// instead of a connection pool. `MultiplexedConnection` handles concurrent commands
-/// over one TCP connection, making a pool unnecessary.
+/// Uses a single multiplexed connection (via `ConnectionManager` for auto-reconnect,
+/// or a cluster connection when `cluster_mode` is on) instead of a connection pool.
+/// `MultiplexedConnection` handles concurrent commands over one TCP connection,
+/// making a pool unnecessary.
 #[cfg(feature = "redis-backend")]
 #[derive(Clone)]
 pub struct DatabaseHandler {
     /// Auto-reconnecting multiplexed connection for normal Redis operations.
-    connection: ConnectionManager,
+    connection: RedisConnection,
     /// Redis connection URL (kept for creating pub/sub and blocking connections).
     redis_url: String,
 }
@@ -75,7 +123,10 @@ impl DatabaseHandler {
             .set_response_timeout(Some(Duration::from_secs(config.database_timeout.into())))
             .set_connection_timeout(Some(Duration::from_secs(config.database_timeout.into())));
 
-        let connection = loop {
+        // Single-server connection first, even in cluster mode: the startup
+        // checks need one node's answer, and a cluster client cannot connect
+        // to a non-cluster server at all.
+        let single = loop {
             match client
                 .get_connection_manager_with_config(manager_config.clone())
                 .await
@@ -89,14 +140,9 @@ impl DatabaseHandler {
             }
         };
 
-        let database = Self {
-            connection,
-            redis_url: config.database_url.clone(),
-        };
-
         // Verify connectivity with PING
         loop {
-            let mut conn = database.connection.clone();
+            let mut conn = single.clone();
             let pong: Result<String, redis::RedisError> =
                 redis::cmd("PING").query_async(&mut conn).await;
             match pong {
@@ -121,7 +167,19 @@ impl DatabaseHandler {
         }
 
         // Check the version of Redis Server
-        database.check_server_version().await?;
+        Self::check_server_version(&mut single.clone()).await?;
+        Self::check_cluster_mode(&mut single.clone(), config.cluster_mode).await?;
+
+        let connection = if config.cluster_mode {
+            RedisConnection::Cluster(Self::connect_cluster(config).await?)
+        } else {
+            RedisConnection::Single(single)
+        };
+
+        let database = Self {
+            connection,
+            redis_url: config.database_url.clone(),
+        };
 
         // Warn if Redis connection has no authentication
         database.check_auth_warning(&config.database_url);
@@ -131,8 +189,104 @@ impl DatabaseHandler {
 
     /// Returns a clone of the auto-reconnecting multiplexed connection.
     /// This is cheap (Arc clone internally) and supports concurrent use.
-    pub async fn get_async_connection(&self) -> Result<ConnectionManager, MediatorError> {
+    pub async fn get_async_connection(&self) -> Result<RedisConnection, MediatorError> {
         Ok(self.connection.clone())
+    }
+
+    /// Opens the cluster connection, retrying until the server is reachable.
+    async fn connect_cluster(config: &DatabaseConfig) -> Result<ClusterConnection, MediatorError> {
+        let timeout = Duration::from_secs(config.database_timeout.into());
+        let client = ClusterClientBuilder::new(vec![config.database_url.as_str()])
+            .connection_timeout(timeout)
+            .response_timeout(timeout)
+            .build()
+            .map_err(|err| {
+                MediatorError::problem_with_log(
+                    1,
+                    "NA",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.res.storage.url",
+                    "Database URL ({1}) is invalid. Reason: {2}",
+                    vec![config.database_url.clone(), err.to_string()],
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Database URL ({}) is invalid. Reason: {}",
+                        config.database_url, err
+                    ),
+                )
+            })?;
+
+        loop {
+            match client.get_async_connection().await {
+                Ok(conn) => {
+                    info!("Connected to database in cluster mode");
+                    return Ok(conn);
+                }
+                Err(err) => {
+                    event!(Level::WARN, "Error connecting to database cluster: {}", err);
+                    event!(Level::WARN, "Retrying database connection in 10 seconds");
+                    sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+
+    /// Refuses to start when `cluster_mode` doesn't match the server.
+    ///
+    /// Uses `CLUSTER INFO`: ElastiCache Serverless supports it, and a
+    /// non-cluster server rejects it with "cluster support disabled".
+    async fn check_cluster_mode(
+        conn: &mut ConnectionManager,
+        cluster_mode: bool,
+    ) -> Result<(), MediatorError> {
+        let server_is_cluster = match redis::cmd("CLUSTER")
+            .arg("INFO")
+            .query_async::<String>(conn)
+            .await
+        {
+            Ok(_) => true,
+            Err(err) if err.to_string().contains("cluster support disabled") => false,
+            Err(err) => {
+                return Err(MediatorError::problem_with_log(
+                    6,
+                    "NA",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.res.storage.info",
+                    "Couldn't query database information. Reason: {1}",
+                    vec![err.to_string()],
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Couldn't query database information. Reason: {err}"),
+                ));
+            }
+        };
+
+        if server_is_cluster == cluster_mode {
+            return Ok(());
+        }
+        let setting = if cluster_mode { "true" } else { "false" };
+        let server = if server_is_cluster {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        Err(MediatorError::problem_with_log(
+            2,
+            "NA",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "me.res.storage.config",
+            "database.cluster_mode (DATABASE_CLUSTER_MODE) is {1}, but the database server has cluster mode {2}",
+            vec![setting.to_string(), server.to_string()],
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "database.cluster_mode (DATABASE_CLUSTER_MODE) is {setting}, but the database server has cluster mode {server}"
+            ),
+        ))
     }
 
     /// Returns a dedicated Redis connection with no response timeout.
@@ -210,18 +364,13 @@ impl DatabaseHandler {
     }
 
     /// Helper function to check the version of the Redis Server
-    async fn check_server_version(&self) -> Result<String, MediatorError> {
+    async fn check_server_version(conn: &mut ConnectionManager) -> Result<String, MediatorError> {
         let redis_version_req: VersionReq = match VersionReq::parse(REDIS_VERSION_REQ) {
             Ok(result) => result,
             Err(err) => panic!("Couldn't process required Redis version. Reason: {err}"),
         };
 
-        let mut conn = self.connection.clone();
-        let server_info: String = match redis::cmd("INFO")
-            .arg("SERVER")
-            .query_async(&mut conn)
-            .await
-        {
+        let server_info: String = match redis::cmd("INFO").arg("SERVER").query_async(conn).await {
             Ok(result) => result,
             Err(err) => {
                 return Err(MediatorError::problem_with_log(

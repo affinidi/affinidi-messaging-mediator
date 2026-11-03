@@ -35,7 +35,7 @@ use crate::types::{
     messages::{FetchOptions, Folder, GetMessagesResponse, MessageList, MessageListElement},
 };
 use crate::{
-    database::DatabaseHandler,
+    database::{DatabaseHandler, RedisConnection},
     errors::MediatorError,
     store::{
         DeletionAuthority, ExpiryReport, ForwardQueueEntry, InboxStatusReply, MediatorStore,
@@ -44,11 +44,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use redis::{
-    Value,
-    aio::{ConnectionManager, MultiplexedConnection},
-    from_redis_value,
-};
+use redis::{Value, aio::MultiplexedConnection, from_redis_value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
@@ -206,7 +202,7 @@ impl RedisStore {
 
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
     /// Protected by circuit breaker for fast-fail when Redis is unavailable.
-    pub async fn get_connection(&self) -> Result<ConnectionManager, MediatorError> {
+    pub async fn get_connection(&self) -> Result<RedisConnection, MediatorError> {
         if !self.circuit_breaker.allow_request() {
             return Err(MediatorError::DatabaseError(
                 14,

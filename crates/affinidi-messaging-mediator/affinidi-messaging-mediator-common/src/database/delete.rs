@@ -146,7 +146,7 @@ impl DatabaseHandler {
     /// evidence. Never as delivery.
     async fn record_outbox_receipt(
         &self,
-        conn: &mut redis::aio::ConnectionManager,
+        conn: &mut super::RedisConnection,
         message_hash: &str,
         did_hash: &str,
         as_admin: bool,

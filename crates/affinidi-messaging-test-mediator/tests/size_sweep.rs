@@ -88,6 +88,7 @@ async fn redis_store(
         ),
         database_url: format!("{}/{db}", base.trim_end_matches('/')),
         database_timeout: 2,
+        cluster_mode: false,
         circuit_breaker_threshold: 5,
         circuit_breaker_recovery_secs: 10,
     };

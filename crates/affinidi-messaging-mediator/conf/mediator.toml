@@ -149,6 +149,11 @@ database_url = "redis://127.0.0.1/"
 ### Timeout for database operations in seconds
 database_timeout = "2"
 
+### Env: DATABASE_CLUSTER_MODE
+### "true" when the database runs in cluster mode (e.g. ElastiCache Serverless).
+### The mediator refuses to start if this does not match the server.
+cluster_mode = "false"
+
 ### ****************************************************************************************************************************
 ### Security configuration
 ### ****************************************************************************************************************************
