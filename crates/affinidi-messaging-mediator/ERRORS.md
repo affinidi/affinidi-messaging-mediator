@@ -122,3 +122,5 @@ places with different statuses. Queue-limit refusals (61, 62, 95) include a
 |         94 |       508        | e.p.protocol.forwarding.loop_detected              |     No     | Forward exceeded max_hops, or its next hop resolves back to this mediator                                                   |
 |         95 |       503        | e.p.limits.queue.peer                              |    Yes     | Too many messages already waiting from this sender for this recipient |
 |         96 |       403        | e.p.authorization.sender.mismatch                  |     No     | Message `from` is not the DID that authenticated the session |
+|         97 |       507        | e.m.me.res.storage.full                            |    Yes     | Mediator storage is full (data storage maximum reached); retry once space is freed                                         |
+|         98 |       503        | w.m.me.res.storage.busy                            |    Yes     | Mediator storage is busy or unreachable (a command timed out, e.g. throttled at its ECPU maximum); retry later              |

@@ -162,6 +162,51 @@ impl MediatorError {
         }
     }
 
+    /// A [`DatabaseError`](Self::DatabaseError) caused by a database cap, as
+    /// a problem report that names the cause; any other error unchanged.
+    ///
+    /// The cause is read from the error text, which carries the database's
+    /// own reply: `command not allowed when used memory` once the data
+    /// storage maximum is reached, `timed out` when a command outlasts
+    /// `database_timeout` (the database is throttled at its ECPU maximum, or
+    /// unreachable). Left as they are, both reach an HTTP client as a generic
+    /// "Service temporarily unavailable" and a websocket client as nothing.
+    pub fn named_storage_cap(self) -> Self {
+        match self {
+            Self::DatabaseError(code, session, text)
+                if text.contains("command not allowed when used memory") =>
+            {
+                Self::problem_with_log(
+                    97,
+                    session,
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Message,
+                    "me.res.storage.full",
+                    "Mediator storage is full; nothing new can be stored until space is freed",
+                    vec![],
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!("Storage full (DatabaseError {code}): {text}"),
+                )
+            }
+            Self::DatabaseError(code, session, text) if text.contains("timed out") => {
+                Self::problem_with_log(
+                    98,
+                    session,
+                    None,
+                    ProblemReportSorter::Warning,
+                    ProblemReportScope::Message,
+                    "me.res.storage.busy",
+                    "Mediator storage is busy; retry later",
+                    vec![],
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Storage busy (DatabaseError {code}): {text}"),
+                )
+            }
+            other => other,
+        }
+    }
+
     /// Creates a `MediatorError::MediatorError` with a DIDComm Problem Report.
     ///
     /// The `comment` is also used as the log message. For cases where the log
@@ -273,7 +318,7 @@ impl IntoResponse for AppError {
         // `Retry-After` header below.
         let mut retry_after_secs: Option<u64> = None;
 
-        let response = match self.error {
+        let response = match self.error.named_storage_cap() {
             MediatorError::ErrorHandlingError(error_code, session_id, msg) => {
                 event!(
                     Level::WARN,
@@ -736,6 +781,69 @@ mod tests {
     use super::*;
     use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
     use axum::http::StatusCode;
+
+    /// The problem code and HTTP status of `text` as a database error once
+    /// named, or `None` when it is left as a plain database error.
+    fn named(text: &str) -> Option<(String, StatusCode)> {
+        match MediatorError::DatabaseError(14, "s".into(), text.into()).named_storage_cap() {
+            MediatorError::MediatorError(_, _, _, report, status, _) => Some((
+                report.code.clone(),
+                StatusCode::from_u16(status).expect("valid status"),
+            )),
+            _ => None,
+        }
+    }
+
+    // The texts below are what redis-rs 1.8.1 reports from a real server.
+    #[test]
+    fn a_full_database_is_named_storage_full() {
+        let full = Some((
+            "e.m.me.res.storage.full".to_string(),
+            StatusCode::INSUFFICIENT_STORAGE,
+        ));
+        assert_eq!(
+            named(
+                "Couldn't store message: \"OOM\": command not allowed when used memory > 'maxmemory'."
+            ),
+            full
+        );
+        assert_eq!(
+            named(
+                "Failed to add account. Reason: Transaction aborted: [(Index 0, error: \"OOM\": command not allowed when used memory > 'maxmemory'.)]"
+            ),
+            full,
+            "an aborted transaction names its cause"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_database_is_named_storage_busy() {
+        assert_eq!(
+            named("inbox_status failed: timed out"),
+            Some((
+                "w.m.me.res.storage.busy".to_string(),
+                StatusCode::SERVICE_UNAVAILABLE
+            ))
+        );
+    }
+
+    #[test]
+    fn other_database_errors_stay_generic() {
+        assert_eq!(named("Failed to add account. Reason: CROSSSLOT"), None);
+    }
+
+    #[test]
+    fn a_full_database_reaches_an_http_client_as_507() {
+        let error = MediatorError::DatabaseError(
+            14,
+            "s".into(),
+            "\"OOM\": command not allowed when used memory > 'maxmemory'.".into(),
+        );
+        assert_eq!(
+            AppError::from(error).into_response().status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+    }
 
     fn refusal(msg_id: Option<String>) -> MediatorError {
         MediatorError::problem(
