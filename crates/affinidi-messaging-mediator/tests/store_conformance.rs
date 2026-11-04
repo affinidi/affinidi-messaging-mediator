@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_messaging_mediator_common::store::types::{
-    ForwardQueueEntry, MessageMetaData, Session, SessionState,
+    ForwardQueueEntry, MessageMetaData, Session, SessionState, StreamingClientState,
 };
 use affinidi_messaging_mediator_common::store::{MediatorStore, TrustTaskClaim};
 use affinidi_messaging_mediator_common::types::accounts::{
@@ -1720,6 +1720,73 @@ async fn check_bulk_account_reads(store: Arc<dyn MediatorStore>) {
     assert_eq!(stats[2].messages_received, 0);
 }
 
+/// Live delivery: a client registers and goes live (the WebSocket flow), a
+/// notification published for its mediator instance reaches that instance's
+/// subscriber, and a clean start or a disconnect drops the client.
+async fn check_streaming_pubsub(store: Arc<dyn MediatorStore>) {
+    let did = "did_hash_streaming";
+    let uuid = "conformance-mediator-uuid";
+    let connect = || async {
+        for state in [StreamingClientState::Registered, StreamingClientState::Live] {
+            store
+                .streaming_set_state(did, uuid, state)
+                .await
+                .expect("streaming_set_state");
+        }
+    };
+    connect().await;
+    assert_eq!(
+        store.streaming_is_client_live(did, false).await.as_deref(),
+        Some(uuid),
+        "a live client is found on its mediator instance"
+    );
+
+    let mut rx = store
+        .streaming_subscribe(uuid)
+        .await
+        .expect("streaming_subscribe");
+    // A subscription can take a moment to reach the server, and pub/sub does
+    // not replay: publish until one lands.
+    let record = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            store
+                .streaming_publish_message(did, uuid, "conformance-notification", false)
+                .await
+                .expect("streaming_publish_message");
+            if let Ok(Ok(record)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                break record;
+            }
+        }
+    })
+    .await
+    .expect("a published notification reaches the subscriber");
+    assert_eq!(record.did_hash, did);
+    assert_eq!(record.message, "conformance-notification");
+
+    store
+        .streaming_clean_start(uuid)
+        .await
+        .expect("streaming_clean_start");
+    assert_eq!(
+        store.streaming_is_client_live(did, false).await,
+        None,
+        "a clean start drops the instance's clients"
+    );
+
+    connect().await;
+    store
+        .streaming_set_state(did, uuid, StreamingClientState::Deregistered)
+        .await
+        .expect("streaming_set_state deregistered");
+    assert_eq!(
+        store.streaming_is_client_live(did, false).await,
+        None,
+        "a disconnected client is not live"
+    );
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -1729,6 +1796,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_admin_roles(store.clone()).await;
     check_login_session(store.clone()).await;
     check_bulk_account_reads(store.clone()).await;
+    check_streaming_pubsub(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -1841,6 +1909,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn bulk_account_reads() {
                 check_bulk_account_reads(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn streaming_pubsub() {
+                check_streaming_pubsub(ready($ctor).await).await;
             }
         }
     };
