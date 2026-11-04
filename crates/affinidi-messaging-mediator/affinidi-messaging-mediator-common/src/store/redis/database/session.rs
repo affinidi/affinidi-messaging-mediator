@@ -198,6 +198,16 @@ impl Database {
         did_hash: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
+        if self.keys().cluster_mode() {
+            return self
+                .update_session_authenticated_in_steps(
+                    old_session_id,
+                    new_session_id,
+                    did_hash,
+                    refresh_token_hash,
+                )
+                .await;
+        }
         let mut con = self.get_connection().await?;
 
         let old_sid = format!("SESSION:{old_session_id}");
@@ -232,6 +242,67 @@ impl Database {
                 )
             })?;
 
+        Ok(())
+    }
+
+    /// `update_session_authenticated` for cluster mode, where the two session
+    /// keys sit in different slots and cannot be `RENAME`d. Fails closed: the
+    /// old session is read and deleted in one step before the new one is
+    /// written, so a failure can force a new login but never leaves both ids
+    /// valid.
+    async fn update_session_authenticated_in_steps(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did_hash: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut con = self.get_connection().await?;
+        let old_sid = format!("SESSION:{old_session_id}");
+        let new_sid = format!("SESSION:{new_session_id}");
+        let failed = |reason: String| {
+            MediatorError::SessionError(
+                14,
+                old_session_id.into(),
+                format!("Failed to retrieve session ({old_session_id}). Reason: {reason}"),
+            )
+        };
+
+        let (fields, _): (HashMap<String, String>, u32) = redis::pipe()
+            .atomic()
+            .hgetall(&old_sid)
+            .del(&old_sid)
+            .query_async(&mut con)
+            .await
+            .map_err(|err| failed(err.to_string()))?;
+        if fields.is_empty() {
+            return Err(failed("no such session".into()));
+        }
+
+        let fields: Vec<(String, String)> = fields.into_iter().collect();
+        redis::pipe()
+            .atomic()
+            .hset_multiple(&new_sid, &fields)
+            .hset(&new_sid, "state", SessionState::Authenticated.to_string())
+            .hset(&new_sid, "refresh_token_hash", refresh_token_hash)
+            .expire(&new_sid, 86400)
+            .exec_async(&mut con)
+            .await
+            .map_err(|err| failed(err.to_string()))?;
+
+        // Bookkeeping beside a login that has already succeeded: a failure
+        // here must not fail the login.
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("SESSIONS_SUCCESS")
+            .arg(1);
+        let mut listed = redis::pipe();
+        listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
+        if let Err(err) = self.exec_steps(&mut con, vec![counted, listed]).await {
+            warn!(session_id = %new_session_id, "Couldn't record a successful login: {err}");
+        }
         Ok(())
     }
 

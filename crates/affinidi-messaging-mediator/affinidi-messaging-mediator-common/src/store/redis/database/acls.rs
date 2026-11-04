@@ -109,7 +109,7 @@ impl Database {
                 query.add_command(Cmd::hget(self.keys().did(did), "ACLS"));
             }
 
-            let result: Vec<Value> = query.query_async(&mut con).await.map_err(|err| {
+            let result: Vec<Value> = self.query_each(&mut con, query).await.map_err(|err| {
                 MediatorError::DatabaseError(
                     14,
                     "NA".to_string(),

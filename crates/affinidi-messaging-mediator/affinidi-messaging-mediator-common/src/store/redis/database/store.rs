@@ -1,6 +1,8 @@
 use std::time::Instant;
 
 use super::Database;
+use super::cluster_scripts::{ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_MESSAGE};
+use crate::database::RedisConnection;
 use crate::errors::MediatorError;
 
 // Mirror of the metric names declared in the mediator's
@@ -13,7 +15,7 @@ mod names {
 }
 use serde::{Deserialize, Serialize};
 use sha256::digest;
-use tracing::{Instrument, Level, debug, event, info, span};
+use tracing::{Instrument, Level, debug, event, info, span, warn};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MessageMetaData {
@@ -53,19 +55,33 @@ impl Database {
 
             let start = Instant::now();
             let mut conn = self.get_connection().await?;
-            let mut cmd = redis::cmd("FCALL");
-            cmd.arg("store_message")
-                .arg(1)
-                .arg(&message_hash)
-                .arg(message)
-                .arg(expires_at)
-                .arg(message.len())
-                .arg(to_did_hash)
-                .arg(from_hash);
-            if queue_maxlen > 0 {
-                cmd.arg(queue_maxlen);
-            }
-            cmd.exec_async(&mut conn).await.map_err(|err| {
+            let stored = if self.keys().cluster_mode() {
+                self.store_message_in_steps(
+                    &mut conn,
+                    &message_hash,
+                    message,
+                    expires_at,
+                    to_did_hash,
+                    from_hash,
+                    queue_maxlen,
+                )
+                .await
+            } else {
+                let mut cmd = redis::cmd("FCALL");
+                cmd.arg("store_message")
+                    .arg(1)
+                    .arg(&message_hash)
+                    .arg(message)
+                    .arg(expires_at)
+                    .arg(message.len())
+                    .arg(to_did_hash)
+                    .arg(from_hash);
+                if queue_maxlen > 0 {
+                    cmd.arg(queue_maxlen);
+                }
+                cmd.exec_async(&mut conn).await
+            };
+            stored.map_err(|err| {
                 event!(Level::ERROR, "Couldn't store message in database: {}", err);
                 MediatorError::DatabaseError(
                     14,
@@ -87,6 +103,123 @@ impl Database {
         }
         .instrument(_span)
         .await
+    }
+
+    /// `store_message` for cluster mode, as single-slot steps ordered so a
+    /// failure part-way is harmless or repaired by a retry:
+    ///
+    /// 1. body and metadata (nothing to do if already stored for this
+    ///    recipient);
+    /// 2. the expiry index, so the sweeper can reach the message from here on;
+    /// 3. the recipient's inbox and the sender's outbox, concurrently — the
+    ///    message is deliverable from here on;
+    /// 4. the queue ids on the metadata, which a delete needs;
+    /// 5. the global counters, best-effort.
+    ///
+    /// Until step 4 the metadata has no inbox id, so a retry redoes the steps.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_message_in_steps(
+        &self,
+        conn: &mut RedisConnection,
+        message_hash: &str,
+        message: &str,
+        expires_at: u64,
+        to_did_hash: &str,
+        from_hash: &str,
+        queue_maxlen: usize,
+    ) -> redis::RedisResult<()> {
+        let keys = self.keys();
+        let bytes = message.len();
+
+        let written: i64 = STORE_MESSAGE
+            .key(keys.msg(message_hash))
+            .key(keys.msg_meta(message_hash))
+            .arg(message)
+            .arg(bytes)
+            .arg(to_did_hash)
+            .invoke_async(conn)
+            .await?;
+        if written == 0 {
+            return Ok(());
+        }
+
+        // Index before bucket: a failure between them leaves an empty bucket
+        // in the index, which the sweeper passes over.
+        let bucket = format!("MSG_EXPIRY:{expires_at}");
+        redis::cmd("ZADD")
+            .arg("MSG_EXPIRY")
+            .arg("NX")
+            .arg(expires_at)
+            .arg(&bucket)
+            .exec_async(conn)
+            .await?;
+        redis::cmd("SADD")
+            .arg(&bucket)
+            .arg(message_hash)
+            .exec_async(conn)
+            .await?;
+
+        let mut inbox_conn = conn.clone();
+        let inbox = async {
+            ENQUEUE_INBOX
+                .key(keys.did(to_did_hash))
+                .key(keys.receive_q(to_did_hash))
+                .arg(message_hash)
+                .arg(bytes)
+                .arg(from_hash)
+                .arg(queue_maxlen)
+                .invoke_async::<String>(&mut inbox_conn)
+                .await
+        };
+        let mut outbox_conn = conn.clone();
+        let outbox = async {
+            if from_hash == "ANONYMOUS" {
+                return Ok(None);
+            }
+            ENQUEUE_OUTBOX
+                .key(keys.did(from_hash))
+                .key(keys.peer_q(from_hash))
+                .key(keys.send_q(from_hash))
+                .arg(message_hash)
+                .arg(bytes)
+                .arg(to_did_hash)
+                .arg(queue_maxlen)
+                .invoke_async::<String>(&mut outbox_conn)
+                .await
+                .map(Some)
+        };
+        let (receive_id, send_id) = futures_util::future::try_join(inbox, outbox).await?;
+
+        let mut ids = vec!["RECEIVE_ID".to_string(), receive_id];
+        if let Some(send_id) = send_id {
+            ids.extend([
+                "FROM".to_string(),
+                from_hash.to_string(),
+                "SEND_ID".to_string(),
+                send_id,
+            ]);
+        }
+        RECORD_QUEUE_IDS
+            .key(keys.msg_meta(message_hash))
+            .arg(ids)
+            .invoke_async::<i64>(conn)
+            .await?;
+
+        let mut counted = redis::pipe();
+        counted
+            .atomic()
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("RECEIVED_BYTES")
+            .arg(bytes)
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("RECEIVED_COUNT")
+            .arg(1);
+        if let Err(err) = counted.exec_async(conn).await {
+            warn!("Couldn't count stored message {message_hash}: {err}");
+        }
+        Ok(())
     }
 
     /// Retrieves the message MetaData for a given message hash

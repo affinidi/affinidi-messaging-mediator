@@ -293,16 +293,16 @@ impl Database {
 
             // For each DID, fetch their access_list count and DID Details
             let mut did_query = Pipeline::new();
-            let did_query = did_query.atomic();
+            did_query.atomic();
             let mut access_list_query = Pipeline::new();
-            let access_list_query = access_list_query.atomic();
+            access_list_query.atomic();
             for did in &dids {
                 did_query.add_command(redis::Cmd::hgetall(self.keys().did(did)));
                 access_list_query.add_command(redis::Cmd::scard(self.keys().access_list(did)));
             }
 
             let did_results: Vec<HashMap<String, String>> =
-                did_query.query_async(&mut con).await.map_err(|err| {
+                self.query_each(&mut con, did_query).await.map_err(|err| {
                     MediatorError::DatabaseError(
                         14,
                         "NA".to_string(),
@@ -310,8 +310,8 @@ impl Database {
                     )
                 })?;
 
-            let access_list_results: Vec<u32> = access_list_query
-                .query_async(&mut con)
+            let access_list_results: Vec<u32> = self
+                .query_each(&mut con, access_list_query)
                 .await
                 .map_err(|err| {
                     MediatorError::DatabaseError(

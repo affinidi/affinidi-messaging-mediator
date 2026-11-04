@@ -202,18 +202,48 @@ impl RedisStore {
         con: &mut RedisConnection,
         steps: Vec<redis::Pipeline>,
     ) -> redis::RedisResult<()> {
+        self.query_steps(con, steps).await.map(|_| ())
+    }
+
+    /// [`exec_steps`](Self::exec_steps), returning every reply in order.
+    pub(crate) async fn query_steps(
+        &self,
+        con: &mut RedisConnection,
+        steps: Vec<redis::Pipeline>,
+    ) -> redis::RedisResult<Vec<Value>> {
         if self.keys().cluster_mode() {
+            let mut replies = Vec::new();
             for mut step in steps {
-                step.atomic().exec_async(con).await?;
+                replies.extend(step.atomic().query_async::<Vec<Value>>(con).await?);
             }
-            Ok(())
+            Ok(replies)
         } else {
             let mut all = redis::pipe();
             all.atomic();
             for cmd in steps.iter().flat_map(|step| step.cmd_iter()) {
                 all.add_command(cmd.clone());
             }
-            all.exec_async(con).await
+            all.query_async(con).await
+        }
+    }
+
+    /// Runs a pipeline of independent commands. With cluster mode off it runs
+    /// as is. With it on, each command runs on its own, concurrently, so the
+    /// pipeline is neither atomic nor filtered by `ignore()`: use it where the
+    /// commands need neither, and read replies by position.
+    pub(crate) async fn query_each<T: redis::FromRedisValue>(
+        &self,
+        con: &mut RedisConnection,
+        pipe: redis::Pipeline,
+    ) -> redis::RedisResult<Vec<T>> {
+        if self.keys().cluster_mode() {
+            futures_util::future::try_join_all(pipe.cmd_iter().map(|cmd| {
+                let mut con = con.clone();
+                async move { cmd.query_async(&mut con).await }
+            }))
+            .await
+        } else {
+            pipe.query_async(con).await
         }
     }
 
@@ -238,6 +268,81 @@ impl RedisStore {
                 .query_async(con)
                 .await
         }
+    }
+
+    /// The `get_status_reply` map, for cluster mode: the account's counters
+    /// and inbox (one slot), then its live-streaming flag (the streaming
+    /// slot). Fields match the library function's, which leaves the inbox
+    /// fields out for a missing inbox and reports `0` ids for an empty one.
+    async fn inbox_status_in_steps(
+        &self,
+        con: &mut RedisConnection,
+        did_hash: &str,
+    ) -> redis::RedisResult<HashMap<String, Value>> {
+        type Entries = Vec<(String, Vec<String>)>;
+        let keys = self.keys();
+        let inbox = keys.receive_q(did_hash);
+        let ((count, bytes), exists, len, oldest, newest): (
+            (Option<i64>, Option<i64>),
+            bool,
+            i64,
+            Entries,
+            Entries,
+        ) = redis::pipe()
+            .atomic()
+            .cmd("HMGET")
+            .arg(keys.did(did_hash))
+            .arg("RECEIVE_QUEUE_COUNT")
+            .arg("RECEIVE_QUEUE_BYTES")
+            .cmd("EXISTS")
+            .arg(&inbox)
+            .cmd("XLEN")
+            .arg(&inbox)
+            .cmd("XRANGE")
+            .arg(&inbox)
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(1)
+            .cmd("XREVRANGE")
+            .arg(&inbox)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(con)
+            .await?;
+        let live: bool = redis::cmd("HEXISTS")
+            .arg(keys.global_streaming())
+            .arg(did_hash)
+            .query_async(con)
+            .await?;
+
+        let text = |s: String| Value::BulkString(s.into_bytes());
+        let first_id = |entries: Entries| {
+            text(
+                entries
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| "0".to_string(), |(id, _)| id),
+            )
+        };
+        let mut fields = HashMap::from([
+            ("recipient_did".to_string(), text(did_hash.to_string())),
+            ("live_delivery".to_string(), Value::Int(live.into())),
+        ]);
+        if let Some(count) = count {
+            fields.insert("message_count".to_string(), Value::Int(count));
+        }
+        if let Some(bytes) = bytes {
+            fields.insert("total_bytes".to_string(), Value::Int(bytes));
+        }
+        if exists {
+            fields.insert("oldest_received".to_string(), first_id(oldest));
+            fields.insert("newest_received".to_string(), first_id(newest));
+            fields.insert("queue_count".to_string(), Value::Int(len));
+        }
+        Ok(fields)
     }
 
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
@@ -513,13 +618,16 @@ impl MediatorStore for RedisStore {
         for id in msg_ids {
             exists_pipe.cmd("EXISTS").arg(self.keys().msg_meta(id));
         }
-        let present: Vec<bool> = exists_pipe.query_async(&mut conn).await.map_err(|err| {
-            MediatorError::DatabaseError(
-                14,
-                "NA".into(),
-                format!("Couldn't check message metadata before marking delivery: {err}"),
-            )
-        })?;
+        let present: Vec<bool> = self
+            .query_each(&mut conn, exists_pipe)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".into(),
+                    format!("Couldn't check message metadata before marking delivery: {err}"),
+                )
+            })?;
 
         // One pipeline for the whole pickup. `HSETNX` on the first-delivery
         // stamp is what makes the stamp itself idempotent: the first handover
@@ -533,10 +641,10 @@ impl MediatorStore for RedisStore {
             }
             marked.push(id);
             let key = self.keys().msg_meta(id);
-            // NOT `.ignore()`: the reply says whether this was the first
-            // delivery (1) or a redelivery (0), which is what decides below
-            // whether the expiry deadline moves. Reading it back beats
-            // inferring it, and costs nothing — the command runs either way.
+            // The HSETNX reply says whether this was the first delivery (1) or
+            // a redelivery (0), which is what decides below whether the expiry
+            // deadline moves. Reading it back beats inferring it, and costs
+            // nothing — the command runs either way.
             pipe.cmd("HSETNX")
                 .arg(&key)
                 .arg("FIRST_DELIVERED_AT")
@@ -544,8 +652,7 @@ impl MediatorStore for RedisStore {
             pipe.cmd("HINCRBY")
                 .arg(&key)
                 .arg("DELIVERY_ATTEMPTS")
-                .arg(1)
-                .ignore();
+                .arg(1);
         }
         if marked.is_empty() {
             return Ok(report);
@@ -554,8 +661,13 @@ impl MediatorStore for RedisStore {
         // Best-effort by the trait's contract: this is bookkeeping beside a
         // pickup that has already succeeded, and failing the pickup because the
         // bookkeeping failed would trade a real delivery for a statistic.
-        let stamped: Vec<bool> = match pipe.query_async(&mut conn).await {
-            Ok(replies) => replies,
+        let stamped: Vec<bool> = match self.query_each::<Value>(&mut conn, pipe).await {
+            // HSETNX, HINCRBY per message: keep each HSETNX reply.
+            Ok(replies) => replies
+                .into_iter()
+                .step_by(2)
+                .map(|reply| from_redis_value::<bool>(reply).unwrap_or(false))
+                .collect(),
             Err(err) => {
                 warn!(
                     "Couldn't record delivery for {} message(s): {}",
@@ -601,7 +713,7 @@ impl MediatorStore for RedisStore {
                 .ignore();
             expiry_pipe.cmd("SADD").arg(&slot_key).arg(*id).ignore();
         }
-        if moving && let Err(err) = expiry_pipe.exec_async(&mut conn).await {
+        if moving && let Err(err) = self.query_each::<Value>(&mut conn, expiry_pipe).await {
             warn!("Couldn't bring delivered-message expiry forward: {err}");
             report.expiry_advanced = 0;
         }
@@ -629,7 +741,7 @@ impl MediatorStore for RedisStore {
             pipe.cmd("GET")
                 .arg(self.keys().outbox_receipt(sender_did_hash, id));
         }
-        let replies: Vec<redis::Value> = pipe.query_async(&mut conn).await.map_err(|err| {
+        let replies: Vec<redis::Value> = self.query_each(&mut conn, pipe).await.map_err(|err| {
             MediatorError::DatabaseError(
                 14,
                 "NA".into(),
@@ -725,13 +837,14 @@ impl MediatorStore for RedisStore {
                 .arg("FIRST_DELIVERED_AT")
                 .arg("DELIVERY_ATTEMPTS");
         }
-        let rows: Vec<Vec<Option<String>>> = pipe.query_async(&mut conn).await.map_err(|err| {
-            MediatorError::DatabaseError(
-                14,
-                "NA".into(),
-                format!("Couldn't batch-read delivery state: {err}"),
-            )
-        })?;
+        let rows: Vec<Vec<Option<String>>> =
+            self.query_each(&mut conn, pipe).await.map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".into(),
+                    format!("Couldn't batch-read delivery state: {err}"),
+                )
+            })?;
 
         Ok(rows
             .into_iter()
@@ -892,30 +1005,41 @@ impl MediatorStore for RedisStore {
         // here we expose the underlying data so the trait stays
         // protocol-agnostic.
         let mut conn = self.get_connection().await?;
-        let result: Value = redis::cmd("FCALL")
-            .arg("get_status_reply")
-            .arg(1)
-            .arg(did_hash)
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::DatabaseError(
-                    14,
-                    did_hash.into(),
-                    format!("inbox_status Lua call failed: {err}"),
-                )
-            })?;
-
         // The Lua function returns a map with: recipient_did,
         // message_count, total_bytes, oldest_received, newest_received,
         // queue_count, live_delivery.
-        let fields: HashMap<String, Value> = from_redis_value(result).map_err(|err| {
-            MediatorError::DatabaseError(
-                21,
-                did_hash.into(),
-                format!("inbox_status response parse failed: {err}"),
-            )
-        })?;
+        let fields: HashMap<String, Value> = if self.keys().cluster_mode() {
+            self.inbox_status_in_steps(&mut conn, did_hash)
+                .await
+                .map_err(|err| {
+                    MediatorError::DatabaseError(
+                        14,
+                        did_hash.into(),
+                        format!("inbox_status failed: {err}"),
+                    )
+                })?
+        } else {
+            let result: Value = redis::cmd("FCALL")
+                .arg("get_status_reply")
+                .arg(1)
+                .arg(did_hash)
+                .query_async(&mut conn)
+                .await
+                .map_err(|err| {
+                    MediatorError::DatabaseError(
+                        14,
+                        did_hash.into(),
+                        format!("inbox_status Lua call failed: {err}"),
+                    )
+                })?;
+            from_redis_value(result).map_err(|err| {
+                MediatorError::DatabaseError(
+                    21,
+                    did_hash.into(),
+                    format!("inbox_status response parse failed: {err}"),
+                )
+            })?
+        };
 
         let read_str = |k: &str| -> String {
             fields
@@ -1178,18 +1302,20 @@ impl MediatorStore for RedisStore {
         let key = self.keys().did(did_hash);
         let role_str: String = account_type.to_owned().into();
 
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("HSET")
-            .arg(&key)
-            .arg("ROLE_TYPE")
-            .arg(&role_str);
-        if account_type.is_admin() {
-            pipe.cmd("SADD").arg("ADMINS").arg(did_hash);
+        // ROLE_TYPE alone grants admin rights (sessions read it), so it is
+        // set last when promoting and first when demoting: a failure between
+        // the steps never leaves more privilege than either end state.
+        let mut role = redis::pipe();
+        role.cmd("HSET").arg(&key).arg("ROLE_TYPE").arg(&role_str);
+        let mut listed = redis::pipe();
+        let steps = if account_type.is_admin() {
+            listed.cmd("SADD").arg("ADMINS").arg(did_hash);
+            vec![listed, role]
         } else {
-            pipe.cmd("SREM").arg("ADMINS").arg(did_hash);
-        }
-        pipe.exec_async(&mut conn).await.map_err(|err| {
+            listed.cmd("SREM").arg("ADMINS").arg(did_hash);
+            vec![role, listed]
+        };
+        self.exec_steps(&mut conn, steps).await.map_err(|err| {
             MediatorError::DatabaseError(
                 14,
                 did_hash.into(),
@@ -1772,7 +1898,7 @@ impl MediatorStore for RedisStore {
                 .arg(ACTIVITY_AUTHENTICATED);
         }
         let rows: Vec<(Option<u64>, Option<u64>)> =
-            pipe.query_async(&mut conn).await.map_err(|e| {
+            self.query_each(&mut conn, pipe).await.map_err(|e| {
                 MediatorError::DatabaseError(
                     14,
                     "NA".into(),
@@ -1838,9 +1964,10 @@ impl MediatorStore for RedisStore {
         for hash in did_hashes {
             pipe.cmd("HGETALL").arg(self.keys().stats(hash));
         }
-        let rows: Vec<HashMap<String, i64>> = pipe.query_async(&mut conn).await.map_err(|e| {
-            MediatorError::DatabaseError(14, "NA".into(), format!("reading account stats: {e}"))
-        })?;
+        let rows: Vec<HashMap<String, i64>> =
+            self.query_each(&mut conn, pipe).await.map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("reading account stats: {e}"))
+            })?;
         Ok(rows.into_iter().map(stats_from_hash).collect())
     }
 

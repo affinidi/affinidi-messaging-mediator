@@ -56,15 +56,20 @@ impl DatabaseHandler {
                     _ => None,
                 });
 
-            let mut cmd = redis::cmd("FCALL");
-            cmd.arg("delete_message")
-                .arg(1)
-                .arg(message_hash)
-                .arg(did_hash);
-            if let Some(admin_hash) = admin_did_hash {
-                cmd.arg(admin_hash);
-            }
-            let result: Result<String, redis::RedisError> = cmd.query_async(&mut conn).await;
+            let result: Result<String, redis::RedisError> = if self.keys.cluster_mode() {
+                self.delete_message_in_steps(&mut conn, message_hash, did_hash, admin_did_hash)
+                    .await
+            } else {
+                let mut cmd = redis::cmd("FCALL");
+                cmd.arg("delete_message")
+                    .arg(1)
+                    .arg(message_hash)
+                    .arg(did_hash);
+                if let Some(admin_hash) = admin_did_hash {
+                    cmd.arg(admin_hash);
+                }
+                cmd.query_async(&mut conn).await
+            };
 
             match result {
                 Ok(response) if response == "OK" => {
@@ -137,6 +142,90 @@ impl DatabaseHandler {
         }
         .instrument(_span)
         .await
+    }
+
+    /// `delete_message` for cluster mode. Claims the message in its own slot
+    /// (ownership check, then removal), then releases the recipient's and
+    /// sender's queues concurrently, then the global counters. Once claimed
+    /// the message is gone, so a failed release is logged rather than
+    /// returned: it leaves a counter off by one and a queue entry whose
+    /// message is gone, which a fetch skips.
+    async fn delete_message_in_steps(
+        &self,
+        conn: &mut super::RedisConnection,
+        message_hash: &str,
+        did_hash: &str,
+        admin_did_hash: Option<&str>,
+    ) -> redis::RedisResult<String> {
+        use crate::store::redis::database::cluster_scripts::{
+            CLAIM_MESSAGE, RELEASE_INBOX, RELEASE_OUTBOX,
+        };
+
+        let keys = self.keys;
+        let mut claim = CLAIM_MESSAGE.prepare_invoke();
+        claim
+            .key(keys.msg(message_hash))
+            .key(keys.msg_meta(message_hash))
+            .arg(message_hash)
+            .arg(did_hash);
+        if let Some(admin_hash) = admin_did_hash {
+            claim.arg(admin_hash);
+        }
+        let (to, from, bytes, receive_id, send_id): (String, String, String, String, String) =
+            claim.invoke_async(conn).await?;
+
+        let mut inbox_conn = conn.clone();
+        let inbox = async {
+            if to.is_empty() {
+                return Ok(0);
+            }
+            RELEASE_INBOX
+                .key(keys.did(&to))
+                .key(keys.receive_q(&to))
+                .arg(&bytes)
+                .arg(&receive_id)
+                .invoke_async::<i64>(&mut inbox_conn)
+                .await
+        };
+        let mut outbox_conn = conn.clone();
+        let outbox = async {
+            if send_id.is_empty() {
+                return Ok(0);
+            }
+            RELEASE_OUTBOX
+                .key(keys.did(&from))
+                .key(keys.peer_q(&from))
+                .key(keys.send_q(&from))
+                .arg(&bytes)
+                .arg(&to)
+                .arg(&send_id)
+                .invoke_async::<i64>(&mut outbox_conn)
+                .await
+        };
+        let (inbox, outbox) = futures_util::future::join(inbox, outbox).await;
+        for (queue, released) in [("inbox", inbox), ("outbox", outbox)] {
+            if let Err(err) = released {
+                warn!(
+                    "Couldn't release the {queue} entry of deleted message {message_hash}: {err}"
+                );
+            }
+        }
+
+        let mut counted = redis::pipe();
+        counted
+            .atomic()
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("DELETED_BYTES")
+            .arg(&bytes)
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("DELETED_COUNT")
+            .arg(1);
+        if let Err(err) = counted.exec_async(conn).await {
+            warn!("Couldn't count deleted message {message_hash}: {err}");
+        }
+        Ok("OK".to_string())
     }
 
     /// Leave `from` a receipt saying why `message_hash` left its outbox.

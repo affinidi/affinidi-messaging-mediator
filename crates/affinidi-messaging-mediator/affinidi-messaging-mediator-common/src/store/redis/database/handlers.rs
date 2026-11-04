@@ -6,6 +6,17 @@ use tracing::{Level, event};
 impl Database {
     // Load Redis scripts into the database
     pub async fn load_scripts(&self, scripts_path: &str) -> Result<(), MediatorError> {
+        // Cluster-mode servers have no FUNCTION LOAD; the cluster-mode code
+        // sends its scripts with each call instead (see `cluster_scripts`).
+        if self.keys().cluster_mode() {
+            event!(
+                Level::INFO,
+                "Cluster mode: not loading stored functions from {}",
+                scripts_path
+            );
+            return Ok(());
+        }
+
         // Load the file contents into a string
         let lua_scripts = read_to_string(scripts_path).map_err(|err| {
             MediatorError::ConfigError(

@@ -46,6 +46,9 @@ use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState,
 };
 use affinidi_messaging_mediator_common::store::{MediatorStore, TrustTaskClaim};
+use affinidi_messaging_mediator_common::types::accounts::{
+    AccountStatsDelta, ActivityKind, StatsDirection, StatsWire,
+};
 use affinidi_messaging_mediator_common::types::audit::{AuditAction, AuditLogEntry};
 use affinidi_messaging_sdk::protocols::mediator::{
     accounts::{Account, AccountType},
@@ -667,6 +670,17 @@ fn fjall_backend() -> Backend {
 /// reproducing the fresh-store-per-test guarantee the in-process backends have.
 #[cfg(feature = "redis-backend")]
 async fn redis_backend(db_index: u8) -> Option<Backend> {
+    Some(Backend {
+        store: Arc::new(redis_store_flushed(db_index).await?),
+        keepalive: None,
+    })
+}
+
+/// A `RedisStore` on logical DB `db_index`, flushed; `None` without `REDIS_URL`.
+#[cfg(feature = "redis-backend")]
+async fn redis_store_flushed(
+    db_index: u8,
+) -> Option<affinidi_messaging_mediator::store::RedisStore> {
     use affinidi_messaging_mediator::store::RedisStore;
     use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
 
@@ -707,6 +721,12 @@ async fn redis_backend(db_index: u8) -> Option<Backend> {
     // Wipe this logical DB so the check starts from a clean keyspace. Loaded
     // Lua FUNCTIONs are server-global, not per-DB, so FLUSHDB doesn't disturb
     // them (and `initialize()` reloads them anyway).
+    flush_db(&store).await;
+    Some(store)
+}
+
+#[cfg(feature = "redis-backend")]
+async fn flush_db(store: &affinidi_messaging_mediator::store::RedisStore) {
     let mut conn = store.get_connection().await.expect("redis connection");
     // `::redis` — the extern crate, not the sibling `mod redis` this suite's
     // test-generation macro creates (which would shadow a bare `redis::`).
@@ -714,11 +734,41 @@ async fn redis_backend(db_index: u8) -> Option<Backend> {
         .query_async::<()>(&mut conn)
         .await
         .expect("FLUSHDB");
+}
 
-    Some(Backend {
-        store: Arc::new(store),
-        keepalive: None,
-    })
+/// The Redis start-up path the mediator runs before serving: schema
+/// migrations, then the mediator and root-admin accounts. It runs on every
+/// start, so a second run must succeed too.
+#[cfg(feature = "redis-backend")]
+async fn check_redis_startup(store: &affinidi_messaging_mediator::store::RedisStore) {
+    use affinidi_messaging_mediator_common::store::redis::RedisInitConfig;
+
+    let config = RedisInitConfig {
+        mediator_did_hash: "did_hash_startup_mediator".to_string(),
+        admin_did: "did:example:startup_admin".to_string(),
+        global_acl_default: allow_all(),
+    };
+    for _ in 0..2 {
+        store
+            .initialize_redis(&config)
+            .await
+            .expect("initialize_redis");
+    }
+
+    let admin_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&config.admin_did);
+    assert!(
+        store
+            .check_admin_account(&admin_hash)
+            .await
+            .expect("check_admin_account"),
+        "the root admin is an admin after start-up"
+    );
+    let mediator = store
+        .account_get(&config.mediator_did_hash)
+        .await
+        .expect("account_get")
+        .expect("the mediator account exists after start-up");
+    assert_eq!(mediator._type, AccountType::Mediator);
 }
 
 /// Audit log: recording, newest-first ordering, cursor pagination, and
@@ -1454,10 +1504,231 @@ async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// Admin set-up (twice: it runs on every start) → demote → promote → bulk
+/// promote and strip → removing an admin account. Demotion must take effect.
+async fn check_admin_roles(store: Arc<dyn MediatorStore>) {
+    let admin = "did_hash_admin_roles";
+    let other = "did_hash_admin_roles_other";
+    let is_admin = |did: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .check_admin_account(did)
+                .await
+                .expect("check_admin_account")
+        }
+    };
+
+    for _ in 0..2 {
+        store
+            .setup_admin_account(admin, AccountType::Admin, &allow_all())
+            .await
+            .expect("setup_admin_account");
+    }
+    assert!(is_admin(admin).await, "a set-up admin is an admin");
+
+    store
+        .account_set_role(admin, &AccountType::Standard)
+        .await
+        .expect("account_set_role standard");
+    assert!(!is_admin(admin).await, "a demoted admin is not an admin");
+    let demoted = store.account_get(admin).await.expect("account_get");
+    assert_eq!(
+        demoted.expect("account present")._type,
+        AccountType::Standard
+    );
+
+    store
+        .account_set_role(admin, &AccountType::Admin)
+        .await
+        .expect("account_set_role admin");
+    assert!(is_admin(admin).await, "a promoted account is an admin");
+
+    store
+        .account_add(other, &allow_all(), None)
+        .await
+        .expect("account_add other");
+    store
+        .add_admin_accounts(vec![other.to_string()], &allow_all())
+        .await
+        .expect("add_admin_accounts");
+    assert!(is_admin(other).await, "a bulk-promoted account is an admin");
+
+    store
+        .strip_admin_accounts(vec![admin.to_string(), other.to_string()])
+        .await
+        .expect("strip_admin_accounts");
+    assert!(!is_admin(admin).await, "stripped accounts are not admins");
+    assert!(!is_admin(other).await, "stripped accounts are not admins");
+
+    // Removing an admin account strips its admin rights on the way out.
+    store
+        .account_set_role(other, &AccountType::Admin)
+        .await
+        .expect("account_set_role admin");
+    assert!(
+        store
+            .account_remove(&admin_session("root_admin_hash"), other)
+            .await
+            .expect("account_remove admin"),
+        "an admin account can be removed"
+    );
+    assert!(!store.account_exists(other).await.expect("account_exists"));
+}
+
+/// The login path: a challenge session is authenticated under a new id (the
+/// challenge id stops working), then its refresh token is rotated. Both steps
+/// count in the global stats.
+async fn check_login_session(store: Arc<dyn MediatorStore>) {
+    let did = "did:example:conformance_login_user";
+    let did_hash = sha256::digest(did);
+    let challenge_id = "conformance-login-challenge";
+    let session_id = "conformance-login-session";
+    store
+        .account_add(&did_hash, &allow_all(), None)
+        .await
+        .expect("account_add for login DID");
+    let before = store.get_global_stats().await.expect("get_global_stats");
+
+    store
+        .create_session(&Session {
+            session_id: challenge_id.to_string(),
+            challenge: "conformance-challenge".to_string(),
+            state: SessionState::ChallengeSent,
+            did: did.to_string(),
+            did_hash: did_hash.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("create_session");
+    let challenge = store
+        .get_session(challenge_id, did)
+        .await
+        .expect("get_session for the challenge");
+    assert_eq!(challenge.challenge, "conformance-challenge");
+    assert_eq!(challenge.state, SessionState::ChallengeSent);
+
+    store
+        .update_session_authenticated(challenge_id, session_id, did, "refresh-1")
+        .await
+        .expect("update_session_authenticated");
+    assert!(
+        store.get_session(challenge_id, did).await.is_err(),
+        "the challenge session id must stop working once authenticated"
+    );
+    let session = store
+        .get_session(session_id, did)
+        .await
+        .expect("get_session for the authenticated session");
+    assert_eq!(session.state, SessionState::Authenticated);
+    assert_eq!(
+        store
+            .get_refresh_token_hash(session_id)
+            .await
+            .expect("get_refresh_token_hash"),
+        Some("refresh-1".to_string())
+    );
+
+    store
+        .update_refresh_token_hash(session_id, "refresh-2")
+        .await
+        .expect("update_refresh_token_hash");
+    assert_eq!(
+        store
+            .get_refresh_token_hash(session_id)
+            .await
+            .expect("get_refresh_token_hash"),
+        Some("refresh-2".to_string())
+    );
+
+    let after = store.get_global_stats().await.expect("get_global_stats");
+    assert_eq!(after.sessions_created, before.sessions_created + 1);
+    assert_eq!(after.sessions_success, before.sessions_success + 1);
+}
+
+/// Listing and reading several accounts at once: the account list, their
+/// ACLs, activity times and lifetime counters.
+async fn check_bulk_account_reads(store: Arc<dyn MediatorStore>) {
+    let dids: Vec<String> = ["did_hash_bulk_a", "did_hash_bulk_b", "did_hash_bulk_c"]
+        .map(String::from)
+        .to_vec();
+    for did in &dids {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+
+    let mut listed = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = store.account_list(cursor, 100).await.expect("account_list");
+        listed.extend(page.accounts.into_iter().map(|account| account.did_hash));
+        if page.cursor == 0 {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    for did in &dids {
+        assert!(listed.contains(did), "account_list includes {did}");
+    }
+
+    let acls = store
+        .get_did_acls(&dids, AccessListModeType::ExplicitDeny)
+        .await
+        .expect("get_did_acls");
+    let with_acls: Vec<&str> = acls
+        .acl_response
+        .iter()
+        .map(|acl| acl.did_hash.as_str())
+        .collect();
+    for did in &dids {
+        assert!(
+            with_acls.contains(&did.as_str()),
+            "get_did_acls returns {did}"
+        );
+    }
+
+    store
+        .account_activity_record(&dids[0], ActivityKind::Received, 111)
+        .await
+        .expect("account_activity_record");
+    store
+        .account_activity_record(&dids[1], ActivityKind::Authenticated, 222)
+        .await
+        .expect("account_activity_record");
+    let activity = store
+        .account_activity(&dids)
+        .await
+        .expect("account_activity");
+    assert_eq!(activity.len(), dids.len(), "one activity row per account");
+    assert_eq!(activity[0].last_received, Some(111));
+    assert_eq!(activity[1].last_authenticated, Some(222));
+    assert_eq!(activity[2].last_received, None);
+
+    store
+        .account_stats_bump(
+            &dids[0],
+            AccountStatsDelta::new(StatsDirection::Received, StatsWire::DidComm, 10),
+        )
+        .await
+        .expect("account_stats_bump");
+    let stats = store.account_stats(&dids).await.expect("account_stats");
+    assert_eq!(stats.len(), dids.len(), "one stats row per account");
+    assert_eq!(stats[0].messages_received, 1);
+    assert_eq!(stats[0].bytes_received, 10);
+    assert_eq!(stats[2].messages_received, 0);
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
 async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
+    // Store-only checks first, so a failure in the message path (Lua) can't
+    // hide them.
+    check_admin_roles(store.clone()).await;
+    check_login_session(store.clone()).await;
+    check_bulk_account_reads(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -1559,6 +1830,18 @@ macro_rules! conformance_for {
             async fn outbox_receipt_retention() {
                 check_outbox_receipt_retention(ready($ctor).await).await;
             }
+            #[tokio::test]
+            async fn admin_roles() {
+                check_admin_roles(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn login_session() {
+                check_login_session(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn bulk_account_reads() {
+                check_bulk_account_reads(ready($ctor).await).await;
+            }
         }
     };
 }
@@ -1607,7 +1890,20 @@ conformance_for_redis!(redis,
     delivery_decision_matches_access_list => check_delivery_decision_matches_access_list @ 13,
     v1_routing_keys          => check_v1_routing_keys          @ 14,
     trust_task_claim         => check_trust_task_claim         @ 15,
-    // DB 0: every numbered index a default Redis offers (0..=15) is in use, so
-    // the checks added since share it, one after another in a single test.
-    db0_checks => check_db0_in_sequence @ 0,
 );
+
+/// DB 0: every numbered index a default Redis offers (0..=15) is in use, so
+/// the checks added since share it, one after another in a single test. The
+/// start-up check needs the concrete `RedisStore`, so this test is written out
+/// rather than generated.
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn redis_db0_checks() {
+    let Some(store) = redis_store_flushed(0).await else {
+        return;
+    };
+    store.initialize().await.expect("store initialize");
+    check_redis_startup(&store).await;
+    flush_db(&store).await;
+    check_db0_in_sequence(Arc::new(store)).await;
+}
