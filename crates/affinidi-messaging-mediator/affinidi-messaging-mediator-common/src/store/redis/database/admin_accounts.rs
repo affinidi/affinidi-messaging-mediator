@@ -1,7 +1,7 @@
 //! Database routines to add/remove/list admin accounts
-use crate::errors::MediatorError;
+use crate::errors::{MediatorError, is_storage_full};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
-use tracing::{Instrument, Level, debug, info, span};
+use tracing::{Instrument, Level, debug, info, span, warn};
 
 use super::Database;
 
@@ -37,18 +37,51 @@ impl Database {
             .arg(self.keys().did(admin_did_hash))
             .arg("ROLE_TYPE")
             .arg::<String>(admin_type.into());
-        self.exec_steps(&mut con, vec![listed, role])
-            .await
-            .map_err(|err| {
-                MediatorError::DatabaseError(
+        match self.exec_steps(&mut con, vec![listed, role]).await {
+            Ok(()) => {}
+            // A full database refuses even a write that changes nothing, and
+            // this runs on every start. Carry on when the account is already
+            // set up as asked, so a mediator can restart while full (and then
+            // free space); otherwise fail as before.
+            Err(err)
+                if is_storage_full(&err.to_string())
+                    && self
+                        .admin_account_in_place(&mut con, admin_did_hash, admin_type)
+                        .await =>
+            {
+                warn!(
+                    "Database is full; admin account {admin_did_hash} already set up, not rewritten"
+                );
+            }
+            Err(err) => {
+                return Err(MediatorError::DatabaseError(
                     14,
                     "NA".to_string(),
                     format!("Failed to set up admin account for ({admin_did_hash}). Reason: {err}"),
-                )
-            })?;
+                ));
+            }
+        }
 
         info!("Admin account successfully setup: {}", admin_did_hash);
         Ok(())
+    }
+
+    /// Whether `did_hash` is already in the ADMINS set with role `admin_type`.
+    async fn admin_account_in_place(
+        &self,
+        con: &mut crate::database::RedisConnection,
+        did_hash: &str,
+        admin_type: AccountType,
+    ) -> bool {
+        let mut listed = redis::cmd("SISMEMBER");
+        listed.arg("ADMINS").arg(did_hash);
+        let mut role = redis::cmd("HGET");
+        role.arg(self.keys().did(did_hash)).arg("ROLE_TYPE");
+        let expected: String = admin_type.into();
+        matches!(
+            self.query_pair::<bool, Option<String>>(con, listed, role).await,
+            Ok((true, Some(current))) if current == expected
+        )
     }
 
     /// Checks if the provided DID is an admin level account

@@ -142,6 +142,13 @@ pub enum MediatorError {
     ),
 }
 
+/// Whether a database error's text says the database is full: it refuses
+/// writes once used memory passes its maximum (`OOM command not allowed when
+/// used memory > 'maxmemory'`), even a write that would change nothing.
+pub fn is_storage_full(text: &str) -> bool {
+    text.contains("command not allowed when used memory")
+}
+
 impl MediatorError {
     /// Name `msg_id` as the message this error answers, unless it already
     /// names one.
@@ -173,9 +180,7 @@ impl MediatorError {
     /// "Service temporarily unavailable" and a websocket client as nothing.
     pub fn named_storage_cap(self) -> Self {
         match self {
-            Self::DatabaseError(code, session, text)
-                if text.contains("command not allowed when used memory") =>
-            {
+            Self::DatabaseError(code, session, text) if is_storage_full(&text) => {
                 Self::problem_with_log(
                     97,
                     session,

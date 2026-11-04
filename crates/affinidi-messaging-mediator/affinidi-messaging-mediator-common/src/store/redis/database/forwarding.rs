@@ -3,7 +3,7 @@
 //! messages that need to be forwarded to remote mediators.
 
 use super::Database;
-use crate::errors::MediatorError;
+use crate::errors::{MediatorError, is_storage_full};
 use std::collections::HashMap;
 use tracing::{Level, debug, event, warn};
 
@@ -97,6 +97,17 @@ impl Database {
                 if err_str.contains("BUSYGROUP") {
                     debug!("Consumer group '{}' already exists", group_name);
                     Ok(())
+                } else if is_storage_full(&err_str)
+                    && self.forward_queue_group_exists(&mut conn, group_name).await
+                {
+                    // A full database refuses XGROUP CREATE even for a group
+                    // that exists, and this runs before every read: without
+                    // this check forwarding (which frees space) would stop.
+                    debug!(
+                        "Database is full; consumer group '{}' already exists",
+                        group_name
+                    );
+                    Ok(())
                 } else {
                     event!(Level::ERROR, "Couldn't create consumer group: {}", e);
                     Err(MediatorError::DatabaseError(
@@ -107,6 +118,27 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Whether FORWARD_Q has consumer group `group_name`.
+    async fn forward_queue_group_exists(
+        &self,
+        conn: &mut crate::database::RedisConnection,
+        group_name: &str,
+    ) -> bool {
+        let groups: Result<Vec<HashMap<String, redis::Value>>, _> = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg("FORWARD_Q")
+            .query_async(conn)
+            .await;
+        groups.is_ok_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("name")
+                    .and_then(|name| redis::from_redis_value::<String>(name.clone()).ok())
+                    .is_some_and(|name| name == group_name)
+            })
+        })
     }
 
     /// Blocking read from FORWARD_Q using consumer groups.
