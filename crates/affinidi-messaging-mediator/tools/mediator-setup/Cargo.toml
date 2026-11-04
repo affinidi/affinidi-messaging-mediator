@@ -43,7 +43,7 @@ publish-aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
 ## validated with the same rules the mediator applies at load (e.g.
 ## `validate::check_trust_xff_cidrs`), and the config-writer tests parse the
 ## generated TOML into `ConfigRaw` so the two can't drift apart.
-affinidi-messaging-mediator-config = { version = "0.50.0", path = "../../affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.51.0", path = "../../affinidi-messaging-mediator-config" }
 ## CIDR parsing for recipe `[output].trust_xff_cidrs`.
 ipnet = "2"
 # ── TUI Framework ────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ url = "2"
 # ── Affinidi TDK (DID generation, secrets, crypto) ──────────────────────
 ## Uses did-peer feature for did:peer generation. Does NOT depend on the
 ## mediator crate itself — only writes config files the mediator reads.
-affinidi-tdk = { version = "0.36", default-features = false, features = ["did-peer"] }
+affinidi-tdk = { version = "0.37", default-features = false, features = ["did-peer"] }
 affinidi-secrets-resolver = "0.5"
 ## did:key helpers used by the sealed-handoff full-setup path to derive
 ## the `client_did` from the ephemeral Ed25519 pubkey when signing a
@@ -86,7 +86,7 @@ affinidi-crypto = "0.2"
 ## mediator finds them at startup without any inline config plumbing.
 ## Backend selection flows through the wizard's own `secrets-*` features
 ## declared at the top of this file; no hardcoded list here.
-affinidi-messaging-mediator-common = { version = "0.50.0", path = "../../affinidi-messaging-mediator-common", default-features = false, features = [
+affinidi-messaging-mediator-common = { version = "0.51.0", path = "../../affinidi-messaging-mediator-common", default-features = false, features = [
   "server",
 ] }
 
