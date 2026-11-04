@@ -47,7 +47,7 @@ impl Database {
         let mut con = self.get_connection().await?;
 
         redis::cmd("EXISTS")
-            .arg(["DID:", did_hash].concat())
+            .arg(self.keys().did(did_hash))
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -71,8 +71,8 @@ impl Database {
 
         let (details, access_list_count): (HashMap<String, String>, u32) = redis::pipe()
             .atomic()
-            .hgetall(["DID:", did_hash].concat())
-            .scard(["ACCESS_LIST:", did_hash].concat())
+            .hgetall(self.keys().did(did_hash))
+            .scard(self.keys().access_list(did_hash))
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -116,7 +116,7 @@ impl Database {
                 .arg("KNOWN_DIDS")
                 .arg(did_hash)
                 .cmd("HSET")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .arg("SEND_QUEUE_BYTES")
                 .arg(0)
                 .arg("SEND_QUEUE_COUNT")
@@ -238,9 +238,9 @@ impl Database {
                 .arg("KNOWN_DIDS")
                 .arg(did_hash)
                 .cmd("DEL")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .cmd("DEL")
-                .arg(["ACCESS_LIST:", did_hash].concat())
+                .arg(self.keys().access_list(did_hash))
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -295,8 +295,8 @@ impl Database {
             let mut access_list_query = Pipeline::new();
             let access_list_query = access_list_query.atomic();
             for did in &dids {
-                did_query.add_command(redis::Cmd::hgetall(["DID:", did].concat()));
-                access_list_query.add_command(redis::Cmd::scard(["ACCESS_LIST:", did].concat()));
+                did_query.add_command(redis::Cmd::hgetall(self.keys().did(did)));
+                access_list_query.add_command(redis::Cmd::scard(self.keys().access_list(did)));
             }
 
             let did_results: Vec<HashMap<String, String>> =
@@ -363,7 +363,7 @@ impl Database {
             let mut con = self.get_connection().await?;
 
             redis::cmd("HSET")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .arg("ROLE_TYPE")
                 .arg::<String>(_type.to_owned().into())
                 .exec_async(&mut con)
@@ -436,7 +436,7 @@ impl Database {
             None => return Ok(()),
             Some(-2) => {
                 redis::cmd("HDEL")
-                    .arg(["DID:", did_hash].concat())
+                    .arg(self.keys().did(did_hash))
                     .arg(queue_name)
                     .exec_async(&mut con)
                     .await
@@ -450,7 +450,7 @@ impl Database {
             }
             Some(n) => {
                 redis::cmd("HSET")
-                    .arg(["DID:", did_hash].concat())
+                    .arg(self.keys().did(did_hash))
                     .arg(queue_name)
                     .arg(n)
                     .exec_async(&mut con)

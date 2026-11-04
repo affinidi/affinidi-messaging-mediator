@@ -29,8 +29,8 @@ impl Database {
             let mut conn = self.get_connection().await?;
 
             let key = match folder {
-                Folder::Inbox => format!("RECEIVE_Q:{did_hash}"),
-                Folder::Outbox => format!("SEND_Q:{did_hash}"),
+                Folder::Inbox => self.keys().receive_q(did_hash),
+                Folder::Outbox => self.keys().send_q(did_hash),
             };
 
             let (start, end) = if let Some((start, end)) = range {

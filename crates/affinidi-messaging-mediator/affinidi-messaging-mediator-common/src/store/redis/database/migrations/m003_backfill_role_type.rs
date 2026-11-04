@@ -40,7 +40,7 @@ pub(crate) async fn up(db: &Database, _config: &RedisInitConfig) -> Result<(), M
             // `_to_account` in `database/accounts.rs`). That means
             // `account.role` alone can't distinguish "field missing"
             // from "field set to Standard". Probe Redis directly.
-            let key = format!("DID:{}", account.did_hash);
+            let key = db.keys().did(&account.did_hash);
             let role: Option<String> = redis::cmd("HGET")
                 .arg(&key)
                 .arg("ROLE_TYPE")

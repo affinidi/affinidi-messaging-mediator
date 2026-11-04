@@ -111,7 +111,7 @@ impl Database {
             // never succeed.)
             let mut conn = self.get_connection().await?;
             let fields: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
-                .arg(["MSG:META:", message_hash].concat())
+                .arg(self.keys().msg_meta(message_hash))
                 .query_async(&mut conn)
                 .await
                 .map_err(|err| {

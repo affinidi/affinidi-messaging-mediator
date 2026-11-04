@@ -60,7 +60,7 @@ impl Database {
             .cmd("HGETALL")
             .arg(format!("SESSION:{session_id}"))
             .cmd("HMGET")
-            .arg(["DID:", &crate::did_identity::did_hash(did)].concat())
+            .arg(self.keys().did(&crate::did_identity::did_hash(did)))
             .arg("ROLE_TYPE")
             .arg("ACLS")
             .query_async(&mut con)

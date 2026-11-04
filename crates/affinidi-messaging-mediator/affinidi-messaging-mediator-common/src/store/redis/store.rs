@@ -75,18 +75,6 @@ fn stats_from_hash(fields: HashMap<String, i64>) -> AccountStats {
     stats
 }
 
-/// An account's activity times: a hash at `ACTIVITY:{did_hash}` with one field
-/// per [`ActivityKind`], so recording one never rewrites the other.
-fn activity_key(did_hash: &str) -> String {
-    format!("ACTIVITY:{did_hash}")
-}
-
-/// An account's lifetime counters: a hash at `STATS:{did_hash}`, one field
-/// per counter, so each bump is an `HINCRBY` and nothing is read-modified.
-fn stats_key(did_hash: &str) -> String {
-    format!("STATS:{did_hash}")
-}
-
 /// The two field names one counted message touches: the totals and the
 /// per-protocol split. `None` for a direction this store does not keep.
 fn stats_fields(delta: AccountStatsDelta) -> Option<(&'static str, &'static str, String)> {
@@ -198,6 +186,11 @@ impl RedisStore {
     pub fn with_pubsub_capacity(mut self, capacity: usize) -> Self {
         self.pubsub_capacity = capacity.max(1);
         self
+    }
+
+    /// Key names for the configured cluster mode.
+    pub(crate) fn keys(&self) -> crate::database::keys::Keys {
+        self.handler.keys
     }
 
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
@@ -471,7 +464,7 @@ impl MediatorStore for RedisStore {
         // rather than papered over.
         let mut exists_pipe = redis::pipe();
         for id in msg_ids {
-            exists_pipe.cmd("EXISTS").arg(["MSG:META:", id].concat());
+            exists_pipe.cmd("EXISTS").arg(self.keys().msg_meta(id));
         }
         let present: Vec<bool> = exists_pipe.query_async(&mut conn).await.map_err(|err| {
             MediatorError::DatabaseError(
@@ -492,7 +485,7 @@ impl MediatorStore for RedisStore {
                 continue;
             }
             marked.push(id);
-            let key = ["MSG:META:", id].concat();
+            let key = self.keys().msg_meta(id);
             // NOT `.ignore()`: the reply says whether this was the first
             // delivery (1) or a redelivery (0), which is what decides below
             // whether the expiry deadline moves. Reading it back beats
@@ -583,14 +576,11 @@ impl MediatorStore for RedisStore {
         let mut pipe = redis::pipe();
         for id in msg_ids {
             pipe.cmd("HMGET")
-                .arg(["MSG:META:", id].concat())
+                .arg(self.keys().msg_meta(id))
                 .arg("FROM")
                 .arg("FIRST_DELIVERED_AT");
             pipe.cmd("GET")
-                .arg(crate::database::delete::outbox_receipt_key(
-                    sender_did_hash,
-                    id,
-                ));
+                .arg(self.keys().outbox_receipt(sender_did_hash, id));
         }
         let replies: Vec<redis::Value> = pipe.query_async(&mut conn).await.map_err(|err| {
             MediatorError::DatabaseError(
@@ -627,7 +617,7 @@ impl MediatorStore for RedisStore {
 
     async fn delivery_state(&self, msg_id: &str) -> Result<Option<DeliveryState>, MediatorError> {
         let mut conn = self.get_connection().await?;
-        let key = ["MSG:META:", msg_id].concat();
+        let key = self.keys().msg_meta(msg_id);
 
         let fields: Vec<Option<String>> = redis::cmd("HMGET")
             .arg(&key)
@@ -684,7 +674,7 @@ impl MediatorStore for RedisStore {
         let mut pipe = redis::pipe();
         for id in msg_ids {
             pipe.cmd("HMGET")
-                .arg(["MSG:META:", id].concat())
+                .arg(self.keys().msg_meta(id))
                 .arg("FIRST_DELIVERED_AT")
                 .arg("DELIVERY_ATTEMPTS");
         }
@@ -832,7 +822,7 @@ impl MediatorStore for RedisStore {
         // field means nothing is queued for that pair.
         let mut conn = self.get_connection().await?;
         let queued: Option<i64> = redis::cmd("HGET")
-            .arg(format!("PEER_Q:{from_hash}"))
+            .arg(self.keys().peer_q(from_hash))
             .arg(to_hash)
             .query_async(&mut conn)
             .await
@@ -1076,8 +1066,8 @@ impl MediatorStore for RedisStore {
         // and its `DEL` below.
         let mut conn = self.get_connection().await?;
         if let Err(e) = redis::cmd("DEL")
-            .arg(activity_key(did_hash))
-            .arg(stats_key(did_hash))
+            .arg(self.keys().activity(did_hash))
+            .arg(self.keys().stats(did_hash))
             .exec_async(&mut conn)
             .await
         {
@@ -1101,8 +1091,8 @@ impl MediatorStore for RedisStore {
         if removed {
             let mut conn = self.get_connection().await?;
             if let Err(e) = redis::cmd("DEL")
-                .arg(activity_key(did_hash))
-                .arg(stats_key(did_hash))
+                .arg(self.keys().activity(did_hash))
+                .arg(self.keys().stats(did_hash))
                 .exec_async(&mut conn)
                 .await
             {
@@ -1138,7 +1128,7 @@ impl MediatorStore for RedisStore {
         // the legacy `account_change_type` + admin-set membership in
         // one atomic operation.
         let mut conn = self.get_connection().await?;
-        let key = format!("DID:{did_hash}");
+        let key = self.keys().did(did_hash);
         let role_str: String = account_type.to_owned().into();
 
         let mut pipe = redis::pipe();
@@ -1700,8 +1690,8 @@ impl MediatorStore for RedisStore {
                return redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) \
              end return 0",
         )
-        .key(format!("DID:{did_hash}"))
-        .key(activity_key(did_hash))
+        .key(self.keys().did(did_hash))
+        .key(self.keys().activity(did_hash))
         .arg(field)
         .arg(at)
         .invoke_async::<i64>(&mut conn)
@@ -1727,7 +1717,7 @@ impl MediatorStore for RedisStore {
         let mut pipe = redis::pipe();
         for hash in did_hashes {
             pipe.cmd("HMGET")
-                .arg(activity_key(hash))
+                .arg(self.keys().activity(hash))
                 .arg(ACTIVITY_RECEIVED)
                 .arg(ACTIVITY_AUTHENTICATED);
         }
@@ -1768,8 +1758,8 @@ impl MediatorStore for RedisStore {
              redis.call('HINCRBY', KEYS[2], ARGV[3], 1) \
              return 1",
         )
-        .key(format!("DID:{did_hash}"))
-        .key(stats_key(did_hash))
+        .key(self.keys().did(did_hash))
+        .key(self.keys().stats(did_hash))
         .arg(count)
         .arg(bytes)
         .arg(protocol)
@@ -1796,7 +1786,7 @@ impl MediatorStore for RedisStore {
         let mut conn = self.get_connection().await?;
         let mut pipe = redis::pipe();
         for hash in did_hashes {
-            pipe.cmd("HGETALL").arg(stats_key(hash));
+            pipe.cmd("HGETALL").arg(self.keys().stats(hash));
         }
         let rows: Vec<HashMap<String, i64>> = pipe.query_async(&mut conn).await.map_err(|e| {
             MediatorError::DatabaseError(14, "NA".into(), format!("reading account stats: {e}"))

@@ -42,7 +42,7 @@ impl DatabaseHandler {
             // library loads without complaint and would silently never write
             // it. A metadata read that fails only costs the receipt.
             let parties: Option<(String, String)> = redis::cmd("HMGET")
-                .arg(["MSG:META:", message_hash].concat())
+                .arg(self.keys.msg_meta(message_hash))
                 .arg("TO")
                 .arg("FROM")
                 .arg("SEND_ID")
@@ -170,7 +170,7 @@ impl DatabaseHandler {
             at_ms: now_ms(),
         };
         let written: Result<(), redis::RedisError> = redis::cmd("SET")
-            .arg(outbox_receipt_key(from, message_hash))
+            .arg(self.keys.outbox_receipt(from, message_hash))
             .arg(receipt.encode())
             .arg("EX")
             .arg(OUTBOX_RECEIPT_TTL.as_secs())
@@ -180,12 +180,6 @@ impl DatabaseHandler {
             warn!("Couldn't record the outbox receipt for message_hash({message_hash}): {err}");
         }
     }
-}
-
-/// Where a sender's receipt for one removed message lives. Keyed under the
-/// sender so no other account's lookup can reach it.
-pub(crate) fn outbox_receipt_key(from: &str, message_hash: &str) -> String {
-    ["RECEIPT:", from, ":", message_hash].concat()
 }
 
 fn now_ms() -> u64 {

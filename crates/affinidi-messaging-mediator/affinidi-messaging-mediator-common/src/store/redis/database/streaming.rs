@@ -71,7 +71,7 @@ impl Database {
         };
 
         match redis::cmd("HGET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .query_async::<Option<String>>(&mut conn)
             .await
@@ -212,10 +212,10 @@ impl Database {
         match redis::pipe()
             .atomic()
             .cmd("SADD")
-            .arg(["STREAMING_SESSIONS:", stream_uuid].concat())
+            .arg(self.keys().streaming_sessions(stream_uuid))
             .arg(did_hash)
             .cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":FALSE"].concat())
             .exec_async(&mut conn)
@@ -254,7 +254,7 @@ impl Database {
         let mut conn = self.get_connection().await?;
 
         match redis::cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":", "TRUE"].concat())
             .exec_async(&mut conn)
@@ -296,7 +296,7 @@ impl Database {
         let mut conn = self.get_connection().await?;
 
         match redis::cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":", "FALSE"].concat())
             .exec_async(&mut conn)
@@ -340,10 +340,10 @@ impl Database {
         match redis::pipe()
             .atomic()
             .cmd("SREM")
-            .arg(["STREAMING_SESSIONS:", stream_uuid].concat())
+            .arg(self.keys().streaming_sessions(stream_uuid))
             .arg(did_hash)
             .cmd("HDEL")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .exec_async(&mut conn)
             .await

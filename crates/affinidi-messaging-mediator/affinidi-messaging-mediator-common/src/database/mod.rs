@@ -6,6 +6,8 @@ pub mod config;
 
 #[cfg(feature = "redis-backend")]
 pub mod delete;
+#[cfg(feature = "redis-backend")]
+pub mod keys;
 
 #[cfg(feature = "redis-backend")]
 use crate::errors::MediatorError;
@@ -89,6 +91,8 @@ pub struct DatabaseHandler {
     connection: RedisConnection,
     /// Redis connection URL (kept for creating pub/sub and blocking connections).
     redis_url: String,
+    /// Key names for the configured `cluster_mode`.
+    pub(crate) keys: keys::Keys,
 }
 
 #[cfg(feature = "redis-backend")]
@@ -192,6 +196,7 @@ impl DatabaseHandler {
         let database = Self {
             connection,
             redis_url: config.database_url.clone(),
+            keys: keys::Keys::new(config.cluster_mode),
         };
 
         // Warn if Redis connection has no authentication

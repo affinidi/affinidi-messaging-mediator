@@ -35,7 +35,7 @@ impl Database {
             .arg(admin_did_hash)
             .ignore()
             .cmd("HSET")
-            .arg(["DID:", admin_did_hash].concat())
+            .arg(self.keys().did(admin_did_hash))
             .arg("ROLE_TYPE")
             .arg::<String>(admin_type.into())
             .ignore()
@@ -64,7 +64,7 @@ impl Database {
             .arg("ADMINS")
             .arg(did_hash)
             .cmd("HGET")
-            .arg(["DID:", did_hash].concat())
+            .arg(self.keys().did(did_hash))
             .arg("ROLE_TYPE")
             .query_async(&mut con)
             .await
@@ -168,7 +168,7 @@ impl Database {
             for account in &accounts {
                 tx = tx
                     .cmd("HSET")
-                    .arg(["DID:", account].concat())
+                    .arg(self.keys().did(account))
                     .arg("ROLE_TYPE")
                     .arg::<String>(AccountType::Standard.into());
             }

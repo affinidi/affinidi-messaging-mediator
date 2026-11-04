@@ -27,7 +27,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            redis::Cmd::hset(format!("DID:{did_hash}"), "ACLS", acls.to_hex_string())
+            redis::Cmd::hset(self.keys().did(did_hash), "ACLS", acls.to_hex_string())
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -57,7 +57,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            let acl: Option<String> = redis::Cmd::hget(format!("DID:{did_hash}"), "ACLS")
+            let acl: Option<String> = redis::Cmd::hget(self.keys().did(did_hash), "ACLS")
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -106,7 +106,7 @@ impl Database {
             query.atomic();
 
             for did in dids {
-                query.add_command(Cmd::hget(format!("DID:{did}"), "ACLS"));
+                query.add_command(Cmd::hget(self.keys().did(did), "ACLS"));
             }
 
             let result: Vec<Value> = query.query_async(&mut con).await.map_err(|err| {
@@ -181,10 +181,10 @@ impl Database {
             let (on_access_list, acl): (bool, Option<String>) = redis::pipe()
                 .atomic()
                 .cmd("SISMEMBER")
-                .arg(["ACCESS_LIST:", to_hash].concat())
+                .arg(self.keys().access_list(to_hash))
                 .arg(from_hash)
                 .cmd("HGET")
-                .arg(["DID:", to_hash].concat())
+                .arg(self.keys().did(to_hash))
                 .arg("ACLS")
                 .query_async(&mut con)
                 .await
@@ -201,7 +201,7 @@ impl Database {
             // Anonymous sender: the access list is irrelevant, only the
             // recipient's anon_receive bit matters — so skip the membership
             // probe and read the ACL alone.
-            let acl: Option<String> = Cmd::hget(["DID:", to_hash].concat(), "ACLS")
+            let acl: Option<String> = Cmd::hget(self.keys().did(to_hash), "ACLS")
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -255,7 +255,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             let (new_cursor, hashes): (u64, Vec<String>) = redis::cmd("SSCAN")
-                .arg(["ACCESS_LIST:", did_hash].concat())
+                .arg(self.keys().access_list(did_hash))
                 .arg(cursor)
                 .arg("COUNT")
                 .arg(100)
@@ -290,7 +290,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             redis::cmd("SCARD")
-                .arg(["ACCESS_LIST:", did_hash].concat())
+                .arg(self.keys().access_list(did_hash))
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -338,7 +338,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             let mut query = redis::cmd("SADD");
-            let mut query = query.arg(["ACCESS_LIST:", did_hash].concat());
+            let mut query = query.arg(self.keys().access_list(did_hash));
 
             for hash in hashes {
                 query = query.arg(hash);
@@ -383,7 +383,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             let mut query = redis::cmd("SREM");
-            let mut query = query.arg(["ACCESS_LIST:", did_hash].concat());
+            let mut query = query.arg(self.keys().access_list(did_hash));
 
             for hash in hashes {
                 query = query.arg(hash);
@@ -413,7 +413,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             redis::cmd("DEL")
-                .arg(["ACCESS_LIST:", did_hash].concat())
+                .arg(self.keys().access_list(did_hash))
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
@@ -450,7 +450,7 @@ impl Database {
 
             let mut con = self.get_connection().await?;
             let mut query = redis::cmd("SMISMEMBER");
-            let mut query = query.arg(["ACCESS_LIST:", did_hash].concat());
+            let mut query = query.arg(self.keys().access_list(did_hash));
 
             for hash in hashes {
                 query = query.arg(hash);
