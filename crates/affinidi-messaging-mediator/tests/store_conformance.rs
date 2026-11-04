@@ -1787,6 +1787,91 @@ async fn check_streaming_pubsub(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// The same message stored twice, one after the other and at the same time,
+/// is queued and counted once on each side; deleting it releases both sides.
+async fn check_repeated_store(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::DeletionAuthority;
+    use affinidi_messaging_mediator_common::types::messages::Folder;
+
+    let (to, from) = ("did_hash_repeat_to", "did_hash_repeat_from");
+    for did in [to, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let store_message = |body: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .store_message("s", body, to, Some(from), NEVER, 0)
+                .await
+                .expect("store_message")
+        }
+    };
+    let queued = |did: &'static str, folder: Folder| {
+        let store = store.clone();
+        async move {
+            let account = store
+                .account_get(did)
+                .await
+                .expect("account_get")
+                .expect("account present");
+            let listed = store
+                .list_messages(did, folder, None, 100)
+                .await
+                .expect("list_messages")
+                .len();
+            (
+                account.receive_queue_count,
+                account.send_queue_count,
+                listed,
+            )
+        }
+    };
+
+    let first = store_message("repeat-one-after-the-other").await;
+    assert_eq!(store_message("repeat-one-after-the-other").await, first);
+    let (a, b) = tokio::join!(
+        store_message("repeat-at-once"),
+        store_message("repeat-at-once")
+    );
+    assert_eq!(a, b, "both stores name the same message");
+
+    assert_eq!(
+        queued(to, Folder::Inbox).await,
+        (2, 0, 2),
+        "the recipient has each message queued and counted once"
+    );
+    assert_eq!(
+        queued(from, Folder::Outbox).await,
+        (0, 2, 2),
+        "the sender has each message queued and counted once"
+    );
+
+    for id in [&first, &a] {
+        store
+            .delete_message(
+                id,
+                DeletionAuthority::Owner {
+                    did_hash: to.to_string(),
+                },
+            )
+            .await
+            .expect("delete_message");
+    }
+    assert_eq!(
+        queued(to, Folder::Inbox).await,
+        (0, 0, 0),
+        "nothing is left queued"
+    );
+    assert_eq!(
+        queued(from, Folder::Outbox).await,
+        (0, 0, 0),
+        "nothing is left queued"
+    );
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -1797,6 +1882,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_login_session(store.clone()).await;
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
+    check_repeated_store(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -1913,6 +1999,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn streaming_pubsub() {
                 check_streaming_pubsub(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn repeated_store() {
+                check_repeated_store(ready($ctor).await).await;
             }
         }
     };

@@ -108,15 +108,16 @@ impl Database {
     /// `store_message` for cluster mode, as single-slot steps ordered so a
     /// failure part-way is harmless or repaired by a retry:
     ///
-    /// 1. body and metadata (nothing to do if already stored for this
+    /// 1. body, metadata and sender (nothing to do if already stored for this
     ///    recipient);
     /// 2. the expiry index, so the sweeper can reach the message from here on;
     /// 3. the recipient's inbox and the sender's outbox, concurrently — the
     ///    message is deliverable from here on;
-    /// 4. the queue ids on the metadata, which a delete needs;
+    /// 4. the queue ids on the metadata, for readers;
     /// 5. the global counters, best-effort.
     ///
-    /// Until step 4 the metadata has no inbox id, so a retry redoes the steps.
+    /// Every step is idempotent: steps 1–4 by the same message, so a retry or
+    /// the same message stored twice at once queues and counts it once.
     #[allow(clippy::too_many_arguments)]
     async fn store_message_in_steps(
         &self,
@@ -137,6 +138,7 @@ impl Database {
             .arg(message)
             .arg(bytes)
             .arg(to_did_hash)
+            .arg(from_hash)
             .invoke_async(conn)
             .await?;
         if written == 0 {
@@ -164,6 +166,7 @@ impl Database {
             ENQUEUE_INBOX
                 .key(keys.did(to_did_hash))
                 .key(keys.receive_q(to_did_hash))
+                .key(keys.receive_ids(to_did_hash))
                 .arg(message_hash)
                 .arg(bytes)
                 .arg(from_hash)
@@ -180,6 +183,7 @@ impl Database {
                 .key(keys.did(from_hash))
                 .key(keys.peer_q(from_hash))
                 .key(keys.send_q(from_hash))
+                .key(keys.send_ids(from_hash))
                 .arg(message_hash)
                 .arg(bytes)
                 .arg(to_did_hash)
@@ -192,12 +196,7 @@ impl Database {
 
         let mut ids = vec!["RECEIVE_ID".to_string(), receive_id];
         if let Some(send_id) = send_id {
-            ids.extend([
-                "FROM".to_string(),
-                from_hash.to_string(),
-                "SEND_ID".to_string(),
-                send_id,
-            ]);
+            ids.extend(["SEND_ID".to_string(), send_id]);
         }
         RECORD_QUEUE_IDS
             .key(keys.msg_meta(message_hash))
@@ -205,9 +204,9 @@ impl Database {
             .invoke_async::<i64>(conn)
             .await?;
 
+        // One key, so no MULTI: it would only add commands.
         let mut counted = redis::pipe();
         counted
-            .atomic()
             .cmd("HINCRBY")
             .arg("GLOBAL")
             .arg("RECEIVED_BYTES")

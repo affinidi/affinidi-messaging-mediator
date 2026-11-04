@@ -186,6 +186,9 @@ impl DatabaseHandler {
         // Check the version of Redis Server
         Self::check_server_version(&mut single.clone()).await?;
         Self::check_cluster_mode(&mut single.clone(), config.cluster_mode).await?;
+        if config.cluster_mode {
+            Self::check_single_endpoint(&mut single.clone()).await?;
+        }
 
         let connection = if config.cluster_mode {
             RedisConnection::Cluster(Self::connect_cluster(config).await?)
@@ -249,6 +252,63 @@ impl DatabaseHandler {
                 }
             }
         }
+    }
+
+    /// Refuses a cluster with more than one primary node. Cluster mode moves
+    /// only the main connection to a cluster client; the blocking reads and
+    /// pub/sub stay on a single-node connection. A single-endpoint cluster
+    /// (ElastiCache Serverless shows one virtual node) routes those, but a
+    /// multi-node one answers `MOVED` and forwarding would stop.
+    async fn check_single_endpoint(conn: &mut ConnectionManager) -> Result<(), MediatorError> {
+        let slots: Vec<Vec<Value>> = redis::cmd("CLUSTER")
+            .arg("SLOTS")
+            .query_async(conn)
+            .await
+            .map_err(|err| {
+                MediatorError::problem_with_log(
+                    6,
+                    "NA",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.res.storage.info",
+                    "Couldn't query database information. Reason: {1}",
+                    vec![err.to_string()],
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Couldn't query database information. Reason: {err}"),
+                )
+            })?;
+        // Each range is [start, end, primary, replicas...]; a primary is
+        // [host, port, ...].
+        let primaries: std::collections::HashSet<String> = slots
+            .iter()
+            .filter_map(|range| match range.get(2) {
+                Some(Value::Array(node)) => {
+                    let host = redis::from_redis_value::<String>(node.first()?.clone()).ok()?;
+                    let port = redis::from_redis_value::<i64>(node.get(1)?.clone()).ok()?;
+                    Some(format!("{host}:{port}"))
+                }
+                _ => None,
+            })
+            .collect();
+        if primaries.len() <= 1 {
+            return Ok(());
+        }
+        let count = primaries.len().to_string();
+        Err(MediatorError::problem_with_log(
+            2,
+            "NA",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "me.res.storage.config",
+            "database.cluster_mode (DATABASE_CLUSTER_MODE) supports a single-endpoint cluster such as ElastiCache Serverless; this cluster has {1} primary nodes",
+            vec![count.clone()],
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "database.cluster_mode (DATABASE_CLUSTER_MODE) supports a single-endpoint cluster such as ElastiCache Serverless; this cluster has {count} primary nodes"
+            ),
+        ))
     }
 
     /// Refuses to start when `cluster_mode` doesn't match the server.

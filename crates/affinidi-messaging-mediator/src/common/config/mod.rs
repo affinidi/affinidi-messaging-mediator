@@ -92,16 +92,8 @@ fn did_resolver_cache_config(raw: &DIDResolverConfig) -> DIDCacheConfig {
 fn database_config_from_raw(
     raw: affinidi_messaging_mediator_config::DatabaseConfigRaw,
 ) -> DatabaseConfig {
-    // Absent → false. A typo also falls back to false; the startup check then
-    // refuses a cluster-mode server, so it can't go unnoticed.
-    let cluster_mode = !raw.cluster_mode.is_empty()
-        && raw.cluster_mode.parse().unwrap_or_else(|_| {
-            warn!(
-                "Could not parse database.cluster_mode value '{}', using default: false",
-                raw.cluster_mode
-            );
-            false
-        });
+    let cluster_mode =
+        affinidi_messaging_mediator_common::database::config::parse_cluster_mode(&raw.cluster_mode);
     DatabaseConfig {
         functions_file: Some(raw.functions_file),
         database_url: raw.database_url,

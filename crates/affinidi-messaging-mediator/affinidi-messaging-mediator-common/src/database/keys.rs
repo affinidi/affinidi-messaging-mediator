@@ -57,6 +57,19 @@ impl Keys {
         self.tagged("SEND_Q:", did_hash)
     }
 
+    /// Inbox stream id of each message queued for an account, by message hash.
+    /// Cluster mode only: it makes a repeated store and delete idempotent in
+    /// the account's slot (the Lua library does this in one script).
+    pub fn receive_ids(self, did_hash: &str) -> String {
+        self.tagged("RECEIVE_IDS:", did_hash)
+    }
+
+    /// Outbox stream id of each message an account sent, by message hash.
+    /// Cluster mode only, as [`receive_ids`](Self::receive_ids).
+    pub fn send_ids(self, did_hash: &str) -> String {
+        self.tagged("SEND_IDS:", did_hash)
+    }
+
     /// Per-recipient queued-message counts of a sender.
     pub fn peer_q(self, did_hash: &str) -> String {
         self.tagged("PEER_Q:", did_hash)
@@ -193,6 +206,8 @@ mod tests {
             keys.receive_q(H),
             keys.send_q(H),
             keys.peer_q(H),
+            keys.receive_ids(H),
+            keys.send_ids(H),
             keys.stats(H),
             keys.activity(H),
             keys.v1_keys(H),

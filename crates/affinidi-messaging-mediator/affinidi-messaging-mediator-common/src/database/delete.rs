@@ -10,6 +10,12 @@ use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
 use axum::http::StatusCode;
 use tracing::{Instrument, Level, debug, info, span, warn};
 
+/// Attempts at releasing a deleted message's queues before the delete fails.
+const RELEASE_ATTEMPTS: u32 = 3;
+
+/// Pause before each further attempt, multiplied by the attempt number.
+const RELEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl DatabaseHandler {
     /// Deletes a message in the database.
     ///
@@ -144,12 +150,19 @@ impl DatabaseHandler {
         .await
     }
 
-    /// `delete_message` for cluster mode. Claims the message in its own slot
-    /// (ownership check, then removal), then releases the recipient's and
-    /// sender's queues concurrently, then the global counters. Once claimed
-    /// the message is gone, so a failed release is logged rather than
-    /// returned: it leaves a counter off by one and a queue entry whose
-    /// message is gone, which a fetch skips.
+    /// `delete_message` for cluster mode, in steps a repeated delete can finish:
+    ///
+    /// 1. claim the message in its own slot: check ownership and mark it as
+    ///    being deleted;
+    /// 2. release the recipient's and sender's queues concurrently, each
+    ///    finding its entry in its own slot and undoing only what was queued
+    ///    there (idempotent, so retried a few times);
+    /// 3. remove the message, and count it if this delete removed it.
+    ///
+    /// A failure returns an error and leaves the message marked, so the next
+    /// delete passes step 1 again and finishes: nothing is left counted for a
+    /// message that is gone. On a full database step 1's write is refused, so
+    /// the delete fails before changing anything, as the library's does.
     async fn delete_message_in_steps(
         &self,
         conn: &mut super::RedisConnection,
@@ -157,75 +170,106 @@ impl DatabaseHandler {
         did_hash: &str,
         admin_did_hash: Option<&str>,
     ) -> redis::RedisResult<String> {
-        use crate::store::redis::database::cluster_scripts::{
-            CLAIM_MESSAGE, RELEASE_INBOX, RELEASE_OUTBOX,
-        };
+        use crate::store::redis::database::cluster_scripts::CLAIM_MESSAGE;
 
         let keys = self.keys;
         let mut claim = CLAIM_MESSAGE.prepare_invoke();
         claim
-            .key(keys.msg(message_hash))
             .key(keys.msg_meta(message_hash))
             .arg(message_hash)
             .arg(did_hash);
         if let Some(admin_hash) = admin_did_hash {
             claim.arg(admin_hash);
         }
-        let (to, from, bytes, receive_id, send_id): (String, String, String, String, String) =
-            claim.invoke_async(conn).await?;
+        let (to, from, bytes): (String, String, String) = claim.invoke_async(conn).await?;
 
-        let mut inbox_conn = conn.clone();
-        let inbox = async {
-            if to.is_empty() {
-                return Ok(0);
-            }
-            RELEASE_INBOX
-                .key(keys.did(&to))
-                .key(keys.receive_q(&to))
-                .arg(&bytes)
-                .arg(&receive_id)
-                .invoke_async::<i64>(&mut inbox_conn)
-                .await
-        };
-        let mut outbox_conn = conn.clone();
-        let outbox = async {
-            if send_id.is_empty() {
-                return Ok(0);
-            }
-            RELEASE_OUTBOX
-                .key(keys.did(&from))
-                .key(keys.peer_q(&from))
-                .key(keys.send_q(&from))
-                .arg(&bytes)
-                .arg(&to)
-                .arg(&send_id)
-                .invoke_async::<i64>(&mut outbox_conn)
-                .await
-        };
-        let (inbox, outbox) = futures_util::future::join(inbox, outbox).await;
-        for (queue, released) in [("inbox", inbox), ("outbox", outbox)] {
-            if let Err(err) = released {
-                warn!(
-                    "Couldn't release the {queue} entry of deleted message {message_hash}: {err}"
-                );
+        for attempt in 1..=RELEASE_ATTEMPTS {
+            let (inbox, outbox) = futures_util::future::join(
+                self.release_inbox(conn.clone(), &to, message_hash, &bytes),
+                self.release_outbox(conn.clone(), &from, &to, message_hash, &bytes),
+            )
+            .await;
+            match inbox.and(outbox) {
+                Ok(_) => break,
+                Err(err) if attempt < RELEASE_ATTEMPTS => {
+                    warn!("Retrying the queue release of message {message_hash}: {err}");
+                    tokio::time::sleep(RELEASE_RETRY_DELAY * attempt).await;
+                }
+                Err(err) => return Err(err),
             }
         }
 
-        let mut counted = redis::pipe();
-        counted
-            .atomic()
-            .cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("DELETED_BYTES")
-            .arg(&bytes)
-            .cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("DELETED_COUNT")
-            .arg(1);
-        if let Err(err) = counted.exec_async(conn).await {
-            warn!("Couldn't count deleted message {message_hash}: {err}");
+        let removed: i64 = redis::cmd("DEL")
+            .arg(keys.msg(message_hash))
+            .arg(keys.msg_meta(message_hash))
+            .query_async(conn)
+            .await?;
+        if removed > 0 {
+            // One key, so no MULTI: it would only add commands.
+            let mut counted = redis::pipe();
+            counted
+                .cmd("HINCRBY")
+                .arg("GLOBAL")
+                .arg("DELETED_BYTES")
+                .arg(&bytes)
+                .cmd("HINCRBY")
+                .arg("GLOBAL")
+                .arg("DELETED_COUNT")
+                .arg(1);
+            if let Err(err) = counted.exec_async(conn).await {
+                warn!("Couldn't count deleted message {message_hash}: {err}");
+            }
         }
         Ok("OK".to_string())
+    }
+
+    /// Releases the recipient's inbox entry of a message being deleted.
+    async fn release_inbox(
+        &self,
+        mut conn: super::RedisConnection,
+        to: &str,
+        message_hash: &str,
+        bytes: &str,
+    ) -> redis::RedisResult<i64> {
+        use crate::store::redis::database::cluster_scripts::RELEASE_INBOX;
+
+        if to.is_empty() {
+            return Ok(0);
+        }
+        RELEASE_INBOX
+            .key(self.keys.did(to))
+            .key(self.keys.receive_q(to))
+            .key(self.keys.receive_ids(to))
+            .arg(message_hash)
+            .arg(bytes)
+            .invoke_async(&mut conn)
+            .await
+    }
+
+    /// Releases the sender's outbox entry of a message being deleted.
+    async fn release_outbox(
+        &self,
+        mut conn: super::RedisConnection,
+        from: &str,
+        to: &str,
+        message_hash: &str,
+        bytes: &str,
+    ) -> redis::RedisResult<i64> {
+        use crate::store::redis::database::cluster_scripts::RELEASE_OUTBOX;
+
+        if from.is_empty() {
+            return Ok(0);
+        }
+        RELEASE_OUTBOX
+            .key(self.keys.did(from))
+            .key(self.keys.peer_q(from))
+            .key(self.keys.send_q(from))
+            .key(self.keys.send_ids(from))
+            .arg(message_hash)
+            .arg(bytes)
+            .arg(to)
+            .invoke_async(&mut conn)
+            .await
     }
 
     /// Leave `from` a receipt saying why `message_hash` left its outbox.

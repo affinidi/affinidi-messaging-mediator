@@ -53,6 +53,20 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// Parses `[database] cluster_mode`. Absent (empty) is `false`; a value that
+/// is neither `true` nor `false` is warned about and taken as `false`, and the
+/// startup check then refuses a cluster-mode server, so a typo can't go
+/// unnoticed.
+pub fn parse_cluster_mode(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Could not parse database.cluster_mode value '{raw}', using default: false"
+            );
+            false
+        })
+}
+
 impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
     type Error = MediatorError;
 
@@ -61,7 +75,7 @@ impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
             functions_file: Some(raw.functions_file),
             database_url: raw.database_url,
             database_timeout: raw.database_timeout.parse().unwrap_or(2),
-            cluster_mode: raw.cluster_mode.parse().unwrap_or(false),
+            cluster_mode: parse_cluster_mode(&raw.cluster_mode),
             circuit_breaker_threshold: 5,
             circuit_breaker_recovery_secs: 10,
         })

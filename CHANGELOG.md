@@ -8,6 +8,36 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — Redis cluster mode, for ElastiCache Serverless
+
+- **`[database] cluster_mode` (`DATABASE_CLUSTER_MODE`), off by default.** On,
+  the mediator runs on a single-endpoint cluster-mode Valkey such as
+  ElastiCache Serverless: hash-tagged keys, a cluster client, single-slot
+  scripts instead of `FCALL` (serverless has no `FUNCTION`), and idempotent,
+  crash-safe steps where one operation spans slots. Off keeps today's key
+  layout and Lua functions. Startup refuses a setting that doesn't match the
+  server, and a cluster with more than one primary node. Limits (one slot's
+  throughput for the shared keys; TTL keys evicted before error 97) are in
+  `conf/mediator.toml`.
+
+### Changed
+
+- **Startup runs `CLUSTER INFO`** in both modes, so a database user that may
+  not run it can no longer start the mediator.
+- **A full or throttled database reaches clients as a named error** in both
+  modes: 97 `storage.full` (507) or 98 `storage.busy` (503), also over a
+  websocket, which got no reply before. A full database no longer stops a
+  restart or forwarding.
+- The server version check accepts a two-part `redis_version`; ElastiCache
+  Serverless reports `7.2`.
+
+### Breaking — `affinidi-messaging-mediator-common` API
+
+- `DatabaseHandler::get_async_connection` and `RedisStore::get_connection`
+  return `RedisConnection` (one server or a cluster) instead of
+  `ConnectionManager`, and `DatabaseConfig` has a new public field,
+  `cluster_mode`.
+
 ## 0.49.0 (release/0.49)
 
 ### Changed — dependencies to latest (breaking)

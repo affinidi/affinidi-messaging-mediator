@@ -214,7 +214,12 @@ impl RedisStore {
         if self.keys().cluster_mode() {
             let mut replies = Vec::new();
             for mut step in steps {
-                replies.extend(step.atomic().query_async::<Vec<Value>>(con).await?);
+                // A lone command is atomic already; MULTI/EXEC would only
+                // add two commands.
+                if step.len() > 1 {
+                    step.atomic();
+                }
+                replies.extend(step.query_async::<Vec<Value>>(con).await?);
             }
             Ok(replies)
         } else {
@@ -289,7 +294,6 @@ impl RedisStore {
             Entries,
             Entries,
         ) = redis::pipe()
-            .atomic()
             .cmd("HMGET")
             .arg(keys.did(did_hash))
             .arg("RECEIVE_QUEUE_COUNT")
