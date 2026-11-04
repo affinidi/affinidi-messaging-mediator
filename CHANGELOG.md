@@ -8,6 +8,20 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — container send-queue limits
+
+- The published container image now ships `queued_send_messages_soft = 2000`
+  and `queued_send_messages_hard = 10000`, matching the annotated template and
+  the Rust defaults. It shipped 200 and 1000, so every deployment ran a send
+  queue ten times tighter than the documented default while a code search
+  reported 2000, which is a trap for anyone sizing a deployment or reading a
+  `queue_max_saturation_ratio` against the wrong denominator. 200 is also tight
+  in practice: a sender whose recipients stop deleting fills it in seconds.
+  `queued_receive_messages_soft` and `_hard` are unchanged at 200 and 1000,
+  because the receive limits bound total storage and the send limits do not;
+  `queued_send_messages_per_peer` is unchanged at 50 and remains the gate that
+  catches one sender flooding one recipient.
+
 ## 0.50.0 (release/0.50)
 
 ### Changed — trust-tasks-rs 0.37 (breaking)

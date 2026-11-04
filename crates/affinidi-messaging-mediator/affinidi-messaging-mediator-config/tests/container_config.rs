@@ -22,6 +22,17 @@ fn container_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docker/conf/mediator.toml")
 }
 
+/// The annotated template, `conf/mediator.toml`, relative to this crate's manifest.
+fn template_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conf/mediator.toml")
+}
+
+/// A config's `[limits]` section as a TOML table, so two configs can be
+/// compared key by key.
+fn limits_table(raw: &ConfigRaw) -> toml::Table {
+    toml::Table::try_from(&raw.limits).expect("[limits] serialises to a TOML table")
+}
+
 #[test]
 fn container_mediator_toml_parses() {
     let path = container_config_path();
@@ -65,5 +76,54 @@ fn container_mediator_toml_parses() {
         "container backend must be file:// (cloud overrides it via \
          MEDIATOR_SECRETS_BACKEND), got '{}'",
         raw.secrets.backend
+    );
+}
+
+/// The image's `[limits]` must match the annotated template. The image config
+/// overwrites the template in the published container, so a limit that differs
+/// here is the one every container deployment actually runs, while the
+/// template, the Rust defaults and the docs all say otherwise. The send-queue
+/// limits shipped at 200 / 1000 against a documented 2000 / 10000 this way.
+///
+/// If the image needs a limit that differs on purpose, change the template too,
+/// or carve the key out here with a comment saying why.
+#[test]
+fn container_limits_match_template() {
+    let container = container_config_path();
+    let template = template_config_path();
+    if !container.exists() || !template.exists() {
+        eprintln!("skipping: container or template config not present (not a workspace checkout)");
+        return;
+    }
+
+    let parse = |path: &PathBuf| -> ConfigRaw {
+        let toml = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        parse_config(&toml)
+            .unwrap_or_else(|e| panic!("{} parses as ConfigRaw: {e}", path.display()))
+            .0
+    };
+    let image = limits_table(&parse(&container));
+    let documented = limits_table(&parse(&template));
+
+    let drift: Vec<String> = documented
+        .keys()
+        .chain(image.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| image.get(*key) != documented.get(*key))
+        .map(|key| {
+            format!(
+                "{key}: image {:?}, template {:?}",
+                image.get(key),
+                documented.get(key)
+            )
+        })
+        .collect();
+
+    assert!(
+        drift.is_empty(),
+        "docker/conf/mediator.toml [limits] drifted from conf/mediator.toml:\n  {}",
+        drift.join("\n  ")
     );
 }
