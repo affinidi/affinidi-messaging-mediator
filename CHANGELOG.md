@@ -8,6 +8,44 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — container send-queue limits
+
+- The published container image now ships `queued_send_messages_soft = 2000`
+  and `queued_send_messages_hard = 10000`, matching the annotated template and
+  the Rust defaults. It shipped 200 and 1000, so every deployment ran a send
+  queue ten times tighter than the documented default while a code search
+  reported 2000, which is a trap for anyone sizing a deployment or reading a
+  `queue_max_saturation_ratio` against the wrong denominator. 200 is also tight
+  in practice: a sender whose recipients stop deleting fills it in seconds.
+  `queued_receive_messages_soft` and `_hard` are unchanged at 200 and 1000,
+  because the receive limits bound total storage and the send limits do not;
+  `queued_send_messages_per_peer` is unchanged at 50 and remains the gate that
+  catches one sender flooding one recipient.
+
+## 0.50.0 (release/0.50)
+
+### Changed — trust-tasks-rs 0.37 (breaking)
+
+- **`trust-tasks-rs` / `trust-tasks-proof` 0.37, `affinidi-messaging-sdk`
+  0.45, `affinidi-tdk` 0.37, `affinidi-messaging-didcomm-service` 0.30.**
+  0.37 (trustoverip/dtgwg-trust-tasks-tf #1021) makes `validate_freshness`
+  honour a stated `expiresAt`. **Behaviour change:** a consequential task
+  that states an `expiresAt` is accepted until then, up to 30 days after its
+  `issuedAt`, instead of being refused 5 minutes after `issuedAt`. A task
+  without an `expiresAt` keeps the 5-minute window.
+
+### Fixed
+
+- **The replay record now lasts as long as the document is acceptable.** It
+  was kept until `issuedAt` + 5 minutes + skew, or a sooner `expiresAt`. Under
+  0.37 a document with a later `expiresAt` stays acceptable past that, so a
+  replay of it after the record was dropped would have executed again.
+  `retention_end` is now `FreshnessPolicy::record_expiry`, which the 30-day
+  horizon bounds.
+- `vta-sdk` still resolves `trust-tasks-rs` 0.36 (with `affinidi-messaging-sdk`
+  0.44 and `affinidi-tdk` 0.36) until the VTI moves to 0.37. No types cross
+  between the two, and the next `vta-sdk` release removes the second copies.
+
 ### Added — Redis cluster mode, for ElastiCache Serverless
 
 - **`[database] cluster_mode` (`DATABASE_CLUSTER_MODE`), off by default.** On,
