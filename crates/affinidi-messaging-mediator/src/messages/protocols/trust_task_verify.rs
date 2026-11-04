@@ -5,8 +5,10 @@
 //! `consume_inbound` pipeline cannot be applied per handler. This module runs
 //! the same §7.2 checks, in the same order, against the erased document:
 //!
-//! 1. **freshness** — `issuedAt` inside the acceptance window; a task whose spec
-//!    requires a proof or `issuedAt` gets the consequential (5-minute) bound;
+//! 1. **freshness** — the document inside its acceptance window; a task whose
+//!    spec requires a proof or `issuedAt` gets the consequential bound: five
+//!    minutes after `issuedAt`, or until a stated `expiresAt` up to thirty days
+//!    after it;
 //! 2. **identity** — an in-band `issuer` must be the transport-authenticated
 //!    sender, never someone else;
 //! 3. **proof** — a present `proof` must verify against the issuer's DID
@@ -241,8 +243,9 @@ fn is_consequential(policy: SpecPolicy) -> bool {
     policy.is_proof_required || policy.is_issued_at_required
 }
 
-/// The acceptance window: bounded (5 minutes, `issuedAt` required) for a
-/// consequential task, the framework default otherwise.
+/// The acceptance window: bounded for a consequential task (`issuedAt`
+/// required; 5 minutes after it, or a stated `expiresAt` clamped to 30 days
+/// after it), the framework default otherwise.
 fn freshness_for(policy: SpecPolicy) -> FreshnessPolicy {
     if is_consequential(policy) {
         FreshnessPolicy::consequential()
@@ -257,10 +260,7 @@ fn freshness_for(policy: SpecPolicy) -> FreshnessPolicy {
 ///
 /// The key is the **authenticated sender** plus the document `id`, hashed — a
 /// party can only ever burn its own ids. The record is kept until the end of
-/// the acceptance window: `issuedAt` + max age + skew, or `expiresAt` if that
-/// is sooner. A later `expiresAt` buys nothing, because the freshness check
-/// already refuses the document once the window closes — so a producer cannot
-/// make the mediator hold a record for longer than that.
+/// the acceptance window, which is what [`retention_end`] computes.
 async fn claim(
     doc: &TrustTask<Value>,
     policy: SpecPolicy,
@@ -297,15 +297,21 @@ async fn claim(
 }
 
 /// Until when the duplicate-execution record for `doc` must be kept: the end
-/// of its acceptance window, or its `expiresAt` if that comes first.
+/// of its acceptance window (Trust Tasks §7.2, *Bounding the record*).
+///
+/// That is `record_expiry`, never anything shorter. With a stated `expiresAt`
+/// the freshness check accepts the document until then, up to the policy's
+/// expiry horizon (30 days after `issuedAt`), whatever the maximum age; a
+/// record capped at `issuedAt` + max age would be dropped while the document
+/// is still acceptable, and a replay after that would run twice. The horizon
+/// is what stops a producer making the mediator hold a record for longer.
 fn retention_end(doc: &TrustTask<Value>, policy: SpecPolicy, now: DateTime<Utc>) -> DateTime<Utc> {
     let freshness = freshness_for(policy);
-    let window_end = doc.issued_at.unwrap_or(now)
-        + freshness.max_age.unwrap_or(DEFAULT_MAX_AGE)
-        + freshness.skew;
-    freshness
-        .record_expiry(doc, now)
-        .map_or(window_end, |expiry| expiry.min(window_end))
+    freshness.record_expiry(doc, now).unwrap_or_else(|| {
+        // No `expiresAt` and no maximum age: the framework default. Only a
+        // consequential task is recorded, and its policy sets both bounds.
+        doc.issued_at.unwrap_or(now) + DEFAULT_MAX_AGE + freshness.skew
+    })
 }
 
 /// The proof verifier: `eddsa` suites only, over keys the issuer's DID
@@ -402,20 +408,42 @@ mod tests {
     }
 
     #[test]
-    fn a_far_expires_at_cannot_stretch_the_replay_record() {
+    fn a_far_expires_at_is_held_to_the_expiry_horizon() {
         // A producer's `expiresAt` a year out must not make the mediator keep
-        // the record a year: freshness refuses the document after the window.
+        // the record a year: the document is acceptable only to the horizon.
         let (did, _) = did_key();
         let now = Utc::now();
         let mut doc = doc_json(ACCOUNT_UPDATE, &did, Some(now));
         doc["expiresAt"] = Value::String((now + TimeDelta::days(365)).to_rfc3339());
         let doc: TrustTask<Value> = serde_json::from_value(doc).unwrap();
         let end = retention_end(&doc, account_update_policy(), now);
-        assert!(end <= now + TimeDelta::minutes(10), "retained until {end}");
+        let horizon = doc.issued_at.unwrap() + trust_tasks_rs::DEFAULT_EXPIRY_HORIZON;
+        assert!(end >= horizon, "the record must outlast the horizon: {end}");
         assert!(
-            end >= now + TimeDelta::minutes(5),
-            "window must be covered: {end}"
+            end <= horizon + TimeDelta::minutes(5),
+            "retained until {end}"
         );
+    }
+
+    #[test]
+    fn the_replay_record_lasts_as_long_as_a_stated_expiry_is_accepted() {
+        // A day's `expiresAt` is accepted for the day, past the five-minute
+        // maximum age, so the record must last the day: a record dropped at
+        // five minutes would let a replay at an hour run twice.
+        let (did, _) = did_key();
+        let now = Utc::now();
+        let mut doc = doc_json(ACCOUNT_UPDATE, &did, Some(now));
+        let tomorrow = now + TimeDelta::days(1);
+        doc["expiresAt"] = Value::String(tomorrow.to_rfc3339());
+        let doc: TrustTask<Value> = serde_json::from_value(doc).unwrap();
+        let later = now + TimeDelta::hours(1);
+        assert!(
+            doc.validate_freshness(later, &freshness_for(account_update_policy()))
+                .is_ok(),
+            "an hour on, the document is still acceptable"
+        );
+        let end = retention_end(&doc, account_update_policy(), now);
+        assert_eq!(end.timestamp(), tomorrow.timestamp());
     }
 
     #[test]
