@@ -193,6 +193,30 @@ impl RedisStore {
         self.handler.keys
     }
 
+    /// Runs `steps` as one `MULTI`/`EXEC` with cluster mode off. With it on,
+    /// each step runs as its own `MULTI`/`EXEC`, in order, so a step's keys
+    /// must share a slot and the steps must be ordered so a failure between
+    /// them is harmless.
+    pub(crate) async fn exec_steps(
+        &self,
+        con: &mut RedisConnection,
+        steps: Vec<redis::Pipeline>,
+    ) -> redis::RedisResult<()> {
+        if self.keys().cluster_mode() {
+            for mut step in steps {
+                step.atomic().exec_async(con).await?;
+            }
+            Ok(())
+        } else {
+            let mut all = redis::pipe();
+            all.atomic();
+            for cmd in steps.iter().flat_map(|step| step.cmd_iter()) {
+                all.add_command(cmd.clone());
+            }
+            all.exec_async(con).await
+        }
+    }
+
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
     /// Protected by circuit breaker for fast-fail when Redis is unavailable.
     pub async fn get_connection(&self) -> Result<RedisConnection, MediatorError> {
@@ -1363,8 +1387,8 @@ impl MediatorStore for RedisStore {
         let key = format!("OOB_INVITES:{invite_hash}");
         let mut conn = self.get_connection().await?;
 
-        redis::pipe()
-            .atomic()
+        let mut invite = redis::pipe();
+        invite
             .cmd("HMSET")
             .arg(&key)
             .arg("INVITE")
@@ -1373,12 +1397,15 @@ impl MediatorStore for RedisStore {
             .arg(did_hash)
             .cmd("EXPIREAT")
             .arg(&key)
-            .arg(expires_at)
+            .arg(expires_at);
+        let mut counted = redis::pipe();
+        counted
             .cmd("HINCRBY")
             .arg("GLOBAL")
             .arg("OOB_INVITES_CREATED")
-            .arg(1)
-            .exec_async(&mut conn)
+            .arg(1);
+
+        self.exec_steps(&mut conn, vec![invite, counted])
             .await
             .map_err(|err| {
                 MediatorError::DatabaseError(

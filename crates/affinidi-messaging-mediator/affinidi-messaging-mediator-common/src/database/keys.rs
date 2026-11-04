@@ -24,6 +24,11 @@ impl Keys {
         }
     }
 
+    /// Whether cluster mode is on.
+    pub fn cluster_mode(self) -> bool {
+        self.cluster
+    }
+
     fn tagged(self, prefix: &str, tag: &str) -> String {
         if self.cluster {
             format!("{prefix}{{{tag}}}")

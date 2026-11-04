@@ -109,12 +109,10 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            let mut cmd = redis::pipe();
-            let mut cmd = cmd
-                .atomic()
-                .cmd("SADD")
-                .arg("KNOWN_DIDS")
-                .arg(did_hash)
+            // Record before list entry: a failure between them leaves an
+            // unlisted account, which the next add or login lists again.
+            let mut record = redis::pipe();
+            let cmd = record
                 .cmd("HSET")
                 .arg(self.keys().did(did_hash))
                 .arg("SEND_QUEUE_BYTES")
@@ -131,16 +129,21 @@ impl Database {
                 .arg(acls.to_hex_string());
 
             if let Some(queue_limit) = queue_limit {
-                cmd = cmd.arg("QUEUE_LIMIT").arg(queue_limit);
+                cmd.arg("QUEUE_LIMIT").arg(queue_limit);
             }
 
-            cmd.exec_async(&mut con).await.map_err(|err| {
-                MediatorError::DatabaseError(
-                    14,
-                    "NA".to_string(),
-                    format!("Failed to add account. Reason: {err}"),
-                )
-            })?;
+            let mut listed = redis::pipe();
+            listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
+
+            self.exec_steps(&mut con, vec![record, listed])
+                .await
+                .map_err(|err| {
+                    MediatorError::DatabaseError(
+                        14,
+                        "NA".to_string(),
+                        format!("Failed to add account. Reason: {err}"),
+                    )
+                })?;
             debug!("Account added successfully");
 
             Ok(Account {
