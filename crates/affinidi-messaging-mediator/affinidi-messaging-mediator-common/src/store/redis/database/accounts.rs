@@ -231,20 +231,19 @@ impl Database {
             // accepted for a mailbox that no longer exists.
             self.v1_routing_keys_purge(did_hash).await?;
 
-            // Remove from Known DIDs
-            // Remove DID Record
-            // Remove ACCESS_LIST Set
+            // Unlist before deleting the record (the reverse of `account_add`):
+            // a failure between them leaves an unlisted, already blocked
+            // account, which a retry removes.
             let mut con = self.get_connection().await?;
-            redis::pipe()
-                .atomic()
-                .cmd("SREM")
-                .arg("KNOWN_DIDS")
-                .arg(did_hash)
+            let mut unlisted = redis::pipe();
+            unlisted.cmd("SREM").arg("KNOWN_DIDS").arg(did_hash);
+            let mut records = redis::pipe();
+            records
                 .cmd("DEL")
                 .arg(self.keys().did(did_hash))
                 .cmd("DEL")
-                .arg(self.keys().access_list(did_hash))
-                .exec_async(&mut con)
+                .arg(self.keys().access_list(did_hash));
+            self.exec_steps(&mut con, vec![unlisted, records])
                 .await
                 .map_err(|err| {
                     MediatorError::DatabaseError(

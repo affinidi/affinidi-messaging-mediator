@@ -55,15 +55,15 @@ impl Database {
     pub async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
         let mut con = self.get_connection().await?;
 
-        let (session_db, did_db): (HashMap<String, String>, Vec<Option<String>>) = redis::pipe()
-            .atomic()
-            .cmd("HGETALL")
-            .arg(format!("SESSION:{session_id}"))
-            .cmd("HMGET")
+        let mut session_cmd = redis::cmd("HGETALL");
+        session_cmd.arg(format!("SESSION:{session_id}"));
+        let mut did_cmd = redis::cmd("HMGET");
+        did_cmd
             .arg(self.keys().did(&crate::did_identity::did_hash(did)))
             .arg("ROLE_TYPE")
-            .arg("ACLS")
-            .query_async(&mut con)
+            .arg("ACLS");
+        let (session_db, did_db): (HashMap<String, String>, Vec<Option<String>>) = self
+            .query_pair(&mut con, session_cmd, did_cmd)
             .await
             .map_err(|err| {
                 MediatorError::SessionError(

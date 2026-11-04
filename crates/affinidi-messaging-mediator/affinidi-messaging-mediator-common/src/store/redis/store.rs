@@ -217,6 +217,29 @@ impl RedisStore {
         }
     }
 
+    /// Runs two reads as one `MULTI`/`EXEC` with cluster mode off. With it on,
+    /// they run one after the other, so each read must touch one slot.
+    pub(crate) async fn query_pair<A: redis::FromRedisValue, B: redis::FromRedisValue>(
+        &self,
+        con: &mut RedisConnection,
+        first: redis::Cmd,
+        second: redis::Cmd,
+    ) -> redis::RedisResult<(A, B)> {
+        if self.keys().cluster_mode() {
+            Ok((
+                first.query_async(con).await?,
+                second.query_async(con).await?,
+            ))
+        } else {
+            redis::pipe()
+                .atomic()
+                .add_command(first)
+                .add_command(second)
+                .query_async(con)
+                .await
+        }
+    }
+
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
     /// Protected by circuit breaker for fast-fail when Redis is unavailable.
     pub async fn get_connection(&self) -> Result<RedisConnection, MediatorError> {
