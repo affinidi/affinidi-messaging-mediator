@@ -1,5 +1,7 @@
 use super::Database;
+use crate::database::RedisConnection;
 use crate::errors::MediatorError;
+use redis::Value;
 use std::fs::read_to_string;
 use tracing::{Level, event};
 
@@ -30,7 +32,7 @@ impl Database {
         match redis::cmd("FUNCTION")
             .arg("LOAD")
             .arg("REPLACE")
-            .arg(lua_scripts)
+            .arg(&lua_scripts)
             .exec_async(&mut conn)
             .await
         {
@@ -38,6 +40,20 @@ impl Database {
                 event!(
                     Level::INFO,
                     "Loaded LUA scripts into the database from file: {}",
+                    scripts_path
+                );
+                Ok(())
+            }
+            // A full database refuses FUNCTION LOAD (it is DENYOOM). That
+            // must not stop a restart when the library this build ships is
+            // already loaded: nothing would change by loading it again.
+            Err(err)
+                if err.code() == Some("OOM")
+                    && loaded_library_matches(&mut conn, &lua_scripts).await =>
+            {
+                event!(
+                    Level::WARN,
+                    "Database is full and refused FUNCTION LOAD, but the loaded library already matches {}; continuing",
                     scripts_path
                 );
                 Ok(())
@@ -55,5 +71,78 @@ impl Database {
                 ))
             }
         }
+    }
+}
+
+/// True when the server already holds the `atm` library with exactly
+/// `expected` as its code.
+async fn loaded_library_matches(conn: &mut RedisConnection, expected: &str) -> bool {
+    let reply: Result<Value, _> = redis::cmd("FUNCTION")
+        .arg("LIST")
+        .arg("LIBRARYNAME")
+        .arg("atm")
+        .arg("WITHCODE")
+        .query_async(conn)
+        .await;
+    match reply {
+        Ok(value) => find_library_code(&value).as_deref() == Some(expected),
+        Err(_) => false,
+    }
+}
+
+/// Finds the `library_code` field in a FUNCTION LIST reply (RESP2 flat
+/// arrays or RESP3 maps).
+fn find_library_code(value: &Value) -> Option<String> {
+    let text = |v: &Value| redis::from_redis_value::<String>(v.clone()).ok();
+    match value {
+        Value::Array(items) => {
+            for pair in items.windows(2) {
+                if text(&pair[0]).as_deref() == Some("library_code") {
+                    return text(&pair[1]);
+                }
+            }
+            items.iter().find_map(find_library_code)
+        }
+        Value::Map(entries) => entries.iter().find_map(|(k, v)| {
+            if text(k).as_deref() == Some("library_code") {
+                text(v)
+            } else {
+                find_library_code(v)
+            }
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_library_code;
+    use redis::Value;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn finds_library_code_in_resp2_reply() {
+        let reply = Value::Array(vec![Value::Array(vec![
+            bulk("library_name"),
+            bulk("atm"),
+            bulk("engine"),
+            bulk("LUA"),
+            bulk("functions"),
+            Value::Array(vec![]),
+            bulk("library_code"),
+            bulk("#!lua name=atm\n"),
+        ])]);
+        assert_eq!(
+            find_library_code(&reply).as_deref(),
+            Some("#!lua name=atm\n")
+        );
+    }
+
+    #[test]
+    fn missing_library_has_no_code() {
+        assert_eq!(find_library_code(&Value::Array(vec![])), None);
     }
 }

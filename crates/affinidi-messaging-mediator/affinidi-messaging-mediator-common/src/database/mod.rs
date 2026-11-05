@@ -188,6 +188,20 @@ impl DatabaseHandler {
         Self::check_cluster_mode(&mut single.clone(), config.cluster_mode).await?;
         if config.cluster_mode {
             Self::check_single_endpoint(&mut single.clone()).await?;
+            if is_replica(&mut single.clone()).await {
+                return Err(MediatorError::problem_with_log(
+                    2,
+                    "NA",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.res.storage.config",
+                    "database.cluster_mode (DATABASE_CLUSTER_MODE) needs database_url to reach the primary node; it reached a replica",
+                    Vec::<String>::new(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database.cluster_mode (DATABASE_CLUSTER_MODE) needs database_url to reach the primary node; it reached a replica".to_string(),
+                ));
+            }
         }
 
         let connection = if config.cluster_mode {
@@ -204,8 +218,76 @@ impl DatabaseHandler {
 
         // Warn if Redis connection has no authentication
         database.check_auth_warning(&config.database_url);
+        database.check_key_layout().await?;
 
         Ok(database)
+    }
+
+    /// Refuses to start on data written under the other `cluster_mode`.
+    ///
+    /// Cluster mode stores per-account keys under hash-tagged names
+    /// (`DID:{h}`), while `KNOWN_DIDS` keeps the same name in both modes. So
+    /// flipping the setting on an existing dataset would silently orphan
+    /// every account and message. Samples a few known accounts and refuses
+    /// when none exists under this mode's names but some exist under the
+    /// other's. An empty or unreadable `KNOWN_DIDS` passes.
+    async fn check_key_layout(&self) -> Result<(), MediatorError> {
+        let mut conn = self.connection.clone();
+        let sample: Vec<String> = match redis::cmd("SRANDMEMBER")
+            .arg("KNOWN_DIDS")
+            .arg(5)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(sample) => sample,
+            Err(err) => {
+                warn!("Couldn't sample KNOWN_DIDS to check the key layout: {err}");
+                return Ok(());
+            }
+        };
+        let other = keys::Keys::new(!self.keys.cluster_mode());
+        let (mut here, mut there) = (0, 0);
+        for did_hash in &sample {
+            let exists = |key: String| {
+                let mut conn = conn.clone();
+                async move {
+                    redis::cmd("EXISTS")
+                        .arg(key)
+                        .query_async::<i64>(&mut conn)
+                        .await
+                        .unwrap_or(0)
+                        > 0
+                }
+            };
+            if exists(self.keys.did(did_hash)).await {
+                here += 1;
+            } else if exists(other.did(did_hash)).await {
+                there += 1;
+            }
+        }
+        if here > 0 || there == 0 {
+            return Ok(());
+        }
+        let (setting, written) = if self.keys.cluster_mode() {
+            ("true", "false")
+        } else {
+            ("false", "true")
+        };
+        let text = format!(
+            "database.cluster_mode (DATABASE_CLUSTER_MODE) is {setting}, but the existing accounts were written with cluster_mode {written}; their data would be unreachable. Keep cluster_mode {written}, or migrate the data first"
+        );
+        Err(MediatorError::problem_with_log(
+            2,
+            "NA",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "me.res.storage.config",
+            "{1}",
+            vec![text.clone()],
+            StatusCode::INTERNAL_SERVER_ERROR,
+            text,
+        ))
     }
 
     /// Returns a clone of the auto-reconnecting multiplexed connection.
@@ -313,32 +395,55 @@ impl DatabaseHandler {
 
     /// Refuses to start when `cluster_mode` doesn't match the server.
     ///
-    /// Uses `CLUSTER INFO`: ElastiCache Serverless supports it, and a
-    /// non-cluster server rejects it with "cluster support disabled".
+    /// With `cluster_mode` off this must never get in the way of a server
+    /// that worked before cluster mode existed: it reads `cluster_enabled`
+    /// from `INFO cluster` (no extra ACL permission, no error-text matching)
+    /// and only refuses on a definite `cluster_enabled:1`. Any error or a
+    /// missing field means "not a cluster".
+    ///
+    /// With `cluster_mode` on it uses `CLUSTER INFO`, which ElastiCache
+    /// Serverless supports (its `INFO` may not report `cluster_enabled`).
     async fn check_cluster_mode(
         conn: &mut ConnectionManager,
         cluster_mode: bool,
     ) -> Result<(), MediatorError> {
-        let server_is_cluster = match redis::cmd("CLUSTER")
-            .arg("INFO")
-            .query_async::<String>(conn)
-            .await
-        {
-            Ok(_) => true,
-            Err(err) if err.to_string().contains("cluster support disabled") => false,
-            Err(err) => {
-                return Err(MediatorError::problem_with_log(
-                    6,
-                    "NA",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.info",
-                    "Couldn't query database information. Reason: {1}",
-                    vec![err.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Couldn't query database information. Reason: {err}"),
-                ));
+        let server_is_cluster = if cluster_mode {
+            match redis::cmd("CLUSTER")
+                .arg("INFO")
+                .query_async::<String>(conn)
+                .await
+            {
+                Ok(_) => true,
+                Err(err) if err.to_string().contains("cluster support disabled") => false,
+                Err(err) => {
+                    return Err(MediatorError::problem_with_log(
+                        6,
+                        "NA",
+                        None,
+                        ProblemReportSorter::Error,
+                        ProblemReportScope::Protocol,
+                        "me.res.storage.info",
+                        "Couldn't query database information. Reason: {1}",
+                        vec![err.to_string()],
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Couldn't query database information. Reason: {err}"),
+                    ));
+                }
+            }
+        } else {
+            match redis::cmd("INFO")
+                .arg("cluster")
+                .query_async::<String>(conn)
+                .await
+            {
+                Ok(info) => info_reports_cluster_enabled(&info),
+                Err(err) => {
+                    event!(
+                        Level::DEBUG,
+                        "Couldn't read INFO cluster ({err}); assuming the server is not a cluster"
+                    );
+                    false
+                }
             }
         };
 
@@ -388,7 +493,7 @@ impl DatabaseHandler {
         })?;
 
         let config = AsyncConnectionConfig::new().set_response_timeout(None);
-        client
+        let mut conn = client
             .get_multiplexed_async_connection_with_config(&config)
             .await
             .map_err(|err| {
@@ -404,7 +509,25 @@ impl DatabaseHandler {
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("Can't establish blocking database connection. Reason: {err}"),
                 )
-            })
+            })?;
+        // In cluster mode this plain connection goes to whichever node the
+        // endpoint resolves to. XREADGROUP writes, so a replica would answer
+        // MOVED/READONLY; refuse it and let the caller's retry reconnect.
+        if self.keys.cluster_mode() && is_replica(&mut conn).await {
+            return Err(MediatorError::problem_with_log(
+                11,
+                "NA",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "me.res.storage.connection.blocking",
+                "Can't establish blocking database connection. Reason: {1}",
+                vec!["the endpoint resolved to a replica node".into()],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Can't establish blocking database connection. Reason: the endpoint resolved to a replica node".to_string(),
+            ));
+        }
+        Ok(conn)
     }
 
     /// Returns a redis database connector or returns an Error
@@ -599,5 +722,48 @@ mod tests {
     fn server_version_garbage_is_rejected() {
         assert!(parse_server_version("7").is_err());
         assert!(parse_server_version("seven.two").is_err());
+    }
+}
+
+/// True only when the node definitely reports itself a replica. A server
+/// that doesn't support `ROLE` (some proxies, ElastiCache Serverless) is
+/// taken as a primary, so this never refuses a working endpoint.
+#[cfg(feature = "redis-backend")]
+async fn is_replica<C: redis::aio::ConnectionLike>(conn: &mut C) -> bool {
+    match redis::cmd("ROLE").query_async::<Value>(conn).await {
+        Ok(Value::Array(items)) => items.first().is_some_and(|role| {
+            matches!(
+                redis::from_redis_value::<String>(role.clone()).as_deref(),
+                Ok("slave" | "replica")
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// True only when an `INFO cluster` reply says `cluster_enabled:1`.
+#[cfg(feature = "redis-backend")]
+fn info_reports_cluster_enabled(info: &str) -> bool {
+    info.lines()
+        .filter_map(|line| line.trim().strip_prefix("cluster_enabled:"))
+        .any(|value| value.trim() == "1")
+}
+
+#[cfg(all(test, feature = "redis-backend"))]
+mod cluster_detection_tests {
+    use super::info_reports_cluster_enabled;
+
+    #[test]
+    fn info_cluster_enabled_parsing() {
+        assert!(info_reports_cluster_enabled(
+            "# Cluster\r\ncluster_enabled:1\r\n"
+        ));
+        assert!(!info_reports_cluster_enabled(
+            "# Cluster\r\ncluster_enabled:0\r\n"
+        ));
+        assert!(!info_reports_cluster_enabled(""));
+        assert!(!info_reports_cluster_enabled(
+            "# Server\r\nredis_version:7.2.0\r\n"
+        ));
     }
 }

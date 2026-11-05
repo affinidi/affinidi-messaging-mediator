@@ -1872,6 +1872,67 @@ async fn check_repeated_store(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// Several deletes of one message at once: exactly one removes it and the
+/// rest find it gone (R1.7), and nothing is left queued or counted. The
+/// Redis library is atomic; cluster mode must give the same answer.
+async fn check_concurrent_delete(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::DeletionAuthority;
+    use affinidi_messaging_mediator_common::store::ops::is_delete_not_found;
+
+    let (to, from) = ("did_hash_concurrent_to", "did_hash_concurrent_from");
+    for did in [to, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    for round in 0..5 {
+        let body = format!("concurrent-delete-{round}");
+        let id = store
+            .store_message("s", &body, to, Some(from), NEVER, 0)
+            .await
+            .expect("store_message");
+        let delete = |did: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .delete_message(
+                        &id,
+                        DeletionAuthority::Owner {
+                            did_hash: did.to_string(),
+                        },
+                    )
+                    .await
+            }
+        };
+        let results = [delete(to), delete(from), delete(to), delete(from)];
+        let results = futures_util::future::join_all(results).await;
+        let removed = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(removed, 1, "round {round}: exactly one delete removes it");
+        for result in &results {
+            if let Err(err) = result {
+                assert!(
+                    is_delete_not_found(err),
+                    "round {round}: the others find it gone, got {err}"
+                );
+            }
+        }
+    }
+    for did in [to, from] {
+        let account = store
+            .account_get(did)
+            .await
+            .expect("account_get")
+            .expect("account present");
+        assert_eq!(
+            (account.receive_queue_count, account.send_queue_count),
+            (0, 0),
+            "nothing is left counted for {did}"
+        );
+    }
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -1883,6 +1944,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
     check_repeated_store(store.clone()).await;
+    check_concurrent_delete(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -2003,6 +2065,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn repeated_store() {
                 check_repeated_store(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn concurrent_delete() {
+                check_concurrent_delete(ready($ctor).await).await;
             }
         }
     };

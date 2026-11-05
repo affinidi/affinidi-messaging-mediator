@@ -253,7 +253,8 @@ impl RedisStore {
     }
 
     /// Runs two reads as one `MULTI`/`EXEC` with cluster mode off. With it on,
-    /// they run one after the other, so each read must touch one slot.
+    /// they run concurrently (one round trip), so each read must touch one
+    /// slot and neither may depend on the other.
     pub(crate) async fn query_pair<A: redis::FromRedisValue, B: redis::FromRedisValue>(
         &self,
         con: &mut RedisConnection,
@@ -261,10 +262,13 @@ impl RedisStore {
         second: redis::Cmd,
     ) -> redis::RedisResult<(A, B)> {
         if self.keys().cluster_mode() {
-            Ok((
-                first.query_async(con).await?,
-                second.query_async(con).await?,
-            ))
+            let mut first_con = con.clone();
+            let mut second_con = con.clone();
+            futures_util::future::try_join(
+                async move { first.query_async(&mut first_con).await },
+                async move { second.query_async(&mut second_con).await },
+            )
+            .await
         } else {
             redis::pipe()
                 .atomic()
@@ -700,24 +704,29 @@ impl MediatorStore for RedisStore {
         // sooner simply keeps it.
         let deadline = now_ms / 1_000 + delivered_ttl_secs;
         let slot_key = format!("MSG_EXPIRY:{deadline}");
-        let mut expiry_pipe = redis::pipe();
-        let mut moving = false;
-        for (id, first_delivery) in marked.iter().zip(stamped) {
-            if !first_delivery {
-                continue;
-            }
-            moving = true;
-            report.expiry_advanced += 1;
-            expiry_pipe
-                .cmd("ZADD")
-                .arg("MSG_EXPIRY")
-                .arg("NX")
-                .arg(deadline)
-                .arg(&slot_key)
-                .ignore();
-            expiry_pipe.cmd("SADD").arg(&slot_key).arg(*id).ignore();
+        let moving: Vec<&String> = marked
+            .iter()
+            .zip(stamped)
+            .filter(|(_, first_delivery)| *first_delivery)
+            .map(|(id, _)| *id)
+            .collect();
+        if moving.is_empty() {
+            return Ok(report);
         }
-        if moving && let Err(err) = self.query_each::<Value>(&mut conn, expiry_pipe).await {
+        report.expiry_advanced = moving.len();
+        // Index before bucket, as `store_message` keeps them: a failure
+        // between the steps leaves an empty bucket in the index, which the
+        // sweeper passes over, never ids in a bucket it can't reach.
+        let mut index = redis::pipe();
+        index
+            .cmd("ZADD")
+            .arg("MSG_EXPIRY")
+            .arg("NX")
+            .arg(deadline)
+            .arg(&slot_key);
+        let mut bucket = redis::pipe();
+        bucket.cmd("SADD").arg(&slot_key).arg(&moving);
+        if let Err(err) = self.exec_steps(&mut conn, vec![index, bucket]).await {
             warn!("Couldn't bring delivered-message expiry forward: {err}");
             report.expiry_advanced = 0;
         }
@@ -2050,6 +2059,11 @@ impl MediatorStore for RedisStore {
 
         for key in &timeslot_keys {
             let mut conn = self.get_connection().await?;
+            // Messages whose delete failed for a reason other than being
+            // gone already. SPOP took them out of the bucket, so they go
+            // back once it is drained and the bucket stays indexed for the
+            // next pass; otherwise nothing would ever expire them.
+            let mut retry_later: Vec<String> = Vec::new();
             loop {
                 let msg_id: Option<String> = redis::cmd("SPOP")
                     .arg(key)
@@ -2081,8 +2095,26 @@ impl MediatorStore for RedisStore {
                                 observe(&msg_id, meta);
                             }
                         }
-                        Err(_) => report.already_deleted += 1,
+                        Err(err) if ops::is_delete_not_found(&err) => report.already_deleted += 1,
+                        Err(err) => {
+                            warn!("Couldn't expire message {msg_id}, retrying next sweep: {err}");
+                            retry_later.push(msg_id);
+                        }
                     }
+                } else if !retry_later.is_empty() {
+                    redis::cmd("SADD")
+                        .arg(key)
+                        .arg(&retry_later)
+                        .exec_async(&mut conn)
+                        .await
+                        .map_err(|err| {
+                            MediatorError::DatabaseError(
+                                14,
+                                "expiry".into(),
+                                format!("sweep_expired_messages SADD failed: {err}"),
+                            )
+                        })?;
+                    break;
                 } else {
                     redis::cmd("ZREM")
                         .arg("MSG_EXPIRY")

@@ -31,8 +31,10 @@ pub struct DatabaseConfig {
     pub database_url: String,
     pub database_timeout: u32,
     /// Use a cluster client. Startup refuses a server whose cluster mode
-    /// differs (ElastiCache Serverless is always cluster mode).
-    #[serde(default)]
+    /// differs (ElastiCache Serverless is always cluster mode). Accepts a
+    /// bool or the string form `mediator.toml` documents (`"true"`), so the
+    /// standalone processors read the same value.
+    #[serde(default, deserialize_with = "bool_or_string")]
     pub cluster_mode: bool,
     /// Number of consecutive failures before the circuit breaker opens
     pub circuit_breaker_threshold: u32,
@@ -51,6 +53,20 @@ impl Default for DatabaseConfig {
             circuit_breaker_recovery_secs: 10,
         }
     }
+}
+
+/// Reads `cluster_mode` written either as `true` or as `"true"`.
+fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Bool(bool),
+        Text(String),
+    }
+    Ok(match Flag::deserialize(deserializer)? {
+        Flag::Bool(value) => value,
+        Flag::Text(text) => parse_cluster_mode(&text),
+    })
 }
 
 /// Parses `[database] cluster_mode`. Absent (empty) is `false`; a value that
@@ -79,5 +95,29 @@ impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_recovery_secs: 10,
         })
+    }
+}
+
+#[cfg(test)]
+mod cluster_mode_tests {
+    use super::DatabaseConfig;
+
+    fn parse(field: &str) -> bool {
+        let text = format!(
+            r#"{{"functions_file":"f","database_url":"redis://x/","database_timeout":2,
+               "circuit_breaker_threshold":5,"circuit_breaker_recovery_secs":10{field}}}"#
+        );
+        serde_json::from_str::<DatabaseConfig>(&text)
+            .unwrap()
+            .cluster_mode
+    }
+
+    #[test]
+    fn cluster_mode_accepts_bool_and_string() {
+        assert!(parse(r#","cluster_mode":true"#));
+        assert!(parse(r#","cluster_mode":"true""#));
+        assert!(!parse(r#","cluster_mode":"false""#));
+        assert!(!parse(r#","cluster_mode":false"#));
+        assert!(!parse(""));
     }
 }

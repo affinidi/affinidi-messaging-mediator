@@ -1,7 +1,9 @@
 use std::time::Instant;
 
 use super::Database;
-use super::cluster_scripts::{ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_MESSAGE};
+use super::cluster_scripts::{
+    DELETE_LEASE_MS, ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_MESSAGE,
+};
 use crate::database::RedisConnection;
 use crate::errors::MediatorError;
 
@@ -108,16 +110,19 @@ impl Database {
     /// `store_message` for cluster mode, as single-slot steps ordered so a
     /// failure part-way is harmless or repaired by a retry:
     ///
-    /// 1. body, metadata and sender (nothing to do if already stored for this
-    ///    recipient);
+    /// 1. body, metadata and sender, marked `STORING` so no delete can run
+    ///    until step 4 (nothing to do if already stored for this recipient;
+    ///    refused while a delete holds the message);
     /// 2. the expiry index, so the sweeper can reach the message from here on;
-    /// 3. the recipient's inbox and the sender's outbox, concurrently — the
-    ///    message is deliverable from here on;
-    /// 4. the queue ids on the metadata, for readers;
-    /// 5. the global counters, best-effort.
+    /// 3. the recipient's inbox and the sender's outbox, concurrently;
+    /// 4. the queue ids on the metadata, clearing `STORING` — the message is
+    ///    deletable from here on. Refused if a delete took the message over,
+    ///    which fails the store;
+    /// 5. the global counters, best-effort, only for a newly written message
+    ///    so a retry or a concurrent identical store counts it once.
     ///
-    /// Every step is idempotent: steps 1–4 by the same message, so a retry or
-    /// the same message stored twice at once queues and counts it once.
+    /// Steps 1–4 are idempotent by message, so a retry or the same message
+    /// stored twice at once queues and counts it once.
     #[allow(clippy::too_many_arguments)]
     async fn store_message_in_steps(
         &self,
@@ -139,6 +144,7 @@ impl Database {
             .arg(bytes)
             .arg(to_did_hash)
             .arg(from_hash)
+            .arg(DELETE_LEASE_MS)
             .invoke_async(conn)
             .await?;
         if written == 0 {
@@ -198,11 +204,23 @@ impl Database {
         if let Some(send_id) = send_id {
             ids.extend(["SEND_ID".to_string(), send_id]);
         }
-        RECORD_QUEUE_IDS
+        let recorded: i64 = RECORD_QUEUE_IDS
             .key(keys.msg_meta(message_hash))
             .arg(ids)
-            .invoke_async::<i64>(conn)
+            .invoke_async(conn)
             .await?;
+        if recorded == 0 {
+            // A delete took the message over (its store outlived the
+            // lease). Whatever it queued, the message isn't stored.
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "DELETED_WHILE_STORING",
+                format!("message {message_hash} was deleted before its store completed"),
+            )));
+        }
+        if written != 1 {
+            return Ok(());
+        }
 
         // One key, so no MULTI: it would only add commands.
         let mut counted = redis::pipe();

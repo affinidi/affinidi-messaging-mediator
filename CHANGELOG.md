@@ -54,18 +54,34 @@ mediator-tui 0.11.0); they are no longer updated.
   scripts instead of `FCALL` (serverless has no `FUNCTION`), and idempotent,
   crash-safe steps where one operation spans slots. Off keeps today's key
   layout and Lua functions. Startup refuses a setting that doesn't match the
-  server, and a cluster with more than one primary node. Limits (one slot's
-  throughput for the shared keys; TTL keys evicted before error 97) are in
-  `conf/mediator.toml`.
+  server, a cluster with more than one primary node, an endpoint that reaches
+  a replica, and existing data written under the other `cluster_mode` (the
+  key names differ, so flipping the setting would orphan every account and
+  message; there is no migration). Limits (one slot's throughput for the
+  shared keys; TTL keys evicted before error 97) are in `conf/mediator.toml`.
+  The standalone processors read the same setting, as `true` or `"true"`.
+- **Cluster-mode stores and deletes keep the library's guarantees.** A store
+  holds the message until it is fully queued and a delete holds it until it
+  is removed, so exactly one of two concurrent deletes succeeds (the other
+  gets NOT_FOUND, R1.7), a delete never leaves queue entries or counters for
+  a gone message, and a store is never reported for a message that isn't
+  queued (R1.1). A store or delete that dies part-way is taken over after 30
+  seconds.
 
 ### Changed
 
-- **Startup runs `CLUSTER INFO`** in both modes, so a database user that may
-  not run it can no longer start the mediator.
+- **Startup checks the server's cluster mode.** With `cluster_mode` off it
+  reads `cluster_enabled` from `INFO cluster` and refuses only a definite
+  cluster, so existing deployments start as before (no new ACL permission).
+  With it on it runs `CLUSTER INFO`.
+- **The expiry sweeper retries a failed delete on its next pass** instead of
+  dropping the message from the expiry index (both modes).
 - **A full or throttled database reaches clients as a named error** in both
   modes: 97 `storage.full` (507) or 98 `storage.busy` (503), also over a
-  websocket, which got no reply before. A full database no longer stops a
-  restart or forwarding.
+  websocket, which got no reply before. This covers session writes and
+  deletes too, and 98 carries `Retry-After: 5`. A full database no longer
+  stops a restart or forwarding (with `cluster_mode` off, a restart goes
+  ahead when the loaded Lua library already matches this build).
 - The server version check accepts a two-part `redis_version`; ElastiCache
   Serverless reports `7.2`.
 

@@ -10,28 +10,57 @@
 use redis::Script;
 use std::sync::LazyLock;
 
-/// Message slot, first step of a store. Writes the body and metadata unless
-/// the message is already fully stored for this recipient. The sender is
-/// recorded here, before any queue, so a delete arriving mid-store can release
-/// the sender's side.
+/// How long a store or a delete holds a message before another caller may
+/// take it over, in milliseconds. Well above any database response timeout,
+/// so only a caller that died part-way loses its hold.
+pub(crate) const STORE_LEASE_MS: u64 = 30_000;
+pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
+
+/// Message slot, first step of a store. Writes the body and metadata and
+/// marks the message `STORING` until [`RECORD_QUEUE_IDS`] completes the
+/// store, so a delete can't run between the steps and leave queue entries
+/// for a message that is gone. The sender is recorded here, before any
+/// queue.
 ///
-/// KEYS: body, metadata. ARGV: body, bytes, to, from (`ANONYMOUS` for none).
-/// Returns 1 when written, 0 when already stored.
+/// A message whose delete is in progress is refused with
+/// `DELETE_IN_PROGRESS` (the caller reports the store as failed, never as
+/// stored). A delete that died part-way, past its lease, is taken over: the
+/// message is stored again and the enqueue steps re-queue whatever the
+/// delete had released.
+///
+/// KEYS: body, metadata. ARGV: body, bytes, to, from (`ANONYMOUS` for none),
+/// delete lease ms.
+/// Returns 1 when newly written, 2 when an unfinished store (a retry, the
+/// same message stored concurrently, or a taken-over delete) is resumed, and
+/// 0 when the message is already fully stored for this recipient.
 pub(crate) static STORE_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
-if redis.call('HGET', KEYS[2], 'TO') == ARGV[3]
-    and redis.call('HEXISTS', KEYS[2], 'RECEIVE_ID') == 1 then
-    return 0
-end
 local t = redis.call('TIME')
-local now = string.format('%d%03d', t[1], t[2] / 1000)
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local meta = redis.call('HMGET', KEYS[2], 'TO', 'RECEIVE_ID', 'STORING', 'DELETING_AT')
+local result = 1
+if meta[1] then
+    if meta[4] then
+        if now_ms - tonumber(meta[4]) < tonumber(ARGV[5]) then
+            return redis.error_reply('DELETE_IN_PROGRESS message is being deleted')
+        end
+        redis.call('HDEL', KEYS[2], 'DELETING', 'DELETING_AT')
+        result = 2
+    elseif meta[1] == ARGV[3] then
+        if meta[2] and not meta[3] then
+            return 0
+        end
+        result = 2
+    end
+end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3], 'TIMESTAMP', now)
+redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3],
+    'TIMESTAMP', string.format('%d%03d', t[1], t[2] / 1000), 'STORING', now_ms)
 if ARGV[4] ~= 'ANONYMOUS' then
     redis.call('HSET', KEYS[2], 'FROM', ARGV[4])
 end
-return 1
+return result
 "#,
     )
 });
@@ -98,28 +127,39 @@ return id
 });
 
 /// Message slot, last step of a store: record where the message sits in the
-/// queues. Skips a message deleted in the meantime rather than recreating
-/// its metadata.
+/// queues and clear `STORING`, which makes the message deletable. Refuses
+/// (returns 0) when the message was deleted, or a delete took it over, in the
+/// meantime: the store must then report failure, not success.
 ///
 /// KEYS: metadata. ARGV: field/value pairs. Returns 1 when recorded.
 pub(crate) static RECORD_QUEUE_IDS: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
-if redis.call('EXISTS', KEYS[1]) == 0 then
+if redis.call('EXISTS', KEYS[1]) == 0
+    or redis.call('HEXISTS', KEYS[1], 'DELETING') == 1 then
     return 0
 end
 redis.call('HSET', KEYS[1], unpack(ARGV))
+redis.call('HDEL', KEYS[1], 'STORING')
 return 1
 "#,
     )
 });
 
-/// Message slot, first step of a delete: check ownership, then mark the
-/// message as being deleted. It is removed only once both queues are
-/// released, so a delete that fails part-way leaves it in place for the next
-/// delete to finish. Errors match the library's `delete_message`.
+/// Message slot, first step of a delete: check ownership, then take the
+/// message for this delete alone. Errors match the library's
+/// `delete_message`, plus two the caller waits out:
 ///
-/// KEYS: metadata. ARGV: message hash, requester, admin (optional).
+/// - `STORE_IN_PROGRESS`: a store hasn't finished queueing the message.
+/// - `DELETE_IN_PROGRESS`: another delete holds it. When that delete
+///   finishes the message is gone (NOT_FOUND), which is what the library
+///   answers the second of two deletes.
+///
+/// A hold past its lease belongs to a caller that died part-way and is taken
+/// over, so the message is never stuck.
+///
+/// KEYS: metadata. ARGV: message hash, requester, delete token, store lease
+/// ms, delete lease ms, admin (optional).
 /// Returns TO, FROM ("" for an anonymous sender) and BYTES.
 pub(crate) static CLAIM_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
@@ -133,15 +173,43 @@ for i = 1, #flat, 2 do
     meta[flat[i]] = flat[i + 1]
 end
 local is_owner = (meta.TO == ARGV[2]) or (meta.FROM == ARGV[2])
-local is_admin = (#ARGV >= 3 and ARGV[2] == ARGV[3])
+local is_admin = (#ARGV >= 6 and ARGV[2] == ARGV[6])
 if not is_owner and not is_admin then
     return redis.error_reply('PERMISSION_DENIED: Requesting DID does not have ownership of this message')
 end
 if meta.BYTES == nil then
     return redis.error_reply('message (' .. ARGV[1] .. ') metadata did not contain BYTES field.')
 end
-redis.call('HSET', KEYS[1], 'DELETING', '1')
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+if meta.STORING and now_ms - tonumber(meta.STORING) < tonumber(ARGV[4]) then
+    return redis.error_reply('STORE_IN_PROGRESS message is still being stored')
+end
+if meta.DELETING_AT and meta.DELETING ~= ARGV[3]
+    and now_ms - tonumber(meta.DELETING_AT) < tonumber(ARGV[5]) then
+    return redis.error_reply('DELETE_IN_PROGRESS message is being deleted')
+end
+redis.call('HSET', KEYS[1], 'DELETING', ARGV[3], 'DELETING_AT', now_ms)
+redis.call('HDEL', KEYS[1], 'STORING')
 return { meta.TO or '', meta.FROM or '', meta.BYTES }
+"#,
+    )
+});
+
+/// Message slot, last step of a delete: remove the message, but only while
+/// this delete still holds it. A delete that lost its hold (it outlived its
+/// lease and was taken over) removes nothing, so exactly one delete reports
+/// the message removed.
+///
+/// KEYS: body, metadata. ARGV: delete token. Returns 1 when removed.
+pub(crate) static FINISH_DELETE: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+if redis.call('HGET', KEYS[2], 'DELETING') ~= ARGV[1] then
+    return 0
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
 "#,
     )
 });

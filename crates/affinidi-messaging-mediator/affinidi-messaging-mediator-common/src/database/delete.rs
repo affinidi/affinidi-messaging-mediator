@@ -16,6 +16,14 @@ const RELEASE_ATTEMPTS: u32 = 3;
 /// Pause before each further attempt, multiplied by the attempt number.
 const RELEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Attempts at claiming a message that a store or another delete is still
+/// working on. Both normally finish within milliseconds; together the
+/// pauses wait about a second before the delete fails as retryable.
+const CLAIM_ATTEMPTS: u32 = 6;
+
+/// Pause before each further claim attempt, multiplied by the attempt number.
+const CLAIM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl DatabaseHandler {
     /// Deletes a message in the database.
     ///
@@ -47,7 +55,7 @@ impl DatabaseHandler {
             // function for the reason `mark_delivered` gives: a stale function
             // library loads without complaint and would silently never write
             // it. A metadata read that fails only costs the receipt.
-            let parties: Option<(String, String)> = redis::cmd("HMGET")
+            let mut parties: Option<(String, String)> = redis::cmd("HMGET")
                 .arg(self.keys.msg_meta(message_hash))
                 .arg("TO")
                 .arg("FROM")
@@ -63,8 +71,15 @@ impl DatabaseHandler {
                 });
 
             let result: Result<String, redis::RedisError> = if self.keys.cluster_mode() {
+                // The claim waits out a store in progress, so take the
+                // parties from it: the read above may predate the outbox
+                // entry.
                 self.delete_message_in_steps(&mut conn, message_hash, did_hash, admin_did_hash)
                     .await
+                    .map(|(to, from)| {
+                        parties = (!from.is_empty()).then_some((to, from));
+                        "OK".to_string()
+                    })
             } else {
                 let mut cmd = redis::cmd("FCALL");
                 cmd.arg("delete_message")
@@ -152,36 +167,65 @@ impl DatabaseHandler {
 
     /// `delete_message` for cluster mode, in steps a repeated delete can finish:
     ///
-    /// 1. claim the message in its own slot: check ownership and mark it as
-    ///    being deleted;
+    /// 1. claim the message in its own slot: check ownership and take it for
+    ///    this delete alone. A store still queueing it, or another delete
+    ///    holding it, is waited out briefly; the second of two deletes then
+    ///    finds the message gone and answers NOT_FOUND, as the library does;
     /// 2. release the recipient's and sender's queues concurrently, each
     ///    finding its entry in its own slot and undoing only what was queued
     ///    there (idempotent, so retried a few times);
-    /// 3. remove the message, and count it if this delete removed it.
+    /// 3. remove the message only while this delete still holds it, so
+    ///    exactly one delete reports it removed (R1.7), and count it.
     ///
-    /// A failure returns an error and leaves the message marked, so the next
-    /// delete passes step 1 again and finishes: nothing is left counted for a
-    /// message that is gone. On a full database step 1's write is refused, so
-    /// the delete fails before changing anything, as the library's does.
+    /// A failure returns an error and leaves the message held. Once the hold
+    /// passes its lease the next delete (or the expiry sweeper, which keeps
+    /// the message for its next pass) takes it over and finishes. On a full
+    /// database step 1's write is refused, so the delete fails before
+    /// changing anything, as the library's does.
+    ///
+    /// Returns the message's TO and FROM ("" for an anonymous sender).
     async fn delete_message_in_steps(
         &self,
         conn: &mut super::RedisConnection,
         message_hash: &str,
         did_hash: &str,
         admin_did_hash: Option<&str>,
-    ) -> redis::RedisResult<String> {
-        use crate::store::redis::database::cluster_scripts::CLAIM_MESSAGE;
+    ) -> redis::RedisResult<(String, String)> {
+        use crate::store::redis::database::cluster_scripts::{
+            CLAIM_MESSAGE, DELETE_LEASE_MS, FINISH_DELETE, STORE_LEASE_MS,
+        };
 
         let keys = self.keys;
-        let mut claim = CLAIM_MESSAGE.prepare_invoke();
-        claim
-            .key(keys.msg_meta(message_hash))
-            .arg(message_hash)
-            .arg(did_hash);
-        if let Some(admin_hash) = admin_did_hash {
-            claim.arg(admin_hash);
-        }
-        let (to, from, bytes): (String, String, String) = claim.invoke_async(conn).await?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut attempt = 1;
+        let (to, from, bytes): (String, String, String) = loop {
+            let mut claim = CLAIM_MESSAGE.prepare_invoke();
+            claim
+                .key(keys.msg_meta(message_hash))
+                .arg(message_hash)
+                .arg(did_hash)
+                .arg(&token)
+                .arg(STORE_LEASE_MS)
+                .arg(DELETE_LEASE_MS);
+            if let Some(admin_hash) = admin_did_hash {
+                claim.arg(admin_hash);
+            }
+            match claim.invoke_async(conn).await {
+                Ok(claimed) => break claimed,
+                Err(err)
+                    if attempt < CLAIM_ATTEMPTS
+                        && matches!(
+                            err.code(),
+                            Some("STORE_IN_PROGRESS" | "DELETE_IN_PROGRESS")
+                        ) =>
+                {
+                    debug!("Waiting to delete message {message_hash}: {err}");
+                    tokio::time::sleep(CLAIM_RETRY_DELAY * attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        };
 
         for attempt in 1..=RELEASE_ATTEMPTS {
             let (inbox, outbox) = futures_util::future::join(
@@ -199,28 +243,36 @@ impl DatabaseHandler {
             }
         }
 
-        let removed: i64 = redis::cmd("DEL")
-            .arg(keys.msg(message_hash))
-            .arg(keys.msg_meta(message_hash))
-            .query_async(conn)
+        let removed: i64 = FINISH_DELETE
+            .key(keys.msg(message_hash))
+            .key(keys.msg_meta(message_hash))
+            .arg(&token)
+            .invoke_async(conn)
             .await?;
-        if removed > 0 {
-            // One key, so no MULTI: it would only add commands.
-            let mut counted = redis::pipe();
-            counted
-                .cmd("HINCRBY")
-                .arg("GLOBAL")
-                .arg("DELETED_BYTES")
-                .arg(&bytes)
-                .cmd("HINCRBY")
-                .arg("GLOBAL")
-                .arg("DELETED_COUNT")
-                .arg(1);
-            if let Err(err) = counted.exec_async(conn).await {
-                warn!("Couldn't count deleted message {message_hash}: {err}");
-            }
+        if removed == 0 {
+            // Another delete took the message over; it reports the removal.
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "NOT_FOUND",
+                format!("message_hash ({message_hash}) was removed by another delete"),
+            )));
         }
-        Ok("OK".to_string())
+
+        // One key, so no MULTI: it would only add commands.
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("DELETED_BYTES")
+            .arg(&bytes)
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("DELETED_COUNT")
+            .arg(1);
+        if let Err(err) = counted.exec_async(conn).await {
+            warn!("Couldn't count deleted message {message_hash}: {err}");
+        }
+        Ok((to, from))
     }
 
     /// Releases the recipient's inbox entry of a message being deleted.

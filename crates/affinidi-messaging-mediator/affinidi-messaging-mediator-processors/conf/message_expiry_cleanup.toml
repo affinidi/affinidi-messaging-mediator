@@ -7,6 +7,12 @@ database_url = "redis://127.0.0.1/"
 ### Default: 2
 database_timeout = 2
 
+### cluster_mode: "true" to talk to a cluster-mode server such as ElastiCache
+### Serverless. Must match the mediator's [database] cluster_mode; startup
+### refuses a server whose cluster mode differs.
+### Default: "false"
+cluster_mode = "false"
+
 [processors.message_expiry_cleanup]
 ### enabled: If true, the message expiry cleanup processor is enabled within the mediator locally
 ### Default: true
