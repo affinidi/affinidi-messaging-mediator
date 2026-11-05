@@ -67,6 +67,12 @@ impl Database {
         &self,
         did_hash: &str,
     ) -> Result<Option<Account>, MediatorError> {
+        // An anonymous session's hash is empty. In cluster mode an empty
+        // `{}` tag doesn't group keys, so the read below would be refused as
+        // cross-slot.
+        if did_hash.is_empty() {
+            return Ok(None);
+        }
         let mut con = self.get_connection().await?;
 
         let (details, access_list_count): (HashMap<String, String>, u32) = redis::pipe()

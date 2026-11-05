@@ -17,10 +17,11 @@ pub(crate) const STORE_LEASE_MS: u64 = 30_000;
 pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 
 /// Message slot, first step of a store. Writes the body and metadata and
-/// marks the message `STORING` until [`RECORD_QUEUE_IDS`] completes the
-/// store, so a delete can't run between the steps and leave queue entries
-/// for a message that is gone. The sender is recorded here, before any
-/// queue.
+/// marks the message `STORING:<token>` until [`RECORD_QUEUE_IDS`] completes
+/// this store, so a delete can't run between the steps and leave queue
+/// entries for a message that is gone. One mark per store: the same message
+/// stored twice at once stays held until both stores finish. The sender is
+/// recorded here, before any queue.
 ///
 /// A message whose delete is in progress is refused with
 /// `DELETE_IN_PROGRESS` (the caller reports the store as failed, never as
@@ -29,7 +30,7 @@ pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 /// delete had released.
 ///
 /// KEYS: body, metadata. ARGV: body, bytes, to, from (`ANONYMOUS` for none),
-/// delete lease ms.
+/// delete lease ms, store token, store lease ms.
 /// Returns 1 when newly written, 2 when an unfinished store (a retry, the
 /// same message stored concurrently, or a taken-over delete) is resumed, and
 /// 0 when the message is already fully stored for this recipient.
@@ -38,17 +39,27 @@ pub(crate) static STORE_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
         r#"
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-local meta = redis.call('HMGET', KEYS[2], 'TO', 'RECEIVE_ID', 'STORING', 'DELETING_AT')
+local flat = redis.call('HGETALL', KEYS[2])
+local meta, storing = {}, false
+for i = 1, #flat, 2 do
+    if string.sub(flat[i], 1, 8) == 'STORING:' then
+        if now_ms - tonumber(flat[i + 1]) < tonumber(ARGV[7]) then
+            storing = true
+        end
+    else
+        meta[flat[i]] = flat[i + 1]
+    end
+end
 local result = 1
-if meta[1] then
-    if meta[4] then
-        if now_ms - tonumber(meta[4]) < tonumber(ARGV[5]) then
+if meta.TO then
+    if meta.DELETING_AT then
+        if now_ms - tonumber(meta.DELETING_AT) < tonumber(ARGV[5]) then
             return redis.error_reply('DELETE_IN_PROGRESS message is being deleted')
         end
         redis.call('HDEL', KEYS[2], 'DELETING', 'DELETING_AT')
         result = 2
-    elseif meta[1] == ARGV[3] then
-        if meta[2] and not meta[3] then
+    elseif meta.TO == ARGV[3] then
+        if meta.RECEIVE_ID and not storing then
             return 0
         end
         result = 2
@@ -56,7 +67,7 @@ if meta[1] then
 end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3],
-    'TIMESTAMP', string.format('%d%03d', t[1], t[2] / 1000), 'STORING', now_ms)
+    'TIMESTAMP', string.format('%d%03d', t[1], t[2] / 1000), 'STORING:' .. ARGV[6], now_ms)
 if ARGV[4] ~= 'ANONYMOUS' then
     redis.call('HSET', KEYS[2], 'FROM', ARGV[4])
 end
@@ -127,11 +138,13 @@ return id
 });
 
 /// Message slot, last step of a store: record where the message sits in the
-/// queues and clear `STORING`, which makes the message deletable. Refuses
-/// (returns 0) when the message was deleted, or a delete took it over, in the
-/// meantime: the store must then report failure, not success.
+/// queues and clear this store's `STORING:<token>`; the message is deletable
+/// once no store holds it. Refuses (returns 0) when the message was deleted,
+/// or a delete took it over, in the meantime: the store must then report
+/// failure, not success.
 ///
-/// KEYS: metadata. ARGV: field/value pairs. Returns 1 when recorded.
+/// KEYS: metadata. ARGV: store token, then field/value pairs. Returns 1 when
+/// recorded.
 pub(crate) static RECORD_QUEUE_IDS: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -139,8 +152,8 @@ if redis.call('EXISTS', KEYS[1]) == 0
     or redis.call('HEXISTS', KEYS[1], 'DELETING') == 1 then
     return 0
 end
-redis.call('HSET', KEYS[1], unpack(ARGV))
-redis.call('HDEL', KEYS[1], 'STORING')
+redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('HDEL', KEYS[1], 'STORING:' .. ARGV[1])
 return 1
 "#,
     )
@@ -150,7 +163,8 @@ return 1
 /// message for this delete alone. Errors match the library's
 /// `delete_message`, plus two the caller waits out:
 ///
-/// - `STORE_IN_PROGRESS`: a store hasn't finished queueing the message.
+/// - `STORE_IN_PROGRESS`: a store hasn't finished queueing the message
+///   (any `STORING:<token>` within its lease).
 /// - `DELETE_IN_PROGRESS`: another delete holds it. When that delete
 ///   finishes the message is gone (NOT_FOUND), which is what the library
 ///   answers the second of two deletes.
@@ -168,9 +182,13 @@ local flat = redis.call('HGETALL', KEYS[1])
 if #flat == 0 then
     return redis.error_reply('NOT_FOUND: message_hash (' .. ARGV[1] .. ')')
 end
-local meta = {}
+local meta, stores = {}, {}
 for i = 1, #flat, 2 do
-    meta[flat[i]] = flat[i + 1]
+    if string.sub(flat[i], 1, 8) == 'STORING:' then
+        stores[flat[i]] = tonumber(flat[i + 1])
+    else
+        meta[flat[i]] = flat[i + 1]
+    end
 end
 local is_owner = (meta.TO == ARGV[2]) or (meta.FROM == ARGV[2])
 local is_admin = (#ARGV >= 6 and ARGV[2] == ARGV[6])
@@ -182,15 +200,21 @@ if meta.BYTES == nil then
 end
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-if meta.STORING and now_ms - tonumber(meta.STORING) < tonumber(ARGV[4]) then
-    return redis.error_reply('STORE_IN_PROGRESS message is still being stored')
+local expired = {}
+for field, since in pairs(stores) do
+    if now_ms - since < tonumber(ARGV[4]) then
+        return redis.error_reply('STORE_IN_PROGRESS message is still being stored')
+    end
+    table.insert(expired, field)
 end
 if meta.DELETING_AT and meta.DELETING ~= ARGV[3]
     and now_ms - tonumber(meta.DELETING_AT) < tonumber(ARGV[5]) then
     return redis.error_reply('DELETE_IN_PROGRESS message is being deleted')
 end
 redis.call('HSET', KEYS[1], 'DELETING', ARGV[3], 'DELETING_AT', now_ms)
-redis.call('HDEL', KEYS[1], 'STORING')
+if #expired > 0 then
+    redis.call('HDEL', KEYS[1], unpack(expired))
+end
 return { meta.TO or '', meta.FROM or '', meta.BYTES }
 "#,
     )
@@ -280,3 +304,231 @@ return count
 "#,
     )
 });
+
+/// The scripts in a fixed interleaving, against the cluster server in
+/// `REDIS_URL` when `REDIS_CLUSTER_MODE` is `true` (the cluster CI job);
+/// skipped otherwise.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::keys::Keys;
+    use redis::cluster_async::ClusterConnection;
+
+    const LEASE_MS: u64 = 30_000;
+
+    async fn cluster() -> Option<ClusterConnection> {
+        if std::env::var("REDIS_CLUSTER_MODE").ok()? != "true" {
+            return None;
+        }
+        let url = std::env::var("REDIS_URL").ok()?;
+        let client = redis::cluster::ClusterClientBuilder::new(vec![url])
+            .build()
+            .expect("cluster client");
+        Some(
+            client
+                .get_async_connection()
+                .await
+                .expect("cluster connection"),
+        )
+    }
+
+    struct Message {
+        keys: Keys,
+        hash: String,
+        to: String,
+        from: String,
+    }
+
+    impl Message {
+        fn new() -> Self {
+            let id = uuid::Uuid::new_v4();
+            Message {
+                keys: Keys::new(true),
+                hash: format!("race-msg-{id}"),
+                to: format!("race-to-{id}"),
+                from: format!("race-from-{id}"),
+            }
+        }
+
+        async fn store(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+            STORE_MESSAGE
+                .key(self.keys.msg(&self.hash))
+                .key(self.keys.msg_meta(&self.hash))
+                .arg("body")
+                .arg(4)
+                .arg(&self.to)
+                .arg(&self.from)
+                .arg(LEASE_MS)
+                .arg(token)
+                .arg(LEASE_MS)
+                .invoke_async(conn)
+                .await
+                .expect("STORE_MESSAGE")
+        }
+
+        /// The enqueue steps and the record, as a store finishes them.
+        async fn finish_store(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+            let receive_id: String = ENQUEUE_INBOX
+                .key(self.keys.did(&self.to))
+                .key(self.keys.receive_q(&self.to))
+                .key(self.keys.receive_ids(&self.to))
+                .arg(&self.hash)
+                .arg(4)
+                .arg(&self.from)
+                .arg(0)
+                .invoke_async(conn)
+                .await
+                .expect("ENQUEUE_INBOX");
+            let send_id: String = ENQUEUE_OUTBOX
+                .key(self.keys.did(&self.from))
+                .key(self.keys.peer_q(&self.from))
+                .key(self.keys.send_q(&self.from))
+                .key(self.keys.send_ids(&self.from))
+                .arg(&self.hash)
+                .arg(4)
+                .arg(&self.to)
+                .arg(0)
+                .invoke_async(conn)
+                .await
+                .expect("ENQUEUE_OUTBOX");
+            RECORD_QUEUE_IDS
+                .key(self.keys.msg_meta(&self.hash))
+                .arg(token)
+                .arg(vec!["RECEIVE_ID", &receive_id, "SEND_ID", &send_id])
+                .invoke_async(conn)
+                .await
+                .expect("RECORD_QUEUE_IDS")
+        }
+
+        async fn claim(
+            &self,
+            conn: &mut ClusterConnection,
+            token: &str,
+            store_lease_ms: u64,
+        ) -> redis::RedisResult<Vec<String>> {
+            CLAIM_MESSAGE
+                .key(self.keys.msg_meta(&self.hash))
+                .arg(&self.hash)
+                .arg(&self.to)
+                .arg(token)
+                .arg(store_lease_ms)
+                .arg(LEASE_MS)
+                .invoke_async(conn)
+                .await
+        }
+
+        /// The release and finish steps of a claimed delete.
+        async fn finish_delete(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+            let _: i64 = RELEASE_INBOX
+                .key(self.keys.did(&self.to))
+                .key(self.keys.receive_q(&self.to))
+                .key(self.keys.receive_ids(&self.to))
+                .arg(&self.hash)
+                .arg(4)
+                .invoke_async(conn)
+                .await
+                .expect("RELEASE_INBOX");
+            let _: i64 = RELEASE_OUTBOX
+                .key(self.keys.did(&self.from))
+                .key(self.keys.peer_q(&self.from))
+                .key(self.keys.send_q(&self.from))
+                .key(self.keys.send_ids(&self.from))
+                .arg(&self.hash)
+                .arg(4)
+                .arg(&self.to)
+                .invoke_async(conn)
+                .await
+                .expect("RELEASE_OUTBOX");
+            FINISH_DELETE
+                .key(self.keys.msg(&self.hash))
+                .key(self.keys.msg_meta(&self.hash))
+                .arg(token)
+                .invoke_async(conn)
+                .await
+                .expect("FINISH_DELETE")
+        }
+
+        /// Recipient and sender queue counts, inbox and outbox lengths, and
+        /// the sender's count for the recipient.
+        async fn queued(&self, conn: &mut ClusterConnection) -> [i64; 5] {
+            let mut hget = async |key: String, field: &str| -> i64 {
+                redis::cmd("HGET")
+                    .arg(key)
+                    .arg(field)
+                    .query_async::<Option<i64>>(conn)
+                    .await
+                    .expect("HGET")
+                    .unwrap_or(0)
+            };
+            let receive = hget(self.keys.did(&self.to), "RECEIVE_QUEUE_COUNT").await;
+            let send = hget(self.keys.did(&self.from), "SEND_QUEUE_COUNT").await;
+            let peer = hget(self.keys.peer_q(&self.from), &self.to).await;
+            let mut xlen = async |key: String| -> i64 {
+                redis::cmd("XLEN")
+                    .arg(key)
+                    .query_async(conn)
+                    .await
+                    .expect("XLEN")
+            };
+            let inbox = xlen(self.keys.receive_q(&self.to)).await;
+            let outbox = xlen(self.keys.send_q(&self.from)).await;
+            [receive, send, inbox, outbox, peer]
+        }
+    }
+
+    /// The same message stored twice at once, deleted after the first store
+    /// finishes: the delete waits for the second store, so the message and
+    /// every queue entry and count for it go together.
+    #[tokio::test]
+    async fn test_delete_waits_for_every_store_of_a_message() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        assert_eq!(msg.store(&mut conn, "s1").await, 1);
+        assert_eq!(msg.store(&mut conn, "s2").await, 2);
+        assert_eq!(msg.finish_store(&mut conn, "s1").await, 1);
+
+        match msg.claim(&mut conn, "d", LEASE_MS).await {
+            Err(err) => assert_eq!(err.code(), Some("STORE_IN_PROGRESS")),
+            Ok(claimed) => panic!("claimed while the second store holds it: {claimed:?}"),
+        }
+
+        assert_eq!(msg.finish_store(&mut conn, "s2").await, 1);
+        assert_eq!(msg.queued(&mut conn).await, [1; 5]);
+
+        msg.claim(&mut conn, "d", LEASE_MS)
+            .await
+            .expect("claim once both stores finished");
+        assert_eq!(msg.finish_delete(&mut conn, "d").await, 1);
+        assert_eq!(
+            msg.queued(&mut conn).await,
+            [0; 5],
+            "nothing is left queued"
+        );
+    }
+
+    /// A store that died part-way, past its lease, no longer holds the
+    /// message: a delete takes it over and clears the store's mark.
+    #[tokio::test]
+    async fn test_delete_takes_over_an_expired_store() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        assert_eq!(msg.store(&mut conn, "dead").await, 1);
+        msg.claim(&mut conn, "d", 0)
+            .await
+            .expect("an expired store doesn't hold the message");
+        let marked: bool = redis::cmd("HEXISTS")
+            .arg(msg.keys.msg_meta(&msg.hash))
+            .arg("STORING:dead")
+            .query_async(&mut conn)
+            .await
+            .expect("HEXISTS");
+        assert!(!marked, "the dead store's mark is cleared");
+        assert_eq!(msg.finish_delete(&mut conn, "d").await, 1);
+    }
+}

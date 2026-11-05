@@ -405,6 +405,10 @@ jobs:
             --features "didcomm,redis-backend" \
             --test store_conformance \
             --test redis_reconnect
+          cargo test \
+            -p affinidi-messaging-mediator-common \
+            --features redis-backend \
+            --lib cluster_scripts
 
   test-mediator-fjall:
     # The e2e suite against the on-disk Fjall backend (each store in its own

@@ -120,6 +120,15 @@ async fn check_account_lifecycle(store: Arc<dyn MediatorStore>) {
         !store.account_exists(did).await.expect("account_exists"),
         "account must not exist before it is added"
     );
+    // An anonymous session's DID hash is empty: no account, not an error.
+    assert!(
+        store
+            .account_get("")
+            .await
+            .expect("account_get of an empty hash")
+            .is_none(),
+        "an empty DID hash names no account"
+    );
 
     let added: Account = store
         .account_add(did, &allow_all(), None)

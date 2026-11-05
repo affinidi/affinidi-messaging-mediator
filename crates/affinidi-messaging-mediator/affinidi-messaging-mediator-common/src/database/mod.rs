@@ -402,7 +402,7 @@ impl DatabaseHandler {
     /// missing field means "not a cluster".
     ///
     /// With `cluster_mode` on it uses `CLUSTER INFO`, which ElastiCache
-    /// Serverless supports (its `INFO` may not report `cluster_enabled`).
+    /// Serverless supports (it reports `cluster_enabled:1` too).
     async fn check_cluster_mode(
         conn: &mut ConnectionManager,
         cluster_mode: bool,

@@ -151,7 +151,10 @@ enum StorageCap {
 fn storage_cap(text: &str) -> Option<StorageCap> {
     if is_storage_full(text) {
         Some(StorageCap::Full)
-    } else if text.contains("timed out") {
+    } else if text.contains("timed out")
+        || text.contains("STORE_IN_PROGRESS")
+        || text.contains("DELETE_IN_PROGRESS")
+    {
         Some(StorageCap::Busy)
     } else {
         None
@@ -192,8 +195,11 @@ impl MediatorError {
     /// own reply: `command not allowed when used memory` once the data
     /// storage maximum is reached, `timed out` when a command outlasts
     /// `database_timeout` (the database is throttled at its ECPU maximum, or
-    /// unreachable). Left as they are, both reach an HTTP client as a generic
-    /// "Service temporarily unavailable" and a websocket client as nothing.
+    /// unreachable), and in cluster mode `STORE_IN_PROGRESS` /
+    /// `DELETE_IN_PROGRESS` when another store or delete still holds the
+    /// message past the wait. Left as they are, they reach an HTTP client as
+    /// a generic "Service temporarily unavailable" and a websocket client as
+    /// nothing.
     ///
     /// Covers [`DatabaseError`](Self::DatabaseError),
     /// [`SessionError`](Self::SessionError) (login and session writes) and a
@@ -874,6 +880,22 @@ mod tests {
             "Couldn't delete message_hash (h). Reason: Response timed out".to_string(),
         );
         assert!(named_code(delete).is_some_and(|c| c.ends_with("storage.busy")));
+        let held = MediatorError::problem_with_log(
+            10,
+            "NA",
+            None,
+            ProblemReportSorter::Warning,
+            ProblemReportScope::Message,
+            "database.message.delete.error",
+            "Couldn't delete message_hash ({1}). Reason: {2}",
+            vec!["h".into(), "STORE_IN_PROGRESS: message is still being stored".into()],
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Couldn't delete message_hash (h). Reason: STORE_IN_PROGRESS: message is still being stored".to_string(),
+        );
+        assert!(
+            named_code(held).is_some_and(|c| c.ends_with("storage.busy")),
+            "a delete that waited out its claim is retryable"
+        );
         assert_eq!(
             storage_busy_retry_after_secs("e.p.me.res.storage.busy"),
             Some(STORAGE_BUSY_RETRY_AFTER_SECS)

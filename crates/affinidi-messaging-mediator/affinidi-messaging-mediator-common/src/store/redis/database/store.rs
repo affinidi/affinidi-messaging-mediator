@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use super::Database;
 use super::cluster_scripts::{
-    DELETE_LEASE_MS, ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_MESSAGE,
+    DELETE_LEASE_MS, ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_LEASE_MS, STORE_MESSAGE,
 };
 use crate::database::RedisConnection;
 use crate::errors::MediatorError;
@@ -110,14 +110,14 @@ impl Database {
     /// `store_message` for cluster mode, as single-slot steps ordered so a
     /// failure part-way is harmless or repaired by a retry:
     ///
-    /// 1. body, metadata and sender, marked `STORING` so no delete can run
-    ///    until step 4 (nothing to do if already stored for this recipient;
-    ///    refused while a delete holds the message);
+    /// 1. body, metadata and sender, marked `STORING:<token>` for this store
+    ///    so no delete can run until step 4 (nothing to do if already stored
+    ///    for this recipient; refused while a delete holds the message);
     /// 2. the expiry index, so the sweeper can reach the message from here on;
     /// 3. the recipient's inbox and the sender's outbox, concurrently;
-    /// 4. the queue ids on the metadata, clearing `STORING` — the message is
-    ///    deletable from here on. Refused if a delete took the message over,
-    ///    which fails the store;
+    /// 4. the queue ids on the metadata, clearing this store's mark — the
+    ///    message is deletable once no store holds it. Refused if a delete
+    ///    took the message over, which fails the store;
     /// 5. the global counters, best-effort, only for a newly written message
     ///    so a retry or a concurrent identical store counts it once.
     ///
@@ -136,6 +136,7 @@ impl Database {
     ) -> redis::RedisResult<()> {
         let keys = self.keys();
         let bytes = message.len();
+        let token = uuid::Uuid::new_v4().to_string();
 
         let written: i64 = STORE_MESSAGE
             .key(keys.msg(message_hash))
@@ -145,6 +146,8 @@ impl Database {
             .arg(to_did_hash)
             .arg(from_hash)
             .arg(DELETE_LEASE_MS)
+            .arg(&token)
+            .arg(STORE_LEASE_MS)
             .invoke_async(conn)
             .await?;
         if written == 0 {
@@ -206,6 +209,7 @@ impl Database {
         }
         let recorded: i64 = RECORD_QUEUE_IDS
             .key(keys.msg_meta(message_hash))
+            .arg(&token)
             .arg(ids)
             .invoke_async(conn)
             .await?;
