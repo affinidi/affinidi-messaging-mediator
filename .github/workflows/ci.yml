@@ -137,7 +137,7 @@ jobs:
     # cargo-deny, duplicating the jobs above. Skipped on fork PRs: the Snyk
     # scan needs secrets a fork does not get.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    uses: affinidi/pipeline-rust/.github/workflows/checks-no-test.yaml@feat/release-branch-actions
+    uses: affinidi/pipeline-rust/.github/workflows/checks-no-test.yaml@main
     # Every job the called workflow declares is checked at startup, enabled or not.
     permissions:
       contents: read
@@ -162,7 +162,7 @@ jobs:
     steps:
       # Checks out the repo. Toolchain sync, lockstep versions, CHANGELOG /
       # RELEASE consistency, RELEASE never moves backwards.
-      - uses: affinidi/pipeline-rust/.github/actions/release-guards@feat/release-branch-actions
+      - uses: affinidi/pipeline-rust/.github/actions/release-guards@main
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"

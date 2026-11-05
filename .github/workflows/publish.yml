@@ -65,7 +65,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       # Toolchain from rust-toolchain.toml.
-      - uses: affinidi/pipeline-rust/.github/actions/release-publish@feat/release-branch-actions
+      - uses: affinidi/pipeline-rust/.github/actions/release-publish@main
         with:
           build-jobs: "4"
           # Matches CI. Deliberately without `-D warnings`: CI's publish dry-run

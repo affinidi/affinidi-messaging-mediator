@@ -42,7 +42,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       # Toolchain for a patch's `cargo update -w`: rust-toolchain.toml.
-      - uses: affinidi/pipeline-rust/.github/actions/release-prep@feat/release-branch-actions
+      - uses: affinidi/pipeline-rust/.github/actions/release-prep@main
         with:
           kind: ${{ inputs.kind }}
           token: ${{ steps.app-token.outputs.token }}
