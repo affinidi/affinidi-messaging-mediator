@@ -13,6 +13,7 @@ make by opening a [GitHub issue](https://github.com/affinidi/affinidi-messaging-
   (keyring, TLS, and the console's image rendering).
 - **Redis** (optional) for the Redis-backed tests: `docker run -p 6379:6379 redis:7`
   and `REDIS_URL=redis://localhost:6379`.
+- Python ≥ 3.11 for the scripts in `scripts/`.
 
 Optional but useful: `cargo-deny` (config in `deny.toml`), `cargo-semver-checks`.
 

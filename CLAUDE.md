@@ -27,11 +27,19 @@ Rules that bite hardest here:
 ## Releases
 
 Lockstep versioning: every crate carries `[workspace.package] version`, and
-internal dependencies require it exactly. Never bump one crate on its own —
-use `scripts/cut-release.py` / `scripts/prepare-release.py`. Flow is main →
-nightly → `release/X.Y`; see `RELEASES.md`. Publishing is crates.io Trusted
-Publishing from `publish.yml` only; a brand-new crate needs a manual first
-publish.
+internal dependencies require it exactly. Never bump one crate on its own;
+trigger the release workflows rather than running the scripts:
+
+- cut: `gh workflow run release-cut.yml --ref main -f name=0.42` (a dry run;
+  add `-f dry-run=false` to cut);
+- rc, GA or patch: `gh workflow run release-prep.yml --ref release/0.42 -f kind=rc`
+  (or `ga`, `patch`);
+- backport: label the merged PR `backport release/0.42`.
+
+`scripts/cut-release.py` and `scripts/prepare-release.py` are a maintainer's
+local fallback only. Flow is main → nightly → `release/X.Y`; see
+`RELEASES.md`. Publishing is crates.io Trusted Publishing from `publish.yml`
+only; a brand-new crate needs a manual first publish.
 
 Semver caution: services pin these crates loosely; behavioural changes to
 delivery/ack/auth semantics are breaking even when signatures don't change —
