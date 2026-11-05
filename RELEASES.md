@@ -105,53 +105,58 @@ backport or prep PR, or labelled `release-direct`; only the release tooling
 changes the version or `RELEASE`, on any branch. A cut, prep or backport PR
 counts as one only when the release-bot app (`affinidi-semantic-release[bot]`)
 opened it from a branch of this repository: a branch name alone proves nothing.
-While maintainers still cut and prep locally, a cut or prep PR also counts
-when a person with the admin or maintain role opened it.
+A cut or prep PR also counts when a person with the admin or maintain role
+opened it, for the local fallback below.
 
 ## Procedures
 
 ### Cut
 
+Actions → **Cut a release** (`release-cut.yml`) on `main`, with the
+`major.minor`, or:
+
 ```sh
-python3 scripts/cut-release.py 0.42 --dry-run   # builds both commits, pushes nothing
-python3 scripts/cut-release.py 0.42
+gh workflow run release-cut.yml --ref main -f name=0.42                     # dry run: builds both commits, pushes nothing
+gh workflow run release-cut.yml --ref main -f name=0.42 -f dry-run=false
 ```
 
-From a clean checkout with push access, Python ≥ 3.11, cargo, and `gh`
-authenticated. It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` =
-`0.42.0-rc.0`, which `release-tag.yml` tags and builds an image for), creates
-the `backport release/0.42` label, and opens the `release-cut/0.42` PR that
-moves `main` to `0.43.0` and closes `main`'s `## Unreleased` changelog section
-under `## 0.42.0 (release/0.42)` (the release branch's copy gets its date at
-GA). Merge it, then update the schedule table above.
+With the release-bot app's token it pushes `release/0.42` (workspace at
+`0.42.0`, `RELEASE` = `0.42.0-rc.0`, which `release-tag.yml` tags and builds an
+image for), creates the `backport release/0.42` label, and opens the
+`release-cut/0.42` PR that moves `main` to `0.43.0` and closes `main`'s
+`## Unreleased` changelog section under `## 0.42.0 (release/0.42)` (the release
+branch's copy gets its date at GA). Merge it, then update the schedule table
+above.
 
-`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
-before `nightly` exists, is `--from origin/main`.
+`from` (`-f from=<rev>`) cuts from something other than `origin/nightly` — the
+first cut, before `nightly` exists, is `origin/main`.
 
-Cuts are moving to the release bot: Actions → **Cut a release**
-(`release-cut.yml`) on `main` does the same with the release-bot app's token
-(`dry-run` on by default). Once it is the way to cut, `scripts/cut-release.py`
-goes, and so does the maintainer allowance in `branch-rules.yml` once preps
-move too (below).
+Fallback, when the workflow cannot run: a maintainer runs
+`python3 scripts/cut-release.py 0.42 [--dry-run] [--from <rev>]` from a clean
+checkout with push access, Python ≥ 3.11, cargo, and `gh` authenticated. It
+does the same with their own credentials.
 
 ### Release candidate, GA, patch
 
-From a clean checkout of `release/<major.minor>`, as a maintainer:
+Actions → **Prepare a release** (`release-prep.yml`) with the release branch
+as the ref and `rc`, `ga` or `patch`, or:
 
 ```sh
-python3 scripts/prepare-release.py --kind rc|ga|patch --pr-body /tmp/body.md
+gh workflow run release-prep.yml --ref release/0.42 -f kind=rc   # or ga, patch
 ```
 
 It moves `RELEASE`, writes the changelog (GA: the `## Unreleased` section
 becomes `## 0.42.0 (date)`; patch: a new section listing the commits since the
-last tag) and moves the whole workspace for a patch. Commit it signed off as
-`chore(release): v<RELEASE>` on `release-prep/<major.minor>/<RELEASE>` and open
-the PR into the release branch with that body.
+last tag) and moves the whole workspace for a patch, then opens the
+`chore(release): v<RELEASE>` PR into the release branch with the release-bot
+app's token.
 
-Preps are moving to the release bot: Actions → **Prepare a release**
-(`release-prep.yml`) with the release branch as the ref does the same and opens
-the PR with the release-bot app's token. Once cuts and preps both run there,
-`scripts/prepare-release.py` and `scripts/release_lib.py` go.
+Fallback, when the workflow cannot run: from a clean checkout of
+`release/<major.minor>`, a maintainer runs
+`python3 scripts/prepare-release.py --kind rc|ga|patch --pr-body /tmp/body.md`,
+commits it signed off as `chore(release): v<RELEASE>` on
+`release-prep/<major.minor>/<RELEASE>` and opens the PR into the release branch
+with that body.
 
 **Merging it is the release.** On that push to the release branch:
 
