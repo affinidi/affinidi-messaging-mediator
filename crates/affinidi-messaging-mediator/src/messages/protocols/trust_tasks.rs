@@ -912,6 +912,30 @@ async fn consume_account_update(
         }
     }
 
+    // Queue limits are resolved here rather than at the write below, because a
+    // refusal must refuse the *whole* update: by the time the write runs, the ACL
+    // member has already been stored and audited. The wire carries i64 and the
+    // store works in i32; a member omitted is left unchanged.
+    let queue_limits = typed
+        .payload
+        .queue_limits
+        .as_ref()
+        .map(|limits| {
+            resolve_queue_limits(
+                session,
+                is_admin,
+                (
+                    limits.send_queue_limit.map(|v| v as i32),
+                    limits.receive_queue_limit.map(|v| v as i32),
+                ),
+                (
+                    state.limits().queued_send_messages_hard,
+                    state.limits().queued_receive_messages_hard,
+                ),
+            )
+        })
+        .transpose()?;
+
     // ---- Apply: capabilities, then queue limits, then the role. ----
 
     if let Some(acl_value) = acl_value {
@@ -932,31 +956,7 @@ async fn consume_account_update(
         .await;
     }
 
-    if let Some(limits) = &typed.payload.queue_limits {
-        // The wire carries i64; the store works in i32. A member omitted is unchanged.
-        let req_send = limits.send_queue_limit.map(|v| v as i32);
-        let req_receive = limits.receive_queue_limit.map(|v| v as i32);
-
-        // A standard account may only touch limits it self-manages, capped at the
-        // hard maximum; an admin sets any value.
-        let (send_queue_limit, receive_queue_limit) =
-            if session.account_type == AccountType::Standard {
-                (
-                    gate_self_managed_limit(
-                        req_send,
-                        session.acls.get_self_manage_send_queue_limit(),
-                        state.limits().queued_send_messages_hard,
-                    ),
-                    gate_self_managed_limit(
-                        req_receive,
-                        session.acls.get_self_manage_receive_queue_limit(),
-                        state.limits().queued_receive_messages_hard,
-                    ),
-                )
-            } else {
-                (req_send, req_receive)
-            };
-
+    if let Some((send_queue_limit, receive_queue_limit)) = queue_limits {
         state
             .database
             .account_change_queue_limits(&target_hash, send_queue_limit, receive_queue_limit)
@@ -1036,19 +1036,96 @@ async fn consume_account_update(
     serde_json::to_value(&response_doc).map_err(serialize_err)
 }
 
-/// A standard account may change a queue limit only if it self-manages that limit;
-/// the value is capped at the mediator's hard maximum. The `-1` (unlimited) and `-2`
-/// sentinels pass through unchanged. Not self-managed → leave the limit unchanged.
-fn gate_self_managed_limit(requested: Option<i32>, self_managed: bool, hard: i32) -> Option<i32> {
+/// The stored `(send, receive)` queue limits for a `(requested send, requested
+/// receive)` pair. An admin's request stands as sent; anyone else's goes through
+/// [`gate_self_managed_limit`]. `None` in either position leaves that limit
+/// unchanged. `hard` is `(send, receive)` from the mediator's limits.
+///
+/// `is_admin` is the caller's own admin test, so that the two self-or-admin members
+/// of one `account/update` — the ACL and these limits — cannot disagree about who
+/// an admin is. It had tested `account_type != Standard` here while the ACL member
+/// tested `Admin | RootAdmin`, which let an account whose type did not decode
+/// (`Unknown`) past this gate but not that one.
+fn resolve_queue_limits(
+    session: &Session,
+    is_admin: bool,
+    requested: (Option<i32>, Option<i32>),
+    hard: (i32, i32),
+) -> Result<(Option<i32>, Option<i32>), MediatorError> {
+    if is_admin {
+        return Ok(requested);
+    }
+    Ok((
+        gate_self_managed_limit(
+            requested.0,
+            session.acls.get_self_manage_send_queue_limit(),
+            hard.0,
+            "send_queue_limit",
+            session,
+        )?,
+        gate_self_managed_limit(
+            requested.1,
+            session.acls.get_self_manage_receive_queue_limit(),
+            hard.1,
+            "receive_queue_limit",
+            session,
+        )?,
+    ))
+}
+
+/// A standard account may change a queue limit only if it self-manages that limit,
+/// and may not switch it off. Permission to adjust a limit is not permission to
+/// remove it, so `-1` (unlimited) and anything past `-2` are refused: being below
+/// every maximum they would slip past the clamp and be stored verbatim. `-2` resets
+/// to the mediator default and passes through; a value above `hard` is clamped; a
+/// negative `hard` is unbounded, so there is no ceiling to clamp against. Not
+/// self-managed → refused, as `ensure_self_manageable` refuses a capability the
+/// account may not change. Admins do not come here.
+fn gate_self_managed_limit(
+    requested: Option<i32>,
+    self_managed: bool,
+    hard: i32,
+    limit_name: &str,
+    session: &Session,
+) -> Result<Option<i32>, MediatorError> {
+    // Both limits are gated on every request, so an omitted member is nothing to
+    // gate — it must be answered before the permission test, or an account that
+    // self-manages one limit and not the other could never set the one it does.
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
     if !self_managed {
-        return None;
+        // A member the account may not touch is refused, not quietly dropped: the
+        // response echoes the stored account, so a silent no-op reaches the caller
+        // as a success carrying the old value, which reads as "applied".
+        return Err(tt_problem(
+            session,
+            "authorization.queue_limit.not_self_manageable",
+            format!("this account may not self-manage its `{limit_name}`"),
+            StatusCode::FORBIDDEN,
+        ));
     }
     match requested {
-        Some(-1) | Some(-2) => requested,
-        Some(limit) if limit > hard => Some(hard),
-        other => other,
+        RESET_QUEUE_LIMIT_TO_DEFAULT => Ok(Some(RESET_QUEUE_LIMIT_TO_DEFAULT)),
+        limit if limit < 0 => Err(tt_problem(
+            session,
+            "authorization.queue_limit.admin_required",
+            format!(
+                "admin access is required to set an unlimited `{limit_name}` ({limit}); \
+                 this account may set a limit of 0 or more, or \
+                 {RESET_QUEUE_LIMIT_TO_DEFAULT} to reset it to the mediator default"
+            ),
+            StatusCode::FORBIDDEN,
+        )),
+        limit if hard >= 0 && limit > hard => Ok(Some(hard)),
+        limit => Ok(Some(limit)),
     }
 }
+
+/// The queue-limit sentinel meaning "drop this account's override and fall back to
+/// the mediator default" — `_change_queue_limit` in the store turns it into an
+/// `HDEL`. It is not a limit value, so it is never clamped.
+const RESET_QUEUE_LIMIT_TO_DEFAULT: i32 = -2;
 
 /// Handle `messaging/account/remove`: self-or-admin. Refuses to remove the
 /// mediator's own account or the root admin (both compared in constant time).
@@ -2294,6 +2371,191 @@ mod tests {
         }
     }
     use trust_tasks_rs::TrustTask;
+
+    /// `(send, receive)` hard limits standing in for a mediator's configuration.
+    const HARD: (i32, i32) = (2_000, 1_000);
+
+    /// A standard account that self-manages both queue limits.
+    fn self_managing_account() -> Session {
+        let mut acls = MediatorACLSet::default();
+        acls.set_self_manage_send_queue_limit(true);
+        acls.set_self_manage_receive_queue_limit(true);
+        Session {
+            session_id: "test-session".to_string(),
+            account_type: AccountType::Standard,
+            acls,
+            ..Default::default()
+        }
+    }
+
+    fn admin_account() -> Session {
+        Session {
+            session_id: "test-session".to_string(),
+            account_type: AccountType::Admin,
+            ..Default::default()
+        }
+    }
+
+    /// The problem-report code and HTTP status an error carries, or a panic when
+    /// it is not a problem report — a refusal the caller cannot read is a no-op
+    /// with extra steps.
+    fn problem_of(err: &MediatorError) -> (String, u16) {
+        match err {
+            MediatorError::MediatorError(_, _, _, report, status, _) => {
+                (report.code.clone(), *status)
+            }
+            other => panic!("expected a problem report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_standard_account_cannot_switch_a_queue_limit_off() {
+        // The bug: `-1` means *no limit*, and being below every maximum it slid
+        // past the over-hard clamp and was stored verbatim, after which the
+        // sender gate never refused the account again. Permission to raise a
+        // limit is not permission to remove it, so this is refused outright.
+        for requested in [(Some(-1), None), (None, Some(-1))] {
+            let err = resolve_queue_limits(&self_managing_account(), false, requested, HARD)
+                .expect_err("-1 must be refused for a standard account");
+            let (code, status) = problem_of(&err);
+            assert!(
+                code.ends_with("authorization.queue_limit.admin_required"),
+                "unexpected problem code {code}"
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
+        }
+
+        // Nothing past `-2` is a limit either, and the gate casts to `u32`, so
+        // `-5` would read as four billion. Same refusal.
+        for value in [-3, -5, i32::MIN] {
+            assert!(
+                resolve_queue_limits(&self_managing_account(), false, (Some(value), None), HARD)
+                    .is_err(),
+                "{value} must be refused for a standard account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_standard_account_may_still_reset_to_the_mediator_default() {
+        // `-2` is not a limit value: the store turns it into an `HDEL` of the
+        // per-account override. It must keep passing through untouched.
+        assert_eq!(
+            resolve_queue_limits(&self_managing_account(), false, (Some(-2), Some(-2)), HARD)
+                .expect("-2 is a reset, not an unlimited value"),
+            (Some(-2), Some(-2))
+        );
+    }
+
+    #[test]
+    fn a_standard_account_is_clamped_to_the_hard_limit() {
+        assert_eq!(
+            resolve_queue_limits(
+                &self_managing_account(),
+                false,
+                (Some(50_000), Some(50_000)),
+                HARD
+            )
+            .expect("an oversized value is clamped, not refused"),
+            (Some(HARD.0), Some(HARD.1))
+        );
+        // A value within the limit is stored as asked.
+        assert_eq!(
+            resolve_queue_limits(
+                &self_managing_account(),
+                false,
+                (Some(500), Some(500)),
+                HARD
+            )
+            .expect("an in-range value stands"),
+            (Some(500), Some(500))
+        );
+        // A limit the account does not self-manage is refused outright, the way
+        // `ensure_self_manageable` refuses a capability it may not change — not
+        // dropped, which would echo the old value back as a success.
+        let mut session = self_managing_account();
+        session.acls.set_self_manage_send_queue_limit(false);
+        let err = resolve_queue_limits(&session, false, (Some(500), Some(500)), HARD)
+            .expect_err("a limit the account does not self-manage is refused");
+        let (code, status) = problem_of(&err);
+        assert!(
+            code.ends_with("authorization.queue_limit.not_self_manageable"),
+            "unexpected problem code {code}"
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
+    }
+
+    #[test]
+    fn an_unbounded_mediator_has_no_ceiling_to_clamp_to() {
+        // `hard = -1` is the operator saying this limit is not bounded. Clamping
+        // against it would invert: `500 > -1` holds, so an account asking to be
+        // held to 500 would have been stored as unlimited — reaching the very
+        // state the gate above refuses, by asking for something *tighter*.
+        assert_eq!(
+            resolve_queue_limits(
+                &self_managing_account(),
+                false,
+                (Some(500), Some(500)),
+                (-1, -1)
+            )
+            .expect("a finite request stands when the mediator is unbounded"),
+            (Some(500), Some(500))
+        );
+        // And `-1` is still not the account's to ask for, bounded or not.
+        assert!(
+            resolve_queue_limits(&self_managing_account(), false, (Some(-1), None), (-1, -1))
+                .is_err(),
+            "an unbounded mediator does not hand out its own exemption"
+        );
+    }
+
+    #[test]
+    fn a_limit_the_account_does_not_self_manage_is_only_refused_when_it_is_asked_for() {
+        // Both limits run through the gate on every request. An account that
+        // self-manages send but not receive must still be able to set send: the
+        // omitted receive member is nothing to refuse.
+        let mut session = self_managing_account();
+        session.acls.set_self_manage_receive_queue_limit(false);
+        assert_eq!(
+            resolve_queue_limits(&session, false, (Some(42), None), HARD)
+                .expect("an omitted member is not a request to change it"),
+            (Some(42), None)
+        );
+        // Asking for it is still refused.
+        assert!(
+            resolve_queue_limits(&session, false, (Some(42), Some(42)), HARD).is_err(),
+            "the receive limit is not this account's to set"
+        );
+    }
+
+    #[test]
+    fn an_account_whose_type_did_not_decode_is_gated_like_a_standard_one() {
+        // The gate runs on the caller's admin test, not on "anything that is not
+        // Standard". `Unknown` is not an admin — `account/update` refuses its ACL
+        // member for exactly that reason — so it must not slip past this one.
+        let mut session = self_managing_account();
+        session.account_type = AccountType::Unknown;
+        assert!(
+            resolve_queue_limits(&session, false, (Some(-1), None), HARD).is_err(),
+            "a non-admin session must be gated whatever its account type"
+        );
+    }
+
+    #[test]
+    fn an_admin_may_still_set_a_queue_limit_to_unlimited() {
+        // The gate is for self-service only. An admin's request stands as sent,
+        // unlimited included, and is never clamped to the hard limit.
+        assert_eq!(
+            resolve_queue_limits(&admin_account(), true, (Some(-1), Some(-1)), HARD)
+                .expect("an admin sets any value"),
+            (Some(-1), Some(-1))
+        );
+        assert_eq!(
+            resolve_queue_limits(&admin_account(), true, (Some(50_000), Some(-2)), HARD)
+                .expect("an admin sets any value"),
+            (Some(50_000), Some(-2))
+        );
+    }
 
     #[tokio::test]
     async fn ping_consume_returns_ok_and_echoes_nonce() {

@@ -22,6 +22,64 @@ mediator-tui 0.11.0); they are no longer updated.
   `queued_send_messages_per_peer` is unchanged at 50 and remains the gate that
   catches one sender flooding one recipient.
 
+### Fixed
+
+- **A standard account can no longer switch its own queue limit off.**
+  `SELF_MANAGE_SEND_QUEUE_LIMIT` / `SELF_MANAGE_RECEIVE_QUEUE_LIMIT` let an
+  account raise its own limit up to the mediator's hard maximum, enforced by
+  clamping anything larger. `-1` is not a larger number — it is the sentinel
+  for *no limit at all* — so it slid past the clamp and was stored verbatim,
+  after which the account's queue gate never refused it again, whatever its
+  depth. Any deployment whose default ACL grants those flags — AMA's does,
+  through `GLOBAL_DEFAULT_ACL` in `cdk-atlas-lib`; this repo's shipped
+  `global_acl_default` does not — made one `messaging/account/update/0.1`
+  enough, with no admin and no redeploy. **Behaviour change (R3.6):** a
+  standard account requesting `-1` (or any negative other than `-2`) for either
+  queue limit now gets an `authorization.queue_limit.admin_required` problem
+  report and a 403 instead of a success; a request it is allowed to make is
+  unaffected, and values above the hard limit are still clamped rather than
+  refused. An admin still sets `-1` deliberately, and `-2` still resets the
+  account to the mediator default for standard accounts and admins alike.
+  The `queue_stream_maxlen` doc comment in `limits.rs` described `-2` as
+  unlimited; it is a reset, and now says so.
+
+- **A self-managed queue limit is no longer clamped against an unbounded hard
+  limit.** When the mediator is configured with `queued_send_messages_hard` or
+  `queued_receive_messages_hard` of `-1` (not bounded), the clamp compared
+  against it as a number: `500 > -1` holds, so a standard account asking to be
+  held to 500 was stored as `-1` instead and ended up with no limit at all —
+  reaching the state above by asking for something *tighter*. A negative hard
+  limit is now read as "no ceiling" and the request stands, as
+  `queue_stream_maxlen` already reads one. (`queue_at_capacity` and
+  `validate_peer_queue_limit` test for `-1` exactly, and are unbounded on any
+  other negative only through the unsigned cast — the accident this change
+  closes on the write path, not prior art to copy.) An unbounded mediator
+  still does not hand out its own exemption: `-1` from a standard account is
+  refused either way.
+
+- **A queue limit the account may not self-manage is now refused, not silently
+  dropped.** `account/update` ignored a `send_queue_limit` / `receive_queue_limit`
+  from an account without the matching `SELF_MANAGE_*` flag and answered 200 with
+  the account echoed, so the caller read the unchanged old value as the value it
+  had just set. It now gets an `authorization.queue_limit.not_self_manageable`
+  problem report and a 403, as `acl` already did for a capability the account may
+  not change.
+
+- **The two self-or-admin members of `account/update` now agree on who an admin
+  is.** The `acl` member tested `Admin | RootAdmin`, the queue limits tested
+  "anything that is not `Standard`", so an account whose type did not decode
+  (`AccountType::Unknown`) was gated on one member and waved through on the other.
+  Both now use the handler's own `is_admin`.
+
+- **`account/update` no longer applies part of a refused request.** The handler
+  guards every member before applying any of them, so that a member the caller
+  may not set refuses the whole update; the queue-limit check above was added
+  at the write instead, one step inside the apply phase. A single request
+  carrying both an `acl` member and an unlimited queue limit therefore stored
+  and audited the ACL change and then returned 403, leaving the account
+  half-updated with no response document to say which half landed. The check
+  now runs with the other guards, before the first write.
+
 ## 0.50.0 (release/0.50)
 
 ### Changed — trust-tasks-rs 0.37 (breaking)
