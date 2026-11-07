@@ -26,7 +26,6 @@ locally before pushing avoids round-trips:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 scripts/check-release-guards.py
 bash scripts/check-test-clock-isolation.sh
 ```
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Transitional: maintainers still cut locally. Cuts should move to the release
+# bot (the release-cut workflow); then delete this script, and release_lib.py
+# once prepare-release.py is gone too.
 """Cut a release: create `release/<major.minor>` and move main to the next one.
 
     python3 scripts/cut-release.py 0.42 [--from origin/nightly] [--dry-run]
@@ -7,7 +10,8 @@ Run by the release manager from a clean checkout with push access and `gh`
 authenticated. It:
 
   1. resolves the source commit — `origin/nightly` by default, the newest main
-     commit the full CI suite passed (RELEASES.md);
+     commit the full CI suite passed (RELEASES.md) — and refuses one main
+     doesn't have, since only main is reviewed;
   2. pushes `release/<name>` = source commit + one commit that moves the
      workspace (lockstep: `[workspace.package] version` and every internal
      requirement) to `<name>.0` and writes `RELEASE` = `<name>.0-rc.0`.
@@ -58,6 +62,8 @@ def main():
         sys.exit(f"{branch} already exists")
     source = git("rev-parse", "--verify", f"{args.source}^{{commit}}").stdout.strip()
     main_sha = git("rev-parse", "--verify", "origin/main^{commit}").stdout.strip()
+    if git("merge-base", "--is-ancestor", source, main_sha, check=False).returncode:
+        sys.exit(f"{args.source} ({source[:12]}) is not on main: a release is cut from a reviewed main commit")
     print(f"cutting {branch} from {args.source} ({source[:12]}); main is {main_sha[:12]}")
 
     # Prune after the temporary directory is gone: pruned inside it, the
