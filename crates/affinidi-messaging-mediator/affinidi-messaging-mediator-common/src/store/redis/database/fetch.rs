@@ -144,6 +144,9 @@ impl Database {
                             .unwrap_or_default()
                     };
                     let (msg_id, from) = (field("MSG_ID"), field("FROM"));
+                    // Atomic so a delete cannot land between the two reads:
+                    // that would return a deleted message with no metadata
+                    // (no RECEIVE_ID), and it would be delivered again.
                     let (body, meta): (Option<String>, HashMap<String, String>) = redis::pipe()
                         .atomic()
                         .get(keys.msg(&msg_id))

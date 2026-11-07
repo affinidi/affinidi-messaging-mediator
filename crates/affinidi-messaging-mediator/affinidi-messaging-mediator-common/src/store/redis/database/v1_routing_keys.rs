@@ -197,24 +197,21 @@ impl RedisStore {
         // Bindings before the index: a failure part-way leaves the index
         // listing what is left, so a retried purge finishes.
         let mut con = self.get_connection().await?;
-        let mut steps: Vec<Pipeline> = verkeys
-            .iter()
-            .map(|verkey| {
-                let mut unbound = Pipeline::new();
-                unbound.cmd("DEL").arg(key_owner(verkey));
-                unbound
-            })
-            .collect();
+        let mut unbound = Pipeline::new();
+        for verkey in &verkeys {
+            unbound.cmd("DEL").arg(key_owner(verkey));
+        }
         let mut unindexed = Pipeline::new();
         unindexed.cmd("DEL").arg(self.keys().v1_keys(did_hash));
-        steps.push(unindexed);
-        self.exec_steps(&mut con, steps).await.map_err(|err| {
-            MediatorError::DatabaseError(
-                14,
-                "NA".to_string(),
-                format!("Failed to purge v1 routing keys for ({did_hash}). Reason: {err}"),
-            )
-        })?;
+        self.query_fanout_then(&mut con, unbound, unindexed)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".to_string(),
+                    format!("Failed to purge v1 routing keys for ({did_hash}). Reason: {err}"),
+                )
+            })?;
 
         Ok(())
     }

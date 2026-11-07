@@ -236,6 +236,26 @@ impl RedisStore {
         }
     }
 
+    /// Runs `independent`, then `last`, as one `MULTI`/`EXEC` with cluster
+    /// mode off. With it on, the independent commands run concurrently, each
+    /// on its own, and `last` runs only once all of them have succeeded. Use
+    /// it where `last` must not happen before the rest, and a failure part-way
+    /// is harmless. Returns every reply in order.
+    pub(crate) async fn query_fanout_then(
+        &self,
+        con: &mut RedisConnection,
+        independent: redis::Pipeline,
+        last: redis::Pipeline,
+    ) -> redis::RedisResult<Vec<Value>> {
+        if self.keys().cluster_mode() {
+            let mut replies: Vec<Value> = self.query_each(con, independent).await?;
+            replies.extend(self.query_steps(con, vec![last]).await?);
+            Ok(replies)
+        } else {
+            self.query_steps(con, vec![independent, last]).await
+        }
+    }
+
     /// Runs a pipeline of independent commands. With cluster mode off it runs
     /// as is. With it on, each command runs on its own, concurrently, so the
     /// pipeline is neither atomic nor filtered by `ignore()`: use it where the

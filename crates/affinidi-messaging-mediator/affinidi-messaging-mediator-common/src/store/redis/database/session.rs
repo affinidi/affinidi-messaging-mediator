@@ -9,48 +9,11 @@ use crate::errors::MediatorError;
 use crate::store::types::{Session, SessionState};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::Database;
 
 impl Database {
-    /// Creates a new session in the database
-    /// Typically called when sending the initial challenge to the client
-    pub async fn create_session(&self, session: &Session) -> Result<(), MediatorError> {
-        let mut con = self.get_connection().await?;
-
-        let sid = format!("SESSION:{}", session.session_id);
-
-        redis::pipe()
-            .atomic()
-            .cmd("HSET")
-            .arg(&sid)
-            .arg("challenge")
-            .arg(&session.challenge)
-            .arg("state")
-            .arg(session.state.to_string())
-            .arg("did")
-            .arg(&session.did)
-            .cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("SESSIONS_CREATED")
-            .arg(1)
-            .expire(&sid, 900)
-            .exec_async(&mut con)
-            .await
-            .map_err(|err| {
-                MediatorError::SessionError(
-                    14,
-                    sid.clone(),
-                    format!("Failed to create session ({sid}). Reason: {err}"),
-                )
-            })?;
-
-        debug!("Session created: session_id={}", session.session_id);
-
-        Ok(())
-    }
-
     /// Retrieves a session and associated other info from the database
     pub async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
         let mut con = self.get_connection().await?;

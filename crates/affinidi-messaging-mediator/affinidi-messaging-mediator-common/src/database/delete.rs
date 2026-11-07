@@ -50,30 +50,15 @@ impl DatabaseHandler {
         async move {
             let mut conn = self.get_async_connection().await?;
 
-            // Read before the delete, because the delete removes the metadata.
-            // The receipt is written here in Rust rather than in the stored
-            // function for the reason `mark_delivered` gives: a stale function
-            // library loads without complaint and would silently never write
-            // it. A metadata read that fails only costs the receipt.
-            let mut parties: Option<(String, String)> = redis::cmd("HMGET")
-                .arg(self.keys.msg_meta(message_hash))
-                .arg("TO")
-                .arg("FROM")
-                .arg("SEND_ID")
-                .query_async::<Vec<Option<String>>>(&mut conn)
-                .await
-                .ok()
-                .and_then(|fields| match fields.as_slice() {
-                    // `SEND_ID` is present exactly when the message sits in
-                    // a sender's outbox, i.e. has a recorded sender.
-                    [Some(to), Some(from), Some(_)] => Some((to.clone(), from.clone())),
-                    _ => None,
-                });
+            // The sender and recipient, for the outbox receipt. The receipt is
+            // written here in Rust rather than in the stored function for the
+            // reason `mark_delivered` gives: a stale function library loads
+            // without complaint and would silently never write it.
+            let mut parties: Option<(String, String)> = None;
 
             let result: Result<String, redis::RedisError> = if self.keys.cluster_mode() {
-                // The claim waits out a store in progress, so take the
-                // parties from it: the read above may predate the outbox
-                // entry.
+                // The claim waits out a store in progress and returns the
+                // parties, so no read beforehand is needed.
                 self.delete_message_in_steps(&mut conn, message_hash, did_hash, admin_did_hash)
                     .await
                     .map(|(to, from)| {
@@ -81,6 +66,22 @@ impl DatabaseHandler {
                         "OK".to_string()
                     })
             } else {
+                // Read before the delete, because the delete removes the
+                // metadata. A read that fails only costs the receipt.
+                parties = redis::cmd("HMGET")
+                    .arg(self.keys.msg_meta(message_hash))
+                    .arg("TO")
+                    .arg("FROM")
+                    .arg("SEND_ID")
+                    .query_async::<Vec<Option<String>>>(&mut conn)
+                    .await
+                    .ok()
+                    .and_then(|fields| match fields.as_slice() {
+                        // `SEND_ID` is present exactly when the message sits
+                        // in a sender's outbox, i.e. has a recorded sender.
+                        [Some(to), Some(from), Some(_)] => Some((to.clone(), from.clone())),
+                        _ => None,
+                    });
                 let mut cmd = redis::cmd("FCALL");
                 cmd.arg("delete_message")
                     .arg(1)

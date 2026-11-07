@@ -189,16 +189,7 @@ impl DatabaseHandler {
         if config.cluster_mode {
             Self::check_single_endpoint(&mut single.clone()).await?;
             if is_replica(&mut single.clone()).await {
-                return Err(MediatorError::problem_with_log(
-                    2,
-                    "NA",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.config",
-                    "database.cluster_mode (DATABASE_CLUSTER_MODE) needs database_url to reach the primary node; it reached a replica",
-                    Vec::<String>::new(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                return Err(storage_config_error(
                     "database.cluster_mode (DATABASE_CLUSTER_MODE) needs database_url to reach the primary node; it reached a replica".to_string(),
                 ));
             }
@@ -276,18 +267,7 @@ impl DatabaseHandler {
         let text = format!(
             "database.cluster_mode (DATABASE_CLUSTER_MODE) is {setting}, but the existing accounts were written with cluster_mode {written}; their data would be unreachable. Keep cluster_mode {written}, or migrate the data first"
         );
-        Err(MediatorError::problem_with_log(
-            2,
-            "NA",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.config",
-            "{1}",
-            vec![text.clone()],
-            StatusCode::INTERNAL_SERVER_ERROR,
-            text,
-        ))
+        Err(storage_config_error(text))
     }
 
     /// Returns a clone of the auto-reconnecting multiplexed connection.
@@ -376,21 +356,10 @@ impl DatabaseHandler {
         if primaries.len() <= 1 {
             return Ok(());
         }
-        let count = primaries.len().to_string();
-        Err(MediatorError::problem_with_log(
-            2,
-            "NA",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.config",
-            "database.cluster_mode (DATABASE_CLUSTER_MODE) supports a single-endpoint cluster such as ElastiCache Serverless; this cluster has {1} primary nodes",
-            vec![count.clone()],
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "database.cluster_mode (DATABASE_CLUSTER_MODE) supports a single-endpoint cluster such as ElastiCache Serverless; this cluster has {count} primary nodes"
-            ),
-        ))
+        Err(storage_config_error(format!(
+            "database.cluster_mode (DATABASE_CLUSTER_MODE) supports a single-endpoint cluster such as ElastiCache Serverless; this cluster has {} primary nodes",
+            primaries.len()
+        )))
     }
 
     /// Refuses to start when `cluster_mode` doesn't match the server.
@@ -456,20 +425,9 @@ impl DatabaseHandler {
         } else {
             "disabled"
         };
-        Err(MediatorError::problem_with_log(
-            2,
-            "NA",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.config",
-            "database.cluster_mode (DATABASE_CLUSTER_MODE) is {1}, but the database server has cluster mode {2}",
-            vec![setting.to_string(), server.to_string()],
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "database.cluster_mode (DATABASE_CLUSTER_MODE) is {setting}, but the database server has cluster mode {server}"
-            ),
-        ))
+        Err(storage_config_error(format!(
+            "database.cluster_mode (DATABASE_CLUSTER_MODE) is {setting}, but the database server has cluster mode {server}"
+        )))
     }
 
     /// Returns a dedicated Redis connection with no response timeout.
@@ -696,6 +654,23 @@ impl DatabaseHandler {
             info!("Redis TLS connection detected (rediss://)");
         }
     }
+}
+
+/// A storage configuration that stops the mediator starting, as a problem
+/// report whose text is also the log line.
+fn storage_config_error(text: String) -> MediatorError {
+    MediatorError::problem_with_log(
+        2,
+        "NA",
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "me.res.storage.config",
+        "{1}",
+        vec![text.clone()],
+        StatusCode::INTERNAL_SERVER_ERROR,
+        text,
+    )
 }
 
 #[cfg(all(test, feature = "redis-backend"))]

@@ -185,32 +185,31 @@ impl Database {
 
             // ROLE_TYPE alone grants admin rights (sessions read it), so each
             // account's role is reset before the ADMINS set is touched.
-            let mut steps: Vec<redis::Pipeline> = accounts
-                .iter()
-                .map(|account| {
-                    let mut role = redis::pipe();
-                    role.cmd("HSET")
-                        .arg(self.keys().did(account))
-                        .arg("ROLE_TYPE")
-                        .arg::<String>(AccountType::Standard.into());
-                    role
-                })
-                .collect();
+            let mut roles = redis::pipe();
+            for account in &accounts {
+                roles
+                    .cmd("HSET")
+                    .arg(self.keys().did(account))
+                    .arg("ROLE_TYPE")
+                    .arg::<String>(AccountType::Standard.into());
+            }
             let mut unlisted = redis::pipe();
             unlisted.cmd("SREM").arg("ADMINS");
             for account in &accounts {
                 debug!("Removing Admin account: {}", account);
                 unlisted.arg(account);
             }
-            steps.push(unlisted);
 
-            let result = self.query_steps(&mut con, steps).await.map_err(|err| {
-                MediatorError::DatabaseError(
-                    14,
-                    "NA".to_string(),
-                    format!("Failed to remove admin account. Reason: {err}"),
-                )
-            })?;
+            let result = self
+                .query_fanout_then(&mut con, roles, unlisted)
+                .await
+                .map_err(|err| {
+                    MediatorError::DatabaseError(
+                        14,
+                        "NA".to_string(),
+                        format!("Failed to remove admin account. Reason: {err}"),
+                    )
+                })?;
             debug!("Admin accounts removed successfully: {:?}", result);
 
             // The SREM reply, last: how many were in the ADMINS set.
