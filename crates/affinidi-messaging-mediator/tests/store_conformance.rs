@@ -1149,6 +1149,13 @@ async fn check_expiry_sweep_reports_each_message(store: Arc<dyn MediatorStore>) 
 
     assert!(store.get_message(to, &expiring).await.unwrap().is_none());
     assert!(store.get_message(to, &kept).await.unwrap().is_some());
+
+    // The sweep unlisted what it removed: a second pass finds nothing.
+    let again = store
+        .sweep_expired_messages(now, "did_hash_admin_expiry")
+        .await
+        .expect("second sweep");
+    assert_eq!((again.expired, again.already_deleted), (0, 0), "{again:?}");
 }
 
 /// Store four messages for the outbox-receipt checks: three from `from` and one

@@ -45,7 +45,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use redis::{Value, aio::MultiplexedConnection, from_redis_value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
@@ -2059,25 +2063,37 @@ impl MediatorStore for RedisStore {
 
         for key in &timeslot_keys {
             let mut conn = self.get_connection().await?;
-            // Messages whose delete failed for a reason other than being
-            // gone already. SPOP took them out of the bucket, so they go
-            // back once it is drained and the bucket stays indexed for the
-            // next pass; otherwise nothing would ever expire them.
-            let mut retry_later: Vec<String> = Vec::new();
+            // A message leaves its bucket only after its delete has
+            // succeeded or found it already gone. Removing it first (SPOP)
+            // and putting it back on failure loses it for good when the
+            // put-back is refused (SADD is DENYOOM on a full database) or
+            // the process dies in between. SREM and ZREM free memory, so
+            // they still run at maxmemory.
+            let mut bucket_cleared = true;
+            // SSCAN may return a member more than once across batches.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut cursor: u64 = 0;
             loop {
-                let msg_id: Option<String> = redis::cmd("SPOP")
+                let (next, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
                     .arg(key)
+                    .arg(cursor)
+                    .arg("COUNT")
+                    .arg(STATIC_TIMESLOT_BATCH)
                     .query_async(&mut conn)
                     .await
                     .map_err(|err| {
                         MediatorError::DatabaseError(
                             14,
                             "expiry".into(),
-                            format!("sweep_expired_messages SPOP failed: {err}"),
+                            format!("sweep_expired_messages SSCAN failed: {err}"),
                         )
                     })?;
 
-                if let Some(msg_id) = msg_id {
+                let mut done: Vec<String> = Vec::new();
+                for msg_id in batch {
+                    if !seen.insert(msg_id.clone()) {
+                        continue;
+                    }
                     let meta = match on_expired {
                         Some(_) => MediatorStore::get_message_metadata(self, "expiry", &msg_id)
                             .await
@@ -2094,42 +2110,52 @@ impl MediatorStore for RedisStore {
                             if let (Some(observe), Some(meta)) = (on_expired, &meta) {
                                 observe(&msg_id, meta);
                             }
+                            done.push(msg_id);
                         }
-                        Err(err) if ops::is_delete_not_found(&err) => report.already_deleted += 1,
+                        Err(err) if ops::is_delete_not_found(&err) => {
+                            report.already_deleted += 1;
+                            done.push(msg_id);
+                        }
                         Err(err) => {
+                            // Left in the bucket; the next sweep retries it.
                             warn!("Couldn't expire message {msg_id}, retrying next sweep: {err}");
-                            retry_later.push(msg_id);
+                            bucket_cleared = false;
                         }
                     }
-                } else if !retry_later.is_empty() {
-                    redis::cmd("SADD")
+                }
+
+                // On failure the messages are gone but still listed; the next
+                // sweep finds them not-found and unlists them then.
+                if !done.is_empty()
+                    && let Err(err) = redis::cmd("SREM")
                         .arg(key)
-                        .arg(&retry_later)
+                        .arg(&done)
                         .exec_async(&mut conn)
                         .await
-                        .map_err(|err| {
-                            MediatorError::DatabaseError(
-                                14,
-                                "expiry".into(),
-                                format!("sweep_expired_messages SADD failed: {err}"),
-                            )
-                        })?;
-                    break;
-                } else {
-                    redis::cmd("ZREM")
-                        .arg("MSG_EXPIRY")
-                        .arg(key)
-                        .exec_async(&mut conn)
-                        .await
-                        .map_err(|err| {
-                            MediatorError::DatabaseError(
-                                14,
-                                "expiry".into(),
-                                format!("sweep_expired_messages ZREM failed: {err}"),
-                            )
-                        })?;
+                {
+                    warn!("sweep_expired_messages SREM on {key} failed: {err}");
+                    bucket_cleared = false;
+                }
+
+                cursor = next;
+                if cursor == 0 {
                     break;
                 }
+            }
+
+            if bucket_cleared {
+                redis::cmd("ZREM")
+                    .arg("MSG_EXPIRY")
+                    .arg(key)
+                    .exec_async(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        MediatorError::DatabaseError(
+                            14,
+                            "expiry".into(),
+                            format!("sweep_expired_messages ZREM failed: {err}"),
+                        )
+                    })?;
             }
         }
 
