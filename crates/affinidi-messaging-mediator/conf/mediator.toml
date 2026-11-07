@@ -509,9 +509,15 @@ queued_receive_messages_hard = "1000"
 ### the message TTL expires. Raising a hard limit therefore moves the stream
 ### bound with it automatically; there is no second number to remember.
 ###
-### Residual: an account granted -1 or -2 (unlimited) is not clamped to the
-### hard limit, so no finite bound sits above it and trimming can still reach
-### such an account. That is a property of choosing unlimited.
+### Residual: an account an admin has granted -1 (no limit) is not clamped to
+### the hard limit, so no finite bound sits above it and trimming can still
+### reach such an account. That is a property of choosing unlimited. Only an
+### admin can grant it: an account that self-manages its own limit is refused
+### -1 and may set anything from 0 up to the hard limit — or any value at
+### all when the hard limit is itself -1, there being no ceiling to hold it
+### to. (-2 is not a third limit value but a request to drop the account's
+### override and go back to the mediator default, so it never diverges from
+### the hard limit.)
 
 ### Env: LIMIT_TO_KEYS_PER_DID
 ### Maximum keys per recipient DID (DoS protection).

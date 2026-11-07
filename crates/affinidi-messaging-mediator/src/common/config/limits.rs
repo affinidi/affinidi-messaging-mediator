@@ -108,12 +108,16 @@ impl LimitsConfig {
     /// to a limit. Trimming is a backstop against state the gates should have
     /// prevented, never a bound on traffic they allow.
     ///
-    /// **Residual, stated rather than hidden:** an account may be granted `-1`
-    /// or `-2` (unlimited), which `account_update` passes through *without*
+    /// **Residual, stated rather than hidden:** an admin may set an account's
+    /// limit to `-1` (unlimited), which `account_update` stores *without*
     /// clamping to the hard limit. No finite bound can sit above that, so for
     /// such an account the stream is still bounded while its counters are not.
     /// Those accounts have deliberately opted out of limits; the divergence is
-    /// a property of that choice, not of this value.
+    /// a property of that choice, not of this value. A standard account cannot
+    /// reach it: `gate_self_managed_limit` refuses `-1` even from an account
+    /// that self-manages the limit. (`-2` is not a third limit value but a
+    /// request to drop the account's override and fall back to the mediator
+    /// default, so it never diverges from the hard limit.)
     ///
     /// A global hard limit of `-1` disables trimming outright (`0` = no
     /// `MAXLEN`), which also avoids handing Redis the result of casting `-1`
