@@ -11,26 +11,35 @@ impl Database {
     pub async fn streaming_clean_start(&self, uuid: &str) -> Result<(), MediatorError> {
         let mut conn = self.get_connection().await?;
 
-        let response: Vec<Value> = redis::pipe()
-            .atomic()
-            .cmd("FCALL")
-            .arg("clean_start_streaming")
-            .arg(1)
-            .arg(uuid)
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                event!(
-                    Level::ERROR,
-                    "redis function clean_start_streaming() failed. Reason: {}",
-                    err
-                );
-                MediatorError::DatabaseError(
-                    14,
-                    "NA".into(),
-                    format!("redis function clean_start_streaming() failed. Reason: {err}"),
-                )
-            })?;
+        let response: Vec<Value> = if self.keys().cluster_mode() {
+            super::cluster_scripts::CLEAN_START_STREAMING
+                .key(self.keys().streaming_sessions(uuid))
+                .key(self.keys().global_streaming())
+                .invoke_async::<Value>(&mut conn)
+                .await
+                .map(|count| vec![count])
+        } else {
+            redis::pipe()
+                .atomic()
+                .cmd("FCALL")
+                .arg("clean_start_streaming")
+                .arg(1)
+                .arg(uuid)
+                .query_async(&mut conn)
+                .await
+        }
+        .map_err(|err| {
+            event!(
+                Level::ERROR,
+                "redis function clean_start_streaming() failed. Reason: {}",
+                err
+            );
+            MediatorError::DatabaseError(
+                14,
+                "NA".into(),
+                format!("redis function clean_start_streaming() failed. Reason: {err}"),
+            )
+        })?;
 
         if let Ok(count) = from_redis_value::<i64>(response[0].clone()) {
             event!(
@@ -71,7 +80,7 @@ impl Database {
         };
 
         match redis::cmd("HGET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .query_async::<Option<String>>(&mut conn)
             .await
@@ -212,10 +221,10 @@ impl Database {
         match redis::pipe()
             .atomic()
             .cmd("SADD")
-            .arg(["STREAMING_SESSIONS:", stream_uuid].concat())
+            .arg(self.keys().streaming_sessions(stream_uuid))
             .arg(did_hash)
             .cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":FALSE"].concat())
             .exec_async(&mut conn)
@@ -254,7 +263,7 @@ impl Database {
         let mut conn = self.get_connection().await?;
 
         match redis::cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":", "TRUE"].concat())
             .exec_async(&mut conn)
@@ -296,7 +305,7 @@ impl Database {
         let mut conn = self.get_connection().await?;
 
         match redis::cmd("HSET")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .arg([stream_uuid, ":", "FALSE"].concat())
             .exec_async(&mut conn)
@@ -340,10 +349,10 @@ impl Database {
         match redis::pipe()
             .atomic()
             .cmd("SREM")
-            .arg(["STREAMING_SESSIONS:", stream_uuid].concat())
+            .arg(self.keys().streaming_sessions(stream_uuid))
             .arg(did_hash)
             .cmd("HDEL")
-            .arg("GLOBAL_STREAMING")
+            .arg(self.keys().global_streaming())
             .arg(did_hash)
             .exec_async(&mut conn)
             .await

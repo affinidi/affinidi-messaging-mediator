@@ -356,7 +356,59 @@ jobs:
             -p affinidi-messaging-mediator \
             --no-default-features \
             --features "didcomm,redis-backend" \
-            --test store_conformance
+            --test store_conformance \
+            --test redis_reconnect
+
+  redis-conformance-cluster:
+    # The same checks against a single-node Valkey cluster (all slots on one
+    # node) with `cluster_mode` on, the mode ElastiCache Serverless needs.
+    # Started by hand: a service container can't take `--cluster-enabled`.
+    # Valkey 9 for numbered databases in cluster mode, which the suite uses.
+    name: redis conformance (valkey cluster)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "--cfg tracing_unstable"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: redis-conformance-cluster
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+      - name: Start a single-node Valkey cluster
+        run: |
+          docker run -d --name valkey -p 7000:7000 valkey/valkey:9.0 \
+            valkey-server --port 7000 --cluster-enabled yes --cluster-databases 16 \
+            --cluster-announce-ip 127.0.0.1 --appendonly no
+          for _ in $(seq 1 30); do
+            docker exec valkey valkey-cli -p 7000 ping && break
+            sleep 1
+          done
+          docker exec valkey valkey-cli -p 7000 cluster addslotsrange 0 16383
+          for _ in $(seq 1 30); do
+            docker exec valkey valkey-cli -p 7000 cluster info | grep -q cluster_state:ok && break
+            sleep 1
+          done
+          docker exec valkey valkey-cli -p 7000 cluster info | grep cluster_state:ok
+      - name: cargo test store_conformance against the Valkey cluster
+        env:
+          REDIS_URL: redis://localhost:7000
+          REDIS_CLUSTER_MODE: "true"
+        run: |
+          cargo test \
+            -p affinidi-messaging-mediator \
+            --no-default-features \
+            --features "didcomm,redis-backend" \
+            --test store_conformance \
+            --test redis_reconnect
+          cargo test \
+            -p affinidi-messaging-mediator-common \
+            --features redis-backend \
+            --lib cluster_scripts
 
   test-mediator-fjall:
     # The e2e suite against the on-disk Fjall backend (each store in its own

@@ -22,9 +22,9 @@ impl Database {
             let (didcomm_message, meta_data): (Value, Vec<String>) = redis::pipe()
                 .atomic()
                 .cmd("GET")
-                .arg(["MSG:", msg_id].concat())
+                .arg(self.keys().msg(msg_id))
                 .cmd("HGETALL")
-                .arg(["MSG:META:", msg_id].concat())
+                .arg(self.keys().msg_meta(msg_id))
                 .query_async(&mut conn)
                 .await
                 .map_err(|err| {

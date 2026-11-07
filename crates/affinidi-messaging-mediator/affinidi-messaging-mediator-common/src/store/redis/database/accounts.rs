@@ -47,7 +47,7 @@ impl Database {
         let mut con = self.get_connection().await?;
 
         redis::cmd("EXISTS")
-            .arg(["DID:", did_hash].concat())
+            .arg(self.keys().did(did_hash))
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -67,12 +67,18 @@ impl Database {
         &self,
         did_hash: &str,
     ) -> Result<Option<Account>, MediatorError> {
+        // An anonymous session's hash is empty. In cluster mode an empty
+        // `{}` tag doesn't group keys, so the read below would be refused as
+        // cross-slot.
+        if did_hash.is_empty() {
+            return Ok(None);
+        }
         let mut con = self.get_connection().await?;
 
         let (details, access_list_count): (HashMap<String, String>, u32) = redis::pipe()
             .atomic()
-            .hgetall(["DID:", did_hash].concat())
-            .scard(["ACCESS_LIST:", did_hash].concat())
+            .hgetall(self.keys().did(did_hash))
+            .scard(self.keys().access_list(did_hash))
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -109,14 +115,12 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            let mut cmd = redis::pipe();
-            let mut cmd = cmd
-                .atomic()
-                .cmd("SADD")
-                .arg("KNOWN_DIDS")
-                .arg(did_hash)
+            // Record before list entry: a failure between them leaves an
+            // unlisted account, which the next add or login lists again.
+            let mut record = redis::pipe();
+            let cmd = record
                 .cmd("HSET")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .arg("SEND_QUEUE_BYTES")
                 .arg(0)
                 .arg("SEND_QUEUE_COUNT")
@@ -131,16 +135,21 @@ impl Database {
                 .arg(acls.to_hex_string());
 
             if let Some(queue_limit) = queue_limit {
-                cmd = cmd.arg("QUEUE_LIMIT").arg(queue_limit);
+                cmd.arg("QUEUE_LIMIT").arg(queue_limit);
             }
 
-            cmd.exec_async(&mut con).await.map_err(|err| {
-                MediatorError::DatabaseError(
-                    14,
-                    "NA".to_string(),
-                    format!("Failed to add account. Reason: {err}"),
-                )
-            })?;
+            let mut listed = redis::pipe();
+            listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
+
+            self.exec_steps(&mut con, vec![record, listed])
+                .await
+                .map_err(|err| {
+                    MediatorError::DatabaseError(
+                        14,
+                        "NA".to_string(),
+                        format!("Failed to add account. Reason: {err}"),
+                    )
+                })?;
             debug!("Account added successfully");
 
             Ok(Account {
@@ -228,20 +237,19 @@ impl Database {
             // accepted for a mailbox that no longer exists.
             self.v1_routing_keys_purge(did_hash).await?;
 
-            // Remove from Known DIDs
-            // Remove DID Record
-            // Remove ACCESS_LIST Set
+            // Unlist before deleting the record (the reverse of `account_add`):
+            // a failure between them leaves an unlisted, already blocked
+            // account, which a retry removes.
             let mut con = self.get_connection().await?;
-            redis::pipe()
-                .atomic()
-                .cmd("SREM")
-                .arg("KNOWN_DIDS")
-                .arg(did_hash)
+            let mut unlisted = redis::pipe();
+            unlisted.cmd("SREM").arg("KNOWN_DIDS").arg(did_hash);
+            let mut records = redis::pipe();
+            records
                 .cmd("DEL")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .cmd("DEL")
-                .arg(["ACCESS_LIST:", did_hash].concat())
-                .exec_async(&mut con)
+                .arg(self.keys().access_list(did_hash));
+            self.exec_steps(&mut con, vec![unlisted, records])
                 .await
                 .map_err(|err| {
                     MediatorError::DatabaseError(
@@ -291,16 +299,16 @@ impl Database {
 
             // For each DID, fetch their access_list count and DID Details
             let mut did_query = Pipeline::new();
-            let did_query = did_query.atomic();
+            did_query.atomic();
             let mut access_list_query = Pipeline::new();
-            let access_list_query = access_list_query.atomic();
+            access_list_query.atomic();
             for did in &dids {
-                did_query.add_command(redis::Cmd::hgetall(["DID:", did].concat()));
-                access_list_query.add_command(redis::Cmd::scard(["ACCESS_LIST:", did].concat()));
+                did_query.add_command(redis::Cmd::hgetall(self.keys().did(did)));
+                access_list_query.add_command(redis::Cmd::scard(self.keys().access_list(did)));
             }
 
             let did_results: Vec<HashMap<String, String>> =
-                did_query.query_async(&mut con).await.map_err(|err| {
+                self.query_each(&mut con, did_query).await.map_err(|err| {
                     MediatorError::DatabaseError(
                         14,
                         "NA".to_string(),
@@ -308,8 +316,8 @@ impl Database {
                     )
                 })?;
 
-            let access_list_results: Vec<u32> = access_list_query
-                .query_async(&mut con)
+            let access_list_results: Vec<u32> = self
+                .query_each(&mut con, access_list_query)
                 .await
                 .map_err(|err| {
                     MediatorError::DatabaseError(
@@ -363,7 +371,7 @@ impl Database {
             let mut con = self.get_connection().await?;
 
             redis::cmd("HSET")
-                .arg(["DID:", did_hash].concat())
+                .arg(self.keys().did(did_hash))
                 .arg("ROLE_TYPE")
                 .arg::<String>(_type.to_owned().into())
                 .exec_async(&mut con)
@@ -436,7 +444,7 @@ impl Database {
             None => return Ok(()),
             Some(-2) => {
                 redis::cmd("HDEL")
-                    .arg(["DID:", did_hash].concat())
+                    .arg(self.keys().did(did_hash))
                     .arg(queue_name)
                     .exec_async(&mut con)
                     .await
@@ -450,7 +458,7 @@ impl Database {
             }
             Some(n) => {
                 redis::cmd("HSET")
-                    .arg(["DID:", did_hash].concat())
+                    .arg(self.keys().did(did_hash))
                     .arg(queue_name)
                     .arg(n)
                     .exec_async(&mut con)

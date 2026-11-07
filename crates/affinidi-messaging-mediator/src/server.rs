@@ -375,9 +375,14 @@ pub async fn serve_internal(
                 //
                 // Held for `/readyz` — the supervisor that owns the health
                 // registry does not exist yet at this point.
-                lua_integrity_outcome = Some(crate::common::lua_integrity::check_and_report(
-                    functions_file,
-                ));
+                // Cluster mode never loads the library (`load_scripts`
+                // returns early), so a mismatched file there is harmless and
+                // must not mark the mediator degraded.
+                if !config.database.cluster_mode {
+                    lua_integrity_outcome = Some(crate::common::lua_integrity::check_and_report(
+                        functions_file,
+                    ));
+                }
                 store.load_scripts(functions_file).await.map_err(|e| {
                     error!("Failed to load LUA scripts: {e}");
                     e

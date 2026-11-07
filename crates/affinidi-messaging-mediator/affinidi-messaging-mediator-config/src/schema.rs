@@ -21,6 +21,9 @@ pub struct DatabaseConfigRaw {
     pub database_url: String,
     pub database_timeout: String,
     pub scripts_path: Option<String>,
+    /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
+    #[serde(default)]
+    pub cluster_mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

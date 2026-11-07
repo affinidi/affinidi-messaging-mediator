@@ -1,7 +1,7 @@
 //! Database routines to add/remove/list admin accounts
-use crate::errors::MediatorError;
+use crate::errors::{MediatorError, is_storage_full};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
-use tracing::{Instrument, Level, debug, info, span};
+use tracing::{Instrument, Level, debug, info, span, warn};
 
 use super::Database;
 
@@ -28,29 +28,60 @@ impl Database {
             admin_did_hash, admin_did_hash
         );
 
-        redis::pipe()
-            .atomic()
-            .cmd("SADD")
-            .arg("ADMINS")
-            .arg(admin_did_hash)
-            .ignore()
-            .cmd("HSET")
-            .arg(["DID:", admin_did_hash].concat())
+        // ROLE_TYPE alone grants admin rights (sessions read it), so it is
+        // written last: a failure between the steps leaves no admin.
+        let mut listed = redis::pipe();
+        listed.cmd("SADD").arg("ADMINS").arg(admin_did_hash);
+        let mut role = redis::pipe();
+        role.cmd("HSET")
+            .arg(self.keys().did(admin_did_hash))
             .arg("ROLE_TYPE")
-            .arg::<String>(admin_type.into())
-            .ignore()
-            .exec_async(&mut con)
-            .await
-            .map_err(|err| {
-                MediatorError::DatabaseError(
+            .arg::<String>(admin_type.into());
+        match self.exec_steps(&mut con, vec![listed, role]).await {
+            Ok(()) => {}
+            // A full database refuses even a write that changes nothing, and
+            // this runs on every start. Carry on when the account is already
+            // set up as asked, so a mediator can restart while full (and then
+            // free space); otherwise fail as before.
+            Err(err)
+                if is_storage_full(&err.to_string())
+                    && self
+                        .admin_account_in_place(&mut con, admin_did_hash, admin_type)
+                        .await =>
+            {
+                warn!(
+                    "Database is full; admin account {admin_did_hash} already set up, not rewritten"
+                );
+            }
+            Err(err) => {
+                return Err(MediatorError::DatabaseError(
                     14,
                     "NA".to_string(),
                     format!("Failed to set up admin account for ({admin_did_hash}). Reason: {err}"),
-                )
-            })?;
+                ));
+            }
+        }
 
         info!("Admin account successfully setup: {}", admin_did_hash);
         Ok(())
+    }
+
+    /// Whether `did_hash` is already in the ADMINS set with role `admin_type`.
+    async fn admin_account_in_place(
+        &self,
+        con: &mut crate::database::RedisConnection,
+        did_hash: &str,
+        admin_type: AccountType,
+    ) -> bool {
+        let mut listed = redis::cmd("SISMEMBER");
+        listed.arg("ADMINS").arg(did_hash);
+        let mut role = redis::cmd("HGET");
+        role.arg(self.keys().did(did_hash)).arg("ROLE_TYPE");
+        let expected: String = admin_type.into();
+        matches!(
+            self.query_pair::<bool, Option<String>>(con, listed, role).await,
+            Ok((true, Some(current))) if current == expected
+        )
     }
 
     /// Checks if the provided DID is an admin level account
@@ -58,15 +89,12 @@ impl Database {
     pub(crate) async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
         let mut con = self.get_connection().await?;
 
-        let (exists, role_type): (u32, u32) = redis::pipe()
-            .atomic()
-            .cmd("SISMEMBER")
-            .arg("ADMINS")
-            .arg(did_hash)
-            .cmd("HGET")
-            .arg(["DID:", did_hash].concat())
-            .arg("ROLE_TYPE")
-            .query_async(&mut con)
+        let mut listed = redis::cmd("SISMEMBER");
+        listed.arg("ADMINS").arg(did_hash);
+        let mut role = redis::cmd("HGET");
+        role.arg(self.keys().did(did_hash)).arg("ROLE_TYPE");
+        let (exists, role_type): (u32, u32) = self
+            .query_pair(&mut con, listed, role)
             .await
             .map_err(|err| {
                 MediatorError::DatabaseError(
@@ -155,25 +183,28 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            let mut tx = redis::pipe();
-            let mut tx = tx.atomic().cmd("SREM").arg("ADMINS");
-
-            // Remove from the ADMINS Set
+            // ROLE_TYPE alone grants admin rights (sessions read it), so each
+            // account's role is reset before the ADMINS set is touched.
+            let mut steps: Vec<redis::Pipeline> = accounts
+                .iter()
+                .map(|account| {
+                    let mut role = redis::pipe();
+                    role.cmd("HSET")
+                        .arg(self.keys().did(account))
+                        .arg("ROLE_TYPE")
+                        .arg::<String>(AccountType::Standard.into());
+                    role
+                })
+                .collect();
+            let mut unlisted = redis::pipe();
+            unlisted.cmd("SREM").arg("ADMINS");
             for account in &accounts {
                 debug!("Removing Admin account: {}", account);
-                tx = tx.arg(account);
+                unlisted.arg(account);
             }
+            steps.push(unlisted);
 
-            // Remove admin field on each DID
-            for account in &accounts {
-                tx = tx
-                    .cmd("HSET")
-                    .arg(["DID:", account].concat())
-                    .arg("ROLE_TYPE")
-                    .arg::<String>(AccountType::Standard.into());
-            }
-
-            let result: Vec<i32> = tx.query_async(&mut con).await.map_err(|err| {
+            let result = self.query_steps(&mut con, steps).await.map_err(|err| {
                 MediatorError::DatabaseError(
                     14,
                     "NA".to_string(),
@@ -182,7 +213,11 @@ impl Database {
             })?;
             debug!("Admin accounts removed successfully: {:?}", result);
 
-            Ok(result.first().unwrap_or(&0).to_owned())
+            // The SREM reply, last: how many were in the ADMINS set.
+            Ok(result
+                .last()
+                .and_then(|removed| redis::from_redis_value::<i32>(removed.clone()).ok())
+                .unwrap_or(0))
         }
         .instrument(_span)
         .await

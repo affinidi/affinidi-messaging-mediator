@@ -58,9 +58,9 @@ impl Database {
 
             // Grab a message from the Stream
             let key = if folder == &Folder::Inbox {
-                ["RECEIVE_Q:", did_hash].concat()
+                self.keys().receive_q(did_hash)
             } else {
-                ["SEND_Q:", did_hash].concat()
+                self.keys().send_q(did_hash)
             };
             let message: Vec<(String, HashMap<String, String>)> =
                 redis::Cmd::xrange_count(&key, "-", "+", 1)
@@ -167,9 +167,9 @@ impl Database {
         let mut con = self.get_connection().await?;
 
         let key = if folder == &Folder::Inbox {
-            ["RECEIVE_Q:", did_hash].concat()
+            self.keys().receive_q(did_hash)
         } else {
-            ["SEND_Q:", did_hash].concat()
+            self.keys().send_q(did_hash)
         };
 
         redis::Cmd::del(key)
