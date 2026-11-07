@@ -148,10 +148,14 @@ enum StorageCap {
     Busy,
 }
 
-fn storage_cap(text: &str) -> Option<StorageCap> {
+/// `timeout_is_storage` says whether a timeout in `text` can only be a
+/// storage timeout. It holds for database and session errors, which wrap a
+/// database reply. A generic problem report can carry any timeout (a forward,
+/// a DID resolution), so for it only the database's own replies count.
+fn storage_cap(text: &str, timeout_is_storage: bool) -> Option<StorageCap> {
     if is_storage_full(text) {
         Some(StorageCap::Full)
-    } else if text.contains("timed out")
+    } else if (timeout_is_storage && text.contains("timed out"))
         || text.contains("STORE_IN_PROGRESS")
         || text.contains("DELETE_IN_PROGRESS")
     {
@@ -208,29 +212,33 @@ impl MediatorError {
     pub fn named_storage_cap(self) -> Self {
         let cap = match &self {
             Self::DatabaseError(code, _, text) | Self::SessionError(code, _, text) => {
-                storage_cap(text).map(|cap| (cap, *code, text.clone()))
+                storage_cap(text, true).map(|cap| (cap, *code, text.clone()))
             }
             Self::MediatorError(code, _, _, report, status, log)
                 if *status >= 500 && !report.code.contains("storage.") =>
             {
-                storage_cap(log).map(|cap| (cap, *code, log.clone()))
+                let from_database = report.code.contains(".database.");
+                storage_cap(log, from_database).map(|cap| (cap, *code, log.clone()))
             }
             _ => None,
         };
         let Some((cap, code, text)) = cap else {
             return self;
         };
-        let session = match self {
-            Self::DatabaseError(_, session, _)
-            | Self::SessionError(_, session, _)
-            | Self::MediatorError(_, session, ..) => session,
+        // Keep the id of the message this error answers, so the report
+        // stays threaded (`pthid`) to the request.
+        let (session, msg_id) = match self {
+            Self::DatabaseError(_, session, _) | Self::SessionError(_, session, _) => {
+                (session, None)
+            }
+            Self::MediatorError(_, session, msg_id, ..) => (session, msg_id),
             _ => unreachable!("only these variants are matched above"),
         };
         match cap {
             StorageCap::Full => Self::problem_with_log(
                 97,
                 session,
-                None,
+                msg_id,
                 ProblemReportSorter::Error,
                 ProblemReportScope::Message,
                 "me.res.storage.full",
@@ -242,7 +250,7 @@ impl MediatorError {
             StorageCap::Busy => Self::problem_with_log(
                 98,
                 session,
-                None,
+                msg_id,
                 ProblemReportSorter::Warning,
                 ProblemReportScope::Message,
                 "me.res.storage.busy",
@@ -900,6 +908,55 @@ mod tests {
             storage_busy_retry_after_secs("e.p.me.res.storage.busy"),
             Some(STORAGE_BUSY_RETRY_AFTER_SECS)
         );
+    }
+
+    #[test]
+    fn a_non_storage_timeout_is_not_named_storage_busy() {
+        let forward = MediatorError::problem_with_log(
+            50,
+            "NA",
+            Some("req-1".into()),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Message,
+            "me.res.forwarding.error",
+            "Couldn't forward message: {1}",
+            vec!["operation timed out".into()],
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Couldn't forward message: operation timed out".to_string(),
+        );
+        match forward.named_storage_cap() {
+            MediatorError::MediatorError(_, _, _, report, _, _) => {
+                assert!(
+                    !report.code.contains("storage."),
+                    "renamed to {}",
+                    report.code
+                )
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_named_cap_keeps_the_request_it_answers() {
+        let delete = MediatorError::problem_with_log(
+            10,
+            "NA",
+            Some("req-1".into()),
+            ProblemReportSorter::Warning,
+            ProblemReportScope::Message,
+            "database.message.delete.error",
+            "Couldn't delete message_hash ({1}). Reason: {2}",
+            vec!["h".into(), "Response timed out".into()],
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Couldn't delete message_hash (h). Reason: Response timed out".to_string(),
+        );
+        match delete.named_storage_cap() {
+            MediatorError::MediatorError(_, _, msg_id, report, _, _) => {
+                assert!(report.code.ends_with("storage.busy"));
+                assert_eq!(msg_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// The problem code and HTTP status of `text` as a database error once
