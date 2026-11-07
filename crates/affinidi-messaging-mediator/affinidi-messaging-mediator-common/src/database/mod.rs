@@ -658,6 +658,7 @@ impl DatabaseHandler {
 
 /// A storage configuration that stops the mediator starting, as a problem
 /// report whose text is also the log line.
+#[cfg(feature = "redis-backend")]
 fn storage_config_error(text: String) -> MediatorError {
     MediatorError::problem_with_log(
         2,
