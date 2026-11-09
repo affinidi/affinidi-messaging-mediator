@@ -27,6 +27,8 @@
 //! - `access_lists`       — `{did_hash}:{member_did_hash}` → empty
 //! - `admins`             — `did_hash` → role flag (1=Admin,
 //!   2=RootAdmin, 3=Mediator)
+//! - `mux_records`        — member `did_hash` → JSON mux grant record
+//! - `mux_principals`     — `{principal_hash} 0xFF {member_did_hash}` → empty
 //! - `oob_invites`        — `oob_id` → JSON `{ invite_b64, did_hash,
 //!   expires_at }`
 //! - `trust_task_claims`  — claim key → JSON `{ digest, retain_until }`; the
@@ -57,6 +59,7 @@
 //! one key-only scan at open and maintained under `write_lock`
 //! thereafter, which is sound because this backend is single-process.
 
+use affinidi_messaging_mediator_common::store::mux::{MuxDidRecord, MuxIndexDelta};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
 };
@@ -179,6 +182,8 @@ const KEYSPACE_WRITE_WEIGHTS: &[(&str, u32)] = &[
     (PARTITION_ACCESS_LISTS, 1),
     (PARTITION_ADMINS, 1),
     (PARTITION_V1_ROUTING_KEYS, 1),
+    (PARTITION_MUX_RECORDS, 1),
+    (PARTITION_MUX_PRINCIPALS, 1),
     (PARTITION_OOB_INVITES, 1),
     (PARTITION_GLOBALS, 1),
 ];
@@ -208,6 +213,12 @@ const PARTITION_ACCOUNTS: &str = "accounts";
 const PARTITION_ACCESS_LISTS: &str = "access_lists";
 const PARTITION_ADMINS: &str = "admins";
 const PARTITION_V1_ROUTING_KEYS: &str = "v1_routing_keys";
+/// member DID hash -> JSON [`MuxDidRecord`]. Additive: a database written
+/// before it existed simply has no mux records.
+const PARTITION_MUX_RECORDS: &str = "mux_records";
+/// `<principal_hash> 0xFF <member_did_hash>` -> empty. The principal index,
+/// written in the same batch as the record it mirrors.
+const PARTITION_MUX_PRINCIPALS: &str = "mux_principals";
 const PARTITION_OOB_INVITES: &str = "oob_invites";
 const PARTITION_TRUST_TASK_CLAIMS: &str = "trust_task_claims";
 const PARTITION_SCID_SOURCES: &str = "scid_sources";
@@ -306,6 +317,8 @@ pub struct FjallStore {
     /// base58 routing verkey -> owning account's DID hash. See
     /// `MediatorStore::v1_routing_key_bind`.
     v1_routing_keys: Keyspace,
+    mux_records: Keyspace,
+    mux_principals: Keyspace,
     oob_invites: Keyspace,
     trust_task_claims: Keyspace,
     /// did:scid account hash → serialised source record.
@@ -577,6 +590,14 @@ const DEFAULT_CB_RECOVERY_SECS: u64 = 10;
 const CB_PROBE_KEY: &[u8] = b"__circuit_breaker_probe__";
 
 /// Build the `peer_queue` key for one (sender, recipient) pair.
+fn mux_principal_key(principal_hash: &str, did_hash: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(principal_hash.len() + 1 + did_hash.len());
+    key.extend_from_slice(principal_hash.as_bytes());
+    key.push(PEER_QUEUE_SEP);
+    key.extend_from_slice(did_hash.as_bytes());
+    key
+}
+
 fn peer_queue_key(from_hash: &str, to_hash: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(from_hash.len() + 1 + to_hash.len());
     k.extend_from_slice(from_hash.as_bytes());
@@ -815,6 +836,8 @@ impl FjallStore {
             access_lists: open_partition(PARTITION_ACCESS_LISTS)?,
             admins: open_partition(PARTITION_ADMINS)?,
             v1_routing_keys: open_partition(PARTITION_V1_ROUTING_KEYS)?,
+            mux_records: open_partition(PARTITION_MUX_RECORDS)?,
+            mux_principals: open_partition(PARTITION_MUX_PRINCIPALS)?,
             oob_invites: open_partition(PARTITION_OOB_INVITES)?,
             trust_task_claims: open_partition(PARTITION_TRUST_TASK_CLAIMS)?,
             scid_sources: open_partition(PARTITION_SCID_SOURCES)?,
@@ -2246,6 +2269,104 @@ impl MediatorStore for FjallStore {
     }
 
     // ─── DIDComm v1 routing keys ─────────────────────────────────────────────
+
+    // ─── DID multiplexing ────────────────────────────────────────────────────
+
+    fn supports_mux(&self) -> bool {
+        true
+    }
+
+    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
+        self.mux_records
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("mux_record_get", e))?
+            .map(|raw| Self::decode::<MuxDidRecord>(&raw))
+            .transpose()
+    }
+
+    async fn mux_record_cas(
+        &self,
+        did_hash: &str,
+        expected_version: Option<u64>,
+        new: Option<&MuxDidRecord>,
+        index: &MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        // Read-compare-write under the write lock, and record + index in one
+        // batch, so the index can never disagree with the record it mirrors.
+        let _guard = self.write_lock.lock().await;
+        let current = self.mux_record_get(did_hash).await?.map(|r| r.version);
+        if current != expected_version {
+            return Ok(false);
+        }
+        let mut batch = self.db.batch();
+        match new {
+            Some(rec) => {
+                let raw = serde_json::to_vec(rec).map_err(|e| {
+                    MediatorError::InternalError(
+                        14,
+                        "fjall".into(),
+                        format!("mux record encode: {e}"),
+                    )
+                })?;
+                batch.insert(&self.mux_records, did_hash.as_bytes(), raw);
+            }
+            None => batch.remove(&self.mux_records, did_hash.as_bytes()),
+        }
+        for p in &index.add {
+            batch.insert(&self.mux_principals, mux_principal_key(p, did_hash), b"");
+        }
+        for p in &index.remove {
+            batch.remove(&self.mux_principals, mux_principal_key(p, did_hash));
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("mux_record_cas:commit", e))?;
+        Ok(true)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let mut prefix = principal_hash.as_bytes().to_vec();
+        prefix.push(PEER_QUEUE_SEP);
+        let lower = match after {
+            Some(a) => std::ops::Bound::Excluded(mux_principal_key(principal_hash, a)),
+            None => std::ops::Bound::Included(prefix.clone()),
+        };
+        let mut out = Vec::new();
+        for guard in self
+            .mux_principals
+            .range::<Vec<u8>, _>((lower, std::ops::Bound::Unbounded))
+        {
+            if out.len() >= limit {
+                break;
+            }
+            let key = guard
+                .key()
+                .map_err(|e| Self::db_err("mux_principal_dids:range", e))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&key[prefix.len()..]).into_owned());
+        }
+        Ok(out)
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        let mut prefix = principal_hash.as_bytes().to_vec();
+        prefix.push(PEER_QUEUE_SEP);
+        let mut n = 0;
+        for guard in self.mux_principals.prefix(&prefix) {
+            guard
+                .key()
+                .map_err(|e| Self::db_err("mux_principal_count:prefix", e))?;
+            n += 1;
+        }
+        Ok(n)
+    }
 
     fn supports_v1_routing_keys(&self) -> bool {
         true

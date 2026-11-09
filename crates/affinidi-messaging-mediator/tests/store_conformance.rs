@@ -45,7 +45,7 @@ use std::time::Duration;
 use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState,
 };
-use affinidi_messaging_mediator_common::store::{MediatorStore, TrustTaskClaim};
+use affinidi_messaging_mediator_common::store::{MediatorStore, TrustTaskClaim, mux};
 use affinidi_messaging_mediator_common::types::audit::{AuditAction, AuditLogEntry};
 use affinidi_messaging_sdk::protocols::mediator::{
     accounts::{Account, AccountType},
@@ -1452,6 +1452,309 @@ async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
     );
 }
 
+// ─── DID multiplexing ────────────────────────────────────────────────────────
+
+fn mux_grant(
+    id: &str,
+    member: &str,
+    principal: &str,
+    kid: &str,
+    iat: u64,
+    epoch: u64,
+) -> mux::MuxGrant {
+    mux::MuxGrant {
+        grant_id: id.into(),
+        did: format!("did:example:{member}"),
+        did_hash: member.into(),
+        principal: format!("did:example:{principal}"),
+        principal_hash: principal.into(),
+        kid: kid.into(),
+        key_fp: "fp".into(),
+        did_version: None,
+        epoch,
+        scope: mux::MuxScope::new([mux::MuxCapability::Receive]).unwrap(),
+        iat,
+        exp: iat + 3600,
+        narrowed_scope: None,
+        narrowed_exp: None,
+        state: mux::MuxGrantState::Active,
+        state_changed_at: None,
+        jws: "jws".into(),
+    }
+}
+
+/// The two backend primitives: version-checked replace, and the principal
+/// index moving in the same step.
+async fn check_mux_primitives(store: Arc<dyn MediatorStore>) {
+    assert!(store.supports_mux());
+    let member = "mux-prim-member";
+    assert_eq!(store.mux_record_get(member).await.unwrap(), None);
+
+    let rec = mux::MuxDidRecord {
+        version: 1,
+        epoch: 0,
+        ..Default::default()
+    };
+    let add = mux::MuxIndexDelta {
+        add: vec!["mux-prim-p1".into(), "mux-prim-p2".into()],
+        remove: vec![],
+    };
+
+    // Expecting a version that isn't there loses, and writes nothing.
+    assert!(
+        !store
+            .mux_record_cas(member, Some(7), Some(&rec), &add)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.mux_record_get(member).await.unwrap(), None);
+    assert_eq!(store.mux_principal_count("mux-prim-p1").await.unwrap(), 0);
+
+    // Create.
+    assert!(
+        store
+            .mux_record_cas(member, None, Some(&rec), &add)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.mux_record_get(member).await.unwrap(),
+        Some(rec.clone())
+    );
+    assert_eq!(
+        store
+            .mux_principal_dids("mux-prim-p1", None, 10)
+            .await
+            .unwrap(),
+        vec![member.to_string()]
+    );
+
+    // A second create (expects absence) loses.
+    assert!(
+        !store
+            .mux_record_cas(member, None, Some(&rec), &add)
+            .await
+            .unwrap()
+    );
+
+    // Replace at the right version, moving p2 out of the index.
+    let rec2 = mux::MuxDidRecord {
+        version: 2,
+        epoch: 1,
+        ..Default::default()
+    };
+    let rm = mux::MuxIndexDelta {
+        add: vec![],
+        remove: vec!["mux-prim-p2".into()],
+    };
+    assert!(
+        store
+            .mux_record_cas(member, Some(1), Some(&rec2), &rm)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.mux_record_get(member).await.unwrap().unwrap().epoch,
+        1
+    );
+    assert_eq!(store.mux_principal_count("mux-prim-p2").await.unwrap(), 0);
+    assert_eq!(store.mux_principal_count("mux-prim-p1").await.unwrap(), 1);
+
+    // Delete.
+    let rm1 = mux::MuxIndexDelta {
+        add: vec![],
+        remove: vec!["mux-prim-p1".into()],
+    };
+    assert!(
+        store
+            .mux_record_cas(member, Some(2), None, &rm1)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.mux_record_get(member).await.unwrap(), None);
+    assert!(
+        store
+            .mux_principal_dids("mux-prim-p1", None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Index paging is ascending and strictly after the cursor.
+    for m in ["mux-prim-c", "mux-prim-a", "mux-prim-b"] {
+        let one = mux::MuxIndexDelta {
+            add: vec!["mux-prim-pager".into()],
+            remove: vec![],
+        };
+        assert!(
+            store
+                .mux_record_cas(m, None, Some(&rec), &one)
+                .await
+                .unwrap()
+        );
+    }
+    let page1 = store
+        .mux_principal_dids("mux-prim-pager", None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        page1,
+        vec!["mux-prim-a".to_string(), "mux-prim-b".to_string()]
+    );
+    let page2 = store
+        .mux_principal_dids("mux-prim-pager", Some("mux-prim-b"), 2)
+        .await
+        .unwrap();
+    assert_eq!(page2, vec!["mux-prim-c".to_string()]);
+    assert_eq!(
+        store.mux_principal_count("mux-prim-pager").await.unwrap(),
+        3
+    );
+}
+
+/// The grant rules end to end through `mux::modify`, so each backend is shown
+/// to carry them — including two writers racing on one record.
+async fn check_mux_grant_flows(store: Arc<dyn MediatorStore>) {
+    let limits = mux::MuxLimits::default();
+    let now = 1_800_000_000;
+    let member = "mux-flow-member";
+
+    // Two principals granted, concurrently: both must land.
+    let (a, b) = tokio::join!(
+        mux::modify(
+            &*store,
+            member,
+            &limits,
+            now,
+            Some("mux-flow-p"),
+            |rec, n| {
+                mux::put_grant(
+                    rec,
+                    mux_grant("g1", member, "mux-flow-p", "k1", now, 0),
+                    &limits,
+                    now,
+                    n,
+                )
+            }
+        ),
+        mux::modify(
+            &*store,
+            member,
+            &limits,
+            now,
+            Some("mux-flow-q"),
+            |rec, n| {
+                mux::put_grant(
+                    rec,
+                    mux_grant("g2", member, "mux-flow-q", "k1", now, 0),
+                    &limits,
+                    now,
+                    n,
+                )
+            }
+        ),
+    );
+    a.unwrap();
+    b.unwrap();
+    let rec = mux::load(&*store, member, &limits, now).await.unwrap();
+    assert_eq!(rec.grants.len(), 2);
+
+    let (page, next) = mux::grants_for_principal(&*store, "mux-flow-p", None, 10, &limits, now)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].grant_id, "g1");
+    assert!(next.is_none());
+
+    // An unknown key suspends both.
+    let suspended = mux::modify(&*store, member, &limits, now + 1, None, |rec, _| {
+        Ok(mux::suspend_unless_known_kid(rec, "k2", now + 1))
+    })
+    .await
+    .unwrap();
+    assert_eq!(suspended.len(), 2);
+
+    // Revoke-all bumps the epoch; an old-epoch grant is then refused.
+    let (epoch, _) = mux::modify(&*store, member, &limits, now + 2, None, |rec, _| {
+        Ok(mux::revoke_all(rec, now + 2))
+    })
+    .await
+    .unwrap();
+    assert_eq!(epoch, 1);
+    let err = mux::modify(
+        &*store,
+        member,
+        &limits,
+        now + 3,
+        Some("mux-flow-p"),
+        |rec, n| {
+            mux::put_grant(
+                rec,
+                mux_grant("g3", member, "mux-flow-p", "k2", now + 3, 0),
+                &limits,
+                now + 3,
+                n,
+            )
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, mux::MuxStoreError::EpochMismatch { .. }));
+    mux::modify(
+        &*store,
+        member,
+        &limits,
+        now + 3,
+        Some("mux-flow-p"),
+        |rec, n| {
+            mux::put_grant(
+                rec,
+                mux_grant("g3", member, "mux-flow-p", "k2", now + 3, 1),
+                &limits,
+                now + 3,
+                n,
+            )
+        },
+    )
+    .await
+    .unwrap();
+
+    // Removing the principal's account drops its grant everywhere.
+    let other = "mux-flow-member2";
+    mux::modify(
+        &*store,
+        other,
+        &limits,
+        now,
+        Some("mux-flow-p"),
+        |rec, n| {
+            mux::put_grant(
+                rec,
+                mux_grant("g4", other, "mux-flow-p", "k1", now, 0),
+                &limits,
+                now,
+                n,
+            )
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.mux_principal_count("mux-flow-p").await.unwrap(), 2);
+    mux::remove_account(&*store, "mux-flow-p", &limits, now + 4)
+        .await
+        .unwrap();
+    assert_eq!(store.mux_principal_count("mux-flow-p").await.unwrap(), 0);
+    let rec = mux::load(&*store, other, &limits, now + 4).await.unwrap();
+    assert!(rec.grants.is_empty());
+
+    // Removing the member's account drops its record and every index entry.
+    mux::remove_account(&*store, member, &limits, now + 5)
+        .await
+        .unwrap();
+    assert_eq!(store.mux_record_get(member).await.unwrap(), None);
+    assert_eq!(store.mux_principal_count("mux-flow-q").await.unwrap(), 0);
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -1460,7 +1763,9 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
     check_outbox_receipts(store.clone()).await;
-    check_purge_and_removal_receipts(store).await;
+    check_purge_and_removal_receipts(store.clone()).await;
+    check_mux_primitives(store.clone()).await;
+    check_mux_grant_flows(store).await;
 }
 
 /// Generate one `#[tokio::test]` per check for a backend `$ctor`.
@@ -1556,6 +1861,14 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn outbox_receipt_retention() {
                 check_outbox_receipt_retention(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn mux_primitives() {
+                check_mux_primitives(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn mux_grant_flows() {
+                check_mux_grant_flows(ready($ctor).await).await;
             }
         }
     };

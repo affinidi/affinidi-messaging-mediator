@@ -8,6 +8,21 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — DID multiplexing grant storage (no behaviour change yet)
+
+- Storage for DID multiplexing grants: a member DID's signed permission for a
+  *principal* connection to collect its messages (design:
+  `design-docs/mediator-did-multiplexing-design.md`). Every grant rule (epoch,
+  replay floor, quotas, narrow-only updates, unknown-key suspension, expiry)
+  lives once, in `affinidi-messaging-mediator-common::store::mux`; the Redis,
+  Fjall and memory backends implement only a versioned compare-and-swap of a
+  per-DID record, so they cannot drift on a rule. Nothing reads or writes
+  grants yet: the protocol and connection handling follow, opt-in, behind
+  `limits.mux.enabled` (off by default).
+- `MediatorStore` gains `supports_mux`, `mux_record_get`, `mux_record_cas`,
+  `mux_principal_dids` and `mux_principal_count`, all defaulted, so a
+  third-party backend keeps compiling and reports mux as unsupported.
+
 ### Added — did:webs
 
 - The mediator resolves `did:webs`, so a did:webs client can authenticate and
