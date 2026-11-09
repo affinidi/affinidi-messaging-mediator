@@ -65,6 +65,20 @@ mediator-tui 0.11.0); they are no longer updated.
   `feat/messaging-mux`). `trust-tasks.lock` still names
   `https://trusttasks.org`, and the pins must be refreshed from there once the
   specs are published, before this ships.
+- DIDComm mux connections. A client opens one by offering the
+  `affinidi-mux` WebSocket subprotocol (provisional name) alongside its
+  bearer token; the mediator echoes it only when mux is enabled. On connect
+  the mediator admits the principal's stored grants, registers each member
+  with live delivery on the one socket, and sends a signed
+  `messaging/mux/event` `ready` (with the attach nonce) and `attached`.
+  `messaging/mux/attach` and `detach` act on the connection they arrive on.
+  Revoke, revoke-all, unknown-key suspension and narrowing reach every live
+  connection carrying the affected DIDs **before** the response is sent, and
+  a frame queued for a member that has since left is dropped, not written.
+  Members expire on their own clocks and grant members' keys are re-checked
+  every `revalidate_interval_secs`. Message pickup (`status-request`,
+  `delivery-request`) and `messages-received` accept a member's DID when its
+  scope includes `pickup` / `delete`.
 
 ### Added — did:webs
 

@@ -21,12 +21,17 @@ use std::collections::HashSet;
 
 use super::grants::{self, Ctx, MuxError};
 use super::proof::Expect;
+use super::registry::MuxConn;
+use super::session::{LeaveReason, MuxSource, verify_attach};
+use crate::tasks::websocket_streaming::StreamingTask;
 
 /// Grants a task removed, voided, suspended or narrowed: the connection layer
 /// detaches (or re-scopes) these before the response goes out.
 #[derive(Debug, Default)]
 pub struct Changed {
     pub removed: Vec<MuxGrant>,
+    /// Why `removed` went, for the `detached` events.
+    pub reason: Option<LeaveReason>,
     pub suspended: Vec<MuxGrant>,
     pub narrowed: Vec<MuxGrant>,
 }
@@ -411,10 +416,16 @@ pub async fn revoke(
     if !unmatched_dids.is_empty() {
         out["unmatchedDids"] = json!(unmatched_dids.into_iter().collect::<Vec<_>>());
     }
+    let reason = Some(if req.role == "principal" {
+        LeaveReason::RevokedByPrincipal
+    } else {
+        LeaveReason::RevokedByMember
+    });
     Ok((
         out,
         Changed {
             removed,
+            reason,
             ..Default::default()
         },
     ))
@@ -471,6 +482,7 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
             json!({ "did": st.did, "epoch": epoch, "epochAdvanced": true, "revokedGrants": voided.len() }),
             Changed {
                 removed: voided,
+                reason: Some(LeaveReason::EpochBumped),
                 ..Default::default()
             },
         )),
@@ -487,6 +499,97 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
             retryable: false,
         }),
     }
+}
+
+// ─── attach / detach (on the connection itself) ─────────────────────────────
+
+/// `messaging/mux/attach` on mux connection `conn`. Refusals are per item.
+pub async fn attach(
+    ctx: &Ctx<'_>,
+    conn: &MuxConn,
+    streaming: Option<&StreamingTask>,
+    max_attach_lifetime_secs: u64,
+    payload: &Value,
+) -> (Value, Changed) {
+    let mut changed = Changed::default();
+    let ident = conn.session.lock().await.ident();
+    let statements = payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut results = Vec::with_capacity(statements.len());
+    for raw in &statements {
+        let did = raw
+            .get("issuer")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let admitted = match verify_attach(ctx, &ident, raw, max_attach_lifetime_secs).await {
+            Ok((member, suspended)) => {
+                changed.suspended.extend(suspended);
+                conn.session.lock().await.admit(member)
+            }
+            Err(e) => Err(e),
+        };
+        results.push(match admitted {
+            Ok(member) => {
+                if let Some(streaming) = streaming {
+                    conn.register_member(streaming, &member).await;
+                }
+                json!({
+                    "did": member.did,
+                    "status": "attached",
+                    "scope": member.scope,
+                    "expiresAt": rfc3339(member.expires_at),
+                })
+            }
+            Err(e) => {
+                let code = e.code();
+                let prefix = if matches!(code, "sessionMismatch" | "memberQuota") {
+                    "messaging/mux/attach"
+                } else {
+                    "messaging/mux"
+                };
+                json!({ "did": did, "status": "refused", "code": format!("{prefix}:{code}") })
+            }
+        });
+    }
+    (json!({ "results": results }), changed)
+}
+
+/// `messaging/mux/detach`: removes session attaches only. A member carried by
+/// a stored grant stays (`retainedByGrant`): ending that is a revoke.
+pub async fn detach(conn: &MuxConn, streaming: Option<&StreamingTask>, payload: &Value) -> Value {
+    let dids: Vec<String> = payload
+        .get("dids")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (mut detached, mut retained, mut not_attached) = (Vec::new(), Vec::new(), Vec::new());
+    for did in dids {
+        let hash = did_hash(&did);
+        let source = conn
+            .session
+            .lock()
+            .await
+            .get(&hash)
+            .map(|m| m.source.clone());
+        match source {
+            Some(MuxSource::Attach) => {
+                conn.detach(streaming, &hash, LeaveReason::DetachRequested)
+                    .await;
+                detached.push(did);
+            }
+            Some(MuxSource::Grant { .. }) => retained.push(did),
+            None => not_attached.push(did),
+        }
+    }
+    json!({ "detached": detached, "retainedByGrant": retained, "notAttached": not_attached })
 }
 
 #[cfg(all(test, feature = "memory-backend"))]

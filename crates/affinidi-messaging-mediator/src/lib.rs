@@ -94,6 +94,9 @@ pub struct SharedData {
     pub database: Arc<dyn MediatorStore>,
     /// Optional background task handle for WebSocket streaming.
     pub streaming_task: Option<StreamingTask>,
+    /// Live DID-multiplexing connections on this instance (empty unless
+    /// `limits.mux.enabled`).
+    pub mux: Arc<mux::registry::MuxRegistry>,
     /// DIDComm Discover Features protocol handler.
     #[cfg(feature = "didcomm")]
     pub discover_features: Arc<DiscoverFeatures>,

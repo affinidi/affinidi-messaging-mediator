@@ -122,55 +122,56 @@ impl MuxSession {
             .is_some_and(|m| m.expires_at > now && m.scope.contains(cap))
     }
 
-    /// Admit a member by a session attach statement (§4.3). Returns the new
-    /// member and any other principals' grants the unknown-key rule suspended
-    /// (each needs a detach on its own connection and a durable notice).
+    /// The connection identity an attach must be bound to, copied out so the
+    /// statement can be verified without holding the session lock across the
+    /// DID resolution it needs (R1.3).
+    pub fn ident(&self) -> AttachIdent {
+        AttachIdent {
+            principal_did: self.principal_did.clone(),
+            session_id: self.session_id.clone(),
+            nonce: self.nonce.clone(),
+        }
+    }
+
+    /// Put an already-verified member on the connection, enforcing the
+    /// per-connection cap. An attach overlapping a grant keeps the wider.
+    pub fn admit(&mut self, member: MuxMember) -> Result<MuxMember, MuxError> {
+        if !self.members.contains_key(&member.did_hash) && self.members.len() >= self.max_members {
+            return Err(MuxError::MemberQuota {
+                max: self.max_members,
+            });
+        }
+        let member = match self.members.remove(&member.did_hash) {
+            Some(existing) => merge(existing, member),
+            None => member,
+        };
+        self.members.insert(member.did_hash.clone(), member.clone());
+        Ok(member)
+    }
+
+    /// [`verify_attach`] then [`Self::admit`], for callers that own the
+    /// session outright.
     pub async fn attach(
         &mut self,
         ctx: &Ctx<'_>,
         raw: &Value,
         max_attach_lifetime_secs: u64,
     ) -> Result<(MuxMember, Vec<MuxGrant>), MuxError> {
-        let verified = ctx
-            .verifier
-            .verify_attach(
-                raw,
-                &self.session_id,
-                &self.nonce,
-                Expect {
-                    mediator_did: ctx.mediator_did,
-                    principal: Some(&self.principal_did),
-                    now: ctx.now,
-                    max_lifetime_secs: max_attach_lifetime_secs,
-                },
-            )
-            .await?;
-        member_standing(ctx, &verified.did_hash, &verified.scope).await?;
-        if !self.members.contains_key(&verified.did_hash) && self.members.len() >= self.max_members
-        {
-            return Err(MuxError::MemberQuota {
-                max: self.max_members,
-            });
+        if self.members.len() >= self.max_members {
+            // Cheap early refusal; `admit` re-checks.
+            let did = raw
+                .get("issuer")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !self.members.contains_key(&did_hash(did)) {
+                return Err(MuxError::MemberQuota {
+                    max: self.max_members,
+                });
+            }
         }
-        let suspended =
-            super::grants::suspend_unless_known_kid(ctx, &verified.did_hash, &verified.key.kid)
-                .await?;
-        let member = MuxMember {
-            did: verified.did,
-            did_hash: verified.did_hash.clone(),
-            source: MuxSource::Attach,
-            scope: verified.scope,
-            kid: verified.key.kid,
-            key_fp: verified.key.key_fp,
-            expires_at: verified.exp,
-        };
-        // An attach overlapping a grant keeps the wider of the two.
-        let member = match self.members.remove(&verified.did_hash) {
-            Some(existing) => merge(existing, member),
-            None => member,
-        };
-        self.members.insert(verified.did_hash, member.clone());
-        Ok((member, suspended))
+        let (member, suspended) =
+            verify_attach(ctx, &self.ident(), raw, max_attach_lifetime_secs).await?;
+        Ok((self.admit(member)?, suspended))
     }
 
     /// Admit every usable stored grant on connect (§4.5). Returns the members
@@ -273,6 +274,20 @@ impl MuxSession {
         out
     }
 
+    /// Apply a narrowed grant to the member it admitted: its scope and expiry
+    /// shrink now, not at the next reconnect.
+    pub fn narrow(&mut self, grant: &MuxGrant) {
+        if let Some(m) = self.members.get_mut(&grant.did_hash)
+            && m.source
+                == (MuxSource::Grant {
+                    grant_id: grant.grant_id.clone(),
+                })
+        {
+            m.scope = grant.effective_scope().clone();
+            m.expires_at = m.expires_at.min(grant.effective_exp());
+        }
+    }
+
     /// Remove members whose admission has lapsed at `now`.
     pub fn expire(&mut self, now: u64) -> Vec<MuxMember> {
         let gone: Vec<String> = self
@@ -283,6 +298,54 @@ impl MuxSession {
             .collect();
         gone.iter().filter_map(|h| self.members.remove(h)).collect()
     }
+}
+
+/// What an attach statement must be bound to.
+#[derive(Clone, Debug)]
+pub struct AttachIdent {
+    pub principal_did: String,
+    pub session_id: String,
+    pub nonce: String,
+}
+
+/// Verify an attach statement for the connection `ident`, check the member's
+/// standing, and apply the unknown-key rule. Returns the member to admit and
+/// any grants the rule suspended. Holds no lock.
+pub async fn verify_attach(
+    ctx: &Ctx<'_>,
+    ident: &AttachIdent,
+    raw: &Value,
+    max_attach_lifetime_secs: u64,
+) -> Result<(MuxMember, Vec<MuxGrant>), MuxError> {
+    let verified = ctx
+        .verifier
+        .verify_attach(
+            raw,
+            &ident.session_id,
+            &ident.nonce,
+            Expect {
+                mediator_did: ctx.mediator_did,
+                principal: Some(&ident.principal_did),
+                now: ctx.now,
+                max_lifetime_secs: max_attach_lifetime_secs,
+            },
+        )
+        .await?;
+    member_standing(ctx, &verified.did_hash, &verified.scope).await?;
+    let suspended =
+        super::grants::suspend_unless_known_kid(ctx, &verified.did_hash, &verified.key.kid).await?;
+    Ok((
+        MuxMember {
+            did: verified.did,
+            did_hash: verified.did_hash,
+            source: MuxSource::Attach,
+            scope: verified.scope,
+            kid: verified.key.kid,
+            key_fp: verified.key.key_fp,
+            expires_at: verified.exp,
+        },
+        suspended,
+    ))
 }
 
 /// The member must have an account, not be blocked, and its own ACLs must

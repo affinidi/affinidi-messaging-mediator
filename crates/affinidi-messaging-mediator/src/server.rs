@@ -830,6 +830,7 @@ pub async fn serve_internal(
         service_start_timestamp: chrono::Utc::now(),
         did_resolver,
         database: store,
+        mux: Default::default(),
         streaming_task,
         #[cfg(feature = "didcomm")]
         discover_features,

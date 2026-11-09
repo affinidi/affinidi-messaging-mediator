@@ -482,7 +482,9 @@ pub(crate) async fn consume(
             )
             .await?
         }
-        ServedTask::MuxGrant
+        ServedTask::MuxAttach
+        | ServedTask::MuxDetach
+        | ServedTask::MuxGrant
         | ServedTask::MuxList
         | ServedTask::MuxUpdate
         | ServedTask::MuxRevoke
@@ -568,6 +570,8 @@ served_tasks! {
     QueuePurge => queue::purge::v0_1::Payload,
     MonitorSubscribe => monitor::subscribe::v0_1::Payload,
     MonitorUnsubscribe => monitor::unsubscribe::v0_1::Payload,
+    MuxAttach => crate::task_specs::messaging::mux::attach::v0_1::Payload,
+    MuxDetach => crate::task_specs::messaging::mux::detach::v0_1::Payload,
     MuxGrant => crate::task_specs::messaging::mux::grant::v0_1::Payload,
     MuxList => crate::task_specs::messaging::mux::list::v0_1::Payload,
     MuxUpdate => crate::task_specs::messaging::mux::update::v0_1::Payload,
@@ -2286,12 +2290,34 @@ async fn consume_mux(
         )
     };
 
-    // `_changed` lists the grants this task removed, voided, suspended or
-    // narrowed. Mux connections must drop those members before the response
-    // is sent (§7.3). This build serves no mux connections yet (the mediator
-    // refuses to start with mux enabled until it does), so there is nothing
-    // to detach; the connection layer consumes `_changed` when it lands.
-    let (response, _changed) = match task {
+    // attach / detach act on the connection the request arrived on.
+    let conn = || {
+        state.mux.get(&session.session_id).ok_or_else(|| {
+            tt_problem(
+                session,
+                "messaging/mux:notMuxConnection",
+                "this request must be sent on a mux connection".to_string(),
+                StatusCode::BAD_REQUEST,
+            )
+        })
+    };
+    let streaming = state.streaming_task.as_ref();
+
+    let (response, changed) = match task {
+        ServedTask::MuxAttach => {
+            tasks::attach(
+                &ctx,
+                &*conn()?,
+                streaming,
+                state.config.limits.mux.max_attach_lifetime_secs,
+                payload,
+            )
+            .await
+        }
+        ServedTask::MuxDetach => (
+            tasks::detach(&*conn()?, streaming, payload).await,
+            tasks::Changed::default(),
+        ),
         ServedTask::MuxGrant => tasks::grant(&ctx, sender_did, payload).await,
         ServedTask::MuxList => (
             tasks::list(&ctx, sender_did, payload)
@@ -2308,6 +2334,35 @@ async fn consume_mux(
         ServedTask::MuxRevokeAll => tasks::revoke_all(&ctx, payload).await.map_err(refused)?,
         _ => unreachable!("consume_mux is only called for mux tasks"),
     };
+
+    // Drop the members whose grants this task removed, voided or suspended,
+    // and re-scope narrowed ones, on every live connection that carries them
+    // — *before* answering, so no frame for them leaves after the response
+    // says they are gone (§7.3, R1.1/R7.2).
+    use crate::mux::session::LeaveReason;
+    if !changed.removed.is_empty() {
+        state
+            .mux
+            .detach_grants(
+                streaming,
+                &changed.removed,
+                changed.reason.unwrap_or(LeaveReason::RevokedByMember),
+            )
+            .await;
+    }
+    if !changed.suspended.is_empty() {
+        state
+            .mux
+            .detach_grants(
+                streaming,
+                &changed.suspended,
+                LeaveReason::SuspendedUnknownKey,
+            )
+            .await;
+    }
+    if !changed.narrowed.is_empty() {
+        state.mux.narrow(&changed.narrowed).await;
+    }
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,
@@ -2326,6 +2381,16 @@ async fn consume_mux(
             .map_err(serialize_err)
     }
     match task {
+        ServedTask::MuxAttach => {
+            respond::<mux::attach::v0_1::Payload, mux::attach::v0_1::Response>(
+                doc, session, response,
+            )
+        }
+        ServedTask::MuxDetach => {
+            respond::<mux::detach::v0_1::Payload, mux::detach::v0_1::Response>(
+                doc, session, response,
+            )
+        }
         ServedTask::MuxGrant => {
             respond::<mux::grant::v0_1::Payload, mux::grant::v0_1::Response>(doc, session, response)
         }
