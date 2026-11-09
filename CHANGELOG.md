@@ -8,6 +8,8 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+## 0.51.0 (release/0.51)
+
 ### Added — did:webs
 
 - The mediator resolves `did:webs`, so a did:webs client can authenticate and
