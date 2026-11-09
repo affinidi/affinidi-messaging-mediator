@@ -849,6 +849,30 @@ pub async fn serve_internal(
         didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
     };
 
+    // DID multiplexing startup checks. Mux is off unless an operator enables
+    // it (design §5.8); when they do, refuse to start rather than run with a
+    // setting that silently means less than its name (R5.2).
+    if shared_state.config.limits.mux.enabled {
+        if !shared_state.database.supports_mux() {
+            return Err(MediatorError::ConfigError(
+                12,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but the configured storage backend does not \
+                 implement DID multiplexing grants"
+                    .into(),
+            ));
+        }
+        // The grant store exists; the protocol and connection handling that
+        // use it do not yet. Remove this refusal when they land.
+        return Err(MediatorError::ConfigError(
+            12,
+            "NA".into(),
+            "[limits.mux] enabled = \"true\" but this build does not yet serve DID \
+             multiplexing (only its storage is implemented); set enabled = \"false\""
+                .into(),
+        ));
+    }
+
     // DIDComm v1 startup checks. Both run before the listener binds, so a
     // misconfiguration is a refusal to start rather than traffic the mediator
     // accepts and then silently drops.

@@ -1188,6 +1188,27 @@ async fn consume_account_remove(
         .database
         .account_remove(&session.to_store_session(), &target_hash)
         .await?;
+    // Mux grants on either side of the removed account go too, whether or not
+    // mux is enabled now: grants left from when it was would otherwise come
+    // back to life if the DID re-registered. Done after the account removal,
+    // so a failure here cannot leave a half-removed account; it is logged
+    // loudly because the grants then outlive the account (R6.3).
+    if removed && state.database.supports_mux() {
+        let limits = state.config.limits.mux.store_limits();
+        if let Err(e) = affinidi_messaging_mediator_common::store::mux::remove_account(
+            &*state.database,
+            &target_hash,
+            &limits,
+            state.clock.unix_secs(),
+        )
+        .await
+        {
+            tracing::error!(
+                did_hash = %target_hash,
+                "account removed, but its DID multiplexing grants could not be: {e}"
+            );
+        }
+    }
     record_audit(
         state,
         session,

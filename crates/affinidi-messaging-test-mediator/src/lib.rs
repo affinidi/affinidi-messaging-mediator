@@ -349,6 +349,7 @@ pub struct TestMediatorBuilder {
     /// Override for `LimitsConfig.did_rate_limit_per_second` /
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
+    mux_enabled: bool,
     /// Override for `LimitsConfig.queued_send_messages_per_peer`.
     queue_send_limit_per_peer: Option<i32>,
     /// See [`TestMediatorBuilder::message_size`].
@@ -400,6 +401,7 @@ impl Default for TestMediatorBuilder {
             jwt_refresh_expiry_secs: None,
             max_websocket_connections_per_did: None,
             did_rate_limit: None,
+            mux_enabled: false,
             queue_send_limit_per_peer: None,
             message_size: None,
             clock: None,
@@ -635,6 +637,12 @@ impl TestMediatorBuilder {
     /// (`0` = disabled). Set small to exercise the `429` in tests.
     pub fn did_rate_limit(mut self, per_second: u32, burst: u32) -> Self {
         self.did_rate_limit = Some((per_second, burst));
+        self
+    }
+
+    /// Set `[limits.mux] enabled`. Off by default, as in production.
+    pub fn mux_enabled(mut self, enabled: bool) -> Self {
+        self.mux_enabled = enabled;
         self
     }
 
@@ -942,6 +950,7 @@ impl TestMediatorBuilder {
             limits.did_rate_limit_per_second = per_second;
             limits.did_rate_limit_burst = burst;
         }
+        limits.mux.enabled = self.mux_enabled;
 
         // Disable processors that aren't useful in most tests.
         let mut processors =

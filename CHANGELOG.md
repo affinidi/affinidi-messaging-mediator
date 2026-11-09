@@ -22,6 +22,13 @@ mediator-tui 0.11.0); they are no longer updated.
 - `MediatorStore` gains `supports_mux`, `mux_record_get`, `mux_record_cas`,
   `mux_principal_dids` and `mux_principal_count`, all defaulted, so a
   third-party backend keeps compiling and reports mux as unsupported.
+- `[limits.mux]` config (and `LIMIT_MUX_*` env overrides), **off by default**.
+  Only the exact value `"true"` enables it; anything else is off. This build
+  implements the grant storage only, so a mediator with `enabled = "true"`
+  **refuses to start** with an error naming the setting, rather than accept a
+  setting it cannot honour. It also refuses on a backend without mux support.
+- Removing an account removes its mux grants on both sides (as a member DID
+  and as a principal), whether or not mux is enabled at the time.
 
 ### Added — did:webs
 

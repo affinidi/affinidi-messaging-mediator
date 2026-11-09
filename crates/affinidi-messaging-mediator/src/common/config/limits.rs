@@ -1,7 +1,8 @@
 use affinidi_messaging_mediator_common::errors::MediatorError;
 // `LimitsConfigRaw` (the raw TOML schema) lives in the config crate; the
 // conversion to the typed `LimitsConfig` (a mediator-local type) stays here.
-use affinidi_messaging_mediator_config::LimitsConfigRaw;
+use affinidi_messaging_mediator_common::store::mux::MuxLimits;
+use affinidi_messaging_mediator_config::{LimitsConfigRaw, MuxConfigRaw};
 use serde::{Deserialize, Serialize};
 
 /// Resource limits configuration for the mediator
@@ -85,6 +86,122 @@ pub struct LimitsConfig {
     /// Byte ceiling for the live-delivery pub/sub ring. The ring's slot count is
     /// derived from this — see [`LimitsConfig::pubsub_capacity`].
     pub pubsub_buffer: usize,
+    /// `[limits.mux]` — DID multiplexing. Off unless an operator enables it.
+    #[serde(default)]
+    pub mux: MuxConfig,
+}
+
+/// DID multiplexing: one authenticated connection carrying live delivery and
+/// pickup for many DIDs. See `design-docs/mediator-did-multiplexing-design.md`.
+///
+/// **Off by default, and never turned on by an upgrade.** Everything about mux
+/// is opt-in (design §5.8): an absent table, an absent `enabled`, or an
+/// `enabled` that is not exactly `true` all mean off.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxConfig {
+    pub enabled: bool,
+    /// Member DIDs one connection may carry at once.
+    pub max_dids_per_connection: usize,
+    /// Stored grants one principal may hold (a resource bound; see
+    /// `store::mux`).
+    pub max_grants_per_principal: usize,
+    /// Active grants one member DID may have issued.
+    pub max_grants_per_did: usize,
+    /// Longest lifetime (`exp - iat`) a grant may ask for.
+    pub max_grant_lifetime_secs: u64,
+    /// Longest a session attach proof may be valid for.
+    pub max_attach_lifetime_secs: u64,
+    /// How often an attached member's signing key is re-checked against its
+    /// current DID document while connected.
+    pub revalidate_interval_secs: u64,
+    /// Ceiling on a mux connection's send-queue depth.
+    pub max_channel_slots: usize,
+    /// How long a dead grant stays listable after its expiry.
+    pub dead_retention_secs: u64,
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self::from(MuxConfigRaw::default())
+    }
+}
+
+impl MuxConfig {
+    /// The subset of these limits the grant rules in `store::mux` enforce.
+    #[must_use]
+    pub fn store_limits(&self) -> MuxLimits {
+        MuxLimits {
+            max_grants_per_did: self.max_grants_per_did,
+            max_grants_per_principal: self.max_grants_per_principal,
+            max_grant_lifetime_secs: self.max_grant_lifetime_secs,
+            dead_retention_secs: self.dead_retention_secs,
+        }
+    }
+}
+
+impl From<MuxConfigRaw> for MuxConfig {
+    fn from(raw: MuxConfigRaw) -> Self {
+        // Config loads before tracing is up, hence eprintln (as below).
+        fn num<T: std::str::FromStr>(field: &str, value: &str, default: T, shown: &str) -> T {
+            value.trim().parse().unwrap_or_else(|_| {
+                eprintln!(
+                    "WARN: Could not parse limits.mux.{field} config value, using default: {shown}"
+                );
+                default
+            })
+        }
+        let enabled = match raw.enabled.trim() {
+            "true" => true,
+            "false" | "" => false,
+            other => {
+                eprintln!(
+                    "WARN: limits.mux.enabled = {other:?} is not \"true\" or \"false\"; DID multiplexing stays OFF"
+                );
+                false
+            }
+        };
+        Self {
+            enabled,
+            max_dids_per_connection: num(
+                "max_dids_per_connection",
+                &raw.max_dids_per_connection,
+                1000,
+                "1000",
+            ),
+            max_grants_per_principal: num(
+                "max_grants_per_principal",
+                &raw.max_grants_per_principal,
+                5000,
+                "5000",
+            ),
+            max_grants_per_did: num("max_grants_per_did", &raw.max_grants_per_did, 16, "16"),
+            max_grant_lifetime_secs: num(
+                "max_grant_lifetime_secs",
+                &raw.max_grant_lifetime_secs,
+                2_592_000,
+                "2592000",
+            ),
+            max_attach_lifetime_secs: num(
+                "max_attach_lifetime_secs",
+                &raw.max_attach_lifetime_secs,
+                86_400,
+                "86400",
+            ),
+            revalidate_interval_secs: num(
+                "revalidate_interval_secs",
+                &raw.revalidate_interval_secs,
+                900,
+                "900",
+            ),
+            max_channel_slots: num("max_channel_slots", &raw.max_channel_slots, 512, "512"),
+            dead_retention_secs: num(
+                "dead_retention_secs",
+                &raw.dead_retention_secs,
+                604_800,
+                "604800",
+            ),
+        }
+    }
 }
 
 impl LimitsConfig {
@@ -166,6 +283,7 @@ impl Default for LimitsConfig {
             did_rate_limit_burst: 10,
             ws_send_buffer: 33_554_432,
             pubsub_buffer: 16_777_216,
+            mux: MuxConfig::default(),
         }
     }
 }
@@ -331,6 +449,7 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 warn_default("pubsub_buffer", "16777216");
                 16_777_216
             }),
+            mux: MuxConfig::from(raw.mux),
         })
     }
 }
@@ -338,6 +457,31 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mux_is_off_unless_explicitly_enabled() {
+        assert!(!LimitsConfig::default().mux.enabled);
+        let mut raw = MuxConfigRaw::default();
+        assert!(!MuxConfig::from(raw.clone()).enabled);
+        for v in ["", "yes", "1", "TRUE", "on"] {
+            raw.enabled = v.into();
+            assert!(
+                !MuxConfig::from(raw.clone()).enabled,
+                "{v:?} must not enable mux"
+            );
+        }
+        raw.enabled = "true".into();
+        assert!(MuxConfig::from(raw).enabled);
+    }
+
+    #[test]
+    fn an_absent_mux_table_parses_as_off() {
+        let raw: MuxConfigRaw = toml::from_str("").unwrap();
+        let mux = MuxConfig::from(raw);
+        assert_eq!(mux, MuxConfig::default());
+        assert!(!mux.enabled);
+        assert_eq!(mux.store_limits(), MuxLimits::default());
+    }
 
     #[test]
     fn test_limits_default() {
@@ -409,6 +553,7 @@ mod tests {
             did_rate_limit_burst: "20".to_string(),
             ws_send_buffer: "8388608".to_string(),
             pubsub_buffer: "4194304".to_string(),
+            mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
         assert_eq!(limits.ws_send_buffer, 8_388_608);
@@ -471,6 +616,7 @@ mod tests {
             did_rate_limit_burst: "10".to_string(),
             ws_send_buffer: "67108864".to_string(),
             pubsub_buffer: "33554432".to_string(),
+            mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
         // Invalid values should fall back to unwrap_or defaults
