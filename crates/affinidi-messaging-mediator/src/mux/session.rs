@@ -19,8 +19,15 @@ use serde_json::Value;
 use super::grants::{Ctx, MuxError, check_scope};
 use super::proof::Expect;
 
-/// Length of the per-connection attach nonce (alphanumeric, ~190 bits).
-const NONCE_LEN: usize = 32;
+/// Bytes of randomness in the per-connection attach nonce. The spec's
+/// `MuxNonce` is 32 random bytes as unpadded base64url: exactly 43 characters.
+const NONCE_BYTES: usize = 32;
+
+/// A fresh `MuxNonce`.
+fn new_nonce() -> String {
+    use base64::Engine;
+    base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; NONCE_BYTES]>())
+}
 
 /// How a member came to be on the connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +98,7 @@ impl MuxSession {
             principal_did: principal_did.to_string(),
             principal_hash: did_hash(principal_did),
             session_id: session_id.to_string(),
-            nonce: crate::handlers::authenticate::create_random_string(NONCE_LEN),
+            nonce: new_nonce(),
             max_members,
             members: HashMap::new(),
         }
@@ -384,6 +391,26 @@ fn merge(a: MuxMember, b: MuxMember) -> MuxMember {
         scope,
         expires_at: a.expires_at.max(b.expires_at),
         ..keep
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    /// The `ready` event's `muxNonce` must match the spec's `MuxNonce`
+    /// (`^[A-Za-z0-9_-]{43}$`), or a client parsing the event with the
+    /// generated types refuses it.
+    #[test]
+    fn the_nonce_matches_the_spec_pattern() {
+        for _ in 0..64 {
+            let n = super::new_nonce();
+            assert_eq!(n.len(), 43, "{n}");
+            assert!(
+                n.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{n}"
+            );
+        }
+        assert_ne!(super::new_nonce(), super::new_nonce());
     }
 }
 

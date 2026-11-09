@@ -8,6 +8,14 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Fixed — DID multiplexing
+
+- The `muxNonce` in a mux connection's `ready` event is now 32 random bytes
+  as unpadded base64url (43 characters), as `messaging/mux/event/0.1`
+  requires. It was 32 alphanumeric characters, which a client parsing the
+  event with the generated bindings refused. The end-to-end test now checks
+  every mux event against the spec's generated type.
+
 ### Added — DID multiplexing grant storage (no behaviour change yet)
 
 - Storage for DID multiplexing grants: a member DID's signed permission for a
