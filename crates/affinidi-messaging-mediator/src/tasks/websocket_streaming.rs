@@ -82,6 +82,33 @@ const REDELIVERY_MAX: usize = 1000;
 /// at `WS_CHANNEL_SLOTS × message_size` and all connections at the pool size.
 pub const WS_CHANNEL_SLOTS: usize = 8;
 
+/// How a client entry reaches its DID.
+///
+/// A DID can be carried by its own (*direct*) socket, or as a member of a
+/// principal's multiplexed connection (*mux*, design §7.2). A direct socket
+/// always takes precedence: a mux entry yields to it and waits on standby.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EntryKind {
+    #[default]
+    Direct,
+    Mux,
+}
+
+/// What happened to one member DID on a mux connection, told to that
+/// connection's socket so it can emit `messaging/mux/event` (R6.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberChange {
+    /// The member's live delivery moved to another socket (its own direct
+    /// socket, or a newer mux connection). It stays on this connection,
+    /// inactive, and comes back if that socket goes away.
+    Superseded { did_hash: String },
+    /// The member registered behind a live socket and is waiting on standby.
+    Inactive { did_hash: String },
+    /// The socket that held the member went away; this connection carries it
+    /// again.
+    Reactivated { did_hash: String },
+}
+
 /// One registered streaming client for a DID.
 struct ClientEntry {
     /// Channel to the per-connection websocket handler.
@@ -109,6 +136,8 @@ struct ClientEntry {
     /// Carried across replacements and reset by any registration that arrives
     /// outside the window. Drives the duel damper in `_handle_registration`.
     churn_streak: u32,
+    /// Direct socket, or a member of a mux connection.
+    kind: EntryKind,
 }
 
 /// Used when updating the streaming state.
@@ -125,6 +154,8 @@ pub enum StreamingUpdateState {
         /// dropped, and observed by the socket handler that owns the
         /// connection. See `ClientEntry::resync`.
         resync: Arc<AtomicBool>,
+        /// Direct socket, or a mux member (design §7.2).
+        kind: EntryKind,
     },
     /// Enable live delivery for the socket owned by `session_id`.
     ///
@@ -154,6 +185,9 @@ pub enum WebSocketCommands {
     /// A monitor batch is never stored, so that answer would deliver nothing —
     /// it is sent as the frame instead.
     Verbatim(String),
+    /// A mux member's delivery moved; the socket reports it to its client.
+    /// Never sent to a direct socket.
+    MemberChange(MemberChange),
     /// Close this socket for the stated reason.
     ///
     /// The reason is carried rather than assumed. It used to be a bare `Close`,
@@ -202,6 +236,10 @@ pub enum CloseReason {
 /// the queue. There is no separate "release" call to forget.
 pub struct QueuedCommand {
     pub cmd: WebSocketCommands,
+    /// The DID this payload is for. A mux connection carries many DIDs, so its
+    /// handler needs to know which one to drain, resync or drop frames for.
+    /// `None` for control commands.
+    pub did_hash: Option<String>,
     /// `None` for control commands (`Close`), which carry no payload and must
     /// never be refused for want of buffer bytes.
     _permit: Option<SendPermit>,
@@ -210,7 +248,11 @@ pub struct QueuedCommand {
 impl QueuedCommand {
     /// A control command. Always admissible — it holds no bytes.
     fn control(cmd: WebSocketCommands) -> Self {
-        Self { cmd, _permit: None }
+        Self {
+            cmd,
+            did_hash: None,
+            _permit: None,
+        }
     }
 }
 
@@ -259,6 +301,7 @@ fn try_queue(
         } else {
             WebSocketCommands::Message(message)
         },
+        did_hash: Some(did_hash.to_string()),
         _permit: Some(permit),
     };
 
@@ -413,6 +456,11 @@ impl StreamingTask {
 
             // Create a hashmap to store the clients keyed by did_hash.
             let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+            // Entries that yielded the live slot to another socket for the same
+            // DID (design §7.2): a mux member behind its DID's direct socket,
+            // or behind a newer mux connection. Newest last. Promoted when the
+            // live entry goes away.
+            let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
 
             // DIDs with an inbox-redelivery drain currently in flight. Used to
             // damp duplicate-socket flip-flop: a duel that replaces the socket
@@ -432,7 +480,7 @@ impl StreamingTask {
                     value = rx.recv() => {
                         match value {
                             Ok(payload) => {
-                                self.dispatch_payload(database.as_ref(), &mut clients, payload).await;
+                                self.dispatch_payload(&database, &mut clients, &mut standby, &replay_in_progress, payload).await;
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Subscriber fell behind; backend's broadcast capacity
@@ -463,15 +511,20 @@ impl StreamingTask {
                         if let Some(value) = &value {
                             match &value.state {
                                 StreamingUpdateState::Register { .. } => {
-                                    self._handle_registration(&database, &mut clients, &replay_in_progress, value).await;
+                                    self._handle_registration(&database, &mut clients, &mut standby, &replay_in_progress, value).await;
                                 },
                                 StreamingUpdateState::Start { session_id } => {
-                                    self._handle_activation(&database, &mut clients, &replay_in_progress, &value.did_hash, session_id, true).await;
+                                    self._handle_activation(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, true).await;
                                 },
                                 StreamingUpdateState::Stop { session_id } => {
-                                    self._handle_activation(&database, &mut clients, &replay_in_progress, &value.did_hash, session_id, false).await;
+                                    self._handle_activation(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, false).await;
                                 },
                                 StreamingUpdateState::Deregister { session_id } => {
+                                    // A standby entry leaving takes nothing live with it.
+                                    if remove_standby(&mut standby, &value.did_hash, session_id) {
+                                        debug!(did_hash = %value.did_hash, leaving_session = %session_id, "Deregistered a standby entry");
+                                        continue;
+                                    }
                                     // Only the session that currently owns the slot may
                                     // vacate it. One DID has one entry, so a socket that
                                     // was already replaced still runs its own teardown —
@@ -495,7 +548,9 @@ impl StreamingTask {
                                         Some(_) => {
                                             clients.remove(value.did_hash.as_str());
                                             info!("Deregistered streaming for DID: ({}) registered_clients({})", value.did_hash, clients.len());
-                                            if let Err(err) = database.streaming_set_state(&value.did_hash, &self.uuid, StreamingClientState::Deregistered).await {
+                                            if !self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await
+                                                && let Err(err) = database.streaming_set_state(&value.did_hash, &self.uuid, StreamingClientState::Deregistered).await
+                                            {
                                                 error!("Error stopping streaming for client ({}): {}",value.did_hash, err);
                                             }
                                         }
@@ -527,8 +582,10 @@ impl StreamingTask {
     /// dropped (see [`try_queue_message`]).
     async fn dispatch_payload(
         &self,
-        database: &dyn MediatorStore,
+        database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replay_in_progress: &Arc<DashSet<String>>,
         payload: PubSubRecord,
     ) {
         let PubSubRecord {
@@ -548,6 +605,18 @@ impl StreamingTask {
                     if entry.tx.is_closed() {
                         warn!("Dead WebSocket channel for ({did_hash}), cleaning up");
                         clients.remove(&did_hash);
+                        if self
+                            .promote_standby(
+                                database,
+                                clients,
+                                standby,
+                                replay_in_progress,
+                                &did_hash,
+                            )
+                            .await
+                        {
+                            return;
+                        }
                         if let Err(e) = database
                             .streaming_set_state(
                                 &did_hash,
@@ -622,10 +691,12 @@ impl StreamingTask {
     /// arrive. Ordering makes this safe for legitimate traffic: `Register` and
     /// `Start` travel the same FIFO channel, so a live session's own `Start`
     /// always finds its entry.
+    #[allow(clippy::too_many_arguments)]
     async fn _handle_activation(
         &self,
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
         replay_in_progress: &Arc<DashSet<String>>,
         did_hash: &str,
         session_id: &str,
@@ -638,6 +709,15 @@ impl StreamingTask {
                 entry.tx.clone()
             }
             Some(entry) => {
+                // A standby entry keeps its wish, so that it is honoured if
+                // it is promoted; nothing is delivered to it meanwhile.
+                if let Some(waiting) = standby
+                    .get_mut(did_hash)
+                    .and_then(|v| v.iter_mut().find(|e| e.session_id == session_id))
+                {
+                    waiting.active = active;
+                    return;
+                }
                 debug!(
                     did_hash = %did_hash,
                     requesting_session = %session_id,
@@ -719,6 +799,7 @@ impl StreamingTask {
         &self,
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
         replay_in_progress: &Arc<DashSet<String>>,
         value: &StreamingUpdate,
     ) {
@@ -727,6 +808,7 @@ impl StreamingTask {
             session_id: new_session_id,
             did,
             resync: client_resync,
+            kind,
         } = &value.state
         else {
             // Only `Register` updates reach this helper.
@@ -755,6 +837,66 @@ impl StreamingTask {
                 )))
                 .await;
             return;
+        }
+
+        let new_entry = |churn_streak| ClientEntry {
+            tx: client_tx.clone(),
+            session_id: new_session_id.to_string(),
+            active: false,
+            registered_at: Instant::now(),
+            resync: client_resync.clone(),
+            churn_streak,
+            kind: *kind,
+        };
+
+        // Mux precedence (design §7.2). A direct socket outranks a mux member,
+        // and among mux connections the newest carries the DID. A displaced
+        // or outranked mux entry is never *closed*: its connection carries
+        // other DIDs too. It waits on standby instead, and is told so.
+        if let Some(old) = clients.get(&value.did_hash) {
+            match (old.kind, *kind) {
+                (EntryKind::Direct, EntryKind::Mux) => {
+                    let _ = client_tx.try_send(QueuedCommand::control(
+                        WebSocketCommands::MemberChange(MemberChange::Inactive {
+                            did_hash: value.did_hash.clone(),
+                        }),
+                    ));
+                    standby
+                        .entry(value.did_hash.clone())
+                        .or_default()
+                        .push(new_entry(0));
+                    debug!(
+                        did = did,
+                        session = new_session_id,
+                        "Mux member registered behind a direct socket; standing by"
+                    );
+                    return;
+                }
+                (EntryKind::Mux, _) => {
+                    // The live mux entry yields: to a direct socket always, and
+                    // to a newer mux connection by newest-wins.
+                    let old = clients.remove(&value.did_hash).expect("present above");
+                    let _ =
+                        old.tx
+                            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+                                MemberChange::Superseded {
+                                    did_hash: value.did_hash.clone(),
+                                },
+                            )));
+                    standby.entry(value.did_hash.clone()).or_default().push(old);
+                    self.install(
+                        database,
+                        clients,
+                        replay_in_progress,
+                        &value.did_hash,
+                        new_entry(0),
+                        true,
+                    )
+                    .await;
+                    return;
+                }
+                (EntryKind::Direct, EntryKind::Direct) => {}
+            }
         }
 
         // Is this replacing an existing session for the same DID?
@@ -861,79 +1003,149 @@ impl StreamingTask {
             false
         };
 
+        self.install(
+            database,
+            clients,
+            replay_in_progress,
+            &value.did_hash,
+            new_entry(churn_streak),
+            replacing,
+        )
+        .await;
+    }
+
+    /// Make `entry` the DID's live entry, record it, and — when it took the
+    /// slot from another socket — redeliver the inbox to it, since a message in
+    /// flight to the displaced socket would otherwise be stranded (#374).
+    async fn install(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        replay_in_progress: &Arc<DashSet<String>>,
+        did_hash: &str,
+        entry: ClientEntry,
+        replacing: bool,
+    ) {
         // Count after this registration lands. A replacement swaps a map entry
-        // rather than adding one, so `len() + 1` over-reported by one on every
-        // duplicate — which reads, misleadingly, like a client leak during a
-        // duel. `clients` is keyed by DID hash, so this is the number of DIDs
-        // with a live socket, not the number of sockets.
-        let registered_clients = if replacing {
+        // rather than adding one, so `len() + 1` would over-report. `clients`
+        // is keyed by DID hash, so this is the number of DIDs with a live
+        // socket, not the number of sockets.
+        let registered_clients = if clients.contains_key(did_hash) {
             clients.len()
         } else {
             clients.len() + 1
         };
         info!(
-            did = did,
-            session = new_session_id,
-            "Registered streaming for DID: ({}) registered_clients({})",
-            value.did_hash,
-            registered_clients
+            session = %entry.session_id,
+            kind = ?entry.kind,
+            "Registered streaming for DID: ({did_hash}) registered_clients({registered_clients})",
         );
-        clients.insert(
-            value.did_hash.clone(),
-            ClientEntry {
-                tx: client_tx.clone(),
-                session_id: new_session_id.to_string(),
-                active: false,
-                registered_at: Instant::now(),
-                resync: client_resync.clone(),
-                churn_streak,
-            },
-        );
+        let client_tx = entry.tx.clone();
+        let session_id = entry.session_id.clone();
+        let state = if entry.active {
+            StreamingClientState::Live
+        } else {
+            StreamingClientState::Registered
+        };
+        clients.insert(did_hash.to_string(), entry);
 
         if let Err(err) = database
-            .streaming_set_state(
-                &value.did_hash,
-                &self.uuid,
-                StreamingClientState::Registered,
-            )
+            .streaming_set_state(did_hash, &self.uuid, state)
             .await
         {
-            error!(
-                "Error starting streaming to client ({}) streaming: {}",
-                value.did_hash, err
-            );
+            error!("Error starting streaming to client ({did_hash}) streaming: {err}");
         }
 
-        // On a replacement, re-cover any inbox message that was in flight to
-        // the now-closed socket by redelivering the recipient's undelivered
-        // inbox to the new socket (issue #374). Skip if a redelivery for this
-        // DID is already running, so a flip-flop duel can't amplify into a
-        // repeated whole-inbox dump.
+        // Skip if a redelivery for this DID is already running, so a
+        // flip-flop duel can't amplify into a repeated whole-inbox dump.
         if replacing {
-            // `DashSet::insert` returns `true` only when the hash was newly
-            // added, so a concurrent redelivery for the same DID still sees
-            // `false` and skips the duplicate drain — same guard semantics as
-            // the previous `HashSet`, without the lock-poison hazard.
-            let spawn = replay_in_progress.insert(value.did_hash.clone());
-            if spawn {
+            if replay_in_progress.insert(did_hash.to_string()) {
                 spawn_inbox_redelivery(
                     Arc::clone(database),
-                    client_tx.clone(),
+                    client_tx,
                     self.send_budget.clone(),
-                    value.did_hash.clone(),
-                    new_session_id.to_string(),
+                    did_hash.to_string(),
+                    session_id,
                     Arc::clone(replay_in_progress),
                     self.delivered_expiry_seconds,
                     self.monitor.clone(),
                 );
             } else {
                 debug!(
-                    did_hash = %value.did_hash,
+                    did_hash = %did_hash,
                     "Inbox redelivery already in progress for DID; skipping duplicate drain"
                 );
             }
         }
     }
+
+    /// After the live entry for `did_hash` went away, promote the newest
+    /// standby entry whose socket is still open, tell it, and redeliver.
+    /// Returns whether one was promoted.
+    async fn promote_standby(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replay_in_progress: &Arc<DashSet<String>>,
+        did_hash: &str,
+    ) -> bool {
+        let Some(waiting) = standby.get_mut(did_hash) else {
+            return false;
+        };
+        let mut promoted = None;
+        while let Some(candidate) = waiting.pop() {
+            if !candidate.tx.is_closed() {
+                promoted = Some(candidate);
+                break;
+            }
+        }
+        if waiting.is_empty() {
+            standby.remove(did_hash);
+        }
+        let Some(mut entry) = promoted else {
+            return false;
+        };
+        let _ = entry
+            .tx
+            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+                MemberChange::Reactivated {
+                    did_hash: did_hash.to_string(),
+                },
+            )));
+        entry.registered_at = Instant::now();
+        // Redeliver only to an entry that wants live delivery; an inactive
+        // one collects by pickup, as it would have on its own.
+        let replay = entry.active;
+        self.install(
+            database,
+            clients,
+            replay_in_progress,
+            did_hash,
+            entry,
+            replay,
+        )
+        .await;
+        true
+    }
+}
+
+/// Remove `session_id`'s standby entry for `did_hash`, if it has one.
+fn remove_standby(
+    standby: &mut HashMap<String, Vec<ClientEntry>>,
+    did_hash: &str,
+    session_id: &str,
+) -> bool {
+    let Some(waiting) = standby.get_mut(did_hash) else {
+        return false;
+    };
+    let before = waiting.len();
+    waiting.retain(|e| e.session_id != session_id);
+    let removed = waiting.len() != before;
+    if waiting.is_empty() {
+        standby.remove(did_hash);
+    }
+    removed
 }
 
 /// Drain the recipient's undelivered inbox to a freshly-registered socket
@@ -1095,6 +1307,7 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
+                kind: EntryKind::Direct,
             },
         );
         clients
@@ -1126,6 +1339,7 @@ mod tests {
             registered_at: Instant::now(),
             resync: resync.clone(),
             churn_streak: 0,
+            kind: EntryKind::Direct,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -1167,7 +1381,7 @@ mod tests {
 
         let task = streaming_task();
         let mut events = task.monitor.tap();
-        let database = MemoryStore::new();
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         // One slot, never read: the first push is queued, the next is dropped.
         let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
         let mut clients = HashMap::from([(
@@ -1179,6 +1393,7 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
+                kind: EntryKind::Direct,
             },
         )]);
         let record = |msg_id: Option<&str>| PubSubRecord {
@@ -1192,16 +1407,28 @@ mod tests {
             }),
         };
 
-        task.dispatch_payload(&database, &mut clients, record(Some("m1")))
-            .await;
+        task.dispatch_payload(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &Arc::new(DashSet::new()),
+            record(Some("m1")),
+        )
+        .await;
         let event = events.try_recv().expect("the queued push is reported");
         assert_eq!(event.stage, crate::monitor::Stage::Delivered);
         assert_eq!(event.msg_id.as_deref(), Some("m1"));
         assert_eq!(event.from.as_deref(), Some("alice"));
         assert_eq!(event.to.as_deref(), Some("bob"));
 
-        task.dispatch_payload(&database, &mut clients, record(Some("m2")))
-            .await;
+        task.dispatch_payload(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &Arc::new(DashSet::new()),
+            record(Some("m2")),
+        )
+        .await;
         assert!(
             events.try_recv().is_err(),
             "a dropped push must not be reported as delivered"
@@ -1209,8 +1436,14 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
         clients.get_mut("bob").expect("bob").tx = tx;
-        task.dispatch_payload(&database, &mut clients, record(None))
-            .await;
+        task.dispatch_payload(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &Arc::new(DashSet::new()),
+            record(None),
+        )
+        .await;
         assert!(
             events.try_recv().is_err(),
             "an untagged push is not a stored message's delivery"
@@ -1231,6 +1464,7 @@ mod tests {
             registered_at: Instant::now(),
             resync: resync.clone(),
             churn_streak: 0,
+            kind: EntryKind::Direct,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -1277,6 +1511,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "A",
@@ -1311,6 +1546,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "A",
@@ -1345,6 +1581,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "B",
@@ -1367,6 +1604,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "B",
@@ -1400,6 +1638,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "A",
@@ -1448,6 +1687,7 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
+                kind: EntryKind::Direct,
             },
         );
 
@@ -1460,11 +1700,18 @@ mod tests {
                 session_id: "B".to_string(),
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
+                kind: EntryKind::Direct,
             },
         };
 
-        task._handle_registration(&database, &mut clients, &replay_in_progress, &update)
-            .await;
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            &update,
+        )
+        .await;
 
         // The old socket is told to close, and told that it was *replaced* —
         // the one situation where that wording is true.
@@ -1541,6 +1788,7 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
+                kind: EntryKind::Direct,
             },
         );
 
@@ -1548,6 +1796,7 @@ mod tests {
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "A",
@@ -1594,12 +1843,14 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
+                kind: EntryKind::Direct,
             },
         );
 
         task._handle_activation(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &did_hash,
             "A",
@@ -1640,11 +1891,18 @@ mod tests {
                 session_id: "B".to_string(),
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
+                kind: EntryKind::Direct,
             },
         };
 
-        task._handle_registration(&database, &mut clients, &replay_in_progress, &update)
-            .await;
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            &update,
+        )
+        .await;
 
         // No replacement ⇒ no redelivery push within the window.
         assert!(
@@ -1680,6 +1938,7 @@ mod tests {
                 session_id: session.to_string(),
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
+                kind: EntryKind::Direct,
             },
         };
 
@@ -1689,6 +1948,7 @@ mod tests {
         task._handle_registration(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &register("s0", tx),
         )
@@ -1703,6 +1963,7 @@ mod tests {
             task._handle_registration(
                 &database,
                 &mut clients,
+                &mut HashMap::new(),
                 &replay_in_progress,
                 &register(&session, tx),
             )
@@ -1723,6 +1984,7 @@ mod tests {
         task._handle_registration(
             &database,
             &mut clients,
+            &mut HashMap::new(),
             &replay_in_progress,
             &register("refused", late_tx),
         )
@@ -1777,6 +2039,7 @@ mod tests {
                 registered_at: Instant::now(),
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: CHURN_REFUSE_STREAK * 10,
+                kind: EntryKind::Direct,
             },
         );
 
@@ -1788,15 +2051,264 @@ mod tests {
                 session_id: "live".to_string(),
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
+                kind: EntryKind::Direct,
             },
         };
-        task._handle_registration(&database, &mut clients, &replay_in_progress, &update)
-            .await;
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            &update,
+        )
+        .await;
 
         assert_eq!(
             clients.get(&did_hash).map(|e| e.session_id.as_str()),
             Some("live"),
             "a dead incumbent must never hold the slot against a live client"
         );
+    }
+
+    // ─── DID multiplexing (design §7.2) ──────────────────────────────────
+
+    fn reg(
+        did: &str,
+        session: &str,
+        tx: mpsc::Sender<QueuedCommand>,
+        kind: EntryKind,
+    ) -> StreamingUpdate {
+        StreamingUpdate {
+            did_hash: digest(did),
+            state: StreamingUpdateState::Register {
+                channel: tx,
+                session_id: session.to_string(),
+                did: did.to_string(),
+                resync: Arc::new(AtomicBool::new(false)),
+                kind,
+            },
+        }
+    }
+
+    async fn next_cmd(rx: &mut mpsc::Receiver<QueuedCommand>) -> QueuedCommand {
+        timeout(StdDuration::from_secs(2), rx.recv())
+            .await
+            .expect("a command arrives")
+            .expect("channel open")
+    }
+
+    #[tokio::test]
+    async fn a_mux_member_stands_by_behind_a_direct_socket() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let task = streaming_task();
+        let replay = Arc::new(DashSet::new());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+        let did = "did:example:mux-a";
+
+        let (d_tx, mut d_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "direct", d_tx, EntryKind::Direct),
+        )
+        .await;
+        let (m_tx, mut m_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "mux", m_tx, EntryKind::Mux),
+        )
+        .await;
+
+        assert_eq!(clients.get(&digest(did)).unwrap().session_id, "direct");
+        assert_eq!(standby.get(&digest(did)).unwrap().len(), 1);
+        match next_cmd(&mut m_rx).await.cmd {
+            WebSocketCommands::MemberChange(MemberChange::Inactive { did_hash }) => {
+                assert_eq!(did_hash, digest(did))
+            }
+            _ => panic!("mux member must be told it is inactive"),
+        }
+        // The direct socket is not disturbed.
+        assert!(d_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_direct_socket_supersedes_a_mux_member_without_closing_its_connection() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:mux-b";
+        database
+            .store_message("s", "in-flight", &digest(did), None, 0, 1000)
+            .await
+            .unwrap();
+        let task = streaming_task();
+        let replay = Arc::new(DashSet::new());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+
+        let (m_tx, mut m_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "mux", m_tx, EntryKind::Mux),
+        )
+        .await;
+        let (d_tx, mut d_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "direct", d_tx, EntryKind::Direct),
+        )
+        .await;
+
+        match next_cmd(&mut m_rx).await.cmd {
+            WebSocketCommands::MemberChange(MemberChange::Superseded { .. }) => {}
+            WebSocketCommands::Close(_) => {
+                panic!("a mux connection carries other DIDs and must never be closed for one")
+            }
+            _ => panic!("expected Superseded"),
+        }
+        assert_eq!(clients.get(&digest(did)).unwrap().session_id, "direct");
+        // The direct socket gets the inbox, as for any replacement (#374).
+        let cmd = next_cmd(&mut d_rx).await;
+        assert!(matches!(cmd.cmd, WebSocketCommands::Message(ref m) if m == "in-flight"));
+        assert_eq!(cmd.did_hash.as_deref(), Some(digest(did).as_str()));
+    }
+
+    #[tokio::test]
+    async fn when_the_direct_socket_leaves_the_mux_member_is_reactivated() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:mux-c";
+        let task = streaming_task();
+        let replay = Arc::new(DashSet::new());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+
+        let (d_tx, _d_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "direct", d_tx, EntryKind::Direct),
+        )
+        .await;
+        let (m_tx, mut m_rx) = mpsc::channel(5);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &reg(did, "mux", m_tx, EntryKind::Mux),
+        )
+        .await;
+        let _inactive = next_cmd(&mut m_rx).await;
+        // The member asked for live delivery while standing by.
+        task._handle_activation(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay,
+            &digest(did),
+            "mux",
+            true,
+        )
+        .await;
+        assert!(
+            !clients.get(&digest(did)).unwrap().active,
+            "the direct socket's state is untouched"
+        );
+
+        clients.remove(&digest(did));
+        assert!(
+            task.promote_standby(&database, &mut clients, &mut standby, &replay, &digest(did))
+                .await
+        );
+        let live = clients.get(&digest(did)).unwrap();
+        assert_eq!(live.session_id, "mux");
+        assert!(live.active, "the remembered live-delivery wish is honoured");
+        assert!(standby.is_empty());
+        match next_cmd(&mut m_rx).await.cmd {
+            WebSocketCommands::MemberChange(MemberChange::Reactivated { .. }) => {}
+            _ => panic!("expected Reactivated"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_standby_entry_leaving_does_not_touch_the_live_one() {
+        let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        standby.insert(
+            "h".into(),
+            vec![ClientEntry {
+                tx,
+                session_id: "mux".into(),
+                active: false,
+                registered_at: Instant::now(),
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+                kind: EntryKind::Mux,
+            }],
+        );
+        assert!(!remove_standby(&mut standby, "h", "someone-else"));
+        assert!(remove_standby(&mut standby, "h", "mux"));
+        assert!(standby.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_mux_connection_carries_many_dids_and_tags_each_frame() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let task = streaming_task();
+        let replay = Arc::new(DashSet::new());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        for did in ["did:example:m1", "did:example:m2"] {
+            task._handle_registration(
+                &database,
+                &mut clients,
+                &mut standby,
+                &replay,
+                &reg(did, "mux", tx.clone(), EntryKind::Mux),
+            )
+            .await;
+            task._handle_activation(
+                &database,
+                &mut clients,
+                &mut standby,
+                &replay,
+                &digest(did),
+                "mux",
+                true,
+            )
+            .await;
+        }
+        for did in ["did:example:m1", "did:example:m2"] {
+            let record = PubSubRecord {
+                did_hash: digest(did),
+                message: format!("for {did}"),
+                force_delivery: false,
+                verbatim: false,
+                stored: None,
+            };
+            task.dispatch_payload(&database, &mut clients, &mut standby, &replay, record)
+                .await;
+        }
+        let mut seen = Vec::new();
+        while let Ok(Some(cmd)) = timeout(StdDuration::from_millis(200), rx.recv()).await {
+            if let WebSocketCommands::Message(m) = cmd.cmd {
+                seen.push((cmd.did_hash.unwrap(), m));
+            }
+        }
+        assert!(seen.contains(&(digest("did:example:m1"), "for did:example:m1".into())));
+        assert!(seen.contains(&(digest("did:example:m2"), "for did:example:m2".into())));
     }
 }

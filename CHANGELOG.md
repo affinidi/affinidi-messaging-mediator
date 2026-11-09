@@ -43,6 +43,14 @@ mediator-tui 0.11.0); they are no longer updated.
   member's own ACLs, then the unknown-key rule, then the store rules), revoke
   as principal or member, revoke-all, and key re-validation. Each one returns
   exactly which grants it changed, so the connection layer can detach them.
+- The live-delivery streaming task can now carry one DID on a mux
+  connection as well as on its own socket. A DID's own (direct) socket always
+  wins; a mux entry yields to it and waits on standby, is told it is inactive
+  or superseded, and is reactivated (with inbox redelivery, as for any
+  replacement) when the direct socket goes away. A mux connection is never
+  closed for one of its members. Every queued frame now carries the DID it is
+  for. Direct-socket behaviour (newest wins, duel damper, redelivery) is
+  unchanged and still pinned by the existing tests.
 
 ### Added — did:webs
 

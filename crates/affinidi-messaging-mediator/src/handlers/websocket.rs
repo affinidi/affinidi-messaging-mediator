@@ -14,8 +14,8 @@ use crate::{
     common::session::Session,
     messages::inbound::handle_inbound,
     tasks::websocket_streaming::{
-        CloseReason, QueuedCommand, StreamingUpdate, StreamingUpdateState, WS_CHANNEL_SLOTS,
-        WebSocketCommands,
+        CloseReason, EntryKind, QueuedCommand, StreamingUpdate, StreamingUpdateState,
+        WS_CHANNEL_SLOTS, WebSocketCommands,
     },
 };
 #[cfg(feature = "didcomm")]
@@ -637,6 +637,7 @@ async fn handle_socket(
                     session_id: session.session_id.clone(),
                     did: session.did.clone(),
                     resync: live_resync.clone(),
+                    kind: EntryKind::Direct,
                 },
             };
             match streaming.channel.send(start).await {
@@ -1035,6 +1036,13 @@ async fn handle_socket(
                                     warn!("Failed to send frame to WebSocket client: {e}");
                                 }
                             },
+                            WebSocketCommands::MemberChange(change) => {
+                                // Only a mux connection registers members, and
+                                // this build opens none yet (mux refuses to
+                                // start); the event that reports it to the
+                                // client lands with the mux connection.
+                                debug!(?change, "Mux member change on a socket");
+                            }
                             WebSocketCommands::Close(why) => {
                                 #[cfg(feature = "didcomm")]
                                 if let Ok(msg) =  _package_problem_report(&state, &session, None, _close_problem_report(why)).await
