@@ -14,8 +14,8 @@ use crate::{
     common::session::Session,
     messages::inbound::handle_inbound,
     tasks::websocket_streaming::{
-        CloseReason, QueuedCommand, StreamingUpdate, StreamingUpdateState, WS_CHANNEL_SLOTS,
-        WebSocketCommands,
+        CloseReason, EntryKind, QueuedCommand, StreamingUpdate, StreamingUpdateState,
+        WS_CHANNEL_SLOTS, WebSocketCommands,
     },
 };
 #[cfg(feature = "didcomm")]
@@ -380,6 +380,29 @@ pub async fn websocket_handler(
     //   * this mediator — narrows the offer to `tsp-ack` alone, so that is what
     //     gets selected despite being second. The client sees ack support, and
     //     only a mediator that implements it can produce that answer.
+    // DID multiplexing (design §7). Only an authenticated DIDComm socket can
+    // become a mux connection, and only when the operator enabled mux. The
+    // marker is echoed only then: a client offering it to a mediator that will
+    // not multiplex must not be told it will.
+    #[cfg(feature = "tsp")]
+    let tsp_any = tsp_mode;
+    #[cfg(not(feature = "tsp"))]
+    let tsp_any = false;
+    let mux_mode = !is_relay
+        && !tsp_any
+        && state.config.limits.mux.enabled
+        && app_protocols
+            .iter()
+            .any(|p| p == crate::mux::connection::MUX_SUBPROTOCOL);
+    let app_protocols: Vec<String> = if mux_mode {
+        vec![crate::mux::connection::MUX_SUBPROTOCOL.to_string()]
+    } else {
+        app_protocols
+            .into_iter()
+            .filter(|p| p != crate::mux::connection::MUX_SUBPROTOCOL)
+            .collect()
+    };
+
     #[cfg(feature = "tsp")]
     let app_protocols = if tsp_ack_mode {
         vec!["tsp-ack".to_string()]
@@ -421,7 +444,15 @@ pub async fn websocket_handler(
     {
         async move {
             ws.on_upgrade(move |socket| {
-                handle_socket(socket, state, session, is_relay, tsp_mode, tsp_ack_mode)
+                handle_socket(
+                    socket,
+                    state,
+                    session,
+                    is_relay,
+                    mux_mode,
+                    tsp_mode,
+                    tsp_ack_mode,
+                )
             })
         }
         .instrument(_span)
@@ -429,9 +460,11 @@ pub async fn websocket_handler(
     }
     #[cfg(not(feature = "tsp"))]
     {
-        async move { ws.on_upgrade(move |socket| handle_socket(socket, state, session, is_relay)) }
-            .instrument(_span)
-            .await
+        async move {
+            ws.on_upgrade(move |socket| handle_socket(socket, state, session, is_relay, mux_mode))
+        }
+        .instrument(_span)
+        .await
     }
 }
 
@@ -538,6 +571,8 @@ async fn handle_socket(
     // An anonymous inter-mediator relay socket: it may push frames and
     // receives nothing but the `RelayAck` answers to them.
     is_relay: bool,
+    // A DID-multiplexing connection (design §7): carries member DIDs too.
+    mux_mode: bool,
     #[cfg(feature = "tsp")] tsp_mode: bool,
     #[cfg(feature = "tsp")] tsp_ack_mode: bool,
 ) {
@@ -633,10 +668,11 @@ async fn handle_socket(
             let start = StreamingUpdate {
                 did_hash: session.did_hash.clone(),
                 state: StreamingUpdateState::Register {
-                    channel: tx,
+                    channel: tx.clone(),
                     session_id: session.session_id.clone(),
                     did: session.did.clone(),
                     resync: live_resync.clone(),
+                    kind: EntryKind::Direct,
                 },
             };
             match streaming.channel.send(start).await {
@@ -692,6 +728,32 @@ async fn handle_socket(
             .stats_increment(StatCounter::WebsocketOpen, 1)
             .await;
         info!("Websocket connection established");
+
+        // A mux connection admits its stored grants and tells the client its
+        // nonce and members before anything else is written.
+        let mux_conn = if mux_mode {
+            let (conn, frames) =
+                crate::mux::connection::open(&state, &session, tx.clone(), live_resync.clone()).await;
+            for frame in frames {
+                if let Err(e) = socket.send(Message::Text(frame.into())).await {
+                    warn!("Failed to send mux event to WebSocket client: {e}");
+                }
+            }
+            Some(conn)
+        } else {
+            None
+        };
+        // As before mux: a registered socket's channel is held open only by
+        // the streaming task (and, for mux, the registry), so the socket
+        // notices when they let go. An unregistered socket (relay, or no
+        // streaming task) keeps its own sender so `rx` simply never yields.
+        let _unregistered_tx = (is_relay || state.streaming_task.is_none()).then_some(tx);
+        let mut mux_sweep = tokio::time::interval(Duration::from_secs(30));
+        mux_sweep.reset();
+        let mut mux_revalidate = tokio::time::interval(Duration::from_secs(
+            state.config.limits.mux.revalidate_interval_secs.max(30),
+        ));
+        mux_revalidate.reset();
 
         // Set a timeout for the websocket connection for when the JWT Auth token expires
         let epoch = state.clock.unix_secs();
@@ -972,6 +1034,24 @@ async fn handle_socket(
                         break;
                     }}
                 }
+                _ = async { match &mux_conn { Some(c) => c.notify.notified().await, None => std::future::pending().await } } => {
+                    if let Some(conn) = &mux_conn
+                        && let Some(frame) = crate::mux::connection::drain_left(&state, conn).await
+                        && let Err(e) = socket.send(Message::Text(frame.into())).await
+                    {
+                        warn!("Failed to send mux event to WebSocket client: {e}");
+                    }
+                }
+                _ = mux_sweep.tick(), if mux_conn.is_some() => {
+                    if let Some(conn) = &mux_conn {
+                        crate::mux::connection::sweep(&state, conn, false).await;
+                    }
+                }
+                _ = mux_revalidate.tick(), if mux_conn.is_some() => {
+                    if let Some(conn) = &mux_conn {
+                        crate::mux::connection::sweep(&state, conn, true).await;
+                    }
+                }
                 _ = ping_interval.tick() => {
                     if let Err(e) = socket.send(Message::Ping(vec![].into())).await {
                         debug!("Failed to send WebSocket ping: {e}");
@@ -981,6 +1061,17 @@ async fn handle_socket(
                 }
                 value = rx.recv() => {
                     if let Some(queued) = value {
+                        // On a mux connection, a frame for a member that has
+                        // left since it was queued is dropped, not written:
+                        // after a detach (revoke, expiry, key change) nothing
+                        // more for that DID may reach this principal. The
+                        // message stays in the member's inbox (§7.3, R1.1).
+                        if let (Some(conn), Some(for_did)) = (&mux_conn, queued.did_hash.as_deref())
+                            && !conn.may_write(for_did).await
+                        {
+                            debug!(did_hash = %for_did, "dropping a queued frame for a detached mux member");
+                            continue;
+                        }
                         // Destructuring drops `_permit` at the end of this arm,
                         // returning the message's bytes to the global send pool
                         // once it has been written to the socket.
@@ -1035,6 +1126,14 @@ async fn handle_socket(
                                     warn!("Failed to send frame to WebSocket client: {e}");
                                 }
                             },
+                            WebSocketCommands::MemberChange(change) => {
+                                if let Some(conn) = &mux_conn
+                                    && let Some(frame) = crate::mux::connection::on_member_change(&state, conn, change).await
+                                    && let Err(e) = socket.send(Message::Text(frame.into())).await
+                                {
+                                    warn!("Failed to send mux event to WebSocket client: {e}");
+                                }
+                            }
                             WebSocketCommands::Close(why) => {
                                 #[cfg(feature = "didcomm")]
                                 if let Ok(msg) =  _package_problem_report(&state, &session, None, _close_problem_report(why)).await
@@ -1112,6 +1211,10 @@ async fn handle_socket(
                     }
                 }
             }
+        }
+
+        if let Some(conn) = &mux_conn {
+            crate::mux::connection::close(&state, &session, conn).await;
         }
 
         // Remove this websocket and associated info from the streaming task.

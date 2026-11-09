@@ -54,10 +54,21 @@ pub(crate) async fn status_request(
             serde_json::from_value::<MessagePickupStatusRequest>(msg.body.to_owned())
         {
             if let Some(recipient_did) = body.recipient_did {
-                if !affinidi_messaging_mediator_common::did_identity::same_account(
-                    &recipient_did,
-                    &session.did,
-                ) {
+                // On a mux connection a member with `pickup` may be asked
+                // about too (design §7.6).
+                let mux_member = crate::mux::connection::allows(
+                    state,
+                    &session.session_id,
+                    &affinidi_messaging_mediator_common::did_identity::did_hash(&recipient_did),
+                    affinidi_messaging_mediator_common::store::mux::MuxCapability::Pickup,
+                )
+                .await;
+                if !mux_member
+                    && !affinidi_messaging_mediator_common::did_identity::same_account(
+                        &recipient_did,
+                        &session.did,
+                    )
+                {
                     debug!(
                         "recipient_did: ({}) doesn't match session.did!",
                         recipient_did
@@ -321,9 +332,23 @@ pub(crate) async fn delivery_request(
         };
         debug!("thid = ({})", thid);
 
+        // A member of this mux connection with `pickup` may be collected for
+        // as well as the session's own DID (design §7.6).
+        let mux_member = match msg.body.get("recipient_did").and_then(|v| v.as_str()) {
+            Some(r) => {
+                crate::mux::connection::allows(
+                    state,
+                    &session.session_id,
+                    &affinidi_messaging_mediator_common::did_identity::did_hash(r),
+                    affinidi_messaging_mediator_common::store::mux::MuxCapability::Pickup,
+                )
+                .await
+            }
+            None => false,
+        };
         // Pull recipient_did and limit from message body
         let (recipient_did, limit): (String, usize) =
-            _parse_and_validate_delivery_request_body(session, msg)?;
+            _parse_and_validate_delivery_request_body(session, msg, mux_member)?;
 
         let recipient_did_hash =
             affinidi_messaging_mediator_common::did_identity::did_hash(recipient_did.clone());
@@ -427,46 +452,68 @@ pub(crate) async fn messages_received(
 
         debug!("Messages Id list: {:?}", message_id_list);
 
+        // Whose messages this session may delete: its own, and on a mux
+        // connection each member's with `delete` (design §7.6). An id is
+        // deleted as the first owner it belongs to.
+        let mut owners = vec![session.did_hash.clone()];
+        owners.extend(
+            crate::mux::connection::members_with(
+                state,
+                &session.session_id,
+                affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
+            )
+            .await,
+        );
         for msg_id in &message_id_list {
             debug!("getting message with id: {}", msg_id);
-            match state.database.get_message(&session.did_hash, msg_id).await {
-                Ok(msg) => {
-                    debug!("Got message: {:?}", msg);
-                    debug!("Deleting message: {}", msg_id);
-                    match state
-                        .database
-                        .delete_message(
+            // The store authorises the delete itself; try each owner this
+            // session may delete for until one is accepted.
+            let mut deleted = false;
+            for owner_hash in &owners {
+                let msg = match state.database.get_message(owner_hash, msg_id).await {
+                    Ok(Some(m)) => Some(m),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        warn!("Error getting message: {:?}", err);
+                        continue;
+                    }
+                };
+                debug!("Deleting message: {}", msg_id);
+                match state
+                    .database
+                    .delete_message(
+                        msg_id,
+                        DeletionAuthority::Owner {
+                            did_hash: owner_hash.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let (from, to) = msg
+                            .as_ref()
+                            .map(|m| (m.from_address.clone(), m.to_address.clone()))
+                            .unwrap_or_default();
+                        let body = msg.as_ref().and_then(|m| m.msg.clone());
+                        state.monitor.deleted(
                             msg_id,
-                            DeletionAuthority::Owner {
-                                did_hash: session.did_hash.clone(),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            let (from, to) = msg
-                                .as_ref()
-                                .map(|m| (m.from_address.clone(), m.to_address.clone()))
-                                .unwrap_or_default();
-                            let body = msg.as_ref().and_then(|m| m.msg.clone());
-                            state.monitor.deleted(
-                                msg_id,
-                                &session.did_hash,
-                                from.as_deref(),
-                                to.as_deref(),
-                                crate::monitor::current_channel(),
-                                body.as_deref(),
-                            );
-                            info!("Deleted message: {}", msg_id);
-                        }
-                        Err(err) => {
-                            info!("Error deleting message: {:?}", err);
-                        }
+                            owner_hash,
+                            from.as_deref(),
+                            to.as_deref(),
+                            crate::monitor::current_channel(),
+                            body.as_deref(),
+                        );
+                        info!("Deleted message: {}", msg_id);
+                        deleted = true;
+                        break;
+                    }
+                    Err(err) => {
+                        debug!("Delete of {msg_id} as {owner_hash} refused: {err:?}");
                     }
                 }
-                Err(err) => {
-                    warn!("Error getting message: {:?}", err);
-                }
+            }
+            if !deleted {
+                info!("Message {msg_id} was not deleted: not this session's to delete, or already gone");
             }
         }
 
@@ -505,6 +552,8 @@ fn _parse_message_received_body(
 fn _parse_and_validate_delivery_request_body(
     session: &Session,
     msg: &Message,
+    // The recipient is a member of this session's mux connection with `pickup`.
+    mux_member: bool,
 ) -> Result<(String, usize), MediatorError> {
     let (recipient_did, limit): (String, usize) =
         match serde_json::from_value::<MessagePickupDeliveryRequest>(msg.body.to_owned()) {
@@ -525,7 +574,11 @@ fn _parse_and_validate_delivery_request_body(
             }
         };
 
-    if !affinidi_messaging_mediator_common::did_identity::same_account(&session.did, &recipient_did)
+    if !mux_member
+        && !affinidi_messaging_mediator_common::did_identity::same_account(
+            &session.did,
+            &recipient_did,
+        )
     {
         return Err(MediatorError::problem_with_log(
             52,
