@@ -174,7 +174,9 @@ return 1
 ///
 /// KEYS: metadata. ARGV: message hash, requester, delete token, store lease
 /// ms, delete lease ms, admin (optional).
-/// Returns TO, FROM ("" for an anonymous sender) and BYTES.
+/// Returns TO, FROM ("" for an anonymous sender), BYTES, and the inbox and
+/// outbox entry ids ("" when not recorded), which bind the releases to the
+/// entries this claim saw.
 pub(crate) static CLAIM_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -215,7 +217,7 @@ redis.call('HSET', KEYS[1], 'DELETING', ARGV[3], 'DELETING_AT', now_ms)
 if #expired > 0 then
     redis.call('HDEL', KEYS[1], unpack(expired))
 end
-return { meta.TO or '', meta.FROM or '', meta.BYTES }
+return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta.SEND_ID or '' }
 "#,
     )
 });
@@ -240,14 +242,17 @@ return 1
 
 /// Recipient slot of a delete: release the counters and the inbox entry,
 /// found by message hash in this slot. Releases nothing when the message was
-/// never queued here, so counters only move back what they moved forward.
+/// never queued here, so counters only move back what they moved forward,
+/// nor when the entry isn't the one the claim saw: a delete that stalled
+/// past its lease must not release the entry of the message stored again.
 ///
-/// KEYS: account, inbox, inbox ids. ARGV: message hash, bytes.
+/// KEYS: account, inbox, inbox ids. ARGV: message hash, bytes, claimed entry
+/// id ("" to release whatever is queued).
 pub(crate) static RELEASE_INBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
 local queued = redis.call('HGET', KEYS[3], ARGV[1])
-if not queued then
+if not queued or (ARGV[3] ~= '' and queued ~= ARGV[3]) then
     return 0
 end
 redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_BYTES', -tonumber(ARGV[2]))
@@ -263,12 +268,12 @@ return 1
 /// (dropped at zero) and the outbox entry, as [`RELEASE_INBOX`].
 ///
 /// KEYS: account, per-recipient counts, outbox, outbox ids. ARGV: message
-/// hash, bytes, to.
+/// hash, bytes, to, claimed entry id ("" to release whatever is queued).
 pub(crate) static RELEASE_OUTBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
 local queued = redis.call('HGET', KEYS[4], ARGV[1])
-if not queued then
+if not queued or (ARGV[4] ~= '' and queued ~= ARGV[4]) then
     return 0
 end
 redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_BYTES', -tonumber(ARGV[2]))
@@ -417,14 +422,20 @@ mod tests {
                 .await
         }
 
-        /// The release and finish steps of a claimed delete.
-        async fn finish_delete(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+        /// The release and finish steps of a delete, given its claim.
+        async fn finish_delete(
+            &self,
+            conn: &mut ClusterConnection,
+            token: &str,
+            claimed: &[String],
+        ) -> i64 {
             let _: i64 = RELEASE_INBOX
                 .key(self.keys.did(&self.to))
                 .key(self.keys.receive_q(&self.to))
                 .key(self.keys.receive_ids(&self.to))
                 .arg(&self.hash)
                 .arg(4)
+                .arg(claimed.get(3).map_or("", String::as_str))
                 .invoke_async(conn)
                 .await
                 .expect("RELEASE_INBOX");
@@ -436,6 +447,7 @@ mod tests {
                 .arg(&self.hash)
                 .arg(4)
                 .arg(&self.to)
+                .arg(claimed.get(4).map_or("", String::as_str))
                 .invoke_async(conn)
                 .await
                 .expect("RELEASE_OUTBOX");
@@ -498,10 +510,11 @@ mod tests {
         assert_eq!(msg.finish_store(&mut conn, "s2").await, 1);
         assert_eq!(msg.queued(&mut conn).await, [1; 5]);
 
-        msg.claim(&mut conn, "d", LEASE_MS)
+        let claimed = msg
+            .claim(&mut conn, "d", LEASE_MS)
             .await
             .expect("claim once both stores finished");
-        assert_eq!(msg.finish_delete(&mut conn, "d").await, 1);
+        assert_eq!(msg.finish_delete(&mut conn, "d", &claimed).await, 1);
         assert_eq!(
             msg.queued(&mut conn).await,
             [0; 5],
@@ -519,7 +532,8 @@ mod tests {
         let msg = Message::new();
 
         assert_eq!(msg.store(&mut conn, "dead").await, 1);
-        msg.claim(&mut conn, "d", 0)
+        let claimed = msg
+            .claim(&mut conn, "d", 0)
             .await
             .expect("an expired store doesn't hold the message");
         let marked: bool = redis::cmd("HEXISTS")
@@ -529,6 +543,44 @@ mod tests {
             .await
             .expect("HEXISTS");
         assert!(!marked, "the dead store's mark is cleared");
-        assert_eq!(msg.finish_delete(&mut conn, "d").await, 1);
+        assert_eq!(msg.finish_delete(&mut conn, "d", &claimed).await, 1);
+    }
+
+    /// A delete that stalled past its lease, after another delete took the
+    /// message over and it was stored again, releases nothing of the new
+    /// copy: the copy stays queued and the stale delete removes nothing.
+    #[tokio::test]
+    async fn test_a_stale_delete_spares_a_message_stored_again() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        msg.store(&mut conn, "s1").await;
+        assert_eq!(msg.finish_store(&mut conn, "s1").await, 1);
+        let stale = msg
+            .claim(&mut conn, "d1", LEASE_MS)
+            .await
+            .expect("first delete claims");
+        let taken: Vec<String> = CLAIM_MESSAGE
+            .key(msg.keys.msg_meta(&msg.hash))
+            .arg(&msg.hash)
+            .arg(&msg.to)
+            .arg("d2")
+            .arg(LEASE_MS)
+            .arg(0)
+            .invoke_async(&mut conn)
+            .await
+            .expect("second delete takes the stalled one over");
+        assert_eq!(msg.finish_delete(&mut conn, "d2", &taken).await, 1);
+
+        assert_eq!(msg.store(&mut conn, "s2").await, 1);
+        assert_eq!(msg.finish_store(&mut conn, "s2").await, 1);
+        assert_eq!(msg.finish_delete(&mut conn, "d1", &stale).await, 0);
+        assert_eq!(
+            msg.queued(&mut conn).await,
+            [1; 5],
+            "the message stored again is still queued"
+        );
     }
 }

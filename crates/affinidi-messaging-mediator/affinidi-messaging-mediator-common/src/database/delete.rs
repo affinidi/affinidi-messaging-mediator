@@ -173,8 +173,9 @@ impl DatabaseHandler {
     ///    holding it, is waited out briefly; the second of two deletes then
     ///    finds the message gone and answers NOT_FOUND, as the library does;
     /// 2. release the recipient's and sender's queues concurrently, each
-    ///    finding its entry in its own slot and undoing only what was queued
-    ///    there (idempotent, so retried a few times);
+    ///    finding its entry in its own slot and undoing only the entry the
+    ///    claim saw (idempotent, so retried a few times; a delete that
+    ///    outlived its lease spares a copy of the message stored since);
     /// 3. remove the message only while this delete still holds it, so
     ///    exactly one delete reports it removed (R1.7), and count it.
     ///
@@ -199,7 +200,7 @@ impl DatabaseHandler {
         let keys = self.keys;
         let token = uuid::Uuid::new_v4().to_string();
         let mut attempt = 1;
-        let (to, from, bytes): (String, String, String) = loop {
+        let (to, from, bytes, receive_id, send_id): (String, String, String, String, String) = loop {
             let mut claim = CLAIM_MESSAGE.prepare_invoke();
             claim
                 .key(keys.msg_meta(message_hash))
@@ -230,8 +231,8 @@ impl DatabaseHandler {
 
         for attempt in 1..=RELEASE_ATTEMPTS {
             let (inbox, outbox) = futures_util::future::join(
-                self.release_inbox(conn.clone(), &to, message_hash, &bytes),
-                self.release_outbox(conn.clone(), &from, &to, message_hash, &bytes),
+                self.release_inbox(conn.clone(), &to, message_hash, &bytes, &receive_id),
+                self.release_outbox(conn.clone(), &from, &to, message_hash, &bytes, &send_id),
             )
             .await;
             match inbox.and(outbox) {
@@ -276,13 +277,15 @@ impl DatabaseHandler {
         Ok((to, from))
     }
 
-    /// Releases the recipient's inbox entry of a message being deleted.
+    /// Releases the recipient's inbox entry `receive_id` of a message being
+    /// deleted ("" for whatever entry is queued).
     async fn release_inbox(
         &self,
         mut conn: super::RedisConnection,
         to: &str,
         message_hash: &str,
         bytes: &str,
+        receive_id: &str,
     ) -> redis::RedisResult<i64> {
         use crate::store::redis::database::cluster_scripts::RELEASE_INBOX;
 
@@ -295,11 +298,13 @@ impl DatabaseHandler {
             .key(self.keys.receive_ids(to))
             .arg(message_hash)
             .arg(bytes)
+            .arg(receive_id)
             .invoke_async(&mut conn)
             .await
     }
 
-    /// Releases the sender's outbox entry of a message being deleted.
+    /// Releases the sender's outbox entry `send_id` of a message being
+    /// deleted ("" for whatever entry is queued).
     async fn release_outbox(
         &self,
         mut conn: super::RedisConnection,
@@ -307,6 +312,7 @@ impl DatabaseHandler {
         to: &str,
         message_hash: &str,
         bytes: &str,
+        send_id: &str,
     ) -> redis::RedisResult<i64> {
         use crate::store::redis::database::cluster_scripts::RELEASE_OUTBOX;
 
@@ -321,6 +327,7 @@ impl DatabaseHandler {
             .arg(message_hash)
             .arg(bytes)
             .arg(to)
+            .arg(send_id)
             .invoke_async(&mut conn)
             .await
     }
