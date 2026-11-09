@@ -8,9 +8,10 @@
 //! The registry is how a handler finds those connections, so it can drop the
 //! affected members **before** it answers (design §7.3, R1.1/R7.2).
 //!
-//! Scope is one process. Several mediator processes sharing one Redis would
-//! need the cross-node detach of design §7.4; until that exists the mediator
-//! refuses to enable mux on the Redis backend.
+//! Scope is one process. With several mediator processes sharing one Redis,
+//! a revoke handled by another process reaches this one's connections through
+//! the periodic grant re-check in `connection::sweep`, within one sweep
+//! interval (design §7.4).
 
 use std::collections::HashSet;
 use std::sync::Arc;

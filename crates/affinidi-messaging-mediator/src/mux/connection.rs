@@ -251,6 +251,53 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     for h in expired {
         conn.detach(streaming, &h, LeaveReason::Expired).await;
     }
+
+    // Grant-admitted members: is the stored grant still active? A revoke,
+    // revoke-all or suspension handled on *this* instance detached them
+    // already, before it answered. One handled by another instance sharing
+    // the store reaches this connection here, within one sweep interval
+    // (design §7.4, Q4).
+    let by_grant: Vec<(String, String)> = {
+        let s = conn.session.lock().await;
+        s.members()
+            .filter_map(|m| match &m.source {
+                MuxSource::Grant { grant_id } => Some((m.did_hash.clone(), grant_id.clone())),
+                MuxSource::Attach => None,
+            })
+            .collect()
+    };
+    let limits = state.config.limits.mux.store_limits();
+    for (did_hash, grant_id) in by_grant {
+        let rec = match affinidi_messaging_mediator_common::store::mux::load(
+            &*state.database,
+            &did_hash,
+            &limits,
+            now,
+        )
+        .await
+        {
+            Ok(rec) => rec,
+            // Store unavailable: keep the member and look again next sweep.
+            Err(e) => {
+                debug!("mux grant re-check deferred: {e}");
+                continue;
+            }
+        };
+        use affinidi_messaging_mediator_common::store::mux::MuxGrantState as S;
+        let reason = match rec.grants.iter().find(|g| g.grant_id == grant_id) {
+            Some(g) => match g.state_at(now) {
+                S::Active => continue,
+                S::Suspended => LeaveReason::SuspendedUnknownKey,
+                S::EpochRevoked => LeaveReason::EpochBumped,
+                S::StaleKey => LeaveReason::KeyRotated,
+                S::Expired => LeaveReason::Expired,
+            },
+            // Gone: revoked by one of the parties.
+            None => LeaveReason::RevokedByMember,
+        };
+        conn.detach(streaming, &did_hash, reason).await;
+    }
+
     if !revalidate {
         return;
     }

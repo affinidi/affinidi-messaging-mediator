@@ -11,14 +11,28 @@ async fn mux_is_off_by_default_and_the_mediator_starts() {
 }
 
 #[tokio::test]
-async fn enabling_mux_before_it_is_served_refuses_to_start() {
-    let err = match TestMediator::builder().mux_enabled(true).spawn().await {
-        Ok(_) => panic!("mux enabled must refuse to start until the protocol is served"),
-        Err(e) => e,
+async fn mux_enabled_starts_on_a_backend_that_supports_it() {
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .spawn()
+        .await
+        .expect("mux enabled on the memory backend with streaming");
+    mediator.shutdown();
+}
+
+#[tokio::test]
+async fn mux_without_live_streaming_refuses_to_start() {
+    let err = match TestMediator::builder()
+        .mux_enabled(true)
+        .enable_streaming(false)
+        .spawn()
+        .await
+    {
+        Ok(_) => panic!("mux needs live streaming"),
+        Err(e) => e.to_string(),
     };
-    let msg = err.to_string();
     assert!(
-        msg.contains("[limits.mux]") && msg.contains("does not yet serve"),
-        "refusal should name the setting and the reason, got: {msg}"
+        err.contains("[limits.mux]") && err.contains("streaming"),
+        "{err}"
     );
 }

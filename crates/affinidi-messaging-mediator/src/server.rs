@@ -863,15 +863,21 @@ pub async fn serve_internal(
                     .into(),
             ));
         }
-        // The grant store exists; the protocol and connection handling that
-        // use it do not yet. Remove this refusal when they land.
-        return Err(MediatorError::ConfigError(
-            12,
-            "NA".into(),
-            "[limits.mux] enabled = \"true\" but this build does not yet serve DID \
-             multiplexing (only its storage is implemented); set enabled = \"false\""
-                .into(),
-        ));
+        // Members are carried by live delivery; without the streaming task a
+        // mux connection would carry nothing.
+        if shared_state.streaming_task.is_none() {
+            return Err(MediatorError::ConfigError(
+                12,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but live streaming is disabled; DID \
+                 multiplexing needs it"
+                    .into(),
+            ));
+        }
+        info!(
+            "DID multiplexing enabled: DIDComm clients may open mux connections with the \
+             `affinidi-mux` WebSocket subprotocol"
+        );
     }
 
     // DIDComm v1 startup checks. Both run before the listener binds, so a
