@@ -10,7 +10,7 @@
 //! be Lua), and a rule that drifts between them is a security bug, not a
 //! cosmetic one. So every grant rule — epoch, replay floor, quotas,
 //! narrow-only updates, suspension, expiry — is a pure function over one
-//! [`MuxDidRecord`] in this module, and a backend provides only two
+//! [`MuxDidRecord`](crate::store::mux::MuxDidRecord) in this module, and a backend provides only two
 //! primitives:
 //!
 //! - [`MediatorStore::mux_record_get`] — read a member DID's record;
@@ -18,7 +18,7 @@
 //!   the one that was read, updating the principal index in the same atomic
 //!   step.
 //!
-//! [`modify`] runs the read → rule → compare-and-swap loop.
+//! [`modify`](crate::store::mux::modify) runs the read → rule → compare-and-swap loop.
 //!
 //! # Unit of atomicity
 //!

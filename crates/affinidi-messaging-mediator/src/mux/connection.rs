@@ -18,6 +18,7 @@ use affinidi_messaging_mediator_common::store::mux::MuxCapability;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+#[cfg(feature = "didcomm")]
 use uuid::Uuid;
 
 use super::grants::Ctx;
@@ -32,6 +33,7 @@ use crate::tasks::websocket_streaming::{MemberChange, QueuedCommand};
 pub const MUX_SUBPROTOCOL: &str = "affinidi-mux";
 
 /// `messaging/mux/event` type URI.
+#[cfg(feature = "didcomm")]
 const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/event/0.1";
 
 fn rfc3339(secs: u64) -> String {

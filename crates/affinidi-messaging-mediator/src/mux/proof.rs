@@ -13,7 +13,8 @@
 //! - **`MuxAttach`** — bound to one connection (`sessionId` + `muxNonce`) and
 //!   gone when it closes.
 //!
-//! [`verify_statement`] applies the checks in the order the design fixes
+//! [`StatementVerifier::verify_grant`] and
+//! [`StatementVerifier::verify_attach`] apply the checks in the order the design fixes
 //! (verify → key state → binding → time), and the store rules
 //! (`affinidi_messaging_mediator_common::store::mux`) run after it. Scope
 //! against the member's ACLs and account standing is the caller's, because it
