@@ -29,6 +29,15 @@ mediator-tui 0.11.0); they are no longer updated.
   setting it cannot honour. It also refuses on a backend without mux support.
 - Removing an account removes its mux grants on both sides (as a member DID
   and as a principal), whether or not mux is enabled at the time.
+- `mux::proof::StatementVerifier`: verifies the `MuxGrant` / `MuxAttach`
+  statements a member DID signs to allow a principal to carry its traffic.
+  They use W3C Data Integrity proofs (`eddsa-jcs-2022` / `eddsa-rdfc-2022`),
+  the same format and verifier as Trust Tasks, and only an `authentication`
+  key may sign one. Statements are closed objects (unknown members are
+  refused), bound to the mediator (`audience`), the principal and, for an
+  attach, the connection. It can also re-check that a stored grant's signing
+  key is still the member's current authentication key; a DID that cannot be
+  resolved reports "unknown", never "stale" or "fine".
 
 ### Added — did:webs
 

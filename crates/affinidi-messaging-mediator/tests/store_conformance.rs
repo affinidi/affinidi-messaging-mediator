@@ -1479,7 +1479,7 @@ fn mux_grant(
         narrowed_exp: None,
         state: mux::MuxGrantState::Active,
         state_changed_at: None,
-        jws: "jws".into(),
+        statement: serde_json::json!({}),
     }
 }
 

@@ -157,8 +157,9 @@ pub struct MuxGrant {
     pub state: MuxGrantState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_changed_at: Option<u64>,
-    /// The grant exactly as the member signed it, kept for audit.
-    pub jws: String,
+    /// The grant statement exactly as the member signed it (with its Data
+    /// Integrity proof), kept for audit and returned verbatim by listings.
+    pub statement: serde_json::Value,
 }
 
 impl MuxGrant {
@@ -701,7 +702,7 @@ mod tests {
             narrowed_exp: None,
             state: MuxGrantState::Active,
             state_changed_at: None,
-            jws: "jws".into(),
+            statement: serde_json::json!({}),
         }
     }
 

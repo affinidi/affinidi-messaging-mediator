@@ -34,6 +34,8 @@ pub mod didcomm_v1_identity;
 pub mod handlers;
 pub mod messages;
 pub mod monitor;
+/// DID multiplexing: one connection carrying many DIDs.
+pub mod mux;
 pub mod scid_sources;
 pub mod server;
 pub mod store;
