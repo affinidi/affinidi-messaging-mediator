@@ -52,6 +52,15 @@ fn recipients(frame: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The event document must parse as the spec's generated
+/// `messaging/mux/event` type: that is what a client using the generated
+/// bindings does, so a shape the schema refuses is a broken event.
+fn conforms_to_spec(doc: &Value) {
+    use affinidi_messaging_mediator::task_specs::messaging::mux::event::v0_1::Payload;
+    serde_json::from_value::<trust_tasks_rs::TrustTask<Payload>>(doc.clone())
+        .unwrap_or_else(|e| panic!("mux/event does not match the spec: {e}\n{doc:#}"));
+}
+
 /// `member` grants `principal` receive + pickup, stored as the
 /// `messaging/mux/grant` task would store it.
 async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser) {
@@ -186,6 +195,7 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     assert_eq!(recipients(&ready), vec![principal.did.clone()]);
     let (ready_msg, _) = env.atm.unpack(&ready).await.expect("unpack ready");
     assert_eq!(ready_msg.body["payload"]["event"], "ready");
+    conforms_to_spec(&ready_msg.body);
     assert!(
         ready_msg.body["payload"]["muxNonce"]
             .as_str()
@@ -195,6 +205,7 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     let attached = next_text().await;
     let (attached_msg, _) = env.atm.unpack(&attached).await.expect("unpack attached");
     assert_eq!(attached_msg.body["payload"]["event"], "attached");
+    conforms_to_spec(&attached_msg.body);
     let mut dids: Vec<String> = attached_msg.body["payload"]["dids"]
         .as_array()
         .unwrap()
