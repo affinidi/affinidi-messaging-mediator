@@ -8,6 +8,37 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — durable DID multiplexing notices
+
+- The mediator now stores signed `messaging/mux/notice/0.1` documents in the
+  inbox of the party that must act. They are delivered at least once, and
+  the recipient acknowledges one by deleting it:
+  - `grantsSuspended` goes to each principal whose grants the unknown-key
+    rule suspended. Those grants must be recreated with a fresh member
+    signature. A principal that was offline finds the notice when it next
+    picks up or connects.
+  - `grantsRevoked` goes to each principal whose grant was revoked by its
+    member (`revokedByMember`), voided by `revoke-all` (`epochBumped`), or
+    removed with the member's account (`accountRemoved`). A principal that
+    revoked its own grant is not sent one.
+  - `grantsPresent` goes to a member DID: when its new key suspended grants,
+    and when it authenticates directly (DIDComm) while grants on it exist
+    and it has not been told since they changed. It carries counts only,
+    never a principal DID.
+- The `ready` event's `pendingNotices` now counts the notices waiting in the
+  principal's inbox. It was always 0.
+- A notice is stored only after the change it reports is committed and its
+  members are detached. A `grantsSuspended` or `epochBumped` notice lost to
+  a crash is sent when the principal next opens a mux connection. A
+  `revokedByMember` or `accountRemoved` notice is best effort, because those
+  grants are deleted; `messaging/mux/list` stays the source of truth.
+- Removing a member DID's account now detaches it from its principals' live
+  connections at once (`accountRemoved`). Before, they kept carrying it until
+  the next 30-second sweep.
+- Not yet: `grantsExpiring`, the unknown-key rule on direct authentication,
+  and the audit record for a suspension. Each notice is one more inbox
+  message, so a principal that never drains its inbox accumulates them.
+
 ### Fixed — DID multiplexing
 
 - The `muxNonce` in a mux connection's `ready` event is now 32 random bytes

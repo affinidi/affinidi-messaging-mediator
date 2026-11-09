@@ -7,6 +7,7 @@
 
 pub mod connection;
 pub mod grants;
+pub mod notice;
 pub mod proof;
 pub mod registry;
 pub mod session;

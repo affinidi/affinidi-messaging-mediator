@@ -366,6 +366,7 @@ mod tests {
             state: MuxGrantState::Active,
             state_changed_at: None,
             statement: serde_json::json!({}),
+            noticed: false,
         }
     }
 

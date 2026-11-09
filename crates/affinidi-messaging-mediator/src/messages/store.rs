@@ -27,7 +27,7 @@ use super::{ProcessMessageResponse, WrapperType};
 /// and notifies goes through here so the order can't drift between them.
 async fn _store_message(
     state: &SharedData,
-    session: &Session,
+    session_id: &str,
     force_live_delivery: bool,
     data: &str,
     to_did_hash: &str,
@@ -37,7 +37,7 @@ async fn _store_message(
     let msg_id = state
         .database
         .store_message(
-            &session.session_id,
+            session_id,
             data,
             to_did_hash,
             from_did_hash,
@@ -74,6 +74,27 @@ async fn _store_message(
     state.activity.received(state, to_did_hash).await;
     crate::account_stats::count_stored(state, from_did_hash, to_did_hash, data).await;
     Ok(msg_id)
+}
+
+/// Store a message the mediator authored itself (a mux notice) in a local
+/// inbox, and notify a live connection, in the same order as every other
+/// store. Returns the stored message's id.
+pub(crate) async fn store_system_message(
+    state: &SharedData,
+    data: &str,
+    to_did_hash: &str,
+    expiry: u64,
+) -> Result<String, MediatorError> {
+    _store_message(
+        state,
+        "mediator",
+        false,
+        data,
+        to_did_hash,
+        Some(&state.config.mediator_did_hash),
+        expiry,
+    )
+    .await
 }
 
 /// Stores a message in the mediator's database
@@ -177,7 +198,7 @@ pub(crate) async fn store_message(
 
                         match _store_message(
                             state,
-                            session,
+                            &session.session_id,
                             response.force_live_delivery,
                             &packed,
                             &affinidi_messaging_mediator_common::did_identity::did_hash(recipient),
@@ -227,7 +248,7 @@ pub(crate) async fn store_message(
                     .await?;
                     match _store_message(
                         state,
-                        session,
+                        &session.session_id,
                         response.force_live_delivery,
                         message,
                         &to_hash,
@@ -380,7 +401,7 @@ pub(crate) async fn store_forwarded_message(
 
         match _store_message(
             state,
-            session,
+            &session.session_id,
             false,
             message,
             &recipient_did_hash,
