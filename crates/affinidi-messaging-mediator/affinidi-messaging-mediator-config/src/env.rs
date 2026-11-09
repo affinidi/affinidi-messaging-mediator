@@ -198,6 +198,23 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
     env_override!(config.limits.ws_send_buffer, "LIMIT_WS_SEND_BUFFER");
     env_override!(config.limits.pubsub_buffer, "LIMIT_PUBSUB_BUFFER");
+    env_override!(config.limits.mux.enabled, "LIMIT_MUX_ENABLED");
+    env_override!(
+        config.limits.mux.max_dids_per_connection,
+        "LIMIT_MUX_MAX_DIDS_PER_CONNECTION"
+    );
+    env_override!(
+        config.limits.mux.max_grants_per_principal,
+        "LIMIT_MUX_MAX_GRANTS_PER_PRINCIPAL"
+    );
+    env_override!(
+        config.limits.mux.max_grants_per_did,
+        "LIMIT_MUX_MAX_GRANTS_PER_DID"
+    );
+    env_override!(
+        config.limits.mux.max_grant_lifetime_secs,
+        "LIMIT_MUX_MAX_GRANT_LIFETIME_SECS"
+    );
 
     // `[storage]` is optional, and `[storage.fjall]` is optional within it, so
     // these only override a section that already exists. An env var alone does

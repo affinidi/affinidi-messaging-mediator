@@ -24,6 +24,7 @@
 //!   re-delivers messages whose owning consumer has gone idle.
 
 use crate::common::time::unix_timestamp_secs;
+use affinidi_messaging_mediator_common::store::mux::{MuxDidRecord, MuxIndexDelta};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
 };
@@ -55,7 +56,7 @@ use affinidi_messaging_sdk::{
 use async_trait::async_trait;
 use sha256::digest;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -237,6 +238,13 @@ struct MemoryState {
     /// kept because forward ingress needs the DID while account removal works
     /// from the hash.
     v1_routing_keys: HashMap<String, (String, String)>,
+
+    // ─── DID multiplexing ───────────────────────────────────────────
+    /// member DID hash → its mux record. See `store::mux`.
+    mux_records: HashMap<String, MuxDidRecord>,
+    /// principal hash → member DID hashes it holds grants on (ordered, for
+    /// cursor paging).
+    mux_principals: HashMap<String, BTreeSet<String>>,
 
     // ─── Audit log ──────────────────────────────────────────────────
     /// Privileged-change records, newest-first. Bounded ring capped at
@@ -1191,6 +1199,83 @@ impl MediatorStore for MemoryStore {
     }
 
     // ─── DIDComm v1 routing keys ─────────────────────────────────────────────
+
+    // ─── DID multiplexing ────────────────────────────────────────────────────
+
+    fn supports_mux(&self) -> bool {
+        true
+    }
+
+    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
+        Ok(self.state.lock().await.mux_records.get(did_hash).cloned())
+    }
+
+    async fn mux_record_cas(
+        &self,
+        did_hash: &str,
+        expected_version: Option<u64>,
+        new: Option<&MuxDidRecord>,
+        index: &MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.mux_records.get(did_hash).map(|r| r.version) != expected_version {
+            return Ok(false);
+        }
+        match new {
+            Some(rec) => {
+                state.mux_records.insert(did_hash.to_string(), rec.clone());
+            }
+            None => {
+                state.mux_records.remove(did_hash);
+            }
+        }
+        for p in &index.add {
+            state
+                .mux_principals
+                .entry(p.clone())
+                .or_default()
+                .insert(did_hash.to_string());
+        }
+        for p in &index.remove {
+            if let Some(set) = state.mux_principals.get_mut(p) {
+                set.remove(did_hash);
+                if set.is_empty() {
+                    state.mux_principals.remove(p);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let state = self.state.lock().await;
+        let Some(set) = state.mux_principals.get(principal_hash) else {
+            return Ok(Vec::new());
+        };
+        Ok(match after {
+            Some(a) => set
+                .range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
+                .take(limit)
+                .cloned()
+                .collect(),
+            None => set.iter().take(limit).cloned().collect(),
+        })
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .mux_principals
+            .get(principal_hash)
+            .map_or(0, BTreeSet::len))
+    }
 
     fn supports_v1_routing_keys(&self) -> bool {
         true

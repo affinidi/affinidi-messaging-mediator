@@ -297,6 +297,9 @@ pub mod types;
 /// in-process Rust backends), extracted so it can't drift between them.
 pub mod ops;
 
+/// DID multiplexing grant rules, shared by every backend. See [`mux`].
+pub mod mux;
+
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 
@@ -1135,6 +1138,63 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// and, once the coordinate-mediation protocol lands, by `keylist-query`.
     async fn v1_routing_keys_for(&self, _did_hash: &str) -> Result<Vec<String>, MediatorError> {
         Ok(Vec::new())
+    }
+
+    // ─── DID multiplexing (mux) grants ───────────────────────────────────────
+    //
+    // Two primitives only. Every grant rule lives in [`mux`] as a pure function
+    // over a [`mux::MuxDidRecord`], so the backends cannot drift apart on them.
+
+    /// Whether this backend implements the mux primitives below. Defaults to
+    /// `false`; the mediator refuses to start with mux enabled on a backend
+    /// that returns `false`.
+    fn supports_mux(&self) -> bool {
+        false
+    }
+
+    /// The mux record for member DID `did_hash`, or `None` if it has none.
+    async fn mux_record_get(
+        &self,
+        _did_hash: &str,
+    ) -> Result<Option<mux::MuxDidRecord>, MediatorError> {
+        Ok(None)
+    }
+
+    /// Replace the mux record for `did_hash` **only if** its stored version is
+    /// still `expected_version` (`None` = no record may exist). `new = None`
+    /// deletes the record. In the same atomic step, add `did_hash` to the
+    /// principal index of every hash in `index.add` and remove it from every
+    /// hash in `index.remove`.
+    ///
+    /// Returns `false`, writing nothing, when the version did not match.
+    async fn mux_record_cas(
+        &self,
+        _did_hash: &str,
+        _expected_version: Option<u64>,
+        _new: Option<&mux::MuxDidRecord>,
+        _index: &mux::MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        Err(MediatorError::NotImplemented(
+            12,
+            "NA".into(),
+            "this storage backend does not implement DID multiplexing".into(),
+        ))
+    }
+
+    /// Member DID hashes in `principal_hash`'s index, ascending, strictly
+    /// after `after`, at most `limit`.
+    async fn mux_principal_dids(
+        &self,
+        _principal_hash: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        Ok(Vec::new())
+    }
+
+    /// How many member DIDs `principal_hash`'s index holds.
+    async fn mux_principal_count(&self, _principal_hash: &str) -> Result<usize, MediatorError> {
+        Ok(0)
     }
 
     // ─── ACLs ────────────────────────────────────────────────────────────────

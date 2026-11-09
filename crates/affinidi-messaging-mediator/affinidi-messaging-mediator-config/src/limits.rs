@@ -52,6 +52,42 @@ pub struct LimitsConfigRaw {
     pub ws_send_buffer: String,
     #[serde(default = "default_pubsub_buffer")]
     pub pubsub_buffer: String,
+    /// `[limits.mux]` — DID multiplexing. Absent means disabled.
+    #[serde(default)]
+    pub mux: MuxConfigRaw,
+}
+
+/// Raw `[limits.mux]` schema: DID multiplexing (one connection carrying many
+/// DIDs). Every field is optional; an absent table leaves mux **off** (R5.1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuxConfigRaw {
+    /// `"true"` to enable. Anything else, including absence, is off.
+    pub enabled: String,
+    pub max_dids_per_connection: String,
+    pub max_grants_per_principal: String,
+    pub max_grants_per_did: String,
+    pub max_grant_lifetime_secs: String,
+    pub max_attach_lifetime_secs: String,
+    pub revalidate_interval_secs: String,
+    pub max_channel_slots: String,
+    pub dead_retention_secs: String,
+}
+
+impl Default for MuxConfigRaw {
+    fn default() -> Self {
+        Self {
+            enabled: "false".into(),
+            max_dids_per_connection: "1000".into(),
+            max_grants_per_principal: "5000".into(),
+            max_grants_per_did: "16".into(),
+            max_grant_lifetime_secs: "2592000".into(),
+            max_attach_lifetime_secs: "86400".into(),
+            revalidate_interval_secs: "900".into(),
+            max_channel_slots: "512".into(),
+            dead_retention_secs: "604800".into(),
+        }
+    }
 }
 
 /// Off. Enabling this shortens how long a delivered-but-unacknowledged message
