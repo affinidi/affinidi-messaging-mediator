@@ -6,7 +6,7 @@ hold the history from before the move (up to mediator 0.41.2,
 mediator-common 0.17.7, test-mediator 0.22.0, mediator-admin and
 mediator-tui 0.11.0); they are no longer updated.
 
-## Unreleased
+## 0.51.0 (2026-11-09)
 
 ### Added — did:webs
 
