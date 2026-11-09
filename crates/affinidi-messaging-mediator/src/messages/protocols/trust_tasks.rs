@@ -2363,6 +2363,9 @@ async fn consume_mux(
     if !changed.narrowed.is_empty() {
         state.mux.narrow(&changed.narrowed).await;
     }
+    if !changed.stored.is_empty() {
+        state.mux.admit_grants(streaming, &changed.stored).await;
+    }
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,

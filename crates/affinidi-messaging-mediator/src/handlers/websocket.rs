@@ -1035,11 +1035,12 @@ async fn handle_socket(
                     }}
                 }
                 _ = async { match &mux_conn { Some(c) => c.notify.notified().await, None => std::future::pending().await } } => {
-                    if let Some(conn) = &mux_conn
-                        && let Some(frame) = crate::mux::connection::drain_left(&state, conn).await
-                        && let Err(e) = socket.send(Message::Text(frame.into())).await
-                    {
-                        warn!("Failed to send mux event to WebSocket client: {e}");
+                    if let Some(conn) = &mux_conn {
+                        for frame in crate::mux::connection::drain_changes(&state, conn).await {
+                            if let Err(e) = socket.send(Message::Text(frame.into())).await {
+                                warn!("Failed to send mux event to WebSocket client: {e}");
+                            }
+                        }
                     }
                 }
                 _ = mux_sweep.tick(), if mux_conn.is_some() => {

@@ -255,6 +255,23 @@ impl MuxSession {
         Ok((admitted, refused))
     }
 
+    /// Admit a member carried by a stored grant, while connected. A member
+    /// already carried by an earlier grant takes the new one's identity (it
+    /// replaced the old), so a revoke of the new grant still finds it; one
+    /// carried by an attach is merged, as on connect. Returns the member and
+    /// whether it is new to the connection.
+    pub fn admit_grant(&mut self, member: MuxMember) -> Result<(MuxMember, bool), MuxError> {
+        let existing = self.members.get(&member.did_hash).map(|m| m.source.clone());
+        match existing {
+            Some(MuxSource::Grant { .. }) => {
+                self.members.insert(member.did_hash.clone(), member.clone());
+                Ok((member, false))
+            }
+            Some(MuxSource::Attach) => Ok((self.admit(member)?, false)),
+            None => Ok((self.admit(member)?, true)),
+        }
+    }
+
     /// Remove a member. Returns it if it was on the connection.
     pub fn detach(&mut self, did_hash: &str) -> Option<MuxMember> {
         self.members.remove(did_hash)

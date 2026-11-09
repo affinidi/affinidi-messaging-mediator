@@ -37,7 +37,9 @@ pub struct MuxConn {
     /// Members that left since the socket last reported; the socket loop
     /// drains this into `detached` events to the client.
     pub left: Mutex<Vec<(MuxMember, LeaveReason)>>,
-    /// Wakes the socket loop to report `left`.
+    /// Members admitted while connected (a new grant), for `attached` events.
+    pub joined: Mutex<Vec<MuxMember>>,
+    /// Wakes the socket loop to report `left` / `joined`.
     pub notify: tokio::sync::Notify,
 }
 
@@ -52,6 +54,7 @@ impl MuxConn {
             tx,
             resync,
             left: Mutex::new(Vec::new()),
+            joined: Mutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -218,6 +221,39 @@ impl MuxRegistry {
         }
     }
 
+    /// Carry the members of newly stored grants on every live connection of
+    /// their principal, at once (design §4.4).
+    pub async fn admit_grants(&self, streaming: Option<&StreamingTask>, grants: &[MuxGrant]) {
+        for g in grants {
+            for conn in self.for_principal(&g.principal_hash) {
+                let member = MuxMember {
+                    did: g.did.clone(),
+                    did_hash: g.did_hash.clone(),
+                    source: super::session::MuxSource::Grant {
+                        grant_id: g.grant_id.clone(),
+                    },
+                    scope: g.effective_scope().clone(),
+                    kid: g.kid.clone(),
+                    key_fp: g.key_fp.clone(),
+                    expires_at: g.effective_exp(),
+                };
+                let admitted = conn.session.lock().await.admit_grant(member);
+                match admitted {
+                    Ok((member, new)) => {
+                        if new && let Some(streaming) = streaming {
+                            conn.register_member(streaming, &member).await;
+                        }
+                        conn.joined.lock().await.push(member);
+                        conn.notify.notify_one();
+                    }
+                    // The connection is full: the grant is stored and will be
+                    // carried by a connection with room (or after a reconnect).
+                    Err(e) => debug!(principal = %g.principal_hash, "grant not carried live: {e}"),
+                }
+            }
+        }
+    }
+
     /// Re-scope members admitted by narrowed grants: the narrower scope or
     /// earlier expiry takes effect now.
     pub async fn narrow(&self, grants: &[MuxGrant]) {
@@ -226,5 +262,88 @@ impl MuxRegistry {
                 conn.session.lock().await.narrow(g);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use affinidi_messaging_mediator_common::did_identity::did_hash;
+    use affinidi_messaging_mediator_common::store::mux::{MuxCapability, MuxGrantState, MuxScope};
+
+    fn grant(id: &str, member: &str, principal: &str) -> MuxGrant {
+        MuxGrant {
+            grant_id: id.into(),
+            did: member.into(),
+            did_hash: did_hash(member),
+            principal: principal.into(),
+            principal_hash: did_hash(principal),
+            kid: format!("{member}#key-1"),
+            key_fp: "fp".into(),
+            did_version: None,
+            epoch: 0,
+            scope: MuxScope::new([MuxCapability::Receive]).unwrap(),
+            iat: 1,
+            exp: u64::MAX / 2,
+            narrowed_scope: None,
+            narrowed_exp: None,
+            state: MuxGrantState::Active,
+            state_changed_at: None,
+            statement: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_stored_while_connected_is_carried_at_once() {
+        let registry = MuxRegistry::default();
+        let principal = "did:example:device";
+        let (tx, _rx) = mpsc::channel(8);
+        let conn = Arc::new(MuxConn::new(
+            MuxSession::new(principal, "sess", 10),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        registry.insert("sess", &did_hash(principal), conn.clone());
+
+        registry
+            .admit_grants(None, &[grant("g1", "did:example:work", principal)])
+            .await;
+        let member = conn
+            .session
+            .lock()
+            .await
+            .get(&did_hash("did:example:work"))
+            .cloned();
+        assert!(matches!(
+            member.map(|m| m.source),
+            Some(super::super::session::MuxSource::Grant { grant_id }) if grant_id == "g1"
+        ));
+        assert_eq!(
+            conn.joined.lock().await.len(),
+            1,
+            "an attached event is queued"
+        );
+
+        // A replacing grant takes over, so revoking *it* detaches the member.
+        registry
+            .admit_grants(None, &[grant("g2", "did:example:work", principal)])
+            .await;
+        registry
+            .detach_grants(
+                None,
+                &[grant("g2", "did:example:work", principal)],
+                LeaveReason::RevokedByMember,
+            )
+            .await;
+        assert!(conn.session.lock().await.is_empty());
+
+        // Another principal's grant is not carried here.
+        registry
+            .admit_grants(
+                None,
+                &[grant("g3", "did:example:home", "did:example:other")],
+            )
+            .await;
+        assert!(conn.session.lock().await.is_empty());
     }
 }
