@@ -35,8 +35,23 @@ mediator-tui 0.11.0); they are no longer updated.
 - Removing a member DID's account now detaches it from its principals' live
   connections at once (`accountRemoved`). Before, they kept carrying it until
   the next 30-second sweep.
-- Not yet: `grantsExpiring`, the unknown-key rule on direct authentication,
-  and the audit record for a suspension. Each notice is one more inbox
+- **The unknown-key rule now also runs on direct authentication**, comparing
+  the proven key only with keys of the same kind. A grant records the member
+  DID's `keyAgreement` keys when it is stored. A DIDComm login fires the rule
+  only if its authcrypt sender key is none of those. A TSP login fires it
+  only if the VID's signing key signed none of the active grants. A member
+  that logs in directly with keys it already had keeps its grants; a key
+  added since suspends them, with the same notices as any other suspension.
+  A grant stored before this release recorded no key-agreement keys, so a
+  DIDComm login does not fire the rule while one is active. Spec:
+  trustoverip/dtgwg-trust-tasks-tf#1072.
+- `grantsExpiring` is stored once per grant, for active grants past about
+  three quarters of their lifetime. It is checked when the principal logs
+  in, when it opens a mux connection, and on the key re-check timer while
+  connected (`revalidate_interval_secs`). The mediator cannot see a client's
+  renewal opt-in, so it sends the notice for every such grant; a client that
+  renews discards it. A renewed grant starts a new lifetime.
+- Not yet: the audit record for a suspension. Each notice is one more inbox
   message, so a principal that never drains its inbox accumulates them.
 
 ### Fixed — DID multiplexing

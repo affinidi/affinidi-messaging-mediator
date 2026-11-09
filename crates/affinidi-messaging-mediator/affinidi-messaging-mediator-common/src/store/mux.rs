@@ -166,6 +166,15 @@ pub struct MuxGrant {
     /// is false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub noticed: bool,
+    /// Fingerprints (SHA-256 of the public key) of the member DID's
+    /// `keyAgreement` keys when the grant was stored: the known keys a direct
+    /// DIDComm authentication, which proves a key-agreement key, is compared
+    /// with (the unknown-key rule). Empty when they could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_agreement_fps: Vec<String>,
+    /// Whether the `grantsExpiring` notice for this grant is stored.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expiring_noticed: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -194,6 +203,14 @@ impl MuxGrant {
     /// Whether the grant authorises anything at `now`.
     pub fn is_usable(&self, now: u64) -> bool {
         self.state_at(now) == MuxGrantState::Active
+    }
+
+    /// Whether the grant is active and past about three quarters of its
+    /// lifetime (`grantsExpiring`).
+    pub fn is_expiring(&self, now: u64) -> bool {
+        let exp = self.effective_exp();
+        let lifetime = exp.saturating_sub(self.iat);
+        self.is_usable(now) && now >= self.iat.saturating_add(lifetime / 4 * 3)
     }
 
     fn set_state(&mut self, state: MuxGrantState, now: u64) {
@@ -500,6 +517,57 @@ pub fn revoke_principals(
     revoke_where(rec, now, |g| principal_hashes.contains(&g.principal_hash))
 }
 
+/// The unknown-key rule for a direct DIDComm authentication, which proves a
+/// key-agreement key (`ka_fp`): suspend every active grant unless some active
+/// grant recorded that key. An active grant that recorded no key-agreement
+/// keys gives no basis for comparison, so nothing fires while one exists.
+pub fn suspend_unless_known_key_agreement(
+    rec: &mut MuxDidRecord,
+    ka_fp: &str,
+    now: u64,
+) -> Vec<MuxGrant> {
+    let mut active = rec.grants.iter().filter(|g| g.is_usable(now)).peekable();
+    if active.peek().is_none()
+        || rec.grants.iter().any(|g| {
+            g.is_usable(now)
+                && (g.key_agreement_fps.is_empty()
+                    || g.key_agreement_fps.iter().any(|f| f == ka_fp))
+        })
+    {
+        return Vec::new();
+    }
+    suspend_active(rec, now)
+}
+
+/// The unknown-key rule for a direct TSP authentication, which proves a
+/// signing key (`signing_fp`): suspend every active grant unless one was
+/// signed by that key.
+pub fn suspend_unless_known_signing_key(
+    rec: &mut MuxDidRecord,
+    signing_fp: &str,
+    now: u64,
+) -> Vec<MuxGrant> {
+    let mut active = rec.grants.iter().filter(|g| g.is_usable(now)).peekable();
+    if active.peek().is_none()
+        || rec
+            .grants
+            .iter()
+            .any(|g| g.is_usable(now) && g.key_fp == signing_fp)
+    {
+        return Vec::new();
+    }
+    suspend_active(rec, now)
+}
+
+fn suspend_active(rec: &mut MuxDidRecord, now: u64) -> Vec<MuxGrant> {
+    let mut suspended = Vec::new();
+    for g in rec.grants.iter_mut().filter(|g| g.is_usable(now)) {
+        g.set_state(MuxGrantState::Suspended, now);
+        suspended.push(g.clone());
+    }
+    suspended
+}
+
 /// Remove the grants with these ids on this DID.
 pub fn revoke_grant_ids(
     rec: &mut MuxDidRecord,
@@ -772,6 +840,8 @@ mod tests {
             state_changed_at: None,
             statement: serde_json::json!({}),
             noticed: false,
+            key_agreement_fps: Vec::new(),
+            expiring_noticed: false,
         }
     }
 
@@ -1071,5 +1141,75 @@ mod tests {
         // The same key "coming back" changes nothing: the grant stays stale.
         assert!(suspend_unless_known_kid(&mut rec, "k1", NOW).is_empty());
         assert!(!rec.grants[0].is_usable(NOW));
+    }
+
+    #[test]
+    fn a_direct_didcomm_login_is_compared_with_recorded_key_agreement_keys() {
+        let mut rec = MuxDidRecord::default();
+        let mut g1 = grant("g1", "p1", "k1", NOW - 10, 0);
+        g1.key_agreement_fps = vec!["ka1".into(), "ka2".into()];
+        let mut g2 = grant("g2", "p2", "k1", NOW - 10, 0);
+        g2.key_agreement_fps = vec!["ka1".into()];
+        rec.grants = vec![g1, g2];
+
+        // A key-agreement key listed when the grants were stored is known,
+        // whichever grant recorded it.
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).is_empty());
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka2", NOW).is_empty());
+        // A key added since is not: every active grant is suspended.
+        let s = suspend_unless_known_key_agreement(&mut rec, "ka3", NOW);
+        assert_eq!(s.len(), 2);
+        assert!(
+            rec.grants
+                .iter()
+                .all(|g| g.state == MuxGrantState::Suspended)
+        );
+        // With nothing active, nothing more fires.
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka9", NOW).is_empty());
+    }
+
+    #[test]
+    fn a_grant_without_recorded_key_agreement_keys_never_fires_the_rule() {
+        let mut rec = MuxDidRecord::default();
+        let mut g1 = grant("g1", "p1", "k1", NOW - 10, 0);
+        g1.key_agreement_fps = vec!["ka1".into()];
+        rec.grants = vec![g1, grant("g2", "p2", "k1", NOW - 10, 0)];
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka3", NOW).is_empty());
+        assert!(rec.grants.iter().all(|g| g.is_usable(NOW)));
+    }
+
+    #[test]
+    fn a_direct_tsp_login_is_compared_with_the_grants_signing_keys() {
+        let mut rec = MuxDidRecord::default();
+        let mut g = grant("g1", "p1", "k1", NOW - 10, 0);
+        g.key_fp = "fp1".into();
+        rec.grants = vec![g];
+        assert!(suspend_unless_known_signing_key(&mut rec, "fp1", NOW).is_empty());
+        assert_eq!(
+            suspend_unless_known_signing_key(&mut rec, "fp2", NOW).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_grant_is_expiring_from_three_quarters_of_its_lifetime() {
+        // iat NOW, exp NOW + 3600: expiring from NOW + 2700 until it lapses.
+        let g = grant("g1", "p1", "k1", NOW, 0);
+        assert!(!g.is_expiring(NOW + 2699));
+        assert!(g.is_expiring(NOW + 2700));
+        assert!(g.is_expiring(NOW + 3599));
+        assert!(
+            !g.is_expiring(NOW + 3600),
+            "an expired grant is not expiring"
+        );
+        let mut narrowed = g.clone();
+        narrowed.narrowed_exp = Some(NOW + 400);
+        assert!(
+            narrowed.is_expiring(NOW + 300),
+            "the effective expiry counts"
+        );
+        let mut dead = g;
+        dead.state = MuxGrantState::Suspended;
+        assert!(!dead.is_expiring(NOW + 3000));
     }
 }

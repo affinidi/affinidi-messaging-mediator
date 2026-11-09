@@ -206,6 +206,18 @@ pub async fn tsp_authentication_response(
             .activity
             .authenticated(&state, &session.did_hash)
             .await;
+        // The VID's signing key, compared with the keys that signed the
+        // member's grants (the mux unknown-key rule); in the background.
+        if state.config.limits.mux.enabled && state.database.supports_mux() {
+            let proven = crate::mux::notice::ProvenKey::Signing(crate::mux::proof::fingerprint(
+                &resolved.signing_key,
+            ));
+            let (state, did, did_hash) =
+                (state.clone(), session.did.clone(), session.did_hash.clone());
+            tokio::spawn(async move {
+                crate::mux::notice::on_direct_auth(&state, &did, &did_hash, Some(proven)).await;
+            });
+        }
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);
 
         Ok((

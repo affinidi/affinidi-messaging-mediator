@@ -151,8 +151,7 @@ pub async fn authentication_response(
         };
 
         // Unpack the message + enforce the signed/encrypted invariant.
-        let (msg, _unpack_metadata) =
-            super::helpers::unpack_auth_message(&envelope, &state).await?;
+        let (msg, unpack_metadata) = super::helpers::unpack_auth_message(&envelope, &state).await?;
 
         // Check that the inner plaintext from matches the envelope skid
         if let Some(msg_from) = &msg.from {
@@ -413,8 +412,26 @@ pub async fn authentication_response(
         if state.config.limits.mux.enabled && state.database.supports_mux() {
             let (state, did, did_hash) =
                 (state.clone(), session.did.clone(), session.did_hash.clone());
+            let sender_kid = unpack_metadata.encrypted_from_kid.clone();
             tokio::spawn(async move {
-                crate::mux::notice::on_direct_auth(&state, &did, &did_hash).await;
+                // The authcrypt sender key, compared with the member's
+                // recorded key-agreement keys (the unknown-key rule).
+                let proven = match sender_kid {
+                    Some(kid) => {
+                        match crate::mux::proof::StatementVerifier::new(state.did_resolver.clone())
+                            .key_agreement_fp(&kid)
+                            .await
+                        {
+                            Ok(fp) => Some(crate::mux::notice::ProvenKey::KeyAgreement(fp)),
+                            Err(e) => {
+                                tracing::debug!("authcrypt sender key not checked: {e}");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                crate::mux::notice::on_direct_auth(&state, &did, &did_hash, proven).await;
             });
         }
 
