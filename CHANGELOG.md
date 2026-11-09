@@ -62,11 +62,8 @@ mediator-tui 0.11.0); they are no longer updated.
 - The `messaging/mux/{grant,list,update,revoke,revoke-all}/0.1` Trust Tasks
   are served (over DIDComm and TSP, through the existing Trust Task core) when
   `limits.mux.enabled` is on; otherwise they answer
-  `protocol.trust_task.unsupported`. **Provisional pin:** the specs are pinned
-  from an unreleased local build of the registry (dtgwg-trust-tasks-tf
-  `feat/messaging-mux`). `trust-tasks.lock` still names
-  `https://trusttasks.org`, and the pins must be refreshed from there once the
-  specs are published, before this ships.
+  `protocol.trust_task.unsupported`. The specs are pinned from trusttasks.org
+  (dtgwg-trust-tasks-tf#1068).
 - DIDComm mux connections. A client opens one by offering the
   `affinidi-mux` WebSocket subprotocol (provisional name) alongside its
   bearer token; the mediator echoes it only when mux is enabled. On connect
