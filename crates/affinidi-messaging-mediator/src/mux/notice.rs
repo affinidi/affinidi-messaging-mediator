@@ -348,10 +348,157 @@ async fn present_after_suspension(state: &SharedData, suspended: &[MuxGrant]) {
     }
 }
 
-/// A member DID authenticated directly: if grants on it exist and it has not
-/// been told since they last changed, store a `grantsPresent` notice.
-pub async fn on_direct_auth(state: &SharedData, did: &str, did_hash: &str) {
-    tell_present(state, did, did_hash, 0).await;
+/// The key a direct authentication proved, as a fingerprint
+/// ([`super::proof::fingerprint`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenKey {
+    /// DIDComm: the authcrypt sender key, a `keyAgreement` key.
+    KeyAgreement(String),
+    /// TSP: the sender VID's signing key.
+    Signing(String),
+}
+
+/// A DID authenticated directly (the challenge/response login).
+///
+/// As a member DID: the unknown-key rule runs on the key it proved, compared
+/// with known keys of the same relationship (spec `messaging/mux/grant`).
+/// Grants it suspends are detached from live connections before their
+/// notices are stored. Otherwise the DID is told, once per change of its
+/// grants, that delegations of it exist (`grantsPresent`).
+///
+/// As a principal: it is sent the `grantsExpiring` notice it is owed.
+///
+/// `proven` is `None` when the key could not be determined; the rule then
+/// does not fire.
+pub async fn on_direct_auth(
+    state: &SharedData,
+    did: &str,
+    did_hash: &str,
+    proven: Option<ProvenKey>,
+) {
+    let mut suspended = Vec::new();
+    if let Some(proven) = proven {
+        let limits = state.config.limits.mux.store_limits();
+        let now = state.clock.unix_secs();
+        match mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
+            Ok(match &proven {
+                ProvenKey::KeyAgreement(fp) => {
+                    mux::suspend_unless_known_key_agreement(rec, fp, now)
+                }
+                ProvenKey::Signing(fp) => mux::suspend_unless_known_signing_key(rec, fp, now),
+            })
+        })
+        .await
+        {
+            Ok(s) => suspended = s,
+            Err(e) => warn!(
+                did_hash,
+                "unknown-key rule not applied on authentication: {e}"
+            ),
+        }
+    }
+    if suspended.is_empty() {
+        tell_present(state, did, did_hash, 0).await;
+    } else {
+        state
+            .mux
+            .detach_grants(
+                state.streaming_task.as_ref(),
+                &suspended,
+                LeaveReason::SuspendedUnknownKey,
+            )
+            .await;
+        let changed = Changed {
+            suspended,
+            ..Default::default()
+        };
+        after_change(state, &changed).await;
+    }
+    expiring(state, did_hash).await;
+}
+
+/// Store the `grantsExpiring` notice `principal_hash` is owed: its active
+/// grants past about three quarters of their lifetime, not yet told. Sent
+/// for every such grant: whether the application opted into renewal is known
+/// only to the client, which discards the notice for a grant it renews.
+pub async fn expiring(state: &SharedData, principal_hash: &str) {
+    let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
+    let mut due = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = match mux::grants_for_principal(
+            &*state.database,
+            principal_hash,
+            after.as_deref(),
+            100,
+            &limits,
+            now,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(principal_hash, "grantsExpiring deferred: {e}");
+                return;
+            }
+        };
+        due.extend(
+            page.into_iter()
+                .filter(|g| g.is_expiring(now) && !g.expiring_noticed),
+        );
+        match next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    let Some(principal_did) = due.first().map(|g| g.principal.clone()) else {
+        return;
+    };
+    let mut all_stored = true;
+    for chunk in due.chunks(MAX_ITEMS) {
+        let items: Vec<Value> = chunk
+            .iter()
+            .map(|g| {
+                json!({
+                    "grantId": g.grant_id,
+                    "did": g.did,
+                    "expiresAt": rfc3339(g.effective_exp()),
+                })
+            })
+            .collect();
+        let notice = Notice {
+            recipient_did: principal_did.clone(),
+            recipient_hash: principal_hash.to_string(),
+            payload: json!({ "notice": "grantsExpiring", "expiring": items }),
+        };
+        all_stored &= store(state, &notice).await;
+    }
+    if !all_stored {
+        return;
+    }
+    let mut by_member: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for g in &due {
+        by_member
+            .entry(&g.did_hash)
+            .or_default()
+            .insert(&g.grant_id);
+    }
+    for (member, ids) in by_member {
+        if let Err(e) = mux::modify(&*state.database, member, &limits, now, None, |rec, _| {
+            for g in rec.grants.iter_mut() {
+                if ids.contains(g.grant_id.as_str()) {
+                    g.expiring_noticed = true;
+                }
+            }
+            Ok(())
+        })
+        .await
+        {
+            // Stored but not marked: the next check may send it again.
+            warn!(member, "grantsExpiring stored but not marked: {e}");
+        }
+    }
 }
 
 async fn tell_present(state: &SharedData, did: &str, did_hash: &str, suspended: usize) {
@@ -514,6 +661,8 @@ mod tests {
             state_changed_at: at,
             statement: json!({}),
             noticed: false,
+            key_agreement_fps: Vec::new(),
+            expiring_noticed: false,
         }
     }
 

@@ -53,12 +53,24 @@ async fn signed_grant(
     key: &str,
     principal: &TestUser,
 ) -> Value {
+    let t = now();
+    signed_grant_for(env, member, key, principal, t, t + 3600).await
+}
+
+/// As [`signed_grant`], with an explicit `iat` and `exp`.
+async fn signed_grant_for(
+    env: &TestEnvironment,
+    member: &TestUser,
+    key: &str,
+    principal: &TestUser,
+    iat: u64,
+    exp: u64,
+) -> Value {
     let signer = member
         .secrets
         .iter()
         .find(|s| s.id.ends_with(&format!("#{key}")))
         .unwrap_or_else(|| panic!("member has no {key}"));
-    let t = now();
     sign_trust_task(
         &json!({
             "type": "muxGrant",
@@ -68,8 +80,8 @@ async fn signed_grant(
             "principal": principal.did,
             "scope": ["receive", "pickup", "delete"],
             "epoch": 0,
-            "iat": t,
-            "exp": t + 3600,
+            "iat": iat,
+            "exp": exp,
         }),
         signer,
         SignOptions::new(),
@@ -335,6 +347,9 @@ async fn direct_authentication_tells_the_member_once_per_change() {
         got[0]["payload"],
         json!({ "notice": "grantsPresent", "did": member.did, "count": 1, "suspended": 0, "epoch": 0 })
     );
+    // The member logged in with a key-agreement key its DID listed when it
+    // granted: known, so the phone's grant was not suspended.
+    assert!(notices(&env, &phone).await.is_empty());
 
     // Nothing changed: authenticating again stores nothing new.
     auth().await;
@@ -433,5 +448,117 @@ async fn a_notice_lost_to_a_crash_is_sent_when_the_principal_connects() {
 
     // And only once: a second connect finds nothing more owed.
     assert_eq!(ready(&env, &phone).await["pendingNotices"], 1);
+    assert_eq!(notices(&env, &phone).await.len(), 1);
+}
+
+/// The authenticate-as-`user` handshake, fresh rather than the SDK's cached
+/// tokens.
+async fn fresh_login(env: &TestEnvironment, user: &TestUser) {
+    let auth = env.tdk.authentication();
+    auth.invalidate(user.did.clone(), env.mediator.did().to_string())
+        .await;
+    auth.authenticate(user.did.clone(), env.mediator.did().to_string(), 3, None)
+        .await
+        .expect("authenticate");
+}
+
+#[tokio::test]
+async fn a_login_with_a_key_agreement_key_added_since_the_grant_suspends_it() {
+    use affinidi_messaging_mediator_common::store::mux::{self, MuxLimits};
+    init_tracing();
+    let env = env().await;
+    let member = env.add_user("work").await.unwrap();
+    let phone = env.add_user("phone").await.unwrap();
+    online(&env, &phone).await;
+    present(
+        &env,
+        &phone,
+        signed_grant(&env, &member, "key-1", &phone).await,
+    )
+    .await;
+
+    // The grant recorded the member's key-agreement key. A did:peer document
+    // cannot change, so stand in for "a key added since" by making the
+    // recorded set name a different key.
+    let store = env.mediator.store();
+    let rec = mux::load(&*store, &member.did_hash(), &MuxLimits::default(), now())
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.grants[0].key_agreement_fps.len(),
+        1,
+        "recorded at grant time"
+    );
+    mux::modify(
+        &*store,
+        &member.did_hash(),
+        &MuxLimits::default(),
+        now(),
+        None,
+        |rec, _| {
+            rec.grants[0].key_agreement_fps = vec!["a-key-the-member-did-not-list".into()];
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    fresh_login(&env, &member).await;
+
+    let got = wait_for_notices(&env, &phone, 1).await;
+    assert_eq!(got[0]["payload"]["notice"], "grantsSuspended");
+    assert_eq!(
+        got[0]["payload"]["suspensions"][0]["reason"],
+        "suspendedUnknownKey"
+    );
+    let got = wait_for_notices(&env, &member, 1).await;
+    assert_eq!(got[0]["payload"]["notice"], "grantsPresent");
+    assert_eq!(got[0]["payload"]["suspended"], 1);
+}
+
+#[tokio::test]
+async fn a_grant_past_three_quarters_of_its_life_is_announced_once() {
+    init_tracing();
+    let env = env().await;
+    let member = env.add_user("work").await.unwrap();
+    let phone = env.add_user("phone").await.unwrap();
+    online(&env, &phone).await;
+
+    // An hour-long grant, 50 minutes in: past three quarters.
+    let t = now();
+    let st = signed_grant_for(&env, &member, "key-1", &phone, t - 3000, t + 600).await;
+    let grant_id = st["grantId"].as_str().unwrap().to_string();
+    present(&env, &phone, st).await;
+    assert!(
+        notices(&env, &phone).await.is_empty(),
+        "not until a check runs"
+    );
+
+    // Connecting is a check.
+    assert_eq!(ready(&env, &phone).await["pendingNotices"], 1);
+    let got = notices(&env, &phone).await;
+    assert_eq!(got.len(), 1, "{got:#?}");
+    let p = &got[0]["payload"];
+    assert_eq!(p["notice"], "grantsExpiring");
+    assert_eq!(p["expiring"][0]["grantId"], grant_id);
+    assert_eq!(p["expiring"][0]["did"], member.did);
+
+    // Once per grant: another connect and a login add nothing.
+    ready(&env, &phone).await;
+    fresh_login(&env, &phone).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(notices(&env, &phone).await.len(), 1);
+
+    // A renewal is a new grant with its own lifetime: nothing is owed.
+    // The member presents it: the raw sockets above displaced the phone's SDK
+    // socket.
+    online(&env, &member).await;
+    present(
+        &env,
+        &member,
+        signed_grant(&env, &member, "key-1", &phone).await,
+    )
+    .await;
+    ready(&env, &phone).await;
     assert_eq!(notices(&env, &phone).await.len(), 1);
 }

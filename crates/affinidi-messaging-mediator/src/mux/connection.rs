@@ -154,6 +154,7 @@ pub async fn open(
     };
     // Notices owed from before a crash first, so the count includes them.
     super::notice::recover(state, &session.did_hash).await;
+    super::notice::expiring(state, &session.did_hash).await;
     let pending_notices = super::notice::pending(state, &session.did_hash).await;
     let nonce = mux.nonce.clone();
     let conn = Arc::new(MuxConn::new(mux, tx, resync));
@@ -322,6 +323,11 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     if !revalidate {
         return;
     }
+    // Grants nearing expiry while the principal stays connected (spec
+    // `messaging/mux/notice`: stored on a periodic check rather than at the
+    // three-quarter instant).
+    let principal_hash = conn.session.lock().await.principal_hash.clone();
+    super::notice::expiring(state, &principal_hash).await;
     // Snapshot, then check without the lock (DID resolution is network I/O).
     let to_check: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
     let verifier = StatementVerifier::new(state.did_resolver.clone());

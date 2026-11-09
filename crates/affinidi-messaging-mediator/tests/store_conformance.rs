@@ -1481,6 +1481,8 @@ fn mux_grant(
         state_changed_at: None,
         statement: serde_json::json!({}),
         noticed: false,
+        key_agreement_fps: Vec::new(),
+        expiring_noticed: false,
     }
 }
 
