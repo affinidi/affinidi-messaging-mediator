@@ -17,10 +17,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use affinidi_messaging_mediator_common::store::mux::MuxGrant;
+use affinidi_messaging_mediator_common::store::{
+    MediatorStore,
+    mux::{self, MuxGrant, MuxGrantState, MuxLimits},
+};
 use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::session::{LeaveReason, MuxMember, MuxSession};
 use crate::tasks::websocket_streaming::{
@@ -223,21 +226,59 @@ impl MuxRegistry {
 
     /// Carry the members of newly stored grants on every live connection of
     /// their principal, at once (design §4.4).
-    pub async fn admit_grants(&self, streaming: Option<&StreamingTask>, grants: &[MuxGrant]) {
+    ///
+    /// The store, not the order handlers finish in, decides what is carried:
+    /// each grant is re-read under the connection's session lock and admitted
+    /// only if it is still on its member's record and active. A grant that
+    /// was replaced or revoked after this handler stored it is skipped; a
+    /// concurrent handler admitting the newer grant either ran first (so this
+    /// read sees it) or waits for the lock and overwrites this one. A grant
+    /// whose record cannot be read is not carried (fail closed); the
+    /// principal's next connection carries it.
+    ///
+    /// A grant that replaces the principal's earlier grant on the same DID
+    /// replaces the member's scope and expiry outright, wider or narrower:
+    /// it is a new statement signed by the member DID, verified like any
+    /// other (`grants::store_grant`), so a wider scope is the member's own
+    /// authorisation.
+    pub async fn admit_grants(
+        &self,
+        streaming: Option<&StreamingTask>,
+        store: &dyn MediatorStore,
+        limits: &MuxLimits,
+        now: u64,
+        grants: &[MuxGrant],
+    ) {
         for g in grants {
             for conn in self.for_principal(&g.principal_hash) {
-                let member = MuxMember {
-                    did: g.did.clone(),
-                    did_hash: g.did_hash.clone(),
-                    source: super::session::MuxSource::Grant {
-                        grant_id: g.grant_id.clone(),
-                    },
-                    scope: g.effective_scope().clone(),
-                    kid: g.kid.clone(),
-                    key_fp: g.key_fp.clone(),
-                    expires_at: g.effective_exp(),
+                let mut session = conn.session.lock().await;
+                let current = match mux::load(store, &g.did_hash, limits, now).await {
+                    Ok(rec) => rec.grants.into_iter().find(|s| {
+                        s.grant_id == g.grant_id
+                            && s.principal_hash == g.principal_hash
+                            && matches!(s.state_at(now), MuxGrantState::Active)
+                    }),
+                    Err(e) => {
+                        warn!(principal = %g.principal_hash, grant = %g.grant_id, "grant not carried live, store unreadable: {e}");
+                        None
+                    }
                 };
-                let admitted = conn.session.lock().await.admit_grant(member);
+                let Some(current) = current else {
+                    continue;
+                };
+                let member = MuxMember {
+                    did: current.did.clone(),
+                    did_hash: current.did_hash.clone(),
+                    source: super::session::MuxSource::Grant {
+                        grant_id: current.grant_id.clone(),
+                    },
+                    scope: current.effective_scope().clone(),
+                    kid: current.kid.clone(),
+                    key_fp: current.key_fp.clone(),
+                    expires_at: current.effective_exp(),
+                };
+                let admitted = session.admit_grant(member);
+                drop(session);
                 match admitted {
                     Ok((member, new)) => {
                         if new && let Some(streaming) = streaming {
@@ -246,9 +287,15 @@ impl MuxRegistry {
                         conn.joined.lock().await.push(member);
                         conn.notify.notify_one();
                     }
-                    // The connection is full: the grant is stored and will be
-                    // carried by a connection with room (or after a reconnect).
-                    Err(e) => debug!(principal = %g.principal_hash, "grant not carried live: {e}"),
+                    // The connection is full. The grant stays stored and is
+                    // carried by a connection with room, or after a
+                    // reconnect; the client sees `stored` with no `attached`
+                    // event. The spec has no event for this yet.
+                    Err(e) => warn!(
+                        principal = %g.principal_hash,
+                        grant = %g.grant_id,
+                        "stored grant not carried live: {e}"
+                    ),
                 }
             }
         }
@@ -265,11 +312,12 @@ impl MuxRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "memory-backend"))]
 mod tests {
     use super::*;
+    use crate::store::MemoryStore;
     use affinidi_messaging_mediator_common::did_identity::did_hash;
-    use affinidi_messaging_mediator_common::store::mux::{MuxCapability, MuxGrantState, MuxScope};
+    use affinidi_messaging_mediator_common::store::mux::{MuxCapability, MuxScope};
 
     fn grant(id: &str, member: &str, principal: &str) -> MuxGrant {
         MuxGrant {
@@ -293,10 +341,25 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_grant_stored_while_connected_is_carried_at_once() {
-        let registry = MuxRegistry::default();
-        let principal = "did:example:device";
+    /// Make `g` the principal's stored grant on its member DID.
+    async fn put(store: &MemoryStore, g: &MuxGrant) {
+        mux::modify(store, &g.did_hash, &LIMITS, 0, None, |rec, _| {
+            rec.grants.retain(|x| x.principal_hash != g.principal_hash);
+            rec.grants.push(g.clone());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    const LIMITS: MuxLimits = MuxLimits {
+        max_grants_per_did: 16,
+        max_grants_per_principal: 16,
+        max_grant_lifetime_secs: u64::MAX,
+        dead_retention_secs: 0,
+    };
+
+    fn connected(registry: &MuxRegistry, principal: &str) -> Arc<MuxConn> {
         let (tx, _rx) = mpsc::channel(8);
         let conn = Arc::new(MuxConn::new(
             MuxSession::new(principal, "sess", 10),
@@ -304,10 +367,19 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         ));
         registry.insert("sess", &did_hash(principal), conn.clone());
+        conn
+    }
 
-        registry
-            .admit_grants(None, &[grant("g1", "did:example:work", principal)])
-            .await;
+    #[tokio::test]
+    async fn a_grant_stored_while_connected_is_carried_at_once() {
+        let registry = MuxRegistry::default();
+        let store = MemoryStore::new();
+        let principal = "did:example:device";
+        let conn = connected(&registry, principal);
+
+        let g1 = grant("g1", "did:example:work", principal);
+        put(&store, &g1).await;
+        registry.admit_grants(None, &store, &LIMITS, 0, &[g1]).await;
         let member = conn
             .session
             .lock()
@@ -325,25 +397,69 @@ mod tests {
         );
 
         // A replacing grant takes over, so revoking *it* detaches the member.
+        let g2 = grant("g2", "did:example:work", principal);
+        put(&store, &g2).await;
         registry
-            .admit_grants(None, &[grant("g2", "did:example:work", principal)])
+            .admit_grants(None, &store, &LIMITS, 0, std::slice::from_ref(&g2))
             .await;
         registry
-            .detach_grants(
-                None,
-                &[grant("g2", "did:example:work", principal)],
-                LeaveReason::RevokedByMember,
-            )
+            .detach_grants(None, &[g2], LeaveReason::RevokedByMember)
             .await;
         assert!(conn.session.lock().await.is_empty());
 
         // Another principal's grant is not carried here.
+        let g3 = grant("g3", "did:example:home", "did:example:other");
+        put(&store, &g3).await;
+        registry.admit_grants(None, &store, &LIMITS, 0, &[g3]).await;
+        assert!(conn.session.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_grant_the_store_holds_is_carried() {
+        let registry = MuxRegistry::default();
+        let store = MemoryStore::new();
+        let principal = "did:example:device";
+        let conn = connected(&registry, principal);
+        let work = did_hash("did:example:work");
+
+        // Never stored (or already revoked): not carried.
+        let ghost = grant("ghost", "did:example:work", principal);
         registry
-            .admit_grants(
-                None,
-                &[grant("g3", "did:example:home", "did:example:other")],
-            )
+            .admit_grants(None, &store, &LIMITS, 0, &[ghost])
             .await;
+        assert!(conn.session.lock().await.is_empty());
+
+        // Two grants for one DID finish out of order: the newer one is
+        // stored, and the older one's late admission must not displace it.
+        let mut old = grant("old", "did:example:work", principal);
+        old.scope = MuxScope::new([MuxCapability::Receive, MuxCapability::Delete]).unwrap();
+        let new = grant("new", "did:example:work", principal);
+        put(&store, &new).await;
+        registry
+            .admit_grants(None, &store, &LIMITS, 0, &[new])
+            .await;
+        registry
+            .admit_grants(None, &store, &LIMITS, 0, &[old])
+            .await;
+        let member = conn.session.lock().await.get(&work).cloned().unwrap();
+        assert_eq!(
+            member.source,
+            super::super::session::MuxSource::Grant {
+                grant_id: "new".into()
+            }
+        );
+        assert_eq!(
+            member.scope,
+            MuxScope::new([MuxCapability::Receive]).unwrap()
+        );
+
+        // A suspended grant is not carried.
+        let registry = MuxRegistry::default();
+        let conn = connected(&registry, principal);
+        let mut s = grant("sus", "did:example:home", principal);
+        s.state = MuxGrantState::Suspended;
+        put(&store, &s).await;
+        registry.admit_grants(None, &store, &LIMITS, 0, &[s]).await;
         assert!(conn.session.lock().await.is_empty());
     }
 }
