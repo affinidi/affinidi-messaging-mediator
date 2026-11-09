@@ -5,7 +5,9 @@
 //!
 //! - everything about one account, tagged with its DID hash;
 //! - a message's body and metadata, tagged with the message hash;
-//! - the streaming registry, tagged `streaming`.
+//! - the streaming registry, tagged `streaming`;
+//! - every mux record and principal index, tagged `mux`, since one grant
+//!   change updates a record and the indexes of several principals at once.
 //!
 //! Every other key (`GLOBAL`, `KNOWN_DIDS`, `ADMINS`, `MSG_EXPIRY*`,
 //! `FORWARD_Q`, `AUDIT_LOG`, `SESSION:*`, `OOB_INVITES:*`, `V1_KEY:*`, …) is
@@ -125,6 +127,25 @@ impl Keys {
             "GLOBAL_STREAMING"
         }
     }
+
+    /// One member DID's mux record: a hash `{ v: version, r: record JSON }`.
+    pub fn mux_record(self, did_hash: &str) -> String {
+        self.shared("MUX_DID:", "mux", did_hash)
+    }
+
+    /// The member DID hashes a principal holds mux grants on: a sorted set
+    /// (all scores 0, ordered by member), paged with `ZRANGEBYLEX`.
+    pub fn mux_principal(self, principal_hash: &str) -> String {
+        self.shared("MUX_PRINCIPAL:", "mux", principal_hash)
+    }
+
+    fn shared(self, prefix: &str, group: &str, name: &str) -> String {
+        if self.cluster {
+            format!("{prefix}{{{group}}}:{name}")
+        } else {
+            [prefix, name].concat()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +169,8 @@ mod tests {
             keys.msg_meta("m1"),
             keys.streaming_sessions("u1"),
             keys.global_streaming().to_string(),
+            keys.mux_record(H),
+            keys.mux_principal("p1"),
         ]
     }
 
@@ -169,6 +192,8 @@ mod tests {
                 "MSG:META:m1",
                 "STREAMING_SESSIONS:u1",
                 "GLOBAL_STREAMING",
+                "MUX_DID:abc123",
+                "MUX_PRINCIPAL:p1",
             ]
         );
     }
@@ -191,6 +216,8 @@ mod tests {
                 "MSG:META:{m1}",
                 "STREAMING_SESSIONS:{streaming}:u1",
                 "GLOBAL_STREAMING:{streaming}",
+                "MUX_DID:{mux}:abc123",
+                "MUX_PRINCIPAL:{mux}:p1",
             ]
         );
     }
@@ -219,6 +246,11 @@ mod tests {
         assert_eq!(
             slot(&keys.streaming_sessions("u1")),
             slot(keys.global_streaming())
+        );
+        assert_eq!(slot(&keys.mux_record(H)), slot(&keys.mux_principal("p1")));
+        assert_eq!(
+            slot(&keys.mux_principal("p1")),
+            slot(&keys.mux_principal("p2"))
         );
     }
 }

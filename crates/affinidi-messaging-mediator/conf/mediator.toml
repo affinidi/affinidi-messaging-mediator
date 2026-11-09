@@ -155,10 +155,10 @@ database_timeout = "2"
 ### cluster mode refuses a cluster with more than one primary node: only a
 ### single-endpoint cluster such as ElastiCache Serverless is supported.
 ### Limits in cluster mode:
-###   - The shared keys (GLOBAL, MSG_EXPIRY, FORWARD_Q, the streaming registry)
-###     each live in one slot, so throughput tops out at one slot's capacity
-###     (ElastiCache Serverless: 30,000 ECPU/s per slot), however far the
-###     cache itself scales.
+###   - The shared keys (GLOBAL, MSG_EXPIRY, FORWARD_Q, the streaming registry,
+###     the mux grants) each live in one slot, so throughput tops out at one
+###     slot's capacity (ElastiCache Serverless: 30,000 ECPU/s per slot),
+###     however far the cache itself scales.
 ###   - At its data storage maximum, ElastiCache Serverless first evicts keys
 ###     that have a TTL (sessions, OOB invites, outbox receipts) without any
 ###     error; only then do writes fail with error 97 (storage full). Alarm on

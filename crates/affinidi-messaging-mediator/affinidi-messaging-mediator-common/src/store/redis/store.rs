@@ -79,17 +79,6 @@ fn stats_from_hash(fields: HashMap<String, i64>) -> AccountStats {
     stats
 }
 
-/// Hash `{ v: version, r: record JSON }` for one member DID's mux record.
-fn mux_record_key(did_hash: &str) -> String {
-    format!("MUX_DID:{did_hash}")
-}
-
-/// Sorted set (all scores 0, ordered by member) of the member DID hashes a
-/// principal holds grants on; paged with `ZRANGEBYLEX`.
-fn mux_principal_key(principal_hash: &str) -> String {
-    format!("MUX_PRINCIPAL:{principal_hash}")
-}
-
 /// The two field names one counted message touches: the totals and the
 /// per-protocol split. `None` for a direction this store does not keep.
 fn stats_fields(delta: AccountStatsDelta) -> Option<(&'static str, &'static str, String)> {
@@ -1259,7 +1248,7 @@ impl MediatorStore for RedisStore {
     ) -> Result<Option<crate::store::mux::MuxDidRecord>, MediatorError> {
         let mut conn = self.get_connection().await?;
         let raw: Option<String> = redis::cmd("HGET")
-            .arg(mux_record_key(did_hash))
+            .arg(self.keys().mux_record(did_hash))
             .arg("r")
             .query_async(&mut conn)
             .await
@@ -1311,9 +1300,9 @@ impl MediatorStore for RedisStore {
         let new_version = new.map(|r| r.version.to_string()).unwrap_or_default();
 
         let script = redis::Script::new(SCRIPT);
-        let mut inv = script.key(mux_record_key(did_hash));
+        let mut inv = script.key(self.keys().mux_record(did_hash));
         for p in index.add.iter().chain(index.remove.iter()) {
-            inv.key(mux_principal_key(p));
+            inv.key(self.keys().mux_principal(p));
         }
         inv.arg(expected_version.map(|v| v.to_string()).unwrap_or_default())
             .arg(new_version)
@@ -1340,7 +1329,7 @@ impl MediatorStore for RedisStore {
         };
         let mut conn = self.get_connection().await?;
         redis::cmd("ZRANGEBYLEX")
-            .arg(mux_principal_key(principal_hash))
+            .arg(self.keys().mux_principal(principal_hash))
             .arg(min)
             .arg("+")
             .arg("LIMIT")
@@ -1356,7 +1345,7 @@ impl MediatorStore for RedisStore {
     async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
         let mut conn = self.get_connection().await?;
         redis::cmd("ZCARD")
-            .arg(mux_principal_key(principal_hash))
+            .arg(self.keys().mux_principal(principal_hash))
             .query_async(&mut conn)
             .await
             .map_err(|e| {
