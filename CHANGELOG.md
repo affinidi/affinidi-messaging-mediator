@@ -38,6 +38,11 @@ mediator-tui 0.11.0); they are no longer updated.
   attach, the connection. It can also re-check that a stored grant's signing
   key is still the member's current authentication key; a DID that cannot be
   resolved reports "unknown", never "stale" or "fine".
+- `mux::grants`: the transport-free grant operations the protocol handlers
+  will call: store (verify, then member standing and scope within the
+  member's own ACLs, then the unknown-key rule, then the store rules), revoke
+  as principal or member, revoke-all, and key re-validation. Each one returns
+  exactly which grants it changed, so the connection layer can detach them.
 
 ### Added — did:webs
 
