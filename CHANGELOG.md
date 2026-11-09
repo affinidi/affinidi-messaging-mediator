@@ -51,6 +51,12 @@ mediator-tui 0.11.0); they are no longer updated.
   closed for one of its members. Every queued frame now carries the DID it is
   for. Direct-socket behaviour (newest wins, duel damper, redelivery) is
   unchanged and still pinned by the existing tests.
+- `mux::session::MuxSession`: one connection's member set. It admits members
+  by session attach (bound to the connection's nonce) or by stored grant on
+  connect (re-checking each grant's key; a DID that cannot be resolved is not
+  carried), enforces `max_dids_per_connection`, expires and detaches members,
+  and answers whether the connection may receive, pick up, delete or send for
+  a given DID.
 
 ### Added — did:webs
 

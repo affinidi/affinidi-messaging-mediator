@@ -32,6 +32,10 @@ pub enum MuxError {
     MemberBlocked,
     /// The scope asks for something the member's own ACLs do not allow.
     ScopeExceedsAcl(MuxCapability),
+    /// The connection already carries `limits.mux.max_dids_per_connection`.
+    MemberQuota {
+        max: usize,
+    },
 }
 
 impl MuxError {
@@ -43,6 +47,7 @@ impl MuxError {
             MuxError::UnknownMember => "accountUnavailable",
             MuxError::MemberBlocked => "accountUnavailable",
             MuxError::ScopeExceedsAcl(_) => "scopeNotPermitted",
+            MuxError::MemberQuota { .. } => "memberQuota",
         }
     }
 
@@ -51,6 +56,7 @@ impl MuxError {
         matches!(
             self,
             MuxError::Store(MuxStoreError::Contended | MuxStoreError::Store(_))
+                | MuxError::MemberQuota { .. }
         )
     }
 }
@@ -68,6 +74,12 @@ impl std::fmt::Display for MuxError {
                 write!(
                     f,
                     "scope includes {cap:?}, which the member's own ACLs do not allow"
+                )
+            }
+            MuxError::MemberQuota { max } => {
+                write!(
+                    f,
+                    "this connection already carries the maximum of {max} DIDs"
                 )
             }
         }
