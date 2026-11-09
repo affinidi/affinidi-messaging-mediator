@@ -8,6 +8,18 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — did:webs
+
+- The mediator resolves `did:webs`, so a did:webs client can authenticate and
+  a did:webs recipient can be routed to. A did:webs resolves only when its
+  KERI key event log verifies and the published `did.json` matches the
+  verified key state, under the same default host policy as did:web and
+  did:webvh: public hosts only, no redirects, no proxy. Requires
+  `affinidi-did-resolver-cache-sdk` 0.8.47, which does not turn on
+  `serde_json`'s `preserve_order` for the whole build. A mediator configured to
+  resolve through a DID resolver cache server needs one that resolves did:webs
+  (`affinidi-did-resolver-cache-server` 0.9.16).
+
 ### Changed — container send-queue limits
 
 - The published container image now ships `queued_send_messages_soft = 2000`
