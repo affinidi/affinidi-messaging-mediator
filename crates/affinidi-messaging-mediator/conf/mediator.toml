@@ -525,9 +525,15 @@ queued_receive_messages_hard = "1000"
 ### the message TTL expires. Raising a hard limit therefore moves the stream
 ### bound with it automatically; there is no second number to remember.
 ###
-### Residual: an account granted -1 or -2 (unlimited) is not clamped to the
-### hard limit, so no finite bound sits above it and trimming can still reach
-### such an account. That is a property of choosing unlimited.
+### Residual: an account an admin has granted -1 (no limit) is not clamped to
+### the hard limit, so no finite bound sits above it and trimming can still
+### reach such an account. That is a property of choosing unlimited. Only an
+### admin can grant it: an account that self-manages its own limit is refused
+### -1 and may set anything from 0 up to the hard limit — or any value at
+### all when the hard limit is itself -1, there being no ceiling to hold it
+### to. (-2 is not a third limit value but a request to drop the account's
+### override and go back to the mediator default, so it never diverges from
+### the hard limit.)
 
 ### Env: LIMIT_TO_KEYS_PER_DID
 ### Maximum keys per recipient DID (DoS protection).
@@ -637,6 +643,35 @@ oob_invite_ttl = "86400"
 ### lagging costs a live push (the message still lands in the inbox), it does not
 ### lose messages. Costs up to this much RSS.
 # pubsub_buffer = "16777216"
+
+### ─── DID multiplexing ───────────────────────────────────────────────────────
+### One authenticated WebSocket (the "principal") carrying live delivery and
+### pickup for many DIDs, so a client with many DIDs does not need one
+### connection each. Each DID proves it allows this, either per connection or
+### with a stored, signed grant. Design:
+### design-docs/mediator-did-multiplexing-design.md
+###
+### OFF unless enabled here. Absent, empty, or any value other than "true"
+### leaves it off. Needs [streaming] enabled; the mediator refuses to start
+### otherwise. DIDComm clients open a mux connection with the `affinidi-mux`
+### WebSocket subprotocol (raw TSP `tsp-mux` is not served yet).
+### Several instances behind one Redis: a revoke handled by one instance
+### reaches another's connections within 30 s (the member sweep).
+# [limits.mux]
+### Env: LIMIT_MUX_ENABLED
+# enabled = "false"
+### Env: LIMIT_MUX_MAX_DIDS_PER_CONNECTION
+# max_dids_per_connection = "1000"
+### Env: LIMIT_MUX_MAX_GRANTS_PER_PRINCIPAL
+# max_grants_per_principal = "5000"
+### Env: LIMIT_MUX_MAX_GRANTS_PER_DID
+# max_grants_per_did = "16"
+### Env: LIMIT_MUX_MAX_GRANT_LIFETIME_SECS — 30 days
+# max_grant_lifetime_secs = "2592000"
+# max_attach_lifetime_secs = "86400"
+# revalidate_interval_secs = "900"
+# max_channel_slots = "512"
+# dead_retention_secs = "604800"
 
 ### ****************************************************************************************************************************
 ### Forwarding processor configuration

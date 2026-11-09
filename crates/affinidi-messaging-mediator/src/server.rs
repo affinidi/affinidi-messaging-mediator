@@ -835,6 +835,7 @@ pub async fn serve_internal(
         service_start_timestamp: chrono::Utc::now(),
         did_resolver,
         database: store,
+        mux: Default::default(),
         streaming_task,
         #[cfg(feature = "didcomm")]
         discover_features,
@@ -853,6 +854,36 @@ pub async fn serve_internal(
         #[cfg(feature = "didcomm-v1")]
         didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
     };
+
+    // DID multiplexing startup checks. Mux is off unless an operator enables
+    // it (design §5.8); when they do, refuse to start rather than run with a
+    // setting that silently means less than its name (R5.2).
+    if shared_state.config.limits.mux.enabled {
+        if !shared_state.database.supports_mux() {
+            return Err(MediatorError::ConfigError(
+                12,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but the configured storage backend does not \
+                 implement DID multiplexing grants"
+                    .into(),
+            ));
+        }
+        // Members are carried by live delivery; without the streaming task a
+        // mux connection would carry nothing.
+        if shared_state.streaming_task.is_none() {
+            return Err(MediatorError::ConfigError(
+                12,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but live streaming is disabled; DID \
+                 multiplexing needs it"
+                    .into(),
+            ));
+        }
+        info!(
+            "DID multiplexing enabled: DIDComm clients may open mux connections with the \
+             `affinidi-mux` WebSocket subprotocol"
+        );
+    }
 
     // DIDComm v1 startup checks. Both run before the listener binds, so a
     // misconfiguration is a refusal to start rather than traffic the mediator

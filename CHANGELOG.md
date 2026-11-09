@@ -8,6 +8,91 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Added — DID multiplexing grant storage (no behaviour change yet)
+
+- Storage for DID multiplexing grants: a member DID's signed permission for a
+  *principal* connection to collect its messages (design:
+  `design-docs/mediator-did-multiplexing-design.md`). Every grant rule (epoch,
+  replay floor, quotas, narrow-only updates, unknown-key suspension, expiry)
+  lives once, in `affinidi-messaging-mediator-common::store::mux`; the Redis,
+  Fjall and memory backends implement only a versioned compare-and-swap of a
+  per-DID record, so they cannot drift on a rule. Nothing reads or writes
+  grants yet: the protocol and connection handling follow, opt-in, behind
+  `limits.mux.enabled` (off by default).
+- `MediatorStore` gains `supports_mux`, `mux_record_get`, `mux_record_cas`,
+  `mux_principal_dids` and `mux_principal_count`, all defaulted, so a
+  third-party backend keeps compiling and reports mux as unsupported.
+- `[limits.mux]` config (and `LIMIT_MUX_*` env overrides), **off by default**.
+  Only the exact value `"true"` enables it; anything else is off. A mediator
+  with `enabled = "true"` refuses to start on a backend without mux support
+  or with live streaming disabled. With several instances behind one Redis, a
+  revoke handled by one instance reaches another's live connections within
+  one 30-second member sweep (it is immediate on the instance that handled
+  it).
+- Removing an account removes its mux grants on both sides (as a member DID
+  and as a principal), whether or not mux is enabled at the time.
+- `mux::proof::StatementVerifier`: verifies the `MuxGrant` / `MuxAttach`
+  statements a member DID signs to allow a principal to carry its traffic.
+  They use W3C Data Integrity proofs (`eddsa-jcs-2022` / `eddsa-rdfc-2022`),
+  the same format and verifier as Trust Tasks, and only an `authentication`
+  key may sign one. Statements are closed objects (unknown members are
+  refused), bound to the mediator (`audience`), the principal and, for an
+  attach, the connection. It can also re-check that a stored grant's signing
+  key is still the member's current authentication key; a DID that cannot be
+  resolved reports "unknown", never "stale" or "fine".
+- `mux::grants`: the transport-free grant operations the protocol handlers
+  will call: store (verify, then member standing and scope within the
+  member's own ACLs, then the unknown-key rule, then the store rules), revoke
+  as principal or member, revoke-all, and key re-validation. Each one returns
+  exactly which grants it changed, so the connection layer can detach them.
+- The live-delivery streaming task can now carry one DID on a mux
+  connection as well as on its own socket. A DID's own (direct) socket always
+  wins; a mux entry yields to it and waits on standby, is told it is inactive
+  or superseded, and is reactivated (with inbox redelivery, as for any
+  replacement) when the direct socket goes away. A mux connection is never
+  closed for one of its members. Every queued frame now carries the DID it is
+  for. Direct-socket behaviour (newest wins, duel damper, redelivery) is
+  unchanged and still pinned by the existing tests.
+- `mux::session::MuxSession`: one connection's member set. It admits members
+  by session attach (bound to the connection's nonce) or by stored grant on
+  connect (re-checking each grant's key; a DID that cannot be resolved is not
+  carried), enforces `max_dids_per_connection`, expires and detaches members,
+  and answers whether the connection may receive, pick up, delete or send for
+  a given DID.
+- The `messaging/mux/{grant,list,update,revoke,revoke-all}/0.1` Trust Tasks
+  are served (over DIDComm and TSP, through the existing Trust Task core) when
+  `limits.mux.enabled` is on; otherwise they answer
+  `protocol.trust_task.unsupported`. The specs are pinned from trusttasks.org
+  (dtgwg-trust-tasks-tf#1068).
+- DIDComm mux connections. A client opens one by offering the
+  `affinidi-mux` WebSocket subprotocol (provisional name) alongside its
+  bearer token; the mediator echoes it only when mux is enabled. On connect
+  the mediator admits the principal's stored grants, registers each member
+  with live delivery on the one socket, and sends a signed
+  `messaging/mux/event` `ready` (with the attach nonce) and `attached`.
+  `messaging/mux/attach` and `detach` act on the connection they arrive on.
+  Revoke, revoke-all, unknown-key suspension and narrowing reach every live
+  connection carrying the affected DIDs **before** the response is sent, and
+  a frame queued for a member that has since left is dropped, not written.
+  Members expire on their own clocks and grant members' keys are re-checked
+  every `revalidate_interval_secs`. Message pickup (`status-request`,
+  `delivery-request`) and `messages-received` accept a member's DID when its
+  scope includes `pickup` / `delete`.
+
+## 0.51.0 (release/0.51)
+
+### Added — did:webs
+
+- The mediator resolves `did:webs`, so a did:webs client can authenticate and
+  a did:webs recipient can be routed to. A did:webs resolves only when its
+  KERI key event log verifies and the published `did.json` matches the
+  verified key state, under the same default host policy as did:web and
+  did:webvh: public hosts only, no redirects, no proxy. Requires
+  `affinidi-did-resolver-cache-sdk` 0.8.47, which does not turn on
+  `serde_json`'s `preserve_order` for the whole build. A mediator configured to
+  resolve through a DID resolver cache server needs one that resolves did:webs
+  (`affinidi-did-resolver-cache-server` 0.9.16).
+
 ### Changed — container send-queue limits
 
 - The published container image now ships `queued_send_messages_soft = 2000`
@@ -21,6 +106,64 @@ mediator-tui 0.11.0); they are no longer updated.
   because the receive limits bound total storage and the send limits do not;
   `queued_send_messages_per_peer` is unchanged at 50 and remains the gate that
   catches one sender flooding one recipient.
+
+### Fixed
+
+- **A standard account can no longer switch its own queue limit off.**
+  `SELF_MANAGE_SEND_QUEUE_LIMIT` / `SELF_MANAGE_RECEIVE_QUEUE_LIMIT` let an
+  account raise its own limit up to the mediator's hard maximum, enforced by
+  clamping anything larger. `-1` is not a larger number — it is the sentinel
+  for *no limit at all* — so it slid past the clamp and was stored verbatim,
+  after which the account's queue gate never refused it again, whatever its
+  depth. Any deployment whose default ACL grants those flags — AMA's does,
+  through `GLOBAL_DEFAULT_ACL` in `cdk-atlas-lib`; this repo's shipped
+  `global_acl_default` does not — made one `messaging/account/update/0.1`
+  enough, with no admin and no redeploy. **Behaviour change (R3.6):** a
+  standard account requesting `-1` (or any negative other than `-2`) for either
+  queue limit now gets an `authorization.queue_limit.admin_required` problem
+  report and a 403 instead of a success; a request it is allowed to make is
+  unaffected, and values above the hard limit are still clamped rather than
+  refused. An admin still sets `-1` deliberately, and `-2` still resets the
+  account to the mediator default for standard accounts and admins alike.
+  The `queue_stream_maxlen` doc comment in `limits.rs` described `-2` as
+  unlimited; it is a reset, and now says so.
+
+- **A self-managed queue limit is no longer clamped against an unbounded hard
+  limit.** When the mediator is configured with `queued_send_messages_hard` or
+  `queued_receive_messages_hard` of `-1` (not bounded), the clamp compared
+  against it as a number: `500 > -1` holds, so a standard account asking to be
+  held to 500 was stored as `-1` instead and ended up with no limit at all —
+  reaching the state above by asking for something *tighter*. A negative hard
+  limit is now read as "no ceiling" and the request stands, as
+  `queue_stream_maxlen` already reads one. (`queue_at_capacity` and
+  `validate_peer_queue_limit` test for `-1` exactly, and are unbounded on any
+  other negative only through the unsigned cast — the accident this change
+  closes on the write path, not prior art to copy.) An unbounded mediator
+  still does not hand out its own exemption: `-1` from a standard account is
+  refused either way.
+
+- **A queue limit the account may not self-manage is now refused, not silently
+  dropped.** `account/update` ignored a `send_queue_limit` / `receive_queue_limit`
+  from an account without the matching `SELF_MANAGE_*` flag and answered 200 with
+  the account echoed, so the caller read the unchanged old value as the value it
+  had just set. It now gets an `authorization.queue_limit.not_self_manageable`
+  problem report and a 403, as `acl` already did for a capability the account may
+  not change.
+
+- **The two self-or-admin members of `account/update` now agree on who an admin
+  is.** The `acl` member tested `Admin | RootAdmin`, the queue limits tested
+  "anything that is not `Standard`", so an account whose type did not decode
+  (`AccountType::Unknown`) was gated on one member and waved through on the other.
+  Both now use the handler's own `is_admin`.
+
+- **`account/update` no longer applies part of a refused request.** The handler
+  guards every member before applying any of them, so that a member the caller
+  may not set refuses the whole update; the queue-limit check above was added
+  at the write instead, one step inside the apply phase. A single request
+  carrying both an `acl` member and an unlimited queue limit therefore stored
+  and audited the ACL change and then returned 403, leaving the account
+  half-updated with no response document to say which half landed. The check
+  now runs with the other guards, before the first write.
 
 ## 0.50.0 (release/0.50)
 

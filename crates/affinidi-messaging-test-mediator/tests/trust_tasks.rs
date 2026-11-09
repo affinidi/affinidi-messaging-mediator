@@ -121,8 +121,7 @@ async fn account_update_queue_limits_self_applies_caps_and_persists() {
         .await
         .expect("enable websocket for alice");
 
-    // Alice self-manages her queue limits (allow_all). A normal value is applied;
-    // `-1` means unlimited.
+    // Alice self-manages her queue limits (allow_all), so ordinary values apply.
     let updated = env
         .atm
         .trust_tasks()
@@ -134,7 +133,7 @@ async fn account_update_queue_limits_self_applies_caps_and_persists() {
             Some(
                 QueueLimits::builder()
                     .send_queue_limit(Some(42))
-                    .receive_queue_limit(Some(-1))
+                    .receive_queue_limit(Some(99))
                     .try_into()
                     .expect("QueueLimits has no required member"),
             ),
@@ -143,7 +142,45 @@ async fn account_update_queue_limits_self_applies_caps_and_persists() {
         .expect("alice changes her own queue limits");
     let q = updated.queue_limits.expect("queue limits present");
     assert_eq!(q.send_queue_limit, Some(42));
-    assert_eq!(q.receive_queue_limit, Some(-1));
+    assert_eq!(q.receive_queue_limit, Some(99));
+
+    // But she may not switch a limit off. `-1` (unlimited) is admin-only: it is
+    // below every maximum, so it would slip past the cap applied below and leave
+    // her queue gate inert. This asserted the opposite until FTL-31106 — the
+    // whole bug was that it passed.
+    let refused = env
+        .atm
+        .trust_tasks()
+        .account_update(
+            &alice.profile,
+            None,
+            None,
+            None,
+            Some(
+                QueueLimits::builder()
+                    .receive_queue_limit(Some(-1))
+                    .try_into()
+                    .expect("QueueLimits has no required member"),
+            ),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a standard account must not set its own queue limit to unlimited"
+    );
+
+    // Refused means refused: the earlier value still stands.
+    let after = env
+        .atm
+        .trust_tasks()
+        .account_get(&alice.profile, None)
+        .await
+        .expect("re-read alice's account after the refusal");
+    assert_eq!(
+        after.queue_limits.and_then(|q| q.receive_queue_limit),
+        Some(99),
+        "a refused update must not have changed the stored limit"
+    );
 
     // Persisted across a fresh read.
     let account = env
@@ -282,6 +319,76 @@ async fn acl_get_self_returns_the_decoded_acl() {
     // add_user grants allow_all → the decoded flags reflect it.
     assert_eq!(page.entries[0].acl.send_messages, Some(true));
     assert_eq!(page.entries[0].acl.receive_messages, Some(true));
+}
+
+#[tokio::test]
+async fn account_update_refuses_the_whole_update_when_a_queue_limit_is_refused() {
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::{
+        MediatorAcl, QueueLimits,
+    };
+
+    // `account/update` carries several members and applies them in order —
+    // capabilities, then queue limits, then the role. A member the caller may not
+    // set has to be caught *before* any of them is written, or a refused request
+    // leaves the account half-updated and audited that way, with no response
+    // document to tell the caller which half landed.
+    let env = TestEnvironment::spawn()
+        .await
+        .expect("spawn test environment");
+
+    let alice = env.add_user("alice").await.expect("add alice");
+    env.atm
+        .profile_add(&alice.profile, true)
+        .await
+        .expect("enable websocket for alice");
+
+    // `anon_receive` starts true (allow_all) and alice may self-manage it.
+    let before = env
+        .atm
+        .trust_tasks()
+        .account_get(&alice.profile, None)
+        .await
+        .expect("read alice's account");
+    assert_eq!(before.acl.anon_receive, Some(true));
+
+    // One request: a capability she may change, and a limit she may not.
+    let acl: MediatorAcl = MediatorAcl::builder()
+        .anon_receive(Some(false))
+        .try_into()
+        .expect("MediatorAcl has no required member");
+    let refused = env
+        .atm
+        .trust_tasks()
+        .account_update(
+            &alice.profile,
+            None,
+            None,
+            Some(acl),
+            Some(
+                QueueLimits::builder()
+                    .send_queue_limit(Some(-1))
+                    .try_into()
+                    .expect("QueueLimits has no required member"),
+            ),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the unlimited queue limit must be refused"
+    );
+
+    // The capability must be untouched: all of the update, or none of it.
+    let after = env
+        .atm
+        .trust_tasks()
+        .account_get(&alice.profile, None)
+        .await
+        .expect("re-read alice's account");
+    assert_eq!(
+        after.acl.anon_receive,
+        Some(true),
+        "a refused update must not have applied its ACL member"
+    );
 }
 
 #[tokio::test]

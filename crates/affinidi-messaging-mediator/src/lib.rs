@@ -34,6 +34,8 @@ pub mod didcomm_v1_identity;
 pub mod handlers;
 pub mod messages;
 pub mod monitor;
+/// DID multiplexing: one connection carrying many DIDs.
+pub mod mux;
 pub mod scid_sources;
 pub mod server;
 pub mod store;
@@ -92,6 +94,9 @@ pub struct SharedData {
     pub database: Arc<dyn MediatorStore>,
     /// Optional background task handle for WebSocket streaming.
     pub streaming_task: Option<StreamingTask>,
+    /// Live DID-multiplexing connections on this instance (empty unless
+    /// `limits.mux.enabled`).
+    pub mux: Arc<mux::registry::MuxRegistry>,
     /// DIDComm Discover Features protocol handler.
     #[cfg(feature = "didcomm")]
     pub discover_features: Arc<DiscoverFeatures>,

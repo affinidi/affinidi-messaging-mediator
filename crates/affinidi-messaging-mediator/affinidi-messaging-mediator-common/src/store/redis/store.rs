@@ -79,6 +79,17 @@ fn stats_from_hash(fields: HashMap<String, i64>) -> AccountStats {
     stats
 }
 
+/// Hash `{ v: version, r: record JSON }` for one member DID's mux record.
+fn mux_record_key(did_hash: &str) -> String {
+    format!("MUX_DID:{did_hash}")
+}
+
+/// Sorted set (all scores 0, ordered by member) of the member DID hashes a
+/// principal holds grants on; paged with `ZRANGEBYLEX`.
+fn mux_principal_key(principal_hash: &str) -> String {
+    format!("MUX_PRINCIPAL:{principal_hash}")
+}
+
 /// The two field names one counted message touches: the totals and the
 /// per-protocol split. `None` for a direction this store does not keep.
 fn stats_fields(delta: AccountStatsDelta) -> Option<(&'static str, &'static str, String)> {
@@ -1234,6 +1245,123 @@ impl MediatorStore for RedisStore {
 
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         self.account_exists(did_hash).await
+    }
+
+    // ─── DID multiplexing ────────────────────────────────────────────────────
+
+    fn supports_mux(&self) -> bool {
+        true
+    }
+
+    async fn mux_record_get(
+        &self,
+        did_hash: &str,
+    ) -> Result<Option<crate::store::mux::MuxDidRecord>, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let raw: Option<String> = redis::cmd("HGET")
+            .arg(mux_record_key(did_hash))
+            .arg("r")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("mux_record_get: {e}"))
+            })?;
+        raw.map(|r| {
+            serde_json::from_str(&r).map_err(|e| {
+                MediatorError::InternalError(14, "NA".into(), format!("mux record decode: {e}"))
+            })
+        })
+        .transpose()
+    }
+
+    async fn mux_record_cas(
+        &self,
+        did_hash: &str,
+        expected_version: Option<u64>,
+        new: Option<&crate::store::mux::MuxDidRecord>,
+        index: &crate::store::mux::MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        // One script, so the version check, the record write and every
+        // principal-index update happen as a single atomic step on the server
+        // — and on every mediator instance sharing this Redis.
+        //
+        // KEYS[1] = record; KEYS[2 .. 1+n_add] = indexes to add to;
+        // the rest = indexes to remove from.
+        // ARGV = expected version ('' = must not exist), new version,
+        // record JSON ('' = delete), n_add, member did_hash.
+        const SCRIPT: &str = "\
+            local cur = redis.call('HGET', KEYS[1], 'v') \
+            if cur == false then cur = '' end \
+            if cur ~= ARGV[1] then return 0 end \
+            if ARGV[3] == '' then redis.call('DEL', KEYS[1]) \
+            else redis.call('HSET', KEYS[1], 'v', ARGV[2], 'r', ARGV[3]) end \
+            local n_add = tonumber(ARGV[4]) \
+            for i = 2, #KEYS do \
+              if i <= 1 + n_add then redis.call('ZADD', KEYS[i], 0, ARGV[5]) \
+              else redis.call('ZREM', KEYS[i], ARGV[5]) end \
+            end \
+            return 1";
+
+        let record = match new {
+            Some(rec) => serde_json::to_string(rec).map_err(|e| {
+                MediatorError::InternalError(14, "NA".into(), format!("mux record encode: {e}"))
+            })?,
+            None => String::new(),
+        };
+        let new_version = new.map(|r| r.version.to_string()).unwrap_or_default();
+
+        let script = redis::Script::new(SCRIPT);
+        let mut inv = script.key(mux_record_key(did_hash));
+        for p in index.add.iter().chain(index.remove.iter()) {
+            inv.key(mux_principal_key(p));
+        }
+        inv.arg(expected_version.map(|v| v.to_string()).unwrap_or_default())
+            .arg(new_version)
+            .arg(record)
+            .arg(index.add.len())
+            .arg(did_hash);
+
+        let mut conn = self.get_connection().await?;
+        let won: i64 = inv.invoke_async(&mut conn).await.map_err(|e| {
+            MediatorError::DatabaseError(14, "NA".into(), format!("mux_record_cas: {e}"))
+        })?;
+        Ok(won == 1)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let min = match after {
+            Some(a) => format!("({a}"),
+            None => "-".to_string(),
+        };
+        let mut conn = self.get_connection().await?;
+        redis::cmd("ZRANGEBYLEX")
+            .arg(mux_principal_key(principal_hash))
+            .arg(min)
+            .arg("+")
+            .arg("LIMIT")
+            .arg(0)
+            .arg(limit)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("mux_principal_dids: {e}"))
+            })
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("ZCARD")
+            .arg(mux_principal_key(principal_hash))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("mux_principal_count: {e}"))
+            })
     }
 
     // ─── DIDComm v1 routing keys ─────────────────────────────────────────────
