@@ -220,16 +220,38 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     // Messages for each member arrive on the principal's socket.
     send(&env, &sender, &work, "for work").await;
     send(&env, &sender, &home, "for home").await;
-    let mut got = vec![
-        recipients(&next_text().await),
-        recipients(&next_text().await),
-    ];
+    let frames = [next_text().await, next_text().await];
+    let mut got = vec![recipients(&frames[0]), recipients(&frames[1])];
     got.sort();
     assert_eq!(got, {
         let mut e = vec![vec![work.did.clone()], vec![home.did.clone()]];
         e.sort();
         e
     });
+
+    // The principal acknowledges both over REST with the same session token:
+    // members' messages are deletable because their grants include `delete`.
+    let ids: Vec<String> = frames.iter().map(sha256::digest).collect();
+    let resp: Value = reqwest::Client::new()
+        .delete(env.mediator.endpoint().join("delete").unwrap())
+        .bearer_auth(&tokens.access_token)
+        .json(&json!({ "message_ids": ids }))
+        .send()
+        .await
+        .expect("delete request")
+        .json()
+        .await
+        .expect("delete response");
+    let mut deleted: Vec<String> = resp["data"]["success"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected delete response: {resp:#}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    deleted.sort();
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(deleted, want, "both members' messages deleted: {resp:#}");
 
     // A DID that granted nothing is not carried.
     let stranger = env.add_user("stranger").await.unwrap();

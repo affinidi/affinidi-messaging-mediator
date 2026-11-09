@@ -15,6 +15,11 @@ mediator-tui 0.11.0); they are no longer updated.
   requires. It was 32 alphanumeric characters, which a client parsing the
   event with the generated bindings refused. The end-to-end test now checks
   every mux event against the spec's generated type.
+- `DELETE /delete` on a mux connection's session now deletes a member's
+  messages when the member's grant or attach includes `delete`, as
+  `messages-received` already did. The SDK acknowledges live-stream messages
+  this way (`auto_delete`), so before this a principal could receive a
+  member's message but never acknowledge it, and it was redelivered.
 
 ### Added — DID multiplexing grant storage (no behaviour change yet)
 
