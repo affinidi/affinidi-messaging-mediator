@@ -263,6 +263,7 @@ impl StatementVerifier {
             state: MuxGrantState::Active,
             state_changed_at: None,
             statement: raw.clone(),
+            noticed: false,
         })
     }
 

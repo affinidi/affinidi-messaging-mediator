@@ -531,11 +531,33 @@ impl TestEnvironment {
         alias: &str,
         services: Option<Vec<PeerService>>,
     ) -> Result<TestUser, TestEnvironmentError> {
+        self.add_user_with_keys(alias, services, 1).await
+    }
+
+    /// Add a user whose DID has `signing_keys` Ed25519 authentication keys
+    /// (`#key-1` … `#key-N`) and one X25519 key-agreement key after them.
+    /// Otherwise identical to [`add_user`](Self::add_user).
+    ///
+    /// For tests that need one DID to prove control with different keys,
+    /// such as the mux unknown-key rule.
+    pub async fn add_multi_key_user(
+        &self,
+        alias: &str,
+        signing_keys: usize,
+    ) -> Result<TestUser, TestEnvironmentError> {
+        self.add_user_with_keys(alias, None, signing_keys.max(1))
+            .await
+    }
+
+    async fn add_user_with_keys(
+        &self,
+        alias: &str,
+        services: Option<Vec<PeerService>>,
+        signing_keys: usize,
+    ) -> Result<TestUser, TestEnvironmentError> {
         let mediator_did = self.mediator.did().to_string();
-        let keys = vec![
-            (PeerKeyRole::Verification, KeyType::Ed25519),
-            (PeerKeyRole::Encryption, KeyType::X25519),
-        ];
+        let mut keys = vec![(PeerKeyRole::Verification, KeyType::Ed25519); signing_keys];
+        keys.push((PeerKeyRole::Encryption, KeyType::X25519));
         let generated = match services {
             Some(services) => DID::generate_did_peer_with_services(keys, Some(services)),
             None => DID::generate_did_peer(keys, Some(mediator_did.clone())),

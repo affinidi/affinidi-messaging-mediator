@@ -1211,7 +1211,7 @@ async fn consume_account_remove(
     // loudly because the grants then outlive the account (R6.3).
     if removed && state.database.supports_mux() {
         let limits = state.config.limits.mux.store_limits();
-        if let Err(e) = affinidi_messaging_mediator_common::store::mux::remove_account(
+        match affinidi_messaging_mediator_common::store::mux::remove_account(
             &*state.database,
             &target_hash,
             &limits,
@@ -1219,10 +1219,29 @@ async fn consume_account_remove(
         )
         .await
         {
-            tracing::error!(
+            // Principals carrying the removed DID drop it now and are told.
+            Ok(as_member) if !as_member.is_empty() => {
+                use crate::mux::session::LeaveReason;
+                state
+                    .mux
+                    .detach_grants(
+                        state.streaming_task.as_ref(),
+                        &as_member,
+                        LeaveReason::AccountRemoved,
+                    )
+                    .await;
+                let changed = crate::mux::tasks::Changed {
+                    removed: as_member,
+                    reason: Some(LeaveReason::AccountRemoved),
+                    ..Default::default()
+                };
+                crate::mux::notice::after_change(state, &changed).await;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(
                 did_hash = %target_hash,
                 "account removed, but its DID multiplexing grants could not be: {e}"
-            );
+            ),
         }
     }
     record_audit(
@@ -2369,6 +2388,9 @@ async fn consume_mux(
             .admit_grants(streaming, ctx.store, &ctx.limits, ctx.now, &changed.stored)
             .await;
     }
+    // Durable notices for what this task suspended or revoked: only now,
+    // once the change is committed and its members detached (spec rule 2).
+    crate::mux::notice::after_change(state, &changed).await;
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,

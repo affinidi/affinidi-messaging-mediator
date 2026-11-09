@@ -152,6 +152,9 @@ pub async fn open(
             (Vec::new(), Vec::new())
         }
     };
+    // Notices owed from before a crash first, so the count includes them.
+    super::notice::recover(state, &session.did_hash).await;
+    let pending_notices = super::notice::pending(state, &session.did_hash).await;
     let nonce = mux.nonce.clone();
     let conn = Arc::new(MuxConn::new(mux, tx, resync));
     if let Some(streaming) = &state.streaming_task {
@@ -172,7 +175,7 @@ pub async fn open(
         "maxGrantLifetimeSeconds": limits.max_grant_lifetime_secs,
         "maxAttachLifetimeSeconds": limits.max_attach_lifetime_secs,
         "sessionExpiresAt": rfc3339(session.expires_at),
-        "pendingNotices": 0,
+        "pendingNotices": pending_notices,
     });
     frames.extend(pack_event(state, &session.did, ready).await);
     if !admitted.is_empty() {

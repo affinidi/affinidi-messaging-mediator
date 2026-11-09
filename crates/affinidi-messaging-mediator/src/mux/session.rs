@@ -65,6 +65,7 @@ pub enum LeaveReason {
     SuspendedUnknownKey,
     KeyRotated,
     AccountBlocked,
+    AccountRemoved,
     ResolutionFailed,
 }
 
@@ -79,6 +80,7 @@ impl LeaveReason {
             LeaveReason::SuspendedUnknownKey => "suspendedUnknownKey",
             LeaveReason::KeyRotated => "keyRotated",
             LeaveReason::AccountBlocked => "accountBlocked",
+            LeaveReason::AccountRemoved => "accountRemoved",
             LeaveReason::ResolutionFailed => "resolutionFailed",
         }
     }

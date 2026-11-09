@@ -407,6 +407,17 @@ pub async fn authentication_response(
             .authenticated(&state, &session.did_hash)
             .await;
 
+        // A member DID that authenticated directly learns, once per change of
+        // its grants, that delegations of it exist (`messaging/mux/notice`
+        // `grantsPresent`). In the background: login does not wait on it.
+        if state.config.limits.mux.enabled && state.database.supports_mux() {
+            let (state, did, did_hash) =
+                (state.clone(), session.did.clone(), session.did_hash.clone());
+            tokio::spawn(async move {
+                crate::mux::notice::on_direct_auth(&state, &did, &did_hash).await;
+            });
+        }
+
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);
         info!("Authentication successful for {}", session.did);
 

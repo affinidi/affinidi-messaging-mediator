@@ -160,6 +160,16 @@ pub struct MuxGrant {
     /// The grant statement exactly as the member signed it (with its Data
     /// Integrity proof), kept for audit and returned verbatim by listings.
     pub statement: serde_json::Value,
+    /// Whether the durable notice for this grant's dead state (`suspended`
+    /// or `epochRevoked`) is in its principal's inbox. A notice lost to a
+    /// crash between the state change and the notice is re-sent while this
+    /// is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub noticed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl MuxGrant {
@@ -216,7 +226,21 @@ pub struct MuxDidRecord {
     pub grants: Vec<MuxGrant>,
     #[serde(default)]
     pub replay_floors: Vec<MuxReplayFloor>,
+    /// Ids of `messaging/mux/notice` messages stored in this DID's own inbox
+    /// (as a principal, or as a member for `grantsPresent`), newest last, so
+    /// a `ready` event can say how many still wait. Bounded by
+    /// [`MAX_TRACKED_NOTICES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// The grant set ([`MuxDidRecord::grants_digest`]) this DID was last told
+    /// about in a `grantsPresent` notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_told: Option<String>,
 }
+
+/// The most notice ids a record tracks; older ones are forgotten (the notices
+/// themselves stay in the inbox until deleted).
+pub const MAX_TRACKED_NOTICES: usize = 256;
 
 impl MuxDidRecord {
     /// Principals that currently have an entry (in any state) for this DID —
@@ -231,7 +255,40 @@ impl MuxDidRecord {
     /// Whether the record holds nothing worth keeping. An epoch above zero is
     /// worth keeping: dropping it would bring back grants it voided.
     fn is_empty(&self) -> bool {
-        self.epoch == 0 && self.grants.is_empty() && self.replay_floors.is_empty()
+        self.epoch == 0
+            && self.grants.is_empty()
+            && self.replay_floors.is_empty()
+            && self.notices.is_empty()
+            && self.present_told.is_none()
+    }
+
+    /// Remember a notice stored in this DID's inbox.
+    pub fn track_notice(&mut self, msg_id: String) {
+        self.notices.push(msg_id);
+        let over = self.notices.len().saturating_sub(MAX_TRACKED_NOTICES);
+        self.notices.drain(..over);
+    }
+
+    /// A digest of the grant set on this DID (ids and states), so a
+    /// `grantsPresent` notice is sent once per change rather than on every
+    /// authentication.
+    pub fn grants_digest(&self, now: u64) -> String {
+        let mut entries: Vec<String> = self
+            .grants
+            .iter()
+            .map(|g| format!("{}:{:?}", g.grant_id, g.state_at(now)))
+            .collect();
+        entries.sort();
+        sha256::digest(format!("{}|{}", self.epoch, entries.join(",")))
+    }
+
+    /// Mark these grants' dead-state notices as stored.
+    pub fn mark_noticed(&mut self, grant_ids: &HashSet<String>) {
+        for g in self.grants.iter_mut() {
+            if grant_ids.contains(&g.grant_id) {
+                g.noticed = true;
+            }
+        }
     }
 
     fn floor_for(&self, principal_hash: &str) -> Option<u64> {
@@ -625,12 +682,18 @@ pub async fn grants_for_principal<S: MediatorStore + ?Sized>(
 
 /// Remove everything mux holds about an account being removed, both as a
 /// member DID and as a principal.
+///
+/// Returns the grants that were usable on the account as a member DID: their
+/// principals are detached from it and told (`grantsRevoked`,
+/// `accountRemoved`). Grants the account held as a principal need no notice:
+/// the account and its inbox are gone.
 pub async fn remove_account<S: MediatorStore + ?Sized>(
     store: &S,
     did_hash: &str,
     limits: &MuxLimits,
     now: u64,
-) -> Result<(), MuxStoreError> {
+) -> Result<Vec<MuxGrant>, MuxStoreError> {
+    let mut as_member = Vec::new();
     // As a member: the whole record goes, and with it every principal's index
     // entry for it. The epoch goes too — the account itself is gone, and a
     // re-created account starts from nothing.
@@ -646,6 +709,11 @@ pub async fn remove_account<S: MediatorStore + ?Sized>(
             .mux_record_cas(did_hash, Some(rec.version), None, &delta)
             .await?
         {
+            as_member = rec
+                .grants
+                .into_iter()
+                .filter(|g| g.is_usable(now))
+                .collect();
             break;
         }
     }
@@ -671,7 +739,7 @@ pub async fn remove_account<S: MediatorStore + ?Sized>(
             .await?;
         }
     }
-    Ok(())
+    Ok(as_member)
 }
 
 #[cfg(test)]
@@ -703,6 +771,7 @@ mod tests {
             state: MuxGrantState::Active,
             state_changed_at: None,
             statement: serde_json::json!({}),
+            noticed: false,
         }
     }
 

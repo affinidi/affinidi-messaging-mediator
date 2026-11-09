@@ -1480,6 +1480,7 @@ fn mux_grant(
         state: mux::MuxGrantState::Active,
         state_changed_at: None,
         statement: serde_json::json!({}),
+        noticed: false,
     }
 }
 
