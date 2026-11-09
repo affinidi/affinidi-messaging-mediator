@@ -26,11 +26,12 @@ mediator-tui 0.11.0); they are no longer updated.
   device that granted a new DID had to reconnect before that DID's messages
   arrived. A grant that replaces an earlier one takes over its member, so
   revoking the new grant detaches it.
-  Before it carries a grant, the mediator re-reads the member's record and
-  carries only a grant that is still stored and active, so a grant replaced
-  or revoked in the meantime, or two grants finishing out of order, cannot
-  leave the connection on the wrong scope. A grant the connection has no
-  room for is logged at `warn` and carried on the next connection.
+  The mediator re-reads the member's record before and after it carries a
+  grant, without holding the connection's lock across the read, and never
+  lets an older grant displace a newer one. So a grant replaced or revoked
+  in the meantime, or two grants finishing out of order, cannot leave the
+  connection on the wrong scope. A grant the connection has no room for is
+  logged at `warn` and carried on the next connection.
 
 ### Added — DID multiplexing grant storage (no behaviour change yet)
 

@@ -227,19 +227,23 @@ impl MuxRegistry {
     /// Carry the members of newly stored grants on every live connection of
     /// their principal, at once (design §4.4).
     ///
-    /// The store, not the order handlers finish in, decides what is carried:
-    /// each grant is re-read under the connection's session lock and admitted
-    /// only if it is still on its member's record and active. A grant that
-    /// was replaced or revoked after this handler stored it is skipped; a
-    /// concurrent handler admitting the newer grant either ran first (so this
-    /// read sees it) or waits for the lock and overwrites this one. A grant
-    /// whose record cannot be read is not carried (fail closed); the
-    /// principal's next connection carries it.
+    /// The store, not the order handlers finish in, decides what is carried,
+    /// and no lock is held across a store read (R1.3):
+    ///
+    /// 1. The grant is re-read; one already replaced, revoked or suspended is
+    ///    not carried. A record that cannot be read is not carried either
+    ///    (fail closed); the principal's next connection carries the grant.
+    /// 2. It is admitted under the session lock, unless a newer grant
+    ///    already carries the member (the store keeps only the newest, by
+    ///    `iat`), so out-of-order admissions settle on the newest grant.
+    /// 3. It is re-read once more. If it was revoked meanwhile, it is
+    ///    detached here; otherwise the revoke's own detach, which follows
+    ///    its store write, runs after this admission and finds it.
     ///
     /// A grant that replaces the principal's earlier grant on the same DID
-    /// replaces the member's scope and expiry outright, wider or narrower:
-    /// it is a new statement signed by the member DID, verified like any
-    /// other (`grants::store_grant`), so a wider scope is the member's own
+    /// sets the member's scope and expiry outright, wider or narrower: it is
+    /// a new statement signed by the member DID and verified like any other
+    /// (`grants::store_grant`), so a wider scope is the member's own
     /// authorisation.
     pub async fn admit_grants(
         &self,
@@ -250,43 +254,40 @@ impl MuxRegistry {
         grants: &[MuxGrant],
     ) {
         for g in grants {
-            for conn in self.for_principal(&g.principal_hash) {
-                let mut session = conn.session.lock().await;
-                let current = match mux::load(store, &g.did_hash, limits, now).await {
-                    Ok(rec) => rec.grants.into_iter().find(|s| {
-                        s.grant_id == g.grant_id
-                            && s.principal_hash == g.principal_hash
-                            && matches!(s.state_at(now), MuxGrantState::Active)
-                    }),
-                    Err(e) => {
-                        warn!(principal = %g.principal_hash, grant = %g.grant_id, "grant not carried live, store unreadable: {e}");
-                        None
-                    }
-                };
-                let Some(current) = current else {
+            if self.for_principal(&g.principal_hash).is_empty() {
+                continue;
+            }
+            let current = match current_grant(store, g, limits, now).await {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(principal = %g.principal_hash, grant = %g.grant_id, "grant not carried live, store unreadable: {e}");
                     continue;
-                };
-                let member = MuxMember {
-                    did: current.did.clone(),
-                    did_hash: current.did_hash.clone(),
-                    source: super::session::MuxSource::Grant {
-                        grant_id: current.grant_id.clone(),
-                    },
-                    scope: current.effective_scope().clone(),
-                    kid: current.kid.clone(),
-                    key_fp: current.key_fp.clone(),
-                    expires_at: current.effective_exp(),
-                };
-                let admitted = session.admit_grant(member);
-                drop(session);
+                }
+            };
+            let member = MuxMember {
+                did: current.did.clone(),
+                did_hash: current.did_hash.clone(),
+                source: super::session::MuxSource::Grant {
+                    grant_id: current.grant_id.clone(),
+                },
+                scope: current.effective_scope().clone(),
+                kid: current.kid.clone(),
+                key_fp: current.key_fp.clone(),
+                expires_at: current.effective_exp(),
+                grant_iat: current.iat,
+            };
+            for conn in self.for_principal(&g.principal_hash) {
+                let admitted = conn.session.lock().await.admit_grant(member.clone());
                 match admitted {
-                    Ok((member, new)) => {
+                    Ok(Some((member, new))) => {
                         if new && let Some(streaming) = streaming {
                             conn.register_member(streaming, &member).await;
                         }
                         conn.joined.lock().await.push(member);
                         conn.notify.notify_one();
                     }
+                    Ok(None) => {}
                     // The connection is full. The grant stays stored and is
                     // carried by a connection with room, or after a
                     // reconnect; the client sees `stored` with no `attached`
@@ -297,6 +298,18 @@ impl MuxRegistry {
                         "stored grant not carried live: {e}"
                     ),
                 }
+            }
+            // Step 3. Fail closed on an unreadable record too.
+            if !matches!(
+                current_grant(store, &current, limits, now).await,
+                Ok(Some(_))
+            ) {
+                self.detach_grants(
+                    streaming,
+                    std::slice::from_ref(&current),
+                    LeaveReason::RevokedByMember,
+                )
+                .await;
             }
         }
     }
@@ -310,6 +323,21 @@ impl MuxRegistry {
             }
         }
     }
+}
+
+/// `g` as its member's record holds it now, if it is still there and active.
+async fn current_grant(
+    store: &dyn MediatorStore,
+    g: &MuxGrant,
+    limits: &MuxLimits,
+    now: u64,
+) -> Result<Option<MuxGrant>, mux::MuxStoreError> {
+    let rec = mux::load(store, &g.did_hash, limits, now).await?;
+    Ok(rec.grants.into_iter().find(|s| {
+        s.grant_id == g.grant_id
+            && s.principal_hash == g.principal_hash
+            && matches!(s.state_at(now), MuxGrantState::Active)
+    }))
 }
 
 #[cfg(all(test, feature = "memory-backend"))]
@@ -461,5 +489,41 @@ mod tests {
         put(&store, &s).await;
         registry.admit_grants(None, &store, &LIMITS, 0, &[s]).await;
         assert!(conn.session.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_late_admission_of_an_older_grant_does_not_displace_a_newer_one() {
+        let registry = MuxRegistry::default();
+        let principal = "did:example:device";
+        let conn = connected(&registry, principal);
+        let member = |id: &str, iat: u64, scope: MuxScope| MuxMember {
+            did: "did:example:work".into(),
+            did_hash: did_hash("did:example:work"),
+            source: super::super::session::MuxSource::Grant {
+                grant_id: id.into(),
+            },
+            scope,
+            kid: "did:example:work#key-1".into(),
+            key_fp: "fp".into(),
+            expires_at: u64::MAX / 2,
+            grant_iat: iat,
+        };
+        let narrow = MuxScope::new([MuxCapability::Receive]).unwrap();
+        let wide = MuxScope::new([MuxCapability::Receive, MuxCapability::Delete]).unwrap();
+        let mut s = conn.session.lock().await;
+        assert!(
+            s.admit_grant(member("new", 2, narrow.clone()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(s.admit_grant(member("old", 1, wide)).unwrap().is_none());
+        assert!(
+            s.admit_grant(member("new", 2, narrow.clone()))
+                .unwrap()
+                .is_none()
+        );
+        let m = s.get(&did_hash("did:example:work")).unwrap();
+        assert_eq!(m.scope, narrow);
+        assert_eq!(m.grant_iat, 2);
     }
 }

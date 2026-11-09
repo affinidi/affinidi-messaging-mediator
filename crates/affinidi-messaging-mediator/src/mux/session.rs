@@ -47,6 +47,10 @@ pub struct MuxMember {
     pub kid: String,
     pub key_fp: String,
     pub expires_at: u64,
+    /// The admitting grant's `iat` (0 for an attach). The store keeps only a
+    /// principal's newest grant on a DID, so a live admission never replaces
+    /// a member carried by a newer grant, whatever order they finish in.
+    pub grant_iat: u64,
 }
 
 /// Why a member left, or was never admitted. The wire names are the spec's
@@ -239,6 +243,7 @@ impl MuxSession {
                     kid: grant.kid.clone(),
                     key_fp: grant.key_fp.clone(),
                     expires_at: grant.effective_exp(),
+                    grant_iat: grant.iat,
                 };
                 let member = match self.members.remove(&grant.did_hash) {
                     Some(existing) => merge(existing, member),
@@ -256,19 +261,32 @@ impl MuxSession {
     }
 
     /// Admit a member carried by a stored grant, while connected. A member
-    /// already carried by an earlier grant takes the new one's identity (it
-    /// replaced the old), so a revoke of the new grant still finds it; one
-    /// carried by an attach is merged, as on connect. Returns the member and
-    /// whether it is new to the connection.
-    pub fn admit_grant(&mut self, member: MuxMember) -> Result<(MuxMember, bool), MuxError> {
-        let existing = self.members.get(&member.did_hash).map(|m| m.source.clone());
+    /// already carried by an earlier grant takes the new one's identity,
+    /// scope and expiry (it replaced the old), so a revoke of the new grant
+    /// still finds it; one carried by a *newer* grant is left alone (this
+    /// admission lost a race and is stale). One carried by an attach is
+    /// merged, as on connect.
+    ///
+    /// Returns the member and whether it is new to the connection, or `None`
+    /// when nothing changed.
+    pub fn admit_grant(
+        &mut self,
+        member: MuxMember,
+    ) -> Result<Option<(MuxMember, bool)>, MuxError> {
+        let existing = self
+            .members
+            .get(&member.did_hash)
+            .map(|m| (m.source.clone(), m.grant_iat));
         match existing {
-            Some(MuxSource::Grant { .. }) => {
+            Some((MuxSource::Grant { .. }, iat)) if iat > member.grant_iat => Ok(None),
+            // The same grant again (already carried): nothing changes.
+            Some((source, _)) if source == member.source => Ok(None),
+            Some((MuxSource::Grant { .. }, _)) => {
                 self.members.insert(member.did_hash.clone(), member.clone());
-                Ok((member, false))
+                Ok(Some((member, false)))
             }
-            Some(MuxSource::Attach) => Ok((self.admit(member)?, false)),
-            None => Ok((self.admit(member)?, true)),
+            Some((MuxSource::Attach, _)) => Ok(Some((self.admit(member)?, false))),
+            None => Ok(Some((self.admit(member)?, true))),
         }
     }
 
@@ -367,6 +385,7 @@ pub async fn verify_attach(
             kid: verified.key.kid,
             key_fp: verified.key.key_fp,
             expires_at: verified.exp,
+            grant_iat: 0,
         },
         suspended,
     ))
