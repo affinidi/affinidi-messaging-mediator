@@ -482,6 +482,13 @@ pub(crate) async fn consume(
             )
             .await?
         }
+        ServedTask::MuxGrant
+        | ServedTask::MuxList
+        | ServedTask::MuxUpdate
+        | ServedTask::MuxRevoke
+        | ServedTask::MuxRevokeAll => {
+            consume_mux(task, &doc, state, session, &sender_did, &mediator_did, now).await?
+        }
     };
 
     // Answer in the version that was asked for, before signing.
@@ -561,6 +568,11 @@ served_tasks! {
     QueuePurge => queue::purge::v0_1::Payload,
     MonitorSubscribe => monitor::subscribe::v0_1::Payload,
     MonitorUnsubscribe => monitor::unsubscribe::v0_1::Payload,
+    MuxGrant => crate::task_specs::messaging::mux::grant::v0_1::Payload,
+    MuxList => crate::task_specs::messaging::mux::list::v0_1::Payload,
+    MuxUpdate => crate::task_specs::messaging::mux::update::v0_1::Payload,
+    MuxRevoke => crate::task_specs::messaging::mux::revoke::v0_1::Payload,
+    MuxRevokeAll => crate::task_specs::messaging::mux::revoke_all::v0_1::Payload,
 }
 
 impl ServedTask {
@@ -2221,6 +2233,121 @@ pub(crate) fn tt_problem(
         vec![],
         status,
     )
+}
+
+/// Serve a connection-independent `messaging/mux/*` task (design §4).
+///
+/// Off unless `limits.mux.enabled`, in which case the type is unsupported, as
+/// the specs require. The response payload is built as JSON and checked
+/// against the generated `Response` type before it is wrapped, so a shape the
+/// schema does not allow fails here rather than on the client.
+async fn consume_mux(
+    task: ServedTask,
+    doc: &TrustTask<Value>,
+    state: &SharedData,
+    session: &Session,
+    sender_did: &str,
+    mediator_did: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, MediatorError> {
+    use crate::mux::{grants::Ctx, proof::StatementVerifier, tasks};
+    use crate::task_specs::messaging::mux;
+
+    if !state.config.limits.mux.enabled {
+        return Err(tt_problem(
+            session,
+            "protocol.trust_task.unsupported",
+            format!("unsupported Trust Task type: {}", doc.type_uri),
+            StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
+    validate_tt_basic(doc, session, mediator_did, now)?;
+
+    let verifier = StatementVerifier::new(state.did_resolver.clone());
+    let ctx = Ctx {
+        store: &*state.database,
+        verifier: &verifier,
+        mediator_did,
+        limits: state.config.limits.mux.store_limits(),
+        default_acl: &state.config.security.global_acl_default,
+        now: now.timestamp().max(0) as u64,
+    };
+    let payload = &doc.payload;
+    let refused = |e: tasks::TaskError| {
+        tt_problem(
+            session,
+            &e.code,
+            e.message,
+            if e.retryable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+        )
+    };
+
+    // `_changed` lists the grants this task removed, voided, suspended or
+    // narrowed. Mux connections must drop those members before the response
+    // is sent (§7.3). This build serves no mux connections yet (the mediator
+    // refuses to start with mux enabled until it does), so there is nothing
+    // to detach; the connection layer consumes `_changed` when it lands.
+    let (response, _changed) = match task {
+        ServedTask::MuxGrant => tasks::grant(&ctx, sender_did, payload).await,
+        ServedTask::MuxList => (
+            tasks::list(&ctx, sender_did, payload)
+                .await
+                .map_err(refused)?,
+            tasks::Changed::default(),
+        ),
+        ServedTask::MuxUpdate => tasks::update(&ctx, sender_did, payload)
+            .await
+            .map_err(refused)?,
+        ServedTask::MuxRevoke => tasks::revoke(&ctx, sender_did, payload)
+            .await
+            .map_err(refused)?,
+        ServedTask::MuxRevokeAll => tasks::revoke_all(&ctx, payload).await.map_err(refused)?,
+        _ => unreachable!("consume_mux is only called for mux tasks"),
+    };
+
+    fn respond<P, R>(
+        doc: &TrustTask<Value>,
+        session: &Session,
+        response: Value,
+    ) -> Result<Value, MediatorError>
+    where
+        P: serde::de::DeserializeOwned,
+        R: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let typed: TrustTask<P> = downcast(doc, session)?;
+        let response: R = serde_json::from_value(response).map_err(|e| {
+            serialize_err_msg(format!("mux response does not match its schema: {e}"))
+        })?;
+        serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
+            .map_err(serialize_err)
+    }
+    match task {
+        ServedTask::MuxGrant => {
+            respond::<mux::grant::v0_1::Payload, mux::grant::v0_1::Response>(doc, session, response)
+        }
+        ServedTask::MuxList => {
+            respond::<mux::list::v0_1::Payload, mux::list::v0_1::Response>(doc, session, response)
+        }
+        ServedTask::MuxUpdate => {
+            respond::<mux::update::v0_1::Payload, mux::update::v0_1::Response>(
+                doc, session, response,
+            )
+        }
+        ServedTask::MuxRevoke => {
+            respond::<mux::revoke::v0_1::Payload, mux::revoke::v0_1::Response>(
+                doc, session, response,
+            )
+        }
+        ServedTask::MuxRevokeAll => respond::<
+            mux::revoke_all::v0_1::Payload,
+            mux::revoke_all::v0_1::Response,
+        >(doc, session, response),
+        _ => unreachable!("consume_mux is only called for mux tasks"),
+    }
 }
 
 /// Framework basics: the request is addressed to this mediator and not expired.

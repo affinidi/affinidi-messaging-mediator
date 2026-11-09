@@ -138,6 +138,31 @@ struct AttachStatement {
     proof: Value,
 }
 
+/// `muxRevokeAll` statement body: the member voids every grant issued under
+/// `epoch` (design §5.2).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RevokeAllStatement {
+    #[serde(rename = "type")]
+    kind: String,
+    issuer: String,
+    audience: String,
+    epoch: u64,
+    iat: u64,
+    exp: u64,
+    #[allow(dead_code)]
+    proof: Value,
+}
+
+/// A verified revoke-all: who, and which epoch they void.
+#[derive(Clone, Debug)]
+pub struct VerifiedRevokeAll {
+    pub did: String,
+    pub did_hash: String,
+    pub epoch: u64,
+    pub key: SigningKey,
+}
+
 /// The `proof` member, as far as this module needs to read it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +292,27 @@ impl StatementVerifier {
             did: st.issuer,
             scope: st.scope,
             exp: st.exp,
+            key,
+        })
+    }
+
+    /// Verify a `muxRevokeAll` statement.
+    pub async fn verify_revoke_all(
+        &self,
+        raw: &Value,
+        expect: Expect<'_>,
+    ) -> Result<VerifiedRevokeAll, StatementError> {
+        let st: RevokeAllStatement = parse(raw)?;
+        check_type(&st.kind, "muxRevokeAll")?;
+        let key = self.verify_signature(raw).await?;
+        if st.audience != expect.mediator_did {
+            return Err(StatementError::AudienceMismatch);
+        }
+        check_times(st.iat, st.exp, &expect)?;
+        Ok(VerifiedRevokeAll {
+            did_hash: did_hash(&st.issuer),
+            did: st.issuer,
+            epoch: st.epoch,
             key,
         })
     }
