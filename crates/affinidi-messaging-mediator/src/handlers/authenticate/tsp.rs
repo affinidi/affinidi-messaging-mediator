@@ -169,6 +169,23 @@ pub async fn tsp_authentication_response(
             )
         })?;
 
+        // The mux unknown-key rule on the VID's signing key, compared with
+        // the keys that signed the member's grants, before any token is
+        // issued: a login that cannot be checked fails (fail closed).
+        let mux_suspended = if state.config.limits.mux.enabled && state.database.supports_mux() {
+            Some(
+                crate::mux::notice::unknown_key_check(
+                    &state,
+                    &session.did_hash,
+                    crate::mux::notice::DirectKey::Signing(resolved.signing_key.to_vec()),
+                )
+                .await
+                .map_err(super::helpers::mux_check_failed)?,
+            )
+        } else {
+            None
+        };
+
         // Mint the same JWT pair the DIDComm path issues, rotating the session id.
         let now = state.clock.unix_secs();
         let old_sid = session.session_id.clone();
@@ -206,16 +223,12 @@ pub async fn tsp_authentication_response(
             .activity
             .authenticated(&state, &session.did_hash)
             .await;
-        // The VID's signing key, compared with the keys that signed the
-        // member's grants (the mux unknown-key rule); in the background.
-        if state.config.limits.mux.enabled && state.database.supports_mux() {
-            let proven = crate::mux::notice::ProvenKey::Signing(crate::mux::proof::fingerprint(
-                &resolved.signing_key,
-            ));
+        // Notices the unknown-key check owes; login does not wait on them.
+        if let Some(suspended) = mux_suspended {
             let (state, did, did_hash) =
                 (state.clone(), session.did.clone(), session.did_hash.clone());
             tokio::spawn(async move {
-                crate::mux::notice::on_direct_auth(&state, &did, &did_hash, Some(proven)).await;
+                crate::mux::notice::after_direct_auth(&state, &did, &did_hash, suspended).await;
             });
         }
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);

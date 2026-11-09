@@ -166,6 +166,10 @@ pub async fn open(
     state
         .mux
         .insert(&session.session_id, &session.did_hash, conn.clone());
+    // The grants were read before the connection was published, so a
+    // revocation or suspension committed in between found nothing here to
+    // detach. Re-read them now: any committed later finds the connection.
+    sweep(state, &conn, false).await;
 
     let mut frames = Vec::new();
     let ready = json!({

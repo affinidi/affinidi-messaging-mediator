@@ -351,55 +351,65 @@ async fn present_after_suspension(state: &SharedData, suspended: &[MuxGrant]) {
 /// The key a direct authentication proved, as a fingerprint
 /// ([`super::proof::fingerprint`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProvenKey {
+enum ProvenKey {
     /// DIDComm: the authcrypt sender key, a `keyAgreement` key.
     KeyAgreement(String),
     /// TSP: the sender VID's signing key.
     Signing(String),
 }
 
-/// A DID authenticated directly (the challenge/response login).
+/// The key a direct authentication proved, as the login has it.
+#[derive(Clone, Debug)]
+pub enum DirectKey {
+    /// DIDComm: the authcrypt sender key id; `None` when the message was not
+    /// authcrypt, which proves no key-agreement key, so the rule cannot fire.
+    Authcrypt(Option<String>),
+    /// TSP: the sender VID's signing key bytes.
+    Signing(Vec<u8>),
+}
+
+/// The unknown-key rule (spec `messaging/mux/grant`) on a direct
+/// authentication, applied before the login succeeds: the key is compared
+/// with the known keys of the same relationship, and every active grant on
+/// the DID is suspended if it is unknown. Returns the suspended grants,
+/// committed and detached from this instance's connections; pass them to
+/// [`after_direct_auth`].
 ///
-/// As a member DID: the unknown-key rule runs on the key it proved, compared
-/// with known keys of the same relationship (spec `messaging/mux/grant`).
-/// Grants it suspends are detached from live connections before their
-/// notices are stored. Otherwise the DID is told, once per change of its
-/// grants, that delegations of it exist (`grantsPresent`).
-///
-/// As a principal: it is sent the `grantsExpiring` notice it is owed.
-///
-/// `proven` is `None` when the key could not be determined; the rule then
-/// does not fire.
-pub async fn on_direct_auth(
+/// `Err` when the rule could not be applied — the key did not resolve, or
+/// the store failed — and the login must then fail rather than leave grants
+/// active that a new controller's key should have ended. A DID with no
+/// active grant is never resolved and never fails here.
+pub async fn unknown_key_check(
     state: &SharedData,
-    did: &str,
     did_hash: &str,
-    proven: Option<ProvenKey>,
-) {
-    let mut suspended = Vec::new();
-    if let Some(proven) = proven {
-        let limits = state.config.limits.mux.store_limits();
-        let now = state.clock.unix_secs();
-        match mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
-            Ok(match &proven {
-                ProvenKey::KeyAgreement(fp) => {
-                    mux::suspend_unless_known_key_agreement(rec, fp, now)
-                }
-                ProvenKey::Signing(fp) => mux::suspend_unless_known_signing_key(rec, fp, now),
-            })
-        })
+    key: DirectKey,
+) -> Result<Vec<MuxGrant>, String> {
+    let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
+    let rec = mux::load(&*state.database, did_hash, &limits, now)
         .await
-        {
-            Ok(s) => suspended = s,
-            Err(e) => warn!(
-                did_hash,
-                "unknown-key rule not applied on authentication: {e}"
-            ),
-        }
+        .map_err(|e| e.to_string())?;
+    if !rec.grants.iter().any(|g| g.is_usable(now)) {
+        return Ok(Vec::new());
     }
-    if suspended.is_empty() {
-        tell_present(state, did, did_hash, 0).await;
-    } else {
+    let proven = match key {
+        DirectKey::Authcrypt(None) => return Ok(Vec::new()),
+        DirectKey::Authcrypt(Some(kid)) => ProvenKey::KeyAgreement(
+            super::proof::StatementVerifier::new(state.did_resolver.clone())
+                .key_agreement_fp(&kid)
+                .await?,
+        ),
+        DirectKey::Signing(bytes) => ProvenKey::Signing(super::proof::fingerprint(&bytes)),
+    };
+    let suspended = mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
+        Ok(match &proven {
+            ProvenKey::KeyAgreement(fp) => mux::suspend_unless_known_key_agreement(rec, fp, now),
+            ProvenKey::Signing(fp) => mux::suspend_unless_known_signing_key(rec, fp, now),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if !suspended.is_empty() {
         state
             .mux
             .detach_grants(
@@ -408,6 +418,26 @@ pub async fn on_direct_auth(
                 LeaveReason::SuspendedUnknownKey,
             )
             .await;
+    }
+    Ok(suspended)
+}
+
+/// The notices a direct authentication owes, after [`unknown_key_check`];
+/// login does not wait on them.
+///
+/// As a member DID: the principals of `suspended` grants are told. Otherwise
+/// the DID is told, once per change of its grants, that delegations of it
+/// exist (`grantsPresent`). As a principal: it is sent the `grantsExpiring`
+/// notice it is owed.
+pub async fn after_direct_auth(
+    state: &SharedData,
+    did: &str,
+    did_hash: &str,
+    suspended: Vec<MuxGrant>,
+) {
+    if suspended.is_empty() {
+        tell_present(state, did, did_hash, 0).await;
+    } else {
         let changed = Changed {
             suspended,
             ..Default::default()

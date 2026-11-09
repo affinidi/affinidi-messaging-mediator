@@ -169,7 +169,8 @@ pub struct MuxGrant {
     /// Fingerprints (SHA-256 of the public key) of the member DID's
     /// `keyAgreement` keys when the grant was stored: the known keys a direct
     /// DIDComm authentication, which proves a key-agreement key, is compared
-    /// with (the unknown-key rule). Empty when they could not be read.
+    /// with (the unknown-key rule). Empty when the DID listed none; a grant
+    /// whose keys could not be read is refused, never stored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_agreement_fps: Vec<String>,
     /// Whether the `grantsExpiring` notice for this grant is stored.
@@ -519,8 +520,9 @@ pub fn revoke_principals(
 
 /// The unknown-key rule for a direct DIDComm authentication, which proves a
 /// key-agreement key (`ka_fp`): suspend every active grant unless some active
-/// grant recorded that key. An active grant that recorded no key-agreement
-/// keys gives no basis for comparison, so nothing fires while one exists.
+/// grant recorded that key. Each grant recorded the DID's key-agreement keys
+/// when it was stored, so a key listed then is known; one added since is
+/// not, including the first key of a DID that listed none.
 pub fn suspend_unless_known_key_agreement(
     rec: &mut MuxDidRecord,
     ka_fp: &str,
@@ -528,11 +530,10 @@ pub fn suspend_unless_known_key_agreement(
 ) -> Vec<MuxGrant> {
     let mut active = rec.grants.iter().filter(|g| g.is_usable(now)).peekable();
     if active.peek().is_none()
-        || rec.grants.iter().any(|g| {
-            g.is_usable(now)
-                && (g.key_agreement_fps.is_empty()
-                    || g.key_agreement_fps.iter().any(|f| f == ka_fp))
-        })
+        || rec
+            .grants
+            .iter()
+            .any(|g| g.is_usable(now) && g.key_agreement_fps.iter().any(|f| f == ka_fp))
     {
         return Vec::new();
     }
@@ -1169,13 +1170,29 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_without_recorded_key_agreement_keys_never_fires_the_rule() {
+    fn a_grant_that_recorded_no_keys_does_not_exempt_the_others() {
+        // One grant recorded the key-agreement key, the other recorded none
+        // (its DID listed none then): an unknown key still suspends both.
         let mut rec = MuxDidRecord::default();
         let mut g1 = grant("g1", "p1", "k1", NOW - 10, 0);
         g1.key_agreement_fps = vec!["ka1".into()];
         rec.grants = vec![g1, grant("g2", "p2", "k1", NOW - 10, 0)];
-        assert!(suspend_unless_known_key_agreement(&mut rec, "ka3", NOW).is_empty());
-        assert!(rec.grants.iter().all(|g| g.is_usable(NOW)));
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).is_empty());
+        assert_eq!(
+            suspend_unless_known_key_agreement(&mut rec, "ka3", NOW).len(),
+            2
+        );
+        assert!(rec.grants.iter().all(|g| !g.is_usable(NOW)));
+    }
+
+    #[test]
+    fn the_first_key_agreement_key_of_a_did_that_listed_none_is_unknown() {
+        let mut rec = MuxDidRecord::default();
+        rec.grants = vec![grant("g1", "p1", "k1", NOW - 10, 0)];
+        assert_eq!(
+            suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).len(),
+            1
+        );
     }
 
     #[test]
