@@ -218,28 +218,44 @@ pub async fn on_member_change(
     .await
 }
 
-/// Members that left since the last call, as one `detached` frame.
-pub async fn drain_left(state: &SharedData, conn: &MuxConn) -> Option<String> {
+/// Members that joined or left since the last call, as at most one
+/// `attached` and one `detached` frame.
+pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
+    let joined: Vec<MuxMember> = std::mem::take(&mut *conn.joined.lock().await);
     let left: Vec<(MuxMember, LeaveReason)> = std::mem::take(&mut *conn.left.lock().await);
-    if left.is_empty() {
-        return None;
-    }
     let principal = conn.session.lock().await.principal_did.clone();
-    let dids: Vec<Value> = left
-        .iter()
-        .map(|(m, r)| change(m, r.wire(), None))
-        .collect();
-    pack_event(
-        state,
-        &principal,
-        json!({ "event": "detached", "dids": dids }),
-    )
-    .await
+    let mut frames = Vec::new();
+    if !joined.is_empty() {
+        let dids: Vec<Value> = joined.iter().map(|m| change(m, "grant", None)).collect();
+        frames.extend(
+            pack_event(
+                state,
+                &principal,
+                json!({ "event": "attached", "dids": dids }),
+            )
+            .await,
+        );
+    }
+    if !left.is_empty() {
+        let dids: Vec<Value> = left
+            .iter()
+            .map(|(m, r)| change(m, r.wire(), None))
+            .collect();
+        frames.extend(
+            pack_event(
+                state,
+                &principal,
+                json!({ "event": "detached", "dids": dids }),
+            )
+            .await,
+        );
+    }
+    frames
 }
 
 /// Periodic sweep: expire lapsed members and, when `revalidate` is set,
 /// re-check each grant-admitted member's signing key (§5.1). Leavers are
-/// queued on the connection for [`drain_left`].
+/// queued on the connection for [`drain_changes`].
 pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     let streaming = state.streaming_task.as_ref();
     let now = state.clock.unix_secs();

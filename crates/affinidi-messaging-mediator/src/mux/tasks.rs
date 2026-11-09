@@ -34,6 +34,9 @@ pub struct Changed {
     pub reason: Option<LeaveReason>,
     pub suspended: Vec<MuxGrant>,
     pub narrowed: Vec<MuxGrant>,
+    /// Grants just stored: their principal's live connections carry the
+    /// member at once (design §4.4), not only after a reconnect.
+    pub stored: Vec<MuxGrant>,
 }
 
 /// A request-level refusal: the whole task fails with this code.
@@ -140,6 +143,7 @@ pub async fn grant(ctx: &Ctx<'_>, sender_did: &str, payload: &Value) -> (Value, 
                     outcome["replacedGrantId"] = json!(old.grant_id);
                 }
                 changed.suspended.extend(stored.suspended);
+                changed.stored.push(stored.grant);
             }
             Err(e) => {
                 outcome["status"] = json!("refused");
