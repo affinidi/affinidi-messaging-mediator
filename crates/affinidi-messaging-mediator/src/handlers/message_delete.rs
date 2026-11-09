@@ -73,36 +73,63 @@ pub async fn message_delete_handler(
         }
         let mut deleted: DeleteMessageResponse = DeleteMessageResponse::default();
 
+        // Whose messages this session may delete: its own, and on a mux
+        // connection (the same session) each member's with `delete` scope.
+        // The store authorises each delete; the first owner it accepts wins.
+        let mut owners = vec![session.did_hash.clone()];
+        owners.extend(
+            crate::mux::connection::members_with(
+                &state,
+                &session.session_id,
+                affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
+            )
+            .await,
+        );
+
         for message in &body.message_ids {
-            // Only while someone is watching: read who the message was between,
-            // so its `deleted` event names both parties.
-            let parties = if state.monitor.is_active() {
-                state
+            let mut result: Result<(), MediatorError> = Err(MediatorError::RequestDataError(
+                44,
+                session.session_id.clone(),
+                "message not found for this session".into(),
+            ));
+            let mut deleted_as = session.did_hash.clone();
+            let mut parties = None;
+            for owner in &owners {
+                // Only while someone is watching: read who the message was
+                // between, so its `deleted` event names both parties.
+                let seen = if state.monitor.is_active() {
+                    state
+                        .database
+                        .get_message(owner, message)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|m| (m.from_address, m.to_address, m.msg))
+                } else {
+                    None
+                };
+                result = state
                     .database
-                    .get_message(&session.did_hash, message)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|m| (m.from_address, m.to_address, m.msg))
-            } else {
-                None
-            };
-            let result: Result<(), MediatorError> = state
-                .database
-                .delete_message(
-                    message,
-                    DeletionAuthority::Owner {
-                        did_hash: session.did_hash.clone(),
-                    },
-                )
-                .await;
+                    .delete_message(
+                        message,
+                        DeletionAuthority::Owner {
+                            did_hash: owner.clone(),
+                        },
+                    )
+                    .await;
+                if result.is_ok() {
+                    deleted_as = owner.clone();
+                    parties = seen;
+                    break;
+                }
+            }
 
             match result {
                 Ok(_) => {
                     let (from, to, body) = parties.unwrap_or_default();
                     state.monitor.deleted(
                         message,
-                        &session.did_hash,
+                        &deleted_as,
                         from.as_deref(),
                         to.as_deref(),
                         crate::monitor::Channel::Rest,
