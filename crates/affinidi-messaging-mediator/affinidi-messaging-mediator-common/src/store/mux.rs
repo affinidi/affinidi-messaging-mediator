@@ -105,7 +105,7 @@ impl From<MuxScope> for Vec<MuxCapability> {
 /// `Expired` is never stored: it is what [`MuxGrant::state_at`] reports for an
 /// `Active` grant whose effective expiry has passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum MuxGrantState {
     Active,
     /// The member proved control with a key no active grant was signed with
@@ -708,6 +708,18 @@ mod tests {
 
     fn limits() -> MuxLimits {
         MuxLimits::default()
+    }
+
+    #[test]
+    fn grant_states_use_the_spec_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&MuxGrantState::StaleKey).unwrap(),
+            r#""staleKey""#
+        );
+        assert_eq!(
+            serde_json::to_string(&MuxGrantState::EpochRevoked).unwrap(),
+            r#""epochRevoked""#
+        );
     }
 
     #[test]

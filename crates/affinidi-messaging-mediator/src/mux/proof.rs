@@ -88,14 +88,14 @@ impl StatementError {
     /// The code after `messaging/mux/<task>:`.
     pub fn code(&self) -> &'static str {
         match self {
-            StatementError::Malformed(_) | StatementError::WrongType { .. } => "malformed",
+            StatementError::Malformed(_) | StatementError::WrongType { .. } => "malformedRequest",
             StatementError::ProofPurposeInvalid => "proofPurposeInvalid",
-            StatementError::ProofInvalid(_) => "proofInvalid",
+            StatementError::ProofInvalid(_) => "statementProofInvalid",
             StatementError::AudienceMismatch => "audienceMismatch",
             StatementError::PrincipalMismatch => "principalMismatch",
             StatementError::SessionMismatch => "sessionMismatch",
             StatementError::NotYetValid => "notYetValid",
-            StatementError::Expired => "expired",
+            StatementError::Expired => "statementExpired",
             StatementError::LifetimeTooLong { .. } => "lifetimeTooLong",
         }
     }
@@ -189,7 +189,9 @@ impl StatementVerifier {
         let resolver = Arc::new(CachedDidResolver::new(Arc::new(resolver)));
         let verifier = Verifier::with_resolver(resolver.clone()).with_options(
             VerifyOptions::new()
-                .with_allowed_suites(vec![CryptoSuite::EddsaJcs2022, CryptoSuite::EddsaRdfc2022]),
+                // JCS only: mux statements carry no `@context`, so RDF
+                // canonicalisation (eddsa-rdfc-2022) cannot apply to them.
+                .with_allowed_suites(vec![CryptoSuite::EddsaJcs2022]),
         );
         Self {
             resolver,
@@ -205,7 +207,7 @@ impl StatementVerifier {
         expect: Expect<'_>,
     ) -> Result<MuxGrant, StatementError> {
         let st: GrantStatement = parse(raw)?;
-        check_type(&st.kind, "MuxGrant")?;
+        check_type(&st.kind, "muxGrant")?;
         let key = self.verify_signature(raw).await?;
         if st.audience != expect.mediator_did {
             return Err(StatementError::AudienceMismatch);
@@ -248,7 +250,7 @@ impl StatementVerifier {
         expect: Expect<'_>,
     ) -> Result<VerifiedAttach, StatementError> {
         let st: AttachStatement = parse(raw)?;
-        check_type(&st.kind, "MuxAttach")?;
+        check_type(&st.kind, "muxAttach")?;
         let key = self.verify_signature(raw).await?;
         if st.audience != expect.mediator_did {
             return Err(StatementError::AudienceMismatch);
@@ -405,7 +407,7 @@ mod tests {
 
     fn grant_body(member: &str) -> Value {
         json!({
-            "type": "MuxGrant",
+            "type": "muxGrant",
             "issuer": member,
             "audience": MEDIATOR,
             "grantId": "g-1",
@@ -453,7 +455,7 @@ mod tests {
             .verify_grant(&raw, expect(Some(PRINCIPAL)))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), "proofInvalid");
+        assert_eq!(err.code(), "statementProofInvalid");
     }
 
     #[tokio::test]
@@ -471,7 +473,7 @@ mod tests {
             .verify_grant(&raw, expect(Some(PRINCIPAL)))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), "proofInvalid");
+        assert_eq!(err.code(), "statementProofInvalid");
     }
 
     #[tokio::test]
@@ -538,7 +540,7 @@ mod tests {
         let raw = sign(&body, &secret, None).await;
         assert_eq!(
             v.verify_grant(&raw, expect(None)).await.unwrap_err().code(),
-            "malformed"
+            "malformedRequest"
         );
 
         let mut body = grant_body(&member);
@@ -546,7 +548,7 @@ mod tests {
         let raw = sign(&body, &secret, None).await;
         assert_eq!(
             v.verify_grant(&raw, expect(None)).await.unwrap_err().code(),
-            "malformed"
+            "malformedRequest"
         );
     }
 
@@ -555,7 +557,7 @@ mod tests {
         let (member, secret) = did_key(8);
         let v = verifier().await;
         let body = json!({
-            "type": "MuxAttach",
+            "type": "muxAttach",
             "issuer": member,
             "audience": MEDIATOR,
             "principal": PRINCIPAL,
@@ -590,7 +592,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code(),
-            "malformed"
+            "malformedRequest"
         );
     }
 

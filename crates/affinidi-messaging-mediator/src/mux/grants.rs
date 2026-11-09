@@ -40,9 +40,9 @@ impl MuxError {
         match self {
             MuxError::Statement(e) => e.code(),
             MuxError::Store(e) => store_code(e),
-            MuxError::UnknownMember => "unknownMember",
-            MuxError::MemberBlocked => "memberBlocked",
-            MuxError::ScopeExceedsAcl(_) => "scopeExceedsAcl",
+            MuxError::UnknownMember => "accountUnavailable",
+            MuxError::MemberBlocked => "accountUnavailable",
+            MuxError::ScopeExceedsAcl(_) => "scopeNotPermitted",
         }
     }
 
@@ -89,9 +89,9 @@ impl From<MuxStoreError> for MuxError {
 fn store_code(e: &MuxStoreError) -> &'static str {
     match e {
         MuxStoreError::EmptyScope => "emptyScope",
-        MuxStoreError::DidMismatch => "malformed",
+        MuxStoreError::DidMismatch => "malformedRequest",
         MuxStoreError::EpochMismatch { .. } => "epochMismatch",
-        MuxStoreError::Expired => "expired",
+        MuxStoreError::Expired => "statementExpired",
         MuxStoreError::LifetimeTooLong { .. } => "lifetimeTooLong",
         MuxStoreError::Replayed { .. } => "replayed",
         MuxStoreError::GrantIdReused => "grantIdReused",
@@ -101,6 +101,8 @@ fn store_code(e: &MuxStoreError) -> &'static str {
         MuxStoreError::NotActive => "notActive",
         MuxStoreError::WidenRefused => "widenRequiresGrant",
         MuxStoreError::Contended => "contended",
+        // Not a per-item outcome: a store failure fails the whole request
+        // (the handler maps it to the framework's internal error).
         MuxStoreError::Store(_) => "storeUnavailable",
     }
 }
@@ -372,7 +374,7 @@ mod tests {
             iat: u64,
         ) -> Value {
             let body = json!({
-                "type": "MuxGrant", "issuer": member, "audience": MEDIATOR,
+                "type": "muxGrant", "issuer": member, "audience": MEDIATOR,
                 "grantId": id, "principal": principal, "scope": ["receive"],
                 "epoch": 0, "iat": iat, "exp": iat + 3600,
             });
