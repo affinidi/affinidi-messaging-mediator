@@ -363,8 +363,25 @@ pub async fn websocket_handler(
     // Opt-in on purpose: flipping every client at once would trade silent loss
     // for silent duplication, since a client that never acks would be
     // redelivered its whole inbox on every reconnect.
+    //
+    // `tsp-mux` (spec `messaging/mux/event`, "Raw-TSP sockets") makes the
+    // raw-TSP socket a mux connection, and implies `tsp-ack`: delete-on-send is
+    // at-most-once, and across N member DIDs one socket drop would lose N
+    // inboxes' worth of in-flight frames. Selected only when this build can
+    // multiplex — mux enabled and a streaming task to register members with —
+    // so a mediator that will not multiplex never claims it will. Same
+    // ordering trick as `tsp-ack` below: the client offers `tsp`, `tsp-ack`,
+    // `tsp-mux` in that order, so an older mediator reflects the list and
+    // selects `tsp`.
     #[cfg(feature = "tsp")]
-    let tsp_ack_mode = !is_relay && app_protocols.iter().any(|p| p == "tsp-ack");
+    let tsp_mux_mode = tsp_mode
+        && state.config.limits.mux.enabled
+        && state.streaming_task.is_some()
+        && app_protocols
+            .iter()
+            .any(|p| p == crate::mux::connection::TSP_MUX_SUBPROTOCOL);
+    #[cfg(feature = "tsp")]
+    let tsp_ack_mode = !is_relay && (tsp_mux_mode || app_protocols.iter().any(|p| p == "tsp-ack"));
 
     // The echo has to be a HONEST capability signal, and by default it isn't:
     // the offered list is just the client's own list reflected back, so a
@@ -401,16 +418,23 @@ pub async fn websocket_handler(
             .filter(|p| {
                 p != crate::mux::connection::MUX_SUBPROTOCOL
                     && p != crate::mux::connection::LEGACY_MUX_SUBPROTOCOL
+                    && p != crate::mux::connection::TSP_MUX_SUBPROTOCOL
             })
             .collect(),
     };
 
     #[cfg(feature = "tsp")]
-    let app_protocols = if tsp_ack_mode {
+    let app_protocols = if tsp_mux_mode {
+        vec![crate::mux::connection::TSP_MUX_SUBPROTOCOL.to_string()]
+    } else if tsp_ack_mode {
         vec!["tsp-ack".to_string()]
     } else {
         app_protocols
     };
+    // From here on `mux_mode` means "this socket is a mux connection", on
+    // either wire; `tsp_mode` says which.
+    #[cfg(feature = "tsp")]
+    let mux_mode = mux_mode || tsp_mux_mode;
 
     // Same honesty requirement as `tsp-ack` above, and here it is load-bearing:
     // the relaying peer treats the echoed `relay-ack` as proof that its frames
@@ -748,6 +772,14 @@ async fn handle_socket(
 
         // A mux connection admits its stored grants and tells the client its
         // nonce and members before anything else is written.
+        #[cfg(feature = "tsp")]
+        let mux_wire = if tsp_mode {
+            crate::mux::connection::MuxWire::Tsp
+        } else {
+            crate::mux::connection::MuxWire::DidComm
+        };
+        #[cfg(not(feature = "tsp"))]
+        let mux_wire = crate::mux::connection::MuxWire::DidComm;
         let mux_conn = if let Some(slots) = &mux_slots {
             let (conn, frames) = crate::mux::connection::open(
                 &state,
@@ -755,12 +787,43 @@ async fn handle_socket(
                 tx.clone(),
                 live_resync.clone(),
                 slots.clone(),
+                mux_wire,
             )
             .await;
+            // A `tsp-mux` client has no other way to learn its nonce and
+            // members, and must not be left inferring them (R6.2): with no
+            // `ready` to send, the connection is not opened.
+            let no_ready = frames.is_empty() && mux_wire == crate::mux::connection::MuxWire::Tsp;
             for frame in frames {
-                if let Err(e) = socket.send(Message::Text(frame.into())).await {
+                if let Err(e) = socket.send(frame.into()).await {
                     warn!("Failed to send mux event to WebSocket client: {e}");
                 }
+            }
+            if no_ready {
+                warn!("tsp-mux connection not opened: its `ready` event could not be sealed");
+                crate::mux::connection::close(&state, &session, &conn).await;
+                if let Some(streaming) = &state.streaming_task {
+                    let stop = StreamingUpdate {
+                        did_hash: session.did_hash.clone(),
+                        state: StreamingUpdateState::Deregister {
+                            session_id: session.session_id.clone(),
+                        },
+                    };
+                    let _ = streaming.channel.send(stop).await;
+                }
+                state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
+                metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).decrement(1.0);
+                let _ = socket
+                    .send(close_with(
+                        close_code::SERVER_ERROR,
+                        "mux connection could not be established",
+                    ))
+                    .await;
+                let _ = state
+                    .database
+                    .stats_increment(StatCounter::WebsocketClose, 1)
+                    .await;
+                return;
             }
             Some(conn)
         } else {
@@ -782,6 +845,9 @@ async fn handle_socket(
         let epoch = state.clock.unix_secs();
         if session.expires_at <= epoch {
             warn!("JWT access token has expired. Closing Session");
+            if let Some(conn) = &mux_conn {
+                crate::mux::connection::close(&state, &session, conn).await;
+            }
             let _ = socket
                 .send(close_with(
                     close_code::POLICY,
@@ -815,14 +881,22 @@ async fn handle_socket(
         // `queued_receive_messages_hard` and message expiry.
         #[cfg(feature = "tsp")]
         let mut tsp_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // On a `tsp-mux` socket the drain covers the members too.
+        #[cfg(feature = "tsp")]
+        let tsp_mux_conn = if tsp_mode { mux_conn.clone() } else { None };
+        #[cfg(feature = "tsp")]
+        let mut member_inflight = MemberInflight::new();
 
         // Flush-on-connect for raw-TSP delivery: drain whatever is already queued
         // for this DID straight onto the socket before entering the live-delivery
         // loop. If the socket is already gone, exit cleanly.
         #[cfg(feature = "tsp")]
-        if tsp_mode && drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight)
+        if tsp_mode && drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, None)))
             .await
             .is_break() {
+            if let Some(conn) = &mux_conn {
+                crate::mux::connection::close(&state, &session, conn).await;
+            }
             if let Some(streaming) = &state.streaming_task {
                 let stop = StreamingUpdate {
                     did_hash: session.did_hash.clone(),
@@ -869,6 +943,15 @@ async fn handle_socket(
                         if let Ok(msg) = msg {
                             match msg {
                                 Message::Text(msg) => {
+                                    // A `tsp-mux` socket carries binary TSP frames
+                                    // only; anything else is a protocol violation
+                                    // by the principal, which closes the socket.
+                                    #[cfg(feature = "tsp")]
+                                    if tsp_mux_conn.is_some() {
+                                        warn!("Text frame on a tsp-mux socket; closing");
+                                        close_reason = (close_code::POLICY, "tsp-mux sockets carry TSP frames only");
+                                        break;
+                                    }
                                     if msg.len() > state.config.limits.ws_size {
                                         warn!("Error processing message, the size is too big. limit is {}, message size is {}", state.config.limits.ws_size, msg.len());
                                         continue;
@@ -993,6 +1076,26 @@ async fn handle_socket(
                                             // only logged leaves it believing the message went (R1.1).
                                             // A raw-TSP socket has no in-band error frame: the one thing
                                             // it can say is why it is closing.
+                                            //
+                                            // A `tsp-mux` socket does have one: the
+                                            // `refused` event, so one member's bad
+                                            // frame does not take every member
+                                            // offline. It closes only for a failure
+                                            // of the principal itself (here, its
+                                            // account blocked), or when the event
+                                            // cannot be sealed — then closing is the
+                                            // only report left.
+                                            if let Some(conn) = &tsp_mux_conn
+                                                && !session.acls.get_blocked()
+                                                && let Some(frame) = crate::mux::connection::refused_event(&state, conn, &msg, &e).await
+                                            {
+                                                if let Err(e) = socket.send(frame.into()).await {
+                                                    warn!("Failed to send mux refused event: {e}");
+                                                    close_reason = (close_code::GOING_AWAY, "client disconnected");
+                                                    break;
+                                                }
+                                                continue;
+                                            }
                                             if tsp_mode {
                                                 close_reason = tsp_refusal_close(&e);
                                                 break;
@@ -1016,6 +1119,13 @@ async fn handle_socket(
                                     // says nothing about TSP and nothing about why. The
                                     // frame is still dropped — decoding it genuinely
                                     // needs the feature — but it is now dropped by name.
+                                    #[cfg(feature = "tsp")]
+                                    if tsp_mux_conn.is_some() {
+                                        warn!("Non-TSP binary frame on a tsp-mux socket; closing");
+                                        close_reason = (close_code::POLICY, "tsp-mux sockets carry TSP frames only");
+                                        break;
+                                    }
+
                                     #[cfg(not(feature = "tsp"))]
                                     if crate::handlers::message_inbound::looks_like_tsp_bytes(&msg) {
                                         warn!(
@@ -1059,8 +1169,8 @@ async fn handle_socket(
                 }
                 _ = async { match &mux_conn { Some(c) => c.notify.notified().await, None => std::future::pending().await } } => {
                     if let Some(conn) = &mux_conn {
-                        for frame in crate::mux::connection::drain_changes(&state, conn).await {
-                            if let Err(e) = socket.send(Message::Text(frame.into())).await {
+                        for frame in crate::mux::connection::drain_changes(&state, conn, mux_wire).await {
+                            if let Err(e) = socket.send(frame.into()).await {
                                 warn!("Failed to send mux event to WebSocket client: {e}");
                             }
                         }
@@ -1102,6 +1212,24 @@ async fn handle_socket(
                         match queued.cmd {
                             WebSocketCommands::Message(msg) => {
                                 debug!("ws: Received message from streaming task");
+                                // On a `tsp-mux` socket a member's notification
+                                // is that member's live frame, written as it is:
+                                // its stored inbox is walked only by a drain, and
+                                // only with `pickup`.
+                                #[cfg(feature = "tsp")]
+                                if let Some(conn) = &tsp_mux_conn
+                                    && let Some(for_did) = queued.did_hash.as_deref()
+                                    && for_did != session.did_hash
+                                {
+                                    if send_tsp_member_live(conn, for_did, &mut socket, &msg, &mut member_inflight)
+                                        .await
+                                        .is_break()
+                                    {
+                                        close_reason = (close_code::GOING_AWAY, "client disconnected");
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 // In raw-TSP mode the notification body carries no id we can
                                 // delete by, so it's just a wake-up: re-drain the inbox (which
                                 // re-fetches with ids, sends Binary, and deletes-on-send). The
@@ -1109,7 +1237,7 @@ async fn handle_socket(
                                 #[cfg(feature = "tsp")]
                                 if tsp_mode {
                                     let _ = &msg; // body intentionally ignored in TSP mode
-                                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight)
+                                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, None)
             .await
             .is_break() {
                                         close_reason = (close_code::GOING_AWAY, "client disconnected");
@@ -1152,8 +1280,8 @@ async fn handle_socket(
                             },
                             WebSocketCommands::MemberChange(change) => {
                                 if let Some(conn) = &mux_conn
-                                    && let Some(frame) = crate::mux::connection::on_member_change(&state, conn, change).await
-                                    && let Err(e) = socket.send(Message::Text(frame.into())).await
+                                    && let Some(frame) = crate::mux::connection::on_member_change(&state, conn, change, mux_wire).await
+                                    && let Err(e) = socket.send(frame.into()).await
                                 {
                                     warn!("Failed to send mux event to WebSocket client: {e}");
                                 }
@@ -1205,7 +1333,18 @@ async fn handle_socket(
                 if tsp_mode {
                     // A TSP notification is only ever a wake-up, so the resync
                     // *is* the drain — there is no separate signal to send.
-                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight)
+                    //
+                    // On `tsp-mux` the resync is owed per DID, as on a DIDComm
+                    // mux connection: the members whose pushes were dropped
+                    // are drained (those with `pickup`; a `receive`-only
+                    // member's frames stay stored for its next connection).
+                    // The principal's own inbox is always drained, which is
+                    // cheap and safe under ack mode.
+                    let owed: Option<std::collections::HashSet<String>> = mux_slots
+                        .as_ref()
+                        .filter(|_| tsp_mux_conn.is_some())
+                        .map(|slots| slots.take_resync().into_iter().collect());
+                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, owed.as_ref())))
                         .await
                         .is_break()
                     {
@@ -1360,6 +1499,23 @@ const TSP_DRAIN_MAX: usize = 1000;
 /// message (`queued_receive_messages_hard`, message expiry); nothing new can
 /// grow without limit here.
 ///
+/// ## On a `tsp-mux` socket (`members` is the connection)
+///
+/// When `members` is given, the principal's inbox is drained first and then
+/// each attached member's whose scope includes `pickup` (all of them, or only
+/// those named by the third element: the DIDs owed a resync), round-robin, one page
+/// of [`TSP_MUX_MEMBER_PAGE`] per member per round, so one deep inbox cannot
+/// hold the rest back. The socket loop asks for that on connect and on a
+/// resync; the principal's own notifications drain the principal only, so a
+/// busy principal does not re-walk every member's inbox per message. The mode
+/// is always ack mode (`tsp-mux` implies `tsp-ack`), so nothing is deleted on
+/// send: a member's frames go only when the client acks them, and the ack is
+/// authorised against that member's `delete` scope by the delete path. A
+/// member without `delete` therefore keeps its frames in its inbox.
+/// Membership and scope are re-read before every page, so a member detached
+/// mid-drain gets nothing more. Each member has its own in-flight set,
+/// pruned only by a complete walk of that member's inbox.
+///
 /// Returns:
 /// - [`ControlFlow::Break`] when the socket send failed (caller should
 ///   tear the connection down).
@@ -1372,170 +1528,362 @@ async fn drain_tsp_inbox(
     socket: &mut WebSocket,
     ack_mode: bool,
     inflight: &mut std::collections::HashSet<String>,
+    members: Option<(
+        &crate::mux::registry::MuxConn,
+        &mut MemberInflight,
+        Option<&std::collections::HashSet<String>>,
+    )>,
 ) -> ControlFlow<(), ()> {
-    let mut start_id: Option<String> = None;
-    let mut total: usize = 0;
-    // Every id this drain walked past (ack mode only) — used to prune `inflight`
-    // once the walk completes, so ids the client has since acked (and which the
-    // inbox therefore no longer returns) stop occupying the set.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    use affinidi_messaging_mediator_common::store::mux::MuxCapability;
+    // Delete-on-send is never used for a member: `tsp-mux` forces ack mode.
+    debug_assert!(ack_mode || members.is_none());
+    let mut walk = TspDrainWalk {
+        budget: TSP_DRAIN_MAX,
+        total: 0,
+    };
 
+    // The principal's own inbox, to the end. Every id walked past (ack mode
+    // only) is kept, to prune `inflight` against once the walk completes, so
+    // ids the client has since acked stop occupying the set.
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
     loop {
-        let options = FetchOptions {
-            limit: TSP_DRAIN_PAGE,
-            start_id: start_id.clone(),
-            ..Default::default() // delete_policy defaults to DoNotDelete; we delete explicitly.
-        };
-        let page = match state
-            .database
-            .fetch_messages_delivering(
-                &session.session_id,
-                &session.did_hash,
-                &options,
-                state.clock.unix_millis() as u64,
-                state.config.limits.delivered_expiry_seconds,
-                state.config.limits.pickup_round_robin,
-            )
-            .await
+        match drain_tsp_page(
+            state,
+            session,
+            &session.did_hash,
+            socket,
+            ack_mode,
+            inflight,
+            &mut seen,
+            &mut walk,
+            &mut cursor,
+            TSP_DRAIN_PAGE,
+        )
+        .await
         {
-            Ok(page) => page,
-            Err(err) => {
-                warn!(
-                    did_hash = %session.did_hash,
-                    "TSP inbox drain fetch failed, aborting drain: {err}"
-                );
-                return ControlFlow::Continue(());
-            }
-        };
-        if page.success.is_empty() {
-            break;
-        }
-
-        for element in page.success {
-            // Advance the cursor regardless of body presence so a missing body
-            // can't pin the drain on the same page forever. `receive_id` is the
-            // inbox stream id, used as the exclusive fetch cursor.
-            start_id = element.receive_id.clone();
-
-            let parties = (element.from_address.clone(), element.to_address.clone());
-            let size = element.size;
-            let Some(body) = element.msg else { continue };
-            // Deletion keys on `msg_id` (the message hash) — the same key the
-            // optimistic-delete fetch path uses; `receive_id` is only the stream
-            // cursor, not a valid delete key.
-            let id = element.msg_id;
-            if ack_mode {
-                seen.insert(id.clone());
-                // Already on the wire for this connection and not yet acked —
-                // sending it again would duplicate within a single session.
-                if inflight.contains(&id) {
-                    continue;
-                }
-            }
-
-            // Stored body is base64url(qb2). Decode back to raw qb2 bytes for
-            // the wire. A malformed entry is skipped (not deleted) so it can be
-            // inspected rather than silently dropped.
-            let qb2 = match BASE64_URL_SAFE_NO_PAD.decode(&body) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    warn!(
-                        did_hash = %session.did_hash,
-                        message_id = %id,
-                        "Skipping inbox entry that isn't valid base64url: {err}"
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(e) = socket.send(Message::Binary(qb2.into())).await {
-                // The socket is gone — leave this message and the rest of the
-                // inbox in place for the next connection (do NOT delete).
-                warn!("Failed to send TSP message to WebSocket client: {e}");
-                return ControlFlow::Break(());
-            }
-            // Only once it is on the wire.
-            state.monitor.delivered(
-                &id,
-                parties.0.as_deref(),
-                parties.1.as_deref(),
-                size,
-                Channel::Websocket,
-                Some(&body),
-            );
-
-            if ack_mode {
-                // Delete-to-ack: the write is not the acknowledgement, so keep
-                // the message. The client deletes it once it has taken the
-                // frame; until then it stays recoverable across a reconnect.
-                inflight.insert(id.clone());
-                debug!(
-                    did_hash = %session.did_hash,
-                    message_id = %id,
-                    "Sent TSP message, awaiting client ack (tsp-ack mode)"
-                );
-            } else {
-                // Delete-on-send: delivered as far as this mode is concerned. A
-                // delete error is logged but not fatal — the frame is already
-                // on the wire, so we continue.
-                match state
-                    .database
-                    .delete_message(
-                        &id,
-                        DeletionAuthority::Owner {
-                            did_hash: session.did_hash.clone(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => state.monitor.deleted(
-                        &id,
-                        &session.did_hash,
-                        parties.0.as_deref(),
-                        parties.1.as_deref(),
-                        Channel::Websocket,
-                        // The frame this drain just sent: a TSP body, stored
-                        // base64url, which is what `detect` reads.
-                        Some(body.as_str()),
-                    ),
-                    Err(err) => warn!(
-                        did_hash = %session.did_hash,
-                        message_id = %id,
-                        "Failed to delete delivered TSP message: {err}"
-                    ),
-                }
-            }
-
-            total += 1;
-            if total >= TSP_DRAIN_MAX {
-                warn!(
-                    did_hash = %session.did_hash,
-                    max = TSP_DRAIN_MAX,
-                    "TSP inbox drain hit its safety cap; remaining messages left for the next drain"
-                );
-                // Returns WITHOUT pruning `inflight` below, deliberately: only a
-                // complete walk proves an absent id was acked, and pruning
-                // against a walk cut short by the cap would resurrect
-                // still-in-flight messages as duplicates.
-                return ControlFlow::Continue(());
-            }
+            TspPage::SocketGone => return ControlFlow::Break(()),
+            // Returns WITHOUT pruning `inflight`, deliberately: only a
+            // complete walk proves an absent id was acked, and pruning against
+            // a walk cut short by the cap (or a failed fetch) would resurrect
+            // still-in-flight messages as duplicates.
+            TspPage::Stopped => return ControlFlow::Continue(()),
+            TspPage::More => continue,
+            TspPage::Exhausted => break,
         }
     }
-
     if ack_mode {
         // Anything no longer in the inbox has been acked (or expired): drop it
         // so the set tracks only what is genuinely outstanding.
         inflight.retain(|id| seen.contains(id));
     }
 
-    if total > 0 {
+    // Then each member with `pickup`, a page at a time, round-robin.
+    if let Some((conn, member_inflight, only)) = members {
+        let now = state.clock.unix_secs();
+        let mut order: Vec<String> = {
+            let s = conn.session.lock().await;
+            // A member no longer attached has nothing in flight here.
+            member_inflight.retain(|did_hash, _| s.get(did_hash).is_some());
+            s.members()
+                .filter(|m| only.is_none_or(|o| o.contains(&m.did_hash)))
+                .filter(|m| s.allows(&m.did_hash, MuxCapability::Pickup, now))
+                .map(|m| m.did_hash.clone())
+                .collect()
+        };
+        order.sort();
+        let mut walks: std::collections::HashMap<
+            String,
+            (Option<String>, std::collections::HashSet<String>),
+        > = std::collections::HashMap::new();
+        while !order.is_empty() {
+            let mut still: Vec<String> = Vec::with_capacity(order.len());
+            for member in order {
+                // Still attached, still with `pickup`? Re-read per page: a
+                // detach between pages must stop this member's frames (§7.3).
+                let allowed = conn.session.lock().await.allows(
+                    &member,
+                    MuxCapability::Pickup,
+                    state.clock.unix_secs(),
+                );
+                if !allowed {
+                    continue;
+                }
+                let (cursor, seen) = walks.entry(member.clone()).or_default();
+                let inflight = member_inflight.entry(member.clone()).or_default();
+                match drain_tsp_page(
+                    state,
+                    session,
+                    &member,
+                    socket,
+                    ack_mode,
+                    inflight,
+                    seen,
+                    &mut walk,
+                    cursor,
+                    TSP_MUX_MEMBER_PAGE,
+                )
+                .await
+                {
+                    TspPage::SocketGone => return ControlFlow::Break(()),
+                    TspPage::Stopped => return ControlFlow::Continue(()),
+                    TspPage::More => still.push(member),
+                    // This member's walk is complete: prune its set.
+                    TspPage::Exhausted => inflight.retain(|id| seen.contains(id)),
+                }
+            }
+            order = still;
+        }
+    }
+
+    if walk.total > 0 {
         debug!(
             did_hash = %session.did_hash,
-            total,
+            total = walk.total,
             awaiting_ack = inflight.len(),
             "TSP inbox drain complete"
         );
     }
+    ControlFlow::Continue(())
+}
+
+/// Members' pages are smaller than the principal's, so a round over many
+/// members stays short.
+#[cfg(feature = "tsp")]
+const TSP_MUX_MEMBER_PAGE: usize = 20;
+
+/// The most ids one member's in-flight set holds. A set is pruned by a
+/// complete drain of the member's inbox, which happens on connect and resync
+/// only, and a member without `pickup` is never drained, so live frames
+/// alone would grow it for the life of the connection. Past this the set is
+/// cleared; the cost is a possible duplicate, which an at-least-once client
+/// already handles.
+#[cfg(feature = "tsp")]
+const TSP_MUX_MEMBER_INFLIGHT_MAX: usize = 1024;
+
+/// In-flight ids per member DID hash, on a `tsp-mux` socket.
+#[cfg(feature = "tsp")]
+type MemberInflight = std::collections::HashMap<String, std::collections::HashSet<String>>;
+
+/// The budget shared by every page of one drain.
+#[cfg(feature = "tsp")]
+struct TspDrainWalk {
+    /// Frames this drain may still send ([`TSP_DRAIN_MAX`] in all).
+    budget: usize,
+    total: usize,
+}
+
+/// How one page of a drain ended.
+#[cfg(feature = "tsp")]
+enum TspPage {
+    /// The socket is gone; nothing more was written or deleted.
+    SocketGone,
+    /// The fetch failed or the drain's cap was reached: stop this drain
+    /// without pruning `inflight`.
+    Stopped,
+    /// The page was full; the inbox may hold more.
+    More,
+    /// The inbox has nothing after the cursor.
+    Exhausted,
+}
+
+/// Write one page of `did_hash`'s inbox after `cursor` to the socket.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "tsp")]
+async fn drain_tsp_page(
+    state: &SharedData,
+    session: &Session,
+    did_hash: &str,
+    socket: &mut WebSocket,
+    ack_mode: bool,
+    inflight: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+    walk: &mut TspDrainWalk,
+    cursor: &mut Option<String>,
+    limit: usize,
+) -> TspPage {
+    let options = FetchOptions {
+        limit,
+        start_id: cursor.clone(),
+        ..Default::default() // delete_policy defaults to DoNotDelete; we delete explicitly.
+    };
+    let page = match state
+        .database
+        .fetch_messages_delivering(
+            &session.session_id,
+            did_hash,
+            &options,
+            state.clock.unix_millis() as u64,
+            state.config.limits.delivered_expiry_seconds,
+            state.config.limits.pickup_round_robin,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(err) => {
+            warn!(
+                %did_hash,
+                "TSP inbox drain fetch failed, aborting drain: {err}"
+            );
+            return TspPage::Stopped;
+        }
+    };
+    if page.success.is_empty() {
+        return TspPage::Exhausted;
+    }
+
+    for element in page.success {
+        // Advance the cursor regardless of body presence so a missing body
+        // can't pin the drain on the same page forever. `receive_id` is the
+        // inbox stream id, used as the exclusive fetch cursor.
+        *cursor = element.receive_id.clone();
+
+        let parties = (element.from_address.clone(), element.to_address.clone());
+        let size = element.size;
+        let Some(body) = element.msg else { continue };
+        // Deletion keys on `msg_id` (the message hash) — the same key the
+        // optimistic-delete fetch path uses; `receive_id` is only the stream
+        // cursor, not a valid delete key.
+        let id = element.msg_id;
+        if ack_mode {
+            seen.insert(id.clone());
+            // Already on the wire for this connection and not yet acked —
+            // sending it again would duplicate within a single session.
+            if inflight.contains(&id) {
+                continue;
+            }
+        }
+
+        // Stored body is base64url(qb2). Decode back to raw qb2 bytes for
+        // the wire. A malformed entry is skipped (not deleted) so it can be
+        // inspected rather than silently dropped.
+        let qb2 = match BASE64_URL_SAFE_NO_PAD.decode(&body) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    %did_hash,
+                    message_id = %id,
+                    "Skipping inbox entry that isn't valid base64url: {err}"
+                );
+                continue;
+            }
+        };
+
+        if let Err(e) = socket.send(Message::Binary(qb2.into())).await {
+            // The socket is gone — leave this message and the rest of the
+            // inbox in place for the next connection (do NOT delete).
+            warn!("Failed to send TSP message to WebSocket client: {e}");
+            return TspPage::SocketGone;
+        }
+        // Only once it is on the wire.
+        state.monitor.delivered(
+            &id,
+            parties.0.as_deref(),
+            parties.1.as_deref(),
+            size,
+            Channel::Websocket,
+            Some(&body),
+        );
+
+        if ack_mode {
+            // Delete-to-ack: the write is not the acknowledgement, so keep
+            // the message. The client deletes it once it has taken the
+            // frame; until then it stays recoverable across a reconnect.
+            inflight.insert(id.clone());
+            debug!(
+                %did_hash,
+                message_id = %id,
+                "Sent TSP message, awaiting client ack (tsp-ack mode)"
+            );
+        } else {
+            // Delete-on-send: delivered as far as this mode is concerned. A
+            // delete error is logged but not fatal — the frame is already
+            // on the wire, so we continue.
+            match state
+                .database
+                .delete_message(
+                    &id,
+                    DeletionAuthority::Owner {
+                        did_hash: did_hash.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(()) => state.monitor.deleted(
+                    &id,
+                    did_hash,
+                    parties.0.as_deref(),
+                    parties.1.as_deref(),
+                    Channel::Websocket,
+                    // The frame this drain just sent: a TSP body, stored
+                    // base64url, which is what `detect` reads.
+                    Some(body.as_str()),
+                ),
+                Err(err) => warn!(
+                    %did_hash,
+                    message_id = %id,
+                    "Failed to delete delivered TSP message: {err}"
+                ),
+            }
+        }
+
+        walk.total += 1;
+        walk.budget = walk.budget.saturating_sub(1);
+        if walk.budget == 0 {
+            warn!(
+                did_hash = %session.did_hash,
+                max = TSP_DRAIN_MAX,
+                "TSP inbox drain hit its safety cap; remaining messages left for the next drain"
+            );
+            return TspPage::Stopped;
+        }
+    }
+    TspPage::More
+}
+
+/// Write a mux member's live notification to a `tsp-mux` socket.
+///
+/// The notification body is the stored message (base64url of the qb2), so it
+/// is the frame itself. Writing it, rather than answering with a drain of the
+/// member's inbox as the principal's notifications are answered, keeps a
+/// `receive` wake-up from becoming a `pickup` drain: a member's stored inbox
+/// is walked only for a member with `pickup` ([`drain_tsp_inbox`]). Ack mode
+/// applies: the frame stays stored until the client acks it, and its
+/// id joins `inflight` so a later drain does not send it again. A body that
+/// is not a TSP message is not written; it stays in the member's inbox.
+#[cfg(feature = "tsp")]
+async fn send_tsp_member_live(
+    conn: &crate::mux::registry::MuxConn,
+    did_hash: &str,
+    socket: &mut WebSocket,
+    body: &str,
+    inflight: &mut MemberInflight,
+) -> ControlFlow<(), ()> {
+    // Checked by the caller already; re-checked here because this write is
+    // the one that must not happen for a detached member (§7.3, R1.1).
+    if !conn.may_write(did_hash).await {
+        return ControlFlow::Continue(());
+    }
+    let id = sha256::digest(body);
+    let inflight = inflight.entry(did_hash.to_string()).or_default();
+    if inflight.contains(&id) {
+        return ControlFlow::Continue(());
+    }
+    if inflight.len() >= TSP_MUX_MEMBER_INFLIGHT_MAX {
+        inflight.clear();
+    }
+    let qb2 = match BASE64_URL_SAFE_NO_PAD.decode(body) {
+        Ok(b) if affinidi_tsp::is_tsp(&b) => b,
+        _ => {
+            debug!(%did_hash, "not writing a non-TSP live frame to a tsp-mux socket; it stays stored");
+            return ControlFlow::Continue(());
+        }
+    };
+    if let Err(e) = socket.send(Message::Binary(qb2.into())).await {
+        warn!("Failed to send TSP message to WebSocket client: {e}");
+        return ControlFlow::Break(());
+    }
+    inflight.insert(id);
     ControlFlow::Continue(())
 }
 

@@ -6,9 +6,14 @@
 //! handful of functions here and writes the frames they return, so the mux
 //! logic is testable and the hot loop's control flow barely changes.
 //!
-//! DIDComm only for now. A mux connection is negotiated with the
-//! [`MUX_SUBPROTOCOL`] WebSocket subprotocol (spec `messaging/mux/event/0.1`,
-//! "DIDComm sockets"). Raw TSP (`tsp-mux`, design §4.10) follows.
+//! Two wires. A DIDComm socket becomes a mux connection by negotiating the
+//! `didcomm-mux` WebSocket subprotocol ([`MUX_SUBPROTOCOL`]; the legacy
+//! `affinidi-mux` is still accepted, see [`mux_subprotocol`]), and its events
+//! are DIDComm messages (spec `messaging/mux/event/0.1`, "DIDComm sockets"). A
+//! raw-TSP socket negotiates `tsp-mux` ([`TSP_MUX_SUBPROTOCOL`]; spec
+//! "Raw-TSP sockets", design §4.10), and its events are TSP Direct messages
+//! from the mediator's VID to the principal's, written as Binary frames
+//! ([`MuxWire`]).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -17,7 +22,7 @@ use affinidi_messaging_mediator_common::store::mux::{MuxCapability, MuxChange};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 use uuid::Uuid;
 
 use super::grants::Ctx;
@@ -49,9 +54,41 @@ pub fn mux_subprotocol<'a>(offered: impl IntoIterator<Item = &'a String>) -> Opt
     legacy.then_some(LEGACY_MUX_SUBPROTOCOL)
 }
 
+/// WebSocket subprotocol a raw-TSP client offers, after `tsp` and `tsp-ack`,
+/// to open a mux connection. It implies `tsp-ack` (delete-to-ack) delivery.
+pub const TSP_MUX_SUBPROTOCOL: &str = "tsp-mux";
+
 /// `messaging/mux/event` type URI.
-#[cfg(feature = "didcomm")]
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/event/0.1";
+
+/// The wire a mux connection's events travel on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MuxWire {
+    /// `didcomm-mux`: events are DIDComm messages, written as Text frames.
+    DidComm,
+    /// `tsp-mux`: events are TSP Direct messages sealed to the principal's
+    /// VID, written as Binary frames.
+    Tsp,
+}
+
+/// One event, ready to write to the socket.
+#[derive(Debug)]
+pub enum EventFrame {
+    /// A packed DIDComm message.
+    Text(String),
+    /// A sealed TSP message (qb2).
+    Binary(Vec<u8>),
+}
+
+impl From<EventFrame> for axum::extract::ws::Message {
+    fn from(frame: EventFrame) -> Self {
+        match frame {
+            EventFrame::Text(t) => Self::Text(t.into()),
+            EventFrame::Binary(b) => Self::Binary(b.into()),
+        }
+    }
+}
 
 fn rfc3339(secs: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
@@ -103,6 +140,27 @@ fn grant_id(member: &MuxMember) -> Option<&str> {
     }
 }
 
+/// The signed `messaging/mux/event` document for `payload`, addressed to the
+/// principal.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+async fn signed_event(state: &SharedData, principal_did: &str, payload: Value) -> Option<Value> {
+    let doc = json!({
+        "id": format!("urn:uuid:{}", Uuid::new_v4()),
+        "type": EVENT_TYPE,
+        "issuer": state.config.mediator_did,
+        "recipient": principal_did,
+        "issuedAt": rfc3339(state.clock.unix_secs()),
+        "payload": payload,
+    });
+    match crate::messages::protocols::trust_task_sign::sign_response(doc, state).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("mux event not signed: {e}");
+            None
+        }
+    }
+}
+
 /// Sign a `messaging/mux/event` payload as the mediator and pack it to the
 /// principal, ready to write to the socket.
 #[cfg(feature = "didcomm")]
@@ -110,22 +168,7 @@ pub async fn pack_event(state: &SharedData, principal_did: &str, payload: Value)
     use affinidi_messaging_didcomm::message::Message;
     let mediator_did = &state.config.mediator_did;
     let now = state.clock.unix_secs();
-    let doc = json!({
-        "id": format!("urn:uuid:{}", Uuid::new_v4()),
-        "type": EVENT_TYPE,
-        "issuer": mediator_did,
-        "recipient": principal_did,
-        "issuedAt": rfc3339(now),
-        "payload": payload,
-    });
-    let signed = match crate::messages::protocols::trust_task_sign::sign_response(doc, state).await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("mux event not signed: {e}");
-            return None;
-        }
-    };
+    let signed = signed_event(state, principal_did, payload).await?;
     let message = Message::build(
         Uuid::new_v4().to_string(),
         crate::messages::protocols::trust_tasks::ENVELOPE_TYPE.to_string(),
@@ -158,16 +201,151 @@ pub async fn pack_event(_: &SharedData, _: &str, _: Value) -> Option<String> {
     None
 }
 
+/// Sign a `messaging/mux/event` payload as the mediator and seal it as a TSP
+/// Direct message from the mediator's VID to the principal's — the same
+/// sealing a TSP management Trust Task response gets — for a `tsp-mux`
+/// socket. The signed document is the TSP payload, verbatim.
+#[cfg(feature = "tsp")]
+pub async fn seal_event(
+    state: &SharedData,
+    principal_did: &str,
+    payload: Value,
+) -> Option<Vec<u8>> {
+    let signed = signed_event(state, principal_did, payload).await?;
+    let identity = match state.tsp_identity().await {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("mux event not sealed, no mediator TSP identity: {e}");
+            return None;
+        }
+    };
+    let recipient =
+        match crate::messages::inbound::resolve_tsp_vid(state, principal_did, "mux-event").await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("mux event not sealed, principal VID unresolved: {e}");
+                return None;
+            }
+        };
+    let bytes = match serde_json::to_vec(&signed) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("mux event not serialised: {e}");
+            return None;
+        }
+    };
+    match affinidi_tsp::message::direct::pack(
+        &bytes,
+        affinidi_tsp::MessageType::Direct,
+        &identity.vid,
+        principal_did,
+        &identity.signing_key,
+        &recipient.encryption_key,
+    ) {
+        Ok(packed) => Some(packed.bytes),
+        Err(e) => {
+            warn!("mux event not sealed: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "tsp"))]
+pub async fn seal_event(_: &SharedData, _: &str, _: Value) -> Option<Vec<u8>> {
+    None
+}
+
+/// `payload` as an event frame for `wire`.
+pub async fn event(
+    state: &SharedData,
+    wire: MuxWire,
+    principal_did: &str,
+    payload: Value,
+) -> Option<EventFrame> {
+    match wire {
+        MuxWire::DidComm => pack_event(state, principal_did, payload)
+            .await
+            .map(EventFrame::Text),
+        MuxWire::Tsp => seal_event(state, principal_did, payload)
+            .await
+            .map(EventFrame::Binary),
+    }
+}
+
+/// The `refused` event for an inbound frame refused on a `tsp-mux` socket
+/// (spec `messaging/mux/event`, "In-band refusals").
+///
+/// `frameId` is the lowercase hex SHA-256 of the frame's exact bytes and
+/// `code` the refusal code the traffic monitor reports for the same refusal;
+/// the sender and receiver are read from the frame's cleartext envelope where
+/// it parses. `None` when the event cannot be sealed, and then the caller
+/// must report the refusal some other way (by closing the socket): a refusal
+/// reported nowhere leaves the sender believing the frame went (R1.1).
+#[cfg(feature = "tsp")]
+pub async fn refused_event(
+    state: &SharedData,
+    conn: &MuxConn,
+    frame: &[u8],
+    error: &affinidi_messaging_mediator_common::errors::MediatorError,
+) -> Option<EventFrame> {
+    let payload = refused_payload(frame, error);
+    let principal = conn.session.lock().await.principal_did.clone();
+    seal_event(state, &principal, payload)
+        .await
+        .map(EventFrame::Binary)
+}
+
+/// The `refused` payload, separated out for testing.
+#[cfg(feature = "tsp")]
+fn refused_payload(
+    frame: &[u8],
+    error: &affinidi_messaging_mediator_common::errors::MediatorError,
+) -> Value {
+    /// The spec's `MuxDid` shape; anything else is left out rather than sent.
+    fn mux_did(s: &str) -> bool {
+        s.len() <= 2048
+            && s.strip_prefix("did:").is_some_and(|rest| {
+                rest.split_once(':').is_some_and(|(method, id)| {
+                    !method.is_empty()
+                        && method
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                        && !id.is_empty()
+                        && !id.chars().any(char::is_whitespace)
+                })
+            })
+    }
+    let (code, reason) = crate::monitor::refusal_outcome(error);
+    let mut v = json!({
+        "event": "refused",
+        "frameId": sha256::digest(frame),
+        "code": code,
+    });
+    if let Ok(meta) = affinidi_tsp::MetaEnvelope::parse(frame) {
+        if mux_did(&meta.sender) {
+            v["sender"] = json!(meta.sender);
+        }
+        if mux_did(&meta.receiver) {
+            v["receiver"] = json!(meta.receiver);
+        }
+    }
+    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+        v["reason"] = json!(reason.chars().take(512).collect::<String>());
+    }
+    v
+}
+
 /// Open a mux connection for `session`: admit its stored grants, register
 /// every member on `tx`, publish it in the registry, and return it with the
-/// `ready` and `attached` frames to write first.
+/// `ready` and `attached` frames to write first, in that order.
 pub async fn open(
     state: &SharedData,
     session: &Session,
     tx: mpsc::Sender<QueuedCommand>,
     resync: Arc<AtomicBool>,
     slots: Arc<super::fair_queue::MuxSlots>,
-) -> (Arc<MuxConn>, Vec<String>) {
+    wire: MuxWire,
+) -> (Arc<MuxConn>, Vec<EventFrame>) {
     let limits = &state.config.limits.mux;
     let mut mux = MuxSession::new(
         &session.did,
@@ -218,15 +396,16 @@ pub async fn open(
         "sessionExpiresAt": rfc3339(session.expires_at),
         "pendingNotices": pending_notices,
     });
-    frames.extend(pack_event(state, &session.did, ready).await);
+    frames.extend(event(state, wire, &session.did, ready).await);
     if !admitted.is_empty() {
         let dids: Vec<Value> = admitted
             .iter()
             .map(|m| attached(m, "connect", true))
             .collect();
         frames.extend(
-            pack_event(
+            event(
                 state,
+                wire,
                 &session.did,
                 json!({ "event": "attached", "dids": dids }),
             )
@@ -242,8 +421,9 @@ pub async fn open(
             .map(|r| detached(&r.did, Some(&r.grant_id), r.reason))
             .collect();
         frames.extend(
-            pack_event(
+            event(
                 state,
+                wire,
                 &session.did,
                 json!({ "event": "detached", "dids": dids }),
             )
@@ -305,7 +485,8 @@ pub async fn on_member_change(
     state: &SharedData,
     conn: &MuxConn,
     change_: MemberChange,
-) -> Option<String> {
+    wire: MuxWire,
+) -> Option<EventFrame> {
     let hash = match &change_ {
         MemberChange::Superseded { did_hash }
         | MemberChange::Inactive { did_hash }
@@ -334,12 +515,12 @@ pub async fn on_member_change(
             json!({ "event": "attached", "dids": [attached(&member, "reactivated", true)] })
         }
     };
-    pack_event(state, &principal, payload).await
+    event(state, wire, &principal, payload).await
 }
 
 /// Members that joined or left since the last call, as at most one
 /// `attached` and one `detached` frame.
-pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
+pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) -> Vec<EventFrame> {
     let joined: Vec<MuxMember> = std::mem::take(&mut *conn.joined.lock().await);
     let left: Vec<(MuxMember, LeaveReason)> = std::mem::take(&mut *conn.left.lock().await);
     let principal = conn.session.lock().await.principal_did.clone();
@@ -347,8 +528,9 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
     if !joined.is_empty() {
         let dids: Vec<Value> = joined.iter().map(|m| attached(m, "grant", true)).collect();
         frames.extend(
-            pack_event(
+            event(
                 state,
+                wire,
                 &principal,
                 json!({ "event": "attached", "dids": dids }),
             )
@@ -361,8 +543,9 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
             .map(|(m, r)| detached(&m.did, grant_id(m), *r))
             .collect();
         frames.extend(
-            pack_event(
+            event(
                 state,
+                wire,
                 &principal,
                 json!({ "event": "detached", "dids": dids }),
             )
@@ -614,4 +797,57 @@ pub async fn close(state: &SharedData, session: &Session, conn: &MuxConn) {
         .await;
     }
     state.mux.remove(&session.session_id, &session.did_hash);
+}
+
+#[cfg(all(test, feature = "tsp"))]
+mod tests {
+    use super::refused_payload;
+    use affinidi_messaging_mediator_common::errors::MediatorError;
+    use affinidi_messaging_sdk::messages::problem_report::{
+        ProblemReportScope, ProblemReportSorter,
+    };
+    use http::StatusCode;
+
+    fn refusal() -> MediatorError {
+        MediatorError::problem(
+            73,
+            "s",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Message,
+            "authorization.access_list.denied",
+            "delivery blocked by the recipient's access list",
+            vec![],
+            StatusCode::FORBIDDEN,
+        )
+    }
+
+    /// The payload a `tsp-mux` socket sends for a refused frame matches the
+    /// spec's generated type, and names the frame by the SHA-256 of its exact
+    /// bytes with the code the traffic monitor reports.
+    #[test]
+    fn refused_payload_matches_the_spec_and_the_monitor() {
+        use crate::task_specs::messaging::mux::event::v0_1::Payload;
+        let frame = b"\xf8not really a TSP frame";
+        let error = refusal();
+        let v = refused_payload(frame, &error);
+        assert_eq!(v["event"], "refused");
+        assert_eq!(v["frameId"], sha256::digest(&frame[..]));
+        assert_eq!(v["code"], crate::monitor::refusal_outcome(&error).0);
+        // Unreadable envelope: no sender or receiver is claimed.
+        assert!(v.get("sender").is_none() && v.get("receiver").is_none());
+        serde_json::from_value::<Payload>(v.clone())
+            .unwrap_or_else(|e| panic!("refused payload is not the spec's shape: {e}\n{v:#}"));
+    }
+
+    /// An internal failure reports a stable code and no detail.
+    #[test]
+    fn an_internal_failure_is_reported_without_detail() {
+        let v = refused_payload(
+            b"x",
+            &MediatorError::InternalError(1, "s".into(), "redis down at 10.0.0.1".into()),
+        );
+        assert_eq!(v["code"], "internalError");
+        assert!(v.get("reason").is_none());
+    }
 }

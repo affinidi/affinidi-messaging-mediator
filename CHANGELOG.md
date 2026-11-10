@@ -44,6 +44,102 @@ mediator-tui 0.11.0); they are no longer updated.
 - The mediator gains a `test-hooks` feature (test-only pause points, never
   for deployed builds). The test mediator enables it for its own tests, which
   now cover a suspension landing while a mux connection is opening (#106).
+### Added — DID multiplexing on raw-TSP sockets (`tsp-mux`)
+
+- A raw-TSP WebSocket can now be a mux connection (spec
+  `messaging/mux/event/0.1`, "Raw-TSP sockets"). The client offers `tsp`,
+  `tsp-ack`, `tsp-mux` in that order. The mediator selects `tsp-mux` only in
+  a TSP build with `limits.mux.enabled` on and a streaming task running.
+  Otherwise it selects `tsp-ack` or `tsp` as before, so a mediator that will
+  not multiplex never claims it will. A `tsp-mux` offer that is not selected
+  is no longer echoed back. `tsp-mux` implies `tsp-ack`.
+- On a `tsp-mux` socket the mux events (`ready` first, then `attached` for
+  grants carried on connect, then `attached`/`detached` as members change)
+  are signed `messaging/mux/event` documents. Each is sent as a TSP Direct
+  message from the mediator's VID to the principal's, in a Binary frame. Mux
+  Trust Tasks use the existing TSP Trust Task path, and their responses
+  arrive through the principal's inbox. If `ready` cannot be sealed, the
+  socket closes (1011) instead of running a mux connection the client
+  cannot see.
+- Members' live frames arrive untagged on the principal's socket. The
+  client routes each one by the receiver VID in its envelope. A frame stays
+  stored until it is acked.
+- **In-band refusals.** On a `tsp-mux` socket a refused inbound frame no
+  longer closes the socket. The mediator sends a `refused` event with
+  `frameId` (lowercase hex SHA-256 of the frame's exact bytes) and `code`
+  (the traffic monitor's refusal code). Where it can read them, it adds
+  `sender`, `receiver` and `reason`. The socket still closes when the
+  principal's token expires, when the principal's account is blocked, on a
+  protocol violation (a Text or non-TSP frame), and when the event cannot
+  be sealed. Plain `tsp` and `tsp-ack` still close on a refusal.
+- **Inbox drain.** On connect, a `tsp-mux` drain empties the principal's
+  inbox first. It then goes round-robin through the attached members with
+  `pickup`, one bounded page per member per round. A resync drains the
+  principal and only the members owed one (per-member resync, as on a
+  DIDComm mux connection). The principal's own live notifications drain
+  only the principal. Nothing is
+  deleted on send. An ack (a delete by message id) is authorised against
+  the owning member's `delete` scope, so a member without `delete` keeps
+  its frames in its inbox.
+- Membership is re-checked before each drain page and each live write, so
+  a member detached part-way through a drain gets nothing more. Closing a
+  `tsp-mux` socket tears down its mux connection. That now also happens
+  when a mux socket closes during flush-on-connect or because its token had
+  already expired.
+
+### Added — DID multiplexing audit records
+
+The `messaging/mux/*` specs require an audit record for each of these, and
+the mediator wrote none. Each is now in the audit log (`audit/list`), with
+the new actions from affinidi-messaging-mediator-types 0.1.1:
+
+- `mux_grant_revoke`: one entry per grant `messaging/mux/revoke` removed.
+  The actor is the party that revoked; the target is the other party.
+- `mux_revoke_all`: a `messaging/mux/revoke-all` that advanced the member's
+  epoch, with the new epoch and how many grants it voided. The target is the
+  member DID.
+- `mux_grant_suspend`: one entry per grant the unknown-key rule suspended,
+  whether fired by a statement or by a direct login. The actor is the member
+  DID whose key fired it; the target is the principal that lost the grant.
+  On a direct login it is written before the login answers.
+
+Recording is best-effort, like every audit entry: a failure is logged and
+never undoes the change.
+
+### Changed — DID multiplexing connections (R3.6)
+
+- **Subprotocol `didcomm-mux`.** A DIDComm socket now becomes a mux
+  connection by offering `didcomm-mux`, the name `messaging/mux/event/0.1`
+  defines (trustoverip/dtgwg-trust-tasks-tf#1078). The provisional
+  `affinidi-mux` that SDK 0.45.1 and 0.45.2 offer is still accepted; when a
+  client offers both, `didcomm-mux` is selected. SDK 0.45.3 offers the new
+  name.
+- **`connectionFull`.** A connection already carrying
+  `max_dids_per_connection` members now says so instead of leaving the
+  client to infer it. On connect, valid grants it has no room for are listed
+  in the `detached` event with reason `connectionFull`. A grant stored while
+  the principal is connected, which the connection has no room for, gets a
+  `detached` / `connectionFull` event too. Previously the first case
+  was logged only, with the wrong reason, and the second only logged.
+  Grants are now validated before the connection's room is checked, so a
+  grant reported `connectionFull` is a valid one.
+- **`attachedNow`.** A stored grant's outcome in the `messaging/mux/grant`
+  response now carries `attachedNow`, which the schema requires: whether a
+  connection on this instance took the member at once.
+- **Event entries match the schema.** `detached` entries carry only `did`,
+  `reason` and `grantId`. They used to carry `scope`, `expiresAt` and
+  (for `superseded`) `deliveryActive`, which the spec allows on `attached`
+  entries only. `attached` entries always carry `deliveryActive`. The
+  `attached` event that marks a member inactive, because the DID's own
+  direct socket keeps its traffic, now gives the reason the member joined by
+  (`connect` or `attach`) instead of `superseded`, which is not an attach
+  reason.
+- **Login check bounded.** The unknown-key check on a direct login now
+  reads the DID's grants and resolves its key within 5 s
+  (`mux::notice::CHECK_READ_TIMEOUT`). A slow store or resolver refuses the
+  login as retryable (`me.res.storage.error`, 503) instead of holding it
+  open. The commit and detach that follow are not cut short. Each refusal
+  counts in the new `mux_login_check_failures_total` metric.
 ### Added — the mux `send` scope on the inbound path
 
 - A mux connection now accepts a frame whose sender is one of its member
