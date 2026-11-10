@@ -675,9 +675,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-types"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b377b5a31439c9a7503a2def750d073906a40930ac101fdc8a4cb123095f370"
+checksum = "03c53b3184bc0aadf4aa7fccb71b904c95e962fc735fbf855f5c6f21988faa9c"
 dependencies = [
  "regex",
  "serde",
