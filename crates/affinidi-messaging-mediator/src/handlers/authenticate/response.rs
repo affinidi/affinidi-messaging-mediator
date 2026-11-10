@@ -335,6 +335,24 @@ pub async fn authentication_response(
             )
             .into());
         }
+        // The mux unknown-key rule on the authcrypt sender key, before any
+        // token is issued: a login that cannot be checked fails (fail closed).
+        let mux_suspended = if state.config.limits.mux.enabled && state.database.supports_mux() {
+            Some(
+                crate::mux::notice::unknown_key_check(
+                    &state,
+                    &session.did_hash,
+                    crate::mux::notice::DirectKey::Authcrypt(
+                        unpack_metadata.encrypted_from_kid.clone(),
+                    ),
+                )
+                .await
+                .map_err(super::helpers::mux_check_failed)?,
+            )
+        } else {
+            None
+        };
+
         let old_sid = session.session_id;
         session.session_id = create_random_string(12);
 
@@ -406,32 +424,12 @@ pub async fn authentication_response(
             .authenticated(&state, &session.did_hash)
             .await;
 
-        // A member DID that authenticated directly learns, once per change of
-        // its grants, that delegations of it exist (`messaging/mux/notice`
-        // `grantsPresent`). In the background: login does not wait on it.
-        if state.config.limits.mux.enabled && state.database.supports_mux() {
+        // Notices the unknown-key check owes; login does not wait on them.
+        if let Some(suspended) = mux_suspended {
             let (state, did, did_hash) =
                 (state.clone(), session.did.clone(), session.did_hash.clone());
-            let sender_kid = unpack_metadata.encrypted_from_kid.clone();
             tokio::spawn(async move {
-                // The authcrypt sender key, compared with the member's
-                // recorded key-agreement keys (the unknown-key rule).
-                let proven = match sender_kid {
-                    Some(kid) => {
-                        match crate::mux::proof::StatementVerifier::new(state.did_resolver.clone())
-                            .key_agreement_fp(&kid)
-                            .await
-                        {
-                            Ok(fp) => Some(crate::mux::notice::ProvenKey::KeyAgreement(fp)),
-                            Err(e) => {
-                                tracing::debug!("authcrypt sender key not checked: {e}");
-                                None
-                            }
-                        }
-                    }
-                    None => None,
-                };
-                crate::mux::notice::on_direct_auth(&state, &did, &did_hash, proven).await;
+                crate::mux::notice::after_direct_auth(&state, &did, &did_hash, suspended).await;
             });
         }
 

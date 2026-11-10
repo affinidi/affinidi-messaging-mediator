@@ -57,6 +57,8 @@ pub enum StatementError {
         requested: u64,
         max: u64,
     },
+    /// The member DID could not be resolved now.
+    DidUnresolvable(String),
 }
 
 impl std::fmt::Display for StatementError {
@@ -79,6 +81,7 @@ impl std::fmt::Display for StatementError {
                 f,
                 "statement lifetime {requested}s exceeds the maximum of {max}s"
             ),
+            Self::DidUnresolvable(why) => write!(f, "member DID could not be resolved: {why}"),
         }
     }
 }
@@ -98,6 +101,7 @@ impl StatementError {
             StatementError::NotYetValid => "notYetValid",
             StatementError::Expired => "statementExpired",
             StatementError::LifetimeTooLong { .. } => "lifetimeTooLong",
+            StatementError::DidUnresolvable(_) => "didUnresolvable",
         }
     }
 }
@@ -245,8 +249,13 @@ impl StatementVerifier {
         }
         check_times(st.iat, st.exp, &expect)?;
         // The member's key-agreement keys now, the known keys a later direct
-        // DIDComm authentication is compared with (the unknown-key rule).
-        let key_agreement_fps = self.key_agreement_fps(&st.issuer).await;
+        // DIDComm authentication is compared with (the unknown-key rule). A
+        // grant whose keys cannot be read is refused, not stored without
+        // them: an empty set means the DID listed none.
+        let key_agreement_fps = self
+            .key_agreement_fps(&st.issuer)
+            .await
+            .map_err(StatementError::DidUnresolvable)?;
 
         Ok(MuxGrant {
             grant_id: st.grant_id,
@@ -351,20 +360,24 @@ impl StatementVerifier {
         )
     }
 
-    /// Fingerprints of `did`'s `keyAgreement` keys as resolved now. Empty
-    /// when the DID cannot be resolved or lists none: a grant stored that way
-    /// gives no basis for the direct-authentication unknown-key rule.
-    pub async fn key_agreement_fps(&self, did: &str) -> Vec<String> {
-        let Ok(resolved) = self.resolver.client().resolve(did).await else {
-            return Vec::new();
-        };
+    /// Fingerprints of `did`'s `keyAgreement` keys as resolved now; empty
+    /// when it lists none. `Err` when the DID cannot be resolved, which is
+    /// not the same as listing none.
+    pub async fn key_agreement_fps(&self, did: &str) -> Result<Vec<String>, String> {
+        let resolved = self
+            .resolver
+            .client()
+            .resolve(did)
+            .await
+            .map_err(|e| format!("resolve {did}: {e}"))?;
         let doc = &resolved.doc;
-        doc.key_agreement
+        Ok(doc
+            .key_agreement
             .iter()
             .filter_map(|r| key_agreement_method(doc, r))
             .filter_map(|m| m.decode_public_key().ok())
             .map(|(_, bytes)| fingerprint(&bytes))
-            .collect()
+            .collect())
     }
 
     /// The fingerprint of the `keyAgreement` key `kid` (an authcrypt sender

@@ -505,6 +505,16 @@ async fn a_login_with_a_key_agreement_key_added_since_the_grant_suspends_it() {
 
     fresh_login(&env, &member).await;
 
+    // Committed before the login answered, not in the background.
+    let rec = mux::load(&*store, &member.did_hash(), &MuxLimits::default(), now())
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.grants[0].state,
+        mux::MuxGrantState::Suspended,
+        "suspended by the time the login succeeds"
+    );
+
     let got = wait_for_notices(&env, &phone, 1).await;
     assert_eq!(got[0]["payload"]["notice"], "grantsSuspended");
     assert_eq!(

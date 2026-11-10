@@ -57,6 +57,7 @@ impl MuxError {
             self,
             MuxError::Store(MuxStoreError::Contended | MuxStoreError::Store(_))
                 | MuxError::MemberQuota { .. }
+                | MuxError::Statement(StatementError::DidUnresolvable(_))
         )
     }
 }

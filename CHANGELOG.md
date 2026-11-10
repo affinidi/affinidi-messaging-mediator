@@ -42,9 +42,22 @@ mediator-tui 0.11.0); they are no longer updated.
   only if the VID's signing key signed none of the active grants. A member
   that logs in directly with keys it already had keeps its grants; a key
   added since suspends them, with the same notices as any other suspension.
-  A grant stored before this release recorded no key-agreement keys, so a
-  DIDComm login does not fire the rule while one is active. Spec:
+  A DID that listed no `keyAgreement` keys when it granted has none known,
+  so its first one suspends its grants. Spec:
   trustoverip/dtgwg-trust-tasks-tf#1072.
+- **Behaviour change (login):** for a DID with active mux grants, the
+  unknown-key check runs before the login succeeds, and its suspensions are
+  committed and detached before tokens are issued. If the check cannot run,
+  because the sender key does not resolve or the store fails, the login is
+  refused with `me.res.storage.error` (HTTP 503) and the client retries. A
+  DID with no active grant is unaffected and never resolved for this.
+- A grant whose member DID cannot be resolved for its `keyAgreement` keys is
+  refused with `messaging/mux:didUnresolvable` (retryable). Before, it was
+  stored with no keys recorded, which switched the DIDComm unknown-key rule
+  off for every grant on that DID.
+- A mux connection now re-reads its grants once it is published, so a
+  revocation or suspension committed while it was opening detaches the
+  member at once rather than at the next sweep.
 - `grantsExpiring` is stored once per grant, for active grants past about
   three quarters of their lifetime. It is checked when the principal logs
   in, when it opens a mux connection, and on the key re-check timer while

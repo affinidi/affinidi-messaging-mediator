@@ -173,6 +173,22 @@ pub(super) fn _create_refresh_token(
     Ok((refresh_token, refresh_claims.exp, token_hash))
 }
 
+/// The login could not apply the mux unknown-key rule; the client retries.
+pub(super) fn mux_check_failed(e: String) -> MediatorError {
+    MediatorError::problem_with_log(
+        14,
+        "",
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "me.res.storage.error",
+        "Database transaction error: {1}",
+        vec![e.clone()],
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("mux unknown-key rule not applied, login refused: {e}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
