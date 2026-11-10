@@ -180,27 +180,24 @@ pub(crate) async fn handle_inbound_tsp(
     // there (see `mux::connection::sender_session`); the frame is then the
     // member's from here on. As on the DIDComm side, `send` admits only what
     // *sends*: opaque delivery and the routed / nested relay arms, never a
-    // Direct or Control message to the mediator itself (`member_refusal`
-    // keeps the refusal for that branch).
-    let member;
+    // Direct or Control message to the mediator itself. The frame runs as the
+    // member only once it is admitted as one of those: until then, every step
+    // (resolving and unpacking a layer addressed to the mediator) runs under
+    // the principal's own session, and a Direct or Control frame is refused
+    // with the original mismatch (`member_refusal`).
+    let mut member: Option<Session> = None;
     let mut member_refusal = None;
-    let session = if state.config.security.force_session_did_match && session.authenticated {
-        match check_direct_delivery_session_match(session, Some(meta.sender.as_str())) {
-            Ok(()) => session,
-            Err(refused) => {
-                member = crate::mux::connection::sender_session(state, session, &meta.sender).await;
-                match &member {
-                    Some(member) => {
-                        member_refusal = Some(refused);
-                        member
-                    }
-                    None => return Err(refused),
-                }
-            }
+    if state.config.security.force_session_did_match
+        && session.authenticated
+        && let Err(refused) =
+            check_direct_delivery_session_match(session, Some(meta.sender.as_str()))
+    {
+        member = crate::mux::connection::sender_session(state, session, &meta.sender).await;
+        if member.is_none() {
+            return Err(refused);
         }
-    } else {
-        session
-    };
+        member_refusal = Some(refused);
+    }
 
     // The message kind (Direct/Routed/Nested/Control) now lives in the ENCRYPTED
     // payload, not the cleartext envelope, so a keys-free relay can no longer
@@ -213,6 +210,8 @@ pub(crate) async fn handle_inbound_tsp(
         &meta.receiver,
         &state.config.mediator_did,
     ) {
+        // Opaque delivery is a send: a member admitted above sends it as itself.
+        let session = member.as_ref().unwrap_or(session);
         // Direct delivery, and subject to the same two gates the DIDComm
         // direct-delivery branch applies. `docs/acls.md` §6 documents this flow
         // as "Direct delivery (DIDComm and TSP)" and has always promised both.
@@ -282,6 +281,8 @@ pub(crate) async fn handle_inbound_tsp(
     {
         return Err(refused);
     }
+    // Admitted: a relay arm, sent by the member as itself from here on.
+    let session = member.as_ref().unwrap_or(session);
 
     // Peer-mediator allowlist for the branches where we act as a *relay*.
     //

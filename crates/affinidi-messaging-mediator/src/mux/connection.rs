@@ -479,7 +479,6 @@ pub async fn sender_session(
     use affinidi_messaging_mediator_common::{
         did_identity::did_hash, store::mux::MuxScope, types::acls::MediatorACLSet,
     };
-    use affinidi_messaging_sdk::protocols::mediator::accounts::AccountType;
 
     let hash = did_hash(sender_did);
     if hash == session.did_hash
@@ -487,14 +486,17 @@ pub async fn sender_session(
     {
         return None;
     }
+    // A member must have an account: a grant or attach is refused without
+    // one, so a member without one now has lost it, and is refused rather than
+    // given the deployment's default ACLs.
     let (acls, account_type) = match state.database.account_get(&hash).await {
         Ok(Some(account)) => (MediatorACLSet::from_u64(account.acls), account._type),
-        Ok(None) => (
-            state.config.security.global_acl_default.clone(),
-            AccountType::Unknown,
-        ),
+        Ok(None) => {
+            debug!(principal = %session.did_hash, session_id = %session.session_id, member = %hash, "mux send refused: member has no account");
+            return None;
+        }
         Err(e) => {
-            warn!(member = %hash, "mux send refused: member account unreadable: {e}");
+            warn!(principal = %session.did_hash, session_id = %session.session_id, member = %hash, "mux send refused: member account unreadable: {e}");
             return None;
         }
     };
