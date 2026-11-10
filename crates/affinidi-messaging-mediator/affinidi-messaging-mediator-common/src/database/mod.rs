@@ -623,6 +623,7 @@ impl DatabaseHandler {
 
 /// A query about the database server itself (version, cluster layout)
 /// failed.
+#[cfg(feature = "redis-backend")]
 fn storage_info_error(err: &redis::RedisError) -> MediatorError {
     MediatorError::problem_with_log(
         6,
