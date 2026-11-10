@@ -160,6 +160,26 @@ pub struct MuxGrant {
     /// The grant statement exactly as the member signed it (with its Data
     /// Integrity proof), kept for audit and returned verbatim by listings.
     pub statement: serde_json::Value,
+    /// Whether the durable notice for this grant's dead state (`suspended`
+    /// or `epochRevoked`) is in its principal's inbox. A notice lost to a
+    /// crash between the state change and the notice is re-sent while this
+    /// is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub noticed: bool,
+    /// Fingerprints (SHA-256 of the public key) of the member DID's
+    /// `keyAgreement` keys when the grant was stored: the known keys a direct
+    /// DIDComm authentication, which proves a key-agreement key, is compared
+    /// with (the unknown-key rule). Empty when the DID listed none; a grant
+    /// whose keys could not be read is refused, never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_agreement_fps: Vec<String>,
+    /// Whether the `grantsExpiring` notice for this grant is stored.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expiring_noticed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl MuxGrant {
@@ -184,6 +204,14 @@ impl MuxGrant {
     /// Whether the grant authorises anything at `now`.
     pub fn is_usable(&self, now: u64) -> bool {
         self.state_at(now) == MuxGrantState::Active
+    }
+
+    /// Whether the grant is active and past about three quarters of its
+    /// lifetime (`grantsExpiring`).
+    pub fn is_expiring(&self, now: u64) -> bool {
+        let exp = self.effective_exp();
+        let lifetime = exp.saturating_sub(self.iat);
+        self.is_usable(now) && now >= self.iat.saturating_add(lifetime / 4 * 3)
     }
 
     fn set_state(&mut self, state: MuxGrantState, now: u64) {
@@ -216,7 +244,21 @@ pub struct MuxDidRecord {
     pub grants: Vec<MuxGrant>,
     #[serde(default)]
     pub replay_floors: Vec<MuxReplayFloor>,
+    /// Ids of `messaging/mux/notice` messages stored in this DID's own inbox
+    /// (as a principal, or as a member for `grantsPresent`), newest last, so
+    /// a `ready` event can say how many still wait. Bounded by
+    /// [`MAX_TRACKED_NOTICES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// The grant set ([`MuxDidRecord::grants_digest`]) this DID was last told
+    /// about in a `grantsPresent` notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_told: Option<String>,
 }
+
+/// The most notice ids a record tracks; older ones are forgotten (the notices
+/// themselves stay in the inbox until deleted).
+pub const MAX_TRACKED_NOTICES: usize = 256;
 
 impl MuxDidRecord {
     /// Principals that currently have an entry (in any state) for this DID —
@@ -231,7 +273,40 @@ impl MuxDidRecord {
     /// Whether the record holds nothing worth keeping. An epoch above zero is
     /// worth keeping: dropping it would bring back grants it voided.
     fn is_empty(&self) -> bool {
-        self.epoch == 0 && self.grants.is_empty() && self.replay_floors.is_empty()
+        self.epoch == 0
+            && self.grants.is_empty()
+            && self.replay_floors.is_empty()
+            && self.notices.is_empty()
+            && self.present_told.is_none()
+    }
+
+    /// Remember a notice stored in this DID's inbox.
+    pub fn track_notice(&mut self, msg_id: String) {
+        self.notices.push(msg_id);
+        let over = self.notices.len().saturating_sub(MAX_TRACKED_NOTICES);
+        self.notices.drain(..over);
+    }
+
+    /// A digest of the grant set on this DID (ids and states), so a
+    /// `grantsPresent` notice is sent once per change rather than on every
+    /// authentication.
+    pub fn grants_digest(&self, now: u64) -> String {
+        let mut entries: Vec<String> = self
+            .grants
+            .iter()
+            .map(|g| format!("{}:{:?}", g.grant_id, g.state_at(now)))
+            .collect();
+        entries.sort();
+        sha256::digest(format!("{}|{}", self.epoch, entries.join(",")))
+    }
+
+    /// Mark these grants' dead-state notices as stored.
+    pub fn mark_noticed(&mut self, grant_ids: &HashSet<String>) {
+        for g in self.grants.iter_mut() {
+            if grant_ids.contains(&g.grant_id) {
+                g.noticed = true;
+            }
+        }
     }
 
     fn floor_for(&self, principal_hash: &str) -> Option<u64> {
@@ -263,6 +338,49 @@ impl MuxDidRecord {
 pub struct MuxIndexDelta {
     pub add: Vec<String>,
     pub remove: Vec<String>,
+}
+
+/// Grants that changed on one mediator instance, published so the other
+/// instances sharing the store apply the change to their own live mux
+/// connections within moments rather than at their next periodic re-check
+/// (design §7.4).
+///
+/// Carries hashes only — never statements, DIDs or keys. A receiver re-reads
+/// each member's record and acts on what the store holds, so a record is a
+/// hint to look, not an instruction: a stale, duplicated or reordered one
+/// does no harm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxChangeRecord {
+    /// The instance that made the change (its streaming UUID), so it can
+    /// ignore its own records: it applied the change before publishing.
+    pub origin: String,
+    pub changes: Vec<MuxChange>,
+}
+
+/// One changed (member DID, principal) pair in a [`MuxChangeRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MuxChange {
+    /// The member DID's hash: whose record to re-read.
+    pub did_hash: String,
+    /// The principal's hash: whose live connections to reconcile.
+    pub principal_hash: String,
+    /// A grant was just stored for this pair, so a receiver may carry it on
+    /// the principal's live connections, as the originating instance does.
+    /// Without it a receiver only drops or narrows: a grant it did not just
+    /// see stored may be one its connection refused on connect (key not
+    /// checkable, member blocked), and only a reconnect re-runs those checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stored: bool,
+}
+
+impl MuxChange {
+    pub fn of(grant: &MuxGrant, stored: bool) -> Self {
+        Self {
+            did_hash: grant.did_hash.clone(),
+            principal_hash: grant.principal_hash.clone(),
+            stored,
+        }
+    }
 }
 
 /// Operator limits the grant rules enforce. See `[limits.mux]`.
@@ -441,6 +559,57 @@ pub fn revoke_principals(
     now: u64,
 ) -> Vec<MuxGrant> {
     revoke_where(rec, now, |g| principal_hashes.contains(&g.principal_hash))
+}
+
+/// The unknown-key rule for a direct DIDComm authentication, which proves a
+/// key-agreement key (`ka_fp`): suspend every active grant unless some active
+/// grant recorded that key. Each grant recorded the DID's key-agreement keys
+/// when it was stored, so a key listed then is known; one added since is
+/// not, including the first key of a DID that listed none.
+pub fn suspend_unless_known_key_agreement(
+    rec: &mut MuxDidRecord,
+    ka_fp: &str,
+    now: u64,
+) -> Vec<MuxGrant> {
+    let mut active = rec.grants.iter().filter(|g| g.is_usable(now)).peekable();
+    if active.peek().is_none()
+        || rec
+            .grants
+            .iter()
+            .any(|g| g.is_usable(now) && g.key_agreement_fps.iter().any(|f| f == ka_fp))
+    {
+        return Vec::new();
+    }
+    suspend_active(rec, now)
+}
+
+/// The unknown-key rule for a direct TSP authentication, which proves a
+/// signing key (`signing_fp`): suspend every active grant unless one was
+/// signed by that key.
+pub fn suspend_unless_known_signing_key(
+    rec: &mut MuxDidRecord,
+    signing_fp: &str,
+    now: u64,
+) -> Vec<MuxGrant> {
+    let mut active = rec.grants.iter().filter(|g| g.is_usable(now)).peekable();
+    if active.peek().is_none()
+        || rec
+            .grants
+            .iter()
+            .any(|g| g.is_usable(now) && g.key_fp == signing_fp)
+    {
+        return Vec::new();
+    }
+    suspend_active(rec, now)
+}
+
+fn suspend_active(rec: &mut MuxDidRecord, now: u64) -> Vec<MuxGrant> {
+    let mut suspended = Vec::new();
+    for g in rec.grants.iter_mut().filter(|g| g.is_usable(now)) {
+        g.set_state(MuxGrantState::Suspended, now);
+        suspended.push(g.clone());
+    }
+    suspended
 }
 
 /// Remove the grants with these ids on this DID.
@@ -625,12 +794,18 @@ pub async fn grants_for_principal<S: MediatorStore + ?Sized>(
 
 /// Remove everything mux holds about an account being removed, both as a
 /// member DID and as a principal.
+///
+/// Returns the grants that were usable on the account as a member DID: their
+/// principals are detached from it and told (`grantsRevoked`,
+/// `accountRemoved`). Grants the account held as a principal need no notice:
+/// the account and its inbox are gone.
 pub async fn remove_account<S: MediatorStore + ?Sized>(
     store: &S,
     did_hash: &str,
     limits: &MuxLimits,
     now: u64,
-) -> Result<(), MuxStoreError> {
+) -> Result<Vec<MuxGrant>, MuxStoreError> {
+    let mut as_member = Vec::new();
     // As a member: the whole record goes, and with it every principal's index
     // entry for it. The epoch goes too — the account itself is gone, and a
     // re-created account starts from nothing.
@@ -646,6 +821,11 @@ pub async fn remove_account<S: MediatorStore + ?Sized>(
             .mux_record_cas(did_hash, Some(rec.version), None, &delta)
             .await?
         {
+            as_member = rec
+                .grants
+                .into_iter()
+                .filter(|g| g.is_usable(now))
+                .collect();
             break;
         }
     }
@@ -671,7 +851,7 @@ pub async fn remove_account<S: MediatorStore + ?Sized>(
             .await?;
         }
     }
-    Ok(())
+    Ok(as_member)
 }
 
 #[cfg(test)]
@@ -703,6 +883,9 @@ mod tests {
             state: MuxGrantState::Active,
             state_changed_at: None,
             statement: serde_json::json!({}),
+            noticed: false,
+            key_agreement_fps: Vec::new(),
+            expiring_noticed: false,
         }
     }
 
@@ -1002,5 +1185,93 @@ mod tests {
         // The same key "coming back" changes nothing: the grant stays stale.
         assert!(suspend_unless_known_kid(&mut rec, "k1", NOW).is_empty());
         assert!(!rec.grants[0].is_usable(NOW));
+    }
+
+    #[test]
+    fn a_direct_didcomm_login_is_compared_with_recorded_key_agreement_keys() {
+        let mut rec = MuxDidRecord::default();
+        let mut g1 = grant("g1", "p1", "k1", NOW - 10, 0);
+        g1.key_agreement_fps = vec!["ka1".into(), "ka2".into()];
+        let mut g2 = grant("g2", "p2", "k1", NOW - 10, 0);
+        g2.key_agreement_fps = vec!["ka1".into()];
+        rec.grants = vec![g1, g2];
+
+        // A key-agreement key listed when the grants were stored is known,
+        // whichever grant recorded it.
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).is_empty());
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka2", NOW).is_empty());
+        // A key added since is not: every active grant is suspended.
+        let s = suspend_unless_known_key_agreement(&mut rec, "ka3", NOW);
+        assert_eq!(s.len(), 2);
+        assert!(
+            rec.grants
+                .iter()
+                .all(|g| g.state == MuxGrantState::Suspended)
+        );
+        // With nothing active, nothing more fires.
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka9", NOW).is_empty());
+    }
+
+    #[test]
+    fn a_grant_that_recorded_no_keys_does_not_exempt_the_others() {
+        // One grant recorded the key-agreement key, the other recorded none
+        // (its DID listed none then): an unknown key still suspends both.
+        let mut rec = MuxDidRecord::default();
+        let mut g1 = grant("g1", "p1", "k1", NOW - 10, 0);
+        g1.key_agreement_fps = vec!["ka1".into()];
+        rec.grants = vec![g1, grant("g2", "p2", "k1", NOW - 10, 0)];
+        assert!(suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).is_empty());
+        assert_eq!(
+            suspend_unless_known_key_agreement(&mut rec, "ka3", NOW).len(),
+            2
+        );
+        assert!(rec.grants.iter().all(|g| !g.is_usable(NOW)));
+    }
+
+    #[test]
+    fn the_first_key_agreement_key_of_a_did_that_listed_none_is_unknown() {
+        let mut rec = MuxDidRecord {
+            grants: vec![grant("g1", "p1", "k1", NOW - 10, 0)],
+            ..Default::default()
+        };
+        assert_eq!(
+            suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_direct_tsp_login_is_compared_with_the_grants_signing_keys() {
+        let mut rec = MuxDidRecord::default();
+        let mut g = grant("g1", "p1", "k1", NOW - 10, 0);
+        g.key_fp = "fp1".into();
+        rec.grants = vec![g];
+        assert!(suspend_unless_known_signing_key(&mut rec, "fp1", NOW).is_empty());
+        assert_eq!(
+            suspend_unless_known_signing_key(&mut rec, "fp2", NOW).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_grant_is_expiring_from_three_quarters_of_its_lifetime() {
+        // iat NOW, exp NOW + 3600: expiring from NOW + 2700 until it lapses.
+        let g = grant("g1", "p1", "k1", NOW, 0);
+        assert!(!g.is_expiring(NOW + 2699));
+        assert!(g.is_expiring(NOW + 2700));
+        assert!(g.is_expiring(NOW + 3599));
+        assert!(
+            !g.is_expiring(NOW + 3600),
+            "an expired grant is not expiring"
+        );
+        let mut narrowed = g.clone();
+        narrowed.narrowed_exp = Some(NOW + 400);
+        assert!(
+            narrowed.is_expiring(NOW + 300),
+            "the effective expiry counts"
+        );
+        let mut dead = g;
+        dead.state = MuxGrantState::Suspended;
+        assert!(!dead.is_expiring(NOW + 3000));
     }
 }

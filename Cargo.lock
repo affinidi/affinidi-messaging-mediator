@@ -382,7 +382,7 @@ checksum = "1878317a1ac3a7c06594cfcafc954e27956e14274d16e8652e1ecf952f8e8b32"
 dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.45.0",
+ "affinidi-messaging-sdk 0.45.4",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "affinidi-tsp",
@@ -436,7 +436,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator-common",
  "affinidi-messaging-mediator-config",
- "affinidi-messaging-sdk 0.45.0",
+ "affinidi-messaging-sdk 0.45.4",
  "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-task-utils",
@@ -505,7 +505,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.45.0",
+ "affinidi-messaging-sdk 0.45.4",
  "affinidi-messaging-test-mediator",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
@@ -675,9 +675,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-types"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b377b5a31439c9a7503a2def750d073906a40930ac101fdc8a4cb123095f370"
+checksum = "03c53b3184bc0aadf4aa7fccb71b904c95e962fc735fbf855f5c6f21988faa9c"
 dependencies = [
  "regex",
  "serde",
@@ -725,9 +725,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.45.0"
+version = "0.45.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8302fe6f491ab542b154191558554ea075c7e13352ab8a141d78038da864b86"
+checksum = "a0cfb61a4f793ea44a584c7d1052d28ebf96f4537b098f19dd7efc18353adeab"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -777,7 +777,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.45.0",
+ "affinidi-messaging-sdk 0.45.4",
  "affinidi-secrets-resolver",
  "affinidi-tdk 0.37.0",
  "affinidi-tdk-common",
@@ -1002,7 +1002,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.45.0",
+ "affinidi-messaging-sdk 0.45.4",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "clap",
@@ -7154,7 +7154,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a253edfdea34032da21af84e16fcc94f4c7a6ba237f9f3bc2dbf43cea8535c44"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",

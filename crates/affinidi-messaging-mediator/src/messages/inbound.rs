@@ -175,8 +175,28 @@ pub(crate) async fn handle_inbound_tsp(
     // `security.enable_inter_mediator_relay` — anonymous inbound is opt-in (that
     // flag, or the legacy implicit `SEND_FORWARDED` in `global_acl_default`),
     // which bounds the exposure to relay-enabled deployments.
-    if state.config.security.force_session_did_match && session.authenticated {
-        check_direct_delivery_session_match(session, Some(meta.sender.as_str()))?;
+    //
+    // On a mux connection the sender may instead be a member carrying `send`
+    // there (see `mux::connection::sender_session`); the frame is then the
+    // member's from here on. As on the DIDComm side, `send` admits only what
+    // *sends*: opaque delivery and the routed / nested relay arms, never a
+    // Direct or Control message to the mediator itself. The frame runs as the
+    // member only once it is admitted as one of those: until then, every step
+    // (resolving and unpacking a layer addressed to the mediator) runs under
+    // the principal's own session, and a Direct or Control frame is refused
+    // with the original mismatch (`member_refusal`).
+    let mut member: Option<Session> = None;
+    let mut member_refusal = None;
+    if state.config.security.force_session_did_match
+        && session.authenticated
+        && let Err(refused) =
+            check_direct_delivery_session_match(session, Some(meta.sender.as_str()))
+    {
+        member = crate::mux::connection::sender_session(state, session, &meta.sender).await;
+        if member.is_none() {
+            return Err(refused);
+        }
+        member_refusal = Some(refused);
     }
 
     // The message kind (Direct/Routed/Nested/Control) now lives in the ENCRYPTED
@@ -190,6 +210,8 @@ pub(crate) async fn handle_inbound_tsp(
         &meta.receiver,
         &state.config.mediator_did,
     ) {
+        // Opaque delivery is a send: a member admitted above sends it as itself.
+        let session = member.as_ref().unwrap_or(session);
         // Direct delivery, and subject to the same two gates the DIDComm
         // direct-delivery branch applies. `docs/acls.md` §6 documents this flow
         // as "Direct delivery (DIDComm and TSP)" and has always promised both.
@@ -250,6 +272,17 @@ pub(crate) async fn handle_inbound_tsp(
                 StatusCode::BAD_REQUEST,
             )
         })?;
+
+    if let Some(refused) = member_refusal
+        && !matches!(
+            unpacked.message_type,
+            TspMessageType::Routed | TspMessageType::Nested
+        )
+    {
+        return Err(refused);
+    }
+    // Admitted: a relay arm, sent by the member as itself from here on.
+    let session = member.as_ref().unwrap_or(session);
 
     // Peer-mediator allowlist for the branches where we act as a *relay*.
     //
@@ -1126,11 +1159,36 @@ async fn handle_inbound_didcomm(
                     // authcrypt encryption (encrypted_from_kid).
                     // Skip for unauthenticated sessions (e.g. inter-mediator relay):
                     // there is no session DID to match against.
-                    if state.config.security.force_session_did_match && session.authenticated {
+                    //
+                    // On a mux connection a sender other than the principal is
+                    // accepted only as a member carrying `send` there, and only
+                    // for a `forward`: `send` lets the member *send* through this
+                    // socket, not drive the mediator (pickup, Trust Tasks, admin)
+                    // on it. The sender here is the key that authenticated the
+                    // envelope, so the principal cannot send as a member.
+                    let member;
+                    let session = if state.config.security.force_session_did_match && session.authenticated {
                         let sender_kid =
                             metadata.sign_from.as_ref().or(metadata.encrypted_from_kid.as_ref());
-                        check_session_sender_match(session, &msg.id, &sender_kid)?;
-                    }
+                        match check_session_sender_match(session, &msg.id, &sender_kid) {
+                            Ok(()) => session,
+                            Err(refused) => {
+                                let sender_did = sender_kid.and_then(|kid| kid.split_once('#')).map(|(did, _)| did);
+                                member = match sender_did {
+                                    Some(did) if is_forward(&msg) => {
+                                        crate::mux::connection::sender_session(state, session, did).await
+                                    }
+                                    _ => None,
+                                };
+                                match &member {
+                                    Some(member) => member,
+                                    None => return Err(refused),
+                                }
+                            }
+                        }
+                    } else {
+                        session
+                    };
 
                     // Process the message
                     let response = msg.process(state, session, &metadata).await?;
@@ -1197,9 +1255,30 @@ async fn handle_inbound_didcomm(
                     // is refusing the hop, which is the bug being fixed.
                     // [`RelayMode::Rewrap`] plus `relay_trusted_mediators` is the
                     // posture for deployments that need the peer authenticated.
-                    if state.config.security.force_session_did_match && session.authenticated {
-                        check_direct_delivery_session_match(session, envelope.from_did.as_deref())?;
-                    }
+                    //
+                    // On a mux connection the claim may instead name a member
+                    // carrying `send` there: by granting `send` the member
+                    // vouched for frames this socket presents in its name. The
+                    // frame is then the member's from here on — its queue limits,
+                    // its stats — as on its own connection.
+                    let member;
+                    let session = if state.config.security.force_session_did_match && session.authenticated {
+                        match check_direct_delivery_session_match(session, envelope.from_did.as_deref()) {
+                            Ok(()) => session,
+                            Err(refused) => {
+                                member = match envelope.from_did.as_deref() {
+                                    Some(did) => crate::mux::connection::sender_session(state, session, did).await,
+                                    None => None,
+                                };
+                                match &member {
+                                    Some(member) => member,
+                                    None => return Err(refused),
+                                }
+                            }
+                        }
+                    } else {
+                        session
+                    };
 
                     // Check if the message will pass ACL Checks
                     if let Some(from_hash) = from_hash.as_deref() {
@@ -1377,6 +1456,17 @@ async fn peel_relay_rewrap_layers(
     }
 }
 
+/// Whether `msg` is a `routing/2.0/forward`: the one message to the mediator a
+/// mux member's `send` scope admits on the principal's connection.
+#[cfg(feature = "didcomm")]
+fn is_forward(msg: &affinidi_messaging_didcomm::message::Message) -> bool {
+    matches!(
+        msg.typ
+            .parse::<affinidi_messaging_sdk::messages::known::MessageType>(),
+        Ok(affinidi_messaging_sdk::messages::known::MessageType::ForwardRequest)
+    )
+}
+
 /// Refusal for a message whose `from` is not the DID that authenticated it.
 #[cfg(feature = "didcomm")]
 fn sender_mismatch(session: &Session, msg_id: &str, reason: &str) -> MediatorError {
@@ -1525,6 +1615,31 @@ mod tests {
         assert!(check_session_sender_match(&session, "msg-1", &Some(&key0)).is_ok());
         assert!(check_session_sender_match(&session, "msg-1", &Some(&key1)).is_ok());
         assert!(check_session_sender_match(&session, "msg-1", &Some(&signing)).is_ok());
+    }
+
+    /// The `send` scope admits a member's `forward` and nothing else
+    /// addressed to the mediator.
+    #[test]
+    fn only_a_forward_is_a_member_send() {
+        let msg = |typ: &str| {
+            affinidi_messaging_didcomm::message::Message::build(
+                "id".to_string(),
+                typ.to_string(),
+                serde_json::json!({}),
+            )
+            .finalize()
+        };
+        assert!(is_forward(&msg("https://didcomm.org/routing/2.0/forward")));
+        for typ in [
+            "https://didcomm.org/trust-ping/2.0/ping",
+            "https://didcomm.org/messagepickup/3.0/status-request",
+            "https://didcomm.org/messagepickup/3.0/delivery-request",
+            "https://didcomm.org/messagepickup/3.0/messages-received",
+            "https://didcomm.org/basicmessage/2.0/message",
+            "not a type",
+        ] {
+            assert!(!is_forward(&msg(typ)), "{typ}");
+        }
     }
 
     // --- check_direct_delivery_session_match tests ---

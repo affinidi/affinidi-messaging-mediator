@@ -151,8 +151,7 @@ pub async fn authentication_response(
         };
 
         // Unpack the message + enforce the signed/encrypted invariant.
-        let (msg, _unpack_metadata) =
-            super::helpers::unpack_auth_message(&envelope, &state).await?;
+        let (msg, unpack_metadata) = super::helpers::unpack_auth_message(&envelope, &state).await?;
 
         // Check that the inner plaintext from matches the envelope skid
         if let Some(msg_from) = &msg.from {
@@ -336,6 +335,24 @@ pub async fn authentication_response(
             )
             .into());
         }
+        // The mux unknown-key rule on the authcrypt sender key, before any
+        // token is issued: a login that cannot be checked fails (fail closed).
+        let mux_suspended = if state.config.limits.mux.enabled && state.database.supports_mux() {
+            Some(
+                crate::mux::notice::unknown_key_check(
+                    &state,
+                    &session.did_hash,
+                    crate::mux::notice::DirectKey::Authcrypt(
+                        unpack_metadata.encrypted_from_kid.clone(),
+                    ),
+                )
+                .await
+                .map_err(super::helpers::mux_check_failed)?,
+            )
+        } else {
+            None
+        };
+
         let old_sid = session.session_id;
         session.session_id = create_random_string(12);
 
@@ -406,6 +423,15 @@ pub async fn authentication_response(
             .activity
             .authenticated(&state, &session.did_hash)
             .await;
+
+        // Notices the unknown-key check owes; login does not wait on them.
+        if let Some(suspended) = mux_suspended {
+            let (state, did, did_hash) =
+                (state.clone(), session.did.clone(), session.did_hash.clone());
+            tokio::spawn(async move {
+                crate::mux::notice::after_direct_auth(&state, &did, &did_hash, suspended).await;
+            });
+        }
 
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);
         info!("Authentication successful for {}", session.did);

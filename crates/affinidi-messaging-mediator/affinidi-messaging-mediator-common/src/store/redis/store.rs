@@ -19,7 +19,7 @@ use crate::store::redis::database::{
 };
 use crate::store::{
     DeliveryDecision, DeliveryMarkReport, DeliveryState, OutboxReceipt, SentMessageState,
-    StoredMessageRef, ops,
+    StoredMessageRef, mux, ops,
 };
 use crate::types::{
     accounts::{
@@ -78,6 +78,17 @@ fn stats_from_hash(fields: HashMap<String, i64>) -> AccountStats {
     stats.sent_by_protocol = counts("SENT");
     stats
 }
+
+/// Pub/sub channel every instance publishes its mux grant changes on and
+/// every instance subscribes to (one channel for the cluster, unlike the
+/// per-instance `CHANNEL:{uuid}` delivery channels). Plain pub/sub reaches
+/// every node of a cluster, so the name needs no hash tag.
+const MUX_CHANGES_CHANNEL: &str = "MUX_CHANGES";
+
+/// Slots in the local broadcast ring bridging [`MUX_CHANGES_CHANNEL`]. A
+/// record is a few hashes, so this is cheap; a subscriber that falls further
+/// behind sees `Lagged` and re-checks its connections in full.
+const MUX_CHANGES_CAPACITY: usize = 1024;
 
 /// The two field names one counted message touches: the totals and the
 /// per-protocol split. `None` for a direction this store does not keep.
@@ -155,6 +166,9 @@ pub struct RedisStore {
     /// Slots in the local broadcast ring that bridges Redis pub/sub to the
     /// streaming task. See `with_pubsub_capacity`.
     pubsub_capacity: usize,
+    /// The bridge from [`MUX_CHANGES_CHANNEL`] to local subscribers, keyed by
+    /// channel name so it retires the same way as the delivery bridges.
+    mux_channels: Arc<Mutex<HashMap<String, broadcast::Sender<mux::MuxChangeRecord>>>>,
 }
 
 impl RedisStore {
@@ -179,6 +193,7 @@ impl RedisStore {
             lua_scripts_path,
             broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
             pubsub_capacity: PUBSUB_BROADCAST_CAPACITY,
+            mux_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -574,6 +589,7 @@ impl MediatorStore for RedisStore {
         // bridge tasks exit. The underlying Database's connection
         // manager drops with the store.
         self.broadcast_channels.lock().await.clear();
+        self.mux_channels.lock().await.clear();
         Ok(())
     }
 
@@ -1355,6 +1371,72 @@ impl MediatorStore for RedisStore {
             .map_err(|e| {
                 MediatorError::DatabaseError(14, "NA".into(), format!("mux_principal_count: {e}"))
             })
+    }
+
+    async fn mux_changes_publish(
+        &self,
+        record: &mux::MuxChangeRecord,
+    ) -> Result<(), MediatorError> {
+        let payload = serde_json::to_string(record).map_err(|e| {
+            MediatorError::InternalError(14, "NA".into(), format!("mux_changes_publish: {e}"))
+        })?;
+        let mut conn = self.get_connection().await?;
+        redis::cmd("PUBLISH")
+            .arg(MUX_CHANGES_CHANNEL)
+            .arg(payload)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::DatabaseError(14, "NA".into(), format!("mux_changes_publish: {e}"))
+            })
+    }
+
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<mux::MuxChangeRecord>>, MediatorError> {
+        // Same shape as `streaming_subscribe`: one Redis subscription per
+        // process, fanned out through a broadcast channel, and retired when
+        // the pub/sub connection drops so subscribers see `Closed`.
+        let mut channels = self.mux_channels.lock().await;
+        if let Some(sender) = channels.get(MUX_CHANGES_CHANNEL) {
+            return Ok(Some(sender.subscribe()));
+        }
+        let (sender, receiver) = broadcast::channel(MUX_CHANGES_CAPACITY);
+        let mut pubsub = self.handler.get_pubsub_connection().await?;
+        pubsub.subscribe(MUX_CHANGES_CHANNEL).await.map_err(|err| {
+            MediatorError::DatabaseError(
+                14,
+                "NA".into(),
+                format!("mux_changes_subscribe SUBSCRIBE failed: {err}"),
+            )
+        })?;
+        debug!("RedisStore: opened pubsub bridge for channel {MUX_CHANGES_CHANNEL}");
+
+        let inner_sender = sender.clone();
+        let bridge_channels = self.mux_channels.clone();
+        tokio::spawn(async move {
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = stream.next().await {
+                match msg
+                    .get_payload::<String>()
+                    .map_err(|e| e.to_string())
+                    .and_then(|p| {
+                        serde_json::from_str::<mux::MuxChangeRecord>(&p).map_err(|e| e.to_string())
+                    }) {
+                    // No subscriber right now is fine.
+                    Ok(record) => {
+                        let _ = inner_sender.send(record);
+                    }
+                    Err(e) => warn!("RedisStore mux change bridge: malformed payload: {e}"),
+                }
+            }
+            retire_bridge(&bridge_channels, MUX_CHANGES_CHANNEL, &inner_sender).await;
+            drop(inner_sender);
+            warn!("RedisStore mux change bridge lost its connection; subscribers will resubscribe");
+        });
+
+        channels.insert(MUX_CHANGES_CHANNEL.to_string(), sender);
+        Ok(Some(receiver))
     }
 
     // ─── DIDComm v1 routing keys ─────────────────────────────────────────────

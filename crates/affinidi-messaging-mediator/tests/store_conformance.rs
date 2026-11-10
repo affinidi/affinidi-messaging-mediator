@@ -690,6 +690,18 @@ async fn redis_backend(db_index: u8) -> Option<Backend> {
 async fn redis_store_flushed(
     db_index: u8,
 ) -> Option<affinidi_messaging_mediator::store::RedisStore> {
+    let store = redis_store(db_index).await?;
+    // Wipe this logical DB so the check starts from a clean keyspace. Loaded
+    // Lua FUNCTIONs are server-global, not per-DB, so FLUSHDB doesn't disturb
+    // them (and `initialize()` reloads them anyway).
+    flush_db(&store).await;
+    Some(store)
+}
+
+/// A Redis store on logical DB `db_index`, left as it is, or `None` when
+/// `REDIS_URL` is unset.
+#[cfg(feature = "redis-backend")]
+async fn redis_store(db_index: u8) -> Option<affinidi_messaging_mediator::store::RedisStore> {
     use affinidi_messaging_mediator::store::RedisStore;
     use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
 
@@ -720,18 +732,12 @@ async fn redis_store_flushed(
     let handler = DatabaseHandler::new(&config)
         .await
         .expect("connect to REDIS_URL — is the server reachable?");
-    let store = RedisStore::new(
+    Some(RedisStore::new(
         handler,
         config.circuit_breaker_threshold,
         config.circuit_breaker_recovery_secs,
         config.functions_file.clone(),
-    );
-
-    // Wipe this logical DB so the check starts from a clean keyspace. Loaded
-    // Lua FUNCTIONs are server-global, not per-DB, so FLUSHDB doesn't disturb
-    // them (and `initialize()` reloads them anyway).
-    flush_db(&store).await;
-    Some(store)
+    ))
 }
 
 #[cfg(feature = "redis-backend")]
@@ -1977,6 +1983,9 @@ fn mux_grant(
         state: mux::MuxGrantState::Active,
         state_changed_at: None,
         statement: serde_json::json!({}),
+        noticed: false,
+        key_agreement_fps: Vec::new(),
+        expiring_noticed: false,
     }
 }
 
@@ -2252,6 +2261,107 @@ async fn check_mux_grant_flows(store: Arc<dyn MediatorStore>) {
     assert_eq!(store.mux_principal_count("mux-flow-q").await.unwrap(), 0);
 }
 
+/// A single-process backend has no other instance to tell about mux grant
+/// changes: publishing succeeds and does nothing, and there is nothing to
+/// subscribe to.
+#[cfg(any(feature = "memory-backend", feature = "fjall-backend"))]
+async fn check_mux_changes_single_process(store: Arc<dyn MediatorStore>) {
+    let record = mux::MuxChangeRecord {
+        origin: "instance-a".into(),
+        changes: vec![mux::MuxChange {
+            did_hash: "member".into(),
+            principal_hash: "principal".into(),
+            stored: true,
+        }],
+    };
+    store.mux_changes_publish(&record).await.unwrap();
+    assert!(store.mux_changes_subscribe().await.unwrap().is_none());
+}
+
+/// Two Redis-backed instances: a mux change one publishes reaches the other
+/// (and the publisher's own subscription, which the mediator filters by
+/// `origin`). Pub/sub channels are server-wide, not per logical DB, so this
+/// needs no DB of its own and flushes nothing.
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn redis_mux_changes_reach_every_instance() {
+    let (Some(a), Some(b)) = (redis_store(0).await, redis_store(0).await) else {
+        return;
+    };
+    let mut on_a = a
+        .mux_changes_subscribe()
+        .await
+        .unwrap()
+        .expect("redis subscribes");
+    let mut on_b = b
+        .mux_changes_subscribe()
+        .await
+        .unwrap()
+        .expect("redis subscribes");
+    // A second subscriber on one instance shares its bridge.
+    let mut on_b2 = b.mux_changes_subscribe().await.unwrap().unwrap();
+
+    let record = mux::MuxChangeRecord {
+        origin: format!("instance-a-{}", uuid::Uuid::new_v4()),
+        changes: vec![mux::MuxChange {
+            did_hash: "member".into(),
+            principal_hash: "principal".into(),
+            stored: false,
+        }],
+    };
+    a.mux_changes_publish(&record).await.unwrap();
+
+    // Other suites' runs may publish on the same server: wait for ours.
+    for rx in [&mut on_b, &mut on_b2, &mut on_a] {
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let r = rx.recv().await.expect("subscription open");
+                if r.origin == record.origin {
+                    return r;
+                }
+            }
+        })
+        .await
+        .expect("the record arrives within 5s");
+        assert_eq!(got, record);
+    }
+}
+
+/// Redis only: fetching a message by id counts it as sent in the global
+/// stats. The two counters are one MULTI, so a malformed command in it
+/// drops both.
+#[cfg(feature = "redis-backend")]
+async fn check_fetch_counts_sent(store: Arc<dyn MediatorStore>) {
+    let to = "did_hash_recipient_sent_stats";
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add recipient");
+    let body = "{\"protected\":\"sent-stats\"}";
+    let id = store
+        .store_message("session-id", body, to, None, NEVER, 1000)
+        .await
+        .expect("store_message");
+
+    let before = store.get_global_stats().await.expect("stats before");
+    let fetched = store
+        .get_message(to, &id)
+        .await
+        .expect("get_message")
+        .expect("stored message is retrievable by id");
+    let after = store.get_global_stats().await.expect("stats after");
+    assert_eq!(
+        after.sent_count - before.sent_count,
+        1,
+        "a fetch counts one message sent"
+    );
+    assert_eq!(
+        after.sent_bytes - before.sent_bytes,
+        fetched.size as i64,
+        "a fetch counts the message's bytes sent"
+    );
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -2264,6 +2374,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_streaming_pubsub(store.clone()).await;
     check_repeated_store(store.clone()).await;
     check_concurrent_delete(store.clone()).await;
+    check_fetch_counts_sent(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -2398,6 +2509,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn mux_grant_flows() {
                 check_mux_grant_flows(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn mux_changes_single_process() {
+                check_mux_changes_single_process(ready($ctor).await).await;
             }
         }
     };

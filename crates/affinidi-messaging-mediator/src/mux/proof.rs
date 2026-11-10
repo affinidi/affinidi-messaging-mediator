@@ -57,6 +57,8 @@ pub enum StatementError {
         requested: u64,
         max: u64,
     },
+    /// The member DID could not be resolved now.
+    DidUnresolvable(String),
 }
 
 impl std::fmt::Display for StatementError {
@@ -79,6 +81,7 @@ impl std::fmt::Display for StatementError {
                 f,
                 "statement lifetime {requested}s exceeds the maximum of {max}s"
             ),
+            Self::DidUnresolvable(why) => write!(f, "member DID could not be resolved: {why}"),
         }
     }
 }
@@ -98,6 +101,7 @@ impl StatementError {
             StatementError::NotYetValid => "notYetValid",
             StatementError::Expired => "statementExpired",
             StatementError::LifetimeTooLong { .. } => "lifetimeTooLong",
+            StatementError::DidUnresolvable(_) => "didUnresolvable",
         }
     }
 }
@@ -244,6 +248,14 @@ impl StatementVerifier {
             return Err(StatementError::PrincipalMismatch);
         }
         check_times(st.iat, st.exp, &expect)?;
+        // The member's key-agreement keys now, the known keys a later direct
+        // DIDComm authentication is compared with (the unknown-key rule). A
+        // grant whose keys cannot be read is refused, not stored without
+        // them: an empty set means the DID listed none.
+        let key_agreement_fps = self
+            .key_agreement_fps(&st.issuer)
+            .await
+            .map_err(StatementError::DidUnresolvable)?;
 
         Ok(MuxGrant {
             grant_id: st.grant_id,
@@ -263,6 +275,9 @@ impl StatementVerifier {
             state: MuxGrantState::Active,
             state_changed_at: None,
             statement: raw.clone(),
+            noticed: false,
+            key_agreement_fps,
+            expiring_noticed: false,
         })
     }
 
@@ -345,6 +360,52 @@ impl StatementVerifier {
         )
     }
 
+    /// Fingerprints of `did`'s `keyAgreement` keys as resolved now; empty
+    /// when it lists none. `Err` when the DID cannot be resolved, which is
+    /// not the same as listing none.
+    pub async fn key_agreement_fps(&self, did: &str) -> Result<Vec<String>, String> {
+        let resolved = self
+            .resolver
+            .client()
+            .resolve(did)
+            .await
+            .map_err(|e| format!("resolve {did}: {e}"))?;
+        let doc = &resolved.doc;
+        Ok(doc
+            .key_agreement
+            .iter()
+            .filter_map(|r| key_agreement_method(doc, r))
+            .filter_map(|m| m.decode_public_key().ok())
+            .map(|(_, bytes)| fingerprint(&bytes))
+            .collect())
+    }
+
+    /// The fingerprint of the `keyAgreement` key `kid` (an authcrypt sender
+    /// key), as resolved now. `Err` when it cannot be determined: the DID does
+    /// not resolve, or `kid` is not one of its key-agreement keys.
+    pub async fn key_agreement_fp(&self, kid: &str) -> Result<String, String> {
+        let (did, fragment) = kid
+            .split_once('#')
+            .ok_or_else(|| format!("{kid} has no fragment"))?;
+        let resolved = self
+            .resolver
+            .client()
+            .resolve(did)
+            .await
+            .map_err(|e| format!("resolve {did}: {e}"))?;
+        let doc = &resolved.doc;
+        let method = doc
+            .key_agreement
+            .iter()
+            .filter_map(|r| key_agreement_method(doc, r))
+            .find(|m| fragment_of(m.id.as_str()) == Some(fragment))
+            .ok_or_else(|| format!("{kid} is not a keyAgreement key of {did}"))?;
+        let (_, bytes) = method
+            .decode_public_key()
+            .map_err(|e| format!("decode {kid}: {e}"))?;
+        Ok(fingerprint(&bytes))
+    }
+
     /// Signature, issuer binding and current-authentication-key checks, plus
     /// the resolved key for later re-validation.
     async fn verify_signature(&self, raw: &Value) -> Result<SigningKey, StatementError> {
@@ -409,8 +470,34 @@ fn check_times(iat: u64, exp: u64, expect: &Expect<'_>) -> Result<(), StatementE
     Ok(())
 }
 
-fn fingerprint(public_key: &[u8]) -> String {
+/// The fingerprint every mux key comparison uses: SHA-256 of the raw public
+/// key bytes.
+pub fn fingerprint(public_key: &[u8]) -> String {
     sha256::digest(public_key)
+}
+
+fn fragment_of(id: &str) -> Option<&str> {
+    id.split_once('#').map(|(_, f)| f)
+}
+
+/// The method a `keyAgreement` entry names: embedded, or a reference to the
+/// document's `verificationMethod` set (absolute or `#fragment`).
+fn key_agreement_method(
+    doc: &affinidi_did_common::Document,
+    r: &affinidi_did_common::verification_method::VerificationRelationship,
+) -> Option<affinidi_did_common::verification_method::VerificationMethod> {
+    use affinidi_did_common::verification_method::VerificationRelationship as R;
+    match r {
+        R::VerificationMethod(m) => Some((**m).clone()),
+        R::Reference(id) => {
+            let fragment = fragment_of(id)?;
+            doc.verification_method
+                .iter()
+                .find(|m| fragment_of(m.id.as_str()) == Some(fragment))
+                .cloned()
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +577,20 @@ mod tests {
         assert_eq!(g.key_fp.len(), 64);
         assert!(g.scope.contains(MuxCapability::Pickup));
         assert_eq!(g.statement, raw);
+    }
+
+    /// A TSP authentication proves the raw Ed25519 key; a grant records the
+    /// fingerprint of the same key resolved for its proof. They must agree,
+    /// or every TSP login would look like an unknown key.
+    #[tokio::test]
+    async fn a_grant_key_fingerprint_is_the_raw_public_key_digest() {
+        let (did, secret) = did_key(9);
+        let v = verifier().await;
+        let g = v
+            .verify_grant(&sign(&grant_body(&did), &secret, None).await, expect(None))
+            .await
+            .unwrap();
+        assert_eq!(g.key_fp, fingerprint(secret.get_public_bytes()));
     }
 
     #[tokio::test]

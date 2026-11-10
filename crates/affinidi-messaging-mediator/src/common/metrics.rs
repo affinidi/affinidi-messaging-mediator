@@ -53,6 +53,12 @@ pub mod names {
     pub const MESSAGES_EXPIRED_TOTAL: &str = "messages_expired_total";
     /// counter: Activity-record writes the store refused or failed
     pub const ACCOUNT_ACTIVITY_WRITE_FAILURES_TOTAL: &str = "account_activity_write_failures_total";
+    /// counter: Audit-log entries the store failed to record (the change
+    /// they describe still happened)
+    pub const AUDIT_WRITE_FAILURES_TOTAL: &str = "audit_write_failures_total";
+    /// counter: Direct logins refused because the mux unknown-key rule
+    /// could not be applied (store or resolver failure, or timeout)
+    pub const MUX_LOGIN_CHECK_FAILURES_TOTAL: &str = "mux_login_check_failures_total";
     /// counter: Total inbound message bytes
     pub const MESSAGE_BYTES_INBOUND_TOTAL: &str = "message_bytes_inbound_total";
 
@@ -117,6 +123,15 @@ pub mod names {
     /// apart from "never generated", which is the distinction an alert on
     /// [`WS_LIVE_RESYNC_SENT`] alone cannot make.
     pub const WS_LIVE_RESYNC_SUPPRESSED: &str = "ws_live_resync_suppressed_total";
+    /// counter: Live pushes for a DID on a mux connection refused because that
+    /// DID already held its own share (8) of the connection's send queue.
+    ///
+    /// Each one is also counted in [`WS_LIVE_DELIVERY_DROPPED`], and is no more
+    /// a loss than any other drop: the message is in the member's inbox and the
+    /// member is sent a resync. What this one says is that fair queuing did its
+    /// job: without it the busy member's frames would have taken the other
+    /// members' room. A steady rate points at one member outpacing its client.
+    pub const MUX_QUEUE_FAIRNESS_SKIPS_TOTAL: &str = "mux_queue_fairness_skips_total";
     /// gauge: Bytes currently free in the global WebSocket send-buffer pool.
     pub const WS_SEND_BUFFER_AVAILABLE_BYTES: &str = "ws_send_buffer_available_bytes";
     /// counter: Old WebSocket sessions displaced by a newer duplicate for the same DID

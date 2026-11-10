@@ -1197,6 +1197,33 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(0)
     }
 
+    /// Tell every other mediator instance sharing this store that the grants
+    /// in `record` changed, so they reconcile their live mux connections
+    /// (design §7.4). Best-effort: delivery is at most once, and receivers
+    /// fall back to their periodic grant re-check for anything missed.
+    ///
+    /// The default does nothing, which suits a single-process backend
+    /// (Memory, Fjall): there is no other instance to tell.
+    async fn mux_changes_publish(
+        &self,
+        _record: &mux::MuxChangeRecord,
+    ) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    /// Subscribe to [`mux_changes_publish`](Self::mux_changes_publish)
+    /// records from every instance, this one's included. `Ok(None)` when the
+    /// backend is single-process (the default) and there is nothing to hear.
+    ///
+    /// A receiver that sees [`broadcast::error::RecvError::Lagged`] missed
+    /// records; one that sees `Closed` lost the subscription and must
+    /// subscribe again. Either way it must re-check its connections in full.
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<mux::MuxChangeRecord>>, MediatorError> {
+        Ok(None)
+    }
+
     // ─── ACLs ────────────────────────────────────────────────────────────────
 
     /// Replace the ACL bitmask for a DID. Caller is responsible for

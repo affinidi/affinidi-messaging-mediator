@@ -881,8 +881,17 @@ pub async fn serve_internal(
         }
         info!(
             "DID multiplexing enabled: DIDComm clients may open mux connections with the \
-             `affinidi-mux` WebSocket subprotocol"
+             `didcomm-mux` WebSocket subprotocol"
         );
+        // Grant changes handled by other instances sharing the store reach
+        // this one's connections within one pub/sub hop rather than at the
+        // next periodic re-check (design §7.4). Not load-bearing: the re-check
+        // is the backstop while it is down.
+        let state = shared_state.clone();
+        supervisor.spawn("mux_sync", false, move || {
+            let state = state.clone();
+            async move { crate::mux::sync::run(state).await }
+        });
     }
 
     // DIDComm v1 startup checks. Both run before the listener binds, so a

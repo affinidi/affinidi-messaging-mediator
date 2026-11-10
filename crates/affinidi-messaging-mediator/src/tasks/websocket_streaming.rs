@@ -31,11 +31,12 @@
  Fjall's in-process broadcast, or the test MemoryStore.
 */
 use crate::common::metrics::names::{
-    WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
+    MUX_QUEUE_FAIRNESS_SKIPS_TOTAL, WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
     WEBSOCKET_DUPLICATE_REPLACEMENTS_TOTAL, WEBSOCKET_REDELIVERED_MESSAGES_TOTAL,
     WS_LIVE_DELIVERY_DROPPED,
 };
 use crate::common::ws_budget::{SendPermit, WsSendBudget};
+use crate::mux::fair_queue::{MuxSlots, SlotCredit, SlotRefusal};
 use crate::tasks::supervisor::TaskSupervisor;
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
@@ -138,6 +139,10 @@ struct ClientEntry {
     churn_streak: u32,
     /// Direct socket, or a member of a mux connection.
     kind: EntryKind,
+    /// The connection's per-DID slot accounting when it is a mux connection
+    /// (design §7.2 fair queuing); `None` on a direct socket, whose queue is
+    /// the plain bounded channel.
+    slots: Option<Arc<MuxSlots>>,
 }
 
 /// Used when updating the streaming state.
@@ -156,6 +161,10 @@ pub enum StreamingUpdateState {
         resync: Arc<AtomicBool>,
         /// Direct socket, or a mux member (design §7.2).
         kind: EntryKind,
+        /// Set for every entry on a mux connection, the principal's own
+        /// included: the slots its queued frames hold. `None` for a direct
+        /// socket.
+        slots: Option<Arc<MuxSlots>>,
     },
     /// Enable live delivery for the socket owned by `session_id`.
     ///
@@ -243,6 +252,9 @@ pub struct QueuedCommand {
     /// `None` for control commands (`Close`), which carry no payload and must
     /// never be refused for want of buffer bytes.
     _permit: Option<SendPermit>,
+    /// The DID's slot on a mux connection, held, like the permit, until the
+    /// socket loop takes the item. `None` on a direct socket and for control.
+    _slot: Option<SlotCredit>,
 }
 
 impl QueuedCommand {
@@ -252,6 +264,18 @@ impl QueuedCommand {
             cmd,
             did_hash: None,
             _permit: None,
+            _slot: None,
+        }
+    }
+
+    /// An empty payload tagged for `did_hash`, for tests of queue ordering.
+    #[cfg(test)]
+    pub(crate) fn for_test(did_hash: Option<&str>) -> Self {
+        Self {
+            cmd: WebSocketCommands::Message(String::new()),
+            did_hash: did_hash.map(str::to_string),
+            _permit: None,
+            _slot: None,
         }
     }
 }
@@ -268,22 +292,41 @@ impl QueuedCommand {
 /// delivery for all of them.
 fn try_queue_message(
     tx: &mpsc::Sender<QueuedCommand>,
+    slots: Option<&Arc<MuxSlots>>,
     budget: &WsSendBudget,
     did_hash: &str,
     message: String,
 ) -> bool {
-    try_queue(tx, budget, did_hash, message, false)
+    try_queue(tx, slots, budget, did_hash, message, false)
 }
 
 /// [`try_queue_message`], with `verbatim` choosing the command the socket
 /// handler receives.
+///
+/// On a mux connection (`slots` set) the payload must first take one of its
+/// DID's slots: a DID that already holds its share is refused here, so it is
+/// the busy member whose push drops, not whichever member happened to arrive
+/// once the shared queue was full (design §7.2).
 fn try_queue(
     tx: &mpsc::Sender<QueuedCommand>,
+    slots: Option<&Arc<MuxSlots>>,
     budget: &WsSendBudget,
     did_hash: &str,
     message: String,
     verbatim: bool,
 ) -> bool {
+    let slot = match slots.map(|s| s.try_acquire(did_hash)) {
+        None => None,
+        Some(Ok(slot)) => Some(slot),
+        Some(Err(why)) => {
+            debug!(did_hash = %did_hash, refusal = ?why, "mux send share full; dropping live notification");
+            if why == SlotRefusal::Member {
+                metrics::counter!(MUX_QUEUE_FAIRNESS_SKIPS_TOTAL).increment(1);
+            }
+            metrics::counter!(WS_LIVE_DELIVERY_DROPPED).increment(1);
+            return false;
+        }
+    };
     let Some(permit) = budget.try_reserve(message.len()) else {
         warn!(
             "WebSocket send buffer exhausted ({} bytes total); dropping live notification for {}. \
@@ -303,6 +346,7 @@ fn try_queue(
         },
         did_hash: Some(did_hash.to_string()),
         _permit: Some(permit),
+        _slot: slot,
     };
 
     if tx.try_send(queued).is_err() {
@@ -332,9 +376,21 @@ fn deliver_live(
     message: String,
     verbatim: bool,
 ) -> bool {
-    if try_queue(&entry.tx, budget, did_hash, message, verbatim) {
+    if try_queue(
+        &entry.tx,
+        entry.slots.as_ref(),
+        budget,
+        did_hash,
+        message,
+        verbatim,
+    ) {
         debug!("Sent message to client ({did_hash})");
         return true;
+    }
+    // On a mux connection the resync is owed to this DID, not the socket:
+    // recorded before the shared flag goes up, so the socket finds it.
+    if let Some(slots) = &entry.slots {
+        slots.raise_resync(did_hash);
     }
     // Repeated drops collapse into one signal, which is the right shape: the
     // client's answer to any number of them is the same single drain.
@@ -703,10 +759,10 @@ impl StreamingTask {
         active: bool,
     ) {
         // The socket to flush to, captured while the entry is borrowed.
-        let client_tx = match clients.get_mut(did_hash) {
+        let (client_tx, client_slots) = match clients.get_mut(did_hash) {
             Some(entry) if entry.session_id == session_id => {
                 entry.active = active;
-                entry.tx.clone()
+                (entry.tx.clone(), entry.slots.clone())
             }
             Some(entry) => {
                 // A standby entry keeps its wish, so that it is honoured if
@@ -777,6 +833,7 @@ impl StreamingTask {
                 spawn_inbox_redelivery(
                     Arc::clone(database),
                     client_tx,
+                    client_slots,
                     self.send_budget.clone(),
                     did_hash.to_string(),
                     session_id.to_string(),
@@ -809,6 +866,7 @@ impl StreamingTask {
             did,
             resync: client_resync,
             kind,
+            slots: client_slots,
         } = &value.state
         else {
             // Only `Register` updates reach this helper.
@@ -847,6 +905,7 @@ impl StreamingTask {
             resync: client_resync.clone(),
             churn_streak,
             kind: *kind,
+            slots: client_slots.clone(),
         };
 
         // Mux precedence (design §7.2). A direct socket outranks a mux member,
@@ -1041,6 +1100,7 @@ impl StreamingTask {
             "Registered streaming for DID: ({did_hash}) registered_clients({registered_clients})",
         );
         let client_tx = entry.tx.clone();
+        let client_slots = entry.slots.clone();
         let session_id = entry.session_id.clone();
         let state = if entry.active {
             StreamingClientState::Live
@@ -1063,6 +1123,7 @@ impl StreamingTask {
                 spawn_inbox_redelivery(
                     Arc::clone(database),
                     client_tx,
+                    client_slots,
                     self.send_budget.clone(),
                     did_hash.to_string(),
                     session_id,
@@ -1162,6 +1223,7 @@ fn remove_standby(
 fn spawn_inbox_redelivery(
     database: Arc<dyn MediatorStore>,
     client_tx: mpsc::Sender<QueuedCommand>,
+    client_slots: Option<Arc<MuxSlots>>,
     budget: WsSendBudget,
     did_hash: String,
     session_id: String,
@@ -1222,7 +1284,7 @@ fn spawn_inbox_redelivery(
                 // in the inbox. Stopping the drain early is therefore lossless —
                 // the client picks the remainder up via normal message-pickup,
                 // exactly as it does when REDELIVERY_MAX is hit.
-                if !try_queue_message(&client_tx, &budget, &did_hash, msg) {
+                if !try_queue_message(&client_tx, client_slots.as_ref(), &budget, &did_hash, msg) {
                     debug!(
                         did_hash = %did_hash,
                         "Send queue or byte budget unavailable mid-redelivery; \
@@ -1308,6 +1370,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         );
         clients
@@ -1340,6 +1403,7 @@ mod tests {
             resync: resync.clone(),
             churn_streak: 0,
             kind: EntryKind::Direct,
+            slots: None,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -1371,6 +1435,51 @@ mod tests {
         );
     }
 
+    /// On a mux connection a busy member fills only its own share of the
+    /// queue: its next push is dropped and *it* is owed the resync, while
+    /// another member on the same socket still queues (design §7.2).
+    #[tokio::test]
+    async fn a_busy_mux_member_drops_only_its_own_pushes() {
+        use crate::mux::fair_queue::{MEMBER_SLOTS, MuxSlots};
+        let slots = MuxSlots::new(512);
+        let (tx, mut rx) = mpsc::channel::<QueuedCommand>(slots.channel_capacity());
+        let resync = Arc::new(AtomicBool::new(false));
+        let entry = || ClientEntry {
+            tx: tx.clone(),
+            session_id: "S".to_string(),
+            active: true,
+            registered_at: Instant::now(),
+            resync: resync.clone(),
+            churn_streak: 0,
+            kind: EntryKind::Mux,
+            slots: Some(slots.clone()),
+        };
+        let (busy, quiet) = (entry(), entry());
+        let budget = WsSendBudget::new(1_000_000);
+
+        for i in 0..MEMBER_SLOTS {
+            assert!(deliver_live(&busy, &budget, "busy", format!("b{i}"), false));
+        }
+        assert!(
+            !deliver_live(&busy, &budget, "busy", "over".into(), false),
+            "the busy member is refused past its share"
+        );
+        assert!(resync.load(Ordering::Relaxed), "the socket is woken");
+        assert_eq!(slots.take_resync(), vec!["busy".to_string()]);
+
+        assert!(
+            deliver_live(&quiet, &budget, "quiet", "q".into(), false),
+            "another member still has room on the same socket"
+        );
+        assert!(slots.take_resync().is_empty(), "and owes no resync");
+
+        // Taking a frame off the queue returns the busy member's slot.
+        let taken = rx.recv().await.unwrap();
+        assert_eq!(taken.did_hash.as_deref(), Some("busy"));
+        drop(taken);
+        assert!(deliver_live(&busy, &budget, "busy", "again".into(), false));
+    }
+
     /// A stored message's live delivery is reported when its notification is
     /// queued to the socket, and not when the push is dropped (R1.1). Untagged
     /// pushes — monitor batches, ephemeral messages — report nothing, or the
@@ -1394,6 +1503,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         )]);
         let record = |msg_id: Option<&str>| PubSubRecord {
@@ -1465,6 +1575,7 @@ mod tests {
             resync: resync.clone(),
             churn_streak: 0,
             kind: EntryKind::Direct,
+            slots: None,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -1688,6 +1799,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         );
 
@@ -1701,6 +1813,7 @@ mod tests {
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
+                slots: None,
             },
         };
 
@@ -1789,6 +1902,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         );
 
@@ -1844,6 +1958,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         );
 
@@ -1892,6 +2007,7 @@ mod tests {
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
+                slots: None,
             },
         };
 
@@ -1939,6 +2055,7 @@ mod tests {
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
+                slots: None,
             },
         };
 
@@ -2040,6 +2157,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: CHURN_REFUSE_STREAK * 10,
                 kind: EntryKind::Direct,
+                slots: None,
             },
         );
 
@@ -2052,6 +2170,7 @@ mod tests {
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
+                slots: None,
             },
         };
         task._handle_registration(
@@ -2086,6 +2205,7 @@ mod tests {
                 did: did.to_string(),
                 resync: Arc::new(AtomicBool::new(false)),
                 kind,
+                slots: None,
             },
         }
     }
@@ -2256,6 +2376,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 churn_streak: 0,
                 kind: EntryKind::Mux,
+                slots: None,
             }],
         );
         assert!(!remove_standby(&mut standby, "h", "someone-else"));

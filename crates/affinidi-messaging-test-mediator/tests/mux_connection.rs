@@ -5,7 +5,8 @@
 //! own grant operation (`mux::grants::store_grant`, the code the
 //! `messaging/mux/grant` Trust Task runs) because the SDK has no mux client
 //! yet. Everything else is the wire: the principal's socket negotiates
-//! `affinidi-mux`, receives the signed `ready` / `attached` events, and then
+//! `affinidi-mux` (the provisional name, still accepted; `mux_limits.rs`
+//! covers `didcomm-mux`), receives the signed `ready` / `attached` events, and then
 //! receives messages addressed to each member.
 
 mod common;
@@ -50,6 +51,15 @@ fn recipients(frame: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The event document must parse as the spec's generated
+/// `messaging/mux/event` type: that is what a client using the generated
+/// bindings does, so a shape the schema refuses is a broken event.
+fn conforms_to_spec(doc: &Value) {
+    use affinidi_messaging_mediator::task_specs::messaging::mux::event::v0_1::Payload;
+    serde_json::from_value::<trust_tasks_rs::TrustTask<Payload>>(doc.clone())
+        .unwrap_or_else(|e| panic!("mux/event does not match the spec: {e}\n{doc:#}"));
 }
 
 /// `member` grants `principal` receive + pickup, stored as the
@@ -186,6 +196,7 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     assert_eq!(recipients(&ready), vec![principal.did.clone()]);
     let (ready_msg, _) = env.atm.unpack(&ready).await.expect("unpack ready");
     assert_eq!(ready_msg.body["payload"]["event"], "ready");
+    conforms_to_spec(&ready_msg.body);
     assert!(
         ready_msg.body["payload"]["muxNonce"]
             .as_str()
@@ -195,6 +206,7 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     let attached = next_text().await;
     let (attached_msg, _) = env.atm.unpack(&attached).await.expect("unpack attached");
     assert_eq!(attached_msg.body["payload"]["event"], "attached");
+    conforms_to_spec(&attached_msg.body);
     let mut dids: Vec<String> = attached_msg.body["payload"]["dids"]
         .as_array()
         .unwrap()
@@ -209,16 +221,38 @@ async fn one_socket_carries_live_delivery_for_every_granted_did() {
     // Messages for each member arrive on the principal's socket.
     send(&env, &sender, &work, "for work").await;
     send(&env, &sender, &home, "for home").await;
-    let mut got = vec![
-        recipients(&next_text().await),
-        recipients(&next_text().await),
-    ];
+    let frames = [next_text().await, next_text().await];
+    let mut got = vec![recipients(&frames[0]), recipients(&frames[1])];
     got.sort();
     assert_eq!(got, {
         let mut e = vec![vec![work.did.clone()], vec![home.did.clone()]];
         e.sort();
         e
     });
+
+    // The principal acknowledges both over REST with the same session token:
+    // members' messages are deletable because their grants include `delete`.
+    let ids: Vec<String> = frames.iter().map(sha256::digest).collect();
+    let resp: Value = reqwest::Client::new()
+        .delete(env.mediator.endpoint().join("delete").unwrap())
+        .bearer_auth(&tokens.access_token)
+        .json(&json!({ "message_ids": ids }))
+        .send()
+        .await
+        .expect("delete request")
+        .json()
+        .await
+        .expect("delete response");
+    let mut deleted: Vec<String> = resp["data"]["success"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected delete response: {resp:#}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    deleted.sort();
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(deleted, want, "both members' messages deleted: {resp:#}");
 
     // A DID that granted nothing is not carried.
     let stranger = env.add_user("stranger").await.unwrap();

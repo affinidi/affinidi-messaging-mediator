@@ -1211,7 +1211,7 @@ async fn consume_account_remove(
     // loudly because the grants then outlive the account (R6.3).
     if removed && state.database.supports_mux() {
         let limits = state.config.limits.mux.store_limits();
-        if let Err(e) = affinidi_messaging_mediator_common::store::mux::remove_account(
+        match affinidi_messaging_mediator_common::store::mux::remove_account(
             &*state.database,
             &target_hash,
             &limits,
@@ -1219,10 +1219,36 @@ async fn consume_account_remove(
         )
         .await
         {
-            tracing::error!(
+            // Principals carrying the removed DID drop it now and are told.
+            Ok(as_member) if !as_member.is_empty() => {
+                use crate::mux::session::LeaveReason;
+                state
+                    .mux
+                    .detach_grants(
+                        state.streaming_task.as_ref(),
+                        &as_member,
+                        LeaveReason::AccountRemoved,
+                    )
+                    .await;
+                let changes: Vec<_> = as_member
+                    .iter()
+                    .map(|g| {
+                        affinidi_messaging_mediator_common::store::mux::MuxChange::of(g, false)
+                    })
+                    .collect();
+                crate::mux::sync::publish(state, &changes).await;
+                let changed = crate::mux::tasks::Changed {
+                    removed: as_member,
+                    reason: Some(LeaveReason::AccountRemoved),
+                    ..Default::default()
+                };
+                crate::mux::notice::after_change(state, &changed).await;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(
                 did_hash = %target_hash,
                 "account removed, but its DID multiplexing grants could not be: {e}"
-            );
+            ),
         }
     }
     record_audit(
@@ -2303,7 +2329,7 @@ async fn consume_mux(
     };
     let streaming = state.streaming_task.as_ref();
 
-    let (response, changed) = match task {
+    let (mut response, changed) = match task {
         ServedTask::MuxAttach => {
             tasks::attach(
                 &ctx,
@@ -2363,6 +2389,46 @@ async fn consume_mux(
     if !changed.narrowed.is_empty() {
         state.mux.narrow(&changed.narrowed).await;
     }
+    if !changed.stored.is_empty() {
+        let carried = state
+            .mux
+            .admit_grants(streaming, ctx.store, &ctx.limits, ctx.now, &changed.stored)
+            .await;
+        // `attachedNow` on each stored grant: whether a connection on this
+        // instance took the member. Another instance's connection takes it
+        // moments later and is not counted.
+        if let Some(results) = response.get_mut("results").and_then(Value::as_array_mut) {
+            for r in results {
+                if r.get("status").and_then(Value::as_str) == Some("stored") {
+                    let id = r.get("grantId").and_then(Value::as_str).unwrap_or_default();
+                    r["attachedNow"] = Value::Bool(carried.contains(id));
+                }
+            }
+        }
+    }
+    // The same principals' connections on other instances sharing the store
+    // follow within one pub/sub hop (§7.4); this answer does not wait for them.
+    crate::mux::sync::publish(state, &crate::mux::sync::changes_of(&changed)).await;
+    // Durable notices for what this task suspended or revoked: only now,
+    // once the change is committed and its members detached (spec rule 2).
+    crate::mux::notice::after_change(state, &changed).await;
+    // Audit records the specs require: revocations, an advanced epoch, and
+    // grants the unknown-key rule suspended.
+    match task {
+        ServedTask::MuxRevoke => {
+            crate::mux::audit::revoked(state, &session.did_hash, &changed).await
+        }
+        ServedTask::MuxRevokeAll => {
+            crate::mux::audit::revoked_all(state, &session.did_hash, &response).await
+        }
+        _ => {}
+    }
+    crate::mux::audit::suspended(
+        state,
+        &changed.suspended,
+        crate::mux::audit::SuspendedBy::Statement,
+    )
+    .await;
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,
