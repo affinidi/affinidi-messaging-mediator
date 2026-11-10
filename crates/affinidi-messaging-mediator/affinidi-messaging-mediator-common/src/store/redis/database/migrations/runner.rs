@@ -92,8 +92,8 @@ async fn record_migration(db: &Database, id: u32, name: &str) -> Result<(), Medi
     let mut conn = db.get_connection().await?;
     let now = crate::time::unix_timestamp_secs();
 
-    redis::pipe()
-        .cmd("SADD")
+    let mut pipe = redis::pipe();
+    pipe.cmd("SADD")
         .arg(MIGRATIONS_SET_KEY)
         .arg(id)
         .cmd("HSET")
@@ -101,9 +101,10 @@ async fn record_migration(db: &Database, id: u32, name: &str) -> Result<(), Medi
         .arg("name")
         .arg(name)
         .arg("applied_at")
-        .arg(now)
-        .exec_async(&mut conn)
+        .arg(now);
+    db.query_each::<redis::Value>(&mut conn, pipe)
         .await
+        .map(|_| ())
         .map_err(|e| {
             MediatorError::DatabaseError(
                 14,

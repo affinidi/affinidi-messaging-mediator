@@ -74,6 +74,7 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     // connection, there is no pool to size. Pre-0.14 deployments that
     // set it can drop the env var with no behaviour change.
     env_override!(config.database.database_timeout, "DATABASE_TIMEOUT");
+    env_override!(config.database.cluster_mode, "DATABASE_CLUSTER_MODE");
 
     env_override!(config.security.mediator_acl_mode, "MEDIATOR_ACL_MODE");
     env_override!(config.security.global_acl_default, "GLOBAL_DEFAULT_ACL");

@@ -23,11 +23,6 @@ pub(crate) fn key_owner(verkey: &str) -> String {
     ["V1_KEY:", verkey].concat()
 }
 
-/// The DID-hash → verkey-set key.
-pub(crate) fn key_owned(did_hash: &str) -> String {
-    ["V1_KEYS:", did_hash].concat()
-}
-
 impl RedisStore {
     /// Bind a routing verkey to an account, refusing to steal one already
     /// bound elsewhere.
@@ -87,7 +82,7 @@ impl RedisStore {
 
             // Idempotent either way: the reverse index is a set.
             redis::cmd("SADD")
-                .arg(key_owned(&did_hash))
+                .arg(self.keys().v1_keys(&did_hash))
                 .arg(verkey)
                 .exec_async(&mut con)
                 .await
@@ -144,20 +139,24 @@ impl RedisStore {
             return Ok(false);
         };
 
-        let mut pipe = Pipeline::new();
-        pipe.atomic()
-            .cmd("DEL")
-            .arg(key_owner(verkey))
+        // Index before binding: a failure between them leaves the binding
+        // in place, so a retried unbind finds it and finishes.
+        let mut unindexed = Pipeline::new();
+        unindexed
             .cmd("SREM")
-            .arg(key_owned(&crate::did_identity::did_hash(&owner)))
+            .arg(self.keys().v1_keys(&crate::did_identity::did_hash(&owner)))
             .arg(verkey);
-        pipe.exec_async(&mut con).await.map_err(|err| {
-            MediatorError::DatabaseError(
-                14,
-                "NA".to_string(),
-                format!("Failed to unbind v1 routing key. Reason: {err}"),
-            )
-        })?;
+        let mut unbound = Pipeline::new();
+        unbound.cmd("DEL").arg(key_owner(verkey));
+        self.exec_steps(&mut con, vec![unindexed, unbound])
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".to_string(),
+                    format!("Failed to unbind v1 routing key. Reason: {err}"),
+                )
+            })?;
 
         Ok(true)
     }
@@ -169,7 +168,7 @@ impl RedisStore {
     ) -> Result<Vec<String>, MediatorError> {
         let mut con = self.get_connection().await?;
         let mut keys: Vec<String> = redis::cmd("SMEMBERS")
-            .arg(key_owned(did_hash))
+            .arg(self.keys().v1_keys(did_hash))
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -195,20 +194,24 @@ impl RedisStore {
             return Ok(());
         }
 
+        // Bindings before the index: a failure part-way leaves the index
+        // listing what is left, so a retried purge finishes.
         let mut con = self.get_connection().await?;
-        let mut pipe = Pipeline::new();
-        pipe.atomic();
+        let mut unbound = Pipeline::new();
         for verkey in &verkeys {
-            pipe.cmd("DEL").arg(key_owner(verkey));
+            unbound.cmd("DEL").arg(key_owner(verkey));
         }
-        pipe.cmd("DEL").arg(key_owned(did_hash));
-        pipe.exec_async(&mut con).await.map_err(|err| {
-            MediatorError::DatabaseError(
-                14,
-                "NA".to_string(),
-                format!("Failed to purge v1 routing keys for ({did_hash}). Reason: {err}"),
-            )
-        })?;
+        let mut unindexed = Pipeline::new();
+        unindexed.cmd("DEL").arg(self.keys().v1_keys(did_hash));
+        self.query_fanout_then(&mut con, unbound, unindexed)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".to_string(),
+                    format!("Failed to purge v1 routing keys for ({did_hash}). Reason: {err}"),
+                )
+            })?;
 
         Ok(())
     }

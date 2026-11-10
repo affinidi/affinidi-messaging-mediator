@@ -11,6 +11,7 @@ pub mod accounts;
 pub(crate) mod acls;
 pub mod admin_accounts;
 pub(crate) mod audit;
+pub(crate) mod cluster_scripts;
 pub mod fetch;
 pub mod forwarding;
 pub mod get;

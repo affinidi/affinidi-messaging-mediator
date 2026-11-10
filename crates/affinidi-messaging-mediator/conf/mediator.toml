@@ -149,6 +149,22 @@ database_url = "redis://127.0.0.1/"
 ### Timeout for database operations in seconds
 database_timeout = "2"
 
+### Env: DATABASE_CLUSTER_MODE
+### "true" when the database runs in cluster mode (e.g. ElastiCache Serverless).
+### The mediator refuses to start if this does not match the server, and in
+### cluster mode refuses a cluster with more than one primary node: only a
+### single-endpoint cluster such as ElastiCache Serverless is supported.
+### Limits in cluster mode:
+###   - The shared keys (GLOBAL, MSG_EXPIRY, FORWARD_Q, the streaming registry,
+###     the mux grants) each live in one slot, so throughput tops out at one
+###     slot's capacity (ElastiCache Serverless: 30,000 ECPU/s per slot),
+###     however far the cache itself scales.
+###   - At its data storage maximum, ElastiCache Serverless first evicts keys
+###     that have a TTL (sessions, OOB invites, outbox receipts) without any
+###     error; only then do writes fail with error 97 (storage full). Alarm on
+###     BytesUsedForCache at 75% of the maximum, as AWS recommends.
+cluster_mode = "false"
+
 ### ****************************************************************************************************************************
 ### Security configuration
 ### ****************************************************************************************************************************

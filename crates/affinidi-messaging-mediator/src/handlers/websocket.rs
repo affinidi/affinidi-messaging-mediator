@@ -1010,7 +1010,7 @@ async fn handle_socket(
 
                                             // Send a problem report to the sender
                                             #[cfg(feature = "didcomm")]
-                                            match e {
+                                            match e.named_storage_cap() {
                                                 MediatorError::MediatorError(_, _, msg_id, problem_report, _, log_message) => {
                                                     match  _package_problem_report(&state, &session, msg_id, *problem_report).await {
                                                         Ok(msg) => {
@@ -1024,9 +1024,9 @@ async fn handle_socket(
                                                         }
                                                     }
                                                 },
-                                                _ => {
+                                                other => {
                                                     // This is a generic error, we don't need to send a problem report
-                                                    warn!("Error processing message: {:?}", e);
+                                                    warn!("Error processing message: {:?}", other);
                                                 }
                                             }
                                             #[cfg(not(feature = "didcomm"))]

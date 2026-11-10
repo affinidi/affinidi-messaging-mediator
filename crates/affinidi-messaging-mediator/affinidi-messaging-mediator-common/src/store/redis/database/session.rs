@@ -9,61 +9,24 @@ use crate::errors::MediatorError;
 use crate::store::types::{Session, SessionState};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::Database;
 
 impl Database {
-    /// Creates a new session in the database
-    /// Typically called when sending the initial challenge to the client
-    pub async fn create_session(&self, session: &Session) -> Result<(), MediatorError> {
-        let mut con = self.get_connection().await?;
-
-        let sid = format!("SESSION:{}", session.session_id);
-
-        redis::pipe()
-            .atomic()
-            .cmd("HSET")
-            .arg(&sid)
-            .arg("challenge")
-            .arg(&session.challenge)
-            .arg("state")
-            .arg(session.state.to_string())
-            .arg("did")
-            .arg(&session.did)
-            .cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("SESSIONS_CREATED")
-            .arg(1)
-            .expire(&sid, 900)
-            .exec_async(&mut con)
-            .await
-            .map_err(|err| {
-                MediatorError::SessionError(
-                    14,
-                    sid.clone(),
-                    format!("Failed to create session ({sid}). Reason: {err}"),
-                )
-            })?;
-
-        debug!("Session created: session_id={}", session.session_id);
-
-        Ok(())
-    }
-
     /// Retrieves a session and associated other info from the database
     pub async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
         let mut con = self.get_connection().await?;
 
-        let (session_db, did_db): (HashMap<String, String>, Vec<Option<String>>) = redis::pipe()
-            .atomic()
-            .cmd("HGETALL")
-            .arg(format!("SESSION:{session_id}"))
-            .cmd("HMGET")
-            .arg(["DID:", &crate::did_identity::did_hash(did)].concat())
+        let mut session_cmd = redis::cmd("HGETALL");
+        session_cmd.arg(format!("SESSION:{session_id}"));
+        let mut did_cmd = redis::cmd("HMGET");
+        did_cmd
+            .arg(self.keys().did(&crate::did_identity::did_hash(did)))
             .arg("ROLE_TYPE")
-            .arg("ACLS")
-            .query_async(&mut con)
+            .arg("ACLS");
+        let (session_db, did_db): (HashMap<String, String>, Vec<Option<String>>) = self
+            .query_pair(&mut con, session_cmd, did_cmd)
             .await
             .map_err(|err| {
                 MediatorError::SessionError(
@@ -198,6 +161,16 @@ impl Database {
         did_hash: &str,
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
+        if self.keys().cluster_mode() {
+            return self
+                .update_session_authenticated_in_steps(
+                    old_session_id,
+                    new_session_id,
+                    did_hash,
+                    refresh_token_hash,
+                )
+                .await;
+        }
         let mut con = self.get_connection().await?;
 
         let old_sid = format!("SESSION:{old_session_id}");
@@ -232,6 +205,67 @@ impl Database {
                 )
             })?;
 
+        Ok(())
+    }
+
+    /// `update_session_authenticated` for cluster mode, where the two session
+    /// keys sit in different slots and cannot be `RENAME`d. Fails closed: the
+    /// old session is read and deleted in one step before the new one is
+    /// written, so a failure can force a new login but never leaves both ids
+    /// valid.
+    async fn update_session_authenticated_in_steps(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did_hash: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut con = self.get_connection().await?;
+        let old_sid = format!("SESSION:{old_session_id}");
+        let new_sid = format!("SESSION:{new_session_id}");
+        let failed = |reason: String| {
+            MediatorError::SessionError(
+                14,
+                old_session_id.into(),
+                format!("Failed to retrieve session ({old_session_id}). Reason: {reason}"),
+            )
+        };
+
+        let (fields, _): (HashMap<String, String>, u32) = redis::pipe()
+            .atomic()
+            .hgetall(&old_sid)
+            .del(&old_sid)
+            .query_async(&mut con)
+            .await
+            .map_err(|err| failed(err.to_string()))?;
+        if fields.is_empty() {
+            return Err(failed("no such session".into()));
+        }
+
+        let fields: Vec<(String, String)> = fields.into_iter().collect();
+        redis::pipe()
+            .atomic()
+            .hset_multiple(&new_sid, &fields)
+            .hset(&new_sid, "state", SessionState::Authenticated.to_string())
+            .hset(&new_sid, "refresh_token_hash", refresh_token_hash)
+            .expire(&new_sid, 86400)
+            .exec_async(&mut con)
+            .await
+            .map_err(|err| failed(err.to_string()))?;
+
+        // Bookkeeping beside a login that has already succeeded: a failure
+        // here must not fail the login.
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("SESSIONS_SUCCESS")
+            .arg(1);
+        let mut listed = redis::pipe();
+        listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
+        if let Err(err) = self.exec_steps(&mut con, vec![counted, listed]).await {
+            warn!(session_id = %new_session_id, "Couldn't record a successful login: {err}");
+        }
         Ok(())
     }
 

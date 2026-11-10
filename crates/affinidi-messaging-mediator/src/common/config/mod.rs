@@ -92,10 +92,13 @@ fn did_resolver_cache_config(raw: &DIDResolverConfig) -> DIDCacheConfig {
 fn database_config_from_raw(
     raw: affinidi_messaging_mediator_config::DatabaseConfigRaw,
 ) -> DatabaseConfig {
+    let cluster_mode =
+        affinidi_messaging_mediator_common::database::config::parse_cluster_mode(&raw.cluster_mode);
     DatabaseConfig {
         functions_file: Some(raw.functions_file),
         database_url: raw.database_url,
         database_timeout: raw.database_timeout.parse().unwrap_or(2),
+        cluster_mode,
         circuit_breaker_threshold: 5,
         circuit_breaker_recovery_secs: 10,
     }
@@ -1573,5 +1576,36 @@ mod tsp_advertise_tests {
         let mut doc = did_doc(other);
         let out = augment_did_web_doc_with_tsp_service(&mut doc, "did:web:mediator.example.com");
         assert!(out.is_none(), "no DIDComm endpoint to mirror — no mutation");
+    }
+}
+
+#[cfg(test)]
+mod database_config_tests {
+    use super::*;
+
+    fn raw(cluster_mode: &str) -> affinidi_messaging_mediator_config::DatabaseConfigRaw {
+        affinidi_messaging_mediator_config::DatabaseConfigRaw {
+            functions_file: "./atm-functions.lua".into(),
+            database_url: "redis://127.0.0.1/".into(),
+            database_timeout: "2".into(),
+            scripts_path: None,
+            cluster_mode: cluster_mode.into(),
+        }
+    }
+
+    #[test]
+    fn cluster_mode_is_off_when_absent() {
+        assert!(!database_config_from_raw(raw("")).cluster_mode);
+    }
+
+    #[test]
+    fn cluster_mode_is_on_only_when_true() {
+        assert!(database_config_from_raw(raw("true")).cluster_mode);
+        assert!(!database_config_from_raw(raw("false")).cluster_mode);
+    }
+
+    #[test]
+    fn cluster_mode_typo_falls_back_to_off() {
+        assert!(!database_config_from_raw(raw("ture")).cluster_mode);
     }
 }

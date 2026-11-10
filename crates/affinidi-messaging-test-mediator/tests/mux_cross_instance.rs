@@ -70,6 +70,8 @@ async fn redis_store(flush: bool) -> Option<Arc<dyn MediatorStore>> {
         ),
         database_url: format!("{}/{DB}", base.trim_end_matches('/')),
         database_timeout: 2,
+        // CI's cluster job runs this against a cluster-mode server too.
+        cluster_mode: std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true"),
         circuit_breaker_threshold: 5,
         circuit_breaker_recovery_secs: 10,
     };
