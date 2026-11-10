@@ -636,9 +636,23 @@ async fn handle_socket(
 
         metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).increment(1.0);
 
+        // A mux connection shares its queue among many DIDs, so each gets a
+        // fair share of it (design §7.2): per-DID slots on the way in, and a
+        // round-robin writer on the way out. A direct socket keeps the plain
+        // bounded channel.
+        let mux_slots = mux_mode.then(|| {
+            crate::mux::fair_queue::MuxSlots::new(state.config.limits.mux.max_channel_slots)
+        });
+        let mut fair = mux_slots
+            .as_ref()
+            .map(|_| crate::mux::fair_queue::FairOrder::<QueuedCommand>::default());
+
         // Register the transmission channel between websocket_streaming task and this websocket.
-        let (tx, mut rx): (Sender<QueuedCommand>, Receiver<QueuedCommand>) =
-            mpsc::channel(WS_CHANNEL_SLOTS);
+        let (tx, mut rx): (Sender<QueuedCommand>, Receiver<QueuedCommand>) = mpsc::channel(
+            mux_slots
+                .as_ref()
+                .map_or(WS_CHANNEL_SLOTS, |s| s.channel_capacity()),
+        );
 
         // Raised by the streaming task when a live notification for this DID
         // had to be dropped (send queue full, or the global byte budget
@@ -673,6 +687,7 @@ async fn handle_socket(
                     did: session.did.clone(),
                     resync: live_resync.clone(),
                     kind: EntryKind::Direct,
+                    slots: mux_slots.clone(),
                 },
             };
             match streaming.channel.send(start).await {
@@ -731,9 +746,15 @@ async fn handle_socket(
 
         // A mux connection admits its stored grants and tells the client its
         // nonce and members before anything else is written.
-        let mux_conn = if mux_mode {
-            let (conn, frames) =
-                crate::mux::connection::open(&state, &session, tx.clone(), live_resync.clone()).await;
+        let mux_conn = if let Some(slots) = &mux_slots {
+            let (conn, frames) = crate::mux::connection::open(
+                &state,
+                &session,
+                tx.clone(),
+                live_resync.clone(),
+                slots.clone(),
+            )
+            .await;
             for frame in frames {
                 if let Err(e) = socket.send(Message::Text(frame.into())).await {
                     warn!("Failed to send mux event to WebSocket client: {e}");
@@ -1060,7 +1081,7 @@ async fn handle_socket(
                         break;
                     }
                 }
-                value = rx.recv() => {
+                value = next_queued(&mut rx, fair.as_mut()) => {
                     if let Some(queued) = value {
                         // On a mux connection, a frame for a member that has
                         // left since it was queued is dropped, not written:
@@ -1191,24 +1212,48 @@ async fn handle_socket(
                     }
                     continue;
                 }
+                // Whose inbox each status reports. A direct socket carries one
+                // DID. A mux connection's resync is owed per DID, to the ones
+                // whose pushes were dropped, and never to a member that has
+                // left since (R7.2); the statuses all go to the principal.
                 #[cfg(feature = "didcomm")]
-                match _package_status(&state, &session).await {
-                    Ok(packed) => {
-                        if let Err(e) = socket.send(Message::Text(packed.into())).await {
-                            warn!("Failed to send resync status to WebSocket client: {e}");
-                        } else {
-                            debug!(
-                                did_hash = %session.did_hash,
-                                "sent message-pickup status after a dropped live notification"
-                            );
-                        }
+                let owed: Vec<(String, String)> = match (&mux_conn, &mux_slots) {
+                    (Some(conn), Some(slots)) => {
+                        let hashes = slots.take_resync();
+                        let s = conn.session.lock().await;
+                        hashes
+                            .into_iter()
+                            .filter_map(|h| {
+                                if h == session.did_hash {
+                                    Some((session.did.clone(), h))
+                                } else {
+                                    s.get(&h).map(|m| (m.did.clone(), h))
+                                }
+                            })
+                            .collect()
                     }
-                    Err(e) => {
-                        // Leave the flag down: a failure to *build* the status
-                        // will fail identically next time, and re-raising it
-                        // would spin. The client still recovers on its next
-                        // poll; this is the enhancement failing, not delivery.
-                        warn!("Couldn't build resync status for {}: {e}", session.did_hash);
+                    _ => vec![(session.did.clone(), session.did_hash.clone())],
+                };
+                #[cfg(feature = "didcomm")]
+                for (did, did_hash) in owed {
+                    match _package_status_for(&state, &session, &did, &did_hash).await {
+                        Ok(packed) => {
+                            if let Err(e) = socket.send(Message::Text(packed.into())).await {
+                                warn!("Failed to send resync status to WebSocket client: {e}");
+                            } else {
+                                debug!(
+                                    did_hash = %did_hash,
+                                    "sent message-pickup status after a dropped live notification"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Leave the flag down: a failure to *build* the status
+                            // will fail identically next time, and re-raising it
+                            // would spin. The client still recovers on its next
+                            // poll; this is the enhancement failing, not delivery.
+                            warn!("Couldn't build resync status for {did_hash}: {e}");
+                        }
                     }
                 }
             }
@@ -1253,6 +1298,19 @@ async fn handle_socket(
     }
     .instrument(_span)
     .await
+}
+
+/// The next command for the socket loop. A direct socket reads its channel in
+/// order, as it always has; a mux connection reads it through its fair order
+/// (design §7.2). Cancel-safe either way.
+async fn next_queued(
+    rx: &mut Receiver<QueuedCommand>,
+    fair: Option<&mut crate::mux::fair_queue::FairOrder<QueuedCommand>>,
+) -> Option<QueuedCommand> {
+    match fair {
+        None => rx.recv().await,
+        Some(fair) => fair.next(rx).await,
+    }
 }
 
 /// Page size for the TSP inbox drain — reuses the same shape as
@@ -1611,15 +1669,25 @@ async fn _package_problem_report(
 /// than that *something* was missed. A client already understands this message
 /// — it is the same one it gets for a `status-request` — so the resync needs no
 /// new protocol on the client side.
+///
+/// It reports the inbox of `did`: the session's own DID, or a member of its
+/// mux connection. Either way it is packed to the session's DID: on a mux
+/// connection the principal is the party the control plane addresses
+/// (design §7.5), and `recipient_did` says whose inbox it is.
 #[cfg(feature = "didcomm")]
-async fn _package_status(state: &SharedData, session: &Session) -> Result<String, MediatorError> {
-    let status = state.database.inbox_status(&session.did_hash).await?;
+async fn _package_status_for(
+    state: &SharedData,
+    session: &Session,
+    did: &str,
+    did_hash: &str,
+) -> Result<String, MediatorError> {
+    let status = state.database.inbox_status(did_hash).await?;
 
     let msg = DidcommMessage::build(
         Uuid::new_v4().to_string(),
         "https://didcomm.org/messagepickup/3.0/status".to_string(),
         json!({
-            "recipient_did": session.did,
+            "recipient_did": did,
             "message_count": status.message_count,
             "live_delivery": true,
         }),

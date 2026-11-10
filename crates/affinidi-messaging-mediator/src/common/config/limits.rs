@@ -114,7 +114,10 @@ pub struct MuxConfig {
     /// How often an attached member's signing key is re-checked against its
     /// current DID document while connected.
     pub revalidate_interval_secs: u64,
-    /// Ceiling on a mux connection's send-queue depth.
+    /// Ceiling on a mux connection's send-queue depth, across all its DIDs.
+    /// Each DID on the connection may hold up to 8 of these (fair queuing,
+    /// design §7.2), so a connection queues at most
+    /// `min(8 × DIDs, max_channel_slots)` frames. Clamped to `[8, 65536]`.
     pub max_channel_slots: usize,
     /// How long a dead grant stays listable after its expiry.
     pub dead_retention_secs: u64,
@@ -137,6 +140,24 @@ impl MuxConfig {
             dead_retention_secs: self.dead_retention_secs,
         }
     }
+}
+
+/// Largest `limits.mux.max_channel_slots` honoured. Frames are bounded in
+/// bytes by `ws_send_buffer` anyway; this keeps one connection's depth sane.
+pub const MUX_MAX_CHANNEL_SLOTS_CEILING: usize = 65_536;
+
+/// Clamp `limits.mux.max_channel_slots` into `[8, 65536]`: below one member's
+/// share (8) a member could not use its own slots, and the channel must have a
+/// finite capacity.
+fn channel_slots(value: usize) -> usize {
+    let floor = crate::mux::fair_queue::MEMBER_SLOTS;
+    let clamped = value.clamp(floor, MUX_MAX_CHANNEL_SLOTS_CEILING);
+    if clamped != value {
+        eprintln!(
+            "WARN: limits.mux.max_channel_slots = {value} is outside [{floor}, {MUX_MAX_CHANNEL_SLOTS_CEILING}]; using {clamped}"
+        );
+    }
+    clamped
 }
 
 impl From<MuxConfigRaw> for MuxConfig {
@@ -193,7 +214,12 @@ impl From<MuxConfigRaw> for MuxConfig {
                 900,
                 "900",
             ),
-            max_channel_slots: num("max_channel_slots", &raw.max_channel_slots, 512, "512"),
+            max_channel_slots: channel_slots(num(
+                "max_channel_slots",
+                &raw.max_channel_slots,
+                512,
+                "512",
+            )),
             dead_retention_secs: num(
                 "dead_retention_secs",
                 &raw.dead_retention_secs,
@@ -481,6 +507,27 @@ mod tests {
         assert_eq!(mux, MuxConfig::default());
         assert!(!mux.enabled);
         assert_eq!(mux.store_limits(), MuxLimits::default());
+    }
+
+    #[test]
+    fn mux_channel_slots_are_bounded() {
+        let mut raw = MuxConfigRaw::default();
+        assert_eq!(MuxConfig::from(raw.clone()).max_channel_slots, 512);
+        for (given, used) in [
+            ("0", 8),
+            ("3", 8),
+            ("8", 8),
+            ("1000", 1000),
+            ("10000000", MUX_MAX_CHANNEL_SLOTS_CEILING),
+            ("nonsense", 512),
+        ] {
+            raw.max_channel_slots = given.into();
+            assert_eq!(
+                MuxConfig::from(raw.clone()).max_channel_slots,
+                used,
+                "{given}"
+            );
+        }
     }
 
     #[test]

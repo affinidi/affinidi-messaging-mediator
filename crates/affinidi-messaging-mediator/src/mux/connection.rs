@@ -133,6 +133,7 @@ pub async fn open(
     session: &Session,
     tx: mpsc::Sender<QueuedCommand>,
     resync: Arc<AtomicBool>,
+    slots: Arc<super::fair_queue::MuxSlots>,
 ) -> (Arc<MuxConn>, Vec<String>) {
     let limits = &state.config.limits.mux;
     let mut mux = MuxSession::new(
@@ -157,7 +158,7 @@ pub async fn open(
     super::notice::expiring(state, &session.did_hash).await;
     let pending_notices = super::notice::pending(state, &session.did_hash).await;
     let nonce = mux.nonce.clone();
-    let conn = Arc::new(MuxConn::new(mux, tx, resync));
+    let conn = Arc::new(MuxConn::new(mux, tx, resync).with_slots(slots));
     if let Some(streaming) = &state.streaming_task {
         for m in &admitted {
             conn.register_member(streaming, m).await;
