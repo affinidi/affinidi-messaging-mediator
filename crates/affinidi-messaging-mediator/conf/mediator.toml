@@ -637,8 +637,9 @@ oob_invite_ttl = "86400"
 ###
 ### OFF unless enabled here. Absent, empty, or any value other than "true"
 ### leaves it off. Needs [streaming] enabled; the mediator refuses to start
-### otherwise. DIDComm clients open a mux connection with the `affinidi-mux`
-### WebSocket subprotocol (raw TSP `tsp-mux` is not served yet).
+### otherwise. DIDComm clients open a mux connection with the `didcomm-mux`
+### WebSocket subprotocol (the provisional `affinidi-mux` is still accepted;
+### raw TSP `tsp-mux` is not served yet).
 ### Several instances behind one Redis: a revoke handled by one instance
 ### reaches another's connections within 30 s (the member sweep).
 # [limits.mux]

@@ -379,27 +379,66 @@ pub enum DirectKey {
 /// the store failed — and the login must then fail rather than leave grants
 /// active that a new controller's key should have ended. A DID with no
 /// active grant is never resolved and never fails here.
+///
+/// The read and the key resolution are bounded by [`CHECK_READ_TIMEOUT`], so
+/// a slow store or resolver refuses the login (retryable) instead of holding
+/// it open. The commit and detach are not cut short: a suspension the store
+/// accepted is always detached before this returns. Every failure counts in
+/// `mux_login_check_failures_total`.
 pub async fn unknown_key_check(
+    state: &SharedData,
+    did_hash: &str,
+    key: DirectKey,
+) -> Result<Vec<MuxGrant>, String> {
+    let r = check(state, did_hash, key).await;
+    if r.is_err() {
+        metrics::counter!(crate::common::metrics::names::MUX_LOGIN_CHECK_FAILURES_TOTAL)
+            .increment(1);
+    }
+    r
+}
+
+/// The longest a direct login waits to read the DID's grants and resolve its
+/// key for the unknown-key rule. The authcrypt sender was resolved moments
+/// earlier to unpack the login, so the resolution is normally a cache hit.
+pub const CHECK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn check(
     state: &SharedData,
     did_hash: &str,
     key: DirectKey,
 ) -> Result<Vec<MuxGrant>, String> {
     let limits = state.config.limits.mux.store_limits();
     let now = state.clock.unix_secs();
-    let rec = mux::load(&*state.database, did_hash, &limits, now)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !rec.grants.iter().any(|g| g.is_usable(now)) {
-        return Ok(Vec::new());
-    }
-    let proven = match key {
-        DirectKey::Authcrypt(None) => return Ok(Vec::new()),
-        DirectKey::Authcrypt(Some(kid)) => ProvenKey::KeyAgreement(
-            super::proof::StatementVerifier::new(state.did_resolver.clone())
-                .key_agreement_fp(&kid)
-                .await?,
-        ),
-        DirectKey::Signing(bytes) => ProvenKey::Signing(super::proof::fingerprint(&bytes)),
+    let read = async {
+        let rec = mux::load(&*state.database, did_hash, &limits, now)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !rec.grants.iter().any(|g| g.is_usable(now)) {
+            return Ok(None);
+        }
+        Ok::<_, String>(match key {
+            DirectKey::Authcrypt(None) => None,
+            DirectKey::Authcrypt(Some(kid)) => Some(ProvenKey::KeyAgreement(
+                super::proof::StatementVerifier::new(state.did_resolver.clone())
+                    .key_agreement_fp(&kid)
+                    .await?,
+            )),
+            DirectKey::Signing(bytes) => {
+                Some(ProvenKey::Signing(super::proof::fingerprint(&bytes)))
+            }
+        })
+    };
+    let proven = match tokio::time::timeout(CHECK_READ_TIMEOUT, read).await {
+        Ok(Ok(Some(p))) => p,
+        Ok(Ok(None)) => return Ok(Vec::new()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(format!(
+                "grants or key not read within {}s",
+                CHECK_READ_TIMEOUT.as_secs()
+            ));
+        }
     };
     let suspended = mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
         Ok(match &proven {

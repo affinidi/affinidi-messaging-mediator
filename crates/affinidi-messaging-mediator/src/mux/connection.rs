@@ -7,9 +7,8 @@
 //! logic is testable and the hot loop's control flow barely changes.
 //!
 //! DIDComm only for now. A mux connection is negotiated with the
-//! [`MUX_SUBPROTOCOL`] WebSocket subprotocol (a provisional name; how a
-//! DIDComm socket becomes a mux connection is still open in the design, §12a).
-//! Raw TSP (`tsp-mux`, design §4.10) follows.
+//! [`MUX_SUBPROTOCOL`] WebSocket subprotocol (spec `messaging/mux/event/0.1`,
+//! "DIDComm sockets"). Raw TSP (`tsp-mux`, design §4.10) follows.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -30,7 +29,25 @@ use crate::common::session::Session;
 use crate::tasks::websocket_streaming::{MemberChange, QueuedCommand};
 
 /// WebSocket subprotocol a DIDComm client offers to open a mux connection.
-pub const MUX_SUBPROTOCOL: &str = "affinidi-mux";
+pub const MUX_SUBPROTOCOL: &str = "didcomm-mux";
+
+/// The provisional name SDK 0.45.1 and 0.45.2 offer. Still accepted, so
+/// those clients keep working; no released mediator served it, and the spec
+/// lets a mediator accept a token it shipped before the binding existed.
+pub const LEGACY_MUX_SUBPROTOCOL: &str = "affinidi-mux";
+
+/// The mux subprotocol to select from a client's offer, if it made one:
+/// the spec's name when offered, else the legacy one.
+pub fn mux_subprotocol<'a>(offered: impl IntoIterator<Item = &'a String>) -> Option<&'static str> {
+    let mut legacy = false;
+    for p in offered {
+        if p == MUX_SUBPROTOCOL {
+            return Some(MUX_SUBPROTOCOL);
+        }
+        legacy |= p == LEGACY_MUX_SUBPROTOCOL;
+    }
+    legacy.then_some(LEGACY_MUX_SUBPROTOCOL)
+}
 
 /// `messaging/mux/event` type URI.
 #[cfg(feature = "didcomm")]
@@ -53,21 +70,37 @@ fn ctx<'a>(state: &'a SharedData, verifier: &'a StatementVerifier) -> Ctx<'a> {
     }
 }
 
-/// A `MemberChange` (spec) entry.
-fn change(member: &MuxMember, reason: &str, delivery_active: Option<bool>) -> Value {
+/// A `MemberChange` (spec) entry for an `attached` event: the member's
+/// scope, expiry and whether its live traffic comes here.
+fn attached(member: &MuxMember, reason: &str, delivery_active: bool) -> Value {
     let mut v = json!({
         "did": member.did,
         "reason": reason,
         "scope": member.scope,
         "expiresAt": rfc3339(member.expires_at),
+        "deliveryActive": delivery_active,
     });
     if let MuxSource::Grant { grant_id } = &member.source {
         v["grantId"] = json!(grant_id);
     }
-    if let Some(a) = delivery_active {
-        v["deliveryActive"] = json!(a);
+    v
+}
+
+/// A `MemberChange` entry for a `detached` event, which carries only the
+/// DID, the reason and the grant concerned.
+fn detached(did: &str, grant_id: Option<&str>, reason: LeaveReason) -> Value {
+    let mut v = json!({ "did": did, "reason": reason.wire() });
+    if let Some(id) = grant_id {
+        v["grantId"] = json!(id);
     }
     v
+}
+
+fn grant_id(member: &MuxMember) -> Option<&str> {
+    match &member.source {
+        MuxSource::Grant { grant_id } => Some(grant_id),
+        MuxSource::Attach => None,
+    }
 }
 
 /// Sign a `messaging/mux/event` payload as the mediator and pack it to the
@@ -189,7 +222,7 @@ pub async fn open(
     if !admitted.is_empty() {
         let dids: Vec<Value> = admitted
             .iter()
-            .map(|m| change(m, "connect", None))
+            .map(|m| attached(m, "connect", true))
             .collect();
         frames.extend(
             pack_event(
@@ -200,8 +233,22 @@ pub async fn open(
             .await,
         );
     }
+    // Grants that failed re-validation, and valid ones with no room here,
+    // in one `detached` event (spec event rule 4).
     if !refused.is_empty() {
         debug!(principal = %session.did_hash, refused = refused.len(), "stored grants not carried on connect");
+        let dids: Vec<Value> = refused
+            .iter()
+            .map(|r| detached(&r.did, Some(&r.grant_id), r.reason))
+            .collect();
+        frames.extend(
+            pack_event(
+                state,
+                &session.did,
+                json!({ "event": "detached", "dids": dids }),
+            )
+            .await,
+        );
     }
     (conn, frames)
 }
@@ -259,21 +306,35 @@ pub async fn on_member_change(
     conn: &MuxConn,
     change_: MemberChange,
 ) -> Option<String> {
-    let (hash, event, reason, active) = match &change_ {
-        MemberChange::Superseded { did_hash } => (did_hash, "detached", "superseded", false),
-        MemberChange::Inactive { did_hash } => (did_hash, "attached", "superseded", false),
-        MemberChange::Reactivated { did_hash } => (did_hash, "attached", "reactivated", true),
+    let hash = match &change_ {
+        MemberChange::Superseded { did_hash }
+        | MemberChange::Inactive { did_hash }
+        | MemberChange::Reactivated { did_hash } => did_hash,
     };
     let (member, principal) = {
         let s = conn.session.lock().await;
         (s.get(hash).cloned()?, s.principal_did.clone())
     };
-    pack_event(
-        state,
-        &principal,
-        json!({ "event": event, "dids": [change(&member, reason, Some(active))] }),
-    )
-    .await
+    let payload = match change_ {
+        MemberChange::Superseded { .. } => json!({
+            "event": "detached",
+            "dids": [detached(&member.did, grant_id(&member), LeaveReason::Superseded)],
+        }),
+        // Restates a member just admitted while the DID's own direct socket
+        // keeps its live traffic. The reason must be an AttachReason, and
+        // `superseded` is not one: name how the member joined.
+        MemberChange::Inactive { .. } => {
+            let reason = match member.source {
+                MuxSource::Attach => "attach",
+                MuxSource::Grant { .. } => "connect",
+            };
+            json!({ "event": "attached", "dids": [attached(&member, reason, false)] })
+        }
+        MemberChange::Reactivated { .. } => {
+            json!({ "event": "attached", "dids": [attached(&member, "reactivated", true)] })
+        }
+    };
+    pack_event(state, &principal, payload).await
 }
 
 /// Members that joined or left since the last call, as at most one
@@ -284,7 +345,7 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
     let principal = conn.session.lock().await.principal_did.clone();
     let mut frames = Vec::new();
     if !joined.is_empty() {
-        let dids: Vec<Value> = joined.iter().map(|m| change(m, "grant", None)).collect();
+        let dids: Vec<Value> = joined.iter().map(|m| attached(m, "grant", true)).collect();
         frames.extend(
             pack_event(
                 state,
@@ -297,7 +358,7 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn) -> Vec<String> {
     if !left.is_empty() {
         let dids: Vec<Value> = left
             .iter()
-            .map(|(m, r)| change(m, r.wire(), None))
+            .map(|(m, r)| detached(&m.did, grant_id(m), *r))
             .collect();
         frames.extend(
             pack_event(

@@ -5,7 +5,8 @@
 //! own grant operation (`mux::grants::store_grant`, the code the
 //! `messaging/mux/grant` Trust Task runs) because the SDK has no mux client
 //! yet. Everything else is the wire: the principal's socket negotiates
-//! `affinidi-mux`, receives the signed `ready` / `attached` events, and then
+//! `affinidi-mux` (the provisional name, still accepted; `mux_limits.rs`
+//! covers `didcomm-mux`), receives the signed `ready` / `attached` events, and then
 //! receives messages addressed to each member.
 
 mod common;

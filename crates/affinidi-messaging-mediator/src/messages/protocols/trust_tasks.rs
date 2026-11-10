@@ -2329,7 +2329,7 @@ async fn consume_mux(
     };
     let streaming = state.streaming_task.as_ref();
 
-    let (response, changed) = match task {
+    let (mut response, changed) = match task {
         ServedTask::MuxAttach => {
             tasks::attach(
                 &ctx,
@@ -2390,10 +2390,21 @@ async fn consume_mux(
         state.mux.narrow(&changed.narrowed).await;
     }
     if !changed.stored.is_empty() {
-        state
+        let carried = state
             .mux
             .admit_grants(streaming, ctx.store, &ctx.limits, ctx.now, &changed.stored)
             .await;
+        // `attachedNow` on each stored grant: whether a connection on this
+        // instance took the member. Another instance's connection takes it
+        // moments later and is not counted.
+        if let Some(results) = response.get_mut("results").and_then(Value::as_array_mut) {
+            for r in results {
+                if r.get("status").and_then(Value::as_str) == Some("stored") {
+                    let id = r.get("grantId").and_then(Value::as_str).unwrap_or_default();
+                    r["attachedNow"] = Value::Bool(carried.contains(id));
+                }
+            }
+        }
     }
     // The same principals' connections on other instances sharing the store
     // follow within one pub/sub hop (§7.4); this answer does not wait for them.

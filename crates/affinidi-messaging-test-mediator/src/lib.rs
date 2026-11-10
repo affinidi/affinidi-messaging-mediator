@@ -350,6 +350,8 @@ pub struct TestMediatorBuilder {
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
     mux_enabled: bool,
+    /// Override for `[limits.mux] max_dids_per_connection`.
+    mux_max_dids_per_connection: Option<usize>,
     /// Override for `LimitsConfig.queued_send_messages_per_peer`.
     queue_send_limit_per_peer: Option<i32>,
     /// See [`TestMediatorBuilder::message_size`].
@@ -402,6 +404,7 @@ impl Default for TestMediatorBuilder {
             max_websocket_connections_per_did: None,
             did_rate_limit: None,
             mux_enabled: false,
+            mux_max_dids_per_connection: None,
             queue_send_limit_per_peer: None,
             message_size: None,
             clock: None,
@@ -643,6 +646,13 @@ impl TestMediatorBuilder {
     /// Set `[limits.mux] enabled`. Off by default, as in production.
     pub fn mux_enabled(mut self, enabled: bool) -> Self {
         self.mux_enabled = enabled;
+        self
+    }
+
+    /// Set `[limits.mux] max_dids_per_connection`, to reach a full
+    /// connection without granting a thousand DIDs.
+    pub fn mux_max_dids_per_connection(mut self, max: usize) -> Self {
+        self.mux_max_dids_per_connection = Some(max);
         self
     }
 
@@ -951,6 +961,9 @@ impl TestMediatorBuilder {
             limits.did_rate_limit_burst = burst;
         }
         limits.mux.enabled = self.mux_enabled;
+        if let Some(max) = self.mux_max_dids_per_connection {
+            limits.mux.max_dids_per_connection = max;
+        }
 
         // Disable processors that aren't useful in most tests.
         let mut processors =
