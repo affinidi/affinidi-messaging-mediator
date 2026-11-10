@@ -588,3 +588,134 @@ async fn a_member_with_send_sends_on_the_tsp_mux_socket() {
     assert_eq!(payload, b"sent by work via the principal");
     env.shutdown().await.expect("shutdown");
 }
+
+/// The SDK's `tsp-mux` client (affinidi-messaging-sdk 0.45.4) against this
+/// mediator, end to end: negotiation and `ready`, typed `attached` events,
+/// member frames tagged with their receiver, per-member ack results, and an
+/// in-band `refused` event matched to the frame id `send` returned.
+#[tokio::test]
+async fn the_sdk_client_drives_a_tsp_mux_connection() {
+    use affinidi_messaging_sdk::protocols::{
+        mux::MuxRefused,
+        tsp_mux::{TspMuxFrame, frame_id},
+    };
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    for m in [&work, &home] {
+        env.relate_directly(&sender, m).await.unwrap();
+    }
+    grant(&env, &work, &principal, &["receive", "pickup", "delete"]).await;
+    grant(&env, &home, &principal, &["receive", "pickup"]).await;
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("the SDK opens a tsp-mux connection");
+    assert_eq!(sock.ready().mux_nonce.len(), 43, "ready came first");
+    assert_eq!(sock.principal(), principal.did);
+
+    let next = async |sock: &mut affinidi_messaging_sdk::protocols::tsp_mux::TspMuxWebSocket| {
+        timeout(Duration::from_secs(5), sock.recv())
+            .await
+            .expect("a frame within 5s")
+            .expect("socket readable")
+            .expect("socket open")
+    };
+
+    // `attached` for both members, typed.
+    let attached = match next(&mut sock).await {
+        TspMuxFrame::Event(e) => serde_json::to_value(&*e).unwrap(),
+        other => panic!("expected the attached event, got {other:?}"),
+    };
+    assert_eq!(attached["event"], "attached");
+    let mut dids: Vec<String> = attached["dids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["did"].as_str().unwrap().to_string())
+        .collect();
+    dids.sort();
+    let mut want = vec![work.did.clone(), home.did.clone()];
+    want.sort();
+    assert_eq!(dids, want);
+
+    // Member frames come back unopened, tagged with their receiver.
+    for (m, text) in [(&work, "for work"), (&home, "for home")] {
+        env.atm
+            .tsp()
+            .send(&sender.profile, &m.did, text.as_bytes())
+            .await
+            .expect("sender sends");
+    }
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        match next(&mut sock).await {
+            TspMuxFrame::Data {
+                receiver, frame, ..
+            } => frames.push((receiver, frame)),
+            other => panic!("expected a member frame, got {other:?}"),
+        }
+    }
+    for (to, frame) in &frames {
+        let m = if *to == work.did { &work } else { &home };
+        assert_eq!(*to, m.did);
+        let (payload, from) = env
+            .atm
+            .tsp()
+            .unpack_bytes(&m.profile, frame)
+            .await
+            .expect("the member opens its own frame");
+        assert_eq!(from, sender.did);
+        assert_eq!(
+            payload,
+            if m.did == work.did {
+                b"for work".to_vec()
+            } else {
+                b"for home".to_vec()
+            }
+        );
+    }
+
+    // Acks report exactly what the mediator did: work has `delete`, home not.
+    let refs: Vec<&[u8]> = frames.iter().map(|(_, f)| f.as_slice()).collect();
+    let acked = sock.ack(&refs).await.expect("ack request");
+    assert_eq!(acked.acked.len(), 1, "{acked:?}");
+    assert_eq!(acked.refused.len(), 1, "{acked:?}");
+    assert!(!acked.is_complete());
+    assert_eq!(inbox_len(&env, &work).await, 0);
+    assert_eq!(inbox_len(&env, &home).await, 1, "kept without `delete`");
+
+    // A frame the session may not send is refused in-band; the event names
+    // the id `send` returned, and the socket stays open.
+    let bad = env
+        .atm
+        .tsp()
+        .pack(&sender.profile, &work.did, b"not the principal's to send")
+        .await
+        .expect("pack");
+    let id = sock.send(&bad).await.expect("write the frame");
+    assert_eq!(id, frame_id(&bad));
+    let refused = match next(&mut sock).await {
+        TspMuxFrame::Event(e) => MuxRefused::from_event(&e).expect("a refused event"),
+        other => panic!("expected the refused event, got {other:?}"),
+    };
+    assert_eq!(refused.frame_id, id);
+    env.atm
+        .tsp()
+        .send(&sender.profile, &work.did, b"after the refusal")
+        .await
+        .expect("send");
+    match next(&mut sock).await {
+        TspMuxFrame::Data { receiver, .. } => assert_eq!(receiver, work.did),
+        other => panic!("expected a member frame, got {other:?}"),
+    }
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}
