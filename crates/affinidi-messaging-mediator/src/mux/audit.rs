@@ -3,8 +3,10 @@
 //!
 //! Written after the change is committed and its members detached, like
 //! every other audit entry, and best-effort: a failure to record is logged
-//! and never turns a completed change into an error (see
-//! `messages::protocols::mediator::record_audit`).
+//! and counted in `audit_write_failures_total`, and never turns a completed
+//! change into an error (see `messages::protocols::mediator::record_audit`).
+//! The change is the security-relevant act and has already happened; failing
+//! the request would not undo it, only hide it from the caller.
 
 use affinidi_messaging_mediator_common::store::mux::MuxGrant;
 use affinidi_messaging_mediator_common::types::audit::{AuditAction, AuditLogEntry};
@@ -56,6 +58,7 @@ async fn record(
         detail,
     };
     if let Err(e) = state.database.audit_log_record(&entry).await {
+        metrics::counter!(crate::common::metrics::names::AUDIT_WRITE_FAILURES_TOTAL).increment(1);
         warn!(?action, target, "Failed to record audit-log entry: {e}");
     }
 }
@@ -99,6 +102,9 @@ pub async fn revoked(state: &SharedData, sender_hash: &str, changed: &Changed) {
 
 /// One entry for a `messaging/mux/revoke-all` that advanced the member's
 /// epoch, read from its response. One that changed nothing is not recorded.
+/// The response's `did` is the issuer of the revoke-all statement, whose
+/// Data Integrity proof `tasks::revoke_all` verified against that DID before
+/// touching its record; nothing in it is taken from the request unverified.
 pub async fn revoked_all(state: &SharedData, sender_hash: &str, response: &Value) {
     if response.get("epochAdvanced").and_then(Value::as_bool) != Some(true) {
         return;

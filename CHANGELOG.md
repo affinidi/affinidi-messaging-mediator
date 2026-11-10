@@ -117,7 +117,8 @@ the new actions from affinidi-messaging-mediator-types 0.1.1:
   On a direct login it is written before the login answers.
 
 Recording is best-effort, like every audit entry: a failure is logged and
-never undoes the change.
+never undoes the change. Every failed audit write, mux or not, now also
+counts in the new `audit_write_failures_total` metric.
 
 ### Changed — DID multiplexing connections (R3.6)
 

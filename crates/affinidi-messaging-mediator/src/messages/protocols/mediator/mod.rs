@@ -24,6 +24,7 @@ pub(crate) async fn record_audit(
         detail,
     };
     if let Err(e) = state.database.audit_log_record(&entry).await {
+        metrics::counter!(crate::common::metrics::names::AUDIT_WRITE_FAILURES_TOTAL).increment(1);
         warn!(
             action = ?action,
             target = %target_did_hash,
