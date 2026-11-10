@@ -455,6 +455,68 @@ pub async fn allows(
     }
 }
 
+/// The session a frame from `sender_did` runs under when it arrives on
+/// `session`'s mux connection and its sender is not the principal: the
+/// member's own identity and standing, read now. `None` (refuse, exactly as a
+/// foreign sender is refused on any socket) unless this connection carries
+/// the member with `send` right now *and* the member's own ACLs still allow
+/// what `send` needs on its own connection ([`super::grants::check_scope`]:
+/// not blocked, local, `SEND_MESSAGES`). A store failure refuses too.
+///
+/// The caller has already established that `sender_did` is the frame's sender
+/// — cryptographically for anything addressed to the mediator, and as the
+/// envelope's claim for opaque direct delivery, which the member vouched for
+/// by granting `send`. Everything downstream (forwarding ACLs, queue limits,
+/// the recipient's ACL and access list, stats) then sees the member as the
+/// sender, exactly as on the member's own connection. The returned session
+/// keeps the connection's `session_id`; the socket still answers on the
+/// principal's session.
+pub async fn sender_session(
+    state: &SharedData,
+    session: &Session,
+    sender_did: &str,
+) -> Option<Session> {
+    use affinidi_messaging_mediator_common::{
+        did_identity::did_hash, store::mux::MuxScope, types::acls::MediatorACLSet,
+    };
+    use affinidi_messaging_sdk::protocols::mediator::accounts::AccountType;
+
+    let hash = did_hash(sender_did);
+    if hash == session.did_hash
+        || !allows(state, &session.session_id, &hash, MuxCapability::Send).await
+    {
+        return None;
+    }
+    let (acls, account_type) = match state.database.account_get(&hash).await {
+        Ok(Some(account)) => (MediatorACLSet::from_u64(account.acls), account._type),
+        Ok(None) => (
+            state.config.security.global_acl_default.clone(),
+            AccountType::Unknown,
+        ),
+        Err(e) => {
+            warn!(member = %hash, "mux send refused: member account unreadable: {e}");
+            return None;
+        }
+    };
+    let send = MuxScope::new([MuxCapability::Send]).ok()?;
+    if let Err(e) = super::grants::check_scope(&acls, &send) {
+        debug!(member = %hash, "mux send refused: {e}");
+        return None;
+    }
+    debug!(principal = %session.did_hash, member = %hash, "frame accepted as sent by mux member");
+    Some(Session {
+        session_id: session.session_id.clone(),
+        did: sender_did.to_string(),
+        did_hash: hash,
+        authenticated: true,
+        acls,
+        account_type,
+        state: session.state,
+        expires_at: session.expires_at,
+        ..Default::default()
+    })
+}
+
 /// The members of `session_id`'s mux connection that may do `cap` now.
 pub async fn members_with(state: &SharedData, session_id: &str, cap: MuxCapability) -> Vec<String> {
     let Some(conn) = state.mux.get(session_id) else {
