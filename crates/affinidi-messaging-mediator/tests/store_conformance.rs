@@ -1831,10 +1831,46 @@ async fn redis_mux_changes_reach_every_instance() {
     }
 }
 
+/// Redis only: fetching a message by id counts it as sent in the global
+/// stats. The two counters are one MULTI, so a malformed command in it
+/// drops both.
+#[cfg(feature = "redis-backend")]
+async fn check_fetch_counts_sent(store: Arc<dyn MediatorStore>) {
+    let to = "did_hash_recipient_sent_stats";
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add recipient");
+    let body = "{\"protected\":\"sent-stats\"}";
+    let id = store
+        .store_message("session-id", body, to, None, NEVER, 1000)
+        .await
+        .expect("store_message");
+
+    let before = store.get_global_stats().await.expect("stats before");
+    let fetched = store
+        .get_message(to, &id)
+        .await
+        .expect("get_message")
+        .expect("stored message is retrievable by id");
+    let after = store.get_global_stats().await.expect("stats after");
+    assert_eq!(
+        after.sent_count - before.sent_count,
+        1,
+        "a fetch counts one message sent"
+    );
+    assert_eq!(
+        after.sent_bytes - before.sent_bytes,
+        fetched.size as i64,
+        "a fetch counts the message's bytes sent"
+    );
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
 async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
+    check_fetch_counts_sent(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;

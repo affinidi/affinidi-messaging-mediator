@@ -8,6 +8,13 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Fixed — global sent counters on Redis
+
+- On the Redis backend, fetching a message by id never counted it in the
+  global `SENT_COUNT`/`SENT_BYTES` stats: the `HINCRBY` for `SENT_COUNT`
+  had no key, so Redis refused the whole `MULTI`. Both counters now move,
+  and the store conformance suite checks it.
+
 ### Changed — affinidi-messaging-sdk 0.45.4
 
 - The SDK now has a `tsp-mux` client (`TspOps::connect_websocket_mux`), and

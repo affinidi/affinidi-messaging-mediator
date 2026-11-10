@@ -138,6 +138,7 @@ impl Database {
             .arg("SENT_BYTES")
             .arg(sent_bytes)
             .cmd("HINCRBY")
+            .arg("GLOBAL")
             .arg("SENT_COUNT")
             .arg(1)
             .exec_async(&mut con)
