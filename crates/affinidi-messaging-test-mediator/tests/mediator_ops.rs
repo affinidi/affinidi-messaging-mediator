@@ -688,6 +688,63 @@ async fn an_admin_watches_a_message_arrive_live() {
     );
 }
 
+/// A live push over the recipient's websocket is reported `delivered` once,
+/// on the websocket channel, by the socket that wrote it (R1.1): the
+/// streaming task hands the report over with the frame rather than claiming
+/// the delivery when it queues it.
+#[tokio::test]
+async fn a_live_push_is_reported_delivered_once_by_the_socket() {
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
+
+    let env = direct_env().await;
+    let alice = env.add_user("alice").await.expect("alice");
+    let bob = env.add_user("bob").await.expect("bob");
+    let admin = promoted(&env, "admin", AccountType::Admin).await;
+    let filter: MonitorFilter =
+        serde_json::from_value(json!({ "dids": [bob.did_hash()] })).unwrap();
+    env.atm
+        .trust_tasks()
+        .monitor_subscribe(&admin.profile, Some(filter), Some(60), None, None)
+        .await
+        .expect("admin subscribes");
+    env.atm
+        .profile_add(&bob.profile, true)
+        .await
+        .expect("bob's live websocket");
+
+    send_direct(&env, &alice, &bob).await;
+    // Bob's own control traffic (the pickup status answering his live
+    // toggle) shares the stream; wait for the push itself.
+    loop {
+        let (msg, _) = env
+            .atm
+            .message_pickup()
+            .live_stream_next(&bob.profile, Some(Duration::from_secs(5)), false)
+            .await
+            .expect("live stream")
+            .expect("bob receives the push");
+        if msg.typ == "https://didcomm.org/basicmessage/2.0/message" {
+            assert_eq!(msg.body["content"], "queue status probe");
+            break;
+        }
+    }
+
+    let bob_hash = bob.did_hash();
+    let live_delivery =
+        |e: &serde_json::Value| e["stage"] == "delivered" && e["to"] == bob_hash.as_str();
+    let delivered = await_monitor_event(&env, &admin, live_delivery, common::EVENT_WAIT)
+        .await
+        .expect("the written push is reported");
+    assert_eq!(delivered["channel"], "websocket");
+    assert_eq!(delivered["from"], alice.did_hash().as_str());
+    assert!(
+        await_monitor_event(&env, &admin, live_delivery, Duration::from_millis(1500))
+            .await
+            .is_none(),
+        "one push, one delivery"
+    );
+}
+
 /// A message's whole life is visible to the monitor, with both parties at
 /// every step: received (the recipient read from the envelope's cleartext
 /// header, the channel it arrived on), delivered when the recipient fetches

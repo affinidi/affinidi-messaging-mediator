@@ -245,6 +245,10 @@ pub enum CloseReason {
 /// the queue. There is no separate "release" call to forget.
 pub struct QueuedCommand {
     pub cmd: WebSocketCommands,
+    /// A stored message's delivery, for the socket loop to report once the
+    /// frame is on the wire (R1.1). `None` for control, ephemeral pushes and
+    /// monitor batches.
+    pub report: Option<DeliveryReport>,
     /// The DID this payload is for. A mux connection carries many DIDs, so its
     /// handler needs to know which one to drain, resync or drop frames for.
     /// `None` for control commands.
@@ -262,6 +266,7 @@ impl QueuedCommand {
     fn control(cmd: WebSocketCommands) -> Self {
         Self {
             cmd,
+            report: None,
             did_hash: None,
             _permit: None,
             _slot: None,
@@ -273,10 +278,39 @@ impl QueuedCommand {
     pub(crate) fn for_test(did_hash: Option<&str>) -> Self {
         Self {
             cmd: WebSocketCommands::Message(String::new()),
+            report: None,
             did_hash: did_hash.map(str::to_string),
             _permit: None,
             _slot: None,
         }
+    }
+}
+
+/// A stored message's delivery to report to the traffic monitor. It rides
+/// with the queued frame, and the socket loop emits it only once the frame
+/// is written: a frame dropped from the queue, or for a mux member that left,
+/// or a write that fails, is not a delivery (R1.1).
+#[derive(Debug, Clone)]
+pub struct DeliveryReport {
+    pub msg_id: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub size: u64,
+    /// The body, only while the monitor has a subscriber.
+    pub body: Option<String>,
+}
+
+impl DeliveryReport {
+    /// Report the delivery: call once the frame is on the wire.
+    pub fn emit(self, monitor: &crate::monitor::TrafficMonitor) {
+        monitor.delivered(
+            &self.msg_id,
+            self.from.as_deref(),
+            self.to.as_deref(),
+            self.size,
+            crate::monitor::Channel::Websocket,
+            self.body.as_deref(),
+        );
     }
 }
 
@@ -296,8 +330,9 @@ fn try_queue_message(
     budget: &WsSendBudget,
     did_hash: &str,
     message: String,
+    report: Option<DeliveryReport>,
 ) -> bool {
-    try_queue(tx, slots, budget, did_hash, message, false)
+    try_queue(tx, slots, budget, did_hash, message, false, report)
 }
 
 /// [`try_queue_message`], with `verbatim` choosing the command the socket
@@ -314,6 +349,7 @@ fn try_queue(
     did_hash: &str,
     message: String,
     verbatim: bool,
+    report: Option<DeliveryReport>,
 ) -> bool {
     let slot = match slots.map(|s| s.try_acquire(did_hash)) {
         None => None,
@@ -344,6 +380,7 @@ fn try_queue(
         } else {
             WebSocketCommands::Message(message)
         },
+        report,
         did_hash: Some(did_hash.to_string()),
         _permit: Some(permit),
         _slot: slot,
@@ -375,6 +412,7 @@ fn deliver_live(
     did_hash: &str,
     message: String,
     verbatim: bool,
+    report: Option<DeliveryReport>,
 ) -> bool {
     if try_queue(
         &entry.tx,
@@ -383,6 +421,7 @@ fn deliver_live(
         did_hash,
         message,
         verbatim,
+        report,
     ) {
         debug!("Sent message to client ({did_hash})");
         return true;
@@ -684,27 +723,26 @@ impl StreamingTask {
                             error!("Error deregistering dead client ({did_hash}): {e}");
                         }
                     } else {
-                        // A stored message's delivery is reported here, once
-                        // it is actually queued to the socket (R1.1). Taken
-                        // before the body is moved into the queue.
-                        let report = stored.map(|stored| {
-                            let body = self.monitor.is_active().then(|| message.clone());
-                            (stored, message.len() as u64, body)
+                        // A stored message's delivery rides with the frame;
+                        // the socket loop reports it once it is written
+                        // (R1.1). Taken before the body is moved.
+                        let report = stored.map(|stored| DeliveryReport {
+                            msg_id: stored.msg_id,
+                            from: stored.from_did_hash,
+                            to: Some(did_hash.clone()),
+                            size: message.len() as u64,
+                            body: self.monitor.is_active().then(|| message.clone()),
                         });
                         // Moved, not cloned: the body already exists in the
                         // broadcast ring slot, and `payload` is owned here.
-                        if deliver_live(entry, &self.send_budget, &did_hash, message, verbatim)
-                            && let Some((stored, size, body)) = report
-                        {
-                            self.monitor.delivered(
-                                &stored.msg_id,
-                                stored.from_did_hash.as_deref(),
-                                Some(&did_hash),
-                                size,
-                                crate::monitor::Channel::Websocket,
-                                body.as_deref(),
-                            );
-                        }
+                        deliver_live(
+                            entry,
+                            &self.send_budget,
+                            &did_hash,
+                            message,
+                            verbatim,
+                            report,
+                        );
                     }
                 } else {
                     debug!("pub/sub msg received for did_hash({did_hash}) but it is not active");
@@ -1275,16 +1313,27 @@ fn spawn_inbox_redelivery(
                 if let Some(receive_id) = &element.receive_id {
                     start_id = Some(receive_id.clone());
                 }
-                let (msg_id, size) = (element.msg_id.clone(), element.size);
-                let parties = (element.from_address.clone(), element.to_address.clone());
                 let Some(msg) = element.msg else { continue };
-                let body_for_monitor = monitor.is_active().then(|| msg.clone());
+                let report = DeliveryReport {
+                    msg_id: element.msg_id,
+                    from: element.from_address,
+                    to: element.to_address,
+                    size: element.size,
+                    body: monitor.is_active().then(|| msg.clone()),
+                };
 
                 // Fetched with `DoNotDelete`, so anything not queued here stays
                 // in the inbox. Stopping the drain early is therefore lossless —
                 // the client picks the remainder up via normal message-pickup,
                 // exactly as it does when REDELIVERY_MAX is hit.
-                if !try_queue_message(&client_tx, client_slots.as_ref(), &budget, &did_hash, msg) {
+                if !try_queue_message(
+                    &client_tx,
+                    client_slots.as_ref(),
+                    &budget,
+                    &did_hash,
+                    msg,
+                    Some(report),
+                ) {
                     debug!(
                         did_hash = %did_hash,
                         "Send queue or byte budget unavailable mid-redelivery; \
@@ -1293,14 +1342,6 @@ fn spawn_inbox_redelivery(
                     break 'drain;
                 }
                 metrics::counter!(WEBSOCKET_REDELIVERED_MESSAGES_TOTAL).increment(1);
-                monitor.delivered(
-                    &msg_id,
-                    parties.0.as_deref(),
-                    parties.1.as_deref(),
-                    size,
-                    crate::monitor::Channel::Websocket,
-                    body_for_monitor.as_deref(),
-                );
                 total += 1;
 
                 if total >= REDELIVERY_MAX {
@@ -1413,7 +1454,8 @@ mod tests {
             &budget,
             "did-hash",
             "one".to_string(),
-            false
+            false,
+            None,
         ));
         assert!(
             !resync.load(Ordering::Relaxed),
@@ -1427,7 +1469,8 @@ mod tests {
             &budget,
             "did-hash",
             "two".to_string(),
-            false
+            false,
+            None,
         ));
         assert!(
             resync.load(Ordering::Relaxed),
@@ -1458,17 +1501,24 @@ mod tests {
         let budget = WsSendBudget::new(1_000_000);
 
         for i in 0..MEMBER_SLOTS {
-            assert!(deliver_live(&busy, &budget, "busy", format!("b{i}"), false));
+            assert!(deliver_live(
+                &busy,
+                &budget,
+                "busy",
+                format!("b{i}"),
+                false,
+                None
+            ));
         }
         assert!(
-            !deliver_live(&busy, &budget, "busy", "over".into(), false),
+            !deliver_live(&busy, &budget, "busy", "over".into(), false, None),
             "the busy member is refused past its share"
         );
         assert!(resync.load(Ordering::Relaxed), "the socket is woken");
         assert_eq!(slots.take_resync(), vec!["busy".to_string()]);
 
         assert!(
-            deliver_live(&quiet, &budget, "quiet", "q".into(), false),
+            deliver_live(&quiet, &budget, "quiet", "q".into(), false, None),
             "another member still has room on the same socket"
         );
         assert!(slots.take_resync().is_empty(), "and owes no resync");
@@ -1477,22 +1527,30 @@ mod tests {
         let taken = rx.recv().await.unwrap();
         assert_eq!(taken.did_hash.as_deref(), Some("busy"));
         drop(taken);
-        assert!(deliver_live(&busy, &budget, "busy", "again".into(), false));
+        assert!(deliver_live(
+            &busy,
+            &budget,
+            "busy",
+            "again".into(),
+            false,
+            None
+        ));
     }
 
-    /// A stored message's live delivery is reported when its notification is
-    /// queued to the socket, and not when the push is dropped (R1.1). Untagged
-    /// pushes — monitor batches, ephemeral messages — report nothing, or the
-    /// monitor would report its own batches.
+    /// A stored message's push carries its delivery report to the socket,
+    /// which reports it only once the frame is written (R1.1): nothing is
+    /// reported when the push is queued, a dropped push carries nothing, and
+    /// an untagged push (a monitor batch, an ephemeral message) has no report,
+    /// or the monitor would report its own batches.
     #[tokio::test]
-    async fn delivered_is_reported_only_for_a_queued_stored_message() {
+    async fn a_stored_push_carries_its_delivery_report_to_the_socket() {
         use affinidi_messaging_mediator_common::store::StoredMessageRef;
 
         let task = streaming_task();
         let mut events = task.monitor.tap();
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
-        // One slot, never read: the first push is queued, the next is dropped.
-        let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
+        // One slot: the first push is queued, the next is dropped.
+        let (tx, mut rx) = mpsc::channel::<QueuedCommand>(1);
         let mut clients = HashMap::from([(
             "bob".to_string(),
             ClientEntry {
@@ -1516,46 +1574,43 @@ mod tests {
                 from_did_hash: Some("alice".to_string()),
             }),
         };
+        macro_rules! dispatch {
+            ($r:expr) => {
+                task.dispatch_payload(
+                    &database,
+                    &mut clients,
+                    &mut HashMap::new(),
+                    &Arc::new(DashSet::new()),
+                    $r,
+                )
+                .await
+            };
+        }
 
-        task.dispatch_payload(
-            &database,
-            &mut clients,
-            &mut HashMap::new(),
-            &Arc::new(DashSet::new()),
-            record(Some("m1")),
-        )
-        .await;
-        let event = events.try_recv().expect("the queued push is reported");
+        dispatch!(record(Some("m1")));
+        dispatch!(record(Some("m2")));
+        assert!(
+            events.try_recv().is_err(),
+            "queueing a push is not a delivery"
+        );
+        let queued = rx.try_recv().expect("the first push is queued");
+        let report = queued.report.expect("a stored push carries its report");
+        assert_eq!(report.msg_id, "m1");
+        assert_eq!(report.from.as_deref(), Some("alice"));
+        assert_eq!(report.to.as_deref(), Some("bob"));
+        assert!(rx.try_recv().is_err(), "the second push was dropped");
+
+        // The socket loop emits it once the frame is written.
+        report.emit(&task.monitor);
+        let event = events.try_recv().expect("reported after the write");
         assert_eq!(event.stage, crate::monitor::Stage::Delivered);
         assert_eq!(event.msg_id.as_deref(), Some("m1"));
-        assert_eq!(event.from.as_deref(), Some("alice"));
         assert_eq!(event.to.as_deref(), Some("bob"));
 
-        task.dispatch_payload(
-            &database,
-            &mut clients,
-            &mut HashMap::new(),
-            &Arc::new(DashSet::new()),
-            record(Some("m2")),
-        )
-        .await;
+        dispatch!(record(None));
+        let queued = rx.try_recv().expect("the untagged push is queued");
         assert!(
-            events.try_recv().is_err(),
-            "a dropped push must not be reported as delivered"
-        );
-
-        let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
-        clients.get_mut("bob").expect("bob").tx = tx;
-        task.dispatch_payload(
-            &database,
-            &mut clients,
-            &mut HashMap::new(),
-            &Arc::new(DashSet::new()),
-            record(None),
-        )
-        .await;
-        assert!(
-            events.try_recv().is_err(),
+            queued.report.is_none(),
             "an untagged push is not a stored message's delivery"
         );
     }
@@ -1584,7 +1639,8 @@ mod tests {
             &budget,
             "did-hash",
             "fills".to_string(),
-            false
+            false,
+            None,
         ));
         for i in 0..5 {
             assert!(!deliver_live(
@@ -1592,7 +1648,8 @@ mod tests {
                 &budget,
                 "did-hash",
                 format!("drop-{i}"),
-                false
+                false,
+                None,
             ));
         }
 

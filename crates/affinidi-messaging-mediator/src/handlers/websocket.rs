@@ -1206,6 +1206,9 @@ async fn handle_socket(
                             debug!(did_hash = %for_did, "dropping a queued frame for a detached mux member");
                             continue;
                         }
+                        // A stored message's delivery, reported only once its
+                        // frame is written (R1.1).
+                        let report = queued.report;
                         // Destructuring drops `_permit` at the end of this arm,
                         // returning the message's bytes to the global send pool
                         // once it has been written to the socket.
@@ -1221,12 +1224,17 @@ async fn handle_socket(
                                     && let Some(for_did) = queued.did_hash.as_deref()
                                     && for_did != session.did_hash
                                 {
-                                    if send_tsp_member_live(conn, for_did, &mut socket, &msg, &mut member_inflight)
-                                        .await
-                                        .is_break()
-                                    {
-                                        close_reason = (close_code::GOING_AWAY, "client disconnected");
-                                        break;
+                                    match send_tsp_member_live(conn, for_did, &mut socket, &msg, &mut member_inflight).await {
+                                        ControlFlow::Break(()) => {
+                                            close_reason = (close_code::GOING_AWAY, "client disconnected");
+                                            break;
+                                        }
+                                        ControlFlow::Continue(true) => {
+                                            if let Some(r) = report {
+                                                r.emit(&state.monitor);
+                                            }
+                                        }
+                                        ControlFlow::Continue(false) => {}
                                     }
                                     continue;
                                 }
@@ -1237,6 +1245,9 @@ async fn handle_socket(
                                 #[cfg(feature = "tsp")]
                                 if tsp_mode {
                                     let _ = &msg; // body intentionally ignored in TSP mode
+                                    // The drain reports what it writes; this
+                                    // notification is not itself a delivery.
+                                    drop(report);
                                     if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, None)
             .await
             .is_break() {
@@ -1245,8 +1256,13 @@ async fn handle_socket(
                                     }
                                     continue;
                                 }
-                                if let Err(e) = socket.send(Message::Text(msg.into())).await {
-                                    warn!("Failed to send message to WebSocket client: {e}");
+                                match socket.send(Message::Text(msg.into())).await {
+                                    Ok(()) => {
+                                        if let Some(r) = report {
+                                            r.emit(&state.monitor);
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to send message to WebSocket client: {e}"),
                                 }
                             },
                             WebSocketCommands::Verbatim(body) => {
@@ -1261,10 +1277,13 @@ async fn handle_socket(
                                 if tsp_mode {
                                     match BASE64_URL_SAFE_NO_PAD.decode(&body) {
                                         Ok(qb2) => {
-                                            if let Err(e) =
-                                                socket.send(Message::Binary(qb2.into())).await
-                                            {
-                                                warn!("Failed to send frame to WebSocket client: {e}");
+                                            match socket.send(Message::Binary(qb2.into())).await {
+                                                Ok(()) => {
+                                                    if let Some(r) = report {
+                                                        r.emit(&state.monitor);
+                                                    }
+                                                }
+                                                Err(e) => warn!("Failed to send frame to WebSocket client: {e}"),
                                             }
                                         }
                                         Err(e) => warn!(
@@ -1274,8 +1293,13 @@ async fn handle_socket(
                                     }
                                     continue;
                                 }
-                                if let Err(e) = socket.send(Message::Text(body.into())).await {
-                                    warn!("Failed to send frame to WebSocket client: {e}");
+                                match socket.send(Message::Text(body.into())).await {
+                                    Ok(()) => {
+                                        if let Some(r) = report {
+                                            r.emit(&state.monitor);
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to send frame to WebSocket client: {e}"),
                                 }
                             },
                             WebSocketCommands::MemberChange(change) => {
@@ -1852,7 +1876,8 @@ async fn drain_tsp_page(
     TspPage::More
 }
 
-/// Write a mux member's live notification to a `tsp-mux` socket.
+/// Write a mux member's live notification to a `tsp-mux` socket. Returns
+/// `Continue(true)` once the frame is written.
 ///
 /// The notification body is the stored message (base64url of the qb2), so it
 /// is the frame itself. Writing it, rather than answering with a drain of the
@@ -1869,16 +1894,16 @@ async fn send_tsp_member_live(
     socket: &mut WebSocket,
     body: &str,
     inflight: &mut MemberInflight,
-) -> ControlFlow<(), ()> {
+) -> ControlFlow<(), bool> {
     // Checked by the caller already; re-checked here because this write is
     // the one that must not happen for a detached member (§7.3, R1.1).
     if !conn.may_write(did_hash).await {
-        return ControlFlow::Continue(());
+        return ControlFlow::Continue(false);
     }
     let id = sha256::digest(body);
     let inflight = inflight.entry(did_hash.to_string()).or_default();
     if inflight.contains(&id) {
-        return ControlFlow::Continue(());
+        return ControlFlow::Continue(false);
     }
     if inflight.len() >= TSP_MUX_MEMBER_INFLIGHT_MAX {
         inflight.clear();
@@ -1887,7 +1912,7 @@ async fn send_tsp_member_live(
         Ok(b) if affinidi_tsp::is_tsp(&b) => b,
         _ => {
             debug!(%did_hash, "not writing a non-TSP live frame to a tsp-mux socket; it stays stored");
-            return ControlFlow::Continue(());
+            return ControlFlow::Continue(false);
         }
     };
     if let Err(e) = socket.send(Message::Binary(qb2.into())).await {
@@ -1895,7 +1920,7 @@ async fn send_tsp_member_live(
         return ControlFlow::Break(());
     }
     inflight.insert(id);
-    ControlFlow::Continue(())
+    ControlFlow::Continue(true)
 }
 
 /// The problem report for a socket the streaming task is closing.
