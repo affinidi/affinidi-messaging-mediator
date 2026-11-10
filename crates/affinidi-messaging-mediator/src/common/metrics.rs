@@ -53,6 +53,9 @@ pub mod names {
     pub const MESSAGES_EXPIRED_TOTAL: &str = "messages_expired_total";
     /// counter: Activity-record writes the store refused or failed
     pub const ACCOUNT_ACTIVITY_WRITE_FAILURES_TOTAL: &str = "account_activity_write_failures_total";
+    /// counter: Direct logins refused because the mux unknown-key rule
+    /// could not be applied (store or resolver failure, or timeout)
+    pub const MUX_LOGIN_CHECK_FAILURES_TOTAL: &str = "mux_login_check_failures_total";
     /// counter: Total inbound message bytes
     pub const MESSAGE_BYTES_INBOUND_TOTAL: &str = "message_bytes_inbound_total";
 

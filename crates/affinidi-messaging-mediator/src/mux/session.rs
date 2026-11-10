@@ -53,6 +53,14 @@ pub struct MuxMember {
     pub grant_iat: u64,
 }
 
+/// A stored grant a connection did not carry, for its `detached` event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotCarried {
+    pub did: String,
+    pub grant_id: String,
+    pub reason: LeaveReason,
+}
+
 /// Why a member left, or was never admitted. The wire names are the spec's
 /// `DetachReason` / `MemberChangeReason` values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +75,12 @@ pub enum LeaveReason {
     AccountBlocked,
     AccountRemoved,
     ResolutionFailed,
+    /// The member DID's own direct socket, or a newer mux connection, took
+    /// its live traffic; it stays on this connection, inactive.
+    Superseded,
+    /// Never joined: the grant is valid and stored, but the connection
+    /// already carries `max_dids_per_connection` members.
+    ConnectionFull,
 }
 
 impl LeaveReason {
@@ -82,6 +96,8 @@ impl LeaveReason {
             LeaveReason::AccountBlocked => "accountBlocked",
             LeaveReason::AccountRemoved => "accountRemoved",
             LeaveReason::ResolutionFailed => "resolutionFailed",
+            LeaveReason::Superseded => "superseded",
+            LeaveReason::ConnectionFull => "connectionFull",
         }
     }
 }
@@ -188,11 +204,16 @@ impl MuxSession {
     }
 
     /// Admit every usable stored grant on connect (§4.5). Returns the members
-    /// admitted and the DIDs refused, with why.
+    /// admitted and the grants not carried, with why.
+    ///
+    /// Grants are validated before the connection's room is checked, so a
+    /// grant reported `connectionFull` is a valid one. Which grants fill the
+    /// connection follows the store's order, which is stable from one connect
+    /// to the next.
     pub async fn load_grants(
         &mut self,
         ctx: &Ctx<'_>,
-    ) -> Result<(Vec<MuxMember>, Vec<(String, LeaveReason)>), MuxError> {
+    ) -> Result<(Vec<MuxMember>, Vec<NotCarried>), MuxError> {
         let mut admitted = Vec::new();
         let mut refused = Vec::new();
         let mut after: Option<String> = None;
@@ -210,21 +231,22 @@ impl MuxSession {
                 if !grant.is_usable(ctx.now) {
                     continue;
                 }
-                if self.members.len() >= self.max_members {
-                    refused.push((grant.did.clone(), LeaveReason::DetachRequested));
-                    continue;
-                }
+                let refuse = |reason| NotCarried {
+                    did: grant.did.clone(),
+                    grant_id: grant.grant_id.clone(),
+                    reason,
+                };
                 match ctx.verifier.key_is_current(&grant.kid, &grant.key_fp).await {
                     Ok(true) => {}
                     Ok(false) => {
                         let _ = super::grants::revalidate(ctx, &grant).await;
-                        refused.push((grant.did.clone(), LeaveReason::KeyRotated));
+                        refused.push(refuse(LeaveReason::KeyRotated));
                         continue;
                     }
                     // Unknown is not "fine": the member is not carried until
                     // its key can be checked (fail closed, R5.3).
                     Err(_) => {
-                        refused.push((grant.did.clone(), LeaveReason::ResolutionFailed));
+                        refused.push(refuse(LeaveReason::ResolutionFailed));
                         continue;
                     }
                 }
@@ -232,7 +254,13 @@ impl MuxSession {
                     .await
                     .is_err()
                 {
-                    refused.push((grant.did.clone(), LeaveReason::AccountBlocked));
+                    refused.push(refuse(LeaveReason::AccountBlocked));
+                    continue;
+                }
+                if !self.members.contains_key(&grant.did_hash)
+                    && self.members.len() >= self.max_members
+                {
+                    refused.push(refuse(LeaveReason::ConnectionFull));
                     continue;
                 }
                 let member = MuxMember {
@@ -601,5 +629,52 @@ mod tests {
                 assert_eq!(r.unwrap_err().code(), "memberQuota");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_valid_grant_with_no_room_is_reported_connection_full() {
+        let store = MemoryStore::new();
+        let v = verifier().await;
+        let acl = MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap();
+        let ctx = Ctx {
+            store: &store,
+            verifier: &v,
+            mediator_did: MEDIATOR,
+            limits: MuxLimits::default(),
+            default_acl: &acl,
+            now: NOW,
+        };
+        let (principal, _) = did_key(51);
+        let mut members = Vec::new();
+        for (seed, id) in [(52u8, "g-a"), (53, "g-b")] {
+            let (m, key) = did_key(seed);
+            store.account_add(&did_hash(&m), &acl, None).await.unwrap();
+            let g = signed(
+                json!({"type": "muxGrant", "issuer": m, "audience": MEDIATOR, "grantId": id,
+                       "principal": principal, "scope": ["receive"], "epoch": 0,
+                       "iat": NOW, "exp": NOW + 3600}),
+                &key,
+            )
+            .await;
+            store_grant(&ctx, &m, &g).await.unwrap();
+            members.push((m, id));
+        }
+
+        let mut session = MuxSession::new(&principal, "s", 1);
+        let (admitted, refused) = session.load_grants(&ctx).await.unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].reason, LeaveReason::ConnectionFull);
+        assert_eq!(refused[0].reason.wire(), "connectionFull");
+        // The one left out is the other grant, named with its id.
+        let carried = &admitted[0].did;
+        let (did, id) = members.iter().find(|(m, _)| m != carried).unwrap();
+        assert_eq!(&refused[0].did, did);
+        assert_eq!(refused[0].grant_id, *id);
+
+        // The same grants fill the connection on the next connect.
+        let mut again = MuxSession::new(&principal, "s2", 1);
+        let (admitted2, _) = again.load_grants(&ctx).await.unwrap();
+        assert_eq!(&admitted2[0].did, carried);
     }
 }

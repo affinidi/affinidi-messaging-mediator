@@ -273,7 +273,8 @@ impl MuxRegistry {
     }
 
     /// Carry the members of newly stored grants on every live connection of
-    /// their principal, at once (design §4.4).
+    /// their principal, at once (design §4.4). Returns the ids of the grants
+    /// some connection on this instance now carries (`attachedNow`).
     ///
     /// The store, not the order handlers finish in, decides what is carried,
     /// and no lock is held across a store read (R1.3):
@@ -300,7 +301,8 @@ impl MuxRegistry {
         limits: &MuxLimits,
         now: u64,
         grants: &[MuxGrant],
-    ) {
+    ) -> HashSet<String> {
+        let mut carried = HashSet::new();
         for g in grants {
             if self.for_principal(&g.principal_hash).is_empty() {
                 continue;
@@ -334,17 +336,27 @@ impl MuxRegistry {
                         }
                         conn.joined.lock().await.push(member);
                         conn.notify.notify_one();
+                        carried.insert(current.grant_id.clone());
                     }
-                    Ok(None) => {}
+                    // Already carried by this grant (or a newer one).
+                    Ok(None) => {
+                        carried.insert(current.grant_id.clone());
+                    }
                     // The connection is full. The grant stays stored and is
                     // carried by a connection with room, or after a
-                    // reconnect; the client sees `stored` with no `attached`
-                    // event. The spec has no event for this yet.
-                    Err(e) => warn!(
-                        principal = %g.principal_hash,
-                        grant = %g.grant_id,
-                        "stored grant not carried live: {e}"
-                    ),
+                    // reconnect; this one is told `connectionFull`.
+                    Err(e) => {
+                        debug!(
+                            principal = %g.principal_hash,
+                            grant = %g.grant_id,
+                            "stored grant not carried live: {e}"
+                        );
+                        conn.left
+                            .lock()
+                            .await
+                            .push((member.clone(), LeaveReason::ConnectionFull));
+                        conn.notify.notify_one();
+                    }
                 }
             }
             // Step 3. Fail closed on an unreadable record too.
@@ -358,8 +370,10 @@ impl MuxRegistry {
                     LeaveReason::RevokedByMember,
                 )
                 .await;
+                carried.remove(&current.grant_id);
             }
         }
+        carried
     }
 
     /// Re-scope members admitted by narrowed grants: the narrower scope or

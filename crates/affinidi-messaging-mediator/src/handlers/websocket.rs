@@ -388,19 +388,21 @@ pub async fn websocket_handler(
     let tsp_any = tsp_mode;
     #[cfg(not(feature = "tsp"))]
     let tsp_any = false;
-    let mux_mode = !is_relay
-        && !tsp_any
-        && state.config.limits.mux.enabled
-        && app_protocols
-            .iter()
-            .any(|p| p == crate::mux::connection::MUX_SUBPROTOCOL);
-    let app_protocols: Vec<String> = if mux_mode {
-        vec![crate::mux::connection::MUX_SUBPROTOCOL.to_string()]
+    let mux_selected = if !is_relay && !tsp_any && state.config.limits.mux.enabled {
+        crate::mux::connection::mux_subprotocol(&app_protocols)
     } else {
-        app_protocols
+        None
+    };
+    let mux_mode = mux_selected.is_some();
+    let app_protocols: Vec<String> = match mux_selected {
+        Some(p) => vec![p.to_string()],
+        None => app_protocols
             .into_iter()
-            .filter(|p| p != crate::mux::connection::MUX_SUBPROTOCOL)
-            .collect()
+            .filter(|p| {
+                p != crate::mux::connection::MUX_SUBPROTOCOL
+                    && p != crate::mux::connection::LEGACY_MUX_SUBPROTOCOL
+            })
+            .collect(),
     };
 
     #[cfg(feature = "tsp")]

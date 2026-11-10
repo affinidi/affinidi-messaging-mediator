@@ -876,7 +876,7 @@ pub async fn serve_internal(
         }
         info!(
             "DID multiplexing enabled: DIDComm clients may open mux connections with the \
-             `affinidi-mux` WebSocket subprotocol"
+             `didcomm-mux` WebSocket subprotocol"
         );
         // Grant changes handled by other instances sharing the store reach
         // this one's connections within one pub/sub hop rather than at the
