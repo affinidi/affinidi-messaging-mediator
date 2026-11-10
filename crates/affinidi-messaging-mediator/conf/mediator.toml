@@ -654,6 +654,12 @@ oob_invite_ttl = "86400"
 # max_grant_lifetime_secs = "2592000"
 # max_attach_lifetime_secs = "86400"
 # revalidate_interval_secs = "900"
+### Send-queue depth of one mux connection, across all its DIDs. Each DID on
+### the connection may hold at most 8 queued frames (as a direct socket does),
+### and the socket writes round-robin across DIDs with frames waiting, so one
+### busy DID cannot starve the rest; a connection queues at most
+### min(8 x DIDs, max_channel_slots). Bytes stay bounded by ws_send_buffer.
+### Clamped to 8..65536.
 # max_channel_slots = "512"
 # dead_retention_secs = "604800"
 

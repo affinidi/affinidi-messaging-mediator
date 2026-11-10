@@ -27,6 +27,7 @@ use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
+use super::fair_queue::MuxSlots;
 use super::session::{LeaveReason, MuxMember, MuxSession};
 use crate::tasks::websocket_streaming::{
     EntryKind, QueuedCommand, StreamingTask, StreamingUpdate, StreamingUpdateState,
@@ -39,6 +40,8 @@ pub struct MuxConn {
     pub tx: mpsc::Sender<QueuedCommand>,
     /// The socket's resync flag (shared by its members).
     pub resync: Arc<AtomicBool>,
+    /// The socket's per-DID send slots (fair queuing, design §7.2).
+    pub slots: Option<Arc<MuxSlots>>,
     /// Members that left since the socket last reported; the socket loop
     /// drains this into `detached` events to the client.
     pub left: Mutex<Vec<(MuxMember, LeaveReason)>>,
@@ -58,10 +61,18 @@ impl MuxConn {
             session: Mutex::new(session),
             tx,
             resync,
+            slots: None,
             left: Mutex::new(Vec::new()),
             joined: Mutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Queue this connection's frames through `slots`, so each member gets a
+    /// fair share of its send queue.
+    pub fn with_slots(mut self, slots: Arc<MuxSlots>) -> Self {
+        self.slots = Some(slots);
+        self
     }
 
     /// Register `member` with the streaming task on this connection's queue,
@@ -78,6 +89,7 @@ impl MuxConn {
                     did: member.did.clone(),
                     resync: self.resync.clone(),
                     kind: EntryKind::Mux,
+                    slots: self.slots.clone(),
                 },
             })
             .await;

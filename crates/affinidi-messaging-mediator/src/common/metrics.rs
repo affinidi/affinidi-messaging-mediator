@@ -117,6 +117,15 @@ pub mod names {
     /// apart from "never generated", which is the distinction an alert on
     /// [`WS_LIVE_RESYNC_SENT`] alone cannot make.
     pub const WS_LIVE_RESYNC_SUPPRESSED: &str = "ws_live_resync_suppressed_total";
+    /// counter: Live pushes for a DID on a mux connection refused because that
+    /// DID already held its own share (8) of the connection's send queue.
+    ///
+    /// Each one is also counted in [`WS_LIVE_DELIVERY_DROPPED`], and is no more
+    /// a loss than any other drop: the message is in the member's inbox and the
+    /// member is sent a resync. What this one says is that fair queuing did its
+    /// job: without it the busy member's frames would have taken the other
+    /// members' room. A steady rate points at one member outpacing its client.
+    pub const MUX_QUEUE_FAIRNESS_SKIPS_TOTAL: &str = "mux_queue_fairness_skips_total";
     /// gauge: Bytes currently free in the global WebSocket send-buffer pool.
     pub const WS_SEND_BUFFER_AVAILABLE_BYTES: &str = "ws_send_buffer_available_bytes";
     /// counter: Old WebSocket sessions displaced by a newer duplicate for the same DID
