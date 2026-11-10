@@ -45,8 +45,12 @@ pub struct MuxConn {
     /// Members that left since the socket last reported; the socket loop
     /// drains this into `detached` events to the client.
     pub left: Mutex<Vec<(MuxMember, LeaveReason)>>,
-    /// Members admitted while connected (a new grant), for `attached` events.
+    /// Members admitted or changed while connected (a new grant, an attach,
+    /// a narrowed grant), for `attached` events.
     pub joined: Mutex<Vec<MuxMember>>,
+    /// Members whose live traffic another connection holds (the DID's own
+    /// direct socket, or a newer one): reported `deliveryActive: false`.
+    pub inactive: Mutex<std::collections::HashSet<String>>,
     /// Wakes the socket loop to report `left` / `joined`.
     pub notify: tokio::sync::Notify,
 }
@@ -64,6 +68,7 @@ impl MuxConn {
             slots: None,
             left: Mutex::new(Vec::new()),
             joined: Mutex::new(Vec::new()),
+            inactive: Mutex::new(std::collections::HashSet::new()),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -78,6 +83,9 @@ impl MuxConn {
     /// Register `member` with the streaming task on this connection's queue,
     /// and turn live delivery on when its scope includes `receive`.
     pub async fn register_member(&self, streaming: &StreamingTask, member: &MuxMember) {
+        // A fresh registration: the streaming task says again if another
+        // connection holds the member's traffic.
+        self.inactive.lock().await.remove(&member.did_hash);
         let session_id = self.session.lock().await.session_id.clone();
         let _ = streaming
             .channel
@@ -126,12 +134,24 @@ impl MuxConn {
         Some(member)
     }
 
+    /// Apply a narrowed grant to the member it admitted here, and tell the
+    /// principal with an `attached` event when its scope or expiry changed
+    /// (spec event rule 5).
+    pub async fn narrow(&self, grant: &MuxGrant) {
+        let changed = self.session.lock().await.narrow(grant);
+        if let Some(member) = changed {
+            self.joined.lock().await.push(member);
+            self.notify.notify_one();
+        }
+    }
+
     async fn deregister(
         &self,
         streaming: Option<&StreamingTask>,
         did_hash: &str,
         session_id: &str,
     ) {
+        self.inactive.lock().await.remove(did_hash);
         if let Some(streaming) = streaming {
             let _ = streaming
                 .channel
@@ -381,7 +401,7 @@ impl MuxRegistry {
     pub async fn narrow(&self, grants: &[MuxGrant]) {
         for g in grants {
             for conn in self.for_principal(&g.principal_hash) {
-                conn.session.lock().await.narrow(g);
+                conn.narrow(g).await;
             }
         }
     }

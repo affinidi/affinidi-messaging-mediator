@@ -496,6 +496,17 @@ pub async fn on_member_change(
         let s = conn.session.lock().await;
         (s.get(hash).cloned()?, s.principal_did.clone())
     };
+    {
+        let mut inactive = conn.inactive.lock().await;
+        match &change_ {
+            MemberChange::Superseded { .. } | MemberChange::Inactive { .. } => {
+                inactive.insert(hash.clone());
+            }
+            MemberChange::Reactivated { .. } => {
+                inactive.remove(hash);
+            }
+        }
+    }
     let payload = match change_ {
         MemberChange::Superseded { .. } => json!({
             "event": "detached",
@@ -518,15 +529,26 @@ pub async fn on_member_change(
     event(state, wire, &principal, payload).await
 }
 
-/// Members that joined or left since the last call, as at most one
-/// `attached` and one `detached` frame.
+/// Members that joined, changed or left since the last call, as at most one
+/// `attached` and one `detached` frame. A join is reported with how the member
+/// came (`grant` or `attach`) and whether its live traffic comes here.
 pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) -> Vec<EventFrame> {
     let joined: Vec<MuxMember> = std::mem::take(&mut *conn.joined.lock().await);
     let left: Vec<(MuxMember, LeaveReason)> = std::mem::take(&mut *conn.left.lock().await);
     let principal = conn.session.lock().await.principal_did.clone();
     let mut frames = Vec::new();
     if !joined.is_empty() {
-        let dids: Vec<Value> = joined.iter().map(|m| attached(m, "grant", true)).collect();
+        let inactive = conn.inactive.lock().await.clone();
+        let dids: Vec<Value> = joined
+            .iter()
+            .map(|m| {
+                let reason = match m.source {
+                    MuxSource::Attach => "attach",
+                    MuxSource::Grant { .. } => "grant",
+                };
+                attached(m, reason, !inactive.contains(&m.did_hash))
+            })
+            .collect();
         frames.extend(
             event(
                 state,

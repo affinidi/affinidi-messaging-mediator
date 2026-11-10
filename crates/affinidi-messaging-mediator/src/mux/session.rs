@@ -347,17 +347,25 @@ impl MuxSession {
     }
 
     /// Apply a narrowed grant to the member it admitted: its scope and expiry
-    /// shrink now, not at the next reconnect.
-    pub fn narrow(&mut self, grant: &MuxGrant) {
-        if let Some(m) = self.members.get_mut(&grant.did_hash)
-            && m.source
-                == (MuxSource::Grant {
-                    grant_id: grant.grant_id.clone(),
-                })
+    /// shrink now, not at the next reconnect. Returns the member when its
+    /// scope or expiry changed.
+    pub fn narrow(&mut self, grant: &MuxGrant) -> Option<MuxMember> {
+        let m = self.members.get_mut(&grant.did_hash)?;
+        if m.source
+            != (MuxSource::Grant {
+                grant_id: grant.grant_id.clone(),
+            })
         {
-            m.scope = grant.effective_scope().clone();
-            m.expires_at = m.expires_at.min(grant.effective_exp());
+            return None;
         }
+        let scope = grant.effective_scope().clone();
+        let expires_at = m.expires_at.min(grant.effective_exp());
+        if m.scope == scope && m.expires_at == expires_at {
+            return None;
+        }
+        m.scope = scope;
+        m.expires_at = expires_at;
+        Some(m.clone())
     }
 
     /// Remove members whose admission has lapsed at `now`.

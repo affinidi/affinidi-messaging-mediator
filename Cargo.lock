@@ -382,7 +382,7 @@ checksum = "1878317a1ac3a7c06594cfcafc954e27956e14274d16e8652e1ecf952f8e8b32"
 dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.45.4",
+ "affinidi-messaging-sdk 0.45.5",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "affinidi-tsp",
@@ -436,7 +436,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator-common",
  "affinidi-messaging-mediator-config",
- "affinidi-messaging-sdk 0.45.4",
+ "affinidi-messaging-sdk 0.45.5",
  "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-task-utils",
@@ -505,7 +505,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.45.4",
+ "affinidi-messaging-sdk 0.45.5",
  "affinidi-messaging-test-mediator",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
@@ -725,9 +725,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.45.4"
+version = "0.45.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0cfb61a4f793ea44a584c7d1052d28ebf96f4537b098f19dd7efc18353adeab"
+checksum = "acf9a216fa3812ed3051071395fb9024a259053f7f1272fd6c6510cfa6b72a78"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -777,7 +777,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.45.4",
+ "affinidi-messaging-sdk 0.45.5",
  "affinidi-secrets-resolver",
  "affinidi-tdk 0.37.0",
  "affinidi-tdk-common",
@@ -1002,7 +1002,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.45.4",
+ "affinidi-messaging-sdk 0.45.5",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "clap",
@@ -2991,7 +2991,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.9",
+ "syn 1.0.109",
 ]
 
 [[package]]

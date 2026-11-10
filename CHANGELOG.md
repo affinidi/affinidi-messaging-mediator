@@ -8,6 +8,36 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Fixed — `attached` events for attaches and narrowed grants
+
+Spec event rule 5 says a mediator emits `attached` whenever a member joins
+or its scope or expiry changes. Three gaps:
+
+- A DID admitted by `messaging/mux/attach` got no `attached` event, only the
+  task response, so a client keeping its member set from events never saw
+  it. It now gets one, with reason `attach`.
+- Narrowing a grant (`messaging/mux/update`, here or relayed from another
+  instance) changed the member's scope and expiry silently. It is now
+  reported in an `attached` event with reason `grant`.
+- A member joining while connected was always reported
+  `deliveryActive: true`, and was labelled `grant` even when it came by
+  attach. `deliveryActive` now says whether the member's live traffic comes
+  over this connection: `false` while the DID's own socket, or a newer
+  connection, holds it, until an `attached` with reason `reactivated`.
+
+**Behaviour change (R3.6):** principals may now see `attached` events where
+there were none, and a `grant` join with `deliveryActive: false`. Clients
+built on affinidi-messaging-sdk 0.45.5 fold them into `mux_members()`.
+
+### Changed — affinidi-messaging-sdk 0.45.5
+
+- The SDK now checks mux events on DIDComm sockets: the mediator must have
+  authcrypted them, and they must be addressed to the principal. It also
+  keeps each connection's member set (`ATMProfile::mux_members()`,
+  `TspMuxWebSocket::members()`). `tests/mux_sdk.rs` checks that set
+  against this mediator: grants, an attach, a narrowed grant, a member
+  inactive while its own socket is up, and a revoke.
+
 ### Fixed — global sent counters on Redis
 
 - On the Redis backend, fetching a message by id never counted it in the
