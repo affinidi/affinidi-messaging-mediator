@@ -1357,18 +1357,29 @@ async fn handle_socket(
                 // DID. A mux connection's resync is owed per DID, to the ones
                 // whose pushes were dropped, and never to a member that has
                 // left since (R7.2); the statuses all go to the principal.
+                // A status is message pickup for that inbox, so a member is
+                // reported only while its scope includes `pickup`; a
+                // `receive`-only member's dropped frame stays in its inbox,
+                // where the principal could not collect it anyway.
                 #[cfg(feature = "didcomm")]
                 let owed: Vec<(String, String)> = match (&mux_conn, &mux_slots) {
                     (Some(conn), Some(slots)) => {
                         let hashes = slots.take_resync();
+                        let now = state.clock.unix_secs();
                         let s = conn.session.lock().await;
                         hashes
                             .into_iter()
                             .filter_map(|h| {
                                 if h == session.did_hash {
                                     Some((session.did.clone(), h))
-                                } else {
+                                } else if s.allows(
+                                    &h,
+                                    affinidi_messaging_mediator_common::store::mux::MuxCapability::Pickup,
+                                    now,
+                                ) {
                                     s.get(&h).map(|m| (m.did.clone(), h))
+                                } else {
+                                    None
                                 }
                             })
                             .collect()

@@ -65,9 +65,9 @@ fn recipients(frame: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `member` grants `principal` receive + pickup + delete, stored as the
-/// `messaging/mux/grant` task would store it.
-async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser) {
+/// `member` grants `principal` `scope`, stored as the `messaging/mux/grant`
+/// task would store it.
+async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser, scope: &[&str]) {
     let signer = member
         .secrets
         .iter()
@@ -81,7 +81,7 @@ async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser) {
             "audience": env.mediator.did(),
             "grantId": Uuid::new_v4().to_string(),
             "principal": principal.did,
-            "scope": ["receive", "pickup", "delete"],
+            "scope": scope,
             "epoch": 0,
             "iat": t,
             "exp": t + 3600,
@@ -144,8 +144,24 @@ enum Seen {
     Other,
 }
 
+const FULL: &[&str] = &["receive", "pickup", "delete"];
+
 #[tokio::test]
 async fn a_flooded_member_does_not_starve_another_members_live_delivery() {
+    flood(FULL).await;
+}
+
+/// A resync `status` is message pickup for that member's inbox, so a member
+/// whose scope lacks `pickup` is never reported, however many of its pushes
+/// dropped.
+#[tokio::test]
+async fn a_receive_only_member_is_owed_no_resync_status() {
+    flood(&["receive"]).await;
+}
+
+/// Flood `busy` (granted `busy_scope`) while the principal stops reading,
+/// then check that `quiet` is still served, and who is owed a resync.
+async fn flood(busy_scope: &[&str]) {
     init_tracing();
     let mediator = TestMediator::builder()
         .mux_enabled(true)
@@ -159,8 +175,8 @@ async fn a_flooded_member_does_not_starve_another_members_live_delivery() {
     let busy = env.add_user("busy").await.unwrap();
     let quiet = env.add_user("quiet").await.unwrap();
     let sender = env.add_user("sender").await.unwrap();
-    grant(&env, &busy, &principal).await;
-    grant(&env, &quiet, &principal).await;
+    grant(&env, &busy, &principal, busy_scope).await;
+    grant(&env, &quiet, &principal, FULL).await;
 
     let tokens = env
         .tdk
@@ -275,11 +291,19 @@ async fn a_flooded_member_does_not_starve_another_members_live_delivery() {
         "the quiet member's frame waited out the busy member's whole queue: {summary}"
     );
 
-    // The resync is the busy member's: its inbox, addressed to the principal.
-    assert!(
-        seen.contains(&Seen::Status(busy.did.clone())),
-        "the busy member is told to resync: {summary}"
-    );
+    // The resync is the busy member's: its inbox, addressed to the principal,
+    // and only when its scope includes `pickup`.
+    if busy_scope.contains(&"pickup") {
+        assert!(
+            seen.contains(&Seen::Status(busy.did.clone())),
+            "the busy member is told to resync: {summary}"
+        );
+    } else {
+        assert!(
+            !seen.contains(&Seen::Status(busy.did.clone())),
+            "a member without pickup is owed no status for its inbox: {summary}"
+        );
+    }
     assert!(
         !seen.contains(&Seen::Status(quiet.did.clone())),
         "the quiet member lost nothing and is owed no resync: {summary}"
