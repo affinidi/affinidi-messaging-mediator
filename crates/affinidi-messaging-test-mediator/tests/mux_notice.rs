@@ -514,6 +514,24 @@ async fn a_login_with_a_key_agreement_key_added_since_the_grant_suspends_it() {
         mux::MuxGrantState::Suspended,
         "suspended by the time the login succeeds"
     );
+    // Audited before the login answered too: the member's key fired it, the
+    // phone lost the grant.
+    let audit = store.audit_log_list(0, 100).await.unwrap();
+    let entry = audit
+        .entries
+        .iter()
+        .find(|e| {
+            e.action
+                == affinidi_messaging_mediator_common::types::audit::AuditAction::MuxGrantSuspend
+        })
+        .expect("a mux_grant_suspend audit entry");
+    assert_eq!(entry.actor_did_hash, member.did_hash());
+    assert_eq!(entry.target_did_hash, phone.did_hash());
+    assert!(
+        entry.detail.contains("direct DIDComm authentication"),
+        "{}",
+        entry.detail
+    );
 
     let got = wait_for_notices(&env, &phone, 1).await;
     assert_eq!(got[0]["payload"]["notice"], "grantsSuspended");

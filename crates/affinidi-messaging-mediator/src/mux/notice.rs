@@ -462,6 +462,13 @@ async fn check(
             .map(|g| mux::MuxChange::of(g, false))
             .collect();
         super::sync::publish(state, &changes).await;
+        // Rare (a key change), so written here rather than in the spawned
+        // follow-up, where a crash before it ran would lose the record.
+        let by = match proven {
+            ProvenKey::KeyAgreement(_) => super::audit::SuspendedBy::DirectKeyAgreement,
+            ProvenKey::Signing(_) => super::audit::SuspendedBy::DirectSigning,
+        };
+        super::audit::suspended(state, &suspended, by).await;
     }
     Ok(suspended)
 }

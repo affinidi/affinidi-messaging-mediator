@@ -2412,6 +2412,23 @@ async fn consume_mux(
     // Durable notices for what this task suspended or revoked: only now,
     // once the change is committed and its members detached (spec rule 2).
     crate::mux::notice::after_change(state, &changed).await;
+    // Audit records the specs require: revocations, an advanced epoch, and
+    // grants the unknown-key rule suspended.
+    match task {
+        ServedTask::MuxRevoke => {
+            crate::mux::audit::revoked(state, &session.did_hash, &changed).await
+        }
+        ServedTask::MuxRevokeAll => {
+            crate::mux::audit::revoked_all(state, &session.did_hash, &response).await
+        }
+        _ => {}
+    }
+    crate::mux::audit::suspended(
+        state,
+        &changed.suspended,
+        crate::mux::audit::SuspendedBy::Statement,
+    )
+    .await;
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,
