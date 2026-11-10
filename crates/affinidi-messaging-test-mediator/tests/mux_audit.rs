@@ -120,14 +120,26 @@ async fn revocations_epochs_and_suspensions_are_audited() {
     let all = audit(&env, AuditAction::MuxRevokeAll).await;
     assert_eq!(all.len(), 1, "{all:#?}");
     assert_eq!(all[0].target_did_hash, did_hash(&work.did));
-    assert!(all[0].detail.contains("1 grants voided"), "{}", all[0].detail);
+    assert!(
+        all[0].detail.contains("1 grants voided"),
+        "{}",
+        all[0].detail
+    );
 
     // A grant signed with the member's second key suspends the tablet's
     // grant, signed with the first: the member is the actor, the tablet the
     // target. (A fresh principal: home's grant to the phone was revoked
     // this second, so the phone's replay floor would refuse a new one.)
-    let key1 = home.secrets.iter().find(|s| s.id.ends_with("#key-1")).unwrap();
-    let key2 = home.secrets.iter().find(|s| s.id.ends_with("#key-2")).unwrap();
+    let key1 = home
+        .secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .unwrap();
+    let key2 = home
+        .secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-2"))
+        .unwrap();
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
