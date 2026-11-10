@@ -1187,8 +1187,10 @@ mod tests {
 
     #[test]
     fn the_first_key_agreement_key_of_a_did_that_listed_none_is_unknown() {
-        let mut rec = MuxDidRecord::default();
-        rec.grants = vec![grant("g1", "p1", "k1", NOW - 10, 0)];
+        let mut rec = MuxDidRecord {
+            grants: vec![grant("g1", "p1", "k1", NOW - 10, 0)],
+            ..Default::default()
+        };
         assert_eq!(
             suspend_unless_known_key_agreement(&mut rec, "ka1", NOW).len(),
             1
