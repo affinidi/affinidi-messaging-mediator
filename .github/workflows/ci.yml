@@ -357,6 +357,17 @@ jobs:
             --no-default-features \
             --features "didcomm,redis-backend" \
             --test store_conformance
+      - name: cargo test mux_cross_instance against Redis
+        # A grant change published by another instance reaches this one's
+        # connections through Redis pub/sub. Needs the fixture's
+        # `redis-backend` feature, which the workspace test job does not set.
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: |
+          cargo test \
+            -p affinidi-messaging-test-mediator \
+            --features redis-backend \
+            --test mux_cross_instance
 
   test-mediator-fjall:
     # The e2e suite against the on-disk Fjall backend (each store in its own

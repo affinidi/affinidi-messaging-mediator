@@ -8,10 +8,12 @@
 //! The registry is how a handler finds those connections, so it can drop the
 //! affected members **before** it answers (design §7.3, R1.1/R7.2).
 //!
-//! Scope is one process. With several mediator processes sharing one Redis,
-//! a revoke handled by another process reaches this one's connections through
-//! the periodic grant re-check in `connection::sweep`, within one sweep
-//! interval (design §7.4).
+//! The registry's scope is one process. With several mediator processes
+//! sharing one Redis, a change handled by another process arrives as a
+//! `MuxChangeRecord` on the store's mux pub/sub channel, and [`super::sync`]
+//! applies it here — detach, narrow or admit, as the store now says — within
+//! one pub/sub hop. The periodic grant re-check in `connection::sweep`
+//! remains the backstop for a record that never arrives (design §7.4).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -131,6 +133,34 @@ impl MuxConn {
         }
     }
 
+    /// Take `did_hash` off the connection only if grant `grant_id` still
+    /// admits it: a member a newer grant took over in the meantime stays.
+    pub async fn detach_grant_id(
+        &self,
+        streaming: Option<&StreamingTask>,
+        did_hash: &str,
+        grant_id: &str,
+        reason: LeaveReason,
+    ) -> Option<MuxMember> {
+        let (member, session_id) = {
+            let mut s = self.session.lock().await;
+            let held = s.get(did_hash).is_some_and(|m| {
+                m.source
+                    == (super::session::MuxSource::Grant {
+                        grant_id: grant_id.to_string(),
+                    })
+            });
+            if !held {
+                return None;
+            }
+            (s.detach(did_hash)?, s.session_id.clone())
+        };
+        self.deregister(streaming, did_hash, &session_id).await;
+        self.left.lock().await.push((member.clone(), reason));
+        self.notify.notify_one();
+        Some(member)
+    }
+
     /// Remove every member admitted by one of `grants`.
     pub async fn detach_grants(
         &self,
@@ -192,7 +222,13 @@ impl MuxRegistry {
         self.conns.get(session_id).map(|c| c.clone())
     }
 
-    fn for_principal(&self, principal_hash: &str) -> Vec<Arc<MuxConn>> {
+    /// Every live mux connection on this instance.
+    pub fn all(&self) -> Vec<Arc<MuxConn>> {
+        self.conns.iter().map(|c| c.value().clone()).collect()
+    }
+
+    /// The live mux connections of `principal_hash` on this instance.
+    pub fn for_principal(&self, principal_hash: &str) -> Vec<Arc<MuxConn>> {
         self.by_principal
             .get(principal_hash)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())

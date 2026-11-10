@@ -667,6 +667,29 @@ fn fjall_backend() -> Backend {
 /// reproducing the fresh-store-per-test guarantee the in-process backends have.
 #[cfg(feature = "redis-backend")]
 async fn redis_backend(db_index: u8) -> Option<Backend> {
+    let store = redis_store(db_index).await?;
+
+    // Wipe this logical DB so the check starts from a clean keyspace. Loaded
+    // Lua FUNCTIONs are server-global, not per-DB, so FLUSHDB doesn't disturb
+    // them (and `initialize()` reloads them anyway).
+    let mut conn = store.get_connection().await.expect("redis connection");
+    // `::redis` — the extern crate, not the sibling `mod redis` this suite's
+    // test-generation macro creates (which would shadow a bare `redis::`).
+    ::redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .expect("FLUSHDB");
+
+    Some(Backend {
+        store: Arc::new(store),
+        keepalive: None,
+    })
+}
+
+/// A Redis store on logical DB `db_index`, left as it is, or `None` when
+/// `REDIS_URL` is unset.
+#[cfg(feature = "redis-backend")]
+async fn redis_store(db_index: u8) -> Option<affinidi_messaging_mediator::store::RedisStore> {
     use affinidi_messaging_mediator::store::RedisStore;
     use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
 
@@ -695,28 +718,12 @@ async fn redis_backend(db_index: u8) -> Option<Backend> {
     let handler = DatabaseHandler::new(&config)
         .await
         .expect("connect to REDIS_URL — is the server reachable?");
-    let store = RedisStore::new(
+    Some(RedisStore::new(
         handler,
         config.circuit_breaker_threshold,
         config.circuit_breaker_recovery_secs,
         config.functions_file.clone(),
-    );
-
-    // Wipe this logical DB so the check starts from a clean keyspace. Loaded
-    // Lua FUNCTIONs are server-global, not per-DB, so FLUSHDB doesn't disturb
-    // them (and `initialize()` reloads them anyway).
-    let mut conn = store.get_connection().await.expect("redis connection");
-    // `::redis` — the extern crate, not the sibling `mod redis` this suite's
-    // test-generation macro creates (which would shadow a bare `redis::`).
-    ::redis::cmd("FLUSHDB")
-        .query_async::<()>(&mut conn)
-        .await
-        .expect("FLUSHDB");
-
-    Some(Backend {
-        store: Arc::new(store),
-        keepalive: None,
-    })
+    ))
 }
 
 /// Audit log: recording, newest-first ordering, cursor pagination, and
@@ -1758,6 +1765,72 @@ async fn check_mux_grant_flows(store: Arc<dyn MediatorStore>) {
     assert_eq!(store.mux_principal_count("mux-flow-q").await.unwrap(), 0);
 }
 
+/// A single-process backend has no other instance to tell about mux grant
+/// changes: publishing succeeds and does nothing, and there is nothing to
+/// subscribe to.
+#[cfg(any(feature = "memory-backend", feature = "fjall-backend"))]
+async fn check_mux_changes_single_process(store: Arc<dyn MediatorStore>) {
+    let record = mux::MuxChangeRecord {
+        origin: "instance-a".into(),
+        changes: vec![mux::MuxChange {
+            did_hash: "member".into(),
+            principal_hash: "principal".into(),
+            stored: true,
+        }],
+    };
+    store.mux_changes_publish(&record).await.unwrap();
+    assert!(store.mux_changes_subscribe().await.unwrap().is_none());
+}
+
+/// Two Redis-backed instances: a mux change one publishes reaches the other
+/// (and the publisher's own subscription, which the mediator filters by
+/// `origin`). Pub/sub channels are server-wide, not per logical DB, so this
+/// needs no DB of its own and flushes nothing.
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn redis_mux_changes_reach_every_instance() {
+    let (Some(a), Some(b)) = (redis_store(0).await, redis_store(0).await) else {
+        return;
+    };
+    let mut on_a = a
+        .mux_changes_subscribe()
+        .await
+        .unwrap()
+        .expect("redis subscribes");
+    let mut on_b = b
+        .mux_changes_subscribe()
+        .await
+        .unwrap()
+        .expect("redis subscribes");
+    // A second subscriber on one instance shares its bridge.
+    let mut on_b2 = b.mux_changes_subscribe().await.unwrap().unwrap();
+
+    let record = mux::MuxChangeRecord {
+        origin: format!("instance-a-{}", uuid::Uuid::new_v4()),
+        changes: vec![mux::MuxChange {
+            did_hash: "member".into(),
+            principal_hash: "principal".into(),
+            stored: false,
+        }],
+    };
+    a.mux_changes_publish(&record).await.unwrap();
+
+    // Other suites' runs may publish on the same server: wait for ours.
+    for rx in [&mut on_b, &mut on_b2, &mut on_a] {
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let r = rx.recv().await.expect("subscription open");
+                if r.origin == record.origin {
+                    return r;
+                }
+            }
+        })
+        .await
+        .expect("the record arrives within 5s");
+        assert_eq!(got, record);
+    }
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -1872,6 +1945,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn mux_grant_flows() {
                 check_mux_grant_flows(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn mux_changes_single_process() {
+                check_mux_changes_single_process(ready($ctor).await).await;
             }
         }
     };

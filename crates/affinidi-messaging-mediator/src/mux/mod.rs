@@ -11,4 +11,5 @@ pub mod notice;
 pub mod proof;
 pub mod registry;
 pub mod session;
+pub mod sync;
 pub mod tasks;

@@ -340,6 +340,49 @@ pub struct MuxIndexDelta {
     pub remove: Vec<String>,
 }
 
+/// Grants that changed on one mediator instance, published so the other
+/// instances sharing the store apply the change to their own live mux
+/// connections within moments rather than at their next periodic re-check
+/// (design §7.4).
+///
+/// Carries hashes only — never statements, DIDs or keys. A receiver re-reads
+/// each member's record and acts on what the store holds, so a record is a
+/// hint to look, not an instruction: a stale, duplicated or reordered one
+/// does no harm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxChangeRecord {
+    /// The instance that made the change (its streaming UUID), so it can
+    /// ignore its own records: it applied the change before publishing.
+    pub origin: String,
+    pub changes: Vec<MuxChange>,
+}
+
+/// One changed (member DID, principal) pair in a [`MuxChangeRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MuxChange {
+    /// The member DID's hash: whose record to re-read.
+    pub did_hash: String,
+    /// The principal's hash: whose live connections to reconcile.
+    pub principal_hash: String,
+    /// A grant was just stored for this pair, so a receiver may carry it on
+    /// the principal's live connections, as the originating instance does.
+    /// Without it a receiver only drops or narrows: a grant it did not just
+    /// see stored may be one its connection refused on connect (key not
+    /// checkable, member blocked), and only a reconnect re-runs those checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stored: bool,
+}
+
+impl MuxChange {
+    pub fn of(grant: &MuxGrant, stored: bool) -> Self {
+        Self {
+            did_hash: grant.did_hash.clone(),
+            principal_hash: grant.principal_hash.clone(),
+            stored,
+        }
+    }
+}
+
 /// Operator limits the grant rules enforce. See `[limits.mux]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MuxLimits {
