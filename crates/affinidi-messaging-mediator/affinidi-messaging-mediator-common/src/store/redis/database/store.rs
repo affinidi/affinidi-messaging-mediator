@@ -110,14 +110,19 @@ impl Database {
     /// `store_message` for cluster mode, as single-slot steps ordered so a
     /// failure part-way is harmless or repaired by a retry:
     ///
-    /// 1. body, metadata and sender, marked `STORING:<token>` for this store
+    /// 1. the expiry index, so the sweeper can reach the message from here on
+    ///    (an entry for a message that never gets stored is dropped by the
+    ///    sweeper as already gone);
+    /// 2. body, metadata and sender, marked `STORING:<token>` for this store
     ///    so no delete can run until step 4 (nothing to do if already stored
-    ///    for this recipient; refused while a delete holds the message);
-    /// 2. the expiry index, so the sweeper can reach the message from here on;
+    ///    for this recipient; refused while a delete holds the message). A
+    ///    delete that died or stalled past its lease is taken over, and the
+    ///    entries it claimed are released first;
     /// 3. the recipient's inbox and the sender's outbox, concurrently;
-    /// 4. the queue ids on the metadata, clearing this store's mark — the
+    /// 4. the queue ids on the metadata, clearing this store's mark: the
     ///    message is deletable once no store holds it. Refused if a delete
-    ///    took the message over, which fails the store;
+    ///    took the message over, which fails the store and releases what
+    ///    step 3 queued;
     /// 5. the global counters, best-effort, only for a newly written message
     ///    so a retry or a concurrent identical store counts it once.
     ///
@@ -138,24 +143,11 @@ impl Database {
         let bytes = message.len();
         let token = uuid::Uuid::new_v4().to_string();
 
-        let written: i64 = STORE_MESSAGE
-            .key(keys.msg(message_hash))
-            .key(keys.msg_meta(message_hash))
-            .arg(message)
-            .arg(bytes)
-            .arg(to_did_hash)
-            .arg(from_hash)
-            .arg(DELETE_LEASE_MS)
-            .arg(&token)
-            .arg(STORE_LEASE_MS)
-            .invoke_async(conn)
-            .await?;
-        if written == 0 {
-            return Ok(());
-        }
-
-        // Index before bucket: a failure between them leaves an empty bucket
-        // in the index, which the sweeper passes over.
+        // Index before the message: a failure part-way then leaves at most an
+        // index entry for a message that isn't there, which the sweeper drops
+        // as already gone. Body first would leak the body and metadata for good
+        // when the index write fails and the sender doesn't retry. Index
+        // before bucket: an empty bucket in the index is passed over.
         let bucket = format!("MSG_EXPIRY:{expires_at}");
         redis::cmd("ZADD")
             .arg("MSG_EXPIRY")
@@ -169,6 +161,53 @@ impl Database {
             .arg(message_hash)
             .exec_async(conn)
             .await?;
+
+        let stored: Vec<String> = STORE_MESSAGE
+            .key(keys.msg(message_hash))
+            .key(keys.msg_meta(message_hash))
+            .arg(message)
+            .arg(bytes)
+            .arg(to_did_hash)
+            .arg(from_hash)
+            .arg(DELETE_LEASE_MS)
+            .arg(&token)
+            .arg(STORE_LEASE_MS)
+            .invoke_async(conn)
+            .await?;
+        let [
+            written,
+            release_to,
+            release_from,
+            release_bytes,
+            release_receive_id,
+            release_send_id,
+        ] = <[String; 6]>::try_from(stored).map_err(|reply| {
+            redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "STORE_MESSAGE reply",
+                format!("expected 6 fields, got {reply:?}"),
+            ))
+        })?;
+        if written == "0" {
+            return Ok(());
+        }
+
+        // A delete that died or stalled part-way was taken over: release the
+        // entries it claimed before queueing again, so the message gets new
+        // entries and the stalled delete, if it resumes, releases nothing.
+        if !release_to.is_empty() {
+            self.handler
+                .release_queues(
+                    conn,
+                    message_hash,
+                    &release_to,
+                    &release_from,
+                    &release_bytes,
+                    &release_receive_id,
+                    &release_send_id,
+                )
+                .await?;
+        }
 
         let mut inbox_conn = conn.clone();
         let inbox = async {
@@ -210,19 +249,39 @@ impl Database {
         let recorded: i64 = RECORD_QUEUE_IDS
             .key(keys.msg_meta(message_hash))
             .arg(&token)
-            .arg(ids)
+            .arg(&ids)
             .invoke_async(conn)
             .await?;
         if recorded == 0 {
-            // A delete took the message over (its store outlived the
-            // lease). Whatever it queued, the message isn't stored.
+            // A delete took the message over (this store outlived its lease).
+            // The message isn't stored, so release what this store queued;
+            // the delete may release the same entries, and each goes once.
+            if let Err(err) = self
+                .handler
+                .release_queues(
+                    conn,
+                    message_hash,
+                    to_did_hash,
+                    if from_hash == "ANONYMOUS" {
+                        ""
+                    } else {
+                        from_hash
+                    },
+                    &bytes.to_string(),
+                    &ids[1],
+                    ids.get(3).map_or("", String::as_str),
+                )
+                .await
+            {
+                warn!("Couldn't release the queue entries of message {message_hash}: {err}");
+            }
             return Err(redis::RedisError::from((
                 redis::ErrorKind::Client,
                 "DELETED_WHILE_STORING",
                 format!("message {message_hash} was deleted before its store completed"),
             )));
         }
-        if written != 1 {
+        if written != "1" {
             return Ok(());
         }
 

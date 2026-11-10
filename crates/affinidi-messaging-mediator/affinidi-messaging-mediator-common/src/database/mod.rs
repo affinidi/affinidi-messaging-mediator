@@ -326,20 +326,7 @@ impl DatabaseHandler {
             .arg("SLOTS")
             .query_async(conn)
             .await
-            .map_err(|err| {
-                MediatorError::problem_with_log(
-                    6,
-                    "NA",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.info",
-                    "Couldn't query database information. Reason: {1}",
-                    vec![err.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Couldn't query database information. Reason: {err}"),
-                )
-            })?;
+            .map_err(|err| storage_info_error(&err))?;
         // Each range is [start, end, primary, replicas...]; a primary is
         // [host, port, ...].
         let primaries: std::collections::HashSet<String> = slots
@@ -385,18 +372,7 @@ impl DatabaseHandler {
                 Ok(_) => true,
                 Err(err) if err.to_string().contains("cluster support disabled") => false,
                 Err(err) => {
-                    return Err(MediatorError::problem_with_log(
-                        6,
-                        "NA",
-                        None,
-                        ProblemReportSorter::Error,
-                        ProblemReportScope::Protocol,
-                        "me.res.storage.info",
-                        "Couldn't query database information. Reason: {1}",
-                        vec![err.to_string()],
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Couldn't query database information. Reason: {err}"),
-                    ));
+                    return Err(storage_info_error(&err));
                 }
             }
         } else {
@@ -532,18 +508,7 @@ impl DatabaseHandler {
         let server_info: String = match redis::cmd("INFO").arg("SERVER").query_async(conn).await {
             Ok(result) => result,
             Err(err) => {
-                return Err(MediatorError::problem_with_log(
-                    6,
-                    "NA",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.info",
-                    "Couldn't query database information. Reason: {1}",
-                    vec![err.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Couldn't query database information. Reason: {err}"),
-                ));
+                return Err(storage_info_error(&err));
             }
         };
 
@@ -654,6 +619,23 @@ impl DatabaseHandler {
             info!("Redis TLS connection detected (rediss://)");
         }
     }
+}
+
+/// A query about the database server itself (version, cluster layout)
+/// failed.
+fn storage_info_error(err: &redis::RedisError) -> MediatorError {
+    MediatorError::problem_with_log(
+        6,
+        "NA",
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "me.res.storage.info",
+        "Couldn't query database information. Reason: {1}",
+        vec![err.to_string()],
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Couldn't query database information. Reason: {err}"),
+    )
 }
 
 /// A storage configuration that stops the mediator starting, as a problem

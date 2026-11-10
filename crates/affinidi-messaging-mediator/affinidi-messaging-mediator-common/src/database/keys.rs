@@ -112,11 +112,7 @@ impl Keys {
 
     /// One mediator instance's streaming sessions.
     pub fn streaming_sessions(self, mediator_uuid: &str) -> String {
-        if self.cluster {
-            format!("STREAMING_SESSIONS:{{streaming}}:{mediator_uuid}")
-        } else {
-            ["STREAMING_SESSIONS:", mediator_uuid].concat()
-        }
+        self.shared("STREAMING_SESSIONS:", "streaming", mediator_uuid)
     }
 
     /// DID hash → streaming instance of every live client.

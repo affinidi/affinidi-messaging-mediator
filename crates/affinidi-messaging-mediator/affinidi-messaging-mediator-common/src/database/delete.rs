@@ -61,8 +61,10 @@ impl DatabaseHandler {
                 // parties, so no read beforehand is needed.
                 self.delete_message_in_steps(&mut conn, message_hash, did_hash, admin_did_hash)
                     .await
-                    .map(|(to, from)| {
-                        parties = (!from.is_empty()).then_some((to, from));
+                    .map(|(to, from, in_outbox)| {
+                        // As the library path: a receipt only for a message
+                        // that sat in a sender's outbox.
+                        parties = (in_outbox && !from.is_empty()).then_some((to, from));
                         "OK".to_string()
                     })
             } else {
@@ -179,28 +181,30 @@ impl DatabaseHandler {
     /// 3. remove the message only while this delete still holds it, so
     ///    exactly one delete reports it removed (R1.7), and count it.
     ///
-    /// A failure returns an error and leaves the message held. Once the hold
-    /// passes its lease the next delete (or the expiry sweeper, which keeps
-    /// the message for its next pass) takes it over and finishes. On a full
+    /// A failure in step 2 returns an error and gives the hold up, so the next
+    /// delete (or the expiry sweeper, on its next pass) takes the message over
+    /// at once and finishes; a store of the same message takes it over too and
+    /// releases the claimed entries before queueing it again. On a full
     /// database step 1's write is refused, so the delete fails before
     /// changing anything, as the library's does.
     ///
-    /// Returns the message's TO and FROM ("" for an anonymous sender).
+    /// Returns the message's TO and FROM ("" for an anonymous sender), and
+    /// whether it sat in the sender's outbox, which is when a receipt is due.
     async fn delete_message_in_steps(
         &self,
         conn: &mut super::RedisConnection,
         message_hash: &str,
         did_hash: &str,
         admin_did_hash: Option<&str>,
-    ) -> redis::RedisResult<(String, String)> {
+    ) -> redis::RedisResult<(String, String, bool)> {
         use crate::store::redis::database::cluster_scripts::{
-            CLAIM_MESSAGE, DELETE_LEASE_MS, FINISH_DELETE, STORE_LEASE_MS,
+            ABANDON_DELETE, CLAIM_MESSAGE, DELETE_LEASE_MS, FINISH_DELETE, STORE_LEASE_MS,
         };
 
         let keys = self.keys;
         let token = uuid::Uuid::new_v4().to_string();
         let mut attempt = 1;
-        let (to, from, bytes, receive_id, send_id): (String, String, String, String, String) = loop {
+        let claimed: [String; 10] = loop {
             let mut claim = CLAIM_MESSAGE.prepare_invoke();
             claim
                 .key(keys.msg_meta(message_hash))
@@ -212,8 +216,16 @@ impl DatabaseHandler {
             if let Some(admin_hash) = admin_did_hash {
                 claim.arg(admin_hash);
             }
-            match claim.invoke_async(conn).await {
-                Ok(claimed) => break claimed,
+            match claim.invoke_async::<Vec<String>>(conn).await {
+                Ok(claimed) => {
+                    break <[String; 10]>::try_from(claimed).map_err(|reply| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::Client,
+                            "CLAIM_MESSAGE reply",
+                            format!("expected 10 fields, got {reply:?}"),
+                        ))
+                    })?;
+                }
                 Err(err)
                     if attempt < CLAIM_ATTEMPTS
                         && matches!(
@@ -229,19 +241,75 @@ impl DatabaseHandler {
             }
         };
 
+        let [
+            to,
+            from,
+            bytes,
+            receive_id,
+            send_id,
+            release_to,
+            release_from,
+            release_bytes,
+            release_receive_id,
+            release_send_id,
+        ] = claimed;
+        let mut in_outbox = !send_id.is_empty();
         for attempt in 1..=RELEASE_ATTEMPTS {
-            let (inbox, outbox) = futures_util::future::join(
-                self.release_inbox(conn.clone(), &to, message_hash, &bytes, &receive_id),
-                self.release_outbox(conn.clone(), &from, &to, message_hash, &bytes, &send_id),
-            )
+            // The entries of a taken-over delete whose store died before
+            // releasing them, then this message's own.
+            let released = async {
+                if !release_to.is_empty() {
+                    let (_, outbox) = self
+                        .release_queues(
+                            conn,
+                            message_hash,
+                            &release_to,
+                            &release_from,
+                            &release_bytes,
+                            &release_receive_id,
+                            &release_send_id,
+                        )
+                        .await?;
+                    in_outbox |= outbox > 0 && release_from == from;
+                }
+                self.release_queues(
+                    conn,
+                    message_hash,
+                    &to,
+                    &from,
+                    &bytes,
+                    &receive_id,
+                    &send_id,
+                )
+                .await
+            }
             .await;
-            match inbox.and(outbox) {
-                Ok(_) => break,
+            match released {
+                Ok((_, outbox)) => {
+                    in_outbox |= outbox > 0;
+                    break;
+                }
                 Err(err) if attempt < RELEASE_ATTEMPTS => {
                     warn!("Retrying the queue release of message {message_hash}: {err}");
                     tokio::time::sleep(RELEASE_RETRY_DELAY * attempt).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    // Give the hold up now rather than at the end of its
+                    // lease, so the next delete or store takes the message
+                    // over at once instead of waiting. The releases are
+                    // idempotent, so whoever takes over finishes them.
+                    if let Err(abandon) = ABANDON_DELETE
+                        .key(keys.msg_meta(message_hash))
+                        .arg(&token)
+                        .invoke_async::<i64>(conn)
+                        .await
+                    {
+                        warn!(
+                            "Couldn't give up the delete hold on message {message_hash}: {abandon}"
+                        );
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -274,7 +342,31 @@ impl DatabaseHandler {
         if let Err(err) = counted.exec_async(conn).await {
             warn!("Couldn't count deleted message {message_hash}: {err}");
         }
-        Ok((to, from))
+        Ok((to, from, in_outbox))
+    }
+
+    /// Releases a message's inbox and outbox entries concurrently, each in its
+    /// own slot, and returns how many of each were released (0 or 1). An
+    /// empty `from` is an anonymous sender; an empty entry id releases
+    /// whatever entry is queued for the message. Idempotent: an entry already
+    /// released, or replaced by a new copy of the message, is left alone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn release_queues(
+        &self,
+        conn: &super::RedisConnection,
+        message_hash: &str,
+        to: &str,
+        from: &str,
+        bytes: &str,
+        receive_id: &str,
+        send_id: &str,
+    ) -> redis::RedisResult<(i64, i64)> {
+        let (inbox, outbox) = futures_util::future::join(
+            self.release_inbox(conn.clone(), to, message_hash, bytes, receive_id),
+            self.release_outbox(conn.clone(), from, to, message_hash, bytes, send_id),
+        )
+        .await;
+        Ok((inbox?, outbox?))
     }
 
     /// Releases the recipient's inbox entry `receive_id` of a message being

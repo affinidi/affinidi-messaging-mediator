@@ -135,6 +135,10 @@ async fn retire_bridge<T>(
 const PUBSUB_BROADCAST_CAPACITY: usize = 32;
 const STATIC_TIMESLOT_BATCH: u32 = 100;
 
+/// How long an expiry bucket that couldn't be cleared waits before the
+/// sweeper tries it again, in seconds.
+const EXPIRY_RETRY_SECS: u64 = 60;
+
 /// Redis-backed [`MediatorStore`].
 ///
 /// Holds the Redis connection pool (`DatabaseHandler`) plus a circuit
@@ -2280,7 +2284,23 @@ impl MediatorStore for RedisStore {
                 }
             }
 
-            if bucket_cleared {
+            if !bucket_cleared {
+                // Move the bucket back so it can't hold up the due ones: the
+                // scan takes only the first STATIC_TIMESLOT_BATCH buckets, and
+                // a message whose delete keeps failing would otherwise pin
+                // its bucket at the front for good. Best-effort: on a full
+                // database the write is refused and the bucket stays put.
+                if let Err(err) = redis::cmd("ZADD")
+                    .arg("MSG_EXPIRY")
+                    .arg("XX")
+                    .arg(now_secs + EXPIRY_RETRY_SECS)
+                    .arg(key)
+                    .exec_async(&mut conn)
+                    .await
+                {
+                    warn!("sweep_expired_messages couldn't defer bucket {key}: {err}");
+                }
+            } else {
                 redis::cmd("ZREM")
                     .arg("MSG_EXPIRY")
                     .arg(key)

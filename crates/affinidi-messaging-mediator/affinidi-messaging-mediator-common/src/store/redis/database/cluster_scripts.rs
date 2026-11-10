@@ -25,15 +25,21 @@ pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 ///
 /// A message whose delete is in progress is refused with
 /// `DELETE_IN_PROGRESS` (the caller reports the store as failed, never as
-/// stored). A delete that died part-way, past its lease, is taken over: the
-/// message is stored again and the enqueue steps re-queue whatever the
-/// delete had released.
+/// stored). A delete that died or stalled part-way, past its lease, is taken
+/// over. The queue entries that delete claimed are moved to `RELEASE_*`
+/// fields, and the store releases them before it queues the message again,
+/// so the message gets new entries. A stalled delete that resumes later
+/// then releases nothing: its claimed entry ids no longer match.
+/// `RECORD_QUEUE_IDS` clears the fields once the store completes.
 ///
 /// KEYS: body, metadata. ARGV: body, bytes, to, from (`ANONYMOUS` for none),
 /// delete lease ms, store token, store lease ms.
-/// Returns 1 when newly written, 2 when an unfinished store (a retry, the
-/// same message stored concurrently, or a taken-over delete) is resumed, and
-/// 0 when the message is already fully stored for this recipient.
+/// Returns `{result, release_to, release_from, release_bytes,
+/// release_receive_id, release_send_id}`. `result` is 1 when newly written,
+/// 2 when an unfinished store (a retry, the same message stored
+/// concurrently, or a taken-over delete) is resumed, and 0 when the message
+/// is already fully stored for this recipient. The release fields are ""
+/// unless a taken-over delete's entries are still to be released.
 pub(crate) static STORE_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -56,11 +62,22 @@ if meta.TO then
         if now_ms - tonumber(meta.DELETING_AT) < tonumber(ARGV[5]) then
             return redis.error_reply('DELETE_IN_PROGRESS message is being deleted')
         end
-        redis.call('HDEL', KEYS[2], 'DELETING', 'DELETING_AT')
+        if not meta.RELEASE_TO then
+            meta.RELEASE_TO = meta.TO
+            meta.RELEASE_FROM = meta.FROM or ''
+            meta.RELEASE_BYTES = meta.BYTES or '0'
+            meta.RELEASE_RECEIVE_ID = meta.RECEIVE_ID or ''
+            meta.RELEASE_SEND_ID = meta.SEND_ID or ''
+            redis.call('HSET', KEYS[2], 'RELEASE_TO', meta.RELEASE_TO,
+                'RELEASE_FROM', meta.RELEASE_FROM, 'RELEASE_BYTES', meta.RELEASE_BYTES,
+                'RELEASE_RECEIVE_ID', meta.RELEASE_RECEIVE_ID,
+                'RELEASE_SEND_ID', meta.RELEASE_SEND_ID)
+        end
+        redis.call('HDEL', KEYS[2], 'DELETING', 'DELETING_AT', 'RECEIVE_ID', 'SEND_ID', 'FROM')
         result = 2
     elseif meta.TO == ARGV[3] then
-        if meta.RECEIVE_ID and not storing then
-            return 0
+        if meta.RECEIVE_ID and not storing and not meta.RELEASE_TO then
+            return { '0', '', '', '', '', '' }
         end
         result = 2
     end
@@ -71,7 +88,8 @@ redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3],
 if ARGV[4] ~= 'ANONYMOUS' then
     redis.call('HSET', KEYS[2], 'FROM', ARGV[4])
 end
-return result
+return { tostring(result), meta.RELEASE_TO or '', meta.RELEASE_FROM or '',
+    meta.RELEASE_BYTES or '', meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '' }
 "#,
     )
 });
@@ -139,9 +157,10 @@ return id
 
 /// Message slot, last step of a store: record where the message sits in the
 /// queues and clear this store's `STORING:<token>`; the message is deletable
-/// once no store holds it. Refuses (returns 0) when the message was deleted,
-/// or a delete took it over, in the meantime: the store must then report
-/// failure, not success.
+/// once no store holds it, and drop the `RELEASE_*` fields of a taken-over
+/// delete, whose entries the store has released. Refuses (returns 0) when the
+/// message was deleted, or a delete took it over, in the meantime: the store
+/// must then report failure, not success, and release what it queued.
 ///
 /// KEYS: metadata. ARGV: store token, then field/value pairs. Returns 1 when
 /// recorded.
@@ -153,7 +172,8 @@ if redis.call('EXISTS', KEYS[1]) == 0
     return 0
 end
 redis.call('HSET', KEYS[1], unpack(ARGV, 2))
-redis.call('HDEL', KEYS[1], 'STORING:' .. ARGV[1])
+redis.call('HDEL', KEYS[1], 'STORING:' .. ARGV[1], 'RELEASE_TO', 'RELEASE_FROM',
+    'RELEASE_BYTES', 'RELEASE_RECEIVE_ID', 'RELEASE_SEND_ID')
 return 1
 "#,
     )
@@ -176,7 +196,9 @@ return 1
 /// ms, delete lease ms, admin (optional).
 /// Returns TO, FROM ("" for an anonymous sender), BYTES, and the inbox and
 /// outbox entry ids ("" when not recorded), which bind the releases to the
-/// entries this claim saw.
+/// entries this claim saw. Then the five `RELEASE_*` fields of a taken-over
+/// delete whose store died before releasing them ("" when none): the delete
+/// releases those entries too.
 pub(crate) static CLAIM_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -217,7 +239,9 @@ redis.call('HSET', KEYS[1], 'DELETING', ARGV[3], 'DELETING_AT', now_ms)
 if #expired > 0 then
     redis.call('HDEL', KEYS[1], unpack(expired))
 end
-return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta.SEND_ID or '' }
+return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta.SEND_ID or '',
+    meta.RELEASE_TO or '', meta.RELEASE_FROM or '', meta.RELEASE_BYTES or '',
+    meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '' }
 "#,
     )
 });
@@ -235,6 +259,24 @@ if redis.call('HGET', KEYS[2], 'DELETING') ~= ARGV[1] then
     return 0
 end
 redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+"#,
+    )
+});
+
+/// Message slot of a delete whose release step failed: give the hold up
+/// now, while this delete still has it, rather than at the end of its lease.
+/// The hold is marked expired, not removed, so the next delete or store
+/// takes the message over the usual way and finishes the releases.
+///
+/// KEYS: metadata. ARGV: delete token. Returns 1 when given up.
+pub(crate) static ABANDON_DELETE: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+if redis.call('HGET', KEYS[1], 'DELETING') ~= ARGV[1] then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'DELETING_AT', 0)
 return 1
 "#,
     )
@@ -355,7 +397,8 @@ mod tests {
             }
         }
 
-        async fn store(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+        /// The first step of a store: `{result, release_*}`.
+        async fn store(&self, conn: &mut ClusterConnection, token: &str) -> Vec<String> {
             STORE_MESSAGE
                 .key(self.keys.msg(&self.hash))
                 .key(self.keys.msg_meta(&self.hash))
@@ -371,8 +414,46 @@ mod tests {
                 .expect("STORE_MESSAGE")
         }
 
-        /// The enqueue steps and the record, as a store finishes them.
-        async fn finish_store(&self, conn: &mut ClusterConnection, token: &str) -> i64 {
+        /// Releases this message's entries `receive_id` and `send_id` (""
+        /// for whatever is queued), as `release_queues` does.
+        async fn release(&self, conn: &mut ClusterConnection, receive_id: &str, send_id: &str) {
+            let _: i64 = RELEASE_INBOX
+                .key(self.keys.did(&self.to))
+                .key(self.keys.receive_q(&self.to))
+                .key(self.keys.receive_ids(&self.to))
+                .arg(&self.hash)
+                .arg(4)
+                .arg(receive_id)
+                .invoke_async(conn)
+                .await
+                .expect("RELEASE_INBOX");
+            let _: i64 = RELEASE_OUTBOX
+                .key(self.keys.did(&self.from))
+                .key(self.keys.peer_q(&self.from))
+                .key(self.keys.send_q(&self.from))
+                .key(self.keys.send_ids(&self.from))
+                .arg(&self.hash)
+                .arg(4)
+                .arg(&self.to)
+                .arg(send_id)
+                .invoke_async(conn)
+                .await
+                .expect("RELEASE_OUTBOX");
+        }
+
+        /// The rest of a store, given its first step, as
+        /// `store_message_in_steps` runs it: release a taken-over delete's
+        /// entries, enqueue, record, and on a refused record release what it
+        /// queued.
+        async fn finish_store(
+            &self,
+            conn: &mut ClusterConnection,
+            token: &str,
+            stored: &[String],
+        ) -> i64 {
+            if !stored[1].is_empty() {
+                self.release(conn, &stored[4], &stored[5]).await;
+            }
             let receive_id: String = ENQUEUE_INBOX
                 .key(self.keys.did(&self.to))
                 .key(self.keys.receive_q(&self.to))
@@ -396,13 +477,17 @@ mod tests {
                 .invoke_async(conn)
                 .await
                 .expect("ENQUEUE_OUTBOX");
-            RECORD_QUEUE_IDS
+            let recorded: i64 = RECORD_QUEUE_IDS
                 .key(self.keys.msg_meta(&self.hash))
                 .arg(token)
                 .arg(vec!["RECEIVE_ID", &receive_id, "SEND_ID", &send_id])
                 .invoke_async(conn)
                 .await
-                .expect("RECORD_QUEUE_IDS")
+                .expect("RECORD_QUEUE_IDS");
+            if recorded == 0 {
+                self.release(conn, &receive_id, &send_id).await;
+            }
+            recorded
         }
 
         async fn claim(
@@ -411,13 +496,23 @@ mod tests {
             token: &str,
             store_lease_ms: u64,
         ) -> redis::RedisResult<Vec<String>> {
+            self.claim_with(conn, token, store_lease_ms, LEASE_MS).await
+        }
+
+        async fn claim_with(
+            &self,
+            conn: &mut ClusterConnection,
+            token: &str,
+            store_lease_ms: u64,
+            delete_lease_ms: u64,
+        ) -> redis::RedisResult<Vec<String>> {
             CLAIM_MESSAGE
                 .key(self.keys.msg_meta(&self.hash))
                 .arg(&self.hash)
                 .arg(&self.to)
                 .arg(token)
                 .arg(store_lease_ms)
-                .arg(LEASE_MS)
+                .arg(delete_lease_ms)
                 .invoke_async(conn)
                 .await
         }
@@ -429,28 +524,7 @@ mod tests {
             token: &str,
             claimed: &[String],
         ) -> i64 {
-            let _: i64 = RELEASE_INBOX
-                .key(self.keys.did(&self.to))
-                .key(self.keys.receive_q(&self.to))
-                .key(self.keys.receive_ids(&self.to))
-                .arg(&self.hash)
-                .arg(4)
-                .arg(claimed.get(3).map_or("", String::as_str))
-                .invoke_async(conn)
-                .await
-                .expect("RELEASE_INBOX");
-            let _: i64 = RELEASE_OUTBOX
-                .key(self.keys.did(&self.from))
-                .key(self.keys.peer_q(&self.from))
-                .key(self.keys.send_q(&self.from))
-                .key(self.keys.send_ids(&self.from))
-                .arg(&self.hash)
-                .arg(4)
-                .arg(&self.to)
-                .arg(claimed.get(4).map_or("", String::as_str))
-                .invoke_async(conn)
-                .await
-                .expect("RELEASE_OUTBOX");
+            self.release_claimed(conn, claimed).await;
             FINISH_DELETE
                 .key(self.keys.msg(&self.hash))
                 .key(self.keys.msg_meta(&self.hash))
@@ -458,6 +532,14 @@ mod tests {
                 .invoke_async(conn)
                 .await
                 .expect("FINISH_DELETE")
+        }
+
+        /// The release step of a delete, given its claim.
+        async fn release_claimed(&self, conn: &mut ClusterConnection, claimed: &[String]) {
+            if !claimed[5].is_empty() {
+                self.release(conn, &claimed[8], &claimed[9]).await;
+            }
+            self.release(conn, &claimed[3], &claimed[4]).await;
         }
 
         /// Recipient and sender queue counts, inbox and outbox lengths, and
@@ -498,16 +580,18 @@ mod tests {
         };
         let msg = Message::new();
 
-        assert_eq!(msg.store(&mut conn, "s1").await, 1);
-        assert_eq!(msg.store(&mut conn, "s2").await, 2);
-        assert_eq!(msg.finish_store(&mut conn, "s1").await, 1);
+        let s1 = msg.store(&mut conn, "s1").await;
+        assert_eq!(s1[0], "1");
+        let s2 = msg.store(&mut conn, "s2").await;
+        assert_eq!(s2[0], "2");
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 1);
 
         match msg.claim(&mut conn, "d", LEASE_MS).await {
             Err(err) => assert_eq!(err.code(), Some("STORE_IN_PROGRESS")),
             Ok(claimed) => panic!("claimed while the second store holds it: {claimed:?}"),
         }
 
-        assert_eq!(msg.finish_store(&mut conn, "s2").await, 1);
+        assert_eq!(msg.finish_store(&mut conn, "s2", &s2).await, 1);
         assert_eq!(msg.queued(&mut conn).await, [1; 5]);
 
         let claimed = msg
@@ -531,7 +615,7 @@ mod tests {
         };
         let msg = Message::new();
 
-        assert_eq!(msg.store(&mut conn, "dead").await, 1);
+        assert_eq!(msg.store(&mut conn, "dead").await[0], "1");
         let claimed = msg
             .claim(&mut conn, "d", 0)
             .await
@@ -556,31 +640,176 @@ mod tests {
         };
         let msg = Message::new();
 
-        msg.store(&mut conn, "s1").await;
-        assert_eq!(msg.finish_store(&mut conn, "s1").await, 1);
+        let s1 = msg.store(&mut conn, "s1").await;
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 1);
         let stale = msg
             .claim(&mut conn, "d1", LEASE_MS)
             .await
             .expect("first delete claims");
-        let taken: Vec<String> = CLAIM_MESSAGE
-            .key(msg.keys.msg_meta(&msg.hash))
-            .arg(&msg.hash)
-            .arg(&msg.to)
-            .arg("d2")
-            .arg(LEASE_MS)
-            .arg(0)
-            .invoke_async(&mut conn)
+        let taken = msg
+            .claim_with(&mut conn, "d2", LEASE_MS, 0)
             .await
             .expect("second delete takes the stalled one over");
         assert_eq!(msg.finish_delete(&mut conn, "d2", &taken).await, 1);
 
-        assert_eq!(msg.store(&mut conn, "s2").await, 1);
-        assert_eq!(msg.finish_store(&mut conn, "s2").await, 1);
+        let s2 = msg.store(&mut conn, "s2").await;
+        assert_eq!(s2[0], "1");
+        assert_eq!(msg.finish_store(&mut conn, "s2", &s2).await, 1);
         assert_eq!(msg.finish_delete(&mut conn, "d1", &stale).await, 0);
         assert_eq!(
             msg.queued(&mut conn).await,
             [1; 5],
             "the message stored again is still queued"
         );
+    }
+
+    /// Marks the delete holding the message as past its lease, as if it
+    /// had stalled for longer than `DELETE_LEASE_MS`.
+    async fn expire_delete_hold(msg: &Message, conn: &mut ClusterConnection) {
+        let _: () = redis::cmd("HSET")
+            .arg(msg.keys.msg_meta(&msg.hash))
+            .arg("DELETING_AT")
+            .arg(0)
+            .query_async(conn)
+            .await
+            .expect("HSET DELETING_AT");
+    }
+
+    /// A delete that stalled past its lease, before its release, while the
+    /// message was stored again: the store takes the delete over and gives
+    /// the message new entries, so the stalled delete, resuming, releases
+    /// nothing and removes nothing. The message stays queued.
+    #[tokio::test]
+    async fn test_a_store_takes_over_a_stalled_delete() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        let s1 = msg.store(&mut conn, "s1").await;
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 1);
+        let stalled = msg
+            .claim(&mut conn, "d1", LEASE_MS)
+            .await
+            .expect("the delete claims");
+        expire_delete_hold(&msg, &mut conn).await;
+
+        let s2 = msg.store(&mut conn, "s2").await;
+        assert_eq!(s2[0], "2", "the store resumes over the stalled delete");
+        assert_eq!(s2[1], msg.to, "with the delete's entries to release");
+        assert_eq!(msg.finish_store(&mut conn, "s2", &s2).await, 1);
+        assert_eq!(msg.queued(&mut conn).await, [1; 5]);
+
+        assert_eq!(
+            msg.finish_delete(&mut conn, "d1", &stalled).await,
+            0,
+            "the stalled delete removes nothing"
+        );
+        assert_eq!(
+            msg.queued(&mut conn).await,
+            [1; 5],
+            "the message stored again is still queued"
+        );
+        let fields: Vec<String> = redis::cmd("HKEYS")
+            .arg(msg.keys.msg_meta(&msg.hash))
+            .query_async(&mut conn)
+            .await
+            .expect("HKEYS");
+        assert!(
+            !fields.iter().any(|f| f.starts_with("RELEASE_")),
+            "the completed store drops the release fields: {fields:?}"
+        );
+
+        let claimed = msg
+            .claim(&mut conn, "d2", LEASE_MS)
+            .await
+            .expect("a later delete claims");
+        assert_eq!(msg.finish_delete(&mut conn, "d2", &claimed).await, 1);
+        assert_eq!(msg.queued(&mut conn).await, [0; 5]);
+    }
+
+    /// As above, but the stalled delete resumes between the store's first
+    /// step and its release: the delete releases the old entries and the
+    /// store queues new ones. Each entry is released once.
+    #[tokio::test]
+    async fn test_a_stalled_delete_resuming_mid_takeover_releases_once() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        let s1 = msg.store(&mut conn, "s1").await;
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 1);
+        let stalled = msg
+            .claim(&mut conn, "d1", LEASE_MS)
+            .await
+            .expect("the delete claims");
+        expire_delete_hold(&msg, &mut conn).await;
+
+        let s2 = msg.store(&mut conn, "s2").await;
+        assert_eq!(msg.finish_delete(&mut conn, "d1", &stalled).await, 0);
+        assert_eq!(msg.queued(&mut conn).await, [0; 5]);
+        assert_eq!(msg.finish_store(&mut conn, "s2", &s2).await, 1);
+        assert_eq!(msg.queued(&mut conn).await, [1; 5]);
+    }
+
+    /// A store that stalled past its lease, while a delete took the message
+    /// over and removed it: the store's record step is refused, and the
+    /// store releases what it queued, so nothing is left behind.
+    #[tokio::test]
+    async fn test_a_refused_store_releases_what_it_queued() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        let s1 = msg.store(&mut conn, "s1").await;
+        let claimed = msg
+            .claim(&mut conn, "d", 0)
+            .await
+            .expect("the delete takes the stalled store over");
+        assert_eq!(msg.finish_delete(&mut conn, "d", &claimed).await, 1);
+
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 0);
+        assert_eq!(
+            msg.queued(&mut conn).await,
+            [0; 5],
+            "nothing is left queued"
+        );
+    }
+
+    /// A delete that gave its hold up after a failed release is taken over
+    /// at once by the next delete, which finishes the releases.
+    #[tokio::test]
+    async fn test_an_abandoned_delete_is_taken_over_at_once() {
+        let Some(mut conn) = cluster().await else {
+            return;
+        };
+        let msg = Message::new();
+
+        let s1 = msg.store(&mut conn, "s1").await;
+        assert_eq!(msg.finish_store(&mut conn, "s1", &s1).await, 1);
+        let _ = msg
+            .claim(&mut conn, "d1", LEASE_MS)
+            .await
+            .expect("the delete claims");
+        match msg.claim(&mut conn, "d2", LEASE_MS).await {
+            Err(err) => assert_eq!(err.code(), Some("DELETE_IN_PROGRESS")),
+            Ok(claimed) => panic!("claimed while held: {claimed:?}"),
+        }
+        let abandoned: i64 = ABANDON_DELETE
+            .key(msg.keys.msg_meta(&msg.hash))
+            .arg("d1")
+            .invoke_async(&mut conn)
+            .await
+            .expect("ABANDON_DELETE");
+        assert_eq!(abandoned, 1);
+
+        let claimed = msg
+            .claim(&mut conn, "d2", LEASE_MS)
+            .await
+            .expect("the next delete takes over at once");
+        assert_eq!(msg.finish_delete(&mut conn, "d2", &claimed).await, 1);
+        assert_eq!(msg.queued(&mut conn).await, [0; 5]);
     }
 }

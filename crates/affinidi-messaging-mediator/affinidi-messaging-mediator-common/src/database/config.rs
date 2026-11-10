@@ -69,18 +69,22 @@ fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<b
     })
 }
 
-/// Parses `[database] cluster_mode`. Absent (empty) is `false`; a value that
-/// is neither `true` nor `false` is warned about and taken as `false`, and the
+/// Parses `[database] cluster_mode`, ignoring case and surrounding space:
+/// `true`/`false`, `1`/`0`, `yes`/`no` or `on`/`off`. Absent (empty) is
+/// `false`; any other value is warned about and taken as `false`, and the
 /// startup check then refuses a cluster-mode server, so a typo can't go
 /// unnoticed.
 pub fn parse_cluster_mode(raw: &str) -> bool {
-    !raw.is_empty()
-        && raw.parse().unwrap_or_else(|_| {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "false" | "0" | "no" | "off" => false,
+        "true" | "1" | "yes" | "on" => true,
+        _ => {
             tracing::warn!(
                 "Could not parse database.cluster_mode value '{raw}', using default: false"
             );
             false
-        })
+        }
+    }
 }
 
 impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
@@ -119,5 +123,15 @@ mod cluster_mode_tests {
         assert!(!parse(r#","cluster_mode":"false""#));
         assert!(!parse(r#","cluster_mode":false"#));
         assert!(!parse(""));
+    }
+
+    #[test]
+    fn cluster_mode_ignores_case_and_accepts_common_spellings() {
+        for on in ["True", "TRUE", " true ", "1", "yes", "On"] {
+            assert!(super::parse_cluster_mode(on), "{on:?} is on");
+        }
+        for off in ["False", "0", "no", "OFF", "", "maybe"] {
+            assert!(!super::parse_cluster_mode(off), "{off:?} is off");
+        }
     }
 }
