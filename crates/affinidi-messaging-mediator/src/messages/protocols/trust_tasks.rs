@@ -1230,6 +1230,13 @@ async fn consume_account_remove(
                         LeaveReason::AccountRemoved,
                     )
                     .await;
+                let changes: Vec<_> = as_member
+                    .iter()
+                    .map(|g| {
+                        affinidi_messaging_mediator_common::store::mux::MuxChange::of(g, false)
+                    })
+                    .collect();
+                crate::mux::sync::publish(state, &changes).await;
                 let changed = crate::mux::tasks::Changed {
                     removed: as_member,
                     reason: Some(LeaveReason::AccountRemoved),
@@ -2388,6 +2395,9 @@ async fn consume_mux(
             .admit_grants(streaming, ctx.store, &ctx.limits, ctx.now, &changed.stored)
             .await;
     }
+    // The same principals' connections on other instances sharing the store
+    // follow within one pub/sub hop (§7.4); this answer does not wait for them.
+    crate::mux::sync::publish(state, &crate::mux::sync::changes_of(&changed)).await;
     // Durable notices for what this task suspended or revoked: only now,
     // once the change is committed and its members detached (spec rule 2).
     crate::mux::notice::after_change(state, &changed).await;

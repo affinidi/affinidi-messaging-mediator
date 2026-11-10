@@ -418,6 +418,11 @@ pub async fn unknown_key_check(
                 LeaveReason::SuspendedUnknownKey,
             )
             .await;
+        let changes: Vec<mux::MuxChange> = suspended
+            .iter()
+            .map(|g| mux::MuxChange::of(g, false))
+            .collect();
+        super::sync::publish(state, &changes).await;
     }
     Ok(suspended)
 }

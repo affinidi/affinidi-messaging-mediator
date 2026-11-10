@@ -56,6 +56,12 @@ vta = ["dep:vta-sdk"]
 ## doesn't support.
 jemalloc = ["dep:tikv-jemallocator"]
 
+## Test-only pause points inside race windows (`mux::connection::test_hooks`),
+## for integration tests that must land a change at an exact moment. Never
+## enable it in a deployed build; `affinidi-messaging-test-mediator` turns it on
+## for its own tests only, through a dev-dependency.
+test-hooks = []
+
 ## Storage backends for the `MediatorStore` trait. At least one must be
 ## enabled for the binary to function. Multiple may be enabled, but the
 ## binary still picks one at startup based on its config.

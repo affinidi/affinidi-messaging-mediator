@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use affinidi_messaging_mediator_common::store::mux::MuxCapability;
+use affinidi_messaging_mediator_common::store::mux::{MuxCapability, MuxChange};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -163,6 +163,8 @@ pub async fn open(
             conn.register_member(streaming, m).await;
         }
     }
+    #[cfg(feature = "test-hooks")]
+    test_hooks::on_open_before_publish(&session.did_hash).await;
     state
         .mux
         .insert(&session.session_id, &session.did_hash, conn.clone());
@@ -201,6 +203,53 @@ pub async fn open(
         debug!(principal = %session.did_hash, refused = refused.len(), "stored grants not carried on connect");
     }
     (conn, frames)
+}
+
+/// Pause points for tests that need to land a change inside a race window.
+/// Compiled only with the `test-hooks` feature, which no release build enables.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+
+    struct Pause {
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    static OPEN_BEFORE_PUBLISH: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(Default::default);
+
+    /// Pause the next [`open`](super::open) for `principal_hash` after it has
+    /// read the stored grants and before it publishes the connection in the
+    /// registry. The first receiver fires once `open` is paused there; sending
+    /// on (or dropping) the returned sender lets it go on.
+    pub fn pause_open_before_publish(
+        principal_hash: &str,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        OPEN_BEFORE_PUBLISH.lock().expect("hook map").insert(
+            principal_hash.to_string(),
+            Pause {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn on_open_before_publish(principal_hash: &str) {
+        let pause = OPEN_BEFORE_PUBLISH
+            .lock()
+            .expect("hook map")
+            .remove(principal_hash);
+        if let Some(p) = pause {
+            let _ = p.reached.send(());
+            let _ = p.resume.await;
+        }
+    }
 }
 
 /// Report a streaming-task member change (§7.2) to the client.
@@ -280,9 +329,11 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
 
     // Grant-admitted members: is the stored grant still active? A revoke,
     // revoke-all or suspension handled on *this* instance detached them
-    // already, before it answered. One handled by another instance sharing
-    // the store reaches this connection here, within one sweep interval
-    // (design §7.4, Q4).
+    // already, before it answered, and one handled by another instance
+    // sharing the store arrives within moments over the store's mux pub/sub
+    // channel (`super::sync`). This re-check is the backstop for a change
+    // whose record was lost: it reaches the connection within one sweep
+    // interval (design §7.4, Q4).
     let by_grant: Vec<(String, String)> = {
         let s = conn.session.lock().await;
         s.members()
@@ -309,19 +360,11 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
                 continue;
             }
         };
-        use affinidi_messaging_mediator_common::store::mux::MuxGrantState as S;
-        let reason = match rec.grants.iter().find(|g| g.grant_id == grant_id) {
-            Some(g) => match g.state_at(now) {
-                S::Active => continue,
-                S::Suspended => LeaveReason::SuspendedUnknownKey,
-                S::EpochRevoked => LeaveReason::EpochBumped,
-                S::StaleKey => LeaveReason::KeyRotated,
-                S::Expired => LeaveReason::Expired,
-            },
-            // Gone: revoked by one of the parties.
-            None => LeaveReason::RevokedByMember,
+        let Some(reason) = grant_leave_reason(&rec, &grant_id, now) else {
+            continue;
         };
-        conn.detach(streaming, &did_hash, reason).await;
+        conn.detach_grant_id(streaming, &did_hash, &grant_id, reason)
+            .await;
     }
 
     if !revalidate {
@@ -357,8 +400,11 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
                                     grant_id: g.grant_id.clone(),
                                 })
                         })
+                        && let Ok(Some(stale)) = super::grants::revalidate(&c, g).await
                     {
-                        let _ = super::grants::revalidate(&c, g).await;
+                        // The principal's connections on other instances
+                        // drop it too.
+                        super::sync::publish(state, &[MuxChange::of(&stale, false)]).await;
                     }
                 }
                 conn.detach(streaming, &m.did_hash, LeaveReason::KeyRotated)
@@ -368,6 +414,27 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
             // again next sweep.
             Err(e) => debug!(did = %m.did, "mux key re-check deferred: {e}"),
         }
+    }
+}
+
+/// Why a member admitted by grant `grant_id` must leave, given its member
+/// DID's record as stored now, or `None` while that grant is still active.
+pub fn grant_leave_reason(
+    rec: &affinidi_messaging_mediator_common::store::mux::MuxDidRecord,
+    grant_id: &str,
+    now: u64,
+) -> Option<LeaveReason> {
+    use affinidi_messaging_mediator_common::store::mux::MuxGrantState as S;
+    match rec.grants.iter().find(|g| g.grant_id == grant_id) {
+        Some(g) => match g.state_at(now) {
+            S::Active => None,
+            S::Suspended => Some(LeaveReason::SuspendedUnknownKey),
+            S::EpochRevoked => Some(LeaveReason::EpochBumped),
+            S::StaleKey => Some(LeaveReason::KeyRotated),
+            S::Expired => Some(LeaveReason::Expired),
+        },
+        // Gone: revoked by one of the parties.
+        None => Some(LeaveReason::RevokedByMember),
     }
 }
 
