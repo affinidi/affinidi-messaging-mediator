@@ -540,6 +540,9 @@ pub async fn attach(
                 if let Some(streaming) = streaming {
                     conn.register_member(streaming, &member).await;
                 }
+                // Reported to the principal like any join (spec event rule 5).
+                conn.joined.lock().await.push(member.clone());
+                conn.notify.notify_one();
                 json!({
                     "did": member.did,
                     "status": "attached",

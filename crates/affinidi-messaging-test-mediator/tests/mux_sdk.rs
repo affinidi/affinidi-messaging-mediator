@@ -11,13 +11,32 @@ use std::time::Duration;
 
 use affinidi_messaging_didcomm::message::Message as DidcommMessage;
 use affinidi_messaging_sdk::protocols::mux::{
-    MuxCapability, mux_recipient, sign_attach, sign_grant,
+    MemberChangeReason, MuxCapability, MuxMembers, mux_recipient, sign_attach, sign_grant,
 };
 use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator, TestUser};
 use common::init_tracing;
 use serde_json::json;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+/// Wait until the profile's mux member set satisfies `done`.
+async fn members_until(
+    rx: &mut tokio::sync::watch::Receiver<MuxMembers>,
+    what: &str,
+    done: impl Fn(&MuxMembers) -> bool,
+) -> MuxMembers {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let m = rx.borrow_and_update().clone();
+            if done(&m) {
+                return m;
+            }
+            rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("member set: {what}: {:?}", rx.borrow()))
+}
 
 async fn send(env: &TestEnvironment, from: &TestUser, to: &TestUser, text: &str) {
     let t = std::time::SystemTime::now()
@@ -161,6 +180,84 @@ async fn the_sdk_drives_a_mux_connection_end_to_end() {
         assert!(attached.contains(d), "attached event for {d}: {attached:?}");
     }
 
+    // The SDK keeps the member set from those events (0.45.5): the two
+    // grants and the attach, each with its scope, the principal not among
+    // them.
+    let mut members_rx = device.profile.mux_members().await.expect("mux members");
+    let members = members_until(&mut members_rx, "three members", |m| {
+        [&work.did, &home.did, &temp.did]
+            .iter()
+            .all(|d| m.is_reachable(d))
+    })
+    .await;
+    assert!(members.is_ready());
+    assert_eq!(members.len(), 3, "{members:?}");
+    assert!(members.get(&device.did).is_none());
+    let w = members.get(&work.did).unwrap();
+    assert_eq!(w.scope, scope.to_vec());
+    assert!(w.grant_id.is_some(), "carried by a grant");
+    let t = members.get(&temp.did).unwrap();
+    assert_eq!(t.scope, vec![MuxCapability::Receive, MuxCapability::Delete]);
+    assert!(t.grant_id.is_none(), "a session attach has no grant");
+    assert_eq!(
+        t.reason,
+        MemberChangeReason::Attach,
+        "reported as an attach"
+    );
+
+    // Narrowing a grant is reported too, with the new scope (spec event
+    // rule 5): the device drops `pickup` from `work`.
+    let narrowed = [MuxCapability::Receive, MuxCapability::Delete];
+    env.atm
+        .trust_tasks()
+        .mux_update(
+            &device.profile,
+            w.grant_id.as_deref().unwrap(),
+            Some(&narrowed),
+            None,
+        )
+        .await
+        .expect("mux_update");
+    let members = members_until(&mut members_rx, "work narrowed", |m| {
+        m.get(&work.did).is_some_and(|w| w.scope == narrowed)
+    })
+    .await;
+    let w = members.get(&work.did).unwrap();
+    assert_eq!(w.reason, MemberChangeReason::Grant);
+    assert!(w.delivery_active);
+
+    // `home` connects its own socket, which takes its live traffic: it stays
+    // a member, inactive. Narrowing its grant meanwhile must not report it
+    // active again; its own socket going away does.
+    env.atm
+        .profile_add(&home.profile, true)
+        .await
+        .expect("home's own websocket");
+    let members = members_until(&mut members_rx, "home inactive", |m| {
+        m.get(&home.did).is_some_and(|h| !h.delivery_active)
+    })
+    .await;
+    let home_grant = members.get(&home.did).unwrap().grant_id.clone().unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_update(&device.profile, &home_grant, Some(&narrowed), None)
+        .await
+        .expect("mux_update home");
+    let members = members_until(&mut members_rx, "home narrowed", |m| {
+        m.get(&home.did).is_some_and(|h| h.scope == narrowed)
+    })
+    .await;
+    assert!(
+        !members.is_reachable(&home.did),
+        "narrowing must not report an inactive member active: {:?}",
+        members.get(&home.did)
+    );
+    home.profile.stop_websocket().await.expect("stop home");
+    members_until(&mut members_rx, "home reactivated", |m| {
+        m.is_reachable(&home.did)
+    })
+    .await;
+
     // 4. Messages for all three arrive on the one socket, routed by recipient,
     //    and are acknowledged (auto_delete) over REST as the device.
     for (u, t) in [(&work, "w"), (&home, "h"), (&temp, "t")] {
@@ -235,6 +332,11 @@ async fn the_sdk_drives_a_mux_connection_end_to_end() {
         .mux_revoke(&device.profile, false, vec![], vec![home.did.clone()])
         .await
         .unwrap();
+    let members = members_until(&mut members_rx, "home detached", |m| {
+        m.get(&home.did).is_none()
+    })
+    .await;
+    assert!(members.is_reachable(&work.did) && members.is_reachable(&temp.did));
     send(&env, &sender, &home, "after revoke").await;
     let after = env
         .atm

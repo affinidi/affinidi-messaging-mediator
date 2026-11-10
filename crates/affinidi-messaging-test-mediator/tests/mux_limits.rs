@@ -120,16 +120,18 @@ async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser) -
 
 /// The next event that changes the member set, skipping restatements of a
 /// member's live-delivery state (the member's own socket taking or giving
-/// back its traffic), which race with the member going offline.
+/// back its traffic), which race with the member going offline. A
+/// restatement names how the member joined (`connect` or `attach`) or says
+/// `reactivated`; a join while connected says `grant`, and may itself be
+/// inactive when the member's own socket is still up.
 async fn next_change(env: &TestEnvironment, ws: &mut Socket) -> Value {
     loop {
         let e = next_event(env, ws).await;
         let restatement = e["event"] == "attached"
-            && e["dids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|d| d["reason"] == "reactivated" || d["deliveryActive"] == false);
+            && e["dids"].as_array().unwrap().iter().all(|d| {
+                d["reason"] == "reactivated"
+                    || (d["deliveryActive"] == false && d["reason"] != "grant")
+            });
         let superseded = e["event"] == "detached"
             && e["dids"]
                 .as_array()
