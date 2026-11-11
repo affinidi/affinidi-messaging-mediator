@@ -836,6 +836,13 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         };
 
         config.set_jwt_keys_from_pkcs8(&jwt_bytes)?;
+        if let Ok(pair) = Ed25519KeyPair::from_pkcs8(&jwt_bytes) {
+            super::validate::sample_identity_guard(
+                affinidi_messaging_mediator_config::validate::check_not_sample_jwt_key(
+                    pair.public_key().as_ref(),
+                ),
+            )?;
+        }
 
         Ok(config)
     }

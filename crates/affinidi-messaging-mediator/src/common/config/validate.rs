@@ -9,9 +9,10 @@
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_config::validate::{
-    check_did_syntax, check_jwt_expiry, check_tls, check_trust_xff_cidrs, warn_admin_is_mediator,
-    warn_implicit_relay, warn_per_peer_not_below_receive_limit,
-    warn_permissive_default_with_denylist_mode, warn_remote_admin_allowed,
+    ALLOW_SAMPLE_IDENTITY_ENV, check_did_syntax, check_jwt_expiry, check_not_sample_did, check_tls,
+    check_trust_xff_cidrs, warn_admin_is_mediator, warn_implicit_relay,
+    warn_per_peer_not_below_receive_limit, warn_permissive_default_with_denylist_mode,
+    warn_remote_admin_allowed,
 };
 use tracing::warn;
 
@@ -27,6 +28,8 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     // ── Hard errors ──────────────────────────────────────────────────
     check_did_syntax("mediator_did", &config.mediator_did).map_err(cfg_err)?;
     check_did_syntax("admin_did", &config.admin_did).map_err(cfg_err)?;
+    sample_identity_guard(check_not_sample_did("mediator_did", &config.mediator_did))?;
+    sample_identity_guard(check_not_sample_did("admin_did", &config.admin_did))?;
     check_jwt_expiry(
         config.security.jwt_access_expiry,
         config.security.jwt_refresh_expiry,
@@ -80,4 +83,93 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     }
 
     Ok(())
+}
+
+/// Applies the policy for a sample/test identity (see
+/// [`check_not_sample_did`]): refused in a release build unless
+/// `MEDIATOR_ALLOW_TEST_IDENTITY=true`; a debug build only warns.
+pub(crate) fn sample_identity_guard(check: Result<(), String>) -> Result<(), MediatorError> {
+    let allowed = cfg!(debug_assertions)
+        || std::env::var(ALLOW_SAMPLE_IDENTITY_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+    sample_identity_policy(check, allowed)
+}
+
+fn sample_identity_policy(check: Result<(), String>, allowed: bool) -> Result<(), MediatorError> {
+    match check {
+        Ok(()) => Ok(()),
+        Err(msg) if allowed => {
+            warn!(
+                "{msg} Continuing: test identities are allowed in this build or by {ALLOW_SAMPLE_IDENTITY_ENV}."
+            );
+            Ok(())
+        }
+        Err(msg) => Err(MediatorError::ConfigError(
+            error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("{msg} Set {ALLOW_SAMPLE_IDENTITY_ENV}=true only for a test deployment."),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use affinidi_messaging_mediator_config::validate::{
+        SAMPLE_DID_KEYS, SAMPLE_JWT_PUBLIC_KEYS, check_not_sample_jwt_key,
+    };
+    use base64::Engine;
+
+    #[test]
+    fn a_sample_identity_is_refused_unless_allowed() {
+        let sample = Err("admin_did uses a sample/test identity".to_string());
+        match sample_identity_policy(sample.clone(), false) {
+            Err(MediatorError::ConfigError(_, _, msg)) => {
+                assert!(msg.contains(ALLOW_SAMPLE_IDENTITY_ENV));
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+        assert!(sample_identity_policy(sample, true).is_ok());
+        assert!(sample_identity_policy(Ok(()), false).is_ok());
+    }
+
+    /// The fixed test identity in `docker/test/conf` is on the lists, so
+    /// regenerating it without updating them fails here.
+    #[test]
+    fn the_committed_test_identity_is_listed() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docker/test/conf");
+        let Ok(secrets) = std::fs::read_to_string(dir.join("secrets.json")) else {
+            eprintln!("skipping: docker/test/conf not present (not a workspace checkout)");
+            return;
+        };
+        let toml = std::fs::read_to_string(dir.join("mediator.toml")).unwrap();
+        for field in ["mediator_did", "admin_did"] {
+            let line = toml
+                .lines()
+                .find(|l| l.starts_with(&format!("{field} = ")))
+                .unwrap_or_else(|| panic!("{field} in docker/test/conf/mediator.toml"));
+            assert!(
+                SAMPLE_DID_KEYS.iter().any(|k| line.contains(k)),
+                "{field} in docker/test/conf is not in SAMPLE_DID_KEYS"
+            );
+        }
+
+        let secrets: serde_json::Value = serde_json::from_str(&secrets).unwrap();
+        let entry = secrets["entries"]["mediator_jwt_secret"].as_str().unwrap();
+        let envelope = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(entry.trim_end_matches('='))
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(entry))
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        let pkcs8: Vec<u8> = envelope["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_u64().unwrap() as u8)
+            .collect();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+        use ring::signature::KeyPair;
+        assert!(check_not_sample_jwt_key(pair.public_key().as_ref()).is_err());
+        assert!(!SAMPLE_JWT_PUBLIC_KEYS.is_empty());
+    }
 }

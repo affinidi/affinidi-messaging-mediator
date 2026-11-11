@@ -44,10 +44,10 @@ pub fn warn_implicit_relay(
 /// the mediator's operating key authenticate as admin (privilege confusion)
 /// and conflates two distinct trust roles.
 ///
-/// This is a *warning*, not a hard error: the shipped example config (and
-/// possibly real deployments) use a single DID for both, so rejecting it at
-/// boot would break a currently-valid deployment — which the validation
-/// contract forbids. The footgun is still surfaced loudly.
+/// This is a *warning*, not a hard error: existing deployments may use a
+/// single DID for both, so rejecting it at boot would break a currently-valid
+/// deployment — which the validation contract forbids. The footgun is still
+/// surfaced loudly.
 pub fn warn_admin_is_mediator(admin_did: &str, mediator_did: &str) -> Option<String> {
     if admin_did == mediator_did {
         return Some(format!(
@@ -57,6 +57,57 @@ pub fn warn_admin_is_mediator(admin_did: &str, mediator_did: &str) -> Option<Str
         ));
     }
     None
+}
+
+/// Environment variable that lets a release build start with one of the
+/// identities in [`SAMPLE_DID_KEYS`] or [`SAMPLE_JWT_PUBLIC_KEYS`]. Set it to
+/// `true` only for a test deployment such as `docker-compose.test.yml`.
+pub const ALLOW_SAMPLE_IDENTITY_ENV: &str = "MEDIATOR_ALLOW_TEST_IDENTITY";
+
+/// Public keys (multibase) of the sample and test DIDs committed to this
+/// repository: the example in `conf/mediator.toml` and the fixed identity in
+/// `docker/test/conf`. Their private keys are public, so a deployment that
+/// names one of them as its mediator or admin DID hands that role to anyone.
+pub const SAMPLE_DID_KEYS: &[&str] = &[
+    // Example DID formerly in conf/mediator.toml (mediator_did and admin_did).
+    "z6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ",
+    // docker/test/conf mediator DID.
+    "z6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5pr6",
+    // docker/test/conf admin DID.
+    "z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed",
+];
+
+/// Ed25519 public keys (hex) of the JWT signing keys committed to this
+/// repository (`docker/test/conf/secrets.json`). Tokens signed with one of
+/// them can be minted by anyone.
+pub const SAMPLE_JWT_PUBLIC_KEYS: &[&str] =
+    &["8813a35c3f5b86539604dc5937c6fac5b8331c0964b8f1f6fbd05fb406ec6b65"];
+
+/// `did` must not be one of the sample or test DIDs committed to this
+/// repository (matched on the key it carries, so a re-encoded `did:peer`
+/// with other services is still caught).
+pub fn check_not_sample_did(field: &str, did: &str) -> Result<(), String> {
+    match SAMPLE_DID_KEYS.iter().find(|key| did.contains(*key)) {
+        Some(key) => Err(format!(
+            "{field} uses a sample/test identity whose private key is published in this \
+             repository (key {key}). Generate your own identity with mediator-setup."
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The JWT signing key must not be one committed to this repository.
+/// `public_key` is the raw 32-byte Ed25519 public key.
+pub fn check_not_sample_jwt_key(public_key: &[u8]) -> Result<(), String> {
+    let hex: String = public_key.iter().map(|b| format!("{b:02x}")).collect();
+    if SAMPLE_JWT_PUBLIC_KEYS.contains(&hex.as_str()) {
+        return Err(
+            "the JWT signing key is a sample/test key published in this repository; anyone \
+             can sign session tokens with it. Generate a new one with mediator-setup."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Minimal DID syntax check: `did:<method>:<method-specific-id>`, with a
@@ -389,6 +440,40 @@ mod tests {
     fn warns_only_when_remote_admin_unblocked() {
         assert!(warn_remote_admin_allowed(false).is_some());
         assert!(warn_remote_admin_allowed(true).is_none());
+    }
+
+    #[test]
+    fn sample_dids_are_recognised_by_their_key() {
+        let template = "did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.EzQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3";
+        let err = check_not_sample_did("admin_did", template).unwrap_err();
+        assert!(err.contains("admin_did"));
+        // Same key, different service section.
+        assert!(
+            check_not_sample_did(
+                "mediator_did",
+                "did:peer:2.Vz6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5pr6.SeyJ0IjoiZG0ifQ"
+            )
+            .is_err()
+        );
+        assert!(
+            check_not_sample_did(
+                "admin_did",
+                "did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
+            )
+            .is_err()
+        );
+        assert!(check_not_sample_did("admin_did", "did:key:z6MkOther").is_ok());
+        assert!(check_not_sample_did("mediator_did", "did:web:example.com").is_ok());
+    }
+
+    #[test]
+    fn sample_jwt_keys_are_recognised() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&SAMPLE_JWT_PUBLIC_KEYS[0][i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert!(check_not_sample_jwt_key(&key).is_err());
+        assert!(check_not_sample_jwt_key(&[7u8; 32]).is_ok());
     }
 
     #[test]

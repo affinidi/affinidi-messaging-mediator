@@ -24,7 +24,9 @@ log_json = "false"
 ### three slashes: aws_parameter_store:///mediator/did?region=eu-west-1
 ### Without ?region= the ambient AWS region is used (AWS_REGION, profile,
 ### then IMDS). The mediator-setup wizard publishes to this exact format.
-mediator_did = "did://did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.EzQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3"
+### Empty in this template: mediator-setup fills it in, or set MEDIATOR_DID.
+### Startup fails while it is empty (unless VTA integration supplies it).
+mediator_did = ""
 
 ### ****************************************************************************************************************************
 ### Unified secret storage
@@ -80,7 +82,10 @@ api_prefix = "/mediator/v1/"
 ### NOTE: It is strongly recommended to NOT use the same DID as the mediator!
 ###       This causes more use cases where the secrets of the mediator itself can be exposed in administration tasks.
 ### NOTE: You can add additional admin DIDs after startup via the DIDComm admin protocol
-admin_did = "did://did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.EzQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3"
+### Empty in this template: mediator-setup fills it in, or set ADMIN_DID.
+### Startup fails while it is empty. A release build also refuses the
+### sample/test DIDs committed to this repository.
+admin_did = ""
 
 ### Env: TRUST_XFF_CIDRS — comma-separated (the TOML form is an array);
 ### a malformed entry, or a catch-all range (0.0.0.0/0, ::/0), fails startup.
