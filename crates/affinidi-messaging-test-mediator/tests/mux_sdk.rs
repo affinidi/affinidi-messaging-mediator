@@ -351,3 +351,99 @@ async fn the_sdk_drives_a_mux_connection_end_to_end() {
         "a revoked member's message must not reach the device: {after:?}"
     );
 }
+
+/// `messaging/stats/show` reports this instance's mux connections and
+/// members under its `com.affinidi.mux` extension, for the console's
+/// dashboard.
+#[tokio::test]
+async fn stats_show_counts_mux_connections_and_members() {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let temp = env.add_user("temp").await.unwrap();
+    let admin = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Admin)
+        .await
+        .expect("promote");
+    env.atm
+        .profile_add(&admin.profile, true)
+        .await
+        .expect("admin websocket");
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut ready_rx = device.profile.mux_ready().await.unwrap();
+    let ready = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(r) = ready_rx.borrow().clone() {
+                return r;
+            }
+            ready_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("ready");
+    let (g, _) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[MuxCapability::Receive],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g])
+        .await
+        .expect("grant");
+    let a = sign_attach(
+        &env.atm,
+        &temp.did,
+        &device.did,
+        &mediator_did,
+        &ready.session_id,
+        &ready.mux_nonce,
+        &[MuxCapability::Receive],
+        600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_attach(&device.profile, vec![a])
+        .await
+        .expect("attach");
+    let mut members_rx = device.profile.mux_members().await.unwrap();
+    members_until(&mut members_rx, "two members", |m| m.len() == 2).await;
+
+    let stats = env
+        .atm
+        .trust_tasks()
+        .stats_show(&admin.profile)
+        .await
+        .expect("stats");
+    let stats = serde_json::to_value(&stats).unwrap();
+    let mux = &stats["ext"]["com.affinidi.mux"];
+    assert_eq!(mux["scope"], "instance", "{stats:#}");
+    assert_eq!(mux["connections"], 1);
+    assert_eq!(mux["members"], 2);
+    assert_eq!(mux["membersByGrant"], 1);
+    assert_eq!(mux["membersByAttach"], 1);
+    assert_eq!(mux["membersInactive"], 0);
+}

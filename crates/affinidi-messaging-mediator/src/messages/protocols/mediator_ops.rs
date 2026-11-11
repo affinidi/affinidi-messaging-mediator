@@ -108,6 +108,22 @@ pub(crate) async fn consume_stats_show(
         response["connections"]["websocketMax"] =
             json!(state.config.limits.max_websocket_connections);
     }
+    // DID multiplexing, under an extension member (the spec's `connections`
+    // object is closed). This instance only: another instance's connections
+    // are not counted.
+    if state.config.limits.mux.enabled {
+        let m = state.mux.summary().await;
+        response["ext"] = json!({
+            "com.affinidi.mux": {
+                "scope": "instance",
+                "connections": m.connections,
+                "members": m.members,
+                "membersByGrant": m.by_grant,
+                "membersByAttach": m.by_attach,
+                "membersInactive": m.inactive,
+            }
+        });
+    }
     if let Some(snapshot) = state.queue_snapshot.latest() {
         response["queues"] = json!({
             "surveyedAt": snapshot.taken_at,
