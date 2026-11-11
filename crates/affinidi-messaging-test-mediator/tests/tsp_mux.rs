@@ -530,6 +530,54 @@ async fn the_drain_honours_pickup_and_acks_honour_delete() {
     env.shutdown().await.expect("shutdown");
 }
 
+/// A member holding `pickup` but not `receive` is told about new mail while
+/// the principal is connected: the mediator raises its resync, and on raw
+/// TSP the resync is a drain of that member's inbox. Before, its mail waited
+/// for the next reconnect. A member with neither still gets nothing.
+#[tokio::test]
+async fn a_pickup_only_member_is_drained_when_new_mail_arrives() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let gym = env.add_user("gym").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    for m in [&work, &gym] {
+        env.relate_directly(&sender, m).await.unwrap();
+    }
+    grant(&env, &work, &principal, &["pickup", "delete"]).await;
+    grant(&env, &gym, &principal, &["delete"]).await;
+
+    let (mut ws, _, token) = connect(&env, &principal, &MUX_OFFER).await;
+    expect_ready_and_attached(&env, &mut ws, &principal, &[&work, &gym]).await;
+    assert_quiet(&mut ws, Duration::from_millis(500), "nothing stored yet").await;
+
+    // Mail for both arrives while connected.
+    for m in [&work, &gym] {
+        env.atm
+            .tsp()
+            .send(&sender.profile, &m.did, b"arrived while connected")
+            .await
+            .expect("send");
+    }
+    let frame = timeout(Duration::from_secs(10), next_binary(&mut ws))
+        .await
+        .expect("work's mail is drained while connected");
+    assert_eq!(receiver(&frame), work.did, "only the pickup member's mail");
+    assert_quiet(
+        &mut ws,
+        Duration::from_millis(700),
+        "a member with neither receive nor pickup gets nothing",
+    )
+    .await;
+
+    let (deleted, _) = ack(&env, &token, &[frame]).await;
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(inbox_len(&env, &gym).await, 1, "gym's stays stored");
+    env.shutdown().await.expect("shutdown");
+}
+
 /// The `send` scope works on a raw-TSP mux socket too: a frame whose sender
 /// is a member granting `send` is accepted on the principal's socket (no
 /// `refused` event) and reaches its recipient as the member's.

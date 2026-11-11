@@ -1186,6 +1186,12 @@ async fn handle_socket(
                         crate::mux::connection::sweep(&state, conn, true).await;
                     }
                 }
+                // A resync held back by the floor is sent when it falls due,
+                // not whenever something else next wakes this loop (a ping,
+                // up to a minute later). The body is empty: the resync check
+                // after this select acts on it.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_resync_sent + MIN_RESYNC_INTERVAL)),
+                    if live_resync.load(std::sync::atomic::Ordering::Relaxed) => {}
                 _ = ping_interval.tick() => {
                     if let Err(e) = socket.send(Message::Ping(vec![].into())).await {
                         debug!("Failed to send WebSocket ping: {e}");
@@ -1195,16 +1201,31 @@ async fn handle_socket(
                 }
                 value = next_queued(&mut rx, fair.as_mut()) => {
                     if let Some(queued) = value {
-                        // On a mux connection, a frame for a member that has
-                        // left since it was queued is dropped, not written:
-                        // after a detach (revoke, expiry, key change) nothing
-                        // more for that DID may reach this principal. The
-                        // message stays in the member's inbox (§7.3, R1.1).
-                        if let (Some(conn), Some(for_did)) = (&mux_conn, queued.did_hash.as_deref())
-                            && !conn.may_write(for_did).await
-                        {
-                            debug!(did_hash = %for_did, "dropping a queued frame for a detached mux member");
-                            continue;
+                        // On a mux connection a member's frame is written only
+                        // while the member holds `receive`, checked now rather
+                        // than when it was queued: after a detach (revoke,
+                        // expiry, key change) or a narrowing that dropped
+                        // `receive`, nothing more is pushed for that DID. A
+                        // member holding only `pickup` is told its mail waits
+                        // instead. Either way the message stays in the
+                        // member's inbox (§7.3, R1.1).
+                        // A nudge must not `continue`: the resync it raises is
+                        // acted on below, after this select, in this pass.
+                        let mut write = true;
+                        if let (Some(conn), Some(for_did)) = (&mux_conn, queued.did_hash.as_deref()) {
+                            use crate::mux::registry::LiveFrame;
+                            match conn.live_frame(for_did).await {
+                                LiveFrame::Write => {}
+                                LiveFrame::Nudge => {
+                                    debug!(did_hash = %for_did, "pickup-only mux member has mail; resync raised");
+                                    conn.nudge(for_did);
+                                    write = false;
+                                }
+                                LiveFrame::Drop => {
+                                    debug!(did_hash = %for_did, "dropping a queued frame for a mux member without receive");
+                                    continue;
+                                }
+                            }
                         }
                         // A stored message's delivery, reported only once its
                         // frame is written (R1.1).
@@ -1212,7 +1233,7 @@ async fn handle_socket(
                         // Destructuring drops `_permit` at the end of this arm,
                         // returning the message's bytes to the global send pool
                         // once it has been written to the socket.
-                        match queued.cmd {
+                        if write { match queued.cmd {
                             WebSocketCommands::Message(msg) => {
                                 debug!("ws: Received message from streaming task");
                                 // On a `tsp-mux` socket a member's notification
@@ -1322,7 +1343,7 @@ async fn handle_socket(
                                 close_reason = _close_frame_reason(why);
                                 break;
                             }
-                        }
+                        } }
                     } else {
                         debug!("Received None from streaming task, closing connection");
                         close_reason = (close_code::SERVER_ERROR, "streaming task unavailable");
@@ -1896,8 +1917,8 @@ async fn send_tsp_member_live(
     inflight: &mut MemberInflight,
 ) -> ControlFlow<(), bool> {
     // Checked by the caller already; re-checked here because this write is
-    // the one that must not happen for a detached member (§7.3, R1.1).
-    if !conn.may_write(did_hash).await {
+    // the one that must not happen for a member without `receive` (§7.3, R1.1).
+    if conn.live_frame(did_hash).await != crate::mux::registry::LiveFrame::Write {
         return ControlFlow::Continue(false);
     }
     let id = sha256::digest(body);

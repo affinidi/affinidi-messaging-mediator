@@ -352,6 +352,124 @@ async fn the_sdk_drives_a_mux_connection_end_to_end() {
     );
 }
 
+/// A member holding `pickup` but not `receive` is never pushed its messages,
+/// but the principal is told they wait: a message-pickup `status` naming the
+/// member arrives while connected. Narrowing a grant to drop `receive` stops
+/// the pushes at once, checked when the frame is written, not when the
+/// member joined.
+#[tokio::test]
+async fn pickup_only_members_get_a_status_not_a_push() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut members_rx = device.profile.mux_members().await.expect("mux members");
+    let (g_work, _) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[MuxCapability::Pickup, MuxCapability::Delete],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    let (g_home, home_grant) = sign_grant(
+        &env.atm,
+        &home.did,
+        &device.did,
+        &mediator_did,
+        &[
+            MuxCapability::Receive,
+            MuxCapability::Pickup,
+            MuxCapability::Delete,
+        ],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g_work, g_home])
+        .await
+        .expect("mux_grant");
+    members_until(&mut members_rx, "both members", |m| {
+        m.get(&work.did).is_some() && m.get(&home.did).is_some()
+    })
+    .await;
+    // `home` narrows to pickup only: no more pushes for it.
+    let pickup_only = [MuxCapability::Pickup, MuxCapability::Delete];
+    env.atm
+        .trust_tasks()
+        .mux_update(&device.profile, &home_grant, Some(&pickup_only), None)
+        .await
+        .expect("mux_update");
+    members_until(&mut members_rx, "home narrowed", |m| {
+        m.get(&home.did).is_some_and(|h| h.scope == pickup_only)
+    })
+    .await;
+
+    send(&env, &sender, &work, "for work").await;
+    send(&env, &sender, &home, "for home").await;
+
+    // Statuses for both arrive; no basic message is pushed.
+    let mut told = std::collections::HashSet::new();
+    timeout(Duration::from_secs(15), async {
+        while told.len() < 2 {
+            let Some((msg, _)) = env
+                .atm
+                .message_pickup()
+                .live_stream_next(&device.profile, Some(Duration::from_secs(1)), false)
+                .await
+                .unwrap()
+            else {
+                continue;
+            };
+            assert_ne!(
+                msg.typ, "https://didcomm.org/basicmessage/2.0/message",
+                "a member without receive must not be pushed its message"
+            );
+            if msg.typ == "https://didcomm.org/messagepickup/3.0/status"
+                && msg.body["message_count"].as_u64().unwrap_or(0) > 0
+                && let Some(d) = msg.body["recipient_did"].as_str()
+                && (d == work.did || d == home.did)
+            {
+                told.insert(d.to_string());
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a status for each pickup-only member: {told:?}"));
+    // The messages stay stored for pickup.
+    let store = env.mediator.store();
+    for u in [&work, &home] {
+        assert_eq!(
+            store
+                .inbox_status(&u.did_hash())
+                .await
+                .unwrap()
+                .message_count,
+            1
+        );
+    }
+}
+
 /// `messaging/stats/show` reports this instance's mux connections and
 /// members under its `com.affinidi.mux` extension, for the console's
 /// dashboard.

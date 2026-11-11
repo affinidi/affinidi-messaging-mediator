@@ -8,6 +8,32 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — `pickup`-only mux members are told when mail waits
+
+- A member holding `pickup` but not `receive` is never pushed its messages,
+  and until now the principal learned of new ones only by polling (DIDComm)
+  or at the next connect (raw TSP, where the drain is the only way to
+  collect). New mail for such a member now raises its resync: a pickup
+  `status` naming it on DIDComm, a drain of its inbox on `tsp-mux`. Resyncs
+  keep their 5 s floor, so this is a batched nudge, not a push.
+
+### Fixed — narrowing away `receive` stops live pushes
+
+- A live frame for a mux member was written if the DID was still a member,
+  whatever its scope. Narrowing a grant to drop `receive` (`mux/update`)
+  left its pushes flowing until the next reconnect. Each frame is now
+  checked against the member's scope when it is written.
+
+### Fixed — a held-back resync is sent when due
+
+- A resync raised within 5 s of the last one waited for something else to
+  wake the socket, as late as the next ping. It is now sent once the floor
+  has passed. This also speeds up the resync after a dropped live push.
+
+**Behaviour change (R3.6):** principals may receive pickup `status`
+messages (DIDComm) or drained frames (`tsp-mux`) for `pickup`-only members
+while connected, and stop receiving pushes for members narrowed to exclude
+`receive`.
 ### Added — DID multiplexing in `stats/show` and the console
 
 - `messaging/stats/show` reports this instance's mux connections and
