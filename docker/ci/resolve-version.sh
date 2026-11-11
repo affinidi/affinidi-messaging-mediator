@@ -4,6 +4,8 @@
 # Inputs (environment):
 #   EVENT_NAME     - github.event_name (push | workflow_dispatch | pull_request)
 #   REF_NAME       - github.ref_name (the tag name on a push)
+#   REF_TYPE       - github.ref_type (`tag` or `branch`)
+#   SHA            - github.sha, for the default version of a branch dispatch
 #   INPUT_VERSION  - workflow_dispatch 'version' input (optional)
 #   CRATE_MANIFEST - manifest holding the lockstep version, for the fallback
 #                    (default: the workspace root Cargo.toml, whose first
@@ -15,6 +17,8 @@ set -euo pipefail
 
 : "${EVENT_NAME:=}"
 : "${REF_NAME:=}"
+: "${REF_TYPE:=}"
+: "${SHA:=}"
 : "${INPUT_VERSION:=}"
 : "${CRATE_MANIFEST:=Cargo.toml}"
 
@@ -23,6 +27,9 @@ if [ "$EVENT_NAME" = "push" ]; then
   version="$REF_NAME"
 elif [ -n "$INPUT_VERSION" ]; then
   version="$INPUT_VERSION"
+elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF_TYPE" = "tag" ]; then
+  # A dispatch on a release tag publishes that tag's version.
+  version="$REF_NAME"
 else
   # Default to the workspace version on the checked-out ref. awk (not GNU-only
   # `sed '0,/re/'`) grabs the first `version = "..."`, i.e. [workspace.package]'s.
@@ -37,6 +44,17 @@ case "$version" in
   v*) ;;
   *) version="v${version}" ;;
 esac
+
+# A dispatch from a branch with no version input publishes a dev build of the
+# workspace version: release versions are published only from their tag
+# (check-dispatch.sh enforces that).
+if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF_TYPE" != "tag" ] && [ -z "$INPUT_VERSION" ]; then
+  if [ -z "$SHA" ]; then
+    echo "::error::SHA must be set for a branch dispatch without a version input" >&2
+    exit 1
+  fi
+  version="${version}-dev.${SHA:0:12}"
+fi
 
 # Only advance :latest when this version is at least as new as every released
 # one, so re-publishing an older version never moves :latest backwards.

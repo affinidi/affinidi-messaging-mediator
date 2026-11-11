@@ -14,13 +14,23 @@ name: publish-images
 #                              the tag and dispatches this workflow on it (a tag
 #                              made with GITHUB_TOKEN triggers no `push` run);
 #                              a tag pushed by a person triggers `push: tags`.
-#   * workflow_dispatch     -> build, verify, publish (version input optional)
+#   * workflow_dispatch     -> build, verify, publish. On a release tag it
+#                              publishes only that tag's version. On a branch
+#                              it publishes `v<workspace>-dev.<sha>` by default,
+#                              and never a release version (`vX.Y.Z[-rc.N]`) or
+#                              an existing git tag. A version already in GHCR is
+#                              replaced only with `overwrite: true`
+#                              (docker/ci/check-dispatch.sh).
 #   * PR labelled `ci:image`-> build + verify only (opt-in; no publish)
 # Add the `ci:image` label to any PR that touches docker/ or this workflow.
 #
 # Image tags: always `:<version>` (e.g. `:v0.42.1`, `:v0.42.0-rc.2`). `:latest`
 # moves only for a GA/patch release tag that is the highest released version —
 # never for a release candidate, and never for a dispatch from a branch.
+#
+# The jobs that push (build, publish-ghcr, mirror-ecr-public) run in the
+# `release` environment, whose deployment policy admits only main, release/*
+# and v* tags (RELEASES.md).
 
 on:
   push:
@@ -31,9 +41,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag to publish (e.g. v0.42.1). Defaults to the workspace version on the checked-out ref."
+        description: "Image version tag to publish. On a release tag: that tag (the default). On a branch: a non-release name; defaults to v<workspace version>-dev.<sha>."
         required: false
         type: string
+      overwrite:
+        description: "Replace the version if it already exists in GHCR."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -55,6 +70,10 @@ jobs:
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'ci:image')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read-only: check-dispatch.sh looks the version up in GHCR.
+      packages: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       is_latest: ${{ steps.v.outputs.is_latest }}
@@ -64,6 +83,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Self-test the version and dispatch rules
+        run: bash docker/ci/test-dispatch-guard.sh
+
       # resolve-version.sh already keeps pre-releases (`-rc.N`) off :latest.
       # On top of that, :latest is only ever taken from a release TAG ref: a
       # dispatch from main or a release branch publishes `:<version>` only.
@@ -72,6 +94,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -84,6 +108,25 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "is_latest=$is_latest" >> "$GITHUB_OUTPUT"
           echo "Image version: $version (latest=$is_latest)"
+
+      - name: Log in to GHCR (read)
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check what a manual run may publish
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+        run: bash docker/ci/check-dispatch.sh
 
   # Build the PRODUCTION image (docker/mediator.Dockerfile) and prove it boots
   # with the expected feature set. This is the gate that catches a broken
@@ -136,6 +179,7 @@ jobs:
     needs: [version, verify-image]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.runner }}
+    environment: release
     permissions:
       contents: read
       packages: write
@@ -210,6 +254,7 @@ jobs:
     needs: [version, build]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
       packages: write

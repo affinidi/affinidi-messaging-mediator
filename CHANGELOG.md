@@ -8,6 +8,19 @@ mediator-tui 0.11.0); they are no longer updated.
 
 ## Unreleased
 
+### Changed — manual image runs publish only what their ref allows
+
+- A manual run of `publish-images.yaml` on a release tag publishes only that
+  tag's version. On a branch it publishes `v<workspace>-dev.<sha>` by
+  default, and refuses a release version (`vX.Y.Z`, `vX.Y.Z-rc.N`) or the
+  name of an existing git tag. A version already in GHCR is replaced only
+  with the new `overwrite` input. Rules in `docker/ci/check-dispatch.sh`,
+  self-tested by `docker/ci/test-dispatch-guard.sh` on every image run.
+- The jobs that push images (`build`, `publish-ghcr`) now run in the
+  `release` environment, like the ECR mirror. Its deployment policy must
+  admit `v*` tags (RELEASES.md) or tag runs will wait.
+- The README says how to pin the image by digest and verify its provenance.
+
 ### Changed — DIDComm v1 `keylist-update` registers only keys the client is known to hold, up to a limit
 
 - **Behaviour change (R3.6):** by default a `keylist-update` add succeeds
