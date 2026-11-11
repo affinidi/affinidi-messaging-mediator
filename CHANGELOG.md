@@ -82,7 +82,10 @@ offline recipient succeeding, now get an error.
   one atomic step (a Lua script on Redis; under the store lock on memory and
   Fjall). `account_add` is now a provided method built on it: it creates
   the account or returns the existing one unchanged, so two first-contact
-  requests racing can no longer reset an account's counters. A third-party
+  requests racing can no longer reset an account's counters. Login
+  registration (`/authenticate`, `/tsp/authenticate`) creates the account
+  through it in one step, so an account an admin adds or changes while a
+  login is in flight is used as it is. A third-party
   `MediatorStore` implements `account_create` in place of `account_add`.
 - Storing a message for a party with no account keeps queue counters for
   it, and every backend now agrees that those counters alone are not an
