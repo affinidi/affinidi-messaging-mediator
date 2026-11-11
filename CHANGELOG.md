@@ -236,16 +236,27 @@ enough for a mediator write to wait 30 s is disconnected.
   the not-before, so retries are spaced out on multi-processor deployments
   too.
 - A processor holds at most `batch_size` × `max_concurrent_endpoints`
-  claimed entries, and one endpoint at most half of them, so a backlog for
-  one peer does not stop other peers' forwards being read.
+  claimed entries, one endpoint at most half of them, and an endpoint that
+  is backing off at most `batch_size`, so backlogs for peers that are slow
+  or down do not stop other peers' forwards being read. The rest stay
+  claimed in the queue and are picked up again by the reclaim sweep.
 - Claimed entries are no longer stranded when a processor stops or
   restarts. A processor refreshes the claims on what it holds, and any
   processor takes over an entry whose claim has been idle for
   `reclaim_idle_seconds` (new, default 60, env
   `PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS`). Previously such entries were
-  reclaimed but never delivered. The same sweep delivers a forward with a
-  requested delay (`delay_milli`) once it is due; a delay of up to
-  `max_backoff_ms` is held in memory and sent on time.
+  reclaimed but never delivered. The sweep follows its cursor over the whole
+  pending list, so idle entries behind a long run of busy ones are reached.
+  The same sweep delivers a forward with a requested delay (`delay_milli`)
+  once it is due; a delay of up to `max_backoff_ms` is held in memory and
+  sent on time.
+- A processor only finishes an entry it still holds. Acking a delivered,
+  refused, expired or abandoned entry, and replacing a failed one with its
+  retry, are each one owner-checked write; an entry another processor has
+  taken over is left to it. A processor that cannot confirm its claims for
+  half of `reclaim_idle_seconds` (its store calls are failing) stops
+  sending, reading and reclaiming until it can. A send already under way at
+  that point completes, so its message can arrive twice; none is lost.
 - Each delivered entry is acked as soon as the peer accepts it, rather than
   with the rest of its batch.
 - A next hop whose URL does not parse, or that the egress policy does not
@@ -256,8 +267,10 @@ enough for a mediator write to wait 30 s is disconnected.
 - `ForwardQueueEntry` has a new `not_before_ms` field (unix ms, `0` = none),
   stored as `NOT_BEFORE_MS` on Redis. Entries written before it read as `0`;
   a processor from an earlier release ignores it and retries at once.
-  `ForwardOutcome` has a new `NotPermitted` variant, and `MediatorStore` a
-  new required method, `forward_queue_refresh_claims`.
+  `ForwardOutcome` has a new `NotPermitted` variant. `MediatorStore` has
+  new required methods `forward_queue_refresh_claims` and
+  `forward_queue_finish`, and `forward_queue_autoclaim` now takes a cursor
+  and returns a `ForwardQueueClaimPage` with the cursor to continue from.
 
 **Behaviour change (R3.6):** retries of a failed forward are spaced by the
 endpoint's backoff across all processors; forwards to a non-permitted next hop

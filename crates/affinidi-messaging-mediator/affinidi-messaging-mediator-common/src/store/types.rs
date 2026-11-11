@@ -220,6 +220,18 @@ pub struct ForwardQueueEntry {
     pub not_before_ms: u128,
 }
 
+/// One page of a [`forward_queue_autoclaim`](crate::store::MediatorStore::forward_queue_autoclaim)
+/// scan.
+#[derive(Clone, Debug, Default)]
+pub struct ForwardQueueClaimPage {
+    /// The idle entries this page reclaimed for the caller.
+    pub entries: Vec<ForwardQueueEntry>,
+    /// Where the next page starts, or `None` once the scan has covered the
+    /// whole pending list. A page can be empty and still have a next one:
+    /// each call examines a bounded stretch of the list.
+    pub next_cursor: Option<String>,
+}
+
 // ─── Live streaming pub/sub ─────────────────────────────────────────────────
 
 /// Payload published when a new message is delivered to a live-streaming

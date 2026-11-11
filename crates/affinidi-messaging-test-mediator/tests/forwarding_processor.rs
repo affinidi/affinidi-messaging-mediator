@@ -848,3 +848,301 @@ async fn a_backlogged_endpoint_does_not_stop_others_being_read() {
         .expect("stub channel closed");
     assert_eq!(body, "behind-the-backlog");
 }
+
+// ─── Failing endpoints, concurrent processors, unconfirmed claims ───────────
+
+/// Stub remote mediator that accepts every request, the first after
+/// `first_delay`, and tallies the accepted bodies.
+async fn spawn_tallying_mediator(first_delay: Duration) -> CountingMediator {
+    #[derive(Clone)]
+    struct StubState {
+        seen: Arc<AtomicU32>,
+        first_delay: Duration,
+        first_arrived: Arc<tokio::sync::Notify>,
+        accepted: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    }
+
+    async fn inbound(State(state): State<StubState>, body: String) -> StatusCode {
+        if state.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            state.first_arrived.notify_one();
+            tokio::time::sleep(state.first_delay).await;
+        }
+        *state
+            .accepted
+            .lock()
+            .expect("accepted log")
+            .entry(body)
+            .or_default() += 1;
+        StatusCode::OK
+    }
+
+    let first_arrived = Arc::new(tokio::sync::Notify::new());
+    let accepted = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let app = Router::new()
+        .route("/inbound", post(inbound))
+        .with_state(StubState {
+            seen: Arc::new(AtomicU32::new(0)),
+            first_delay,
+            first_arrived: first_arrived.clone(),
+            accepted: accepted.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub mediator");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub mediator serve");
+    });
+    CountingMediator {
+        endpoint_url: format!("http://{addr}"),
+        first_arrived,
+        accepted,
+    }
+}
+
+/// Two endpoints that fail every attempt, each with a backlog, hold only a
+/// batch each while they back off, so a forward to a working endpoint queued
+/// behind both backlogs is still read and delivered.
+#[tokio::test]
+async fn failing_endpoints_with_backlogs_do_not_stop_a_healthy_one() {
+    let mut healthy = spawn_stub_mediator(0).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+
+    for dead in 0..2 {
+        let failing = spawn_stub_mediator(u32::MAX).await;
+        for i in 0..20 {
+            store
+                .forward_queue_enqueue(
+                    &forward_entry(&failing.endpoint_url, &format!("dead-{dead}-{i}")),
+                    0,
+                )
+                .await
+                .expect("enqueue");
+        }
+        // Keep the failing stub's channel alive for the test.
+        std::mem::forget(failing);
+    }
+
+    // At most 2 x 4 = 8 held, 4 for an endpoint, 2 while it backs off.
+    spawn_processor(
+        ForwardingConfig {
+            batch_size: 2,
+            max_concurrent_endpoints: 4,
+            max_retries: 100,
+            initial_backoff_ms: 10_000,
+            max_backoff_ms: 60_000,
+            ..test_config()
+        },
+        store.clone(),
+    );
+    // Both endpoints fail and back off, and their backlogs are read, before
+    // the healthy forward is queued behind them.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    store
+        .forward_queue_enqueue(
+            &forward_entry(&healthy.endpoint_url, "behind-two-backlogs"),
+            0,
+        )
+        .await
+        .expect("enqueue");
+
+    let body = tokio::time::timeout(Duration::from_secs(5), healthy.received.recv())
+        .await
+        .expect("the failing endpoints' backlogs stopped the healthy forward being read")
+        .expect("stub channel closed");
+    assert_eq!(body, "behind-two-backlogs");
+}
+
+/// Two processors on one queue, a mixed workload, and one endpoint that
+/// fails every attempt: every forward to a working endpoint is delivered
+/// exactly once and every forward to the failing one is abandoned exactly
+/// once, across both processors.
+#[tokio::test]
+async fn two_processors_settle_each_forward_once() {
+    two_processors_settle_each_forward_once_on(Arc::new(MemoryStore::new())).await;
+}
+
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn two_processors_settle_each_forward_once_redis() {
+    let Some(store) = redis_store(13).await else {
+        return;
+    };
+    two_processors_settle_each_forward_once_on(store).await;
+}
+
+async fn two_processors_settle_each_forward_once_on(store: Arc<dyn MediatorStore>) {
+    let first = spawn_tallying_mediator(Duration::ZERO).await;
+    let second = spawn_tallying_mediator(Duration::ZERO).await;
+    let failing = spawn_stub_mediator(u32::MAX).await;
+    let observer = Arc::new(RecordingObserver::default());
+
+    let mut healthy = Vec::new();
+    let mut doomed = Vec::new();
+    for i in 0..20 {
+        for (stub, name) in [(&first, "first"), (&second, "second")] {
+            let message = format!("{name}-{i}");
+            store
+                .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, &message), 0)
+                .await
+                .expect("enqueue");
+            healthy.push(message);
+        }
+        if i % 4 == 0 {
+            let message = format!("doomed-{i}");
+            store
+                .forward_queue_enqueue(&forward_entry(&failing.endpoint_url, &message), 0)
+                .await
+                .expect("enqueue");
+            doomed.push(message);
+        }
+    }
+
+    let config = ForwardingConfig {
+        batch_size: 4,
+        max_retries: 1,
+        initial_backoff_ms: 50,
+        max_backoff_ms: 200,
+        reclaim_idle_seconds: 1,
+        ..test_config()
+    };
+    for _ in 0..2 {
+        let processor = ForwardingProcessor::new(config.clone(), store.clone())
+            .expect("create processor")
+            .with_observer(observer.clone());
+        tokio::spawn(async move {
+            let _ = processor.start().await;
+        });
+    }
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if store.forward_queue_len().await.expect("queue len") == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the queue did not drain");
+    // Two reclaim windows, for any duplicate to surface.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut accepted = first.accepted.lock().expect("accepted log").clone();
+    accepted.extend(second.accepted.lock().expect("accepted log").clone());
+    let outcomes = observer.outcomes.lock().expect("observer log").clone();
+    let count = |message: &str, matches: fn(&ForwardOutcome) -> bool| {
+        outcomes
+            .iter()
+            .filter(|(m, o)| m == message && matches(o))
+            .count()
+    };
+    for message in &healthy {
+        assert_eq!(
+            accepted.get(message).copied(),
+            Some(1),
+            "{message} accepted once"
+        );
+        assert_eq!(
+            count(message, |o| matches!(o, ForwardOutcome::Relayed { .. })),
+            1,
+            "{message} relayed once"
+        );
+    }
+    for message in &doomed {
+        assert_eq!(
+            count(message, |o| matches!(o, ForwardOutcome::Abandoned { .. })),
+            1,
+            "{message} abandoned once: {outcomes:?}"
+        );
+        assert!(
+            count(message, |o| matches!(o, ForwardOutcome::Relayed { .. })) == 0,
+            "{message} was never relayed"
+        );
+    }
+}
+
+/// A processor that cannot confirm its claims stops sending: the send under
+/// way finishes, the rest wait, and another processor takes them over once
+/// their claims go idle. Each message is accepted once.
+#[tokio::test]
+async fn a_processor_that_cannot_confirm_its_claims_stops_sending() {
+    let stub = spawn_tallying_mediator(Duration::from_millis(1_000)).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    let messages: Vec<String> = (0..6).map(|i| format!("unconfirmed-{i}")).collect();
+    for message in &messages {
+        store
+            .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, message), 0)
+            .await
+            .expect("enqueue");
+    }
+    // Refreshes every 500 ms; unconfirmed after 1 s; reclaimable after 2 s.
+    let config = ForwardingConfig {
+        reclaim_idle_seconds: 2,
+        ..test_config()
+    };
+
+    let fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stalled_side = Arc::new(RecordingObserver::default());
+    let first = ForwardingProcessor::new(config.clone(), store.clone())
+        .expect("create processor")
+        .with_observer(stalled_side.clone())
+        .with_claim_refresh_fault(fault.clone());
+    tokio::spawn(async move {
+        let _ = first.start().await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), stub.first_arrived.notified())
+        .await
+        .expect("the first processor never attempted a delivery");
+    fault.store(true, Ordering::SeqCst);
+
+    let other_side = Arc::new(RecordingObserver::default());
+    let second = ForwardingProcessor::new(config, store.clone())
+        .expect("create processor")
+        .with_observer(other_side.clone());
+    tokio::spawn(async move {
+        let _ = second.start().await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if store.forward_queue_len().await.expect("queue len") == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the other processor did not take the entries over");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let accepted = stub.accepted.lock().expect("accepted log").clone();
+    for message in &messages {
+        assert_eq!(
+            accepted.get(message).copied(),
+            Some(1),
+            "{message}: {accepted:?}"
+        );
+    }
+    let relayed = |observer: &RecordingObserver| {
+        observer
+            .outcomes
+            .lock()
+            .expect("observer log")
+            .iter()
+            .filter(|(_, o)| matches!(o, ForwardOutcome::Relayed { .. }))
+            .count()
+    };
+    assert_eq!(
+        relayed(&stalled_side),
+        1,
+        "only the send already under way went out unconfirmed"
+    );
+    assert_eq!(
+        relayed(&other_side),
+        5,
+        "the rest went through the other processor"
+    );
+}

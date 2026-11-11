@@ -68,8 +68,8 @@ use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
-        ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
-        OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
         StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
@@ -390,6 +390,10 @@ fn decode_stream_id(bytes: &[u8]) -> Option<(u64, u64)> {
     let seq = u64::from_be_bytes(bytes[8..].try_into().ok()?);
     Some((ms, seq))
 }
+
+/// Pending entries one autoclaim call examines per entry it may return, as
+/// on Redis.
+const AUTOCLAIM_SCAN_FACTOR: usize = 10;
 
 fn format_stream_id(ms: u64, seq: u64) -> String {
     format!("{ms}-{seq}")
@@ -3364,34 +3368,45 @@ impl MediatorStore for FjallStore {
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
         let now = now_ms_u64();
         let min_idle_ms = min_idle.as_millis() as u64;
+        let start = parse_stream_id_string(cursor).unwrap_or((0, 0));
 
         let _guard = self.write_lock.lock().await;
         let group_prefix_len = group_name.len() + 1; // +1 for the null byte
+        // Examine a bounded stretch of the pending list per call, as Redis
+        // does, and say where to continue.
+        let scan_limit = count.max(1).saturating_mul(AUTOCLAIM_SCAN_FACTOR);
 
-        // Snapshot pending entries for this group whose claim is older
-        // than `min_idle`.
+        // Snapshot pending entries for this group, from the cursor, whose
+        // claim is older than `min_idle`.
         let mut stale: Vec<((u64, u64), StoredPendingClaim)> = Vec::new();
-        for guard in self.forward_pending.prefix(group_name.as_bytes()) {
-            if stale.len() >= count {
-                break;
-            }
+        let mut next_cursor = None;
+        let mut examined = 0usize;
+        for guard in self
+            .forward_pending
+            .range::<Vec<u8>, _>(pending_key(group_name, start)..)
+        {
             let (key, value) = guard
                 .into_inner()
-                .map_err(|e| Self::db_err("forward_queue_autoclaim:prefix", e))?;
-            // Defensive: only consider keys that are actually for our
-            // group (the prefix iter is conservative).
+                .map_err(|e| Self::db_err("forward_queue_autoclaim:range", e))?;
+            // Past this group's keys: the scan is complete.
             if key.len() < group_prefix_len + 16
                 || &key[..group_name.len()] != group_name.as_bytes()
                 || key[group_name.len()] != 0x00
             {
-                continue;
+                break;
             }
             let Some(sid) = decode_stream_id(&key[group_prefix_len..]) else {
                 continue;
             };
+            if examined >= scan_limit || stale.len() >= count {
+                next_cursor = Some(format_stream_id(sid.0, sid.1));
+                break;
+            }
+            examined += 1;
             let claim: StoredPendingClaim = Self::decode(&value)?;
             if now.saturating_sub(claim.claimed_at_ms) >= min_idle_ms {
                 stale.push((sid, claim));
@@ -3402,7 +3417,7 @@ impl MediatorStore for FjallStore {
         // delivery count. Persist updated claims + collect the
         // associated queue entries to return.
         let mut batch = self.db.batch();
-        let mut out = Vec::with_capacity(stale.len());
+        let mut entries = Vec::with_capacity(stale.len());
         for (sid, claim) in stale {
             let Some(raw) = self
                 .forward_queue
@@ -3426,12 +3441,76 @@ impl MediatorStore for FjallStore {
                 pending_key(group_name, sid),
                 Self::encode(&new_claim)?,
             );
-            out.push(Self::decode(&raw)?);
+            entries.push(Self::decode(&raw)?);
         }
         batch
             .commit()
             .map_err(|e| Self::db_err("forward_queue_autoclaim:commit", e))?;
-        Ok(out)
+        Ok(ForwardQueueClaimPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let Some(sid) = parse_stream_id_string(stream_id) else {
+            return Ok(false);
+        };
+        // Under the write lock, so the ownership check and the write cannot
+        // be split by an autoclaim moving the claim.
+        let guard = self.write_lock.lock().await;
+        let claim_key = pending_key(group_name, sid);
+        let held = self
+            .forward_pending
+            .get(&claim_key)
+            .map_err(|e| Self::db_err("forward_queue_finish:get", e))?
+            .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+            .transpose()?
+            .is_some_and(|claim| claim.consumer == consumer_name);
+        if !held {
+            return Ok(false);
+        }
+
+        let mut batch = self.db.batch();
+        let mut len = self.forward_queue_count_inner();
+        if let Some(entry) = requeue {
+            let id = self.alloc_stream_id();
+            let mut entry = entry.clone();
+            entry.stream_id = format_stream_id(id.0, id.1);
+            batch.insert(
+                &self.forward_queue,
+                encode_stream_id(id.0, id.1).to_vec(),
+                Self::encode(&entry)?,
+            );
+            len += 1;
+        }
+        batch.remove(&self.forward_pending, claim_key);
+        let key = encode_stream_id(sid.0, sid.1).to_vec();
+        if self
+            .forward_queue
+            .contains_key(&key)
+            .map_err(|e| Self::db_err("forward_queue_finish:contains", e))?
+        {
+            len -= 1;
+            batch.remove(&self.forward_queue, key);
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_finish:commit", e))?;
+        // Only after the batch is durable. Still under `write_lock`.
+        self.forward_queue_len.store(len, Ordering::Release);
+        drop(guard);
+        self.sync_if_durable("forward_queue_finish:persist")?;
+        if requeue.is_some() {
+            self.forward_notify.notify_waiters();
+        }
+        Ok(true)
     }
 
     async fn forward_queue_refresh_claims(
@@ -4996,9 +5075,10 @@ mod tests {
         assert!(read.is_empty());
         // ...but autoclaim recovers it for the new consumer.
         let claimed = store
-            .forward_queue_autoclaim("forwarding", "c2", Duration::from_millis(0), 10)
+            .forward_queue_autoclaim("forwarding", "c2", Duration::from_millis(0), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].stream_id, id);
         assert_eq!(claimed[0].message, "encrypted");
@@ -5162,9 +5242,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let reclaimed = store
-            .forward_queue_autoclaim("g", "consumer-b", Duration::from_millis(10), 10)
+            .forward_queue_autoclaim("g", "consumer-b", Duration::from_millis(10), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].stream_id, id);
     }
@@ -5235,9 +5316,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         let reclaimed = store
-            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10)
+            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert!(reclaimed.is_empty());
         assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
     }

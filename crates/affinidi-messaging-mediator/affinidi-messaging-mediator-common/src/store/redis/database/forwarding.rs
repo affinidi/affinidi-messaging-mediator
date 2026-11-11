@@ -33,42 +33,18 @@ impl Database {
         if max_len > 0 {
             cmd.arg("MAXLEN").arg("~").arg(max_len);
         }
-        let stream_id: String = cmd
-            .arg("*")
-            .arg("MESSAGE")
-            .arg(&entry.message)
-            .arg("TO_DID_HASH")
-            .arg(&entry.to_did_hash)
-            .arg("FROM_DID_HASH")
-            .arg(&entry.from_did_hash)
-            .arg("FROM_DID")
-            .arg(&entry.from_did)
-            .arg("TO_DID")
-            .arg(&entry.to_did)
-            .arg("ENDPOINT_URL")
-            .arg(&entry.endpoint_url)
-            .arg("RECEIVED_AT_MS")
-            .arg(entry.received_at_ms.to_string())
-            .arg("DELAY_MILLI")
-            .arg(entry.delay_milli.to_string())
-            .arg("EXPIRES_AT")
-            .arg(entry.expires_at.to_string())
-            .arg("RETRY_COUNT")
-            .arg(entry.retry_count.to_string())
-            .arg("HOP_COUNT")
-            .arg(entry.hop_count.to_string())
-            .arg("NOT_BEFORE_MS")
-            .arg(entry.not_before_ms.to_string())
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                event!(Level::ERROR, "Couldn't enqueue forward message: {}", err);
-                MediatorError::DatabaseError(
-                    90,
-                    "forwarding".into(),
-                    format!("Couldn't enqueue forward message: {err}"),
-                )
-            })?;
+        cmd.arg("*");
+        for (field, value) in entry_fields(entry) {
+            cmd.arg(field).arg(value);
+        }
+        let stream_id: String = cmd.query_async(&mut conn).await.map_err(|err| {
+            event!(Level::ERROR, "Couldn't enqueue forward message: {}", err);
+            MediatorError::DatabaseError(
+                90,
+                "forwarding".into(),
+                format!("Couldn't enqueue forward message: {err}"),
+            )
+        })?;
 
         debug!("Enqueued forward message: stream_id={}", stream_id);
         Ok(stream_id)
@@ -250,16 +226,22 @@ impl Database {
 
     /// Claim stale messages from crashed/timed-out consumers.
     /// Messages idle for more than `min_idle_ms` are transferred to this consumer.
+    ///
+    /// One XAUTOCLAIM, from `start`: Redis examines at most ten times `count`
+    /// pending entries per call, so the returned cursor must be followed to
+    /// cover the whole list. Returns `(next cursor, entries)`; the cursor is
+    /// `0-0` once the scan is complete.
     pub async fn forward_queue_autoclaim(
         &self,
         group_name: &str,
         consumer_name: &str,
         min_idle_ms: u64,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        start: &str,
+    ) -> Result<(String, Vec<ForwardQueueEntry>), MediatorError> {
         let mut conn = self.get_connection().await?;
 
-        // XAUTOCLAIM FORWARD_Q <group> <consumer> <min-idle-ms> 0 COUNT <n>
+        // XAUTOCLAIM FORWARD_Q <group> <consumer> <min-idle-ms> <start> COUNT <n>
         // Returns: [next-start-id, [[id, [field, value, ...]], ...], [deleted-ids]]
         #[allow(clippy::type_complexity)]
         let result: (String, Vec<(String, HashMap<String, String>)>, Vec<String>) =
@@ -268,7 +250,7 @@ impl Database {
                 .arg(group_name)
                 .arg(consumer_name)
                 .arg(min_idle_ms)
-                .arg("0-0")
+                .arg(start)
                 .arg("COUNT")
                 .arg(count)
                 .query_async(&mut conn)
@@ -292,7 +274,34 @@ impl Database {
             }
         }
 
-        Ok(entries)
+        Ok((result.0, entries))
+    }
+
+    /// See [`MediatorStore::forward_queue_finish`](crate::store::MediatorStore::forward_queue_finish).
+    pub async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let mut invocation = FINISH.key("FORWARD_Q");
+        invocation.arg(group_name).arg(consumer_name).arg(stream_id);
+        if let Some(entry) = requeue {
+            for (field, value) in entry_fields(entry) {
+                invocation.arg(field).arg(value);
+            }
+        }
+        let finished: i64 = invocation.invoke_async(&mut conn).await.map_err(|err| {
+            event!(Level::ERROR, "forward queue finish error: {}", err);
+            MediatorError::DatabaseError(
+                97,
+                "forwarding".into(),
+                format!("forward queue finish error: {err}"),
+            )
+        })?;
+        Ok(finished == 1)
     }
 }
 
@@ -318,6 +327,51 @@ return lost
 "#,
     )
 });
+
+/// Finish with entry ARGV[3] for consumer ARGV[2] of group ARGV[1], only if
+/// that consumer still holds it: XACK and XDEL it, and when field/value pairs
+/// follow in ARGV[4..], XADD them as its replacement first. Returns 1 when
+/// done, 0 when the entry is not held by that consumer (nothing changed).
+///
+/// KEYS: [1] the stream.
+static FINISH: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
+if not (p[1] and p[1][2] == ARGV[2]) then
+  return 0
+end
+if #ARGV > 3 then
+  local fields = {}
+  for i = 4, #ARGV do
+    fields[#fields + 1] = ARGV[i]
+  end
+  redis.call('XADD', KEYS[1], '*', unpack(fields))
+end
+redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+redis.call('XDEL', KEYS[1], ARGV[3])
+return 1
+"#,
+    )
+});
+
+/// The stream fields of a queue entry, as `XADD` writes them.
+fn entry_fields(entry: &ForwardQueueEntry) -> [(&'static str, String); 12] {
+    [
+        ("MESSAGE", entry.message.clone()),
+        ("TO_DID_HASH", entry.to_did_hash.clone()),
+        ("FROM_DID_HASH", entry.from_did_hash.clone()),
+        ("FROM_DID", entry.from_did.clone()),
+        ("TO_DID", entry.to_did.clone()),
+        ("ENDPOINT_URL", entry.endpoint_url.clone()),
+        ("RECEIVED_AT_MS", entry.received_at_ms.to_string()),
+        ("DELAY_MILLI", entry.delay_milli.to_string()),
+        ("EXPIRES_AT", entry.expires_at.to_string()),
+        ("RETRY_COUNT", entry.retry_count.to_string()),
+        ("HOP_COUNT", entry.hop_count.to_string()),
+        ("NOT_BEFORE_MS", entry.not_before_ms.to_string()),
+    ]
+}
 
 /// Ids per refresh script call, so one call does not hold Redis for long.
 const REFRESH_CHUNK: usize = 256;

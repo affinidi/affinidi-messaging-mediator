@@ -27,6 +27,7 @@
 //! - An endpoint URL that does not parse, or that the egress policy does not
 //!   admit: likewise dropped at once with a problem report of its own
 
+use crate::errors::MediatorError;
 use crate::store::{MediatorStore, types::ForwardQueueEntry};
 use crate::tasks::forwarding::config::ForwardingConfig;
 use crate::tasks::forwarding::observer::{ForwardOutcome, ForwardTransport, ForwardingObserver};
@@ -36,7 +37,10 @@ use affinidi_net_guard::{EgressPolicy, guarded_dns_resolver};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -376,6 +380,16 @@ fn due_at_ms(entry: &ForwardQueueEntry) -> u128 {
     requested.max(entry.not_before_ms)
 }
 
+/// What a delivery task hands back about its batch.
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    /// Entries it did not attempt — the endpoint was backing off, or claims
+    /// were not confirmed lately — to be held until the given unix ms.
+    deferred: Vec<(u128, ForwardQueueEntry)>,
+    /// When the endpoint's backoff ends, if it is backing off.
+    backing_off_until: Option<u128>,
+}
+
 /// The processor's claimed-but-unfinished entries, and which endpoint is
 /// delivered to next.
 ///
@@ -402,6 +416,11 @@ struct Scheduler {
     park_horizon_ms: u128,
     held: HashSet<String>,
     held_by_endpoint: HashMap<String, usize>,
+    /// Endpoints backing off, and until when (unix ms). One of these holds
+    /// at most `batch_size` entries: they cannot be sent until the backoff
+    /// ends, so holding more only takes room from other endpoints. The rest
+    /// stay claimed in the store for the reclaim sweep.
+    backing_off: HashMap<String, u128>,
     /// Entries not yet due, by (due unix ms, arrival order).
     parked: BTreeMap<(u128, u64), ForwardQueueEntry>,
     arrivals: u64,
@@ -423,6 +442,7 @@ impl Scheduler {
             park_horizon_ms: config.max_backoff_ms.max(config.initial_backoff_ms) as u128,
             held: HashSet::new(),
             held_by_endpoint: HashMap::new(),
+            backing_off: HashMap::new(),
             parked: BTreeMap::new(),
             arrivals: 0,
             queued: HashMap::new(),
@@ -433,6 +453,31 @@ impl Scheduler {
 
     fn has_room(&self) -> bool {
         self.held.len() < self.max_held
+    }
+
+    /// How many entries `endpoint_url` may hold now.
+    fn endpoint_cap(&self, endpoint_url: &str, now_ms: u128) -> usize {
+        if self
+            .backing_off
+            .get(endpoint_url)
+            .is_some_and(|until| *until > now_ms)
+        {
+            self.batch_size
+        } else {
+            self.max_held_per_endpoint
+        }
+    }
+
+    fn held_for(&self, endpoint_url: &str) -> usize {
+        self.held_by_endpoint
+            .get(endpoint_url)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Forget backoffs that have ended.
+    fn prune_backoffs(&mut self, now_ms: u128) {
+        self.backing_off.retain(|_, until| *until > now_ms);
     }
 
     fn held_ids(&self) -> Vec<String> {
@@ -471,12 +516,16 @@ impl Scheduler {
                 );
                 continue;
             }
-            let held_here = self
-                .held_by_endpoint
-                .get(&entry.endpoint_url)
-                .copied()
-                .unwrap_or(0);
-            if held_here >= self.max_held_per_endpoint {
+            if self.held.len() >= self.max_held {
+                debug!(
+                    "Holding {} entries already; leaving {} for the reclaim sweep",
+                    self.held.len(),
+                    entry.stream_id
+                );
+                continue;
+            }
+            let held_here = self.held_for(&entry.endpoint_url);
+            if held_here >= self.endpoint_cap(&entry.endpoint_url, now_ms) {
                 debug!(
                     "Endpoint {} already holds {} entries; leaving {} for the reclaim sweep",
                     entry.endpoint_url, held_here, entry.stream_id
@@ -552,18 +601,36 @@ impl Scheduler {
     }
 
     /// A delivery task for `endpoint_url` has finished with `stream_ids`.
-    /// `deferred` are entries it did not attempt because the endpoint was
-    /// backing off; they stay held, parked until the given time.
+    /// Its deferred entries stay held, parked until the given time, up to
+    /// what the endpoint may hold; the rest are let go, to come back through
+    /// the reclaim sweep.
     fn finished(
         &mut self,
         endpoint_url: &str,
         stream_ids: &[String],
-        deferred: Vec<(u128, ForwardQueueEntry)>,
+        outcome: BatchOutcome,
+        now_ms: u128,
     ) {
         for id in stream_ids {
             self.release(id, endpoint_url);
         }
-        for (until_ms, entry) in deferred {
+        match outcome.backing_off_until {
+            Some(until) => {
+                self.backing_off.insert(endpoint_url.to_string(), until);
+            }
+            None => {
+                self.backing_off.remove(endpoint_url);
+            }
+        }
+        let cap = self.endpoint_cap(endpoint_url, now_ms);
+        for (until_ms, entry) in outcome.deferred {
+            if self.held_for(endpoint_url) >= cap {
+                debug!(
+                    "Endpoint {} is at its hold limit; leaving {} for the reclaim sweep",
+                    endpoint_url, entry.stream_id
+                );
+                continue;
+            }
             self.hold(&entry);
             self.park(until_ms, entry);
         }
@@ -633,6 +700,13 @@ pub struct ForwardingProcessor {
     /// Entries handed to a delivery task that another processor has since
     /// taken over: the task skips them.
     revoked: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Unix ms when this processor's claims were last confirmed by a
+    /// successful refresh; see [`Self::claims_current`].
+    claims_confirmed_at_ms: Arc<AtomicU64>,
+    /// Test-only: while set, claim refreshes fail as if the store were
+    /// unreachable.
+    #[cfg(feature = "test-clock")]
+    refresh_fault: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ForwardingProcessor {
@@ -664,6 +738,9 @@ impl ForwardingProcessor {
             packer: None,
             observer: None,
             revoked: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            claims_confirmed_at_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-clock")]
+            refresh_fault: None,
         })
     }
 
@@ -675,6 +752,14 @@ impl ForwardingProcessor {
     /// secrets in its config) compiling and running unchanged.
     pub fn with_system_packer(mut self, packer: Arc<dyn SystemMessagePacker>) -> Self {
         self.packer = Some(packer);
+        self
+    }
+
+    /// Test-only: make claim refreshes fail while `fault` is set, to exercise
+    /// what the processor does when it cannot confirm its claims.
+    #[cfg(feature = "test-clock")]
+    pub fn with_claim_refresh_fault(mut self, fault: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.refresh_fault = Some(fault);
         self
     }
 
@@ -749,6 +834,9 @@ impl ForwardingProcessor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // Nothing is held yet, so there is nothing unconfirmed.
+        self.claims_confirmed_at_ms
+            .store(unix_timestamp_millis() as u64, AtomicOrdering::Release);
 
         let reclaim_idle = Duration::from_secs(self.config.reclaim_idle_seconds.max(1));
         let refresh_every = reclaim_idle / 4;
@@ -824,14 +912,27 @@ impl ForwardingProcessor {
             let consumer = self.consumer_name.clone();
             let batch_size = self.config.batch_size.max(1);
             let block = sweep_every.min(Duration::from_secs(5));
+            let claims_confirmed_at_ms = self.claims_confirmed_at_ms.clone();
+            let unconfirmed_after_ms = reclaim_idle.as_millis() / 2;
             background.spawn(async move {
                 let mut next_sweep = Instant::now() + sweep_every;
                 loop {
+                    // While this processor cannot confirm its claims it takes
+                    // on nothing new. Its sweep in particular would re-claim
+                    // the very entries it cannot use, resetting their idle
+                    // time and keeping every other processor off them.
+                    let confirmed = claims_confirmed_at_ms.load(AtomicOrdering::Acquire) as u128;
+                    if unix_timestamp_millis().saturating_sub(confirmed) > unconfirmed_after_ms {
+                        tokio::time::sleep(refresh_every).await;
+                        continue;
+                    }
                     if Instant::now() >= next_sweep {
                         next_sweep = Instant::now() + sweep_every;
-                        // Until a sweep comes back short: an entry it returns
-                        // has had its idle time reset, so the next call moves
-                        // on to others.
+                        // Follow the cursor over the whole pending list. A page
+                        // can come back empty because it covered only entries
+                        // that are held and refreshed; idle ones may lie
+                        // beyond it.
+                        let mut cursor = "0-0".to_string();
                         loop {
                             match database
                                 .forward_queue_autoclaim(
@@ -839,18 +940,23 @@ impl ForwardingProcessor {
                                     &consumer,
                                     reclaim_idle,
                                     batch_size,
+                                    &cursor,
                                 )
                                 .await
                             {
-                                Ok(entries) if entries.is_empty() => break,
-                                Ok(entries) => {
-                                    let full = entries.len() >= batch_size;
-                                    debug!("Reclaimed {} idle forwarding entries", entries.len());
-                                    if batch_tx.send(entries).await.is_err() {
-                                        return;
+                                Ok(page) => {
+                                    if !page.entries.is_empty() {
+                                        debug!(
+                                            "Reclaimed {} idle forwarding entries",
+                                            page.entries.len()
+                                        );
+                                        if batch_tx.send(page.entries).await.is_err() {
+                                            return;
+                                        }
                                     }
-                                    if !full {
-                                        break;
+                                    match page.next_cursor {
+                                        Some(next) => cursor = next,
+                                        None => break,
                                     }
                                 }
                                 Err(e) => {
@@ -881,7 +987,7 @@ impl ForwardingProcessor {
 
         let this = Arc::new(self.clone());
         let mut scheduler = Scheduler::new(&self.config);
-        let mut deliveries: JoinSet<Vec<(u128, ForwardQueueEntry)>> = JoinSet::new();
+        let mut deliveries: JoinSet<BatchOutcome> = JoinSet::new();
         // Which endpoint, and which entries, each delivery task holds.
         let mut running: HashMap<tokio::task::Id, (String, Vec<String>)> = HashMap::new();
         let mut refresh = tokio::time::interval(refresh_every);
@@ -914,23 +1020,28 @@ impl ForwardingProcessor {
 
             tokio::select! {
                 Some(done) = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
-                    let (id, deferred) = match done {
-                        Ok((id, deferred)) => (id, deferred),
+                    let (id, mut outcome) = match done {
+                        Ok((id, outcome)) => (id, outcome),
                         Err(e) => {
                             // The entries stay claimed in the store, as they
                             // would after a crash: no longer refreshed, they
                             // go idle and the reclaim sweep hands them back.
                             error!("Forwarding delivery task failed: {e}");
-                            (e.id(), Vec::new())
+                            (e.id(), BatchOutcome::default())
                         }
                     };
                     if let Some((endpoint_url, ids)) = running.remove(&id) {
+                        // Entries taken over while the task ran are not held
+                        // again, whatever the task returned.
                         let mut revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+                        outcome
+                            .deferred
+                            .retain(|(_, entry)| !revoked.contains(&entry.stream_id));
                         for id in &ids {
                             revoked.remove(id);
                         }
                         drop(revoked);
-                        scheduler.finished(&endpoint_url, &ids, deferred);
+                        scheduler.finished(&endpoint_url, &ids, outcome, unix_timestamp_millis());
                     }
                 }
                 batch = batch_rx.recv(), if can_read => {
@@ -942,11 +1053,7 @@ impl ForwardingProcessor {
                     // is still ours, so nothing another processor took over in
                     // the meantime is delivered twice.
                     let ids: Vec<&str> = entries.iter().map(|e| e.stream_id.as_str()).collect();
-                    match self
-                        .database
-                        .forward_queue_refresh_claims(&self.config.consumer_group, &self.consumer_name, &ids)
-                        .await
-                    {
+                    match self.refresh_claims(&ids).await {
                         Ok(lost) => {
                             let lost: HashSet<String> = lost.into_iter().collect();
                             let entries = entries
@@ -963,16 +1070,16 @@ impl ForwardingProcessor {
                     }
                 }
                 _ = refresh.tick() => {
+                    // Everything held, including entries a delivery task is
+                    // sending right now: a send may outlast `reclaim_idle`.
+                    let started = unix_timestamp_millis();
                     let held = scheduler.held_ids();
-                    if !held.is_empty() {
-                        let ids: Vec<&str> = held.iter().map(String::as_str).collect();
-                        match self
-                            .database
-                            .forward_queue_refresh_claims(&self.config.consumer_group, &self.consumer_name, &ids)
-                            .await
-                        {
-                            Ok(lost) if lost.is_empty() => {}
-                            Ok(lost) => {
+                    let ids: Vec<&str> = held.iter().map(String::as_str).collect();
+                    match self.refresh_claims(&ids).await {
+                        Ok(lost) => {
+                            self.claims_confirmed_at_ms
+                                .store(started as u64, AtomicOrdering::Release);
+                            if !lost.is_empty() {
                                 // Usually entries a task has just finished
                                 // with; anything else was taken over.
                                 let in_flight = scheduler.forget(&lost);
@@ -981,13 +1088,82 @@ impl ForwardingProcessor {
                                     .unwrap_or_else(|e| e.into_inner())
                                     .extend(in_flight);
                             }
-                            Err(e) => warn!("Could not refresh claims on held FORWARD_Q entries: {e}"),
                         }
+                        // Delivery tasks stop sending once the last good
+                        // refresh is too old (see `claims_current`).
+                        Err(e) => warn!("Could not refresh claims on held FORWARD_Q entries: {e}"),
                     }
+                    scheduler.prune_backoffs(started);
                 }
                 _ = tokio::time::sleep(wake_in) => {}
             }
         }
+    }
+
+    /// Refresh this processor's claims on `stream_ids`; see
+    /// [`MediatorStore::forward_queue_refresh_claims`].
+    async fn refresh_claims(&self, stream_ids: &[&str]) -> Result<Vec<String>, MediatorError> {
+        #[cfg(feature = "test-clock")]
+        if self
+            .refresh_fault
+            .as_ref()
+            .is_some_and(|fault| fault.load(AtomicOrdering::Acquire))
+        {
+            return Err(MediatorError::DatabaseError(
+                96,
+                "forwarding".into(),
+                "claim refresh failed (injected)".into(),
+            ));
+        }
+        if stream_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.database
+            .forward_queue_refresh_claims(
+                &self.config.consumer_group,
+                &self.consumer_name,
+                stream_ids,
+            )
+            .await
+    }
+
+    /// Whether this processor's claims were confirmed recently enough to act
+    /// on them. Refreshes run every quarter of `reclaim_idle_seconds`; if
+    /// none has succeeded for half of it, another processor may be about to
+    /// take the entries over, so nothing more is sent until one does. A send
+    /// already under way when refreshes start failing finishes, and its entry
+    /// is then finished only if still ours: such a message can be delivered
+    /// twice, never lost.
+    fn claims_current(&self) -> bool {
+        let confirmed = self.claims_confirmed_at_ms.load(AtomicOrdering::Acquire) as u128;
+        let limit = (self.config.reclaim_idle_seconds.max(1) as u128) * 1000 / 2;
+        unix_timestamp_millis().saturating_sub(confirmed) <= limit
+    }
+
+    /// Finish with `msg` if this processor still holds it (see
+    /// [`MediatorStore::forward_queue_finish`]). `Ok(false)` means another
+    /// processor has it now and decides its fate.
+    async fn finish(
+        &self,
+        msg: &ForwardQueueEntry,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let finished = self
+            .database
+            .forward_queue_finish(
+                &self.config.consumer_group,
+                &self.consumer_name,
+                &msg.stream_id,
+                requeue,
+            )
+            .await?;
+        if !finished {
+            debug!(
+                "FORWARD_Q entry {} is no longer held by this processor; leaving it to its holder",
+                msg.stream_id
+            );
+        }
+        Ok(finished)
     }
 
     /// Whether another processor has taken this entry over since it was
@@ -1013,7 +1189,7 @@ impl ForwardingProcessor {
         &self,
         endpoint_url: &str,
         messages: Vec<ForwardQueueEntry>,
-    ) -> Vec<(u128, ForwardQueueEntry)> {
+    ) -> BatchOutcome {
         let msg_count = messages.len();
         debug!(
             "Processing {} messages for endpoint: {}",
@@ -1026,37 +1202,27 @@ impl ForwardingProcessor {
         let (ready, expired): (Vec<_>, Vec<_>) =
             messages.into_iter().partition(|m| m.expires_at > now_secs);
 
-        // ACK and delete expired messages
-        if !expired.is_empty() {
-            let expired_ids: Vec<&str> = expired.iter().map(|m| m.stream_id.as_str()).collect();
-            warn!(
-                "Dropping {} expired forwarding messages for endpoint {}",
-                expired.len(),
-                endpoint_url
-            );
-            for msg in &expired {
-                info!(
-                    "FORWARD_EXPIRED: to_did_hash={} from_did_hash={} endpoint={}",
-                    msg.to_did_hash, msg.from_did_hash, endpoint_url
-                );
-                self.observe(msg, ForwardOutcome::Expired);
+        // Drop expired messages that are still ours.
+        for msg in &expired {
+            if self.is_revoked(&msg.stream_id) {
+                continue;
             }
-            if let Err(e) = self
-                .database
-                .forward_queue_ack_and_delete(&self.config.consumer_group, &expired_ids)
-                .await
-            {
-                warn!(
-                    "Failed to ACK and delete {} expired entries: {}",
-                    expired_ids.len(),
-                    e
-                );
+            match self.finish(msg, None).await {
+                Ok(true) => {
+                    info!(
+                        "FORWARD_EXPIRED: to_did_hash={} from_did_hash={} endpoint={}",
+                        msg.to_did_hash, msg.from_did_hash, endpoint_url
+                    );
+                    self.observe(msg, ForwardOutcome::Expired);
+                }
+                Ok(false) => {}
+                Err(e) => warn!("Failed to drop expired entry {}: {e}", msg.stream_id),
             }
         }
 
-        let mut deferred = Vec::new();
+        let mut outcome = BatchOutcome::default();
         if ready.is_empty() {
-            return deferred;
+            return outcome;
         }
 
         // Decide transport from the rate so far.
@@ -1105,6 +1271,19 @@ impl ForwardingProcessor {
                 );
                 continue;
             }
+            // Claims not confirmed lately: another processor may be taking
+            // these over, so send nothing until a refresh succeeds.
+            if !self.claims_current() {
+                debug!(
+                    "Claims not confirmed recently; holding message {} for endpoint {}",
+                    msg.stream_id, endpoint_url
+                );
+                let retry_ms = (self.config.reclaim_idle_seconds.max(1) as u128) * 1000 / 4;
+                outcome
+                    .deferred
+                    .push((unix_timestamp_millis() + retry_ms, msg));
+                continue;
+            }
             // Checked per message, not once per batch: the attempt before this
             // one may just have failed and opened the backoff window.
             if let Some(retry_after_ms) = self.endpoint_backing_off(endpoint_url).await {
@@ -1112,7 +1291,7 @@ impl ForwardingProcessor {
                     "Endpoint {} is backing off; holding message {} until it ends",
                     endpoint_url, msg.stream_id
                 );
-                deferred.push((retry_after_ms, msg));
+                outcome.deferred.push((retry_after_ms, msg));
                 continue;
             }
 
@@ -1149,16 +1328,16 @@ impl ForwardingProcessor {
                         delay_info,
                     );
                     self.observe(&msg, relayed);
-                    // Acked at once rather than with the rest of the batch, so
-                    // a restart mid-batch does not leave a delivered entry to
-                    // be sent again.
-                    let ids = [msg.stream_id.as_str()];
-                    if let Err(e) = self
-                        .database
-                        .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                        .await
-                    {
-                        warn!("Failed to ACK and delete delivered entry: {e}");
+                    // Finished at once rather than with the rest of the batch,
+                    // so a restart mid-batch does not leave a delivered entry
+                    // to be sent again.
+                    match self.finish(&msg, None).await {
+                        Ok(true) => {}
+                        Ok(false) => warn!(
+                            "FORWARD_Q entry {} was delivered after another processor took it over; it may be delivered again",
+                            msg.stream_id
+                        ),
+                        Err(e) => warn!("Failed to ACK and delete delivered entry: {e}"),
                     }
                     self.record_endpoint_success(endpoint_url).await;
                 }
@@ -1214,7 +1393,8 @@ impl ForwardingProcessor {
             }
         }
 
-        deferred
+        outcome.backing_off_until = self.endpoint_backing_off(endpoint_url).await;
+        outcome
     }
 
     /// When the endpoint's backoff ends (unix ms), if it is backing off now.
@@ -1258,13 +1438,14 @@ impl ForwardingProcessor {
         endpoint_url: &str,
         outcome: ForwardOutcome,
     ) {
-        let ids = [msg.stream_id.as_str()];
-        if let Err(e) = self
-            .database
-            .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-            .await
-        {
-            warn!("Failed to ACK and delete undeliverable entry: {e}");
+        // Reported only by the processor that actually drops it.
+        match self.finish(msg, None).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                warn!("Failed to ACK and delete undeliverable entry: {e}");
+                return;
+            }
         }
         self.observe(msg, outcome);
         if self.config.report_errors && !msg.from_did.is_empty() {
@@ -1287,19 +1468,19 @@ impl ForwardingProcessor {
         not_before_ms: u128,
     ) {
         if msg.retry_count >= self.config.max_retries {
-            // Max retries exceeded — ACK and drop, send problem report to sender
+            // Max retries exceeded — drop it if still ours, and report it.
+            match self.finish(msg, None).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    warn!("Failed to ACK and delete abandoned entry: {e}");
+                    return;
+                }
+            }
             warn!(
                 "FORWARD_ABANDONED: to_did_hash={} from_did_hash={} endpoint={} retries={}",
                 msg.to_did_hash, msg.from_did_hash, endpoint_url, msg.retry_count
             );
-            let ids = [msg.stream_id.as_str()];
-            if let Err(e) = self
-                .database
-                .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                .await
-            {
-                warn!("Failed to ACK and delete abandoned entry: {e}");
-            }
             self.observe(
                 msg,
                 ForwardOutcome::Abandoned {
@@ -1322,35 +1503,25 @@ impl ForwardingProcessor {
         retry_entry.retry_count += 1;
         retry_entry.not_before_ms = not_before_ms;
 
-        // Enqueue the retry before releasing the old entry. In the other
-        // order a crash between the two loses the message; in this one it
-        // leaves the old entry claimed, so autoclaim redelivers it (at least
-        // once, never zero).
-        //
-        // `max_len = 0` keeps the legacy unbounded behaviour for retries; the
-        // inbound enqueue path applies the queue limit instead.
-        match self.database.forward_queue_enqueue(&retry_entry, 0).await {
-            Ok(_) => {
-                self.observe(
-                    msg,
-                    ForwardOutcome::Retrying {
-                        attempt: msg.retry_count + 1,
-                        max_retries: self.config.max_retries,
-                    },
-                );
-                let ids = [msg.stream_id.as_str()];
-                if let Err(e) = self
-                    .database
-                    .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                    .await
-                {
-                    warn!("Failed to ACK and delete retried entry: {e}");
-                }
-            }
+        // The retry is enqueued and the old entry acked and deleted in one
+        // write, and only if the old entry is still ours: a processor that
+        // took it over owns its retry, and a second retry entry would be a
+        // second delivery. Unbounded, like the legacy retry path; the inbound
+        // enqueue path applies the queue limit instead.
+        match self.finish(msg, Some(&retry_entry)).await {
+            Ok(true) => self.observe(
+                msg,
+                ForwardOutcome::Retrying {
+                    attempt: msg.retry_count + 1,
+                    max_retries: self.config.max_retries,
+                },
+            ),
+            Ok(false) => {}
             Err(e) => {
-                // The old entry stays claimed, so autoclaim picks it up again
-                // once it has been idle long enough.
-                error!("Failed to re-enqueue retry entry; leaving it claimed for autoclaim: {e}");
+                // Nothing was written, and the entry stays claimed: its claim
+                // goes idle once this processor lets it go, and the reclaim
+                // sweep hands it back.
+                error!("Failed to queue retry entry; leaving the original claimed: {e}");
             }
         }
     }
@@ -2223,7 +2394,12 @@ mod tests {
             "the busy endpoint gets no second task"
         );
 
-        s.finished("https://slow", &["1-0".to_string()], Vec::new());
+        s.finished(
+            "https://slow",
+            &["1-0".to_string()],
+            BatchOutcome::default(),
+            5_000,
+        );
         let (again, batch) = s.next_batch().expect("its queued entry, once it is free");
         assert_eq!(again, "https://slow");
         assert_eq!(batch[0].stream_id, "3-0");
@@ -2274,7 +2450,7 @@ mod tests {
 
         let (endpoint, batch) = s.next_batch().expect("a batch");
         let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
-        s.finished(&endpoint, &ids, Vec::new());
+        s.finished(&endpoint, &ids, BatchOutcome::default(), 5_000);
         assert!(s.has_room());
     }
 
@@ -2299,6 +2475,65 @@ mod tests {
         assert!(endpoints.contains(&"https://other".to_string()));
     }
 
+    /// While an endpoint backs off it holds at most a batch: the rest of what
+    /// it returns, and what arrives for it, is left for the reclaim sweep, so
+    /// two endpoints that are down cannot take the whole budget.
+    #[test]
+    fn an_endpoint_backing_off_holds_only_a_batch() {
+        // 4 x 4 = 16 held at most; 8 for an endpoint, 4 while it backs off.
+        let mut s = scheduler(4, 4);
+        let dead: Vec<_> = (0..8)
+            .map(|i| queued(&format!("{i}-0"), "https://dead"))
+            .collect();
+        s.accept(dead, 5_000);
+        assert_eq!(s.held.len(), 8);
+
+        let (endpoint, batch) = s.next_batch().expect("a batch");
+        let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
+        let deferred = batch.into_iter().map(|m| (60_000, m)).collect();
+        s.finished(
+            &endpoint,
+            &ids,
+            BatchOutcome {
+                deferred,
+                backing_off_until: Some(60_000),
+            },
+            5_000,
+        );
+        assert_eq!(
+            s.held_for("https://dead"),
+            4,
+            "still queued 4, none re-held"
+        );
+
+        s.accept(vec![queued("50-0", "https://dead")], 5_000);
+        assert_eq!(
+            s.held_for("https://dead"),
+            4,
+            "nothing more while backing off"
+        );
+
+        s.prune_backoffs(60_001);
+        s.accept(vec![queued("51-0", "https://dead")], 60_001);
+        assert_eq!(
+            s.held_for("https://dead"),
+            5,
+            "its full share once the backoff ends"
+        );
+    }
+
+    /// Reading never takes the processor past its hold limit, even within
+    /// one batch.
+    #[test]
+    fn a_batch_does_not_overshoot_the_hold_limit() {
+        let mut s = scheduler(2, 2);
+        let mixed: Vec<_> = (0..6)
+            .map(|i| queued(&format!("{i}-0"), &format!("https://peer-{i}")))
+            .collect();
+        s.accept(mixed, 5_000);
+        assert_eq!(s.held.len(), 4);
+    }
+
     /// Entries a delivery task held back stay held and parked until the
     /// endpoint's backoff ends, unchanged: same id, same retry count.
     #[test]
@@ -2312,7 +2547,15 @@ mod tests {
         let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
         // The first was attempted and failed; the second was held back.
         let held_back = batch[1].clone();
-        s.finished(&endpoint, &ids, vec![(9_000, held_back)]);
+        s.finished(
+            &endpoint,
+            &ids,
+            BatchOutcome {
+                deferred: vec![(9_000, held_back)],
+                backing_off_until: Some(9_000),
+            },
+            5_000,
+        );
 
         assert_eq!(s.held.len(), 1);
         assert!(s.next_batch().is_none(), "not before the backoff ends");

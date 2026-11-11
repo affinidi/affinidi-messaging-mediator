@@ -767,10 +767,12 @@ delivery_timeout_seconds = "90"
 ### Seconds a claimed forwarding-queue entry may sit untouched before any
 ### processor in the consumer group takes it over. This is how entries held by
 ### a processor that stopped or restarted get delivered by another (or by it,
-### once back). A running processor refreshes its claims four times in this
-### window, so it never loses one it is still working on. The same sweep
-### picks up a requested forward delay longer than max_backoff_ms when due.
-### Must be at least 1.
+### once back). A running processor refreshes its claims, including those of
+### sends in progress, four times in this window, so it never loses one it is
+### still working on; if it cannot confirm them for half the window it stops
+### sending until it can. The same sweep picks up a requested forward delay
+### longer than max_backoff_ms when due, and an endpoint's entries beyond what
+### it may hold. Must be at least 1; a few seconds or more in production.
 reclaim_idle_seconds = "60"
 
 ### Env: PROCESSOR_FORWARDING_CONSUMER_GROUP

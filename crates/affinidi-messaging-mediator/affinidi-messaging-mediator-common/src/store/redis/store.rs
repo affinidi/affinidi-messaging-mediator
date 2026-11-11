@@ -38,9 +38,10 @@ use crate::{
     database::{DatabaseHandler, RedisConnection},
     errors::MediatorError,
     store::{
-        DeletionAuthority, ExpiryReport, ForwardQueueEntry, InboxStatusReply, MediatorStore,
-        MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session, SessionState,
-        StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
+        DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
+        InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats, PubSubRecord,
+        RefreshRotation, Session, SessionState, StatCounter, StoreHealth, StreamingClientState,
+        TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -1949,16 +1950,32 @@ impl MediatorStore for RedisStore {
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
-        let inner = self
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
+        let (next, entries) = self
             .forward_queue_autoclaim(
                 group_name,
                 consumer_name,
                 min_idle.as_millis() as u64,
                 count,
+                cursor,
             )
             .await?;
-        Ok(inner.into_iter().map(fwd_entry_into_new).collect())
+        Ok(ForwardQueueClaimPage {
+            entries: entries.into_iter().map(fwd_entry_into_new).collect(),
+            next_cursor: (next != "0-0").then_some(next),
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        self.forward_queue_finish(group_name, consumer_name, stream_id, requeue)
+            .await
     }
 
     async fn forward_queue_refresh_claims(

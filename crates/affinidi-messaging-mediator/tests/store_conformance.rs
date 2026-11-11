@@ -449,9 +449,10 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
 
     // Consumer 2 reclaims anything idle beyond zero — i.e. the pending entry.
     let reclaimed = store
-        .forward_queue_autoclaim("g", "consumer-2", Duration::ZERO, 10)
+        .forward_queue_autoclaim("g", "consumer-2", Duration::ZERO, 10, "0-0")
         .await
-        .expect("forward_queue_autoclaim");
+        .expect("forward_queue_autoclaim")
+        .entries;
     assert_eq!(
         reclaimed.len(),
         1,
@@ -532,9 +533,10 @@ async fn check_forward_queue_refresh_claims(store: Arc<dyn MediatorStore>) {
 
     // Just refreshed, so it is not idle long enough for another to take.
     let taken = store
-        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000)
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000, "0-0")
         .await
-        .expect("autoclaim");
+        .expect("autoclaim")
+        .entries;
     assert!(
         taken.iter().all(|e| e.stream_id != kept),
         "a refreshed claim is not reclaimed"
@@ -543,9 +545,10 @@ async fn check_forward_queue_refresh_claims(store: Arc<dyn MediatorStore>) {
     // Left alone, it goes idle and is reclaimable; then the holder has lost it.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let taken = store
-        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000)
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000, "0-0")
         .await
-        .expect("autoclaim");
+        .expect("autoclaim")
+        .entries;
     assert!(
         taken.iter().any(|e| e.stream_id == kept),
         "reclaimed once idle"
@@ -560,6 +563,198 @@ async fn check_forward_queue_refresh_claims(store: Arc<dyn MediatorStore>) {
         .forward_queue_ack_and_delete(group, &[kept])
         .await
         .expect("ack and delete");
+}
+
+fn forward_entry_for_check(message: &str) -> ForwardQueueEntry {
+    ForwardQueueEntry {
+        stream_id: String::new(),
+        message: message.to_string(),
+        to_did_hash: "next_hash".to_string(),
+        from_did_hash: "from_hash".to_string(),
+        from_did: "did:peer:from".to_string(),
+        to_did: "did:peer:next".to_string(),
+        endpoint_url: "https://peer.example.com/inbound".to_string(),
+        received_at_ms: 1,
+        delay_milli: 0,
+        expires_at: NEVER,
+        retry_count: 0,
+        hop_count: 1,
+        not_before_ms: 0,
+    }
+}
+
+/// Forward-queue autoclaim pages: idle entries behind a long run of held,
+/// refreshed ones are still reached by following the cursor. One call
+/// examines only a bounded stretch of the pending list (on Redis, ten times
+/// the count), so a sweep that stopped at the first empty page would never
+/// get past the held head.
+async fn check_forward_queue_autoclaim_pages_past_held_entries(store: Arc<dyn MediatorStore>) {
+    let group = "paging-g";
+    let mut ours = Vec::new();
+    for i in 0..300 {
+        ours.push(
+            store
+                .forward_queue_enqueue(&forward_entry_for_check(&format!("paging-{i}")), 0)
+                .await
+                .expect("forward_queue_enqueue"),
+        );
+    }
+    let claimed = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    assert!(
+        ours.iter()
+            .all(|id| claimed.iter().any(|e| &e.stream_id == id))
+    );
+
+    // The head stays busy; the last few go idle.
+    let (head, tail) = ours.split_at(ours.len() - 5);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let head_ids: Vec<&str> = head.iter().map(String::as_str).collect();
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &head_ids)
+        .await
+        .expect("refresh the head");
+    assert!(lost.is_empty());
+
+    let mut cursor = "0-0".to_string();
+    let mut reclaimed = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = store
+            .forward_queue_autoclaim(group, "sweeper", Duration::from_millis(200), 5, &cursor)
+            .await
+            .expect("forward_queue_autoclaim");
+        pages += 1;
+        if pages == 1 {
+            assert!(
+                page.entries.iter().all(|e| !tail.contains(&e.stream_id)),
+                "the first page cannot reach past the held head"
+            );
+        }
+        reclaimed.extend(page.entries.into_iter().map(|e| e.stream_id));
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 1_000, "the scan must end");
+    }
+    let mut reclaimed_ours: Vec<&String> =
+        reclaimed.iter().filter(|id| ours.contains(id)).collect();
+    reclaimed_ours.sort();
+    let mut expected: Vec<&String> = tail.iter().collect();
+    expected.sort();
+    assert_eq!(
+        reclaimed_ours, expected,
+        "exactly the idle tail is reclaimed"
+    );
+
+    let ids: Vec<&str> = ours.iter().map(String::as_str).collect();
+    store
+        .forward_queue_ack_and_delete(group, &ids)
+        .await
+        .expect("ack and delete");
+}
+
+/// Forward-queue finish: only the consumer holding an entry can finish it,
+/// and a finish with a replacement writes the replacement only then.
+async fn check_forward_queue_finish_is_owner_conditional(store: Arc<dyn MediatorStore>) {
+    let group = "finish-g";
+    let first = store
+        .forward_queue_enqueue(&forward_entry_for_check("finish-first"), 0)
+        .await
+        .expect("forward_queue_enqueue");
+    let second = store
+        .forward_queue_enqueue(&forward_entry_for_check("finish-second"), 0)
+        .await
+        .expect("forward_queue_enqueue");
+    let claimed = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    let first_entry = claimed
+        .iter()
+        .find(|e| e.stream_id == first)
+        .expect("holder claims the first")
+        .clone();
+
+    // A bystander cannot finish what the holder holds.
+    assert!(
+        !store
+            .forward_queue_finish(group, "bystander", &first, None)
+            .await
+            .expect("finish by a bystander")
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[&first])
+        .await
+        .expect("refresh");
+    assert!(lost.is_empty(), "the holder still holds it");
+
+    // The holder replaces it with a retry, in one step.
+    let mut retry = first_entry.clone();
+    retry.retry_count = 1;
+    assert!(
+        store
+            .forward_queue_finish(group, "holder", &first, Some(&retry))
+            .await
+            .expect("finish with a retry")
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[&first])
+        .await
+        .expect("refresh");
+    assert_eq!(lost, vec![first.clone()], "the original is gone");
+    let next = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    let replacement = next
+        .iter()
+        .find(|e| e.message == "finish-first")
+        .expect("the retry is queued");
+    assert_eq!(replacement.retry_count, 1);
+
+    // Once another consumer has taken an entry over, the old holder's finish
+    // changes nothing, retry or not; the new holder's does.
+    let mut cursor = "0-0".to_string();
+    loop {
+        let page = store
+            .forward_queue_autoclaim(group, "bystander", Duration::ZERO, 1_000, &cursor)
+            .await
+            .expect("forward_queue_autoclaim");
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assert!(
+        !store
+            .forward_queue_finish(group, "holder", &second, Some(&retry))
+            .await
+            .expect("finish after a takeover")
+    );
+    assert!(
+        store
+            .forward_queue_finish(group, "bystander", &second, None)
+            .await
+            .expect("finish by the new holder")
+    );
+    assert!(
+        store
+            .forward_queue_finish(group, "bystander", &replacement.stream_id, None)
+            .await
+            .expect("finish the retry")
+    );
+    let after = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    assert!(
+        after.iter().all(|e| !e.message.starts_with("finish-")),
+        "the refused finish queued no second retry"
+    );
 }
 
 /// Session-expiry: a session whose TTL has lapsed is reclaimed by
@@ -2795,6 +2990,8 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_purge_and_removal_receipts(store.clone()).await;
     check_mux_primitives(store.clone()).await;
     check_forward_queue_refresh_claims(store.clone()).await;
+    check_forward_queue_autoclaim_pages_past_held_entries(store.clone()).await;
+    check_forward_queue_finish_is_owner_conditional(store.clone()).await;
     check_mux_grant_flows(store).await;
 }
 
@@ -2843,6 +3040,14 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn forward_queue_refresh_claims() {
                 check_forward_queue_refresh_claims(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_autoclaim_pages_past_held_entries() {
+                check_forward_queue_autoclaim_pages_past_held_entries(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_finish_is_owner_conditional() {
+                check_forward_queue_finish_is_owner_conditional(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn session_expiry_sweep() {

@@ -304,11 +304,11 @@ pub mod mux;
 pub mod redis;
 
 pub use types::{
-    DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueEntry,
-    InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RefreshRotation,
-    RemovalReason, SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport,
-    StatCounter, StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState,
-    StreamingKind, StreamingWrite,
+    DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueClaimPage,
+    ForwardQueueEntry, InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt,
+    PubSubRecord, RefreshRotation, RemovalReason, SentMessageState, Session, SessionClaims,
+    SessionState, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClaim,
+    StreamingClientState, StreamingKind, StreamingWrite,
 };
 
 /// The error every backend's `get_session` returns for a session past the
@@ -1672,13 +1672,34 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// Reclaim entries idle for longer than `min_idle` (typical: a
     /// crashed/timed-out consumer). The reclaiming consumer becomes the
     /// new owner of the returned entries.
+    ///
+    /// One call examines a bounded stretch of the pending list, starting at
+    /// `cursor` (`"0-0"` for the start), and returns up to `count` entries
+    /// with the cursor to continue from. A scan of the whole list follows
+    /// `next_cursor` until it is `None`; stopping at the first short or empty
+    /// page would never reach idle entries behind a long run of busy ones.
     async fn forward_queue_autoclaim(
         &self,
         group_name: &str,
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError>;
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError>;
+
+    /// Finish with one entry, but only if `consumer_name` still has it
+    /// claimed: ack and delete it, and with `requeue`, enqueue that entry in
+    /// its place, all as one write. Returns `false`, changing nothing, when
+    /// the entry is claimed by another consumer or no longer pending — the
+    /// other consumer now owns its fate, and acking or re-queuing it here
+    /// would delete its claim or duplicate its delivery.
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError>;
 
     /// Reset the idle time of each of `stream_ids` that `consumer_name` still
     /// has claimed, so another consumer's

@@ -309,8 +309,9 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   usually in queue order; a retried message can go after later ones. Each
   attempt is bounded by `delivery_timeout_seconds` (90). A processor holds at
   most `batch_size` × `max_concurrent_endpoints` claimed entries, one
-  endpoint at most half of them, so a backlog for one peer does not stop the
-  others' forwards being read.
+  endpoint at most half of them, and an endpoint backing off at most
+  `batch_size`, so backlogs for slow or failing peers do not stop the others'
+  forwards being read.
 - **Retry.** `max_retries` (5) with exponential backoff from
   `initial_backoff_ms` to `max_backoff_ms`, per endpoint. A failed message is
   queued again with a not-before at the end of the endpoint's backoff, which
@@ -321,10 +322,15 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   holds four times per `reclaim_idle_seconds` (60). An entry whose claim goes
   idle that long — its processor stopped, or it was left for later (a long
   requested delay, an endpoint's share exceeded) — is taken over by the next
-  reclaim sweep of any processor in the group. A refresh never moves a claim
-  another processor has taken, so each entry is delivered by whichever
-  processor holds it. Delivered entries are acked one at a time, as soon as
-  the peer accepts them.
+  reclaim sweep of any processor in the group; the sweep follows its cursor
+  over the whole pending list. A refresh never moves a claim another
+  processor has taken, and every ack — and every retry, which replaces its
+  entry in the same write — is made only if the entry is still held, so each
+  entry is settled by whichever processor holds it. Delivered entries are
+  acked one at a time, as soon as the peer accepts them. A processor that
+  cannot confirm its claims for half of `reclaim_idle_seconds` stops sending,
+  reading and reclaiming until it can; a send already under way then
+  completes, so that one message can arrive twice (at-least-once).
 - **Refusal.** A peer's 4xx (other than 408/425/429) is final
   (`e.p.me.res.forwarding.refused`), as is a next hop whose URL does not parse
   or that the egress policy does not admit
