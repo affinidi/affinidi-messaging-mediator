@@ -416,8 +416,12 @@ pub(crate) async fn store_forwarded_message(
                     msg_id, recipient
                 );
             }
+            // Not swallowed: the caller answers the sender from this result,
+            // and a message that was not stored must not be reported as
+            // forwarded.
             Err(e) => {
                 warn!("error storing message recipient({}): {:?}", recipient, e);
+                return Err(e);
             }
         }
 

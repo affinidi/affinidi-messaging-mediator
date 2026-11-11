@@ -1483,13 +1483,15 @@ impl MediatorStore for RedisStore {
         self.account_get(did_hash).await
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
-        let account = self.account_add(did_hash, acls, queue_limit).await?;
+    ) -> Result<Option<Account>, MediatorError> {
+        let Some(account) = self.account_create(did_hash, acls, queue_limit).await? else {
+            return Ok(None);
+        };
         // A fresh account starts with no activity. This also collects a record
         // that a message in flight wrote between a removal's existence check
         // and its `DEL` below.
@@ -1502,7 +1504,7 @@ impl MediatorStore for RedisStore {
         {
             warn!("account {did_hash} added, but its old activity or counters remain: {e}");
         }
-        Ok(account)
+        Ok(Some(account))
     }
 
     async fn account_remove(

@@ -42,12 +42,17 @@ fn _to_account(map: HashMap<String, String>, access_list_count: u32) -> Account 
 // have at least one caller via the trait impl in
 // `store/redis/store.rs`.
 impl Database {
-    /// Quick and efficient check if an account exists locally in the mediator
+    /// Whether an account exists locally in the mediator.
+    ///
+    /// An account is a `DID:<hash>` record carrying `ACLS` or `ROLE_TYPE`.
+    /// Storing a message for a party with no account leaves a record holding
+    /// only queue counters; that is not an account.
     pub(crate) async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         let mut con = self.get_connection().await?;
 
-        redis::cmd("EXISTS")
-            .arg(self.keys().did(did_hash))
+        let (acls, role): (bool, bool) = redis::pipe()
+            .hexists(self.keys().did(did_hash), "ACLS")
+            .hexists(self.keys().did(did_hash), "ROLE_TYPE")
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -56,7 +61,8 @@ impl Database {
                     "NA".to_string(),
                     format!("Failed to check account existence. Reason: {err}"),
                 )
-            })
+            })?;
+        Ok(acls || role)
     }
 
     /// Grab Account information
@@ -89,7 +95,9 @@ impl Database {
                 )
             })?;
 
-        if details.is_empty() {
+        // A record holding only queue counters is not an account (see
+        // `account_exists`).
+        if !details.contains_key("ACLS") && !details.contains_key("ROLE_TYPE") {
             debug!("Account {} does not exist", did_hash);
             return Ok(None);
         }
@@ -98,16 +106,18 @@ impl Database {
         Ok(Some(account))
     }
 
-    /// Add a DID account to the mediator
+    /// Create a DID account on the mediator unless it already has one.
     /// - `did_hash` - SHA256 hash of the DID
     /// - `acls` - ACLs to apply to the account
     /// - `queue_limit` - Optional queue limit for the account
-    pub(crate) async fn account_add(
+    ///
+    /// Returns `None`, writing nothing, when the account already exists.
+    pub(crate) async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
         let _span = span!(Level::DEBUG, "add_account", "did_hash" = did_hash,);
 
         async move {
@@ -115,48 +125,70 @@ impl Database {
 
             let mut con = self.get_connection().await?;
 
-            // Record before list entry: a failure between them leaves an
-            // unlisted account, which the next add or login lists again.
-            let mut record = redis::pipe();
-            let cmd = record
-                .cmd("HSET")
-                .arg(self.keys().did(did_hash))
-                .arg("SEND_QUEUE_BYTES")
-                .arg(0)
-                .arg("SEND_QUEUE_COUNT")
-                .arg(0)
-                .arg("RECEIVE_QUEUE_BYTES")
-                .arg(0)
-                .arg("RECEIVE_QUEUE_COUNT")
-                .arg(0)
-                .arg("ROLE_TYPE")
-                .arg::<String>(AccountType::Standard.into())
-                .arg("ACLS")
-                .arg(acls.to_hex_string());
+            // One script, so the existence check and the write cannot be
+            // split by a concurrent add.
+            //
+            // An account is a record carrying `ACLS` or `ROLE_TYPE`. Storing a
+            // message also creates `DID:<hash>`, holding only queue counters,
+            // for a party that has no account; that record is completed here
+            // rather than refused. Its counters describe messages that are
+            // really queued, so they are kept (`HSETNX`), not zeroed.
+            let created: i64 = redis::Script::new(
+                r#"
+if redis.call('HEXISTS', KEYS[1], 'ACLS') == 1
+    or redis.call('HEXISTS', KEYS[1], 'ROLE_TYPE') == 1 then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'ROLE_TYPE', ARGV[1], 'ACLS', ARGV[2])
+for _, field in ipairs({'SEND_QUEUE_BYTES', 'SEND_QUEUE_COUNT',
+                        'RECEIVE_QUEUE_BYTES', 'RECEIVE_QUEUE_COUNT'}) do
+    redis.call('HSETNX', KEYS[1], field, 0)
+end
+if ARGV[3] ~= '' then
+    redis.call('HSET', KEYS[1], 'QUEUE_LIMIT', ARGV[3])
+end
+return 1
+"#,
+            )
+            .key(self.keys().did(did_hash))
+            .arg::<String>(AccountType::Standard.into())
+            .arg(acls.to_hex_string())
+            .arg(queue_limit.map(|l| l.to_string()).unwrap_or_default())
+            .invoke_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".to_string(),
+                    format!("Failed to add account. Reason: {err}"),
+                )
+            })?;
 
-            if let Some(queue_limit) = queue_limit {
-                cmd.arg("QUEUE_LIMIT").arg(queue_limit);
+            if created == 0 {
+                debug!("Account already exists; left unchanged");
+                return Ok(None);
             }
 
+            // Record before list entry: a failure between them leaves an
+            // unlisted account, which the next login lists again.
             let mut listed = redis::pipe();
             listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
-
-            self.exec_steps(&mut con, vec![record, listed])
+            self.exec_steps(&mut con, vec![listed])
                 .await
                 .map_err(|err| {
                     MediatorError::DatabaseError(
                         14,
                         "NA".to_string(),
-                        format!("Failed to add account. Reason: {err}"),
+                        format!("Failed to list account. Reason: {err}"),
                     )
                 })?;
             debug!("Account added successfully");
 
-            Ok(Account {
+            Ok(Some(Account {
                 did_hash: did_hash.to_string(),
                 acls: acls.to_u64(),
                 ..Default::default()
-            })
+            }))
         }
         .instrument(_span)
         .await

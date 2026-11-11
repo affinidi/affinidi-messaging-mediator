@@ -514,6 +514,16 @@ struct StoredAccount {
     receive_queue_bytes: u64,
     queue_send_limit: Option<i32>,
     queue_receive_limit: Option<i32>,
+    /// Whether this record is an account. Storing a message for a party with
+    /// no account keeps its queue counters here too (as Redis keeps them in a
+    /// `DID:<hash>` hash with no `ACLS`), but that alone does not make it an
+    /// account. Records written before the field existed read as accounts.
+    #[serde(default = "stored_account_default_is_account")]
+    is_account: bool,
+}
+
+fn stored_account_default_is_account() -> bool {
+    true
 }
 
 impl StoredAccount {
@@ -889,6 +899,20 @@ impl FjallStore {
 
     /// Helper: encode any serde value as JSON bytes, mapping errors to
     /// `MediatorError::InternalError`.
+    /// The stored record for `did_hash`, if it is an account (see
+    /// [`StoredAccount::is_account`]).
+    fn account_record(&self, did_hash: &str) -> Result<Option<StoredAccount>, MediatorError> {
+        let Some(raw) = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("accounts.get", e))?
+        else {
+            return Ok(None);
+        };
+        let acc: StoredAccount = Self::decode(&raw)?;
+        Ok(acc.is_account.then_some(acc))
+    }
+
     fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MediatorError> {
         serde_json::to_vec(value).map_err(|e| {
             MediatorError::InternalError(500, "fjall".into(), format!("encode failed: {e}"))
@@ -1986,12 +2010,8 @@ impl MediatorStore for FjallStore {
         // Redis path's "session HMGET + DID HMGET" pipeline).
         if !did.is_empty() {
             let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
-            if let Some(v) = self
-                .accounts
-                .get(did_hash.as_bytes())
-                .map_err(|e| Self::db_err("get_session:accounts.get", e))?
-            {
-                let acc: StoredAccount = Self::decode(&v)?;
+            // A record holding only queue counters is not an account.
+            if let Some(acc) = self.account_record(&did_hash)? {
                 session.acls = MediatorACLSet::from_u64(acc.acls);
                 session.account_type = acc.role;
             } else if session.state != SessionState::ChallengeSent {
@@ -2169,39 +2189,53 @@ impl MediatorStore for FjallStore {
     // ─── Accounts ───────────────────────────────────────────────────────────
 
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
-        self.accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_exists:contains_key", e))
+        Ok(self.account_record(did_hash)?.is_some())
     }
 
     async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
-        let Some(raw) = self
-            .accounts
-            .get(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_get:get", e))?
-        else {
+        let Some(acc) = self.account_record(did_hash)? else {
             return Ok(None);
         };
-        let acc: StoredAccount = Self::decode(&raw)?;
         let count = self.access_list_count_inner(did_hash)?;
         Ok(Some(acc.into_account(did_hash.to_string(), count as u32)))
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        // Checked under the write lock, so an existing account is never
+        // replaced. A record holding only queue counters is completed, and
+        // its counters kept: they describe messages that are really queued.
+        let counters = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_create:get", e))?
+        {
+            Some(raw) => {
+                let existing: StoredAccount = Self::decode(&raw)?;
+                if existing.is_account {
+                    return Ok(None);
+                }
+                existing
+            }
+            None => StoredAccount::default(),
+        };
         let mut record = StoredAccount {
+            role: AccountType::Standard,
             acls: acls.to_u64(),
-            ..Default::default()
+            queue_send_limit: None,
+            queue_receive_limit: None,
+            is_account: true,
+            ..counters
         };
         if let Some(limit) = queue_limit {
             record.queue_send_limit = Some(limit as i32);
             record.queue_receive_limit = Some(limit as i32);
         }
-        let _guard = self.write_lock.lock().await;
         let mut batch = self.db.batch();
         batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
         // A fresh account starts with no activity and no counters, whatever
@@ -2215,7 +2249,7 @@ impl MediatorStore for FjallStore {
         batch
             .commit()
             .map_err(|e| Self::db_err("account_add:insert", e))?;
-        Ok(record.into_account(did_hash.to_string(), 0))
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
     }
 
     async fn account_remove(
@@ -2515,6 +2549,12 @@ impl MediatorStore for FjallStore {
             }
             let did_hash = String::from_utf8(key.as_ref().to_vec()).unwrap_or_default();
             let acc: StoredAccount = Self::decode(&value)?;
+            // A record holding only queue counters is not an account; it is
+            // counted towards the cursor so paging stays stable.
+            if !acc.is_account {
+                total_seen += 1;
+                continue;
+            }
             let count = self.access_list_count_inner(&did_hash)? as u32;
             accounts.push(acc.into_account(did_hash, count));
             total_seen += 1;
@@ -2543,6 +2583,8 @@ impl MediatorStore for FjallStore {
             None => StoredAccount::default(),
         };
         record.role = *account_type;
+        // A role makes the record an account, as `ROLE_TYPE` does on Redis.
+        record.is_account = true;
 
         let mut batch = self.db.batch();
         batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
@@ -2605,6 +2647,8 @@ impl MediatorStore for FjallStore {
             None => StoredAccount::default(),
         };
         record.acls = acls.to_u64();
+        // ACLs make the record an account, as `ACLS` does on Redis.
+        record.is_account = true;
         self.accounts
             .insert(did_hash.as_bytes(), Self::encode(&record)?)
             .map_err(|e| Self::db_err("set_did_acl:insert", e))?;
@@ -2612,14 +2656,9 @@ impl MediatorStore for FjallStore {
     }
 
     async fn get_did_acl(&self, did_hash: &str) -> Result<Option<MediatorACLSet>, MediatorError> {
-        let Some(raw) = self
-            .accounts
-            .get(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("get_did_acl:get", e))?
-        else {
+        let Some(acc) = self.account_record(did_hash)? else {
             return Ok(None);
         };
-        let acc: StoredAccount = Self::decode(&raw)?;
         Ok(Some(MediatorACLSet::from_u64(acc.acls)))
     }
 
@@ -2640,12 +2679,7 @@ impl MediatorStore for FjallStore {
             mediator_acl_mode,
         };
         for did in dids {
-            if let Some(raw) = self
-                .accounts
-                .get(did.as_bytes())
-                .map_err(|e| Self::db_err("get_did_acls:get", e))?
-            {
-                let acc: StoredAccount = Self::decode(&raw)?;
+            if let Some(acc) = self.account_record(did)? {
                 let acls = MediatorACLSet::from_u64(acc.acls);
                 response.acl_response.push(
                     affinidi_messaging_sdk::protocols::mediator::acls_handler::MediatorACLExpanded {
@@ -2677,9 +2711,9 @@ impl MediatorStore for FjallStore {
         let Ok(Some(raw)) = self.accounts.get(to_hash.as_bytes()) else {
             return Ok(None);
         };
-        let acc: StoredAccount = match Self::decode(&raw) {
-            Ok(a) => a,
-            Err(_) => return Ok(None),
+        let acc = match Self::decode::<StoredAccount>(&raw) {
+            Ok(a) if a.is_account => a,
+            _ => return Ok(None),
         };
         let acls = MediatorACLSet::from_u64(acc.acls);
         let sender = match from_hash {
@@ -2833,10 +2867,10 @@ impl MediatorStore for FjallStore {
         admin_type: AccountType,
         acls: &MediatorACLSet,
     ) -> Result<(), MediatorError> {
-        let exists = self.account_exists(admin_did_hash).await?;
-        if !exists {
-            self.account_add(admin_did_hash, acls, None).await?;
-        }
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
         let _guard = self.write_lock.lock().await;
         let mut record: StoredAccount = self
             .accounts
@@ -3759,10 +3793,7 @@ impl MediatorStore for FjallStore {
         // Under the write lock, so it cannot interleave with `account_remove`
         // and leave a removed account's record behind.
         let _guard = self.write_lock.lock().await;
-        let exists = self
-            .accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_activity_record:accounts.get", e))?;
+        let exists = self.account_record(did_hash)?.is_some();
         if !exists {
             return Ok(());
         }
@@ -3802,11 +3833,7 @@ impl MediatorStore for FjallStore {
         delta: AccountStatsDelta,
     ) -> Result<(), MediatorError> {
         let _guard = self.write_lock.lock().await;
-        if !self
-            .accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_stats_bump:accounts.get", e))?
-        {
+        if self.account_record(did_hash)?.is_none() {
             return Ok(());
         }
         let key = stats_key(did_hash);
@@ -4481,6 +4508,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let community = hash("community");
+        store
+            .account_add(&community, &MediatorACLSet::default(), None)
+            .await
+            .expect("sender account");
 
         for i in 0..250 {
             let member = hash(&format!("member-{i}"));
@@ -5655,6 +5686,12 @@ mod idempotent_store_tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let (to, from) = (hash("vta"), hash("control"));
+        for did in [&from, &to] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account");
+        }
 
         let a = store
             .store_message("s", "same-bytes", &to, Some(&from), 0, 0)

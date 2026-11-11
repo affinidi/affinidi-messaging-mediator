@@ -204,25 +204,26 @@ pub(super) async fn register_account_after_proof(
     state: &SharedData,
     did_hash: &str,
 ) -> Result<(), MediatorError> {
-    let acls = match state.database.get_did_acl(did_hash).await? {
-        Some(acls) => acls,
-        None => {
-            if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+    let acls = if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+        match state.database.get_did_acl(did_hash).await? {
+            Some(acls) => acls,
+            None => {
                 info!(
                     "DID({}) has no account and mediator_acl_mode is explicit_allow — rejecting",
                     did_hash
                 );
                 return Err(blocked());
             }
-            // An account that appeared since the read above (an admin adding
-            // it) is not an error: the ACLs `account_add` returns are the
-            // ones checked below.
-            let account = state
-                .database
-                .account_add(did_hash, &state.config.security.global_acl_default, None)
-                .await?;
-            MediatorACLSet::from_u64(account.acls)
         }
+    } else {
+        // Create-if-absent in one atomic store step: an existing account —
+        // including one an admin added or changed since the challenge — is
+        // returned unchanged, and its ACLs are the ones checked below.
+        let account = state
+            .database
+            .account_add(did_hash, &state.config.security.global_acl_default, None)
+            .await?;
+        MediatorACLSet::from_u64(account.acls)
     };
 
     if !authz::grants(&acls, Capability::NotBlocked) {

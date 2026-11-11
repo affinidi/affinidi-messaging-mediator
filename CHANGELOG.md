@@ -30,6 +30,81 @@ mediator-tui 0.11.0); they are no longer updated.
   title says when the view covers this instance only.
 - Needs affinidi-messaging-sdk 0.45.6 (`TrustTasksOps::mux_connections`).
 
+### Changed — a forward is delivered only to a next hop that has an account
+
+- A forward never creates an account. A local next hop with no account on
+  this mediator is refused with `73 delivery.refused`; it used to be
+  registered with `global_acl_default`, in either `mediator_acl_mode`. A
+  recipient gets its account by authenticating (or from an admin) before
+  forwards to it are accepted.
+- A forward from a DID with no account here is still checked against the
+  least-privilege relay ACL (`SEND_FORWARDED` only, if `global_acl_default`
+  grants it), but that DID is no longer registered. Its queued messages
+  are still counted per recipient, so `limits.queue.peer` holds it as it
+  holds any sender; `limits.queue.sender` (a per-account total) does not
+  apply to it. An abandoned relay has no inbox here to report to (logged as
+  `FORWARD_PROBLEM_REPORT_UNSENT`). Recipient-side checks, including access
+  lists, see the sender's DID.
+- A next hop this mediator cannot route is refused instead of stored where
+  nothing would collect it. One whose DID document publishes a DIDComm
+  service with no usable endpoint, or names a mediator whose document has
+  no endpoint URL, gets `73 delivery.refused`. One that names a mediator
+  whose DID cannot be resolved gets `74 did.resolve` with 503, so the sender
+  can retry. Previously each was stored locally, logged "Storing locally —
+  it will not be delivered", and answered as forwarded.
+- A next hop whose own DID cannot be resolved is treated as local: it is
+  delivered if it holds an account here, so a resolver outage does not stop
+  local delivery, and refused with `73` otherwise.
+- A forward is answered as forwarded only once it is stored: a storage
+  failure while storing it locally is now returned to the sender instead of
+  being logged and answered with success. An `ephemeral` forward is accepted
+  only when it is handed to the recipient's live stream; a recipient with no
+  live stream gets `73 delivery.refused`, and a failed publish a 503.
+
+**Behaviour change (R3.6):** a deployment that forwards to recipients
+before they have ever authenticated must now pre-register them with
+`messaging/account/add` (admin). Senders that relied on an unresolvable or
+unroutable next hop being accepted, or on `ephemeral` forwards to an
+offline recipient succeeding, now get an error.
+
+### Changed — `account/add` is admin-only and never replaces an existing account
+
+- `messaging/account/add` for a DID that already has an account is refused
+  with `messaging/account/add:alreadyExists` (409), and the account is left
+  as it was. It used to be written afresh: role back to `standard`, ACLs
+  back to `global_acl_default`, queue limits, counters, activity and stats
+  cleared. Use `messaging/account/update` to change an existing account.
+- `messaging/account/add` now requires an `Admin` or `RootAdmin` account in
+  both `mediator_acl_mode`s. In `explicit_deny` any authenticated account
+  could call it; its own account always exists by then (authentication
+  creates it), so the only accounts it could add were other DIDs'.
+- `MediatorStore` gains `account_create`, which creates an account only if
+  none exists and returns `None` otherwise, with the check and the write in
+  one atomic step (a Lua script on Redis; under the store lock on memory and
+  Fjall). `account_add` is now a provided method built on it: it creates
+  the account or returns the existing one unchanged, so two first-contact
+  requests racing can no longer reset an account's counters. Login
+  registration (`/authenticate`, `/tsp/authenticate`) creates the account
+  through it in one step, so an account an admin adds or changes while a
+  login is in flight is used as it is. A third-party
+  `MediatorStore` implements `account_create` in place of `account_add`.
+- Storing a message for a party with no account keeps queue counters for
+  it, and every backend now agrees that those counters alone are not an
+  account: it is not found by `account_exists` / `account_get`, not listed,
+  not given ACLs (and so not admitted in `explicit_allow`), and
+  `account_create` completes the record, keeping its counters. Memory and
+  Fjall used to treat such a record as a deny-all account; Redis's
+  `account_exists` counted it too. Fjall marks records with a new
+  `is_account` field; records written before it read as accounts.
+- Admin set-up at start completes such a record before setting the role,
+  so the mediator and root-admin accounts never end up without ACLs.
+- `account/add` checks the caller's role in the store, not the role cached
+  in its session.
+
+**Behaviour change (R3.6):** a non-admin client calling
+`messaging/account/add`, or any caller re-adding an existing account to
+reset it, now gets an error.
+
 ### Fixed — live delivery across mediator instances (Redis)
 
 Two instances of one mediator share Redis, and each DID's live-streaming
