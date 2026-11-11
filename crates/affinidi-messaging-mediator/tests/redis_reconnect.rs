@@ -169,6 +169,7 @@ async fn redis_store_recovers_after_connections_drop() {
         expires_at: 9_999_999_999,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     recovers("forward_queue_enqueue", || {
         store.forward_queue_enqueue(&entry, 1000)
