@@ -70,6 +70,8 @@ pub struct ForwardingConfig {
     /// fallback). An attempt that runs over is a retryable failure. Keep it
     /// above 60: a WebSocket attempt (connect, send and the peer's ack) takes
     /// at most 30 s before the REST fallback, which has 30 s of its own.
+    /// Below 90 the WebSocket attempt is cut to a third of this, so the
+    /// fallback always has time; below 60 a warning is logged at startup.
     #[serde(default = "default_delivery_timeout_seconds")]
     pub delivery_timeout_seconds: u64,
     /// Seconds a claimed queue entry may sit untouched before any processor

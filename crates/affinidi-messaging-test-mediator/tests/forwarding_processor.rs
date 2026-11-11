@@ -1340,3 +1340,45 @@ async fn a_websocket_upgrade_that_never_completes_falls_back_to_rest() {
         "{accepted:?}"
     );
 }
+
+/// With a delivery timeout shorter than the WebSocket limits, the WebSocket
+/// attempt is cut to a share of it, so a stalled upgrade still falls back to
+/// REST inside the same delivery attempt rather than being cancelled with it.
+#[tokio::test]
+async fn a_short_delivery_timeout_still_leaves_time_for_the_rest_fallback() {
+    let stalling = spawn_mediator_refusing_websocket(Duration::from_secs(3600)).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    store
+        .forward_queue_enqueue(&forward_entry(&stalling.endpoint_url, "short-timeout"), 0)
+        .await
+        .expect("enqueue");
+
+    let observer = Arc::new(RecordingObserver::default());
+    let processor = ForwardingProcessor::new(
+        ForwardingConfig {
+            ws_threshold_msgs_per_10s: 0,
+            // The WebSocket attempt gets a third: 2 s.
+            delivery_timeout_seconds: 6,
+            ..test_config()
+        },
+        store.clone(),
+    )
+    .expect("create processor")
+    .with_observer(observer.clone());
+    tokio::spawn(async move {
+        let _ = processor.start().await;
+    });
+
+    assert_queue_drains(&store).await;
+    let accepted = stalling.accepted.lock().expect("accepted log").clone();
+    assert_eq!(
+        accepted.get("short-timeout").copied(),
+        Some(1),
+        "{accepted:?}"
+    );
+    let outcomes = observer.outcomes.lock().expect("observer log").clone();
+    assert!(
+        matches!(outcomes.as_slice(), [(_, ForwardOutcome::Relayed { .. })]),
+        "delivered on the first attempt: {outcomes:?}"
+    );
+}

@@ -13,11 +13,18 @@ mediator-tui 0.11.0); they are no longer updated.
 - Every step of a WebSocket relay attempt to a next-hop mediator now has a
   limit: name resolution, TCP connect, TLS and the upgrade together get 10 s;
   the whole attempt (pooled socket, a reconnect if that failed, the send and
-  the peer's `relay-ack`) gets 30 s. The close handshake on a discarded
-  socket runs on its own task, bounded at 5 s. A next hop that accepts the
-  connection and never completes the handshake used to hold the attempt until
-  `delivery_timeout_seconds` ran out, with no REST fallback, and the same
-  thing happened on every retry; it now falls back to REST after 10 s.
+  the peer's `relay-ack`) gets 30 s, or a third of `delivery_timeout_seconds`
+  if that is less, so the REST fallback always has time left. The close
+  handshake on a discarded socket runs on its own task, bounded at 5 s. A
+  next hop that accepts the connection and never completes the handshake used
+  to hold the attempt until `delivery_timeout_seconds` ran out, with no REST
+  fallback, and the same thing happened on every retry; it now falls back to
+  REST after 10 s.
+- When a next-hop name resolves to several addresses, each gets a share of
+  the connect time (at least 2 s), so one that never answers does not stop
+  the others being tried.
+- The processor logs a warning at startup when `delivery_timeout_seconds` is
+  below 60.
 - The socket is dialed at an address that the egress policy admitted. A
   next-hop name is resolved once, through the same guarded resolver the REST
   client uses, and the connection goes to one of those addresses; TLS SNI,

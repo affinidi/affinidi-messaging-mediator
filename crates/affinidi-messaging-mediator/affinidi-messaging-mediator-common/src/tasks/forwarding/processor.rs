@@ -853,6 +853,17 @@ impl ForwardingProcessor {
             );
         }
 
+        if self.config.delivery_timeout_seconds < 60 {
+            let ws = ws_limits_for(Duration::from_secs(
+                self.config.delivery_timeout_seconds.max(1),
+            ));
+            warn!(
+                "delivery_timeout_seconds ({}) is below 60: a WebSocket relay attempt is cut to                  {} ms to leave time for the REST fallback, and the REST request may itself be                  cut short of its 30 s",
+                self.config.delivery_timeout_seconds,
+                ws.attempt.as_millis()
+            );
+        }
+
         let reclaim_idle = Duration::from_secs(self.config.reclaim_idle_seconds.max(1));
         let refresh_every = reclaim_idle / 4;
         let sweep_every = reclaim_idle / 2;
@@ -1962,8 +1973,8 @@ impl ForwardingProcessor {
     /// sends this endpoint back to REST (and, via the suppression window, keeps
     /// it there for a while).
     ///
-    /// The whole attempt is bounded by [`WS_LIMITS`], so a peer that stalls at
-    /// any step leaves time for the REST fallback inside the delivery timeout.
+    /// The whole attempt is bounded by [`ws_limits_for`] the delivery timeout,
+    /// so a peer that stalls at any step leaves time for the REST fallback.
     async fn deliver_via_websocket(
         &self,
         endpoint_url: &str,
@@ -1981,16 +1992,19 @@ impl ForwardingProcessor {
 
         let frame = msg.message.clone();
         let id = frame_id(frame.as_bytes());
-        let policy = self.http_pool.policy.clone();
+        let resolver = GuardedResolver::new(self.http_pool.policy.clone());
+        let limits = ws_limits_for(Duration::from_secs(
+            self.config.delivery_timeout_seconds.max(1),
+        ));
 
         relay_frame(
             &self.ws_pool,
             endpoint_url,
             &ws_url,
-            || resolve_vetted(policy, vetted),
+            || resolve_vetted(resolver, vetted),
             &frame,
             &id,
-            WS_LIMITS,
+            limits,
         )
         .await
     }
@@ -2026,23 +2040,40 @@ type RelaySocket =
 #[derive(Clone, Copy, Debug)]
 struct WsLimits {
     /// The whole attempt: the pooled socket, a new connection if that one
-    /// failed, the send and the peer's [`RelayAck`]. Matches the REST client's
-    /// request timeout, so a stalled peer costs the same on either transport
-    /// and the REST fallback still fits in `delivery_timeout_seconds`.
+    /// failed, the send and the peer's [`RelayAck`]. See [`ws_limits_for`].
     attempt: Duration,
     /// Opening a new connection: name resolution, TCP connect, TLS and the
     /// WebSocket upgrade, together.
     connect: Duration,
+    /// The least time one resolved address is given before the next is tried
+    /// (unless less than that is left). Each address otherwise gets an equal
+    /// share of what remains of `connect`.
+    per_address_min: Duration,
     /// The close handshake on a socket that is being discarded. It runs on its
     /// own task, so the delivery never waits for it.
     close: Duration,
 }
 
-const WS_LIMITS: WsLimits = WsLimits {
-    attempt: Duration::from_secs(30),
-    connect: Duration::from_secs(10),
-    close: Duration::from_secs(5),
-};
+/// The longest a WebSocket attempt may take. Matches the REST client's request
+/// timeout, so a stalled peer costs the same on either transport.
+const WS_ATTEMPT_MAX: Duration = Duration::from_secs(30);
+
+/// The limits on a WebSocket attempt inside a delivery attempt of
+/// `delivery_timeout`.
+///
+/// The WebSocket attempt gets at most a third of the delivery timeout (and at
+/// most [`WS_ATTEMPT_MAX`]), so that however short the delivery timeout is
+/// configured, a stalled WebSocket attempt ends with time left for the REST
+/// fallback rather than being cancelled with the delivery attempt.
+fn ws_limits_for(delivery_timeout: Duration) -> WsLimits {
+    let attempt = WS_ATTEMPT_MAX.min(delivery_timeout / 3);
+    WsLimits {
+        attempt,
+        connect: Duration::from_secs(10).min(attempt),
+        per_address_min: Duration::from_secs(2),
+        close: Duration::from_secs(5),
+    }
+}
 
 /// Relay one frame over the endpoint's pooled socket, or a new one, and wait
 /// for the peer's [`RelayAck`].
@@ -2102,16 +2133,21 @@ where
 
     // No usable connection — open one to a vetted address, negotiating
     // `relay-ack`.
-    let connect_deadline = deadline.min(tokio::time::Instant::now() + limits.connect);
-    let (mut stream, response) =
-        tokio::time::timeout_at(connect_deadline, open_relay_socket(ws_url, resolve))
-            .await
-            .map_err(|_| {
-                format!(
-                    "WebSocket connect to {ws_url} did not complete within {}s",
-                    limits.connect.min(limits.attempt).as_secs()
-                )
-            })??;
+    let connect_started = tokio::time::Instant::now();
+    let connect_deadline = deadline.min(connect_started + limits.connect);
+    let (mut stream, response) = tokio::time::timeout_at(
+        connect_deadline,
+        open_relay_socket(ws_url, resolve, connect_deadline, limits.per_address_min),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "WebSocket connect to {ws_url} did not complete within the {} ms allowed",
+            connect_deadline
+                .saturating_duration_since(connect_started)
+                .as_millis()
+        )
+    })??;
 
     // The subprotocol IS the negotiation: a peer that doesn't echo it cannot
     // acknowledge frames, so it must not be relayed to over this socket. (An
@@ -2165,51 +2201,82 @@ where
     }
 }
 
-/// Resolve `ws_url`'s host to addresses, connect TCP to the first that answers
-/// and run the TLS and WebSocket handshakes over that connection.
+/// Resolve `ws_url`'s host to addresses and open the relay socket on the first
+/// of them that completes TCP connect, TLS and the WebSocket upgrade by
+/// `deadline`.
+///
+/// Each address gets an equal share of the time left (at least
+/// `per_address_min`, unless less than that is left), so an address that
+/// never answers — an unreachable IPv6 address listed first, say — does not
+/// use up the time the others need.
 ///
 /// The request still names the host, so TLS SNI, certificate validation and
 /// the `Host` header are those of the name; only the address is pinned. The
-/// caller bounds the whole of this.
+/// caller must bound the whole of this by `deadline`.
 async fn open_relay_socket<R, F>(
     ws_url: &str,
     resolve: R,
+    deadline: tokio::time::Instant,
+    per_address_min: Duration,
 ) -> Result<(RelaySocket, tungstenite::handshake::client::Response), String>
 where
     R: FnOnce() -> F,
     F: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
 {
-    let mut request = ws_url
-        .into_client_request()
-        .map_err(|e| format!("WebSocket request for {ws_url} is not valid: {e}"))?;
-    request.headers_mut().insert(
-        tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-        tungstenite::http::HeaderValue::from_static(RELAY_ACK_SUBPROTOCOL),
-    );
+    let request = || {
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|e| format!("WebSocket request for {ws_url} is not valid: {e}"))?;
+        request.headers_mut().insert(
+            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            tungstenite::http::HeaderValue::from_static(RELAY_ACK_SUBPROTOCOL),
+        );
+        Ok::<_, String>(request)
+    };
+    // Checked before anything is dialed.
+    request()?;
 
     let addrs = resolve().await?;
     let mut last_error = None;
-    let mut tcp = None;
-    for addr in &addrs {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                tcp = Some(stream);
-                break;
-            }
-            Err(e) => last_error = Some(format!("{addr}: {e}")),
+    for (i, addr) in addrs.iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        if left.is_zero() {
+            break;
         }
+        let share = (left / (addrs.len() - i) as u32)
+            .max(per_address_min)
+            .min(left);
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = tcp.set_nodelay(true);
+            tokio_tungstenite::client_async_tls_with_config(request()?, tcp, None, None)
+                .await
+                .map_err(|e| e.to_string())
+        };
+        // An address given all the time that is left runs to the caller's
+        // deadline, which bounds this whole function and reports the time
+        // allowed.
+        let outcome = if share >= left {
+            Ok(attempt.await)
+        } else {
+            tokio::time::timeout(share, attempt).await
+        };
+        match outcome {
+            Ok(Ok(opened)) => return Ok(opened),
+            Ok(Err(e)) => last_error = Some(format!("{addr}: {e}")),
+            Err(_) => {
+                last_error = Some(format!("{addr}: no answer within {} ms", share.as_millis()))
+            }
+        }
+        debug!("WebSocket connect to {ws_url} via {addr} failed; trying the next address");
     }
-    let tcp = tcp.ok_or_else(|| {
-        format!(
-            "WebSocket connect to {ws_url} failed: {}",
-            last_error.unwrap_or_else(|| "no addresses".into())
-        )
-    })?;
-    let _ = tcp.set_nodelay(true);
-
-    tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None)
-        .await
-        .map_err(|e| format!("WebSocket connect to {ws_url} failed: {e}"))
+    Err(format!(
+        "WebSocket connect to {ws_url} failed: {}",
+        last_error.unwrap_or_else(|| "no addresses".into())
+    ))
 }
 
 /// The addresses a vetted WebSocket URL may be dialed at.
@@ -2220,7 +2287,7 @@ where
 /// the addresses returned here, so there is no second lookup to answer
 /// differently.
 async fn resolve_vetted(
-    policy: EgressPolicy,
+    resolver: GuardedResolver,
     vetted: affinidi_net_guard::VettedUrl,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
     use reqwest::dns::Resolve;
@@ -2236,7 +2303,7 @@ async fn resolve_vetted(
             let host: reqwest::dns::Name = name
                 .parse()
                 .map_err(|e| format!("WebSocket host {name} is not a valid name: {e}"))?;
-            let addrs = GuardedResolver::new(policy)
+            let addrs = resolver
                 .resolve(host)
                 .await
                 .map_err(|e| format!("Refusing WebSocket relay to {name}: {e}"))?;
@@ -3032,6 +3099,7 @@ mod tests {
         WsLimits {
             attempt: Duration::from_millis(attempt_ms),
             connect: Duration::from_millis(connect_ms),
+            per_address_min: Duration::from_millis(100),
             close: Duration::from_millis(200),
         }
     }
@@ -3067,6 +3135,12 @@ mod tests {
     /// Accepts the upgrade, records its `Host`, and acknowledges each frame
     /// after `ack_delay` — or never, if `None`.
     async fn relay_peer(ack_delay: Option<Duration>) -> RelayPeer {
+        relay_peer_closing(ack_delay, false).await
+    }
+
+    /// As [`relay_peer`]; with `close_after_ack`, each connection is dropped
+    /// right after its first ack.
+    async fn relay_peer_closing(ack_delay: Option<Duration>, close_after_ack: bool) -> RelayPeer {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3111,6 +3185,7 @@ mod tests {
                             .send(tungstenite::Message::Text(ack.into()))
                             .await
                             .is_err()
+                            || close_after_ack
                         {
                             return;
                         }
@@ -3299,7 +3374,138 @@ mod tests {
         let vetted = policy
             .vet("wss://93.184.216.34/ws")
             .expect("public literal");
-        let addrs = resolve_vetted(policy, vetted).await.expect("resolved");
+        let addrs = resolve_vetted(GuardedResolver::new(policy), vetted)
+            .await
+            .expect("resolved");
         assert_eq!(addrs, vec!["93.184.216.34:443".parse().unwrap()]);
+    }
+
+    /// A name that resolves to an address the policy does not admit is
+    /// refused, and nothing is returned to dial.
+    #[tokio::test]
+    async fn a_name_resolving_to_a_private_address_is_refused() {
+        use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+
+        struct Private;
+        impl Resolve for Private {
+            fn resolve(&self, _: Name) -> Resolving {
+                Box::pin(async {
+                    let addrs: Vec<std::net::SocketAddr> = vec![
+                        "93.184.216.34:0".parse().unwrap(),
+                        "10.0.0.7:0".parse().unwrap(),
+                    ];
+                    Ok(Box::new(addrs.into_iter()) as Addrs)
+                })
+            }
+        }
+
+        let policy = EgressPolicy::public_internet();
+        let vetted = policy.vet("wss://relay.example.com/ws").expect("vetted");
+        let resolver = GuardedResolver::new(policy).with_inner(Arc::new(Private));
+        let err = resolve_vetted(resolver, vetted)
+            .await
+            .expect_err("a private answer fails the name");
+        assert!(err.contains("relay.example.com"), "{err}");
+    }
+
+    /// The WebSocket attempt always leaves part of the delivery attempt for
+    /// the REST fallback, however short the delivery timeout is.
+    #[test]
+    fn the_websocket_attempt_leaves_time_for_the_fallback() {
+        let default = ws_limits_for(Duration::from_secs(90));
+        assert_eq!(default.attempt, Duration::from_secs(30));
+        assert_eq!(default.connect, Duration::from_secs(10));
+
+        for secs in [1, 5, 20, 45, 60] {
+            let delivery = Duration::from_secs(secs);
+            let limits = ws_limits_for(delivery);
+            assert!(limits.attempt * 3 <= delivery, "{secs}s: {limits:?}");
+            assert!(limits.connect <= limits.attempt, "{secs}s: {limits:?}");
+        }
+    }
+
+    /// An address that accepts and never completes the handshake gets only
+    /// its share of the connect time; the next address is then tried.
+    #[tokio::test]
+    async fn an_unresponsive_first_address_does_not_use_up_the_connect_time() {
+        let stalled = silent_listener().await;
+        let peer = relay_peer(Some(Duration::ZERO)).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let port = peer.addr.port();
+        let second = peer.addr;
+        let started = Instant::now();
+
+        relay_frame(
+            &pool,
+            "two-addresses",
+            &format!("ws://relay.invalid:{port}/ws"),
+            move || std::future::ready(Ok(vec![stalled, second])),
+            "frame",
+            &frame_id(b"frame"),
+            limits(5_000, 2_000),
+        )
+        .await
+        .expect("the second address answers");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(1_800), "{elapsed:?}");
+        assert_eq!(peer.hosts.lock().expect("hosts").len(), 1);
+    }
+
+    /// The connect error names the time actually allowed, which is what is
+    /// left of the attempt when that is less than the connect limit.
+    #[tokio::test]
+    async fn the_connect_error_reports_the_time_allowed() {
+        let stalled = silent_listener().await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let err = relay_frame(
+            &pool,
+            "stalled",
+            &format!("ws://{stalled}/ws"),
+            resolved_to(stalled),
+            "frame",
+            &frame_id(b"frame"),
+            limits(300, 10_000),
+        )
+        .await
+        .expect_err("stalled");
+        // What was left of the 300 ms attempt, not the 10 s connect limit.
+        let allowed: u64 = err
+            .split("within the ")
+            .nth(1)
+            .and_then(|rest| rest.split(" ms allowed").next())
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!((200..=300).contains(&allowed), "{err}");
+    }
+
+    /// A pooled socket the peer has since closed is discarded and a new
+    /// connection carries the frame.
+    #[tokio::test]
+    async fn a_closed_pooled_socket_is_replaced_by_a_new_connection() {
+        let peer = relay_peer_closing(Some(Duration::ZERO), true).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let ws_url = format!("ws://{}/ws", peer.addr);
+
+        for frame in ["first", "second"] {
+            relay_frame(
+                &pool,
+                "peer",
+                &ws_url,
+                resolved_to(peer.addr),
+                frame,
+                &frame_id(frame.as_bytes()),
+                limits(5_000, 1_000),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{frame}: {e}"));
+            // Let the peer's close reach this side.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            peer.hosts.lock().expect("hosts").len(),
+            2,
+            "reconnected once"
+        );
+        assert_eq!(pool.lock().await.len(), 1);
     }
 }
