@@ -353,11 +353,14 @@ its own DID hash and is gated like a Standard account.
 
 `Admin`, `RootAdmin` and `Mediator` are privileged roles. Only a RootAdmin
 may create an account with one, grant one, change the role of an account
-holding one, or change or remove an account holding one other than its own.
-An Admin manages Standard accounts.
+holding one, or change, remove or edit the access list of an account holding
+one other than its own. An account whose stored role did not decode is
+treated the same way, so only a RootAdmin can change or repair it. An Admin
+manages Standard accounts. The roles of the mediator's own account and of
+the configured `admin_did` are not changed by any Trust Task.
 
-The caller's role is read from the store for each request, not from the
-session token.
+The caller's role is read from the store for each Trust Task and OOB
+invitation delete, not from the session token.
 
 ### Who a request acts for
 

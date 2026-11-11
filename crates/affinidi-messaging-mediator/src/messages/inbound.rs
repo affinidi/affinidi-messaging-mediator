@@ -563,6 +563,9 @@ async fn dispatch_tsp_trust_task(
     raw: &serde_json::Value,
 ) -> Result<InboundMessageResponse, MediatorError> {
     let now_secs = state.clock.unix_secs();
+    // A refusal is threaded to the task, as the DIDComm dispatcher threads
+    // one to the message carrying it, so the caller can match it.
+    let task_id = doc.id.clone();
 
     // The sender VID is the framework identity; TSP VIDs carry no key fragment,
     // so it is already the shape `consume` wants.
@@ -575,7 +578,8 @@ async fn dispatch_tsp_trust_task(
         now_secs,
         trust_tasks::TaskTransport::Tsp,
     )
-    .await?
+    .await
+    .map_err(|e| e.threaded_to(&task_id))?
     else {
         // A ping identity mismatch emits nothing — same as the DIDComm path.
         return Ok(InboundMessageResponse::Stored(

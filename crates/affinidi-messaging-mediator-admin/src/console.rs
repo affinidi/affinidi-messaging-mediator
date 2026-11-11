@@ -27,7 +27,9 @@ pub type Target = Option<String>;
 pub enum Mode {
     /// An administrator: sees and manages every account. `root` adds the
     /// rootAdmin-only operations (reading another account's message bodies,
-    /// acting on privileged accounts' queues, assigning rootAdmin).
+    /// granting or changing a privileged role — admin, rootAdmin, mediator —
+    /// and changing, removing or acting on the queues of another privileged
+    /// account).
     Admin { root: bool },
     /// Any other account: its own queues, messages, settings and traffic.
     SelfService,
@@ -41,7 +43,8 @@ pub struct Capabilities {
     /// Mediator-wide views: stats, the queue ranking, any account's queues and
     /// message metadata, the audit log, configuration, monitoring everyone.
     pub mediator_wide: bool,
-    /// Read another account's message body; act on a privileged account's queue.
+    /// Read another account's message body; grant or change a privileged role;
+    /// change, remove or act on the queues of another privileged account.
     pub root: bool,
     /// The account is served locally (has queues here). Needed for self-service
     /// message operations.
@@ -569,8 +572,15 @@ impl MediatorConsole {
         limits: Option<account::update::v0_2::QueueLimits>,
     ) -> Result<account::update::v0_2::Account> {
         self.require_target(&target, "another account")?;
-        if role.is_some() {
+        if let Some(role) = &role {
             self.require_admin("changing a role")?;
+            // Granting a privileged role is the mediator's rootAdmin-only rule;
+            // checked here so the console can say so before the round trip.
+            if *role != account::update::v0_2::AccountType::Standard && !self.capabilities.root {
+                return Err(ConsoleError::NotPermitted(
+                    "granting a privileged role needs a rootAdmin",
+                ));
+            }
         }
         self.atm
             .trust_tasks()

@@ -17,10 +17,15 @@
 //!   or changing or removing an account that holds one (other than one's own),
 //!   is reserved to `RootAdmin`.
 //!
-//! The caller's role is read from the store once per request (see
-//! `trust_tasks::consume`), not taken from the session token.
+//! The caller's role is read from the store once per request ([`principal`]),
+//! not taken from the session token.
 
-use affinidi_messaging_mediator_common::types::accounts::AccountType;
+use affinidi_messaging_mediator_common::{
+    errors::MediatorError,
+    types::{accounts::AccountType, acls::MediatorACLSet},
+};
+
+use crate::{SharedData, common::session::Session};
 
 /// The role a stored account is treated as holding.
 ///
@@ -33,6 +38,34 @@ pub(crate) fn effective_role(stored: AccountType, listed_admin: bool) -> Account
         AccountType::Unknown => AccountType::Standard,
         role => role,
     }
+}
+
+/// The session a request is authorised as: `session` with its role and ACLs
+/// read from the store for this request.
+///
+/// Every handler then decides from the same, current answer. The role is the
+/// stored one, honoured as an administrator only when the store also lists the
+/// account as one (`check_admin_account`), and an `Unknown` role is read as
+/// `Standard` (see [`effective_role`]). An account the
+/// store no longer has is treated as `Standard` with the session's ACLs.
+pub(crate) async fn principal(
+    state: &SharedData,
+    session: &Session,
+) -> Result<Session, MediatorError> {
+    let mut principal = session.clone();
+    match state.database.account_get(&session.did_hash).await? {
+        Some(account) => {
+            let listed_admin = can_administer(account._type)
+                && state
+                    .database
+                    .check_admin_account(&session.did_hash)
+                    .await?;
+            principal.account_type = effective_role(account._type, listed_admin);
+            principal.acls = MediatorACLSet::from_u64(account.acls);
+        }
+        None => principal.account_type = AccountType::Standard,
+    }
+    Ok(principal)
 }
 
 /// Whether `role` may act on accounts other than its own.
@@ -53,12 +86,20 @@ pub(crate) fn is_privileged(role: AccountType) -> bool {
     )
 }
 
+/// Whether an existing account holding `role` is protected from other
+/// administrators: a privileged role, or `Unknown`. A stored role this build
+/// cannot decode might be a privileged one, so changing such an account is
+/// left to a root admin.
+pub(crate) fn is_protected_account(role: AccountType) -> bool {
+    is_privileged(role) || role == AccountType::Unknown
+}
+
 /// Whether `actor` may give an account the role `target`. `current` is the
 /// account's role now, or `None` when the account is being created.
 ///
 /// Any administrator may assign `Standard` to a standard account. Assigning a
-/// privileged role, or changing the role of an account that holds one, needs
-/// `RootAdmin`.
+/// privileged role, or changing the role of an account that holds one (or
+/// whose role is `Unknown`), needs `RootAdmin`.
 pub(crate) fn can_assign_role(
     actor: AccountType,
     current: Option<AccountType>,
@@ -67,23 +108,24 @@ pub(crate) fn can_assign_role(
     if !can_administer(actor) {
         return false;
     }
-    let touches_privileged = is_privileged(target) || current.is_some_and(is_privileged);
+    let touches_privileged = is_privileged(target) || current.is_some_and(is_protected_account);
     !touches_privileged || is_root(actor)
 }
 
 /// Whether an actor may change or remove the account `target_hash`, which
 /// holds `target_role`, as far as the target's role is concerned.
 ///
-/// An account holding a privileged role can be changed by itself or by a
-/// `RootAdmin`, and by nobody else. Other accounts are not restricted here;
-/// the caller's own self-or-admin check still applies.
+/// An account holding a privileged role, or whose role is `Unknown`, can be
+/// changed by itself or by a `RootAdmin`, and by nobody else. Other accounts
+/// are not restricted here; the caller's own self-or-admin check still
+/// applies.
 pub(crate) fn may_modify_account(
     actor_role: AccountType,
     actor_hash: &str,
     target_role: AccountType,
     target_hash: &str,
 ) -> bool {
-    !is_privileged(target_role) || target_hash == actor_hash || is_root(actor_role)
+    !is_protected_account(target_role) || target_hash == actor_hash || is_root(actor_role)
 }
 
 #[cfg(test)]
@@ -160,7 +202,8 @@ mod tests {
     fn an_admin_may_assign_the_standard_role() {
         assert!(can_assign_role(Admin, None, Standard));
         assert!(can_assign_role(Admin, Some(Standard), Standard));
-        assert!(can_assign_role(Admin, Some(Unknown), Standard));
+        assert!(!can_assign_role(Admin, Some(Unknown), Standard));
+        assert!(can_assign_role(RootAdmin, Some(Unknown), Standard));
         assert!(!can_assign_role(Standard, None, Standard));
     }
 
@@ -175,6 +218,8 @@ mod tests {
             assert!(may_modify_account(RootAdmin, "a", target, "b"));
         }
         assert!(may_modify_account(Admin, "a", Standard, "b"));
-        assert!(may_modify_account(Admin, "a", Unknown, "b"));
+        assert!(!may_modify_account(Admin, "a", Unknown, "b"));
+        assert!(may_modify_account(RootAdmin, "a", Unknown, "b"));
+        assert!(may_modify_account(Unknown, "b", Unknown, "b"));
     }
 }

@@ -234,7 +234,7 @@ pub(crate) async fn consume(
     // the two have to be the same account before any of them runs.
     crate::common::authz::require_session_sender(session, Some(&sender_did), None)?;
     // The caller's role and ACLs as the store holds them now.
-    let principal = principal(state, session).await?;
+    let principal = roles::principal(state, session).await?;
     let session = &principal;
 
     // Route by task type. The match is exhaustive over `ServedTask`, so a type
@@ -520,32 +520,6 @@ pub(crate) async fn consume(
     let response_value = trust_task_sign::sign_response(response_value, state).await?;
 
     Ok(Some(response_value))
-}
-
-/// The session a Trust Task is authorised as: `session` with its role and ACLs
-/// read from the store for this request.
-///
-/// Every handler then decides from the same, current answer. The role is the
-/// stored one, honoured as an administrator only when the store also lists the
-/// account as one (`check_admin_account`), and an `Unknown` role is read as
-/// `Standard` (see [`crate::common::roles::effective_role`]). An account the
-/// store no longer has is treated as `Standard` with the session's ACLs.
-async fn principal(state: &SharedData, session: &Session) -> Result<Session, MediatorError> {
-    let mut principal = session.clone();
-    match state.database.account_get(&session.did_hash).await? {
-        Some(account) => {
-            let listed_admin = crate::common::roles::can_administer(account._type)
-                && state
-                    .database
-                    .check_admin_account(&session.did_hash)
-                    .await?;
-            principal.account_type =
-                crate::common::roles::effective_role(account._type, listed_admin);
-            principal.acls = MediatorACLSet::from_u64(account.acls);
-        }
-        None => principal.account_type = AccountType::Standard,
-    }
-    Ok(principal)
 }
 
 /// Declares every Trust Task type this mediator serves — the **single list**.
@@ -928,6 +902,16 @@ async fn consume_account_update(
         if !roles::can_administer(session.account_type) {
             return Err(denied("admin access is required to change account types"));
         }
+        // The mediator's own account and the configured root admin keep the
+        // roles configuration gave them.
+        if is_configured_account(state, &target_hash) {
+            return Err(tt_problem(
+                session,
+                "account.update.protected",
+                "the roles of the mediator and root-admin accounts cannot be changed".to_string(),
+                StatusCode::FORBIDDEN,
+            ));
+        }
         // Granting a privileged role, or changing the role of an account that
         // holds one, is for a root admin.
         if !roles::can_assign_role(session.account_type, Some(current._type), new_type) {
@@ -1219,19 +1203,7 @@ async fn consume_account_remove(
     }
 
     // Never remove the mediator's own account or the root admin.
-    let protected = state
-        .config
-        .mediator_did_hash
-        .as_bytes()
-        .ct_eq(target_hash.as_bytes())
-        .unwrap_u8()
-        == 1
-        || affinidi_messaging_mediator_common::did_identity::did_hash(&state.config.admin_did)
-            .as_bytes()
-            .ct_eq(target_hash.as_bytes())
-            .unwrap_u8()
-            == 1;
-    if protected {
+    if is_configured_account(state, &target_hash) {
         return Err(tt_problem(
             session,
             "account.remove.protected",
@@ -1329,6 +1301,25 @@ async fn consume_account_remove(
     )?;
     let response_doc = typed.respond_with(Uuid::new_v4().to_string(), response);
     serde_json::to_value(&response_doc).map_err(serialize_err)
+}
+
+/// Whether `target_hash` is the mediator's own account or the configured root
+/// admin (`admin_did`), compared in constant time. Neither is removed, and
+/// neither has its role changed, through a Trust Task: both are set up from
+/// configuration at startup.
+fn is_configured_account(state: &SharedData, target_hash: &str) -> bool {
+    state
+        .config
+        .mediator_did_hash
+        .as_bytes()
+        .ct_eq(target_hash.as_bytes())
+        .unwrap_u8()
+        == 1
+        || affinidi_messaging_mediator_common::did_identity::did_hash(&state.config.admin_did)
+            .as_bytes()
+            .ct_eq(target_hash.as_bytes())
+            .unwrap_u8()
+            == 1
 }
 
 /// Handle `messaging/account/add`. Only an admin may add accounts, in either
@@ -1502,7 +1493,7 @@ async fn consume_acl_get(
 
 /// Access-list authz: self-or-admin for the target, plus the `self_manage_list`
 /// capability for a standard account performing a write.
-fn authorize_access_list(
+async fn authorize_access_list(
     state: &SharedData,
     session: &Session,
     sender_kid: &Option<String>,
@@ -1528,6 +1519,24 @@ fn authorize_access_list(
             session,
             "authorization.account.denied",
             "this account may not self-manage its access list".to_string(),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    // Another privileged account's list is changed only by a root admin.
+    if write
+        && let Some(target) = state.database.account_get(target_hash).await?
+        && !roles::may_modify_account(
+            session.account_type,
+            &session.did_hash,
+            target._type,
+            target_hash,
+        )
+    {
+        return Err(tt_problem(
+            session,
+            "authorization.permission",
+            "root-admin access is required to change a privileged account's access list"
+                .to_string(),
             StatusCode::FORBIDDEN,
         ));
     }
@@ -1653,7 +1662,7 @@ async fn consume_access_list_update(
     use access_list::update::v0_1::{Response, Vid};
     validate_tt_basic(&typed, session, mediator_did, now)?;
     let target_hash = typed.payload.did.to_string();
-    authorize_access_list(state, session, sender_kid, &target_hash, true)?;
+    authorize_access_list(state, session, sender_kid, &target_hash, true).await?;
 
     // 1. `clear` empties the list before any additions.
     if typed.payload.clear == Some(true) {
@@ -1745,7 +1754,7 @@ async fn consume_access_list_list(
     use access_list::list::v0_1::{Response, ResponseNextCursor, Vid};
     validate_tt_basic(&typed, session, mediator_did, now)?;
     let target_hash = typed.payload.did.to_string();
-    authorize_access_list(state, session, sender_kid, &target_hash, false)?;
+    authorize_access_list(state, session, sender_kid, &target_hash, false).await?;
 
     // Membership check (subsumes the retired `messaging/access-list/get`): return
     // exactly the supplied entries that are present; a supplied DID absent from

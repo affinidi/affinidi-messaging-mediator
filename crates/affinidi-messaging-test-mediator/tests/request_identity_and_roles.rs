@@ -109,9 +109,20 @@ async fn the_anonymous_relay_session_may_only_relay() {
     let bob = env.add_user("bob").await.expect("bob");
 
     // Requests the mediator would serve for alice are refused without a session.
+    let pickup_status = Message::build(
+        Uuid::new_v4().to_string(),
+        "https://didcomm.org/messagepickup/3.0/status-request".to_string(),
+        json!({}),
+    )
+    .from(alice.did.clone())
+    .to(mediator_did.clone())
+    .created_time(now())
+    .expires_time(now() + 60)
+    .finalize();
     for (name, msg) in [
         ("trust ping", trust_ping(&alice.did, &mediator_did)),
         ("trust task", account_get_task(&alice, &mediator_did)),
+        ("pickup status request", pickup_status),
     ] {
         let packed = authcrypt(&env, &msg, &mediator_did, &alice).await;
         let (status, body) = post_anonymous(&env, packed).await;
@@ -417,6 +428,161 @@ async fn an_unknown_role_is_gated_like_a_standard_account() {
         .account_list(&user.profile, None, None, None)
         .await;
     assert!(refused.is_err(), "an Unknown role may not list accounts");
+
+    env.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_admin_changes_only_its_own_or_a_standard_accounts_access_list() {
+    let env = TestEnvironment::spawn().await.expect("environment");
+    let admin = with_role(&env, "admin", StoreType::Admin).await;
+    let other_admin = with_role(&env, "other-admin", StoreType::Admin).await;
+    let root = with_role(&env, "root", StoreType::RootAdmin).await;
+    let unknown = env.add_user("unknown").await.expect("unknown");
+    env.mediator
+        .store()
+        .account_set_role(&unknown.did_hash(), &StoreType::Unknown)
+        .await
+        .expect("set Unknown role");
+    let bob = env.add_user("bob").await.expect("bob");
+    let carol = env.add_user("carol").await.expect("carol");
+    let mediator_hash =
+        affinidi_messaging_mediator_common::did_identity::did_hash(env.mediator.did());
+    let admin_did_hash =
+        affinidi_messaging_mediator_common::did_identity::did_hash(env.mediator.admin_did());
+
+    for target in [
+        root.did_hash(),
+        other_admin.did_hash(),
+        mediator_hash,
+        admin_did_hash,
+        unknown.did_hash(),
+    ] {
+        for (clear, add) in [(true, vec![]), (false, vec![carol.did_hash()])] {
+            let refused = env
+                .atm
+                .trust_tasks()
+                .access_list_update(&admin.profile, Some(target.clone()), clear, add, vec![])
+                .await;
+            assert!(
+                refused.is_err(),
+                "an admin may not change {target}'s access list (clear={clear})"
+            );
+        }
+    }
+
+    // Its own list and a standard account's list are still the admin's to change.
+    for target in [admin.did_hash(), bob.did_hash()] {
+        env.atm
+            .trust_tasks()
+            .access_list_update(
+                &admin.profile,
+                Some(target),
+                false,
+                vec![carol.did_hash()],
+                vec![],
+            )
+            .await
+            .expect("an admin changes its own or a standard account's list");
+    }
+    // A root admin changes another admin's list.
+    env.atm
+        .trust_tasks()
+        .access_list_update(
+            &root.profile,
+            Some(other_admin.did_hash()),
+            false,
+            vec![carol.did_hash()],
+            vec![],
+        )
+        .await
+        .expect("a root admin changes an admin's list");
+
+    env.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_admin_may_not_change_an_account_whose_role_did_not_decode() {
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::AccountType;
+
+    let env = TestEnvironment::spawn().await.expect("environment");
+    let admin = with_role(&env, "admin", StoreType::Admin).await;
+    let root = with_role(&env, "root", StoreType::RootAdmin).await;
+    let unknown = env.add_user("unknown").await.expect("unknown");
+    env.mediator
+        .store()
+        .account_set_role(&unknown.did_hash(), &StoreType::Unknown)
+        .await
+        .expect("set Unknown role");
+
+    let refused = env
+        .atm
+        .trust_tasks()
+        .account_update(
+            &admin.profile,
+            Some(unknown.did_hash()),
+            Some(AccountType::Standard),
+            None,
+            None,
+        )
+        .await;
+    assert!(refused.is_err(), "an admin may not reset an Unknown role");
+    assert_eq!(
+        stored_role(&env, &unknown.did_hash()).await,
+        StoreType::Unknown
+    );
+
+    env.atm
+        .trust_tasks()
+        .account_update(
+            &root.profile,
+            Some(unknown.did_hash()),
+            Some(AccountType::Standard),
+            None,
+            None,
+        )
+        .await
+        .expect("a root admin repairs it");
+    assert_eq!(
+        stored_role(&env, &unknown.did_hash()).await,
+        StoreType::Standard
+    );
+
+    env.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn the_configured_accounts_keep_their_roles() {
+    use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::AccountType;
+
+    let env = TestEnvironment::spawn().await.expect("environment");
+    let root = with_role(&env, "root", StoreType::RootAdmin).await;
+    let mediator_hash =
+        affinidi_messaging_mediator_common::did_identity::did_hash(env.mediator.did());
+    let admin_did_hash =
+        affinidi_messaging_mediator_common::did_identity::did_hash(env.mediator.admin_did());
+
+    for (target, role) in [
+        (mediator_hash, AccountType::Standard),
+        (admin_did_hash, AccountType::Admin),
+    ] {
+        let before = stored_role(&env, &target).await;
+        let refused = env
+            .atm
+            .trust_tasks()
+            .account_update(&root.profile, Some(target.clone()), Some(role), None, None)
+            .await
+            .expect_err("a configured account's role is not changed by a Trust Task");
+        assert!(
+            format!("{refused:?}").contains("account.update.protected"),
+            "refused as protected: {refused:?}"
+        );
+        assert_eq!(
+            stored_role(&env, &target).await,
+            before,
+            "{target} unchanged"
+        );
+    }
 
     env.shutdown().await.expect("shutdown");
 }

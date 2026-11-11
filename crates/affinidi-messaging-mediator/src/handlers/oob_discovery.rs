@@ -202,6 +202,8 @@ pub async fn delete_oobid_handler(
     State(state): State<SharedData>,
     oobid: Query<Parameters>,
 ) -> Result<(StatusCode, Json<SuccessResponse<String>>), AppError> {
+    // The caller's role as the store holds it now, as for Trust Tasks.
+    let session = crate::common::roles::principal(&state, &session).await?;
     // Check if non ADMIN level account, do they own this OOB invite?
     if !crate::common::roles::can_administer(session.account_type) {
         let oob_did_owner = match state
