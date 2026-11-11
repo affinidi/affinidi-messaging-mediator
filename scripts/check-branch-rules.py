@@ -15,13 +15,21 @@ Into `main`:
      workspace version: main carries the next release's version, set at the cut.
   4. No PR adds a `RELEASE` file: it marks a release branch.
 
+Either way:
+  5. A head branch whose name the rules above treat specially (`backport-…`,
+     `release-prep/…`, `release-cut/…`) must live in this repository. A fork
+     can name a branch anything, so only a branch pushed here carries the
+     meaning of its name.
+
 "The workspace version" is lockstep (scripts/release_lib.py): the root
 `[workspace.package] version`, plus any member that sets a literal
 `[package] version` instead of inheriting it. A base that has no workspace
 version yet (the repository's bootstrap) has nothing to protect, so the
 version rules don't apply to the PR that creates it.
 
-Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names).
+Environment: BASE_REF, HEAD_REF, LABELS (JSON list of label names), REPO
+(this repository, `owner/name`) and HEAD_REPO (the repository the head branch
+lives in). With either of the last two unset, rule 5 is not checked.
 """
 
 import json
@@ -61,6 +69,8 @@ def main():
     base = os.environ["BASE_REF"]
     head = os.environ["HEAD_REF"]
     labels = set(json.loads(os.environ.get("LABELS") or "[]"))
+    repo = os.environ.get("REPO") or ""
+    head_repo = os.environ.get("HEAD_REPO") or ""
     changed = git("diff", "--name-only", "HEAD^1", "HEAD").split()
 
     # A base with no `[workspace.package] version` has no workspace version to
@@ -79,6 +89,16 @@ def main():
     release_file = "RELEASE" in changed
 
     problems = []
+    tooling_name = re.match(r"(backport-\d+-to-release/|release-prep/|release-cut/)", head)
+    if tooling_name and repo and head_repo and head_repo != repo:
+        problems.append(
+            f"`{head}` is a release-tooling branch name, but this branch is in {head_repo}, "
+            f"not {repo}. Those names are only honoured on branches in {repo}; rename the "
+            "branch."
+        )
+        # Judge the rest as an ordinary branch.
+        head = f"{head_repo}:{head}"
+
     if base.startswith("release/"):
         name = base.removeprefix("release/")
         backport = re.fullmatch(rf"backport-\d+-to-release/{re.escape(name)}", head)

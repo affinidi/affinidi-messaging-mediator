@@ -176,12 +176,21 @@ crates and its images stay.
 
 Settings, not files:
 
-- **Ruleset on `release/**`:** require a PR, require the CI jobs, `branch
-  rules` and `DCO sign-off`, block force pushes and deletion.
-- **Ruleset on `main`:** require a PR, and require `branch rules` and `DCO
-  sign-off`.
-- **Ruleset on `nightly`:** block force pushes and deletion; only the
-  workflow's identity may update it.
+- **Ruleset `release branches`** (`release/**`): require a PR; require
+  `branch rules`, `DCO sign-off`, `cargo test (workspace)`, `cargo clippy`,
+  `cargo fmt` and `release guards`; block force pushes and deletion; only
+  admins and the `affinidi-semantic-release` app create a release branch
+  (`cut-release.py` is run by an admin) or push to one directly.
+- **Ruleset `main required checks`** (default branch): require `branch
+  rules`, `DCO sign-off`, `cargo test (workspace)`, `cargo clippy` and `cargo
+  fmt`. `Default_branch_managed` adds the PR, review and signature rules.
+- **Ruleset `nightly`:** block force pushes and deletion. `nightly.yml` only
+  fast-forwards it. Restricting who may move it at all needs `RELEASE_TOKEN`
+  set to an identity a ruleset can name (the GitHub Actions app cannot be a
+  bypass actor).
+- **`branch rules`** honours the release-tooling branch names (`backport-…`,
+  `release-prep/…`, `release-cut/…`) only on branches in this repository, not
+  on a fork's.
 - **Ruleset `tags_managed`** (all tags): blocks creation, update and
   deletion; admins and the `affinidi-semantic-release` app bypass it. That
   app is the identity `release-tag.yml` tags with — `GITHUB_TOKEN` (the
