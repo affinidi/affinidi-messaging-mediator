@@ -1069,6 +1069,16 @@ async fn handle_socket(
             state.config.limits.mux.revalidate_interval_secs.max(30),
         ));
         mux_revalidate.reset();
+        // Members' account standing, re-checked in a task of its own so the
+        // store reads never hold this loop up.
+        #[allow(unused_mut)]
+        let mut standing_every = Duration::from_secs(crate::mux::connection::STANDING_PASS_SECS);
+        #[cfg(feature = "test-hooks")]
+        if let Some(every) = crate::mux::connection::test_hooks::standing_pass_interval(&session.did_hash) {
+            standing_every = every;
+        }
+        let mut mux_standing = tokio::time::interval(standing_every);
+        mux_standing.reset();
 
         // The socket lives until the JWT Auth token expires. `expires_at` was
         // checked to be in the future on entry; the setup since may have
@@ -1390,6 +1400,11 @@ async fn handle_socket(
                 _ = mux_revalidate.tick(), if mux_conn.is_some() => {
                     if let Some(conn) = &mux_conn {
                         crate::mux::connection::sweep(&state, conn, true).await;
+                    }
+                }
+                _ = mux_standing.tick(), if mux_conn.is_some() => {
+                    if let Some(conn) = &mux_conn {
+                        crate::mux::connection::spawn_standing_pass(&state, conn);
                     }
                 }
                 // A resync held back by the floor is sent when it falls due,
@@ -1844,9 +1859,7 @@ async fn drain_tsp_inbox(
         // one whose standing has lapsed is detached, with its event.
         let mut order: Vec<String> = Vec::with_capacity(candidates.len());
         for m in candidates {
-            if crate::mux::connection::check_member(state, conn, &m).await
-                == crate::mux::connection::Standing::Good
-            {
+            if crate::mux::connection::member_stands(state, conn, &m).await {
                 order.push(m.did_hash);
             }
         }

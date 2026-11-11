@@ -19,6 +19,12 @@
 //! 3. A listener that lagged or lost its subscription missed records, so it
 //!    re-checks every member of every local mux connection ([`resync`]).
 //!
+//! A record may also carry [`MemberHint`]s: a member DID's account changed
+//! (re-check its standing wherever it is carried) or it ran `revoke-all`
+//! (end its session attaches). A receiver re-reads the account for the
+//! first; the second names the time of the `revoke-all`, so an attach made
+//! after it is kept.
+//!
 //! No session lock is held across a store read (R1.3).
 
 use std::collections::HashSet;
@@ -26,7 +32,7 @@ use std::time::Duration;
 
 use affinidi_messaging_mediator_common::store::{
     MediatorStore,
-    mux::{self, MuxChange, MuxChangeRecord, MuxGrantState, MuxLimits},
+    mux::{self, MemberHint, MuxChange, MuxChangeRecord, MuxGrantState, MuxLimits},
 };
 use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::{debug, info, warn};
@@ -75,6 +81,7 @@ pub async fn publish(state: &SharedData, changes: &[MuxChange]) {
         origin: state.config.streaming_uuid.clone(),
         changes: dedupe(changes),
         streaming: Vec::new(),
+        members: Vec::new(),
     };
     if let Err(e) = state.database.mux_changes_publish(&record).await {
         warn!(
@@ -82,6 +89,52 @@ pub async fn publish(state: &SharedData, changes: &[MuxChange]) {
             "mux grant change not published to other mediator instances; their periodic \
              re-check applies it within one sweep interval: {e}"
         );
+    }
+}
+
+/// Tell the other instances sharing the store that these member DIDs
+/// changed (account standing, `revoke-all`). Call it after this instance's
+/// own connections are updated. Best-effort, as [`publish`] is: a lost
+/// record leaves the change to each connection's standing pass.
+pub async fn publish_members(state: &SharedData, members: &[MemberHint]) {
+    if members.is_empty() {
+        return;
+    }
+    let record = MuxChangeRecord {
+        origin: state.config.streaming_uuid.clone(),
+        changes: Vec::new(),
+        streaming: Vec::new(),
+        members: members.to_vec(),
+    };
+    if let Err(e) = state.database.mux_changes_publish(&record).await {
+        warn!(
+            members = record.members.len(),
+            "mux member change not published to other mediator instances; their standing \
+             pass applies it within one interval: {e}"
+        );
+    }
+}
+
+/// Apply member changes another instance published to this instance's live
+/// connections.
+async fn apply_members(state: &SharedData, members: &[MemberHint]) {
+    for hint in members {
+        match hint {
+            MemberHint::StandingChanged { did_hash } => {
+                super::connection::recheck_member(state, did_hash).await;
+            }
+            MemberHint::AttachesEnded { did_hash, at } => {
+                state
+                    .mux
+                    .detach_attaches(
+                        state.streaming_task.as_ref(),
+                        did_hash,
+                        *at,
+                        super::session::LeaveReason::EpochBumped,
+                    )
+                    .await;
+            }
+        }
     }
 }
 
@@ -226,6 +279,11 @@ pub async fn resync(state: &SharedData) {
         debug!(pairs = pairs.len(), "re-checking every mux member");
     }
     apply(state, &pairs).await;
+    // Account-standing hints may have been missed too: re-check every
+    // member's standing now rather than at each connection's next pass.
+    for conn in state.mux.all() {
+        super::connection::spawn_standing_pass(state, &conn);
+    }
 }
 
 /// Delays between attempts to resubscribe after the subscription closes,
@@ -274,6 +332,7 @@ pub async fn run(state: SharedData) -> Result<(), String> {
                 if !record.changes.is_empty() {
                     apply(&state, &record.changes).await;
                 }
+                apply_members(&state, &record.members).await;
                 forward_handoffs(&state, &me, &record.streaming).await;
             }
             Err(RecvError::Lagged(missed)) => {
@@ -595,6 +654,7 @@ mod tests {
             origin: "instance-a".into(),
             changes: vec![MuxChange::of(&g, false)],
             streaming: Vec::new(),
+            members: Vec::new(),
         };
         let wire = serde_json::to_value(&record).unwrap();
         assert_eq!(
@@ -607,5 +667,40 @@ mod tests {
         assert!(!wire.to_string().contains("did:example"));
         let back: MuxChangeRecord = serde_json::from_value(wire).unwrap();
         assert_eq!(back, record);
+    }
+
+    /// Member hints travel as hashes and times, and a record from an
+    /// instance that predates them still reads (with none).
+    #[test]
+    fn member_hints_are_hashes_and_optional_on_the_wire() {
+        let record = MuxChangeRecord {
+            origin: "instance-a".into(),
+            changes: Vec::new(),
+            streaming: Vec::new(),
+            members: vec![
+                MemberHint::StandingChanged {
+                    did_hash: did_hash(WORK),
+                },
+                MemberHint::AttachesEnded {
+                    did_hash: did_hash(WORK),
+                    at: 42,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["members"],
+            serde_json::json!([
+                { "event": "standingChanged", "didHash": did_hash(WORK) },
+                { "event": "attachesEnded", "didHash": did_hash(WORK), "at": 42 },
+            ])
+        );
+        assert!(!wire.to_string().contains("did:example"));
+        let back: MuxChangeRecord = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, record);
+
+        let older: MuxChangeRecord =
+            serde_json::from_value(serde_json::json!({ "origin": "b", "changes": [] })).unwrap();
+        assert!(older.members.is_empty());
     }
 }

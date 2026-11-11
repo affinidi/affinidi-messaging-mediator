@@ -360,6 +360,30 @@ pub struct MuxChangeRecord {
     /// that predates the field ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming: Vec<StreamingHandoff>,
+    /// Changes to a member DID itself rather than to one grant: its account
+    /// standing, or its `revoke-all`. Absent from records that carry none;
+    /// an instance that predates the field ignores it, and its standing pass
+    /// applies the change within one interval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<MemberHint>,
+}
+
+/// A change to a member DID that every instance carrying it applies to its
+/// live mux connections. Hashes and times only; a receiver re-reads the
+/// store where the hint names something the store holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "event",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MemberHint {
+    /// The member's account was blocked, removed or had its ACLs changed:
+    /// re-check its standing wherever it is carried.
+    StandingChanged { did_hash: String },
+    /// The member DID ran `revoke-all` at `at` (unix seconds): end its
+    /// session attaches admitted at or before then.
+    AttachesEnded { did_hash: String, at: u64 },
 }
 
 /// A change of which instance streams a DID's live traffic, for the mux

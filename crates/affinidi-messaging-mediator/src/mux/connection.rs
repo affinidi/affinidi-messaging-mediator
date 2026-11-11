@@ -472,6 +472,47 @@ pub mod test_hooks {
         (reached_rx, resume_tx)
     }
 
+    static STANDING_UNREADABLE: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(Default::default);
+    static STANDING_PASS_EVERY: LazyLock<Mutex<HashMap<String, std::time::Duration>>> =
+        LazyLock::new(Default::default);
+
+    /// Make every standing read for member `did_hash` fail as an unreadable
+    /// store would (`unreadable`), or read normally again.
+    pub fn set_standing_unreadable(did_hash: &str, unreadable: bool) {
+        let mut set = STANDING_UNREADABLE.lock().expect("hook set");
+        if unreadable {
+            set.insert(did_hash.to_string());
+        } else {
+            set.remove(did_hash);
+        }
+    }
+
+    pub(super) fn standing_unreadable(did_hash: &str) -> bool {
+        STANDING_UNREADABLE
+            .lock()
+            .expect("hook set")
+            .contains(did_hash)
+    }
+
+    /// Run the standing pass every `every` on the next mux connection that
+    /// `principal_hash` opens, instead of every
+    /// [`STANDING_PASS_SECS`](super::STANDING_PASS_SECS).
+    pub fn standing_pass_every(principal_hash: &str, every: std::time::Duration) {
+        STANDING_PASS_EVERY
+            .lock()
+            .expect("hook map")
+            .insert(principal_hash.to_string(), every);
+    }
+
+    /// The standing-pass interval for a connection `principal_hash` opens.
+    pub fn standing_pass_interval(principal_hash: &str) -> Option<std::time::Duration> {
+        STANDING_PASS_EVERY
+            .lock()
+            .expect("hook map")
+            .remove(principal_hash)
+    }
+
     pub(super) async fn on_open_before_publish(principal_hash: &str) {
         let pause = OPEN_BEFORE_PUBLISH
             .lock()
@@ -581,10 +622,10 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) ->
     frames
 }
 
-/// Periodic sweep: expire lapsed members, detach members whose account no
-/// longer stands ([`check_member`]) and, when `revalidate` is set, re-check
-/// each grant-admitted member's signing key (§5.1). Leavers are queued on the
-/// connection for [`drain_changes`].
+/// Periodic sweep: expire lapsed members and, when `revalidate` is set,
+/// re-check each grant-admitted member's signing key (§5.1). Leavers are
+/// queued on the connection for [`drain_changes`]. Account standing has its
+/// own pass, [`standing_pass`], run off the socket loop.
 pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     let streaming = state.streaming_task.as_ref();
     let now = state.clock.unix_secs();
@@ -597,17 +638,6 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     };
     for h in expired {
         conn.detach(streaming, &h, LeaveReason::Expired).await;
-    }
-
-    // Every member, however admitted: does its account still stand (it
-    // exists, is not blocked, and its own ACLs still cover its scope)? An
-    // attach is checked as a grant is; an account change handled on this
-    // instance detached it already (`recheck_member`), and this is how a
-    // change made elsewhere, or by a path that does not call in, reaches the
-    // connection within one sweep interval.
-    let members: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
-    for m in &members {
-        check_member(state, conn, m).await;
     }
 
     // Grant-admitted members: is the stored grant still active? A revoke,
@@ -733,9 +763,26 @@ pub enum Standing {
     Unknown,
 }
 
+/// How long a good standing check counts for requests made for the member
+/// (pickup, delete, a `tsp-mux` drain). An account change handled by any
+/// instance re-checks at once ([`recheck_member`], and over pub/sub), so this
+/// bounds only a change made behind the mediator's back, as the standing pass
+/// does.
+pub const STANDING_FRESH_SECS: u64 = 10;
+
+/// How often [`standing_pass`] re-checks every member of a connection.
+pub const STANDING_PASS_SECS: u64 = 30;
+
+/// Store reads one [`standing_pass`] keeps in flight at once.
+const STANDING_PASS_PARALLEL: usize = 8;
+
 /// `member`'s standing now (design §5.5, the check an attach or a grant met
-/// when it was admitted).
+/// when it was admitted), read from the store.
 pub async fn member_standing(state: &SharedData, member: &MuxMember) -> Standing {
+    #[cfg(feature = "test-hooks")]
+    if test_hooks::standing_unreadable(&member.did_hash) {
+        return Standing::Unknown;
+    }
     match super::session::standing(
         &*state.database,
         &state.config.security.global_acl_default,
@@ -755,23 +802,110 @@ pub async fn member_standing(state: &SharedData, member: &MuxMember) -> Standing
     }
 }
 
-/// Re-check `member`'s standing and, when it has lapsed, take it off `conn`
-/// with a `detached` event naming why (R6.2).
-pub async fn check_member(state: &SharedData, conn: &MuxConn, member: &MuxMember) -> Standing {
-    let standing = member_standing(state, member).await;
-    if let Standing::Lapsed(reason) = standing {
-        debug!(did = %member.did, reason = reason.wire(), "mux member's account standing lapsed; detaching");
-        conn.detach(state.streaming_task.as_ref(), &member.did_hash, reason)
-            .await;
+/// Act on `standing`, read for the snapshot `member`: on a lapse take the
+/// member off `conn` with a `detached` event naming why (R6.2) — but only if
+/// it is still on the connection as it was read, so a member re-admitted or
+/// widened meanwhile is judged afresh rather than removed on a stale read.
+/// A good result is remembered for [`STANDING_FRESH_SECS`].
+async fn apply_standing(
+    state: &SharedData,
+    conn: &MuxConn,
+    member: &MuxMember,
+    standing: Standing,
+) -> Standing {
+    match standing {
+        Standing::Lapsed(reason) => {
+            let gone = conn
+                .detach_if(
+                    state.streaming_task.as_ref(),
+                    &member.did_hash,
+                    reason,
+                    |now| now.source == member.source && now.scope == member.scope,
+                )
+                .await;
+            if gone.is_some() {
+                debug!(did = %member.did, reason = reason.wire(), "mux member's account standing lapsed; detached");
+            }
+        }
+        Standing::Good => {
+            conn.standing_seen.lock().await.insert(
+                member.did_hash.clone(),
+                super::registry::StandingSeen {
+                    at: state.clock.unix_secs(),
+                    source: member.source.clone(),
+                    scope: member.scope.clone(),
+                },
+            );
+        }
+        Standing::Unknown => {}
     }
     standing
 }
 
-/// After an account change on this instance (its ACLs set, the account
-/// removed): re-check `did_hash` as a member on every live mux connection
-/// here, and detach it wherever its standing has lapsed — attach-admitted
-/// members included — before the change is answered. Connections on other
-/// instances catch up at their next sweep.
+/// Re-check `member`'s standing from the store and act on it
+/// ([`apply_standing`]).
+pub async fn check_member(state: &SharedData, conn: &MuxConn, member: &MuxMember) -> Standing {
+    let standing = member_standing(state, member).await;
+    apply_standing(state, conn, member, standing).await
+}
+
+/// [`check_member`], unless the same admission was found in good standing
+/// within [`STANDING_FRESH_SECS`]: for requests made for a member, so a burst
+/// of them reads its account once.
+pub async fn member_stands(state: &SharedData, conn: &MuxConn, member: &MuxMember) -> bool {
+    let now = state.clock.unix_secs();
+    let fresh = conn
+        .standing_seen
+        .lock()
+        .await
+        .get(&member.did_hash)
+        .is_some_and(|seen| {
+            now.saturating_sub(seen.at) < STANDING_FRESH_SECS
+                && seen.source == member.source
+                && seen.scope == member.scope
+        });
+    fresh || check_member(state, conn, member).await == Standing::Good
+}
+
+/// Re-check every member of `conn` against its account, a few store reads at
+/// a time, detaching those whose standing has lapsed. This is how a change
+/// that reached no instance's handlers (made in the store directly, or whose
+/// pub/sub record was lost) reaches the connection. Run it off the socket
+/// loop ([`spawn_standing_pass`]); it does nothing while a previous pass on
+/// the same connection is still running.
+pub async fn standing_pass(state: &SharedData, conn: &MuxConn) {
+    use futures_util::StreamExt;
+    use std::sync::atomic::Ordering;
+    if conn.standing_pass.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let members: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
+    let read: Vec<(MuxMember, Standing)> = futures_util::stream::iter(members)
+        .map(|m| async move {
+            let standing = member_standing(state, &m).await;
+            (m, standing)
+        })
+        .buffer_unordered(STANDING_PASS_PARALLEL)
+        .collect()
+        .await;
+    for (m, standing) in read {
+        apply_standing(state, conn, &m, standing).await;
+    }
+    conn.standing_pass.store(false, Ordering::Release);
+}
+
+/// [`standing_pass`] as its own task, so the socket loop that calls it keeps
+/// writing frames meanwhile.
+pub fn spawn_standing_pass(state: &SharedData, conn: &Arc<MuxConn>) {
+    let state = state.clone();
+    let conn = conn.clone();
+    tokio::spawn(async move { standing_pass(&state, &conn).await });
+}
+
+/// After an account change handled here (its ACLs set, the account
+/// removed), or one another instance published: re-check `did_hash` as a
+/// member on every live mux connection on this instance — attach-admitted
+/// members included — and detach it wherever its standing has lapsed.
 pub async fn recheck_member(state: &SharedData, did_hash: &str) {
     for conn in state.mux.all() {
         let member = conn.session.lock().await.get(did_hash).cloned();
@@ -781,10 +915,25 @@ pub async fn recheck_member(state: &SharedData, did_hash: &str) {
     }
 }
 
+/// [`recheck_member`], then tell the other instances sharing the store to do
+/// the same (design §7.4: one pub/sub hop rather than their next pass).
+pub async fn account_changed(state: &SharedData, did_hash: &str) {
+    recheck_member(state, did_hash).await;
+    super::sync::publish_members(
+        state,
+        &[
+            affinidi_messaging_mediator_common::store::mux::MemberHint::StandingChanged {
+                did_hash: did_hash.to_string(),
+            },
+        ],
+    )
+    .await;
+}
+
 /// Whether this connection may carry pickup / delete for `did_hash` now: it
 /// carries the member with `cap`, unexpired, and the member's account still
-/// stands. A member whose standing has lapsed is detached; one whose standing
-/// cannot be read is refused this once.
+/// stands ([`member_stands`]). A member whose standing has lapsed is
+/// detached; one whose standing cannot be read is refused this once.
 pub async fn allows(
     state: &SharedData,
     session_id: &str,
@@ -802,7 +951,7 @@ pub async fn allows(
         s.get(did_hash).cloned()
     };
     match member {
-        Some(m) => check_member(state, &conn, &m).await == Standing::Good,
+        Some(m) => member_stands(state, &conn, &m).await,
         None => false,
     }
 }
@@ -847,12 +996,12 @@ pub async fn sender_session(
     {
         return None;
     }
-    let lapsed = |reason| {
-        let conn = conn.clone();
-        let hash = hash.clone();
-        async move {
-            conn.detach(state.streaming_task.as_ref(), &hash, reason)
-                .await;
+    // A refusal for the member's own standing re-checks its whole admission
+    // ([`check_member`]), which detaches it, as of the snapshot taken here.
+    let lapsed = async || {
+        let member = conn.session.lock().await.get(&hash).cloned();
+        if let Some(m) = member {
+            check_member(state, &conn, &m).await;
         }
     };
     // A member must have an account: a grant or attach is refused without
@@ -862,7 +1011,7 @@ pub async fn sender_session(
         Ok(Some(account)) => (MediatorACLSet::from_u64(account.acls), account._type),
         Ok(None) => {
             debug!(principal = %session.did_hash, session_id = %session.session_id, member = %hash, "mux send refused: member has no account");
-            lapsed(LeaveReason::AccountRemoved).await;
+            lapsed().await;
             return None;
         }
         Err(e) => {
@@ -873,13 +1022,11 @@ pub async fn sender_session(
     let send = MuxScope::new([MuxCapability::Send]).ok()?;
     if let Err(e) = super::grants::check_scope(&acls, &send) {
         debug!(member = %hash, "mux send refused: {e}");
-        // Its account no longer stands for `send`; the member's full scope
-        // is re-checked, so one that merely lost `send` is not dropped for
-        // `receive`.
-        let member = conn.session.lock().await.get(&hash).cloned();
-        if let Some(m) = member {
-            check_member(state, &conn, &m).await;
-        }
+        // Its account no longer stands for `send`, which is in the member's
+        // scope, so its whole admission no longer stands: as at admission, a
+        // member whose ACLs do not cover its scope leaves (`accountBlocked`)
+        // rather than being narrowed to what they still allow.
+        lapsed().await;
         return None;
     }
     debug!(principal = %session.did_hash, member = %hash, "frame accepted as sent by mux member");
@@ -896,27 +1043,20 @@ pub async fn sender_session(
     })
 }
 
-/// The members of `session_id`'s mux connection that may do `cap` now,
-/// each with its account standing re-checked as [`allows`] does.
+/// The members of `session_id`'s mux connection that hold `cap` now, by
+/// scope and expiry only. Reads nothing: a caller acting for one of them
+/// checks that member's standing with [`allows`] once a request resolves to
+/// it, so a delete naming one message does not read every member's account.
 pub async fn members_with(state: &SharedData, session_id: &str, cap: MuxCapability) -> Vec<String> {
     let Some(conn) = state.mux.get(session_id) else {
         return Vec::new();
     };
     let now = state.clock.unix_secs();
-    let candidates: Vec<MuxMember> = {
-        let s = conn.session.lock().await;
-        s.members()
-            .filter(|m| s.allows(&m.did_hash, cap, now))
-            .cloned()
-            .collect()
-    };
-    let mut out = Vec::with_capacity(candidates.len());
-    for m in candidates {
-        if check_member(state, &conn, &m).await == Standing::Good {
-            out.push(m.did_hash);
-        }
-    }
-    out
+    let s = conn.session.lock().await;
+    s.members()
+        .filter(|m| s.allows(&m.did_hash, cap, now))
+        .map(|m| m.did_hash.clone())
+        .collect()
 }
 
 /// Tear the connection down: every member out of the streaming task, the

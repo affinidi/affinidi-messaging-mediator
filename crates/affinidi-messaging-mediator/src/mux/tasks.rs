@@ -37,6 +37,10 @@ pub struct Changed {
     /// Grants just stored: their principal's live connections carry the
     /// member at once (design §4.4), not only after a reconnect.
     pub stored: Vec<MuxGrant>,
+    /// A member DID whose `revoke-all` advanced its epoch: its session
+    /// attaches end too, on every connection carrying it, before the answer
+    /// (design §5.2).
+    pub attaches_ended: Option<String>,
 }
 
 /// A request-level refusal: the whole task fails with this code.
@@ -487,6 +491,7 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
             Changed {
                 removed: voided,
                 reason: Some(LeaveReason::EpochBumped),
+                attaches_ended: Some(st.did_hash.clone()),
                 ..Default::default()
             },
         )),

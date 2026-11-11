@@ -3135,6 +3135,7 @@ async fn check_mux_changes_single_process(store: Arc<dyn MediatorStore>) {
             stored: true,
         }],
         streaming: Vec::new(),
+        members: Vec::new(),
     };
     store.mux_changes_publish(&record).await.unwrap();
     assert!(store.mux_changes_subscribe().await.unwrap().is_none());
@@ -3171,6 +3172,7 @@ async fn redis_mux_changes_reach_every_instance() {
             stored: false,
         }],
         streaming: Vec::new(),
+        members: Vec::new(),
     };
     a.mux_changes_publish(&record).await.unwrap();
 

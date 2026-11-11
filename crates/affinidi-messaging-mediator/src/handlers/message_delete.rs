@@ -95,19 +95,35 @@ pub async fn message_delete_handler(
             let mut deleted_as = session.did_hash.clone();
             let mut parties = None;
             for owner in &owners {
-                // Only while someone is watching: read who the message was
-                // between, so its `deleted` event names both parties.
-                let seen = if state.monitor.is_active() {
-                    state
-                        .database
-                        .get_message(owner, message)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|m| (m.from_address, m.to_address, m.msg))
+                let for_member = *owner != session.did_hash;
+                // Read the message for a mux member, to know it is that
+                // member's before its standing is checked; otherwise only
+                // while someone is watching, so its `deleted` event names both
+                // parties.
+                let stored = if for_member || state.monitor.is_active() {
+                    match state.database.get_message(owner, message).await {
+                        Ok(Some(m)) => Some(m),
+                        _ if for_member => continue,
+                        _ => None,
+                    }
                 } else {
                     None
                 };
+                // A member's message is deleted only while the member's own
+                // account still stands; checked for the one member the id
+                // belongs to, not for every member the connection carries.
+                if for_member
+                    && !crate::mux::connection::allows(
+                        &state,
+                        &session.session_id,
+                        owner,
+                        affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
+                    )
+                    .await
+                {
+                    continue;
+                }
+                let seen = stored.map(|m| (m.from_address, m.to_address, m.msg));
                 result = state
                     .database
                     .delete_message(

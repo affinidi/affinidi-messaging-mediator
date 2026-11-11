@@ -55,6 +55,10 @@ pub struct MuxMember {
     /// principal's newest grant on a DID, so a live admission never replaces
     /// a member carried by a newer grant, whatever order they finish in.
     pub grant_iat: u64,
+    /// When a session attach admitted it (0 for one carried by a grant). A
+    /// member's `revoke-all` ends the attaches admitted before it, and only
+    /// those: one admitted afterwards rests on a statement made since.
+    pub attached_at: u64,
 }
 
 /// A stored grant a connection did not carry, for its `detached` event.
@@ -278,6 +282,7 @@ impl MuxSession {
                     key_fp: grant.key_fp.clone(),
                     expires_at: grant.effective_exp(),
                     grant_iat: grant.iat,
+                    attached_at: 0,
                 };
                 let member = match self.members.remove(&grant.did_hash) {
                     Some(existing) => merge(existing, member),
@@ -428,6 +433,7 @@ pub async fn verify_attach(
             key_fp: verified.key.key_fp,
             expires_at: verified.exp,
             grant_iat: 0,
+            attached_at: ctx.now,
         },
         suspended,
     ))
@@ -489,6 +495,7 @@ fn merge(a: MuxMember, b: MuxMember) -> MuxMember {
     MuxMember {
         scope,
         expires_at: a.expires_at.max(b.expires_at),
+        attached_at: a.attached_at.max(b.attached_at),
         ..keep
     }
 }
