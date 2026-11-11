@@ -67,12 +67,15 @@ pub const ALLOW_SAMPLE_IDENTITY_ENV: &str = "MEDIATOR_ALLOW_TEST_IDENTITY";
 /// Public keys (multibase) of the sample and test DIDs committed to this
 /// repository: the example in `conf/mediator.toml` and the fixed identity in
 /// `docker/test/conf`. Their private keys are public, so a deployment that
-/// names one of them as its mediator or admin DID hands that role to anyone.
+/// names one of them as its mediator or admin DID, or loads one as an
+/// operating key, hands that role to anyone.
 pub const SAMPLE_DID_KEYS: &[&str] = &[
     // Example DID formerly in conf/mediator.toml (mediator_did and admin_did).
     "z6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ",
-    // docker/test/conf mediator DID.
+    "zQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3",
+    // docker/test/conf mediator DID (signing and key-agreement keys).
     "z6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5pr6",
+    "z6LShyV6x81XmxvpyDpgwaXo27783iBBJPTeUtDgcvyKLDXP",
     // docker/test/conf admin DID.
     "z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed",
 ];
@@ -94,6 +97,19 @@ pub fn check_not_sample_did(field: &str, did: &str) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// An operating key (its public key as multibase) must not be one of
+/// [`SAMPLE_DID_KEYS`]. Catches a deployment that publishes its own
+/// `did:web` / `did:webvh` document but loads the committed test keys.
+pub fn check_not_sample_operating_key(key_id: &str, public_multibase: &str) -> Result<(), String> {
+    if SAMPLE_DID_KEYS.contains(&public_multibase) {
+        return Err(format!(
+            "operating key '{key_id}' is a sample/test key whose private key is published in \
+             this repository ({public_multibase}). Generate your own keys with mediator-setup."
+        ));
+    }
+    Ok(())
 }
 
 /// The JWT signing key must not be one committed to this repository.
@@ -464,6 +480,18 @@ mod tests {
         );
         assert!(check_not_sample_did("admin_did", "did:key:z6MkOther").is_ok());
         assert!(check_not_sample_did("mediator_did", "did:web:example.com").is_ok());
+    }
+
+    #[test]
+    fn sample_operating_keys_are_recognised() {
+        assert!(
+            check_not_sample_operating_key(
+                "did:web:example.com#key-2",
+                "z6LShyV6x81XmxvpyDpgwaXo27783iBBJPTeUtDgcvyKLDXP"
+            )
+            .is_err()
+        );
+        assert!(check_not_sample_operating_key("k", "z6MkOther").is_ok());
     }
 
     #[test]

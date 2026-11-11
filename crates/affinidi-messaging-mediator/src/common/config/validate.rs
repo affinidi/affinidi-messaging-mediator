@@ -9,10 +9,10 @@
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_config::validate::{
-    ALLOW_SAMPLE_IDENTITY_ENV, check_did_syntax, check_jwt_expiry, check_not_sample_did, check_tls,
-    check_trust_xff_cidrs, warn_admin_is_mediator, warn_implicit_relay,
-    warn_per_peer_not_below_receive_limit, warn_permissive_default_with_denylist_mode,
-    warn_remote_admin_allowed,
+    ALLOW_SAMPLE_IDENTITY_ENV, check_did_syntax, check_jwt_expiry, check_not_sample_did,
+    check_not_sample_operating_key, check_tls, check_trust_xff_cidrs, warn_admin_is_mediator,
+    warn_implicit_relay, warn_per_peer_not_below_receive_limit,
+    warn_permissive_default_with_denylist_mode, warn_remote_admin_allowed,
 };
 use tracing::warn;
 
@@ -94,6 +94,20 @@ pub(crate) fn sample_identity_guard(check: Result<(), String>) -> Result<(), Med
     sample_identity_policy(check, allowed)
 }
 
+/// Applies the sample-identity policy to every loaded operating key. A key
+/// whose public form cannot be computed is skipped: it cannot be a listed
+/// key.
+pub(crate) fn refuse_sample_operating_keys(
+    secrets: &[affinidi_secrets_resolver::secrets::Secret],
+) -> Result<(), MediatorError> {
+    for secret in secrets {
+        if let Ok(public) = secret.get_public_keymultibase() {
+            sample_identity_guard(check_not_sample_operating_key(&secret.id, &public))?;
+        }
+    }
+    Ok(())
+}
+
 fn sample_identity_policy(check: Result<(), String>, allowed: bool) -> Result<(), MediatorError> {
     match check {
         Ok(()) => Ok(()),
@@ -132,6 +146,13 @@ mod tests {
         assert!(sample_identity_policy(Ok(()), false).is_ok());
     }
 
+    fn decode(entry: &str) -> Vec<u8> {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(entry.trim_end_matches('='))
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(entry))
+            .unwrap()
+    }
+
     /// The fixed test identity in `docker/test/conf` is on the lists, so
     /// regenerating it without updating them fails here.
     #[test]
@@ -156,11 +177,7 @@ mod tests {
 
         let secrets: serde_json::Value = serde_json::from_str(&secrets).unwrap();
         let entry = secrets["entries"]["mediator_jwt_secret"].as_str().unwrap();
-        let envelope = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(entry.trim_end_matches('='))
-            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(entry))
-            .unwrap();
-        let envelope: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decode(entry)).unwrap();
         let pkcs8: Vec<u8> = envelope["data"]
             .as_array()
             .unwrap()
@@ -168,6 +185,31 @@ mod tests {
             .map(|b| b.as_u64().unwrap() as u8)
             .collect();
         let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+
+        // Every committed operating key is refused, whatever DID it is used under.
+        let entry = secrets["entries"]["mediator_operating_secrets"]
+            .as_str()
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decode(entry)).unwrap();
+        let operating: Vec<affinidi_secrets_resolver::secrets::Secret> =
+            serde_json::from_value(envelope["data"].clone()).unwrap();
+        assert!(!operating.is_empty());
+        for secret in &operating {
+            assert!(
+                matches!(
+                    sample_identity_policy(
+                        check_not_sample_operating_key(
+                            &secret.id,
+                            &secret.get_public_keymultibase().unwrap()
+                        ),
+                        false
+                    ),
+                    Err(MediatorError::ConfigError(..))
+                ),
+                "operating key {} in docker/test/conf is not in SAMPLE_DID_KEYS",
+                secret.id
+            );
+        }
         use ring::signature::KeyPair;
         assert!(check_not_sample_jwt_key(pair.public_key().as_ref()).is_err());
         assert!(!SAMPLE_JWT_PUBLIC_KEYS.is_empty());

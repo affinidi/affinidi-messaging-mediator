@@ -773,6 +773,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            super::validate::refuse_sample_operating_keys(&converted)?;
             config.mediator_secrets.insert_vec(&converted).await;
         } else {
             // Self-hosted mode: operating keys come from the well-known
@@ -789,6 +790,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                         "Loading {} operating secret(s) from unified secret backend",
                         secrets_vec.len()
                     );
+                    super::validate::refuse_sample_operating_keys(&secrets_vec)?;
                     config.mediator_secrets.insert_vec(&secrets_vec).await;
                 }
                 Ok(None) => {
