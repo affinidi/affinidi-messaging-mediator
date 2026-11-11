@@ -663,19 +663,6 @@ fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: KeyModifiers)
         return;
     }
 
-    // F2 on the sealed-handoff DigestVerify phase copies the
-    // wizard-computed digest to the clipboard. F2 (not a bare
-    // letter) because the panel has an active text input for the
-    // operator's OOB-shared digest — letters would land in the
-    // field. Routes through the SSH-aware copy helper.
-    if code == KeyCode::F(2)
-        && let Some(state) = app.sealed_handoff.as_mut()
-        && state.phase == crate::sealed_handoff::SealedPhase::DigestVerify
-    {
-        state.copy_digest_to_clipboard();
-        return;
-    }
-
     // Bare `c` / `v` / `p` on the sealed-handoff RequestGenerated screen
     // copy one of: the bootstrap request JSON, the `vta bootstrap seal`
     // command, or the `pnm-cli bootstrap seal` command to the system
@@ -1543,7 +1530,10 @@ async fn provision_secret_backend(
     probe: secret_backend::ProvisionProbe,
 ) -> anyhow::Result<()> {
     let backend_url = config_writer::build_backend_url(config);
-    println!("  Provisioning unified secret backend: {backend_url}");
+    println!(
+        "  Provisioning unified secret backend: {}",
+        affinidi_messaging_mediator_common::redact::redact_url(&backend_url)
+    );
     // macOS Keychain prompts once per keychain item the first time a
     // given binary (code-signature ACL) accesses it. Each `cargo
     // build` produces a new binary — so operators rebuilding the

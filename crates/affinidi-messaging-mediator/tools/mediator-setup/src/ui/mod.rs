@@ -451,21 +451,11 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                 return;
             }
             SealedPhase::DigestVerify => {
-                let computed = state.computed_digest.as_deref().unwrap_or("(missing)");
                 let title = "Sealed handoff — verify digest";
                 let desc = "Type the SHA-256 digest your VTA admin showed you on a separate \
                             channel. It is required.";
                 let placeholder = "sha256 hex";
-                let mut hint_default = format!(
-                    "Computed digest of the parsed bundle:\n  {computed}\n\nIf the producer \
-                     told you a different digest, do NOT continue — abort and re-request the \
-                     bundle.\n\nPress [F2] to copy the computed digest to your clipboard."
-                );
-                if let Some(status) = state.clipboard_status.as_deref() {
-                    hint_default.push_str("\n\n");
-                    hint_default.push_str(status);
-                }
-                let hint = state.last_error.clone().unwrap_or(hint_default);
+                let hint = state.digest_verify_hint();
                 prompt::render_prompt(
                     frame,
                     chunks[0],

@@ -167,11 +167,13 @@ fn resolve_bootstrap_seed_ttl() -> Duration {
 /// more actionable error if the backend is actually broken.
 async fn sweep_stale_bootstrap_seeds(config: &crate::app::WizardConfig) {
     let backend_url = crate::config_writer::build_backend_url(config);
+    // Shown in logs and errors with any URL credentials hidden.
+    let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
     let store = match crate::secret_backend::open_secret_backend(&backend_url) {
         Ok(s) => s,
         Err(e) => {
             warn!(
-                backend = %backend_url,
+                backend = %backend_shown,
                 error = %e,
                 "could not open backend for bootstrap-seed sweep; skipping",
             );
@@ -182,7 +184,7 @@ async fn sweep_stale_bootstrap_seeds(config: &crate::app::WizardConfig) {
     match store.sweep_bootstrap_seeds(ttl).await {
         Ok(swept) if !swept.is_empty() => {
             info!(
-                backend = %backend_url,
+                backend = %backend_shown,
                 ttl_s = ttl.as_secs(),
                 swept = ?swept,
                 "swept stale bootstrap seeds before dispatch",
@@ -190,7 +192,7 @@ async fn sweep_stale_bootstrap_seeds(config: &crate::app::WizardConfig) {
         }
         Ok(_) => {}
         Err(e) => warn!(
-            backend = %backend_url,
+            backend = %backend_shown,
             error = %e,
             "bootstrap-seed sweep failed; phase-specific code will re-surface if fatal",
         ),
@@ -209,6 +211,8 @@ async fn phase1_emit_request(
     // secret store — no point minting a request, writing it to disk,
     // and then discovering `aws_secrets://...` can't talk to AWS.
     let backend_url = crate::config_writer::build_backend_url(config);
+    // Shown in logs and errors with any URL credentials hidden.
+    let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
     // Headless flow: *request* a read-only probe. It takes effect only for
     // `aws_secrets://` (entries pre-created out-of-band, e.g. by CDK, so setup
     // only overwrites them — matching the runtime's read-only boot probe). For
@@ -240,13 +244,13 @@ async fn phase1_emit_request(
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "could not discard in-flight bootstrap {} in '{backend_url}': {e}",
+                        "could not discard in-flight bootstrap {} in '{backend_shown}': {e}",
                         entry.bundle_id_hex
                     )
                 })?;
             warn!(
                 bundle_id = %entry.bundle_id_hex,
-                backend = %backend_url,
+                backend = %backend_shown,
                 "--force-reprovision: discarded the in-flight bootstrap request's seed",
             );
         }
@@ -257,7 +261,7 @@ async fn phase1_emit_request(
             .map(|e| e.bundle_id_hex.as_str())
             .collect();
         anyhow::bail!(
-            "A bootstrap is already in progress in backend '{backend_url}'.\n  \
+            "A bootstrap is already in progress in backend '{backend_shown}'.\n  \
              In-flight bundle id(s): {}\n\n\
              To finalise: re-run `mediator-setup --from <recipe> --bundle bundle.armor`\n\
              To restart:  wait {BOOTSTRAP_SEED_TTL_HINT} for auto-cleanup, \
@@ -313,13 +317,15 @@ async fn phase1_emit_request(
     store
         .store_bootstrap_seed(&bundle_id_hex, &state.seed_bytes)
         .await
-        .map_err(|e| anyhow::anyhow!("could not persist ephemeral seed to '{backend_url}': {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("could not persist ephemeral seed to '{backend_shown}': {e}")
+        })?;
 
     info!(
         bundle_id = %bundle_id_hex,
         intent = ?intent,
         request = %request_path.display(),
-        backend = %backend_url,
+        backend = %backend_shown,
         "Sealed-handoff phase 1 complete — request emitted, seed stored in backend"
     );
 
@@ -360,6 +366,8 @@ async fn phase2_apply(
 
     // Open the backend up front; a broken store is a phase-2 fatal.
     let backend_url = crate::config_writer::build_backend_url(config);
+    // Shown in logs and errors with any URL credentials hidden.
+    let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
     let store = crate::secret_backend::open_secret_backend(&backend_url)?;
 
     // Reconstruct a synthetic `SealedHandoffState` keyed to this
@@ -394,11 +402,11 @@ async fn phase2_apply(
     let seed_bytes = store
         .load_bootstrap_seed(&bundle_id_hex)
         .await
-        .map_err(|e| anyhow::anyhow!("read ephemeral seed from '{backend_url}': {e}"))?
+        .map_err(|e| anyhow::anyhow!("read ephemeral seed from '{backend_shown}': {e}"))?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "could not locate the ephemeral seed for bundle id {bundle_id_hex} in backend \
-                 '{backend_url}'. Run phase 1 of `mediator-setup --from <recipe>` against the \
+                 '{backend_shown}'. Run phase 1 of `mediator-setup --from <recipe>` against the \
                  same backend before supplying `--bundle`."
             )
         })?;
@@ -426,7 +434,7 @@ async fn phase2_apply(
     if let Err(e) = store.delete_bootstrap_seed(&bundle_id_hex).await {
         warn!(
             bundle_id = %bundle_id_hex,
-            backend = %backend_url,
+            backend = %backend_shown,
             error = %e,
             "phase-2 seed delete failed; the sweeper will retry later",
         );
@@ -441,7 +449,7 @@ async fn phase2_apply(
         bundle_id = %bundle_id_hex,
         admin_did = %session.admin_did(),
         integration_did = session.integration_did().unwrap_or("(none)"),
-        backend = %backend_url,
+        backend = %backend_shown,
         "Sealed-handoff phase 2 complete — bundle applied, seed removed"
     );
 

@@ -188,9 +188,10 @@ pub struct SealedHandoffState {
     /// Parsed armored bundle, populated on transition into
     /// [`SealedPhase::DigestVerify`].
     pub bundle: Option<SealedBundle>,
-    /// Computed SHA-256 of the parsed bundle, displayed alongside the
-    /// digest-entry prompt as a courtesy "this is what the producer
-    /// should have shown you".
+    /// Computed SHA-256 of the parsed bundle. Never shown or copied
+    /// before the operator's digest is compared with it — showing it
+    /// would let the operator paste back the value being checked. A
+    /// mismatch error names it.
     pub computed_digest: Option<String>,
     /// Successful open result projected onto a `VtaSession`. The
     /// wizard moves this onto `WizardApp.vta_session` when the
@@ -559,17 +560,17 @@ impl SealedHandoffState {
         self.set_clipboard(session.vta_did.clone(), "VTA DID");
     }
 
-    /// Copy the wizard-computed bundle digest to the clipboard.
-    /// Hotkey `[F2]` on the `DigestVerify` panel — `F2` instead of
-    /// a letter key because the panel has an active text input
-    /// for the operator to type the OOB digest, and bare letters
-    /// would land in the field instead of triggering a copy.
-    pub fn copy_digest_to_clipboard(&mut self) {
-        let Some(digest) = self.computed_digest.clone() else {
-            self.clipboard_status = Some("No digest computed yet".into());
-            return;
-        };
-        self.set_clipboard(digest, "computed digest");
+    /// Hint under the `DigestVerify` prompt: the last error, or what
+    /// to type. Deliberately omits the computed digest — the operator
+    /// must type the one the VTA admin gave them, not copy ours back.
+    pub fn digest_verify_hint(&self) -> String {
+        self.last_error.clone().unwrap_or_else(|| {
+            "Type the digest exactly as your VTA admin gave it to you. The wizard \
+             compares it with the bundle and shows both values only if they differ.\n\n\
+             If you have no digest from the VTA admin, do NOT continue — ask for it \
+             on a channel other than the one that carried the bundle."
+                .to_string()
+        })
     }
 
     /// Primary producer command for the current intent.
@@ -1746,6 +1747,20 @@ mod tests {
         assert!(matches!(err, SealedHandoffError::DigestMismatch { .. }));
         // Still on DigestVerify so the operator can correct it.
         assert_eq!(state.phase, SealedPhase::DigestVerify);
+    }
+
+    #[tokio::test]
+    async fn the_computed_digest_is_shown_only_after_a_mismatch() {
+        let mut state = SealedHandoffState::new(VtaIntent::AdminOnly, None);
+        finalize_in_temp_cwd(&mut state).unwrap();
+        let nonce = state.nonce;
+        ingest_sealed(&mut state, AssertionProof::PinnedOnly, nonce).await;
+        let computed = state.computed_digest.clone().unwrap();
+        assert!(!state.digest_verify_hint().contains(&computed));
+
+        let err = open_with_digest(&mut state, "deadbeef").unwrap_err();
+        state.last_error = Some(err.to_string());
+        assert!(state.digest_verify_hint().contains(&computed));
     }
 
     /// Seal `payload` to this run's request with the given proof and
