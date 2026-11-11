@@ -278,6 +278,38 @@ async fn a_member_on_one_instance_reaches_a_principal_on_another() {
     assert_eq!(granted.unwrap()["grantId"], grant_id.as_str());
     assert_eq!(inactive["grantId"], grant_id.as_str());
 
+    // An administrator asking instance A (where its own socket goes) is
+    // told the answer covers that instance only: the device's connection is
+    // on B, so A lists nothing and must not pass that off as the whole
+    // mediator's view.
+    {
+        use affinidi_messaging_mediator_common::types::accounts::AccountType;
+        use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+        let admin = env.add_user("operator").await.unwrap();
+        env.mediator
+            .store()
+            .account_set_role(&admin.did_hash(), &AccountType::Admin)
+            .await
+            .expect("promote");
+        env.atm
+            .profile_add(&admin.profile, true)
+            .await
+            .expect("admin websocket on A");
+        let page = env
+            .atm
+            .trust_tasks()
+            .mux_connections(&admin.profile, &MuxConnectionsQuery::all())
+            .await
+            .expect("mux_connections on A");
+        let page = serde_json::to_value(&page).unwrap();
+        assert_eq!(page["coverage"], "thisInstance", "{page:#}");
+        assert_eq!(
+            page["connections"],
+            json!([]),
+            "B's connection is not A's to list"
+        );
+    }
+
     // 2. While `work`'s own socket is up, its mail goes there, not to B.
     send(&env, &sender, &work, "to work's own socket").await;
     let own = timeout(quick, async {
