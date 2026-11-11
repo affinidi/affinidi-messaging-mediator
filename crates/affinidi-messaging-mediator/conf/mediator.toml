@@ -644,6 +644,36 @@ oob_invite_ttl = "86400"
 ### lose messages. Costs up to this much RSS.
 # pubsub_buffer = "16777216"
 
+### ─── WebSocket liveness ─────────────────────────────────────────────────────
+### Read once per connection, when it opens; a change applies to new
+### connections after a restart. Values are whole seconds.
+
+### Env: LIMIT_WS_PING_INTERVAL_SECS
+### Seconds between the pings the mediator sends on every WebSocket (30).
+### Minimum 1.
+# ws_ping_interval_secs = "30"
+
+### Env: LIMIT_WS_PONG_TIMEOUT_SECS
+### Seconds a WebSocket may go without receiving ANY frame from the client — a
+### pong to the pings above, a ping of its own, or a message — before the
+### mediator closes it with 1001 "connection unresponsive" (90, three ping
+### intervals). Catches a client that went away without closing (lost network,
+### suspended device) long before TCP would. Raised to at least twice
+### ws_ping_interval_secs, so a client that answers each ping is never closed.
+### Every standard WebSocket client answers pings automatically while it reads.
+### Counted in `ws_pong_timeouts_total`.
+### Scale: raise for clients on links with long stalls; lower to free the slots
+### of vanished clients sooner.
+# ws_pong_timeout_secs = "90"
+
+### Env: LIMIT_WS_WRITE_TIMEOUT_SECS
+### Seconds one write to a WebSocket may take (30). A client that stops reading
+### fills its TCP window and leaves the write waiting; past this the mediator
+### closes the connection with 1001 and frees its slots and queued frames.
+### Nothing waiting in that write is reported delivered; it stays in the inbox.
+### Minimum 1. Counted in `ws_write_timeouts_total`.
+# ws_write_timeout_secs = "30"
+
 ### ─── DID multiplexing ───────────────────────────────────────────────────────
 ### One authenticated WebSocket (the "principal") carrying live delivery and
 ### pickup for many DIDs, so a client with many DIDs does not need one

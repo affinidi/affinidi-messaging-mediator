@@ -1,6 +1,6 @@
 use crate::common::metrics::names::{
     ACTIVE_WEBSOCKET_CONNECTIONS, MUX_LIVE_FRAMES_WITHHELD_TOTAL, WS_LIVE_RESYNC_SENT,
-    WS_LIVE_RESYNC_SUPPRESSED, WS_WRITE_TIMEOUTS_TOTAL,
+    WS_LIVE_RESYNC_SUPPRESSED, WS_PONG_TIMEOUTS_TOTAL, WS_WRITE_TIMEOUTS_TOTAL,
 };
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
@@ -153,7 +153,7 @@ where
 /// first tells it nothing it does not already know, on the one socket already
 /// known to be congested.
 ///
-/// Well under the 30s ping interval, so a deferred signal is never waiting long
+/// Well under the default 30s ping interval, so a deferred signal is never waiting long
 /// for a wake-up to carry it.
 const MIN_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -660,13 +660,33 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// How long one write to a WebSocket may take before the peer is treated as
-/// gone. A peer that stops reading leaves a write parked once its TCP window
-/// closes; without a bound the connection never notices, and holds its
-/// slots and queued frames until the kernel gives up on it.
-const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the connection loop waits on the peer.
+///
+/// `ws_write_timeout_secs` bounds one write: a peer that stops reading leaves
+/// a write parked once its TCP window closes, and without a bound the
+/// connection would hold its slots and queued frames until the kernel gives
+/// up on it. `ws_pong_timeout_secs` bounds silence: a peer that has gone away
+/// without closing (a dropped network, a suspended device) answers no ping,
+/// and is closed once nothing has arrived from it for that long.
+#[derive(Clone, Copy, Debug)]
+struct Liveness {
+    ping_interval: Duration,
+    pong_timeout: Duration,
+    write_timeout: Duration,
+}
 
-/// A [`WebSocket`] whose writes are bounded by [`WS_WRITE_TIMEOUT`].
+impl Liveness {
+    fn from_limits(limits: &crate::common::config::LimitsConfig) -> Self {
+        Self {
+            ping_interval: Duration::from_secs(limits.ws_ping_interval_secs.max(1)),
+            pong_timeout: Duration::from_secs(limits.ws_pong_timeout_secs.max(1)),
+            write_timeout: Duration::from_secs(limits.ws_write_timeout_secs.max(1)),
+        }
+    }
+}
+
+/// A [`WebSocket`] whose writes are bounded by a deadline, and which notes
+/// when it last received a frame.
 ///
 /// A write that runs out of time may have left part of a frame on the wire,
 /// so the socket is unusable after it: every later write fails at once, and
@@ -675,14 +695,16 @@ struct BoundedSocket {
     inner: WebSocket,
     write_timeout: Duration,
     stalled: bool,
+    last_inbound: tokio::time::Instant,
 }
 
 impl BoundedSocket {
-    fn new(inner: WebSocket) -> Self {
+    fn new(inner: WebSocket, write_timeout: Duration) -> Self {
         Self {
             inner,
-            write_timeout: WS_WRITE_TIMEOUT,
+            write_timeout,
             stalled: false,
+            last_inbound: tokio::time::Instant::now(),
         }
     }
 
@@ -691,8 +713,19 @@ impl BoundedSocket {
         bounded_write(&mut self.stalled, self.write_timeout, write).await
     }
 
+    /// The next frame from the peer. Any frame, a pong included, shows the
+    /// peer is still there.
     async fn recv(&mut self) -> Option<Result<Message, axum::Error>> {
-        self.inner.recv().await
+        let frame = self.inner.recv().await;
+        if matches!(frame, Some(Ok(_))) {
+            self.last_inbound = tokio::time::Instant::now();
+        }
+        frame
+    }
+
+    /// When the peer is treated as gone if nothing more arrives from it.
+    fn silence_deadline(&self, pong_timeout: Duration) -> tokio::time::Instant {
+        self.last_inbound + pong_timeout
     }
 
     /// A write timed out; the connection should close.
@@ -722,8 +755,8 @@ where
             Err(axum::Error::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "WebSocket write did not complete within {}s",
-                    limit.as_secs()
+                    "WebSocket write did not complete within {}ms",
+                    limit.as_millis()
                 ),
             )))
         }
@@ -825,7 +858,8 @@ async fn handle_socket(
         session = session.session_id
     );
     async move {
-        let mut socket = BoundedSocket::new(socket);
+        let liveness = Liveness::from_limits(&state.config.limits);
+        let mut socket = BoundedSocket::new(socket, liveness.write_timeout);
 
         // A token past its `exp` is still accepted by the upgrade within the
         // JWT leeway, but the socket lives only until `exp`. Refuse it here,
@@ -1088,8 +1122,10 @@ async fn handle_socket(
         tokio::pin!(auth_timeout);
         debug!(expires_in_secs = session.expires_at.saturating_sub(epoch), "WebSocket auth timeout set");
 
-        // Periodic ping to detect dead connections
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        // Periodic ping to detect dead connections: a peer that is still
+        // there answers with a pong, which (like any frame from it) moves the
+        // silence deadline below.
+        let mut ping_interval = tokio::time::interval(liveness.ping_interval);
         ping_interval.reset(); // Skip the immediate first tick
 
         // Sent-but-not-yet-acked message ids, for `tsp-ack` mode only.
@@ -1146,6 +1182,7 @@ async fn handle_socket(
                 close_reason = (close_code::GOING_AWAY, "connection unresponsive");
                 break;
             }
+            let silence_deadline = socket.silence_deadline(liveness.pong_timeout);
             select! {
                 _ = &mut auth_timeout => {
                     debug!("Socket lifetime reached");
@@ -1419,6 +1456,18 @@ async fn handle_socket(
                 // after this select acts on it.
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_resync_sent + MIN_RESYNC_INTERVAL)),
                     if live_resync.load(std::sync::atomic::Ordering::Relaxed) => {}
+                // Nothing has arrived from the peer for the whole pong timeout,
+                // not even a pong to the pings above: it has gone without
+                // closing. Rearmed from the latest frame on every pass.
+                _ = tokio::time::sleep_until(silence_deadline) => {
+                    warn!(
+                        silent_secs = liveness.pong_timeout.as_secs(),
+                        "No frame from the WebSocket peer within the pong timeout; closing"
+                    );
+                    metrics::counter!(WS_PONG_TIMEOUTS_TOTAL).increment(1);
+                    close_reason = (close_code::GOING_AWAY, "connection unresponsive");
+                    break;
+                }
                 _ = ping_interval.tick() => {
                     if let Err(e) = socket.send(Message::Ping(vec![].into())).await {
                         debug!("Failed to send WebSocket ping: {e}");
@@ -2563,7 +2612,7 @@ mod close_report_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CorsOriginPolicy, MIN_RESYNC_INTERVAL, app_subprotocols, bounded_write,
+        BoundedSocket, CorsOriginPolicy, MIN_RESYNC_INTERVAL, app_subprotocols, bounded_write,
         extract_bearer_subprotocol, resync_due, ws_origin_allowed,
     };
     use crate::common::config::OriginMatcher;
@@ -2593,6 +2642,122 @@ mod tests {
                 .is_err()
         );
         assert!(!attempted.get());
+    }
+
+    /// A real WebSocket pair over loopback: the mediator's end, and a client
+    /// end the test controls (and may never read from).
+    async fn socket_pair() -> (
+        axum::extract::ws::WebSocket,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        if let Some(tx) = tx.lock().expect("lock").take() {
+                            let _ = tx.send(socket);
+                        }
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("client handshake");
+        let server = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("server side upgraded in time")
+            .expect("server socket handed over");
+        (server, client)
+    }
+
+    /// A peer that never reads: once its TCP window and the kernel buffers
+    /// fill, the next write waits for room that never comes. It must fail
+    /// within the write timeout, and the socket must refuse further writes.
+    #[tokio::test]
+    async fn a_write_to_a_peer_that_never_reads_times_out() {
+        let (server, client) = socket_pair().await;
+        let mut socket = BoundedSocket::new(server, Duration::from_millis(300));
+        let frame = vec![0u8; 256 * 1024];
+        let mut written = 0usize;
+        let failed = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match socket
+                    .send(axum::extract::ws::Message::Binary(frame.clone().into()))
+                    .await
+                {
+                    Ok(()) => {
+                        written += 1;
+                        // 1 GiB is far beyond any loopback buffering.
+                        assert!(written < 4096, "writes kept succeeding with nobody reading");
+                    }
+                    Err(e) => break e,
+                }
+            }
+        })
+        .await
+        .expect("a write to a peer that never reads must time out, not hang");
+        assert!(
+            failed.to_string().contains("did not complete"),
+            "expected the write timeout, got: {failed}"
+        );
+        assert!(socket.stalled(), "a timed-out socket is marked stalled");
+        assert!(
+            socket
+                .send(axum::extract::ws::Message::Ping(Vec::new().into()))
+                .await
+                .is_err(),
+            "a stalled socket accepts no further writes"
+        );
+        drop(client);
+    }
+
+    /// Any frame from the peer moves the silence deadline; time alone does not.
+    #[tokio::test]
+    async fn the_silence_deadline_follows_the_latest_inbound_frame() {
+        use futures_util::SinkExt;
+        let (server, mut client) = socket_pair().await;
+        let mut socket = BoundedSocket::new(server, Duration::from_secs(5));
+        let timeout = Duration::from_secs(90);
+        let first = socket.silence_deadline(timeout);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            socket.silence_deadline(timeout),
+            first,
+            "no frame, no change"
+        );
+
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Pong(
+                Vec::new().into(),
+            ))
+            .await
+            .expect("client sends a pong");
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.recv())
+            .await
+            .expect("pong arrives");
+        assert!(matches!(
+            frame,
+            Some(Ok(axum::extract::ws::Message::Pong(_)))
+        ));
+        assert!(
+            socket.silence_deadline(timeout) > first,
+            "a pong pushes the deadline out"
+        );
     }
 
     #[tokio::test(start_paused = true)]

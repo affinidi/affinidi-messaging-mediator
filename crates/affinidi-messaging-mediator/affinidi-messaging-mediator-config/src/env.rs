@@ -199,6 +199,18 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
     env_override!(config.limits.ws_send_buffer, "LIMIT_WS_SEND_BUFFER");
     env_override!(config.limits.pubsub_buffer, "LIMIT_PUBSUB_BUFFER");
+    env_override!(
+        config.limits.ws_ping_interval_secs,
+        "LIMIT_WS_PING_INTERVAL_SECS"
+    );
+    env_override!(
+        config.limits.ws_pong_timeout_secs,
+        "LIMIT_WS_PONG_TIMEOUT_SECS"
+    );
+    env_override!(
+        config.limits.ws_write_timeout_secs,
+        "LIMIT_WS_WRITE_TIMEOUT_SECS"
+    );
     env_override!(config.limits.mux.enabled, "LIMIT_MUX_ENABLED");
     env_override!(
         config.limits.mux.max_dids_per_connection,

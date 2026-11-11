@@ -86,6 +86,21 @@ pub struct LimitsConfig {
     /// Byte ceiling for the live-delivery pub/sub ring. The ring's slot count is
     /// derived from this — see [`LimitsConfig::pubsub_capacity`].
     pub pubsub_buffer: usize,
+    /// Seconds between the pings the mediator sends on each WebSocket.
+    /// At least 1.
+    #[serde(default = "default_ws_ping_interval_secs")]
+    pub ws_ping_interval_secs: u64,
+    /// Seconds a WebSocket may go without receiving any frame (a pong, a
+    /// ping, a message) before the mediator closes it with 1001. At least
+    /// twice [`ws_ping_interval_secs`](Self::ws_ping_interval_secs), so a
+    /// peer that answers every ping is never closed.
+    #[serde(default = "default_ws_pong_timeout_secs")]
+    pub ws_pong_timeout_secs: u64,
+    /// Seconds one write to a WebSocket may take. A peer that stops reading
+    /// leaves a write waiting once its TCP window closes; past this the
+    /// mediator closes the connection with 1001. At least 1.
+    #[serde(default = "default_ws_write_timeout_secs")]
+    pub ws_write_timeout_secs: u64,
     /// `[limits.mux]` — DID multiplexing. Off unless an operator enables it.
     #[serde(default)]
     pub mux: MuxConfig,
@@ -309,6 +324,9 @@ impl Default for LimitsConfig {
             did_rate_limit_burst: 10,
             ws_send_buffer: 33_554_432,
             pubsub_buffer: 16_777_216,
+            ws_ping_interval_secs: DEFAULT_WS_PING_INTERVAL_SECS,
+            ws_pong_timeout_secs: DEFAULT_WS_PONG_TIMEOUT_SECS,
+            ws_write_timeout_secs: DEFAULT_WS_WRITE_TIMEOUT_SECS,
             mux: MuxConfig::default(),
         }
     }
@@ -335,6 +353,52 @@ impl LimitsConfig {
     }
 }
 
+const DEFAULT_WS_PING_INTERVAL_SECS: u64 = 30;
+const DEFAULT_WS_PONG_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_WS_WRITE_TIMEOUT_SECS: u64 = 30;
+
+fn default_ws_ping_interval_secs() -> u64 {
+    DEFAULT_WS_PING_INTERVAL_SECS
+}
+fn default_ws_pong_timeout_secs() -> u64 {
+    DEFAULT_WS_PONG_TIMEOUT_SECS
+}
+fn default_ws_write_timeout_secs() -> u64 {
+    DEFAULT_WS_WRITE_TIMEOUT_SECS
+}
+
+/// The WebSocket liveness settings, held to values that work together:
+/// every interval at least 1 s, and the silence allowed at least two ping
+/// intervals, so a peer that answers each ping is never closed for silence.
+/// Returns `(ping_interval, pong_timeout, write_timeout)` in seconds, and a
+/// note for each value that had to be raised.
+fn websocket_liveness(ping: u64, pong: u64, write: u64) -> ((u64, u64, u64), Vec<String>) {
+    let mut notes = Vec::new();
+    let ping_interval = if ping == 0 {
+        notes.push("limits.ws_ping_interval_secs must be at least 1; using 1".to_string());
+        1
+    } else {
+        ping
+    };
+    let least_pong = ping_interval.saturating_mul(2);
+    let pong_timeout = if pong < least_pong {
+        notes.push(format!(
+            "limits.ws_pong_timeout_secs ({pong}) must be at least twice \
+             limits.ws_ping_interval_secs ({ping_interval}); using {least_pong}"
+        ));
+        least_pong
+    } else {
+        pong
+    };
+    let write_timeout = if write == 0 {
+        notes.push("limits.ws_write_timeout_secs must be at least 1; using 1".to_string());
+        1
+    } else {
+        write
+    };
+    ((ping_interval, pong_timeout, write_timeout), notes)
+}
+
 impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
     type Error = MediatorError;
 
@@ -344,6 +408,34 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 "WARN: Could not parse limits.{field} config value, using default: {default}"
             );
         };
+
+        let secs = |field: &str, value: &str, default: u64| -> u64 {
+            value.parse().unwrap_or_else(|_| {
+                warn_default(field, &default.to_string());
+                default
+            })
+        };
+        let ((ws_ping_interval_secs, ws_pong_timeout_secs, ws_write_timeout_secs), notes) =
+            websocket_liveness(
+                secs(
+                    "ws_ping_interval_secs",
+                    &raw.ws_ping_interval_secs,
+                    DEFAULT_WS_PING_INTERVAL_SECS,
+                ),
+                secs(
+                    "ws_pong_timeout_secs",
+                    &raw.ws_pong_timeout_secs,
+                    DEFAULT_WS_PONG_TIMEOUT_SECS,
+                ),
+                secs(
+                    "ws_write_timeout_secs",
+                    &raw.ws_write_timeout_secs,
+                    DEFAULT_WS_WRITE_TIMEOUT_SECS,
+                ),
+            );
+        for note in notes {
+            eprintln!("WARN: {note}");
+        }
 
         Ok(LimitsConfig {
             attachments_max_count: raw.attachments_max_count.parse().unwrap_or_else(|_| {
@@ -475,6 +567,9 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 warn_default("pubsub_buffer", "16777216");
                 16_777_216
             }),
+            ws_ping_interval_secs,
+            ws_pong_timeout_secs,
+            ws_write_timeout_secs,
             mux: MuxConfig::from(raw.mux),
         })
     }
@@ -600,11 +695,17 @@ mod tests {
             did_rate_limit_burst: "20".to_string(),
             ws_send_buffer: "8388608".to_string(),
             pubsub_buffer: "4194304".to_string(),
+            ws_ping_interval_secs: "20".to_string(),
+            ws_pong_timeout_secs: "50".to_string(),
+            ws_write_timeout_secs: "15".to_string(),
             mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
         assert_eq!(limits.ws_send_buffer, 8_388_608);
         assert_eq!(limits.pubsub_buffer, 4_194_304);
+        assert_eq!(limits.ws_ping_interval_secs, 20);
+        assert_eq!(limits.ws_pong_timeout_secs, 50);
+        assert_eq!(limits.ws_write_timeout_secs, 15);
         assert_eq!(limits.attachments_max_count, 5);
         assert_eq!(limits.crypto_operations_per_message, 500);
         assert_eq!(limits.deleted_messages, 75);
@@ -663,12 +764,76 @@ mod tests {
             did_rate_limit_burst: "10".to_string(),
             ws_send_buffer: "67108864".to_string(),
             pubsub_buffer: "33554432".to_string(),
+            ws_ping_interval_secs: "soon".to_string(),
+            ws_pong_timeout_secs: "30".to_string(),
+            ws_write_timeout_secs: "-1".to_string(),
             mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
         // Invalid values should fall back to unwrap_or defaults
         assert_eq!(limits.attachments_max_count, 20);
         assert_eq!(limits.crypto_operations_per_message, 1000);
+        // An unparsable ping interval falls back to 30 s, which lifts the
+        // 30 s pong timeout to two intervals.
+        assert_eq!(limits.ws_ping_interval_secs, 30);
+        assert_eq!(limits.ws_pong_timeout_secs, 60);
+        assert_eq!(limits.ws_write_timeout_secs, 30);
+    }
+
+    #[test]
+    fn websocket_liveness_defaults() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.ws_ping_interval_secs, 30);
+        assert_eq!(limits.ws_pong_timeout_secs, 90);
+        assert_eq!(limits.ws_write_timeout_secs, 30);
+        // A `[limits]` table written before these keys existed still loads,
+        // with the defaults.
+        let raw: LimitsConfigRaw = toml::from_str(
+            r#"
+            attachments_max_count = "20"
+            crypto_operations_per_message = "1000"
+            deleted_messages = "100"
+            forward_task_queue = "50000"
+            http_size = "10485760"
+            listed_messages = "100"
+            local_max_acl = "1000"
+            message_expiry_seconds = "604800"
+            message_size = "1048576"
+            queued_send_messages_soft = "2000"
+            queued_send_messages_hard = "10000"
+            queued_receive_messages_soft = "200"
+            queued_receive_messages_hard = "1000"
+            to_keys_per_recipient = "100"
+            to_recipients = "100"
+            ws_size = "10485760"
+            access_list_limit = "1000"
+            oob_invite_ttl = "86400"
+            "#,
+        )
+        .expect("a limits table without the WebSocket liveness keys parses");
+        let limits = LimitsConfig::try_from(raw).unwrap();
+        assert_eq!(limits.ws_ping_interval_secs, 30);
+        assert_eq!(limits.ws_pong_timeout_secs, 90);
+        assert_eq!(limits.ws_write_timeout_secs, 30);
+    }
+
+    #[test]
+    fn websocket_liveness_values_are_held_to_ones_that_work_together() {
+        // Already coherent: unchanged, nothing to report.
+        let (values, notes) = websocket_liveness(30, 90, 30);
+        assert_eq!(values, (30, 90, 30));
+        assert!(notes.is_empty());
+        // Exactly two intervals is enough.
+        assert_eq!(websocket_liveness(10, 20, 5).0, (10, 20, 5));
+        // Silence allowed shorter than two intervals would close a peer that
+        // answers every ping: raised.
+        let (values, notes) = websocket_liveness(30, 45, 30);
+        assert_eq!(values, (30, 60, 30));
+        assert_eq!(notes.len(), 1);
+        // Zero is not "off": each is raised to its least value.
+        let (values, notes) = websocket_liveness(0, 0, 0);
+        assert_eq!(values, (1, 2, 1));
+        assert_eq!(notes.len(), 3);
     }
 }
 

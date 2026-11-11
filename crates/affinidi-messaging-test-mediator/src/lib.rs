@@ -353,6 +353,9 @@ pub struct TestMediatorBuilder {
     /// Override for `LimitsConfig.did_rate_limit_per_second` /
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
+    /// Override for `LimitsConfig.ws_ping_interval_secs`,
+    /// `ws_pong_timeout_secs` and `ws_write_timeout_secs`.
+    websocket_liveness: Option<(u64, u64, u64)>,
     mux_enabled: bool,
     /// Override for `[limits.mux] max_dids_per_connection`.
     mux_max_dids_per_connection: Option<usize>,
@@ -414,6 +417,7 @@ impl Default for TestMediatorBuilder {
             jwt_refresh_expiry_secs: None,
             max_websocket_connections_per_did: None,
             did_rate_limit: None,
+            websocket_liveness: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
             streaming_liveness: None,
@@ -668,6 +672,20 @@ impl TestMediatorBuilder {
     /// (`0` = disabled). Set small to exercise the `429` in tests.
     pub fn did_rate_limit(mut self, per_second: u32, burst: u32) -> Self {
         self.did_rate_limit = Some((per_second, burst));
+        self
+    }
+
+    /// Override the WebSocket liveness settings, in seconds:
+    /// `limits.ws_ping_interval_secs`, `limits.ws_pong_timeout_secs` and
+    /// `limits.ws_write_timeout_secs`. Defaults to the production defaults
+    /// (30, 90, 30). Set small to exercise an unresponsive peer in tests.
+    pub fn websocket_liveness(
+        mut self,
+        ping_interval_secs: u64,
+        pong_timeout_secs: u64,
+        write_timeout_secs: u64,
+    ) -> Self {
+        self.websocket_liveness = Some((ping_interval_secs, pong_timeout_secs, write_timeout_secs));
         self
     }
 
@@ -1022,6 +1040,11 @@ impl TestMediatorBuilder {
         if let Some((per_second, burst)) = self.did_rate_limit {
             limits.did_rate_limit_per_second = per_second;
             limits.did_rate_limit_burst = burst;
+        }
+        if let Some((ping, pong, write)) = self.websocket_liveness {
+            limits.ws_ping_interval_secs = ping;
+            limits.ws_pong_timeout_secs = pong;
+            limits.ws_write_timeout_secs = write;
         }
         limits.mux.enabled = self.mux_enabled;
         if let Some(max) = self.mux_max_dids_per_connection {
