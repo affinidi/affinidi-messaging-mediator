@@ -1211,26 +1211,22 @@ async fn handle_inbound_didcomm(
                         ));
                     }
 
-                    // Everything the recipient side needs — existence, ACL bits
-                    // and the access-list verdict — comes from one lookup. The
-                    // three facts all derive from the same stored record, so
-                    // asking for them separately cost three reads of it.
-                    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
                     let from_hash = envelope
                         .from_did
                         .as_ref()
                         .map(affinidi_messaging_mediator_common::did_identity::did_hash);
-                    let Some(recipient) = state
-                        .database
-                        .delivery_decision(&to_hash, from_hash.as_deref())
-                        .await?
-                    else {
-                        return Err(crate::messages::delivery_refused(
-                            session,
-                            None,
-                            "direct-delivery recipient is not known on this mediator",
-                        ));
-                    };
+
+                    // Order matters on this branch. Every check about the
+                    // *sender* — session binding, its SEND_MESSAGES bit, the
+                    // anonymous-sender policy — runs before anything about the
+                    // recipient is read, so its answer is the same whichever
+                    // DID the envelope is addressed to. Only then is the
+                    // recipient looked up, and every recipient-side refusal
+                    // (unknown, may not receive, access list) is the one
+                    // uniform `delivery_refused`. Checking the recipient first
+                    // would let a sender tell a served DID from an unknown one
+                    // by which of the two kinds of answer came back. The TSP
+                    // branch orders its checks the same way.
 
                     // The mediator cannot decrypt a direct-delivery envelope, so the
                     // claimed sender (JWE `skid` header) is unverified. When
@@ -1248,7 +1244,7 @@ async fn handle_inbound_didcomm(
                     //
                     // The cost is real and worth naming: on a blind relay hop the
                     // claimed sender stays unverified, and it is that claimed sender
-                    // which `delivery_decision` above hashed into `from_hash` for the
+                    // which `delivery_decision` below receives as `from_hash` for the
                     // recipient's access-list verdict. A relaying peer can therefore
                     // present any sender DID it likes. This is inherent to blind
                     // relay — by construction the receiving mediator cannot see who
@@ -1311,6 +1307,23 @@ async fn handle_inbound_didcomm(
                             StatusCode::FORBIDDEN,
                         ));
                     }
+                    // Everything the recipient side needs — existence, ACL bits
+                    // and the access-list verdict — comes from one lookup. The
+                    // three facts all derive from the same stored record, so
+                    // asking for them separately cost three reads of it.
+                    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
+                    let Some(recipient) = state
+                        .database
+                        .delivery_decision(&to_hash, from_hash.as_deref())
+                        .await?
+                    else {
+                        return Err(crate::messages::delivery_refused(
+                            session,
+                            None,
+                            "direct-delivery recipient is not known on this mediator",
+                        ));
+                    };
+
                     // Recipient-side gates, both answered from the single
                     // lookup above. RECEIVE_MESSAGES mirrors the sender's
                     // SEND_MESSAGES check: a DID whose ACLs withhold it does
