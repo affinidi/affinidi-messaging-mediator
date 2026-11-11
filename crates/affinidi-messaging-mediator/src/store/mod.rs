@@ -252,8 +252,9 @@ pub(crate) mod activity_harness {
             "removing an account removes its activity"
         );
 
-        // Adding clears too, so a record written between a removal's existence
-        // check and its delete cannot outlive the account it belonged to.
+        // Adding an account that already exists changes nothing, its activity
+        // included. (Creating one clears any activity for the hash, as the
+        // re-add above shows.)
         store
             .account_activity_record(&alice, ActivityKind::Received, 300)
             .await
@@ -263,9 +264,9 @@ pub(crate) mod activity_harness {
             .await
             .expect("add over an account with activity");
         assert_eq!(
-            store.account_activity(&[alice]).await.unwrap(),
-            vec![AccountActivity::default()],
-            "adding an account clears any activity for that hash"
+            store.account_activity(&[alice]).await.unwrap()[0].last_received,
+            Some(300),
+            "adding an existing account leaves its activity"
         );
     }
 
