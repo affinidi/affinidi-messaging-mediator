@@ -42,10 +42,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState, StreamingClientState,
 };
-use affinidi_messaging_mediator_common::store::{MediatorStore, TrustTaskClaim, mux};
+use affinidi_messaging_mediator_common::store::{
+    MediatorStore, RefreshRotation, TrustTaskClaim, mux,
+};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountStatsDelta, ActivityKind, StatsDirection, StatsWire,
 };
@@ -1598,6 +1601,179 @@ async fn check_admin_roles(store: Arc<dyn MediatorStore>) {
     assert!(!store.account_exists(other).await.expect("account_exists"));
 }
 
+/// A challenge session is readable before its DID has an account (accounts
+/// are created only once the challenge is answered), and it can be promoted
+/// to an authenticated session.
+async fn check_challenge_session_without_account(store: Arc<dyn MediatorStore>) {
+    let did = "did:example:conformance_unregistered_user";
+    let challenge_id = "conformance-unregistered-challenge";
+    store
+        .create_session(&Session {
+            session_id: challenge_id.to_string(),
+            challenge: "conformance-challenge".to_string(),
+            state: SessionState::ChallengeSent,
+            did: did.to_string(),
+            did_hash: sha256::digest(did),
+            ..Default::default()
+        })
+        .await
+        .expect("create_session");
+    assert!(
+        !store
+            .account_exists(&sha256::digest(did))
+            .await
+            .expect("account_exists"),
+        "creating a challenge session must not create an account"
+    );
+    let session = store
+        .get_session(challenge_id, did)
+        .await
+        .expect("a challenge session is readable without an account");
+    assert_eq!(session.did, did);
+    assert_eq!(session.state, SessionState::ChallengeSent);
+
+    store
+        .update_session_authenticated(
+            challenge_id,
+            "conformance-unregistered-session",
+            did,
+            "refresh-1",
+        )
+        .await
+        .expect("update_session_authenticated");
+}
+
+/// Removing an account ends its sessions: `get_session` for an
+/// authenticated session whose DID no longer has an account fails with
+/// `Unauthorized`, so callers send the client back to authenticate.
+async fn check_removed_account_ends_session(store: Arc<dyn MediatorStore>) {
+    let did = "did:example:conformance_removed_user";
+    let did_hash = sha256::digest(did);
+    let session_id = "conformance-removed-session";
+    store
+        .account_add(&did_hash, &allow_all(), None)
+        .await
+        .expect("account_add");
+    store
+        .put_session(
+            &Session {
+                session_id: session_id.to_string(),
+                challenge: "c".to_string(),
+                state: SessionState::Authenticated,
+                did: did.to_string(),
+                did_hash: did_hash.clone(),
+                refresh_token_hash: Some("hash".to_string()),
+                ..Default::default()
+            },
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("put_session");
+    store
+        .get_session(session_id, did)
+        .await
+        .expect("session readable while the account exists");
+
+    assert!(
+        store
+            .account_remove(&admin_session("admin_hash"), &did_hash)
+            .await
+            .expect("account_remove")
+    );
+    match store.get_session(session_id, did).await {
+        Err(MediatorError::Unauthorized(..)) => {}
+        other => panic!("a session without its account must be refused, got {other:?}"),
+    }
+}
+
+/// Refresh-token rotation is a compare-and-swap: only the current hash
+/// rotates, a stale or absent one changes nothing, and of many concurrent
+/// rotations with one hash exactly one wins.
+async fn check_refresh_rotation(store: Arc<dyn MediatorStore>) {
+    let did = "did:example:conformance_refresh_user";
+    let did_hash = sha256::digest(did);
+    let session_id = "conformance-refresh-session";
+    store
+        .account_add(&did_hash, &allow_all(), None)
+        .await
+        .expect("account_add");
+    let mut session = Session {
+        session_id: session_id.to_string(),
+        challenge: "c".to_string(),
+        state: SessionState::Authenticated,
+        did: did.to_string(),
+        did_hash: did_hash.clone(),
+        refresh_token_hash: Some("hash-1".to_string()),
+        ..Default::default()
+    };
+    store
+        .put_session(&session, Duration::from_secs(300))
+        .await
+        .expect("put_session");
+
+    let rotate = |presented: &'static str, new: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .rotate_refresh_token_hash(session_id, presented, new)
+                .await
+                .expect("rotate_refresh_token_hash")
+        }
+    };
+
+    assert_eq!(rotate("hash-1", "hash-2").await, RefreshRotation::Rotated);
+    assert_eq!(
+        store.get_refresh_token_hash(session_id).await.unwrap(),
+        Some("hash-2".to_string())
+    );
+    // The hash just exchanged no longer matches, and nothing is written.
+    assert_eq!(rotate("hash-1", "hash-3").await, RefreshRotation::Mismatch);
+    assert_eq!(
+        store.get_refresh_token_hash(session_id).await.unwrap(),
+        Some("hash-2".to_string())
+    );
+
+    // Concurrent rotations with the same current hash: exactly one wins.
+    let racers: Vec<_> = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .rotate_refresh_token_hash(session_id, "hash-2", "hash-race")
+                    .await
+                    .expect("rotate_refresh_token_hash")
+            })
+        })
+        .collect();
+    let mut rotated = 0;
+    for racer in racers {
+        if racer.await.unwrap() == RefreshRotation::Rotated {
+            rotated += 1;
+        }
+    }
+    assert_eq!(rotated, 1, "one presented hash rotates exactly once");
+
+    // A session without a recorded hash never matches.
+    session.refresh_token_hash = None;
+    store.delete_session(session_id).await.unwrap();
+    store
+        .put_session(&session, Duration::from_secs(300))
+        .await
+        .expect("put_session without a hash");
+    assert_eq!(rotate("", "hash-4").await, RefreshRotation::Missing);
+    assert_eq!(
+        rotate("hash-race", "hash-4").await,
+        RefreshRotation::Missing
+    );
+
+    // Nor does a session that does not exist.
+    store.delete_session(session_id).await.unwrap();
+    assert_eq!(
+        rotate("hash-race", "hash-4").await,
+        RefreshRotation::Missing
+    );
+}
+
 /// The login path: a challenge session is authenticated under a new id (the
 /// challenge id stops working), then its refresh token is rotated. Both steps
 /// count in the global stats.
@@ -2499,6 +2675,9 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     // hide them.
     check_admin_roles(store.clone()).await;
     check_login_session(store.clone()).await;
+    check_challenge_session_without_account(store.clone()).await;
+    check_refresh_rotation(store.clone()).await;
+    check_removed_account_ends_session(store.clone()).await;
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
     check_streaming_deregister_keeps_another_owner(store.clone()).await;
@@ -2616,6 +2795,18 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn login_session() {
                 check_login_session(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn challenge_session_without_account() {
+                check_challenge_session_without_account(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn refresh_rotation() {
+                check_refresh_rotation(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn removed_account_ends_session() {
+                check_removed_account_ends_session(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn bulk_account_reads() {

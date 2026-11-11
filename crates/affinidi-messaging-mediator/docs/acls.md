@@ -52,7 +52,7 @@ It has two effects: who may authenticate, and who may add accounts.
 | Mode | Authentication | `messaging/account/add` |
 |------|----------------|-------------------------|
 | `explicit_allow` | **Closed.** Only DIDs that already hold an account record may authenticate. An unknown DID is rejected at `/authenticate/challenge` with `403 authentication.blocked` and no account is created for it. | Only `Admin` / `RootAdmin` accounts may add accounts. |
-| `explicit_deny` | **Open.** Any DID may authenticate; an unknown DID is auto-registered with `global_acl_default` when it requests a challenge. | Any authenticated DID may add accounts. |
+| `explicit_deny` | **Open.** Any DID may authenticate; an unknown DID is registered with `global_acl_default` once it answers the challenge (`/authenticate` or `/tsp/authenticate`). Requesting a challenge creates no account. | Any authenticated DID may add accounts. |
 
 In `explicit_allow`, the unknown-DID rejection is deliberately identical to
 the blocked-DID rejection (same status, error code, and problem report):

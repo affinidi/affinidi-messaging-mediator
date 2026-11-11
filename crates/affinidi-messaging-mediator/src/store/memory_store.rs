@@ -34,8 +34,8 @@ use affinidi_messaging_mediator_common::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
         OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        SentMessageState, Session, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef,
-        StreamingClientState, TrustTaskClaim, ops,
+        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -1083,6 +1083,10 @@ impl MediatorStore for MemoryStore {
             if let Some(account) = state.accounts.get(&did_hash) {
                 session.acls = account.acls.clone();
                 session.account_type = account.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
             }
         }
         Ok(session)
@@ -1092,6 +1096,29 @@ impl MediatorStore for MemoryStore {
         let mut state = self.state.lock().await;
         state.sessions.remove(session_id);
         Ok(())
+    }
+
+    /// Compare-and-swap under the store's single state lock, so it cannot
+    /// interleave with another rotation or session write.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        use subtle::ConstantTimeEq;
+        let mut state = self.state.lock().await;
+        let Some(record) = state.get_session_record(session_id) else {
+            return Ok(RefreshRotation::Missing);
+        };
+        let Some(stored) = record.session.refresh_token_hash.as_deref() else {
+            return Ok(RefreshRotation::Missing);
+        };
+        if !bool::from(stored.as_bytes().ct_eq(presented_hash.as_bytes())) {
+            return Ok(RefreshRotation::Mismatch);
+        }
+        record.session.refresh_token_hash = Some(new_hash.to_string());
+        Ok(RefreshRotation::Rotated)
     }
 
     // ─── Accounts ───────────────────────────────────────────────────────────
@@ -2545,7 +2572,12 @@ mod tests {
             .await
             .expect("put challenge session");
 
-        // Step 2: promote to Authenticated under a new session_id.
+        // Step 2: the DID gets its account, then the session is promoted
+        // to Authenticated under a new session_id.
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         store
             .update_session_authenticated(challenge_id, new_id, did, "refresh-hash-xyz")
             .await
@@ -2581,6 +2613,10 @@ mod tests {
         let store = MemoryStore::new();
         let did = "did:peer:refresh-test";
         let sid = "auth-sid-1";
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
 
         let session = Session {
             session_id: sid.into(),

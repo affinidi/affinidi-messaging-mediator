@@ -6,7 +6,7 @@
 //! methods on `Database`.
 
 use crate::errors::MediatorError;
-use crate::store::types::{Session, SessionState};
+use crate::store::types::{RefreshRotation, Session, SessionState};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
 use tracing::warn;
@@ -105,6 +105,18 @@ impl Database {
                 session_id.into(),
                 "No DID found when retrieving session".into(),
             ));
+        }
+
+        // A DID gets its account only once it has answered the challenge, so
+        // a `ChallengeSent` session normally has no `DID:` record to join.
+        // Return it with default ACLs; the login handlers apply the
+        // admission policy themselves. Any later state requires the account,
+        // so removing an account ends its sessions.
+        if did_db.iter().all(Option::is_none) {
+            if session.state == SessionState::ChallengeSent {
+                return Ok(session);
+            }
+            return Err(crate::store::account_gone(session_id));
         }
 
         if let Some(Some(role_type)) = did_db.first() {
@@ -291,6 +303,47 @@ impl Database {
             })?;
 
         Ok(())
+    }
+
+    /// Swaps the stored refresh-token hash from `presented_hash` to
+    /// `new_hash` in one server-side script, so a refresh token can be
+    /// exchanged at most once even when two requests race.
+    pub async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        // Single key, so it runs unchanged in cluster mode.
+        let outcome: i64 = redis::Script::new(
+            "local current = redis.call('HGET', KEYS[1], 'refresh_token_hash') \
+             if not current then return 0 end \
+             if current ~= ARGV[1] then return -1 end \
+             redis.call('HSET', KEYS[1], 'refresh_token_hash', ARGV[2]) \
+             return 1",
+        )
+        .key(format!("SESSION:{session_id}"))
+        .arg(presented_hash)
+        .arg(new_hash)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::SessionError(
+                14,
+                session_id.into(),
+                format!(
+                    "Failed to rotate refresh token hash for session ({session_id}). Reason: {err}"
+                ),
+            )
+        })?;
+
+        Ok(match outcome {
+            1 => RefreshRotation::Rotated,
+            -1 => RefreshRotation::Mismatch,
+            _ => RefreshRotation::Missing,
+        })
     }
 
     /// Retrieves the stored refresh token hash for a session.

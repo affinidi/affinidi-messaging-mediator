@@ -40,6 +40,19 @@ fn inbound_body_limit(shared_data: &SharedData) -> usize {
     shared_data.config.limits.message_size.max(AXUM_DEFAULT)
 }
 
+/// Body cap for `/authenticate/challenge` and `/tsp/authenticate`: a DID
+/// (at most `MAX_CHALLENGE_DID_LEN` bytes) or a VID, a session id and a
+/// signature, with room for JSON escaping. Both are unauthenticated.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+const AUTH_CHALLENGE_BODY_LIMIT: usize = 16 * 1024;
+
+/// Body cap for `/authenticate` and `/authenticate/refresh`: one authcrypt
+/// envelope carrying a challenge or a refresh token. Its headers repeat the
+/// sender and recipient key ids, which for `did:peer:2` run to kilobytes, so
+/// this is generous, but far below axum's 2 MiB default.
+#[cfg(feature = "didcomm")]
+const AUTH_MESSAGE_BODY_LIMIT: usize = 64 * 1024;
+
 pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router {
     let mut app = Router::new()
         // Outbound message handling to ATM clients
@@ -78,7 +91,8 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
             // Authentication step 1/2 - Client requests challenge from server
             .route(
                 "/authenticate/challenge",
-                post(authenticate::authentication_challenge),
+                post(authenticate::authentication_challenge)
+                    .layer(DefaultBodyLimit::max(AUTH_CHALLENGE_BODY_LIMIT)),
             );
     }
 
@@ -87,10 +101,15 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
     {
         app = app
             // Authentication step 2/2 - Client sends encrypted challenge to server
-            .route("/authenticate", post(authenticate::authentication_response))
+            .route(
+                "/authenticate",
+                post(authenticate::authentication_response)
+                    .layer(DefaultBodyLimit::max(AUTH_MESSAGE_BODY_LIMIT)),
+            )
             .route(
                 "/authenticate/refresh",
-                post(authenticate::authentication_refresh),
+                post(authenticate::authentication_refresh)
+                    .layer(DefaultBodyLimit::max(AUTH_MESSAGE_BODY_LIMIT)),
             )
             // Out Of Band Discovery Routes
             .route("/oob", post(oob_discovery::oob_invite_handler))
@@ -105,7 +124,8 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
     {
         app = app.route(
             "/tsp/authenticate",
-            post(authenticate::tsp::tsp_authentication_response),
+            post(authenticate::tsp::tsp_authentication_response)
+                .layer(DefaultBodyLimit::max(AUTH_CHALLENGE_BODY_LIMIT)),
         );
     }
 

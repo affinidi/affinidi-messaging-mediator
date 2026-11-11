@@ -1,0 +1,683 @@
+//! End-to-end coverage of the HTTP authentication flow driven by hand
+//! (challenge → `/authenticate` → `/authenticate/refresh`), so each step's
+//! request can be shaped by the test:
+//!
+//! - an account is created when a DID answers its challenge, not when it asks
+//!   for one, and only DID-shaped, bounded input gets a challenge;
+//! - a refresh token is exchanged only by the DID it was issued to, only once,
+//!   and only against a session that records it.
+
+mod common;
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_mediator::store::MemoryStore;
+use affinidi_messaging_mediator_common::store::{MediatorStore, Session};
+use affinidi_messaging_mediator_common::types::accounts::AccountType;
+use affinidi_messaging_test_mediator::{
+    AccessListModeType, TestEnvironment, TestMediator, TestMediatorHandle, acl,
+};
+use affinidi_secrets_resolver::SecretsResolver;
+use affinidi_tdk::dids::{DID, KeyType, PeerKeyRole};
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use common::init_tracing;
+use serde_json::{Value as JsonValue, json};
+use uuid::Uuid;
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client")
+}
+
+/// POST a JSON body to `path` under the mediator's API and return
+/// (status, JSON body or `Null` when the body is not JSON).
+async fn post(mediator: &TestMediatorHandle, path: &str, body: String) -> (u16, JsonValue) {
+    let resp = http()
+        .post(format!("{}{path}", mediator.endpoint()))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let body = resp.json().await.unwrap_or(JsonValue::Null);
+    (status, body)
+}
+
+async fn challenge(mediator: &TestMediatorHandle, did: &str) -> (u16, JsonValue) {
+    post(
+        mediator,
+        "authenticate/challenge",
+        json!({ "did": did }).to_string(),
+    )
+    .await
+}
+
+/// A fresh `did:peer:2.*` whose secrets the SDK holds but which has no
+/// account on the mediator.
+async fn unregistered_did(env: &TestEnvironment) -> String {
+    let (did, secrets) = DID::generate_did_peer(
+        vec![
+            (PeerKeyRole::Verification, KeyType::Ed25519),
+            (PeerKeyRole::Encryption, KeyType::X25519),
+        ],
+        Some(env.mediator.did().to_string()),
+    )
+    .expect("generate did:peer");
+    env.tdk.secrets_resolver().insert_vec(&secrets).await;
+    did
+}
+
+/// Authcrypt `typ`/`body` from `from` to the mediator, with the inner `from`
+/// set as the SDK sets it.
+async fn packed(env: &TestEnvironment, from: &str, typ: &str, body: JsonValue) -> String {
+    let mediator_did = env.mediator.did().to_string();
+    let msg = Message::build(Uuid::new_v4().to_string(), typ.to_string(), body)
+        .to(mediator_did.clone())
+        .from(from.to_string())
+        .created_time(now())
+        .expires_time(now() + 60)
+        .finalize();
+    env.atm
+        .pack_encrypted(&msg, &mediator_did, Some(from), Some(from))
+        .await
+        .expect("pack auth message")
+        .0
+}
+
+struct Tokens {
+    access: String,
+    refresh: String,
+}
+
+/// Challenge + `/authenticate` for `did`; returns the status and, on 200,
+/// the tokens.
+async fn try_login(env: &TestEnvironment, did: &str) -> (u16, Option<Tokens>) {
+    let (status, body) = challenge(&env.mediator, did).await;
+    assert_eq!(status, 200, "challenge for {did}: {body}");
+    let data = &body["data"];
+    let response = packed(
+        env,
+        did,
+        "https://affinidi.com/atm/1.0/authenticate",
+        json!({
+            "challenge": data["challenge"],
+            "session_id": data["session_id"],
+        }),
+    )
+    .await;
+    let (status, body) = post(&env.mediator, "authenticate", response).await;
+    if status != 200 {
+        return (status, None);
+    }
+    (
+        status,
+        Some(Tokens {
+            access: body["data"]["access_token"].as_str().unwrap().to_string(),
+            refresh: body["data"]["refresh_token"].as_str().unwrap().to_string(),
+        }),
+    )
+}
+
+async fn login(env: &TestEnvironment, did: &str) -> Tokens {
+    let (status, tokens) = try_login(env, did).await;
+    assert_eq!(status, 200, "login for {did}");
+    tokens.unwrap()
+}
+
+/// POST a refresh request for `refresh_token`, authcrypted from `from`.
+async fn refresh(env: &TestEnvironment, from: &str, refresh_token: &str) -> (u16, JsonValue) {
+    let request = packed(
+        env,
+        from,
+        "https://affinidi.com/atm/1.0/authenticate/refresh",
+        json!({ "refresh_token": refresh_token }),
+    )
+    .await;
+    post(&env.mediator, "authenticate/refresh", request).await
+}
+
+fn refreshed_token(body: &JsonValue) -> String {
+    body["data"]["refresh_token"]
+        .as_str()
+        .expect("refresh response carries a new refresh token")
+        .to_string()
+}
+
+/// The `session_id` claim of a JWT (no signature check: the test minted it
+/// through the mediator a moment ago).
+fn session_id_of(jwt: &str) -> String {
+    let payload = jwt.split('.').nth(1).expect("JWT payload");
+    let claims: JsonValue =
+        serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+    claims["session_id"].as_str().unwrap().to_string()
+}
+
+async fn spawn_env(store: Arc<MemoryStore>, mode: AccessListModeType) -> TestEnvironment {
+    let mediator = TestMediator::builder()
+        .store(store)
+        .acl_mode(mode)
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    TestEnvironment::new(mediator)
+        .await
+        .expect("wire the SDK to the mediator")
+}
+
+// ─── Challenge ───────────────────────────────────────────────────────────────
+
+/// In `explicit_deny` an unknown DID gets a challenge, but its account is
+/// written only once it answers; its tokens then work.
+#[tokio::test]
+async fn account_is_created_when_the_challenge_is_answered() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitDeny).await;
+    let did = unregistered_did(&env).await;
+    let did_hash = sha256::digest(&did);
+
+    let (status, body) = challenge(&env.mediator, &did).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !store.account_exists(&did_hash).await.unwrap(),
+        "asking for a challenge must not create an account"
+    );
+
+    let tokens = login(&env, &did).await;
+    assert!(
+        store.account_exists(&did_hash).await.unwrap(),
+        "answering the challenge creates the account"
+    );
+
+    // The access token is usable.
+    let whoami = http()
+        .get(format!("{}whoami", env.mediator.endpoint()))
+        .bearer_auth(&tokens.access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status().as_u16(), 200);
+
+    // And so is the refresh token.
+    let (status, body) = refresh(&env, &did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// In `explicit_allow` a pre-registered DID completes the hand-driven flow,
+/// including a refresh.
+#[tokio::test]
+async fn registered_did_logs_in_and_refreshes_in_explicit_allow_mode() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store, AccessListModeType::ExplicitAllow).await;
+    let alice = env.add_user("alice").await.unwrap();
+
+    let tokens = login(&env, &alice.did).await;
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// An account removed between the challenge and the response is not
+/// recreated in `explicit_allow` mode.
+#[tokio::test]
+async fn account_removed_before_the_response_is_not_recreated_in_explicit_allow_mode() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitAllow).await;
+    let alice = env.add_user("alice").await.unwrap();
+    let did_hash = sha256::digest(&alice.did);
+
+    let (status, body) = challenge(&env.mediator, &alice.did).await;
+    assert_eq!(status, 200, "{body}");
+    let data = &body["data"];
+    let response = packed(
+        &env,
+        &alice.did,
+        "https://affinidi.com/atm/1.0/authenticate",
+        json!({ "challenge": data["challenge"], "session_id": data["session_id"] }),
+    )
+    .await;
+
+    // Remove the account directly, as an admin would.
+    let admin = Session {
+        did_hash: "admin".into(),
+        account_type: AccountType::RootAdmin,
+        ..Default::default()
+    };
+    assert!(store.account_remove(&admin, &did_hash).await.unwrap());
+
+    let (status, body) = post(&env.mediator, "authenticate", response).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(25), "{body}");
+    assert!(!store.account_exists(&did_hash).await.unwrap());
+
+    env.shutdown().await.unwrap();
+}
+
+/// Input that is not a bounded, DID-shaped string gets no challenge, no
+/// session and no account.
+#[tokio::test]
+async fn challenge_refuses_malformed_or_oversized_dids() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitDeny).await;
+
+    let oversized = format!("did:key:{}", "z".repeat(4096));
+    for did in [
+        "",
+        "did:",
+        "did:key:",
+        "did:KEY:abc",
+        "did:key:has space",
+        "did:key:line\nbreak",
+        oversized.as_str(),
+    ] {
+        let (status, body) = challenge(&env.mediator, did).await;
+        assert_eq!(status, 400, "{did:?} must be refused: {body}");
+        assert!(
+            !store.account_exists(&sha256::digest(did)).await.unwrap(),
+            "{did:?} must not be registered"
+        );
+    }
+
+    // A body far larger than any DID is cut off before it is parsed.
+    let huge = format!("did:key:{}", "z".repeat(64 * 1024));
+    let (status, _) = challenge(&env.mediator, &huge).await;
+    assert_eq!(status, 413, "an oversized challenge body is refused");
+
+    env.shutdown().await.unwrap();
+}
+
+// ─── Refresh ─────────────────────────────────────────────────────────────────
+
+/// A refresh token sent by a DID other than the one it was issued to is
+/// refused, and does not disturb the owner's session.
+#[tokio::test]
+async fn refresh_from_a_different_did_is_refused() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store, AccessListModeType::ExplicitDeny).await;
+    let alice = env.add_user("alice").await.unwrap();
+    let mallory = env.add_user("mallory").await.unwrap();
+
+    let tokens = login(&env, &alice.did).await;
+    // Mallory holds a session of its own, so it is a fully authenticated DID.
+    let _ = login(&env, &mallory.did).await;
+
+    let (status, body) = refresh(&env, &mallory.did, &tokens.refresh).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(33), "{body}");
+
+    // Alice's token is untouched and still exchanges once.
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// A refresh token is exchanged once. Presenting it again ends the session,
+/// so the token issued in its place stops working too.
+async fn reused_refresh_token_ends_the_session(env: TestEnvironment) {
+    let alice = env.add_user("alice").await.unwrap();
+    let first = login(&env, &alice.did).await;
+
+    let (status, body) = refresh(&env, &alice.did, &first.refresh).await;
+    assert_eq!(status, 200, "{body}");
+    let second = refreshed_token(&body);
+
+    let (status, body) = refresh(&env, &alice.did, &first.refresh).await;
+    assert_eq!(status, 401, "a used refresh token is refused: {body}");
+
+    let (status, body) = refresh(&env, &alice.did, &second).await;
+    assert_ne!(
+        status, 200,
+        "the session ended, so its newer refresh token is refused too: {body}"
+    );
+
+    // The DID can still log in again from scratch.
+    let again = login(&env, &alice.did).await;
+    let (status, body) = refresh(&env, &alice.did, &again.refresh).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reused_refresh_token_ends_the_session_memory() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    reused_refresh_token_ends_the_session(env).await;
+}
+
+#[cfg(feature = "fjall-backend")]
+#[tokio::test]
+async fn reused_refresh_token_ends_the_session_fjall() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .fjall_backend()
+        .expect("fjall backend")
+        .spawn()
+        .await
+        .expect("spawn fjall mediator");
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    reused_refresh_token_ends_the_session(env).await;
+}
+
+/// Concurrent refreshes with one token: exactly one succeeds.
+#[tokio::test]
+async fn concurrent_refreshes_with_one_token_succeed_once() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    let mut requests = Vec::new();
+    for _ in 0..8 {
+        requests.push(
+            packed(
+                &env,
+                &alice.did,
+                "https://affinidi.com/atm/1.0/authenticate/refresh",
+                json!({ "refresh_token": tokens.refresh }),
+            )
+            .await,
+        );
+    }
+    let results = futures_util::future::join_all(
+        requests
+            .into_iter()
+            .map(|r| post(&env.mediator, "authenticate/refresh", r)),
+    )
+    .await;
+    let ok = results.iter().filter(|(status, _)| *status == 200).count();
+    assert!(
+        ok == 1,
+        "exactly one exchange of a token succeeds: {results:?}"
+    );
+
+    env.shutdown().await.unwrap();
+}
+
+/// A session with no recorded refresh-token hash cannot be refreshed.
+#[tokio::test]
+async fn refresh_without_a_recorded_token_is_refused() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitDeny).await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    let session_id = session_id_of(&tokens.refresh);
+    let mut session = store.get_session(&session_id, &alice.did).await.unwrap();
+    session.refresh_token_hash = None;
+    store
+        .put_session(&session, Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 401, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// Answer a challenge for `did`, running `between` after the challenge is
+/// issued and before the answer is sent. `answer` overrides the challenge
+/// string sent back. Returns the `/authenticate` status and body.
+async fn answer_challenge<F, Fut>(
+    env: &TestEnvironment,
+    did: &str,
+    answer: Option<&str>,
+    between: F,
+) -> (u16, JsonValue)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (status, body) = challenge(&env.mediator, did).await;
+    assert_eq!(status, 200, "challenge for {did}: {body}");
+    let data = &body["data"];
+    let challenge_str = answer
+        .map(JsonValue::from)
+        .unwrap_or_else(|| data["challenge"].clone());
+    let response = packed(
+        env,
+        did,
+        "https://affinidi.com/atm/1.0/authenticate",
+        json!({ "challenge": challenge_str, "session_id": data["session_id"] }),
+    )
+    .await;
+    between().await;
+    post(&env.mediator, "authenticate", response).await
+}
+
+/// A DID blocked after it was issued a challenge is refused when it answers.
+#[tokio::test]
+async fn login_refused_when_blocked_after_the_challenge() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+
+    let (status, body) = answer_challenge(&env, &alice.did, None, || async {
+        let mut blocked = acl::allow_all();
+        blocked.set_blocked(true);
+        env.mediator.set_acl(&alice.did, blocked).await.unwrap();
+    })
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(25), "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// The answer must carry the challenge string the session issued.
+#[tokio::test]
+async fn login_refused_with_a_different_challenge_string() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+
+    let (status, body) =
+        answer_challenge(&env, &alice.did, Some("not-the-challenge"), || async {}).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(34), "{body}");
+
+    // The correct answer still works.
+    let _ = login(&env, &alice.did).await;
+
+    env.shutdown().await.unwrap();
+}
+
+/// Removing an account ends its sessions: the refresh token and the access
+/// token are both refused with 401, so the client authenticates again.
+async fn removed_account_ends_the_session(env: TestEnvironment) {
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    let admin = Session {
+        did_hash: "admin".into(),
+        account_type: AccountType::RootAdmin,
+        ..Default::default()
+    };
+    assert!(
+        env.mediator
+            .store()
+            .account_remove(&admin, &sha256::digest(&alice.did))
+            .await
+            .unwrap()
+    );
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 401, "{body}");
+
+    let whoami = http()
+        .get(format!("{}whoami", env.mediator.endpoint()))
+        .bearer_auth(&tokens.access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status().as_u16(), 401);
+
+    env.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removed_account_ends_the_session_memory() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    removed_account_ends_the_session(env).await;
+}
+
+#[cfg(feature = "fjall-backend")]
+#[tokio::test]
+async fn removed_account_ends_the_session_fjall() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .fjall_backend()
+        .expect("fjall backend")
+        .spawn()
+        .await
+        .expect("spawn fjall mediator");
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    removed_account_ends_the_session(env).await;
+}
+
+// ─── TSP ─────────────────────────────────────────────────────────────────────
+
+/// `/tsp/authenticate` creates the account once the challenge signature
+/// verifies, as `/authenticate` does.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn tsp_account_is_created_when_the_challenge_is_answered() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitDeny).await;
+    let (did, secrets) = DID::generate_did_peer(
+        vec![
+            (PeerKeyRole::Verification, KeyType::Ed25519),
+            (PeerKeyRole::Encryption, KeyType::X25519),
+        ],
+        Some(env.mediator.did().to_string()),
+    )
+    .unwrap();
+    let did_hash = sha256::digest(&did);
+    let signing: [u8; 32] = secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .unwrap()
+        .get_private_bytes()
+        .try_into()
+        .unwrap();
+
+    let (status, body) = challenge(&env.mediator, &did).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!store.account_exists(&did_hash).await.unwrap());
+
+    let signature = affinidi_tsp::crypto::signing::sign(
+        body["data"]["challenge"].as_str().unwrap().as_bytes(),
+        &signing,
+    )
+    .unwrap();
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        json!({
+            "vid": did,
+            "session_id": body["data"]["session_id"],
+            "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(store.account_exists(&did_hash).await.unwrap());
+
+    env.shutdown().await.unwrap();
+}
+
+/// `/tsp/authenticate` refuses a DID blocked after it was issued a challenge.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn tsp_login_refused_when_blocked_after_the_challenge() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let signing: [u8; 32] = alice
+        .secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .unwrap()
+        .get_private_bytes()
+        .try_into()
+        .unwrap();
+
+    let (status, body) = challenge(&env.mediator, &alice.did).await;
+    assert_eq!(status, 200, "{body}");
+
+    let mut blocked = acl::allow_all();
+    blocked.set_blocked(true);
+    env.mediator.set_acl(&alice.did, blocked).await.unwrap();
+
+    let signature = affinidi_tsp::crypto::signing::sign(
+        body["data"]["challenge"].as_str().unwrap().as_bytes(),
+        &signing,
+    )
+    .unwrap();
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        json!({
+            "vid": alice.did,
+            "session_id": body["data"]["session_id"],
+            "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(25), "{body}");
+
+    env.shutdown().await.unwrap();
+}

@@ -70,8 +70,8 @@ use affinidi_messaging_mediator_common::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
         OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        SentMessageState, Session, SessionState, SessionSweepReport, StatCounter, StoreHealth,
-        StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
+        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -1990,6 +1990,10 @@ impl MediatorStore for FjallStore {
                 let acc: StoredAccount = Self::decode(&v)?;
                 session.acls = MediatorACLSet::from_u64(acc.acls);
                 session.account_type = acc.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
             }
         }
         Ok(session)
@@ -2117,6 +2121,45 @@ impl MediatorStore for FjallStore {
             .insert(session_id.as_bytes(), Self::encode(&stored)?)
             .map_err(|e| Self::db_err("update_refresh_token_hash:insert", e))?;
         Ok(())
+    }
+
+    /// Compare-and-swap under `write_lock`. Every session write in this
+    /// backend takes that lock, so nothing can change the record between the
+    /// read and the insert.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        use subtle::ConstantTimeEq;
+        let _guard = self.write_lock.lock().await;
+        let Some(raw) = self
+            .sessions
+            .get(session_id.as_bytes())
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:get", e))?
+        else {
+            return Ok(RefreshRotation::Missing);
+        };
+        let mut stored: StoredSession = Self::decode(&raw)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
+            return Ok(RefreshRotation::Missing);
+        }
+        let Some(current) = stored.session.refresh_token_hash.as_deref() else {
+            return Ok(RefreshRotation::Missing);
+        };
+        if !bool::from(current.as_bytes().ct_eq(presented_hash.as_bytes())) {
+            return Ok(RefreshRotation::Mismatch);
+        }
+        stored.session.refresh_token_hash = Some(new_hash.to_string());
+        self.sessions
+            .insert(session_id.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:insert", e))?;
+        Ok(RefreshRotation::Rotated)
     }
 
     // ─── Accounts ───────────────────────────────────────────────────────────
@@ -4426,6 +4469,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:test";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let did_hash = hash(did);
         let session = Session {
             session_id: "sid-1".into(),
@@ -4553,6 +4601,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:auth";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let old = Session {
             session_id: "challenge-sid".into(),
             challenge: "chal".into(),
@@ -4596,6 +4649,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:refresh";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let session = Session {
             session_id: "auth-sid".into(),
             state: SessionState::Authenticated,

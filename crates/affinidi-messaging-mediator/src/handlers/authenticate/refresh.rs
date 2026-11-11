@@ -9,6 +9,7 @@ use crate::{
     common::session::{Session, SessionClaims, SessionState},
 };
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
+use affinidi_messaging_mediator_common::store::RefreshRotation;
 use affinidi_messaging_sdk::messages::{
     known::MessageType,
     problem_report::{ProblemReportScope, ProblemReportSorter},
@@ -16,8 +17,7 @@ use affinidi_messaging_sdk::messages::{
 use axum::{Json, extract::State};
 use http::StatusCode;
 use sha256::digest;
-use subtle::ConstantTimeEq;
-use tracing::{Instrument, Level, info, span};
+use tracing::{Instrument, Level, info, span, warn};
 
 /// POST /authenticate/refresh
 /// Refresh existing JWT tokens.
@@ -62,6 +62,54 @@ pub async fn authentication_refresh(
         // Unpack the message + enforce the signed/encrypted invariant.
         let (msg, _unpack_metadata) =
             super::helpers::unpack_auth_message(&envelope, &state).await?;
+
+        // The authcrypt sender is the identity this request proves. The inner
+        // plaintext must name the same DID, as on `/authenticate`.
+        let Some(from_did) = envelope.from_did.clone() else {
+            return Err(MediatorError::problem(
+                39,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.message.from.missing",
+                "DIDComm message is missing the from: header. Required for this transaction",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        };
+        match &msg.from {
+            Some(msg_from) if *msg_from == from_did => (),
+            Some(_) => {
+                return Err(MediatorError::problem(
+                    85,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.from.incorrect",
+                    "Inner DIDComm plaintext from field does NOT match signing or encryption DID",
+                    vec![],
+                    StatusCode::BAD_REQUEST,
+                )
+                .into());
+            }
+            None => {
+                return Err(MediatorError::problem(
+                    39,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "authentication.message.from.missing",
+                    "DIDComm message is missing the from: header. Required for this transaction",
+                    vec![],
+                    StatusCode::BAD_REQUEST,
+                )
+                .into());
+            }
+        }
 
         // Only accepts AffinidiAuthenticateRefresh messages
         match msg.typ.as_str().parse::<MessageType>().map_err(|err| {
@@ -208,44 +256,64 @@ pub async fn authentication_refresh(
             .into());
         }
 
+        // A refresh token can only be exchanged by the DID it was issued to.
+        if !affinidi_messaging_mediator_common::did_identity::same_account(
+            &from_did,
+            &results.claims.sub,
+        ) {
+            return Err(session_mismatch(&from_did, &results.claims.sub));
+        }
+
         // Refresh token is valid - check against database and ensure it still exists.
-        // Convert from the trait-layer Session to the local Session shape so the rest
-        // of this handler keeps comparing against `SessionState` enum variants
-        // imported from `crate::common::session`.
-        let session_check: Session = if let Some(from_did) = &envelope.from_did {
-            let s = state
-                .database
-                .get_session(&results.claims.session_id, from_did)
-                .await
-                .map_err(|e| {
-                    MediatorError::problem_with_log(
-                        14,
+        // The session is joined with its owner's account, so the ACLs checked
+        // below are the owner's. Convert from the trait-layer Session to the
+        // local Session shape so the rest of this handler keeps comparing
+        // against `SessionState` enum variants imported from
+        // `crate::common::session`.
+        let session_check: Session = state
+            .database
+            .get_session(&results.claims.session_id, &results.claims.sub)
+            .await
+            .map_err(|e| {
+                // The session ended with its account: tell the client to
+                // authenticate again rather than to retry.
+                if let MediatorError::Unauthorized(..) = e {
+                    return MediatorError::problem_with_log(
+                        34,
                         "",
                         None,
                         ProblemReportSorter::Error,
                         ProblemReportScope::Protocol,
-                        "me.res.storage.error",
-                        "Database transaction error: {1}",
-                        vec![e.to_string()],
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Database transaction error: {e}"),
-                    )
-                })?;
-            s.into()
-        } else {
-            return Err(MediatorError::problem(
-                39,
-                "",
-                None,
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "authentication.message.from.missing",
-                "DIDComm message is missing the from: header. Required for this transaction",
-                vec![],
-                StatusCode::BAD_REQUEST,
-            )
-            .into());
-        };
+                        "authentication.session.invalid",
+                        "Session is no longer valid; authenticate again",
+                        vec![],
+                        StatusCode::UNAUTHORIZED,
+                        format!("Refresh refused: {e}"),
+                    );
+                }
+                MediatorError::problem_with_log(
+                    14,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.res.storage.error",
+                    "Database transaction error: {1}",
+                    vec![e.to_string()],
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Database transaction error: {e}"),
+                )
+            })?
+            .into();
+
+        // The session the token names must belong to the token's subject
+        // (and so to the sender).
+        if !affinidi_messaging_mediator_common::did_identity::same_account(
+            &session_check.did,
+            &results.claims.sub,
+        ) {
+            return Err(session_mismatch(&from_did, &session_check.did));
+        }
 
         // Is the session in an authenticated state? If not, then we can't refresh
         if session_check.state != SessionState::Authenticated {
@@ -281,46 +349,6 @@ pub async fn authentication_refresh(
             .into());
         }
 
-        // Validate refresh token is one-time use by checking stored hash
-        let incoming_hash = digest(refresh_token);
-        let stored_hash = state
-            .database
-            .get_refresh_token_hash(&session_check.session_id)
-            .await
-            .map_err(|e| {
-                MediatorError::problem_with_log(
-                    14,
-                    "",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.error",
-                    "Database transaction error: {1}",
-                    vec![e.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Database transaction error: {e}"),
-                )
-            })?;
-
-        if let Some(stored) = stored_hash
-            && !bool::from(stored.as_bytes().ct_eq(incoming_hash.as_bytes()))
-        {
-            metrics::counter!(crate::common::metrics::names::AUTH_FAILURES_TOTAL, "reason" => "refresh_token_reuse").increment(1);
-            return Err(MediatorError::problem_with_log(
-                38,
-                "",
-                None,
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "authentication.session.refresh_token.reuse",
-                "Refresh token has already been used (possible token replay)",
-                vec![],
-                StatusCode::UNAUTHORIZED,
-                "Refresh token has already been used (possible token replay)",
-            )
-            .into());
-        }
-
         // Generate a new access token
         let (access_token, access_expires_at) = _create_access_token(
             &session_check.did,
@@ -341,10 +369,16 @@ pub async fn authentication_refresh(
             state.config.security.jwt_encoding_key(),
         )?;
 
-        // Store the new refresh token hash
-        state
+        // One-time use: the store swaps the presented token's hash for the
+        // new one only if it is the current hash, in one atomic step, so two
+        // requests with the same token cannot both succeed.
+        let rotation = state
             .database
-            .update_refresh_token_hash(&session_check.session_id, &new_refresh_hash)
+            .rotate_refresh_token_hash(
+                &session_check.session_id,
+                &digest(refresh_token),
+                &new_refresh_hash,
+            )
             .await
             .map_err(|e| {
                 MediatorError::problem_with_log(
@@ -360,6 +394,43 @@ pub async fn authentication_refresh(
                     format!("Database transaction error: {e}"),
                 )
             })?;
+
+        let reason = match rotation {
+            RefreshRotation::Rotated => None,
+            // Already exchanged: whoever holds the current token and whoever
+            // presented this one cannot be told apart, so the session ends
+            // and the DID must authenticate again.
+            RefreshRotation::Mismatch => Some("refresh_token_reuse"),
+            // A session with no recorded refresh token cannot be checked.
+            RefreshRotation::Missing => Some("refresh_token_missing"),
+        };
+        if let Some(reason) = reason {
+            metrics::counter!(crate::common::metrics::names::AUTH_FAILURES_TOTAL, "reason" => reason).increment(1);
+            if let Err(e) = state.database.delete_session(&session_check.session_id).await {
+                warn!(
+                    session_id = %session_check.session_id,
+                    "Couldn't end the session after a refused refresh: {e}"
+                );
+            }
+            info!(
+                "{}: refresh refused ({reason}); session ended for DID({})",
+                session_check.session_id,
+                affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did)
+            );
+            return Err(MediatorError::problem_with_log(
+                38,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.refresh_token.reuse",
+                "Refresh token is no longer valid for this session; authenticate again",
+                vec![],
+                StatusCode::UNAUTHORIZED,
+                format!("Refresh token refused ({reason}); session ended"),
+            )
+            .into());
+        }
 
         metrics::counter!(crate::common::metrics::names::AUTH_REFRESH_TOTAL).increment(1);
         info!(
@@ -387,4 +458,21 @@ pub async fn authentication_refresh(
     }
     .instrument(_span)
     .await
+}
+
+/// The refresh token, its session and the sender do not name one DID.
+fn session_mismatch(sender: &str, other: &str) -> AppError {
+    MediatorError::problem_with_log(
+        33,
+        "",
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "authentication.session.mismatch",
+        "DID mismatch during authentication process",
+        vec![],
+        StatusCode::BAD_REQUEST,
+        format!("DID mismatch on token refresh: sender({sender}) session({other})"),
+    )
+    .into()
 }

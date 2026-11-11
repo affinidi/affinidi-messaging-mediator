@@ -186,6 +186,10 @@ pub async fn tsp_authentication_response(
             None
         };
 
+        // The challenge is answered: give the VID its account (or refuse it
+        // under `explicit_allow`) before any token exists for it.
+        super::helpers::register_account_after_proof(&state, &session.did_hash).await?;
+
         // Mint the same JWT pair the DIDComm path issues, rotating the session id.
         let now = state.clock.unix_secs();
         let old_sid = session.session_id.clone();

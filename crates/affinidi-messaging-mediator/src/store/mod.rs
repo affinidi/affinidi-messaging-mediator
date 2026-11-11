@@ -121,7 +121,17 @@ pub(crate) mod auth_flow_harness {
         assert_eq!(got.state, SessionState::ChallengeSent);
         assert_eq!(got.did, did, "did round-trips on the challenge read");
 
-        // 2. Authentication succeeds — promote and rename under a new ID.
+        // 2. Authentication succeeds — the DID gets its account (as the
+        // login handlers do before issuing tokens), then the session is
+        // promoted and renamed under a new ID.
+        store
+            .account_add(
+                &did_hash,
+                &affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet::default(),
+                None,
+            )
+            .await
+            .expect("account_add");
         store
             .update_session_authenticated(old_sid, new_sid, did, "refresh-hash-1")
             .await

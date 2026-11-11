@@ -305,11 +305,22 @@ pub mod redis;
 
 pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueEntry,
-    InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RemovalReason,
-    SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport, StatCounter,
-    StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind,
-    StreamingWrite,
+    InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RefreshRotation,
+    RemovalReason, SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport,
+    StatCounter, StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState,
+    StreamingKind, StreamingWrite,
 };
+
+/// The error every backend's `get_session` returns for a session past the
+/// challenge step whose DID no longer has an account: the account was
+/// removed, so its sessions are over and the client must authenticate again.
+pub fn account_gone(session_id: &str) -> MediatorError {
+    MediatorError::Unauthorized(
+        20,
+        session_id.into(),
+        "The session's account no longer exists; please re-authenticate".into(),
+    )
+}
 
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
 /// queue (`messaging/message/status/0.1` asks for at least 24 hours).
@@ -1015,6 +1026,11 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// record so the returned `Session` has populated `acls` and
     /// `account_type` fields. The handler uses these to authorise
     /// downstream requests without a separate account lookup.
+    ///
+    /// A `ChallengeSent` session may have no account yet (accounts are
+    /// created once the challenge is answered) and is returned with default
+    /// ACLs. Any other session whose DID has no account fails with
+    /// [`account_gone`]. An empty `did` skips the join (store-internal use).
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError>;
 
     /// Delete a session record. Used for logout and as the *first* step
@@ -2017,6 +2033,32 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         session.refresh_token_hash = Some(refresh_token_hash.to_string());
         self.put_session(&session, std::time::Duration::from_secs(86_400))
             .await
+    }
+
+    /// Exchange a refresh token: if the session's stored refresh-token hash
+    /// equals `presented_hash`, replace it with `new_hash`; otherwise write
+    /// nothing. The compare and the write must be one atomic step, so two
+    /// requests presenting the same token can never both see
+    /// [`RefreshRotation::Rotated`].
+    ///
+    /// The default is NOT atomic (read, compare, write) and exists only so
+    /// out-of-tree backends keep compiling; every in-tree backend overrides
+    /// it. A missing session or a missing stored hash is
+    /// [`RefreshRotation::Missing`], never a match.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        match self.get_refresh_token_hash(session_id).await? {
+            None => Ok(RefreshRotation::Missing),
+            Some(stored) if stored != presented_hash => Ok(RefreshRotation::Mismatch),
+            Some(_) => {
+                self.update_refresh_token_hash(session_id, new_hash).await?;
+                Ok(RefreshRotation::Rotated)
+            }
+        }
     }
 
     /// Legacy: read just the refresh-token hash for a session. Default

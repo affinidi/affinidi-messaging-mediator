@@ -39,8 +39,8 @@ use crate::{
     errors::MediatorError,
     store::{
         DeletionAuthority, ExpiryReport, ForwardQueueEntry, InboxStatusReply, MediatorStore,
-        MessageMetaData, MetadataStats, PubSubRecord, Session, SessionState, StatCounter,
-        StoreHealth, StreamingClientState, TrustTaskClaim,
+        MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session, SessionState,
+        StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -1231,6 +1231,17 @@ impl MediatorStore for RedisStore {
     ) -> Result<Option<String>, MediatorError> {
         // Inherent method on RedisStore (in `database/session.rs`).
         self.get_refresh_token_hash(session_id).await
+    }
+
+    /// Compare-and-swap in one Lua script (see the inherent method).
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        self.rotate_refresh_token_hash(session_id, presented_hash, new_hash)
+            .await
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), MediatorError> {
