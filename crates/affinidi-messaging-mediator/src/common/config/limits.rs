@@ -90,10 +90,14 @@ pub struct LimitsConfig {
     /// At least 1.
     #[serde(default = "default_ws_ping_interval_secs")]
     pub ws_ping_interval_secs: u64,
-    /// Seconds a WebSocket may go without receiving any frame (a pong, a
-    /// ping, a message) before the mediator closes it with 1001. At least
-    /// twice [`ws_ping_interval_secs`](Self::ws_ping_interval_secs), so a
-    /// peer that answers every ping is never closed.
+    /// How long a WebSocket peer may stay silent. Once a ping goes
+    /// unanswered, the peer has `ws_pong_timeout_secs - ws_ping_interval_secs`
+    /// to send any complete frame (a pong, a ping, a message) or the mediator
+    /// closes the socket with 1001; time the mediator spends not reading does
+    /// not count. At least twice
+    /// [`ws_ping_interval_secs`](Self::ws_ping_interval_secs), so a peer that
+    /// answers every ping is never closed. Must also cover the slowest single
+    /// inbound frame upload, since a frame only counts once complete.
     #[serde(default = "default_ws_pong_timeout_secs")]
     pub ws_pong_timeout_secs: u64,
     /// Seconds one write to a WebSocket may take. A peer that stops reading
@@ -372,7 +376,11 @@ fn default_ws_write_timeout_secs() -> u64 {
 /// intervals, so a peer that answers each ping is never closed for silence.
 /// Returns `(ping_interval, pong_timeout, write_timeout)` in seconds, and a
 /// note for each value that had to be raised.
-fn websocket_liveness(ping: u64, pong: u64, write: u64) -> ((u64, u64, u64), Vec<String>) {
+pub(crate) fn websocket_liveness(
+    ping: u64,
+    pong: u64,
+    write: u64,
+) -> ((u64, u64, u64), Vec<String>) {
     let mut notes = Vec::new();
     let ping_interval = if ping == 0 {
         notes.push("limits.ws_ping_interval_secs must be at least 1; using 1".to_string());

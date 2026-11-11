@@ -321,6 +321,13 @@ enable_inter_mediator_relay = "false"
 [streaming]
 ### Env: STREAMING_ENABLED
 ### If true, enables live message streaming via WebSockets
+###
+### Raw TSP WebSockets: on the plain `tsp` subprotocol a message is deleted
+### once its frame is written to the connection, so a client that goes away
+### can lose frames written shortly before the close (delivery is best
+### effort). Use the `tsp-ack` subprotocol for at-least-once delivery: a
+### message stays queued until the client acknowledges it, and is sent again
+### on the next connection if it was not.
 enabled = "true"
 
 ### Env: STREAMING_UUID
@@ -654,23 +661,33 @@ oob_invite_ttl = "86400"
 # ws_ping_interval_secs = "30"
 
 ### Env: LIMIT_WS_PONG_TIMEOUT_SECS
-### Seconds a WebSocket may go without receiving ANY frame from the client — a
-### pong to the pings above, a ping of its own, or a message — before the
-### mediator closes it with 1001 "connection unresponsive" (90, three ping
-### intervals). Catches a client that went away without closing (lost network,
-### suspended device) long before TCP would. Raised to at least twice
-### ws_ping_interval_secs, so a client that answers each ping is never closed.
-### Every standard WebSocket client answers pings automatically while it reads.
+### How long a WebSocket client may stay silent (90, three ping intervals).
+### Once a ping goes out unanswered, the client has
+### ws_pong_timeout_secs - ws_ping_interval_secs (60 by default) to send ANY
+### frame — a pong, a ping of its own, or a message — or the mediator closes
+### the socket with 1001 "connection unresponsive". So a silent client is closed
+### within ws_pong_timeout_secs of its last frame. Catches a client that went
+### away without closing (lost network, suspended device) long before TCP
+### would. Time the mediator spends not reading (sending a large backlog, a slow
+### message) does not count against the client. Raised to at least twice
+### ws_ping_interval_secs.
+### Clients answer pings automatically only while they read their socket: a
+### client must keep reading (a TSP stream must be read continuously) to stay
+### connected.
+### Only complete frames count: a frame still arriving answers nothing, so
+### ws_pong_timeout_secs - ws_ping_interval_secs must cover the slowest single
+### inbound frame upload (up to ws_size at the slowest client's uplink).
 ### Counted in `ws_pong_timeouts_total`.
-### Scale: raise for clients on links with long stalls; lower to free the slots
-### of vanished clients sooner.
+### Scale: raise for slow uplinks or links with long stalls; lower to free the
+### slots of vanished clients sooner.
 # ws_pong_timeout_secs = "90"
 
 ### Env: LIMIT_WS_WRITE_TIMEOUT_SECS
 ### Seconds one write to a WebSocket may take (30). A client that stops reading
 ### fills its TCP window and leaves the write waiting; past this the mediator
 ### closes the connection with 1001 and frees its slots and queued frames.
-### Nothing waiting in that write is reported delivered; it stays in the inbox.
+### The frame whose write timed out is not reported delivered and stays in the
+### inbox; frames queued behind it stay in the inbox too.
 ### Minimum 1. Counted in `ws_write_timeouts_total`.
 # ws_write_timeout_secs = "30"
 

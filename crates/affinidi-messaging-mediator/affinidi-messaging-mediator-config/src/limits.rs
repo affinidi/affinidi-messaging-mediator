@@ -55,8 +55,9 @@ pub struct LimitsConfigRaw {
     /// Seconds between the pings the mediator sends on each WebSocket.
     #[serde(default = "default_ws_ping_interval_secs")]
     pub ws_ping_interval_secs: String,
-    /// Seconds a WebSocket may go without any inbound frame (a pong counts)
-    /// before the mediator closes it.
+    /// How long a WebSocket peer may stay silent: once a ping goes
+    /// unanswered, the peer has this minus the ping interval to send any
+    /// frame (a pong counts) before the mediator closes it.
     #[serde(default = "default_ws_pong_timeout_secs")]
     pub ws_pong_timeout_secs: String,
     /// Seconds one write to a WebSocket may take before the mediator closes it.

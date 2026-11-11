@@ -109,8 +109,8 @@ messages. Watch `ws_live_delivery_dropped_total` (below) to decide.
 until it closes. Two settings bound how long an unresponsive client keeps them:
 `limits.ws_write_timeout_secs` (default 30) closes a connection whose client
 has stopped reading, and `limits.ws_pong_timeout_secs` (default 90) closes one
-from which nothing, not even a pong to the mediator's pings
-(`limits.ws_ping_interval_secs`, default 30), has arrived. Both close with 1001
+that has sent nothing, not even a pong to the mediator's pings
+(`limits.ws_ping_interval_secs`, default 30), for that long. Both close with 1001
 and are counted in `ws_write_timeouts_total` and `ws_pong_timeouts_total`.
 
 **Bursty throughput with lag warnings** — raise `limits.pubsub_buffer`. The
