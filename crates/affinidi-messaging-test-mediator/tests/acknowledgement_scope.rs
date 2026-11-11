@@ -160,7 +160,7 @@ async fn a_repeated_acknowledgement_leaves_another_recipients_copy() {
     assert!(holds(&env, &a, &id).await && holds(&env, &b, &id).await);
 
     let (deleted, errors) = rest_delete(&env, &a, &id).await;
-    assert_eq!(deleted, [id.clone()], "{errors:?}");
+    assert_eq!(deleted, std::slice::from_ref(&id), "{errors:?}");
     assert!(!holds(&env, &a, &id).await, "a's copy is gone");
     assert!(holds(&env, &b, &id).await, "b's copy stays");
 
@@ -188,7 +188,7 @@ async fn a_sender_still_withdraws_what_it_queued() {
 
     let id = store_copies(&env, "{\"protected\":\"withdrawn\"}", &sender, &[&x, &y]).await;
     let (deleted, errors) = rest_delete(&env, &sender, &id).await;
-    assert_eq!(deleted, [id.clone()], "{errors:?}");
+    assert_eq!(deleted, std::slice::from_ref(&id), "{errors:?}");
     assert!(!holds(&env, &x, &id).await, "x's copy is withdrawn");
     assert!(!holds(&env, &y, &id).await, "y's copy is withdrawn");
 }
