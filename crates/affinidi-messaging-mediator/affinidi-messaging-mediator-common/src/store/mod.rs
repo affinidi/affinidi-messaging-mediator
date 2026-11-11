@@ -1228,6 +1228,14 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Whether several mediator processes may share this store, each with
+    /// connections the others cannot see. `false` for an in-process store
+    /// (memory, Fjall); the Redis store says `true`. An answer that lists
+    /// live state from one process says which it covers on this basis.
+    fn spans_processes(&self) -> bool {
+        false
+    }
+
     /// Subscribe to [`mux_changes_publish`](Self::mux_changes_publish)
     /// records from every instance, this one's included. `Ok(None)` when the
     /// backend is single-process (the default) and there is nothing to hear.

@@ -492,6 +492,9 @@ pub(crate) async fn consume(
         | ServedTask::MuxRevokeAll => {
             consume_mux(task, &doc, state, session, &sender_did, &mediator_did, now).await?
         }
+        ServedTask::MuxConnections => {
+            consume_mux_connections(&doc, state, session, &mediator_did, now).await?
+        }
     };
 
     // Answer in the version that was asked for, before signing.
@@ -578,6 +581,7 @@ served_tasks! {
     MuxUpdate => crate::task_specs::messaging::mux::update::v0_1::Payload,
     MuxRevoke => crate::task_specs::messaging::mux::revoke::v0_1::Payload,
     MuxRevokeAll => crate::task_specs::messaging::mux::revoke_all::v0_1::Payload,
+    MuxConnections => crate::task_specs::messaging::mux::connections::v0_1::Payload,
 }
 
 impl ServedTask {
@@ -1756,6 +1760,57 @@ async fn consume_access_list_list(
 }
 
 /// Reject a non-admin caller of an admin-only task.
+/// `messaging/mux/connections`: this instance's live mux connections, for an
+/// administrator. See [`crate::mux::admin`].
+async fn consume_mux_connections(
+    doc: &TrustTask<Value>,
+    state: &SharedData,
+    session: &Session,
+    mediator_did: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, MediatorError> {
+    use crate::mux::admin;
+    use crate::task_specs::messaging::mux::connections::v0_1 as connections;
+
+    if !state.config.limits.mux.enabled {
+        return Err(tt_problem(
+            session,
+            "protocol.trust_task.unsupported",
+            format!("unsupported Trust Task type: {}", doc.type_uri),
+            StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
+    validate_tt_basic(doc, session, mediator_did, now)?;
+    require_admin(session, "messaging/mux/connections")?;
+
+    let query = admin::Query::from_payload(&doc.payload);
+    let mut views = Vec::new();
+    for conn in state.mux.all() {
+        views.push(admin::view(&conn).await);
+    }
+    let binding = admin::Binding {
+        requester: &session.did_hash,
+        instance: &state.config.streaming_uuid,
+        now: now.timestamp().max(0) as u64,
+    };
+    let page = admin::page(views, &query, &binding, !state.database.spans_processes()).map_err(
+        |admin::PageError::CursorInvalid| {
+            tt_problem(
+                session,
+                admin::CURSOR_INVALID,
+                "the cursor was not issued by this instance for this request, or has expired; \
+                 start again without one"
+                    .into(),
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    )?;
+    let response: connections::Response = super::mediator_ops::from_json(page)?;
+    let typed: TrustTask<connections::Payload> = downcast(doc, session)?;
+    serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
+        .map_err(serialize_err)
+}
+
 pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), MediatorError> {
     if matches!(
         session.account_type,

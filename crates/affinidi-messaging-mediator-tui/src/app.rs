@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use affinidi_messaging_mediator_admin::{
     AddressBook, ConsoleError, InspectedMessage, MediatorConsole, Mode, MonitorFilter,
-    MonitorUpdate, PurgePlan, PurgeRequest, account_hash, specs,
+    MonitorUpdate, MuxConnectionsQuery, PurgePlan, PurgeRequest, account_hash, specs,
 };
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -61,6 +61,9 @@ pub enum Tab {
     Accounts,
     /// The mediator's configuration; a rootAdmin can change its limits.
     Config,
+    /// Live mux connections and the member DIDs each carries
+    /// (administrators).
+    Mux,
 }
 
 impl Tab {
@@ -72,6 +75,7 @@ impl Tab {
             Tab::Audit => "Audit",
             Tab::Accounts => "Accounts",
             Tab::Config => "Config",
+            Tab::Mux => "Mux",
         }
     }
 }
@@ -88,6 +92,8 @@ pub enum Update {
     Accounts(Result<Vec<Value>, ConsoleError>),
     /// The mediator's configuration fields.
     Config(Result<Value, ConsoleError>),
+    /// A page of live mux connections.
+    Mux(Result<Value, ConsoleError>),
     /// The account on the Account tab, as `account/get` reports it.
     AccountInfo(Result<Value, ConsoleError>),
     /// The mediator's answer to a configuration change.
@@ -204,6 +210,9 @@ pub struct App {
     message_send: bool,
 
     audit: Vec<Value>,
+    /// The last `messaging/mux/connections` page.
+    mux: Value,
+    mux_state: TableState,
     accounts: Vec<Value>,
     accounts_state: TableState,
     config: Vec<Value>,
@@ -262,6 +271,8 @@ impl App {
             message_state: TableState::default().with_selected(Some(0)),
             message_send: false,
             audit: Vec::new(),
+            mux: Value::Null,
+            mux_state: TableState::default().with_selected(Some(0)),
             accounts: Vec::new(),
             accounts_state: TableState::default().with_selected(Some(0)),
             config: Vec::new(),
@@ -365,7 +376,7 @@ impl App {
                 .selected_message_field(if self.message_send { "to" } else { "from" })
                 .or_else(|| self.target.clone())
                 .or_else(|| Some(self.console.did_hash().to_string())),
-            Tab::Audit | Tab::Config => None,
+            Tab::Audit | Tab::Config | Tab::Mux => None,
         }
     }
 
@@ -467,6 +478,8 @@ impl App {
                 Tab::Audit,
                 Tab::Accounts,
                 Tab::Config,
+                // Last, so the other tabs keep their number keys.
+                Tab::Mux,
             ]
         } else {
             vec![Tab::Account]
@@ -531,6 +544,12 @@ impl App {
             Tab::Accounts => {
                 self.spawn(|c| async move { Update::Accounts(all_accounts(&c).await) })
             }
+            Tab::Mux => self.spawn(|c| async move {
+                // One page: up to 100 connections and 1000 members. The
+                // screen says when there are more.
+                let query = MuxConnectionsQuery::all().limit(100);
+                Update::Mux(to_value(c.mux_connections(query).await))
+            }),
             Tab::Config => {
                 self.spawn(|c| async move { Update::Config(to_value(c.config().await)) })
             }
@@ -583,6 +602,17 @@ impl App {
             Update::Messages(r) => match r {
                 Ok(v) => {
                     self.messages = v["messages"].as_array().cloned().unwrap_or_default();
+                    ok(self)
+                }
+                Err(e) => self.error(e),
+            },
+            Update::Mux(r) => match r {
+                Ok(v) => {
+                    self.mux = v;
+                    let len = self.mux["connections"].as_array().map_or(0, Vec::len);
+                    if self.mux_state.selected().is_none_or(|i| i >= len) {
+                        self.mux_state.select(Some(0));
+                    }
                     ok(self)
                 }
                 Err(e) => self.error(e),
@@ -1033,6 +1063,10 @@ impl App {
             Tab::Account => (&mut self.message_state, self.messages.len()),
             Tab::Accounts => (&mut self.accounts_state, self.accounts.len()),
             Tab::Config => (&mut self.config_state, self.config.len()),
+            Tab::Mux => (
+                &mut self.mux_state,
+                self.mux["connections"].as_array().map_or(0, Vec::len),
+            ),
             Tab::Audit => return,
         };
         if len == 0 {
@@ -1309,6 +1343,7 @@ impl App {
             Tab::Audit => self.render_audit(f, body),
             Tab::Accounts => self.render_accounts(f, body),
             Tab::Config => self.render_config(f, body),
+            Tab::Mux => self.render_mux(f, body),
         }
     }
 
@@ -1486,6 +1521,9 @@ impl App {
                         "↑↓ select  e edit account  i inspect  d delete  p purge  P purge peer  x recv/send  o own  n name  b book  m monitor  q quit"
                     }
                     Tab::Audit => "n name  b book  m monitor  r refresh  q quit",
+                    Tab::Mux => {
+                        "↑↓ select connection  n name  b book  m monitor  r refresh  q quit"
+                    }
                     Tab::Accounts => {
                         "↑↓ select  ⏎ open  n name  b book  m monitor  r refresh  q quit"
                     }
@@ -1883,6 +1921,128 @@ impl App {
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(block),
             area,
+        );
+    }
+
+    fn render_mux(&mut self, f: &mut Frame, area: Rect) {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Min(5)])
+            .split(area);
+        let connections: Vec<Value> = self.mux["connections"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let rows: Vec<Row> = connections
+            .iter()
+            .map(|c| {
+                let members = c["members"].as_array().cloned().unwrap_or_default();
+                let inactive = members
+                    .iter()
+                    .filter(|m| m["deliveryActive"] == false)
+                    .count();
+                Row::new(vec![
+                    Cell::from(did_label(
+                        &self.book,
+                        c["principal"].as_str().unwrap_or("?"),
+                    )),
+                    Cell::from(c["wire"].as_str().unwrap_or("").to_string()),
+                    Cell::from(c["openedAt"].as_str().unwrap_or("").replace('T', " ")),
+                    Cell::from(c["memberCount"].as_u64().unwrap_or(0).to_string()),
+                    Cell::from(if inactive > 0 {
+                        inactive.to_string()
+                    } else {
+                        String::new()
+                    })
+                    .style(Style::default().fg(Color::Yellow)),
+                    Cell::from(short(c["sessionId"].as_str().unwrap_or(""))),
+                ])
+            })
+            .collect();
+        let title = mux_title(&self.mux);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Fill(2),
+                Constraint::Length(8),
+                Constraint::Length(21),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(
+            Row::new(vec![
+                "principal",
+                "wire",
+                "opened",
+                "members",
+                "inactive",
+                "session",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(Block::default().borders(Borders::ALL).title(title));
+        f.render_stateful_widget(table, parts[0], &mut self.mux_state);
+
+        let selected = self
+            .mux_state
+            .selected()
+            .and_then(|i| connections.get(i))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let members = selected["members"].as_array().cloned().unwrap_or_default();
+        let member_rows: Vec<Row> = members
+            .iter()
+            .map(|m| {
+                let active = m["deliveryActive"] != false;
+                let scope = m["scope"]
+                    .as_array()
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                Row::new(vec![
+                    Cell::from(did_label(&self.book, m["did"].as_str().unwrap_or("?"))),
+                    Cell::from(m["source"].as_str().unwrap_or("").to_string()),
+                    Cell::from(scope),
+                    Cell::from(m["expiresAt"].as_str().unwrap_or("").replace('T', " ")),
+                    Cell::from(if active { "live" } else { "inactive" }).style(if active {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }),
+                ])
+            })
+            .collect();
+        let shown = members.len() as u64;
+        let total = selected["memberCount"].as_u64().unwrap_or(0);
+        let members_title = if shown < total {
+            format!(" Members ({shown} of {total} shown) ")
+        } else {
+            format!(" Members ({total}) ")
+        };
+        f.render_widget(
+            Table::new(
+                member_rows,
+                [
+                    Constraint::Fill(2),
+                    Constraint::Length(7),
+                    Constraint::Fill(1),
+                    Constraint::Length(21),
+                    Constraint::Length(9),
+                ],
+            )
+            .header(
+                Row::new(vec!["member", "source", "scope", "expires", "delivery"])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            )
+            .block(Block::default().borders(Borders::ALL).title(members_title)),
+            parts[1],
         );
     }
 
@@ -2757,6 +2917,30 @@ fn human_bytes(b: Option<u64>) -> String {
     }
 }
 
+/// A DID as the console shows it: its address-book name when it has one
+/// (the book is keyed by DID hash), otherwise the DID shortened.
+fn did_label(book: &AddressBook, did: &str) -> String {
+    book.name_of(&sha256::digest(did))
+        .map(str::to_string)
+        .unwrap_or_else(|| short(did))
+}
+
+/// The Mux tab's title: how many connections, and whether the page covers
+/// every instance of the mediator or only the one that answered.
+fn mux_title(page: &Value) -> String {
+    let n = page["connections"].as_array().map_or(0, Vec::len);
+    let more = if page.get("nextCursor").is_some() {
+        "+"
+    } else {
+        ""
+    };
+    let coverage = match page["coverage"].as_str() {
+        Some("thisInstance") => " (this instance only)",
+        _ => "",
+    };
+    format!(" Mux connections: {n}{more}{coverage} ")
+}
+
 /// Whether an audit `action` is a DID-multiplexing one (`mux_grant_suspend`,
 /// `mux_grant_revoke`, `mux_revoke_all`, and any later `mux_` action).
 fn is_mux_action(action: &str) -> bool {
@@ -2781,6 +2965,19 @@ fn mux_summary_line(mux: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_mux_title_says_what_the_page_covers() {
+        let page = serde_json::json!({
+            "connections": [{}, {}], "coverage": "thisInstance", "nextCursor": "c"
+        });
+        assert_eq!(
+            super::mux_title(&page),
+            " Mux connections: 2+ (this instance only) "
+        );
+        let all = serde_json::json!({ "connections": [], "coverage": "allInstances" });
+        assert_eq!(super::mux_title(&all), " Mux connections: 0 ");
+    }
+
     #[test]
     fn mux_audit_actions_are_recognised() {
         for a in ["mux_grant_suspend", "mux_grant_revoke", "mux_revoke_all"] {

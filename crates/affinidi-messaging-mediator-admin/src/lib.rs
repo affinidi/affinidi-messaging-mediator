@@ -34,5 +34,8 @@ pub use identity::{Identity, IdentityChoice, IdentitySource, ProfileFileSource, 
 pub use live::{MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate};
 pub use purge::{PurgePlan, PurgeRequest};
 
+/// What a `messaging/mux/connections` page lists: see
+/// [`MediatorConsole::mux_connections`].
+pub use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
 /// The generated Trust Task types the console's calls take and return.
 pub use affinidi_messaging_sdk::tasks::messaging as specs;

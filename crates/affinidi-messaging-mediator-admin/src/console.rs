@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use affinidi_messaging_didcomm::message::Message;
-use affinidi_messaging_sdk::tasks::messaging::{account, message, queue, stats};
+use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+use affinidi_messaging_sdk::tasks::messaging::{account, message, mux, queue, stats};
 use affinidi_messaging_sdk::tasks::{audit, config};
 use affinidi_messaging_sdk::{
     ATM, config::ATMConfig, messages::compat::UnpackMetadata, profiles::ATMProfile,
@@ -271,6 +272,23 @@ impl MediatorConsole {
         self.atm
             .trust_tasks()
             .stats_show(&self.profile)
+            .await
+            .map_err(ConsoleError::from_call)
+    }
+
+    /// One page of this mediator's live mux connections (DID
+    /// multiplexing), as `messaging/mux/connections` reports them. Its
+    /// `coverage` says whether the page covers every instance of the
+    /// mediator or only the one that answered.
+    pub async fn mux_connections(
+        &self,
+        query: MuxConnectionsQuery,
+    ) -> Result<mux::connections::v0_1::Response> {
+        self.require_admin("the mux connections")?;
+        self.require_operations("messaging/mux/connections")?;
+        self.atm
+            .trust_tasks()
+            .mux_connections(&self.profile, &query)
             .await
             .map_err(ConsoleError::from_call)
     }

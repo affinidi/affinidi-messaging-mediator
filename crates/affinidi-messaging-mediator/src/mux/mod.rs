@@ -5,6 +5,7 @@
 //! mediator-side pieces: verifying the signed statements members issue
 //! (`proof`) and the grant operations the protocol handlers call (`grants`).
 
+pub mod admin;
 pub mod audit;
 pub mod connection;
 pub mod fair_queue;

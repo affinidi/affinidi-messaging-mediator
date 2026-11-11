@@ -1381,7 +1381,7 @@ fn parse_cursor(cursor: &str, snapshot: &QueueSnapshot) -> Option<usize> {
 /// Build a generated response type from JSON. Deserialisation (rather than the
 /// builders) keeps these handlers compiling when the spec gains an optional
 /// member, and checks the shape against the generated types.
-fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, MediatorError> {
+pub(crate) fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, MediatorError> {
     serde_json::from_value(value).map_err(|e| {
         MediatorError::InternalError(
             14,
