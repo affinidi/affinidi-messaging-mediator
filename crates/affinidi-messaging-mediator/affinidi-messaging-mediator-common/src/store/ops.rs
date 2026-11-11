@@ -11,7 +11,9 @@
 //! what keeps Redis aligned with them.
 
 use crate::errors::MediatorError;
-use crate::store::types::{DeletionAuthority, OutboxReceipt, RemovalReason, SentMessageState};
+use crate::store::types::{
+    DeletionAuthority, MessageScope, OutboxReceipt, RemovalReason, SentMessageState,
+};
 use crate::types::acls::{AccessListModeType, MediatorACLSet};
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
 use axum::http::StatusCode;
@@ -100,23 +102,134 @@ pub struct HeldMessage<'a> {
     pub first_delivered_at_ms: Option<u64>,
 }
 
-/// Where a message stands for `sender`: from the message if the backend still
-/// holds it, else from the sender's receipt, else `Unknown`.
+/// Where a message stands for `sender`: from the copies the backend still
+/// holds, else from the sender's receipt, else `Unknown`.
 ///
-/// A held message counts only when `sender` is its recorded sender, so a DID
-/// learns nothing about messages it did not send — not even that they exist.
+/// `held` is every record still stored under the message id — one per
+/// recipient (see [`MessageRef`](crate::store::MessageRef)). Only copies whose
+/// recorded sender is `sender` count, so a DID learns nothing about messages
+/// it did not send — not even that they exist. When it sent the same bytes to
+/// several recipients the answer covers all of them: `Queued` while any copy
+/// is waiting for its first handover, `Delivered` (at the latest first
+/// handover) once every held copy has been handed over. A copy already
+/// removed is no longer held and does not hold the answer back.
 pub fn sent_message_state(
     sender: &str,
-    held: Option<HeldMessage<'_>>,
+    held: &[HeldMessage<'_>],
     receipt: Option<OutboxReceipt>,
 ) -> SentMessageState {
-    match held {
-        Some(held) if held.from_did_hash == Some(sender) => match held.first_delivered_at_ms {
-            Some(at_ms) => SentMessageState::Delivered { at_ms },
-            None => SentMessageState::Queued,
-        },
-        _ => receipt.map_or(SentMessageState::Unknown, SentMessageState::Removed),
+    let mut sent = held
+        .iter()
+        .filter(|held| held.from_did_hash == Some(sender))
+        .peekable();
+    if sent.peek().is_none() {
+        return receipt.map_or(SentMessageState::Unknown, SentMessageState::Removed);
     }
+    let mut latest = 0;
+    for copy in sent {
+        match copy.first_delivered_at_ms {
+            Some(at_ms) => latest = latest.max(at_ms),
+            None => return SentMessageState::Queued,
+        }
+    }
+    SentMessageState::Delivered { at_ms: latest }
+}
+
+/// The parties of one stored record, for [`select_records`].
+#[derive(Clone, Copy, Debug)]
+pub struct RecordParties<'a> {
+    pub to_did_hash: &'a str,
+    pub from_did_hash: Option<&'a str>,
+}
+
+/// Why [`select_records`] chose nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectError {
+    /// No record in scope: the message is not in the queues asked about.
+    NotFound,
+    /// A record exists but the requester is not a party to it.
+    PermissionDenied,
+}
+
+impl SelectError {
+    /// The delete error every backend returns for this outcome.
+    pub fn into_delete_error(self, message_hash: &str) -> MediatorError {
+        match self {
+            SelectError::NotFound => delete_not_found(message_hash, None),
+            SelectError::PermissionDenied => delete_permission_denied(message_hash, None),
+        }
+    }
+}
+
+/// Which of the records stored under one message id a delete (or read) acts
+/// on, as indexes into `records`.
+///
+/// The one place the resolution rules live for the in-process backends; the
+/// Redis library and cluster path implement the same rules and the
+/// conformance suite holds them to it:
+///
+/// - [`MessageScope::Recipient`]: the record held for that recipient, if the
+///   authority may delete it.
+/// - [`MessageScope::Party`]: the record held for the party as recipient when
+///   there is one, else every record it sent. None of either is not-found,
+///   whatever other accounts hold under the id.
+/// - [`MessageScope::All`]: every record, for an admin; an owner is resolved
+///   as `Party` of itself.
+///
+/// Every chosen record is also checked with [`delete_message_permitted`].
+pub fn select_records(
+    scope: MessageScope<'_>,
+    by: &DeletionAuthority,
+    records: &[RecordParties<'_>],
+) -> Result<Vec<usize>, SelectError> {
+    let scope = match (scope, by) {
+        (MessageScope::All, DeletionAuthority::Owner { did_hash }) => {
+            MessageScope::Party(did_hash.as_str())
+        }
+        (scope, _) => scope,
+    };
+    let chosen: Vec<usize> = match scope {
+        MessageScope::Recipient(to) => records
+            .iter()
+            .position(|r| r.to_did_hash == to)
+            .into_iter()
+            .collect(),
+        MessageScope::Party(party) => match records.iter().position(|r| r.to_did_hash == party) {
+            Some(own) => vec![own],
+            None => (0..records.len())
+                .filter(|&i| records[i].from_did_hash == Some(party))
+                .collect(),
+        },
+        MessageScope::All => (0..records.len()).collect(),
+    };
+    if chosen.is_empty() {
+        // Nothing in the queues asked about. Not-found even when other
+        // accounts hold copies under the id: a recipient deleting its own
+        // copy a second time (a redelivered message) must hear "already
+        // gone", which clients treat as success, not a refusal they would
+        // retry and report for as long as another recipient's copy lives —
+        // and a non-party learns nothing about other accounts' messages.
+        return Err(SelectError::NotFound);
+    }
+    if chosen.iter().any(|&i| {
+        !delete_message_permitted(by, records[i].to_did_hash, records[i].from_did_hash)
+    }) {
+        return Err(SelectError::PermissionDenied);
+    }
+    Ok(chosen)
+}
+
+/// Whether an expiry-index entry at `slot_secs` is due for a record whose
+/// current expiry is `expires_at` (`0` = none).
+///
+/// An entry is left by every expiry a record has had: its original deadline,
+/// a delivered-TTL deadline brought forward by `mark_delivered`, and the
+/// deadlines of earlier copies of the same bytes for the same recipient that
+/// were removed and stored again. Only an entry at or after the record's
+/// current expiry may remove it; an earlier one belongs to a deadline the
+/// record no longer has, and the sweeper drops it instead of the record.
+pub fn expiry_entry_is_due(expires_at: u64, slot_secs: u64) -> bool {
+    expires_at != 0 && expires_at <= slot_secs
 }
 
 /// Problem-report descriptor for "delete: there is no such message".
@@ -228,17 +341,17 @@ mod tests {
     #[test]
     fn a_held_message_answers_only_to_its_sender() {
         let held = || {
-            Some(HeldMessage {
+            [HeldMessage {
                 from_did_hash: Some("from"),
                 first_delivered_at_ms: Some(7),
-            })
+            }]
         };
         assert_eq!(
-            sent_message_state("from", held(), None),
+            sent_message_state("from", &held(), None),
             SentMessageState::Delivered { at_ms: 7 }
         );
         assert_eq!(
-            sent_message_state("to", held(), None),
+            sent_message_state("to", &held(), None),
             SentMessageState::Unknown
         );
         let queued = HeldMessage {
@@ -246,7 +359,7 @@ mod tests {
             first_delivered_at_ms: None,
         };
         assert_eq!(
-            sent_message_state("from", Some(queued), None),
+            sent_message_state("from", &[queued], None),
             SentMessageState::Queued
         );
     }
@@ -258,11 +371,11 @@ mod tests {
             at_ms: 9,
         };
         assert_eq!(
-            sent_message_state("from", None, Some(receipt)),
+            sent_message_state("from", &[], Some(receipt)),
             SentMessageState::Removed(receipt)
         );
         assert_eq!(
-            sent_message_state("from", None, None),
+            sent_message_state("from", &[], None),
             SentMessageState::Unknown
         );
     }
@@ -276,6 +389,107 @@ mod tests {
         assert_eq!(OutboxReceipt::decode(&receipt.encode()), Some(receipt));
         assert_eq!(OutboxReceipt::decode("delivered:1"), None);
         assert_eq!(OutboxReceipt::decode("collected"), None);
+    }
+
+    #[test]
+    fn copies_for_several_recipients_answer_together() {
+        let copy = |at: Option<u64>| HeldMessage {
+            from_did_hash: Some("from"),
+            first_delivered_at_ms: at,
+        };
+        assert_eq!(
+            sent_message_state("from", &[copy(Some(5)), copy(None)], None),
+            SentMessageState::Queued,
+            "one copy still waiting"
+        );
+        assert_eq!(
+            sent_message_state("from", &[copy(Some(5)), copy(Some(9))], None),
+            SentMessageState::Delivered { at_ms: 9 }
+        );
+    }
+
+    fn parties<'a>(to: &'a str, from: Option<&'a str>) -> RecordParties<'a> {
+        RecordParties {
+            to_did_hash: to,
+            from_did_hash: from,
+        }
+    }
+
+    #[test]
+    fn a_recipient_scope_names_one_record() {
+        let records = [parties("a", Some("s")), parties("b", Some("s"))];
+        assert_eq!(
+            select_records(MessageScope::Recipient("b"), &owner("b"), &records),
+            Ok(vec![1])
+        );
+        assert_eq!(
+            select_records(MessageScope::Recipient("b"), &owner("s"), &records),
+            Ok(vec![1]),
+            "the sender may remove one recipient's copy"
+        );
+        assert_eq!(
+            select_records(MessageScope::Recipient("b"), &owner("a"), &records),
+            Err(SelectError::PermissionDenied)
+        );
+        assert_eq!(
+            select_records(MessageScope::Recipient("c"), &admin("x"), &records),
+            Err(SelectError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_party_scope_prefers_its_own_inbox_then_what_it_sent() {
+        let records = [
+            parties("a", Some("s")),
+            parties("s", Some("s")),
+            parties("b", Some("s")),
+        ];
+        assert_eq!(
+            select_records(MessageScope::Party("s"), &owner("s"), &records),
+            Ok(vec![1]),
+            "its own inbox copy only"
+        );
+        let records = [parties("a", Some("s")), parties("b", Some("s"))];
+        assert_eq!(
+            select_records(MessageScope::Party("s"), &owner("s"), &records),
+            Ok(vec![0, 1]),
+            "every copy it sent"
+        );
+        assert_eq!(
+            select_records(MessageScope::Party("x"), &owner("x"), &records),
+            Err(SelectError::NotFound),
+            "nothing in x's queues, though others hold copies"
+        );
+        assert_eq!(
+            select_records(MessageScope::Party("x"), &owner("x"), &[]),
+            Err(SelectError::NotFound)
+        );
+        assert_eq!(
+            select_records(MessageScope::Party("x"), &admin("adm"), &records),
+            Err(SelectError::NotFound),
+            "not in the queues an admin asked about"
+        );
+    }
+
+    #[test]
+    fn an_all_scope_is_every_copy_for_an_admin_only() {
+        let records = [parties("a", Some("s")), parties("b", None)];
+        assert_eq!(
+            select_records(MessageScope::All, &admin("adm"), &records),
+            Ok(vec![0, 1])
+        );
+        assert_eq!(
+            select_records(MessageScope::All, &owner("b"), &records),
+            Ok(vec![1])
+        );
+    }
+
+    #[test]
+    fn only_an_entry_at_or_after_the_current_expiry_is_due() {
+        assert!(expiry_entry_is_due(100, 100));
+        assert!(expiry_entry_is_due(100, 150));
+        assert!(!expiry_entry_is_due(200, 100), "an earlier deadline");
+        assert!(!expiry_entry_is_due(0, 100), "no expiry at all");
     }
 
     fn owner(h: &str) -> DeletionAuthority {

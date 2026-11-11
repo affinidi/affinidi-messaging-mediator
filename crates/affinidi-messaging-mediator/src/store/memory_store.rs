@@ -33,6 +33,7 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
+        MessageScope,
         MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
         StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
@@ -69,6 +70,9 @@ const PUBSUB_BROADCAST_CAPACITY: usize = 32;
 // ─── Internal types ─────────────────────────────────────────────────────────
 
 type StreamId = (u64, u64); // (timestamp_ms, sequence)
+
+/// `(msg_id, to_did_hash)`: one recipient's record of a message.
+type RecordKey = (String, String);
 
 /// Pending entries one autoclaim call examines per entry it may return, as
 /// on Redis.
@@ -221,16 +225,18 @@ struct MemoryState {
     stats: HashMap<String, AccountStats>,
 
     // ─── Messages ───────────────────────────────────────────────────
-    messages: HashMap<String, MessageRecord>,
+    /// `(msg_id, to_did_hash) -> record`: one record per recipient of a body
+    /// (see `MessageRef`). Ordered so every record of one id is a range.
+    messages: BTreeMap<RecordKey, MessageRecord>,
 
     // ─── Streams (inbox/outbox) ─────────────────────────────────────
     inbox: HashMap<String, BTreeMap<StreamId, StreamEntry>>, // did_hash -> stream
     outbox: HashMap<String, BTreeMap<StreamId, StreamEntry>>,
 
     // ─── Expiry index ───────────────────────────────────────────────
-    /// `expires_at_secs -> set of msg_ids`. Drained by
+    /// `expires_at_secs -> set of records`. Drained by
     /// `sweep_expired_messages`.
-    expiry: BTreeMap<u64, HashSet<String>>,
+    expiry: BTreeMap<u64, HashSet<RecordKey>>,
 
     // ─── Outbox receipts ────────────────────────────────────────────
     /// `(sender_hash, msg_id) -> (receipt, expires_at_secs)`: why a sent
@@ -310,30 +316,121 @@ impl MemoryState {
         (self.last_stream_ms, self.next_stream_seq)
     }
 
-    /// Record a message-id under its expiry timeslot. `expires_at = 0`
+    /// Record a record under its expiry timeslot. `expires_at = 0`
     /// is a no-op (messages without TTL aren't tracked).
-    fn index_expiry(&mut self, expires_at: u64, msg_id: &str) {
+    fn index_expiry(&mut self, expires_at: u64, key: &RecordKey) {
         if expires_at == 0 {
             return;
         }
         self.expiry
             .entry(expires_at)
             .or_default()
-            .insert(msg_id.to_string());
+            .insert(key.clone());
     }
 
-    /// Remove a message-id from its expiry timeslot. Drops the
+    /// Remove a record from its expiry timeslot. Drops the
     /// timeslot entry once empty.
-    fn unindex_expiry(&mut self, expires_at: u64, msg_id: &str) {
+    fn unindex_expiry(&mut self, expires_at: u64, key: &RecordKey) {
         if expires_at == 0 {
             return;
         }
         if let Some(set) = self.expiry.get_mut(&expires_at) {
-            set.remove(msg_id);
+            set.remove(key);
             if set.is_empty() {
                 self.expiry.remove(&expires_at);
             }
         }
+    }
+
+    /// Every record of `msg_id`, one per recipient, in recipient order.
+    fn records_of(&self, msg_id: &str) -> Vec<(RecordKey, &MessageRecord)> {
+        self.messages
+            .range((msg_id.to_string(), String::new())..)
+            .take_while(|((id, _), _)| id == msg_id)
+            .map(|(key, record)| (key.clone(), record))
+            .collect()
+    }
+
+    /// The record of `msg_id` that `scope` and `by` select, as
+    /// [`ops::select_records`] decides.
+    fn select(
+        &self,
+        msg_id: &str,
+        scope: MessageScope<'_>,
+        by: &DeletionAuthority,
+    ) -> Result<Vec<RecordKey>, ops::SelectError> {
+        let records = self.records_of(msg_id);
+        let parties: Vec<ops::RecordParties<'_>> = records
+            .iter()
+            .map(|(_, record)| ops::RecordParties {
+                to_did_hash: &record.to_did_hash,
+                from_did_hash: record.from_did_hash.as_deref(),
+            })
+            .collect();
+        let chosen = ops::select_records(scope, by, &parties)?;
+        Ok(chosen.into_iter().map(|i| records[i].0.clone()).collect())
+    }
+
+    /// Remove one record with its stream entries, counters, expiry entry and
+    /// the sender's receipt. The caller has authorised it.
+    fn remove_record(&mut self, key: &RecordKey, by: &DeletionAuthority) {
+        let Some(record) = self.messages.remove(key) else {
+            return;
+        };
+        let message_hash = key.0.as_str();
+
+        // Stream entries
+        if let Some(stream) = self.inbox.get_mut(&record.to_did_hash) {
+            stream.remove(&record.receive_id);
+        }
+        if let (Some(from), Some(sid)) = (record.from_did_hash.as_ref(), record.send_id) {
+            if let Some(stream) = self.outbox.get_mut(from) {
+                stream.remove(&sid);
+            }
+            // Sender account counters
+            if let Some(sender) = self.accounts.get_mut(from) {
+                sender.send_queue_count = sender.send_queue_count.saturating_sub(1);
+                sender.send_queue_bytes =
+                    sender.send_queue_bytes.saturating_sub(record.bytes as u64);
+            }
+        }
+        // Per-relationship depth, dropped at zero so the map does not retain a
+        // row for every pair the sender has ever used.
+        if let Some(from) = record.from_did_hash.as_ref() {
+            let pair = (from.clone(), record.to_did_hash.clone());
+            if let Some(count) = self.peer_queue.get_mut(&pair) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_queue.remove(&pair);
+                }
+            }
+        }
+
+        // Recipient account counters
+        if let Some(recv) = self.accounts.get_mut(&record.to_did_hash) {
+            recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
+            recv.receive_queue_bytes = recv.receive_queue_bytes.saturating_sub(record.bytes as u64);
+        }
+
+        // Expiry index
+        self.unindex_expiry(record.expires_at, key);
+
+        // The sender's receipt, when the message sat in a sender's outbox.
+        if let (Some(from), Some(_)) = (record.from_did_hash.as_ref(), record.send_id)
+            && let Some(reason) = ops::removal_reason(by, &record.to_did_hash, Some(from.as_str()))
+        {
+            let receipt = OutboxReceipt {
+                reason,
+                at_ms: now_ms(),
+            };
+            let expires = unix_timestamp_secs() + OUTBOX_RECEIPT_TTL.as_secs();
+            self.receipts
+                .insert((from.clone(), message_hash.to_string()), (receipt, expires));
+        }
+
+        // Counters
+        self.incr_counter("DELETED_BYTES", record.bytes as i64);
+        self.incr_counter("DELETED_COUNT", 1);
     }
 
     /// Lazy session expiry — call before reading a session record.
@@ -526,14 +623,11 @@ impl MediatorStore for MemoryStore {
 
         let mut state = self.state.lock().await;
 
-        // Idempotent on the message hash, as in the Fjall backend — see
+        // Idempotent per recipient, as in the Fjall backend — see
         // `FjallStore::store_message` for the leak a re-submitted message
-        // caused. Same rule here so the two cannot drift.
-        if state
-            .messages
-            .get(&msg_id)
-            .is_some_and(|existing| existing.to_did_hash == to_did_hash)
-        {
+        // caused. The same bytes for another recipient get their own record.
+        let key: RecordKey = (msg_id.clone(), to_did_hash.to_string());
+        if state.messages.contains_key(&key) {
             return Ok(msg_id);
         }
 
@@ -592,11 +686,11 @@ impl MediatorStore for MemoryStore {
         state.incr_counter("RECEIVED_COUNT", 1);
 
         // Expiry index
-        state.index_expiry(expires_at, &msg_id);
+        state.index_expiry(expires_at, &key);
 
         // Body + metadata
         state.messages.insert(
-            msg_id.clone(),
+            key,
             MessageRecord {
                 body: message.to_string(),
                 bytes,
@@ -618,85 +712,22 @@ impl MediatorStore for MemoryStore {
         Ok(msg_id)
     }
 
-    async fn delete_message(
+    async fn delete_message_in(
         &self,
         message_hash: &str,
+        scope: MessageScope<'_>,
         by: DeletionAuthority,
     ) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
-
-        let record = state
-            .messages
-            .get(message_hash)
-            .cloned()
-            .ok_or_else(|| ops::delete_not_found(message_hash, None))?;
-
-        // Authorisation. Owner must be TO or FROM. Admin bypasses. Shared with
-        // the Fjall backend via `store::ops` so the two can't drift.
-        let permitted = ops::delete_message_permitted(
-            &by,
-            &record.to_did_hash,
-            record.from_did_hash.as_deref(),
-        );
-        if !permitted {
-            return Err(ops::delete_permission_denied(message_hash, None));
+        // Authorisation and the choice of records are shared with the Fjall
+        // backend via `store::ops` so the two can't drift. Every chosen record
+        // goes under the one lock.
+        let chosen = state
+            .select(message_hash, scope, &by)
+            .map_err(|e| e.into_delete_error(message_hash))?;
+        for key in &chosen {
+            state.remove_record(key, &by);
         }
-
-        // Stream entries
-        if let Some(stream) = state.inbox.get_mut(&record.to_did_hash) {
-            stream.remove(&record.receive_id);
-        }
-        if let (Some(from), Some(sid)) = (record.from_did_hash.as_ref(), record.send_id) {
-            if let Some(stream) = state.outbox.get_mut(from) {
-                stream.remove(&sid);
-            }
-            // Sender account counters
-            if let Some(sender) = state.accounts.get_mut(from) {
-                sender.send_queue_count = sender.send_queue_count.saturating_sub(1);
-                sender.send_queue_bytes =
-                    sender.send_queue_bytes.saturating_sub(record.bytes as u64);
-            }
-        }
-        // Per-relationship depth, dropped at zero so the map does not retain a
-        // row for every pair the sender has ever used.
-        if let Some(from) = record.from_did_hash.as_ref() {
-            let key = (from.clone(), record.to_did_hash.clone());
-            if let Some(count) = state.peer_queue.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.peer_queue.remove(&key);
-                }
-            }
-        }
-
-        // Recipient account counters
-        if let Some(recv) = state.accounts.get_mut(&record.to_did_hash) {
-            recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
-            recv.receive_queue_bytes = recv.receive_queue_bytes.saturating_sub(record.bytes as u64);
-        }
-
-        // Expiry index
-        state.unindex_expiry(record.expires_at, message_hash);
-
-        // The sender's receipt, when the message sat in a sender's outbox.
-        if let (Some(from), Some(_)) = (record.from_did_hash.as_ref(), record.send_id)
-            && let Some(reason) = ops::removal_reason(&by, &record.to_did_hash, Some(from.as_str()))
-        {
-            let receipt = OutboxReceipt {
-                reason,
-                at_ms: now_ms(),
-            };
-            let expires = unix_timestamp_secs() + OUTBOX_RECEIPT_TTL.as_secs();
-            state
-                .receipts
-                .insert((from.clone(), message_hash.to_string()), (receipt, expires));
-        }
-
-        // Counters + body
-        state.incr_counter("DELETED_BYTES", record.bytes as i64);
-        state.incr_counter("DELETED_COUNT", 1);
-        state.messages.remove(message_hash);
-
         Ok(())
     }
 
@@ -710,22 +741,27 @@ impl MediatorStore for MemoryStore {
         Ok(msg_ids
             .iter()
             .map(|id| {
-                let held = state.messages.get(id).map(|record| ops::HeldMessage {
-                    from_did_hash: record.from_did_hash.as_deref(),
-                    first_delivered_at_ms: record.first_delivered_at_ms,
-                });
+                let held: Vec<ops::HeldMessage<'_>> = state
+                    .records_of(id)
+                    .into_iter()
+                    .map(|(_, record)| ops::HeldMessage {
+                        from_did_hash: record.from_did_hash.as_deref(),
+                        first_delivered_at_ms: record.first_delivered_at_ms,
+                    })
+                    .collect();
                 let receipt = state
                     .receipts
                     .get(&(sender_did_hash.to_string(), id.clone()))
                     .filter(|(_, expires)| *expires > now)
                     .map(|(receipt, _)| *receipt);
-                ops::sent_message_state(sender_did_hash, held, receipt)
+                ops::sent_message_state(sender_did_hash, &held, receipt)
             })
             .collect())
     }
 
     async fn mark_delivered(
         &self,
+        recipient_did_hash: &str,
         msg_ids: &[String],
         now_ms: u64,
         delivered_ttl_secs: u64,
@@ -735,7 +771,8 @@ impl MediatorStore for MemoryStore {
         for id in msg_ids {
             // A message deleted between the read and this call is simply gone;
             // there is nothing to stamp and nothing has gone wrong.
-            let Some(record) = state.messages.get_mut(id) else {
+            let key: RecordKey = (id.clone(), recipient_did_hash.to_string());
+            let Some(record) = state.messages.get_mut(&key) else {
                 continue;
             };
             let first_delivery = record.first_delivered_at_ms.is_none();
@@ -757,9 +794,11 @@ impl MediatorStore for MemoryStore {
             if first_delivery && delivered_ttl_secs > 0 {
                 let deadline = now_ms / 1_000 + delivered_ttl_secs;
                 if record.expires_at == 0 || deadline < record.expires_at {
-                    // Added, not moved: the original slot stays and resolves to
-                    // `already_deleted` when the sweeper reaches it.
-                    state.index_expiry(deadline, id);
+                    // The record's expiry is now the deadline. The new slot is
+                    // added and the original left: the sweeper drops it as
+                    // stale (`ops::expiry_entry_is_due`), or finds it gone.
+                    record.expires_at = deadline;
+                    state.index_expiry(deadline, &key);
                     report.expiry_advanced += 1;
                 }
             }
@@ -767,9 +806,14 @@ impl MediatorStore for MemoryStore {
         Ok(report)
     }
 
-    async fn delivery_state(&self, msg_id: &str) -> Result<Option<DeliveryState>, MediatorError> {
+    async fn delivery_state(
+        &self,
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
         let state = self.state.lock().await;
-        Ok(state.messages.get(msg_id).map(|record| DeliveryState {
+        let key: RecordKey = (msg_id.to_string(), recipient_did_hash.to_string());
+        Ok(state.messages.get(&key).map(|record| DeliveryState {
             first_delivered_at_ms: record.first_delivered_at_ms,
             attempts: record.delivery_attempts,
         }))
@@ -781,7 +825,17 @@ impl MediatorStore for MemoryStore {
         msg_id: &str,
     ) -> Result<Option<MessageListElement>, MediatorError> {
         let state = self.state.lock().await;
-        let Some(record) = state.messages.get(msg_id) else {
+        // Its own inbox copy, else a copy it sent (`MessageScope::Party`).
+        let records = state.records_of(msg_id);
+        let Some((_, record)) = records
+            .iter()
+            .find(|(_, r)| r.to_did_hash == did_hash)
+            .or_else(|| {
+                records
+                    .iter()
+                    .find(|(_, r)| r.from_did_hash.as_deref() == Some(did_hash))
+            })
+        else {
             return Ok(None);
         };
 
@@ -815,14 +869,15 @@ impl MediatorStore for MemoryStore {
 
     async fn get_message_metadata(
         &self,
-        session_id: &str,
+        recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
         let state = self.state.lock().await;
-        let record = state.messages.get(message_hash).ok_or_else(|| {
+        let key: RecordKey = (message_hash.to_string(), recipient_did_hash.to_string());
+        let record = state.messages.get(&key).ok_or_else(|| {
             MediatorError::DatabaseError(
                 14,
-                session_id.into(),
+                "NA".into(),
                 format!("Message metadata not found for {message_hash}"),
             )
         })?;
@@ -927,7 +982,10 @@ impl MediatorStore for MemoryStore {
         for (sid, entry) in &entries {
             let body = {
                 let state = self.state.lock().await;
-                state.messages.get(&entry.msg_id).map(|r| r.body.clone())
+                state
+                    .messages
+                    .get(&(entry.msg_id.clone(), did_hash.to_string()))
+                    .map(|r| r.body.clone())
             };
             let mut element = MessageListElement {
                 msg_id: entry.msg_id.clone(),
@@ -942,8 +1000,9 @@ impl MediatorStore for MemoryStore {
 
             if optimistic_delete {
                 let result = self
-                    .delete_message(
+                    .delete_message_in(
                         &entry.msg_id,
+                        MessageScope::Recipient(did_hash),
                         DeletionAuthority::Owner {
                             did_hash: did_hash.to_string(),
                         },
@@ -988,25 +1047,41 @@ impl MediatorStore for MemoryStore {
     ) -> Result<(usize, usize), MediatorError> {
         // Snapshot the message IDs in the folder under the lock, then
         // call delete_message on each (which re-acquires the lock).
-        let msg_ids: Vec<String> = {
+        // Each entry names one record: the owner's in an inbox, the entry's
+        // recipient in an outbox.
+        let records: Vec<RecordKey> = {
             let state = self.state.lock().await;
-            let stream = match folder {
-                Folder::Inbox => state.inbox.get(did_hash),
-                Folder::Outbox => state.outbox.get(did_hash),
-            };
-            stream
-                .map(|s| s.values().map(|e| e.msg_id.clone()).collect())
-                .unwrap_or_default()
+            match folder {
+                Folder::Inbox => state.inbox.get(did_hash).map(|s| {
+                    s.values()
+                        .map(|e| (e.msg_id.clone(), did_hash.to_string()))
+                        .collect()
+                }),
+                Folder::Outbox => state.outbox.get(did_hash).map(|s| {
+                    s.values()
+                        .map(|e| (e.msg_id.clone(), e.peer_did.clone()))
+                        .collect()
+                }),
+            }
+            .unwrap_or_default()
         };
 
         let mut count = 0;
         let mut bytes = 0;
-        for msg_id in msg_ids {
+        for (msg_id, to) in records {
             let bytes_before = {
                 let state = self.state.lock().await;
-                state.messages.get(&msg_id).map(|r| r.bytes).unwrap_or(0)
+                state
+                    .messages
+                    .get(&(msg_id.clone(), to.clone()))
+                    .map(|r| r.bytes)
+                    .unwrap_or(0)
             };
-            if self.delete_message(&msg_id, by.clone()).await.is_ok() {
+            if self
+                .delete_message_in(&msg_id, MessageScope::Recipient(&to), by.clone())
+                .await
+                .is_ok()
+            {
                 count += 1;
                 bytes += bytes_before;
             }
@@ -2327,48 +2402,64 @@ impl MediatorStore for MemoryStore {
         admin_did_hash: &str,
         on_expired: Option<OnExpired<'_>>,
     ) -> Result<ExpiryReport, MediatorError> {
-        // Snapshot due timeslot keys + their message ids under the
-        // lock, then call delete_message for each.
-        let due: Vec<(u64, Vec<String>)> = {
+        // Snapshot due timeslot keys + their records under the lock, then
+        // remove each record that is still due, under the lock.
+        let due: Vec<(u64, Vec<RecordKey>)> = {
             let state = self.state.lock().await;
             state
                 .expiry
                 .range(..=now_secs)
-                .map(|(ts, ids)| (*ts, ids.iter().cloned().collect()))
+                .map(|(ts, keys)| (*ts, keys.iter().cloned().collect()))
                 .collect()
         };
 
+        let by = DeletionAuthority::Admin {
+            admin_did_hash: admin_did_hash.to_string(),
+        };
         let mut report = ExpiryReport {
             timeslots_swept: due.len() as u32,
             ..Default::default()
         };
-        for (ts, ids) in due {
-            for msg_id in ids {
-                let meta = match on_expired {
-                    Some(_) => self.get_message_metadata("expiry", &msg_id).await.ok(),
-                    None => None,
-                };
-                let result = self
-                    .delete_message(
-                        &msg_id,
-                        DeletionAuthority::Admin {
-                            admin_did_hash: admin_did_hash.to_string(),
-                        },
-                    )
-                    .await;
-                match result {
-                    Ok(_) => {
-                        report.expired += 1;
-                        if let (Some(observe), Some(meta)) = (on_expired, &meta) {
-                            observe(&msg_id, meta);
+        for (ts, keys) in due {
+            for key in keys {
+                // Only an entry at or after the record's current expiry
+                // removes it. One left by a deadline the record no longer has
+                // (an earlier copy of the same bytes for the same recipient,
+                // or the original deadline of a delivered message) is dropped
+                // and the record kept.
+                let removed = {
+                    let mut state = self.state.lock().await;
+                    let meta = state
+                        .messages
+                        .get(&key)
+                        .filter(|record| ops::expiry_entry_is_due(record.expires_at, ts))
+                        .map(|record| MessageMetaData {
+                            bytes: record.bytes,
+                            to_did_hash: record.to_did_hash.clone(),
+                            from_did_hash: record.from_did_hash.clone(),
+                            timestamp: record.timestamp_ms,
+                        });
+                    if meta.is_some() {
+                        state.remove_record(&key, &by);
+                    }
+                    if let Some(set) = state.expiry.get_mut(&ts) {
+                        set.remove(&key);
+                        if set.is_empty() {
+                            state.expiry.remove(&ts);
                         }
                     }
-                    Err(_) => report.already_deleted += 1,
+                    meta
+                };
+                match removed {
+                    Some(meta) => {
+                        report.expired += 1;
+                        if let Some(observe) = on_expired {
+                            observe(&key.0, &meta);
+                        }
+                    }
+                    None => report.already_deleted += 1,
                 }
             }
-            // Drop the (now-empty) timeslot.
-            let mut state = self.state.lock().await;
-            state.expiry.remove(&ts);
         }
         self.state
             .lock()
@@ -2604,9 +2695,20 @@ mod tests {
             )
             .await
             .expect_err("non-owner delete must fail");
+        // Nothing in eve's queues under that id: not found, the same answer
+        // as for an id that does not exist, so a non-party learns nothing
+        // about another account's messages. The message is untouched.
         assert!(
-            format!("{err}").contains(ops::DELETE_PERMISSION_DENIED),
+            format!("{err}").contains(ops::DELETE_NOT_FOUND),
             "got: {err}"
+        );
+        assert!(
+            store
+                .get_message("alice", &msg_id)
+                .await
+                .expect("get_message")
+                .is_some(),
+            "the recipient's message is untouched"
         );
     }
 
@@ -3114,10 +3216,12 @@ mod tests {
             .expect("store");
 
         // A message alice sent to bob. Carol owns neither end, so a delete by
-        // carol is refused rather than "already gone".
+        // carol of bob's copy is refused rather than "already gone". (By id
+        // alone it would be not-found: nothing in carol's queues.)
         let refused = store
-            .delete_message(
+            .delete_message_in(
                 &id,
+                MessageScope::Recipient("bob"),
                 DeletionAuthority::Owner {
                     did_hash: "carol".to_string(),
                 },
@@ -3303,7 +3407,7 @@ mod tests {
         // Never collected: known to be undelivered, which is a different claim
         // from "delivered zero times ago".
         let state = store
-            .delivery_state(&id)
+            .delivery_state("bob", &id)
             .await
             .expect("state")
             .expect("exists");
@@ -3312,11 +3416,11 @@ mod tests {
         assert_eq!(state.since_first_delivery_secs(10_000), None);
 
         store
-            .mark_delivered(std::slice::from_ref(&id), 1_000, 0)
+            .mark_delivered("bob", std::slice::from_ref(&id), 1_000, 0)
             .await
             .expect("mark");
         let state = store
-            .delivery_state(&id)
+            .delivery_state("bob", &id)
             .await
             .expect("state")
             .expect("exists");
@@ -3328,11 +3432,11 @@ mod tests {
         // eviction and ageing key off when it was FIRST handed over, so a
         // reconnecting client would otherwise keep resetting its own clock.
         store
-            .mark_delivered(std::slice::from_ref(&id), 5_000, 0)
+            .mark_delivered("bob", std::slice::from_ref(&id), 5_000, 0)
             .await
             .expect("mark");
         let state = store
-            .delivery_state(&id)
+            .delivery_state("bob", &id)
             .await
             .expect("state")
             .expect("exists");
@@ -3352,12 +3456,12 @@ mod tests {
     async fn marking_a_vanished_message_is_not_an_error() {
         let store = MemoryStore::new();
         store
-            .mark_delivered(&["never-existed".to_string()], 1_000, 0)
+            .mark_delivered("bob", &["never-existed".to_string()], 1_000, 0)
             .await
             .expect("marking an absent message must not fail a delivery");
         assert!(
             store
-                .delivery_state("never-existed")
+                .delivery_state("bob", "never-existed")
                 .await
                 .expect("state")
                 .is_none(),
@@ -3388,7 +3492,7 @@ mod tests {
 
         // Delivered at t=0 with a one-hour delivered TTL.
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 0, 3_600)
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
             .await
             .expect("mark");
         assert_eq!(report.first_delivered, 1);
@@ -3401,7 +3505,7 @@ mod tests {
             .expect("sweep");
         assert_eq!(swept.expired, 0);
         assert!(
-            store.delivery_state(&id).await.expect("state").is_some(),
+            store.delivery_state("bob", &id).await.expect("state").is_some(),
             "still held before its shortened deadline"
         );
 
@@ -3411,7 +3515,7 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(swept.expired, 1);
-        assert!(store.delivery_state(&id).await.expect("state").is_none());
+        assert!(store.delivery_state("bob", &id).await.expect("state").is_none());
     }
 
     /// Off by default. A deployment that does not opt in keeps the behaviour it
@@ -3432,7 +3536,7 @@ mod tests {
             .expect("store");
 
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 0, 0)
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 0)
             .await
             .expect("mark");
         assert_eq!(report.expiry_advanced, 0);
@@ -3442,7 +3546,7 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(swept.expired, 0, "no shortening without the limit set");
-        assert!(store.delivery_state(&id).await.expect("state").is_some());
+        assert!(store.delivery_state("bob", &id).await.expect("state").is_some());
     }
 
     /// **The bug this design exists to avoid.** A client that reconnects often
@@ -3465,12 +3569,12 @@ mod tests {
             .expect("store");
 
         store
-            .mark_delivered(std::slice::from_ref(&id), 0, 3_600)
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
             .await
             .expect("first");
         // Redelivered much later; must not move the deadline to t+3600 again.
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 3_000_000, 3_600)
+            .mark_delivered("bob", std::slice::from_ref(&id), 3_000_000, 3_600)
             .await
             .expect("redelivery");
         assert_eq!(report.first_delivered, 0);
@@ -3509,7 +3613,7 @@ mod tests {
             .expect("store");
 
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 0, 3_600)
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
             .await
             .expect("mark");
         assert_eq!(
@@ -3547,7 +3651,7 @@ mod tests {
         let mut suspected = 0;
         for _ in 0..(POISON_ATTEMPTS + 3) {
             suspected += store
-                .mark_delivered(std::slice::from_ref(&id), 0, 0)
+                .mark_delivered("bob", std::slice::from_ref(&id), 0, 0)
                 .await
                 .expect("mark")
                 .poison_suspected;
@@ -3564,7 +3668,7 @@ mod tests {
             .expect("sweep");
         assert_eq!(swept.expired, 0);
         let state = store
-            .delivery_state(&id)
+            .delivery_state("bob", &id)
             .await
             .expect("state")
             .expect("exists");
@@ -3769,7 +3873,7 @@ mod tests {
         // The message is gone, so it has no delivery state — not a default
         // one, and emphatically not a resurrected record.
         assert!(
-            store.delivery_state(&id).await.expect("state").is_none(),
+            store.delivery_state("bob", &id).await.expect("state").is_none(),
             "an optimistically fetched message is deleted; marking it would \
              recreate metadata for a message that no longer exists"
         );
@@ -3815,7 +3919,7 @@ mod tests {
 
         for id in [&a, &b] {
             let state = store
-                .delivery_state(id)
+                .delivery_state("bob", id)
                 .await
                 .expect("state")
                 .expect("exists");

@@ -14,13 +14,15 @@
 //! layout, which is unchanged. Each keyspace carries its own memtable,
 //! so the count here is also the process's memtable count.
 //!
-//! - `messages`           — `msg_id` → message body (UTF-8). Also carries
-//!   the per-message metadata (`bytes`, peer DID hashes, timestamp), so
-//!   `get_message_metadata` reads it directly; there is no separate
-//!   metadata keyspace.
+//! - `messages`           — `{msg_id}:{to_did_hash}` → message body (UTF-8),
+//!   one row per recipient of a body. Also carries the per-message metadata
+//!   (`bytes`, peer DID hashes, timestamp, expiry), so `get_message_metadata`
+//!   reads it directly; there is no separate metadata keyspace. A row keyed
+//!   by the bare `msg_id` was written before rows were per recipient and is
+//!   still read for its recipient (see `record_key`).
 //! - `inbox`              — `{did_hash}:{stream_id}` → inbox entry
 //! - `outbox`             — `{did_hash}:{stream_id}` → outbox entry
-//! - `expiry`             — `{expires_at_secs}:{msg_id}` → empty
+//! - `expiry`             — `{expires_at_secs}{messages key}` → empty
 //! - `sessions`           — `session_id` → JSON-serialised [`Session`]
 //! - `accounts`           — `did_hash` → JSON-serialised account record.
 //!   Carries the ACL bitmask inline, so there is no separate ACL keyspace.
@@ -69,7 +71,7 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
-        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
+        MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
         StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
@@ -418,13 +420,26 @@ fn stream_key_from_id(did_hash: &str, sid: (u64, u64)) -> Vec<u8> {
     stream_key(did_hash, sid.0, sid.1)
 }
 
-/// `expires_at_be || msg_id` — sortable composite key for the expiry
-/// index. Fjall scans `< now` to find expired messages.
-fn expiry_key(expires_at: u64, msg_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + msg_id.len());
+/// `expires_at_be || record_key` — sortable composite key for the expiry
+/// index. Fjall scans `< now` to find expired messages. Entries written
+/// before records were per recipient carry a bare `msg_id`, which is the
+/// legacy record's key, so they resolve the same way.
+fn expiry_key(expires_at: u64, record_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(8 + record_key.len());
     k.extend_from_slice(&expires_at.to_be_bytes());
-    k.extend_from_slice(msg_id.as_bytes());
+    k.extend_from_slice(record_key.as_bytes());
     k
+}
+
+/// Key of the `messages` row holding `msg_id` for `to`: `{msg_id}:{to}`.
+///
+/// One body may be stored for several recipients, and each gets a row of its
+/// own (see `MessageRef`). A row written before that is keyed by the bare
+/// `msg_id` (a hex digest, so never containing `:`); it is that row's
+/// recipient's record and is read through [`FjallStore::record_for`] until
+/// it expires or is removed. Nothing writes a bare-id row any more.
+fn record_key(msg_id: &str, to_did_hash: &str) -> String {
+    [msg_id, ":", to_did_hash].concat()
 }
 
 /// `group_name || 0x00 || stream_id_be` — composite key for entries
@@ -701,6 +716,166 @@ impl FjallStore {
         }
         Ok(())
     }
+    /// The row of `msg_id` held for `to`: its per-recipient row, else a
+    /// legacy bare-id row whose recipient is `to` (see [`record_key`]).
+    /// Returns the row's key with it.
+    fn record_for(
+        &self,
+        msg_id: &str,
+        to: &str,
+    ) -> Result<Option<(String, StoredMessage)>, MediatorError> {
+        let key = record_key(msg_id, to);
+        if let Some(raw) = self
+            .messages
+            .get(key.as_bytes())
+            .map_err(|e| Self::db_err("record_for:messages.get", e))?
+        {
+            return Ok(Some((key, Self::decode(&raw)?)));
+        }
+        if let Some(raw) = self
+            .messages
+            .get(msg_id.as_bytes())
+            .map_err(|e| Self::db_err("record_for:legacy.get", e))?
+        {
+            let stored: StoredMessage = Self::decode(&raw)?;
+            if stored.to_did_hash == to {
+                return Ok(Some((msg_id.to_string(), stored)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every row of `msg_id`: a legacy bare-id row if there is one, then the
+    /// per-recipient rows (`{msg_id}:` prefix), each with its key.
+    fn records_of(&self, msg_id: &str) -> Result<Vec<(String, StoredMessage)>, MediatorError> {
+        let mut rows = Vec::new();
+        if let Some(raw) = self
+            .messages
+            .get(msg_id.as_bytes())
+            .map_err(|e| Self::db_err("records_of:legacy.get", e))?
+        {
+            rows.push((msg_id.to_string(), Self::decode(&raw)?));
+        }
+        let prefix = [msg_id, ":"].concat();
+        for guard in self.messages.prefix(prefix.as_bytes()) {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("records_of:prefix", e))?;
+            rows.push((
+                String::from_utf8_lossy(key.as_ref()).into_owned(),
+                Self::decode(&value)?,
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// Remove `rows` (keyed as [`records_of`](Self::records_of) returns them)
+    /// with their stream entries, counters, current expiry entries and the
+    /// senders' receipts, in one batch. The caller holds `write_lock` and has
+    /// authorised every row.
+    fn remove_records_locked(
+        &self,
+        message_hash: &str,
+        rows: &[(String, StoredMessage)],
+        by: &DeletionAuthority,
+    ) -> Result<(), MediatorError> {
+        // Accounts and pair counts touched by several rows are read once and
+        // changed in memory, so two rows of one sender both count.
+        let mut accounts: HashMap<String, Option<StoredAccount>> = HashMap::new();
+        let mut account = |did: &str| -> Result<(), MediatorError> {
+            if !accounts.contains_key(did) {
+                let loaded = match self
+                    .accounts
+                    .get(did.as_bytes())
+                    .map_err(|e| Self::db_err("delete_message:accounts.get", e))?
+                {
+                    Some(v) => Some(Self::decode::<StoredAccount>(&v)?),
+                    None => None,
+                };
+                accounts.insert(did.to_string(), loaded);
+            }
+            Ok(())
+        };
+        for (_, stored) in rows {
+            account(&stored.to_did_hash)?;
+            if let Some(from) = &stored.from_did_hash {
+                account(from)?;
+            }
+        }
+        let mut peer_deltas: HashMap<(String, String), i64> = HashMap::new();
+
+        let mut batch = self.db.batch();
+        let mut deleted_bytes = 0i64;
+        for (key, stored) in rows {
+            if let Some(Some(recv)) = accounts.get_mut(&stored.to_did_hash) {
+                recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
+                recv.receive_queue_bytes =
+                    recv.receive_queue_bytes.saturating_sub(stored.bytes as u64);
+            }
+            if let Some(from) = &stored.from_did_hash {
+                if let Some(Some(acc)) = accounts.get_mut(from) {
+                    acc.send_queue_count = acc.send_queue_count.saturating_sub(1);
+                    acc.send_queue_bytes = acc.send_queue_bytes.saturating_sub(stored.bytes as u64);
+                }
+                *peer_deltas
+                    .entry((from.clone(), stored.to_did_hash.clone()))
+                    .or_default() -= 1;
+            }
+            batch.remove(&self.messages, key.as_bytes());
+            batch.remove(
+                &self.inbox,
+                stream_key_from_id(&stored.to_did_hash, stored.receive_id),
+            );
+            if let (Some(from), Some(sid)) = (&stored.from_did_hash, stored.send_id) {
+                batch.remove(&self.outbox, stream_key_from_id(from, sid));
+            }
+            if stored.expires_at > 0 {
+                batch.remove(&self.expiry, expiry_key(stored.expires_at, key));
+            }
+            // The sender's receipt, in the same batch as the delete, so a
+            // removal never commits without it.
+            if let (Some(from), Some(_)) = (&stored.from_did_hash, stored.send_id)
+                && let Some(reason) = ops::removal_reason(by, &stored.to_did_hash, Some(from))
+            {
+                let expires_at = now_ms() / 1_000 + OUTBOX_RECEIPT_TTL.as_secs();
+                let receipt_key = outbox_receipt_key(from, message_hash);
+                batch.insert(
+                    &self.outbox_receipt_expiry,
+                    outbox_receipt_expiry_key(expires_at, &receipt_key),
+                    Vec::<u8>::new(),
+                );
+                batch.insert(
+                    &self.outbox_receipts,
+                    receipt_key,
+                    Self::encode(&StoredOutboxReceipt {
+                        receipt: OutboxReceipt {
+                            reason,
+                            at_ms: now_ms(),
+                        },
+                        expires_at,
+                    })?,
+                );
+            }
+            deleted_bytes += stored.bytes as i64;
+        }
+        for ((from, to), delta) in peer_deltas {
+            self.stage_peer_queue_delta(&mut batch, &from, &to, delta)?;
+        }
+        for (did, acc) in accounts {
+            if let Some(acc) = acc {
+                batch.insert(&self.accounts, did.as_bytes(), Self::encode(&acc)?);
+            }
+        }
+
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("delete_message:commit", e))?;
+
+        let _ = self.bump_global("DELETED_BYTES", deleted_bytes);
+        let _ = self.bump_global("DELETED_COUNT", rows.len() as i64);
+        Ok(())
+    }
+
     /// Stage the per-pair count change for one message onto `batch`.
     ///
     /// `delta` is `+1` when a message is queued and `-1` when one leaves the
@@ -1163,30 +1338,24 @@ impl MediatorStore for FjallStore {
 
         let _guard = self.write_lock.lock().await;
 
-        // Idempotent on the message hash. A sender that re-submits the same
-        // bytes — the delivery layer's outbox re-sends `entry.packed` verbatim
-        // when a send errors after the mediator had in fact stored it — used to
-        // get a second inbox and outbox entry and a second counter increment
-        // over a single `messages` row. The one delete then released one of
-        // each, and the rest leaked for good: the sender's `send_queue_count`
-        // crept up until the `limits.queue.sender` gate refused all its
-        // traffic, and even expiry could not recover it, because both copies
-        // share one expiry key. Checked under the write lock, so two
+        // Idempotent per recipient. A sender that re-submits the same bytes —
+        // the delivery layer's outbox re-sends `entry.packed` verbatim when a
+        // send errors after the mediator had in fact stored it — used to get a
+        // second inbox and outbox entry and a second counter increment over a
+        // single `messages` row. The one delete then released one of each,
+        // and the rest leaked for good. Checked under the write lock, so two
         // concurrent stores of the same bytes cannot both pass.
-        if let Some(existing) = self
-            .messages
-            .get(msg_id.as_bytes())
-            .map_err(|e| Self::db_err("store_message:messages.get", e))?
-        {
-            let existing: StoredMessage = Self::decode(&existing)?;
-            if existing.to_did_hash == to_did_hash {
-                tracing::debug!(
-                    msg_id,
-                    "message already stored for this recipient; not storing it twice"
-                );
-                return Ok(msg_id);
-            }
+        //
+        // The same bytes for another recipient get a row of their own: the
+        // row names its recipient, so neither copy can replace the other.
+        if self.record_for(&msg_id, to_did_hash)?.is_some() {
+            tracing::debug!(
+                msg_id,
+                "message already stored for this recipient; not storing it twice"
+            );
+            return Ok(msg_id);
         }
+        let row_key = record_key(&msg_id, to_did_hash);
 
         let receive_id = self.alloc_stream_id();
         let send_id = if from != "ANONYMOUS" {
@@ -1248,7 +1417,7 @@ impl MediatorStore for FjallStore {
 
         // Build the atomic batch.
         let mut batch = self.db.batch();
-        batch.insert(&self.messages, msg_id.as_bytes(), Self::encode(&stored)?);
+        batch.insert(&self.messages, row_key.as_bytes(), Self::encode(&stored)?);
         batch.insert(
             &self.inbox,
             stream_key_from_id(to_did_hash, receive_id),
@@ -1285,7 +1454,7 @@ impl MediatorStore for FjallStore {
         if expires_at > 0 {
             batch.insert(
                 &self.expiry,
-                expiry_key(expires_at, &msg_id),
+                expiry_key(expires_at, &row_key),
                 Vec::<u8>::new(),
             );
         }
@@ -1308,117 +1477,29 @@ impl MediatorStore for FjallStore {
         Ok(msg_id)
     }
 
-    async fn delete_message(
+    async fn delete_message_in(
         &self,
         message_hash: &str,
+        scope: MessageScope<'_>,
         by: DeletionAuthority,
     ) -> Result<(), MediatorError> {
         let _guard = self.write_lock.lock().await;
 
-        let stored: StoredMessage = match self
-            .messages
-            .get(message_hash.as_bytes())
-            .map_err(|e| Self::db_err("delete_message:messages.get", e))?
-        {
-            Some(v) => Self::decode(&v)?,
-            None => {
-                return Err(ops::delete_not_found(message_hash, None));
-            }
-        };
-
-        // Authorisation. Owner must be TO or FROM. Admin bypasses. Shared with
-        // the memory backend via `store::ops` so the two can't drift.
-        let permitted = ops::delete_message_permitted(
-            &by,
-            &stored.to_did_hash,
-            stored.from_did_hash.as_deref(),
-        );
-        if !permitted {
-            return Err(ops::delete_permission_denied(message_hash, None));
-        }
-
-        // Read-modify-write the recipient and (if non-anonymous) the
-        // sender accounts. Decrement queue counters for each.
-        let recv_key = stored.to_did_hash.as_bytes().to_vec();
-        let recv_account: Option<StoredAccount> = match self
-            .accounts
-            .get(&recv_key)
-            .map_err(|e| Self::db_err("delete_message:accounts.get", e))?
-        {
-            Some(v) => Some(Self::decode(&v)?),
-            None => None,
-        };
-
-        let mut sender_pair: Option<(Vec<u8>, StoredAccount)> = None;
-        if let Some(from) = &stored.from_did_hash {
-            let key = from.as_bytes().to_vec();
-            if let Some(v) = self
-                .accounts
-                .get(&key)
-                .map_err(|e| Self::db_err("delete_message:accounts.get", e))?
-            {
-                let mut acc: StoredAccount = Self::decode(&v)?;
-                acc.send_queue_count = acc.send_queue_count.saturating_sub(1);
-                acc.send_queue_bytes = acc.send_queue_bytes.saturating_sub(stored.bytes as u64);
-                sender_pair = Some((key, acc));
-            }
-        }
-
-        let mut batch = self.db.batch();
-        if let Some(from) = &stored.from_did_hash {
-            self.stage_peer_queue_delta(&mut batch, from, &stored.to_did_hash, -1)?;
-        }
-        batch.remove(&self.messages, message_hash.as_bytes());
-        batch.remove(
-            &self.inbox,
-            stream_key_from_id(&stored.to_did_hash, stored.receive_id),
-        );
-        if let (Some(from), Some(sid)) = (&stored.from_did_hash, stored.send_id) {
-            batch.remove(&self.outbox, stream_key_from_id(from, sid));
-        }
-        if let Some(mut recv) = recv_account {
-            recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
-            recv.receive_queue_bytes = recv.receive_queue_bytes.saturating_sub(stored.bytes as u64);
-            batch.insert(&self.accounts, recv_key, Self::encode(&recv)?);
-        }
-        if let Some((key, acc)) = sender_pair {
-            batch.insert(&self.accounts, key, Self::encode(&acc)?);
-        }
-        if stored.expires_at > 0 {
-            batch.remove(&self.expiry, expiry_key(stored.expires_at, message_hash));
-        }
-        // The sender's receipt, in the same batch as the delete, so a removal
-        // never commits without it.
-        if let (Some(from), Some(_)) = (&stored.from_did_hash, stored.send_id)
-            && let Some(reason) = ops::removal_reason(&by, &stored.to_did_hash, Some(from))
-        {
-            let expires_at = now_ms() / 1_000 + OUTBOX_RECEIPT_TTL.as_secs();
-            let key = outbox_receipt_key(from, message_hash);
-            batch.insert(
-                &self.outbox_receipt_expiry,
-                outbox_receipt_expiry_key(expires_at, &key),
-                Vec::<u8>::new(),
-            );
-            batch.insert(
-                &self.outbox_receipts,
-                key,
-                Self::encode(&StoredOutboxReceipt {
-                    receipt: OutboxReceipt {
-                        reason,
-                        at_ms: now_ms(),
-                    },
-                    expires_at,
-                })?,
-            );
-        }
-
-        batch
-            .commit()
-            .map_err(|e| Self::db_err("delete_message:commit", e))?;
-
-        let _ = self.bump_global("DELETED_BYTES", stored.bytes as i64);
-        let _ = self.bump_global("DELETED_COUNT", 1);
-        Ok(())
+        // Which rows, and whether `by` may remove them: shared with the
+        // memory backend via `store::ops` so the two can't drift.
+        let records = self.records_of(message_hash)?;
+        let parties: Vec<ops::RecordParties<'_>> = records
+            .iter()
+            .map(|(_, stored)| ops::RecordParties {
+                to_did_hash: &stored.to_did_hash,
+                from_did_hash: stored.from_did_hash.as_deref(),
+            })
+            .collect();
+        let chosen = ops::select_records(scope, &by, &parties)
+            .map_err(|e| e.into_delete_error(message_hash))?;
+        let chosen: Vec<(String, StoredMessage)> =
+            chosen.into_iter().map(|i| records[i].clone()).collect();
+        self.remove_records_locked(message_hash, &chosen, &by)
     }
 
     async fn sent_message_states(
@@ -1429,14 +1510,7 @@ impl MediatorStore for FjallStore {
         let now = now_ms() / 1_000;
         let mut states = Vec::with_capacity(msg_ids.len());
         for id in msg_ids {
-            let held: Option<StoredMessage> = match self
-                .messages
-                .get(id.as_bytes())
-                .map_err(|e| Self::db_err("sent_message_states:messages.get", e))?
-            {
-                Some(raw) => Some(Self::decode(&raw)?),
-                None => None,
-            };
+            let held = self.records_of(id)?;
             let receipt = match self
                 .outbox_receipts
                 .get(outbox_receipt_key(sender_did_hash, id))
@@ -1447,20 +1521,21 @@ impl MediatorStore for FjallStore {
                     .map(|stored| stored.receipt),
                 None => None,
             };
-            states.push(ops::sent_message_state(
-                sender_did_hash,
-                held.as_ref().map(|message| ops::HeldMessage {
+            let held: Vec<ops::HeldMessage<'_>> = held
+                .iter()
+                .map(|(_, message)| ops::HeldMessage {
                     from_did_hash: message.from_did_hash.as_deref(),
                     first_delivered_at_ms: message.first_delivered_at_ms,
-                }),
-                receipt,
-            ));
+                })
+                .collect();
+            states.push(ops::sent_message_state(sender_did_hash, &held, receipt));
         }
         Ok(states)
     }
 
     async fn mark_delivered(
         &self,
+        recipient_did_hash: &str,
         msg_ids: &[String],
         now_ms: u64,
         delivered_ttl_secs: u64,
@@ -1474,16 +1549,10 @@ impl MediatorStore for FjallStore {
         let mut wrote = false;
 
         for id in msg_ids {
-            let key = id.as_bytes();
-            let Some(raw) = self
-                .messages
-                .get(key)
-                .map_err(|e| Self::db_err("mark_delivered:get", e))?
-            else {
+            let Some((key, mut stored)) = self.record_for(id, recipient_did_hash)? else {
                 // Deleted between the read and here — nothing to stamp.
                 continue;
             };
-            let mut stored: StoredMessage = Self::decode(&raw)?;
             let first_delivery = stored.first_delivered_at_ms.is_none();
             if first_delivery {
                 report.first_delivered += 1;
@@ -1503,14 +1572,16 @@ impl MediatorStore for FjallStore {
             if first_delivery && delivered_ttl_secs > 0 {
                 let deadline = now_ms / 1_000 + delivered_ttl_secs;
                 if stored.expires_at == 0 || deadline < stored.expires_at {
-                    // Added, not moved: the original entry stays and resolves
-                    // to `already_deleted` when the sweeper reaches it.
-                    batch.insert(&self.expiry, expiry_key(deadline, id), Vec::<u8>::new());
+                    // The record's expiry is now the deadline. The new entry
+                    // is added and the original left: the sweeper drops it as
+                    // stale (`ops::expiry_entry_is_due`) or finds it gone.
+                    stored.expires_at = deadline;
+                    batch.insert(&self.expiry, expiry_key(deadline, &key), Vec::<u8>::new());
                     report.expiry_advanced += 1;
                 }
             }
 
-            batch.insert(&self.messages, key, Self::encode(&stored)?);
+            batch.insert(&self.messages, key.as_bytes(), Self::encode(&stored)?);
             wrote = true;
         }
 
@@ -1522,19 +1593,17 @@ impl MediatorStore for FjallStore {
         Ok(report)
     }
 
-    async fn delivery_state(&self, msg_id: &str) -> Result<Option<DeliveryState>, MediatorError> {
-        let Some(raw) = self
-            .messages
-            .get(msg_id.as_bytes())
-            .map_err(|e| Self::db_err("delivery_state:get", e))?
-        else {
-            return Ok(None);
-        };
-        let stored: StoredMessage = Self::decode(&raw)?;
-        Ok(Some(DeliveryState {
-            first_delivered_at_ms: stored.first_delivered_at_ms,
-            attempts: stored.delivery_attempts,
-        }))
+    async fn delivery_state(
+        &self,
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
+        Ok(self
+            .record_for(msg_id, recipient_did_hash)?
+            .map(|(_, stored)| DeliveryState {
+                first_delivered_at_ms: stored.first_delivered_at_ms,
+                attempts: stored.delivery_attempts,
+            }))
     }
 
     async fn get_message(
@@ -1542,25 +1611,19 @@ impl MediatorStore for FjallStore {
         did_hash: &str,
         msg_id: &str,
     ) -> Result<Option<MessageListElement>, MediatorError> {
-        let stored: StoredMessage = match self
-            .messages
-            .get(msg_id.as_bytes())
-            .map_err(|e| Self::db_err("get_message:messages.get", e))?
-        {
-            Some(v) => Self::decode(&v)?,
-            None => return Ok(None),
+        // Its own inbox copy, else a copy it sent (`MessageScope::Party`).
+        // Anyone else gets `None`: don't leak existence to non-owners.
+        let stored = match self.record_for(msg_id, did_hash)? {
+            Some((_, stored)) => stored,
+            None => match self
+                .records_of(msg_id)?
+                .into_iter()
+                .find(|(_, stored)| stored.from_did_hash.as_deref() == Some(did_hash))
+            {
+                Some((_, stored)) => stored,
+                None => return Ok(None),
+            },
         };
-
-        let is_to = did_hash == stored.to_did_hash;
-        let is_from = stored
-            .from_did_hash
-            .as_deref()
-            .map(|f| f == did_hash)
-            .unwrap_or(false);
-        if !is_to && !is_from {
-            // Don't leak existence to non-owners.
-            return Ok(None);
-        }
 
         Ok(Some(MessageListElement {
             msg_id: msg_id.to_string(),
@@ -1581,22 +1644,15 @@ impl MediatorStore for FjallStore {
 
     async fn get_message_metadata(
         &self,
-        session_id: &str,
+        recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
-        let stored: StoredMessage = match self
-            .messages
-            .get(message_hash.as_bytes())
-            .map_err(|e| Self::db_err("get_message_metadata:messages.get", e))?
-        {
-            Some(v) => Self::decode(&v)?,
-            None => {
-                return Err(MediatorError::DatabaseError(
-                    14,
-                    session_id.into(),
-                    format!("Message metadata not found for {message_hash}"),
-                ));
-            }
+        let Some((_, stored)) = self.record_for(message_hash, recipient_did_hash)? else {
+            return Err(MediatorError::DatabaseError(
+                14,
+                "NA".into(),
+                format!("Message metadata not found for {message_hash}"),
+            ));
         };
         Ok(MessageMetaData {
             bytes: stored.bytes,
@@ -1733,10 +1789,8 @@ impl MediatorStore for FjallStore {
 
         for (sid, entry) in &entries {
             let body = self
-                .messages
-                .get(entry.msg_id.as_bytes())
-                .map_err(|e| Self::db_err("fetch_messages:messages.get", e))?
-                .and_then(|v| Self::decode::<StoredMessage>(&v).ok().map(|s| s.body));
+                .record_for(&entry.msg_id, did_hash)?
+                .map(|(_, stored)| stored.body);
 
             let mut element = MessageListElement {
                 msg_id: entry.msg_id.clone(),
@@ -1751,8 +1805,9 @@ impl MediatorStore for FjallStore {
 
             if optimistic_delete {
                 let result = self
-                    .delete_message(
+                    .delete_message_in(
                         &entry.msg_id,
+                        MessageScope::Recipient(did_hash),
                         DeletionAuthority::Owner {
                             did_hash: did_hash.to_string(),
                         },
@@ -1805,7 +1860,9 @@ impl MediatorStore for FjallStore {
         let start = stream_key(did_hash, 0, 0);
         let end = stream_key(did_hash, u64::MAX, u64::MAX);
 
-        let mut msg_ids = Vec::new();
+        // Each entry names one record: the owner's in an inbox, the entry's
+        // recipient in an outbox.
+        let mut records = Vec::new();
         for guard in partition.range(start..=end) {
             let (key, value) = guard
                 .into_inner()
@@ -1814,23 +1871,29 @@ impl MediatorStore for FjallStore {
                 continue;
             }
             let entry: StoredStreamEntry = Self::decode(&value)?;
-            msg_ids.push(entry.msg_id);
+            let to = match folder {
+                Folder::Inbox => did_hash.to_string(),
+                Folder::Outbox => entry.peer_did,
+            };
+            records.push((entry.msg_id, to));
         }
 
         let mut count = 0;
         let mut bytes = 0;
-        for msg_id in msg_ids {
+        for (msg_id, to) in records {
             // Look up bytes before delete (delete_message removes the
             // record).
             let bytes_before = self
-                .messages
-                .get(msg_id.as_bytes())
+                .record_for(&msg_id, &to)
                 .ok()
                 .flatten()
-                .and_then(|v| Self::decode::<StoredMessage>(&v).ok())
-                .map(|s| s.bytes)
+                .map(|(_, s)| s.bytes)
                 .unwrap_or(0);
-            if self.delete_message(&msg_id, by.clone()).await.is_ok() {
+            if self
+                .delete_message_in(&msg_id, MessageScope::Recipient(&to), by.clone())
+                .await
+                .is_ok()
+            {
                 count += 1;
                 bytes += bytes_before;
             }
@@ -3928,7 +3991,7 @@ impl MediatorStore for FjallStore {
         end.extend_from_slice(&[0xFFu8; 64]);
 
         let mut report = ExpiryReport::default();
-        let mut to_delete: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut to_delete: Vec<(Vec<u8>, u64, String)> = Vec::new();
         let mut last_ts: Option<u64> = None;
         for guard in self.expiry.range(start..=end) {
             let (key, _v) = guard
@@ -3943,63 +4006,58 @@ impl MediatorStore for FjallStore {
                 report.timeslots_swept += 1;
                 last_ts = Some(ts);
             }
-            let msg_id = String::from_utf8(key[8..].to_vec()).unwrap_or_default();
-            if !msg_id.is_empty() {
-                to_delete.push((key.to_vec(), msg_id));
+            // The row the entry names: `{msg_id}:{to}`, or a legacy bare id.
+            let row_key = String::from_utf8(key[8..].to_vec()).unwrap_or_default();
+            if !row_key.is_empty() {
+                to_delete.push((key.to_vec(), ts, row_key));
             }
         }
 
-        // Index keys whose message is gone once this sweep has run. A message
-        // can have more than one key — `mark_delivered` adds a delivered-TTL
-        // deadline beside the original — and `delete_message` removes only the
-        // one its record names, so the others must be dropped here or they are
-        // rescanned on every sweep for good.
-        let mut swept_keys = Vec::new();
-        for (key, msg_id) in to_delete {
-            let meta = match on_expired {
-                Some(_) => self.get_message_metadata("expiry", &msg_id).await.ok(),
+        // Each entry is checked against its row's current expiry and the row
+        // removed only when the entry is due (`ops::expiry_entry_is_due`),
+        // under the write lock so nothing changes in between. A row can have
+        // more than one entry — `mark_delivered` adds a delivered-TTL deadline
+        // beside the original, and an earlier copy of the same bytes for the
+        // same recipient left its own — and only the one matching the row's
+        // expiry removes it; the rest are dropped here, never the row.
+        let by = DeletionAuthority::Admin {
+            admin_did_hash: admin_did_hash.to_string(),
+        };
+        for (key, ts, row_key) in to_delete {
+            let _guard = self.write_lock.lock().await;
+            let row: Option<StoredMessage> = match self
+                .messages
+                .get(row_key.as_bytes())
+                .map_err(|e| Self::db_err("sweep_expired_messages:messages.get", e))?
+            {
+                Some(raw) => Some(Self::decode(&raw)?),
                 None => None,
             };
-            match self
-                .delete_message(
-                    &msg_id,
-                    DeletionAuthority::Admin {
-                        admin_did_hash: admin_did_hash.to_string(),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {
-                    report.expired += 1;
-                    if let (Some(observe), Some(meta)) = (on_expired, &meta) {
-                        observe(&msg_id, meta);
+            let msg_id = row_key.split(':').next().unwrap_or_default().to_string();
+            match row.filter(|stored| ops::expiry_entry_is_due(stored.expires_at, ts)) {
+                Some(stored) => {
+                    let meta = MessageMetaData {
+                        bytes: stored.bytes,
+                        to_did_hash: stored.to_did_hash.clone(),
+                        from_did_hash: stored.from_did_hash.clone(),
+                        timestamp: stored.timestamp_ms,
+                    };
+                    let rows = [(row_key.clone(), stored)];
+                    if let Err(e) = self.remove_records_locked(&msg_id, &rows, &by) {
+                        // A store error: keep the key, so the next sweep
+                        // retries it.
+                        tracing::warn!(msg_id, error = %e, "expiry sweep could not delete message");
+                        continue;
                     }
-                    swept_keys.push((key, msg_id));
+                    report.expired += 1;
+                    if let Some(observe) = on_expired {
+                        observe(&msg_id, &meta);
+                    }
                 }
-                Err(e) if ops::is_delete_not_found(&e) => {
-                    report.already_deleted += 1;
-                    swept_keys.push((key, msg_id));
-                }
-                // A store error: keep the key, so the next sweep retries it.
-                Err(e) => {
-                    tracing::warn!(msg_id, error = %e, "expiry sweep could not delete message")
-                }
+                None => report.already_deleted += 1,
             }
-        }
-        if !swept_keys.is_empty() {
-            let _guard = self.write_lock.lock().await;
             let mut batch = self.db.batch();
-            for (key, msg_id) in swept_keys {
-                // Re-checked under the lock: a message stored again with the
-                // same bytes since keeps its key.
-                if !self
-                    .messages
-                    .contains_key(msg_id.as_bytes())
-                    .map_err(|e| Self::db_err("sweep_expired_messages:contains", e))?
-                {
-                    batch.remove(&self.expiry, key);
-                }
-            }
+            batch.remove(&self.expiry, key);
             batch
                 .commit()
                 .map_err(|e| Self::db_err("sweep_expired_messages:commit", e))?;
@@ -4293,9 +4351,20 @@ mod tests {
             )
             .await
             .expect_err("non-owner delete must fail");
+        // Nothing in eve's queues under that id: not found, the same answer
+        // as for an id that does not exist, so a non-party learns nothing
+        // about another account's messages. The message is untouched.
         assert!(
-            format!("{err}").contains(ops::DELETE_PERMISSION_DENIED),
+            format!("{err}").contains(ops::DELETE_NOT_FOUND),
             "got: {err}"
+        );
+        assert!(
+            store
+                .get_message(&hash("alice"), &msg_id)
+                .await
+                .expect("get_message")
+                .is_some(),
+            "the recipient's message is untouched"
         );
     }
 
@@ -4431,7 +4500,7 @@ mod tests {
             .await
             .expect("store");
         store
-            .mark_delivered(std::slice::from_ref(&id), now * 1_000, 10)
+            .mark_delivered(&alice, std::slice::from_ref(&id), now * 1_000, 10)
             .await
             .expect("mark");
         assert_eq!(
@@ -4440,7 +4509,8 @@ mod tests {
             "own key + delivered deadline"
         );
 
-        // The recipient deletes it: its own key goes, the deadline key stays.
+        // The recipient deletes it: the key of its current expiry (the
+        // delivered deadline) goes, the original key stays.
         store
             .delete_message(
                 &id,
@@ -4452,9 +4522,9 @@ mod tests {
             .expect("delete");
         assert_eq!(store.expiry.iter().count(), 1);
 
-        // Sweeping past the deadline finds the message gone and drops the key.
+        // Sweeping past the original finds the message gone and drops the key.
         let report = store
-            .sweep_expired_messages(now + 20, &hash("admin"))
+            .sweep_expired_messages(now + 3_700, &hash("admin"))
             .await
             .expect("sweep");
         assert_eq!(report.already_deleted, 1);
@@ -4462,7 +4532,7 @@ mod tests {
 
         // And a later sweep has nothing to rescan.
         let report = store
-            .sweep_expired_messages(now + 30, &hash("admin"))
+            .sweep_expired_messages(now + 3_800, &hash("admin"))
             .await
             .expect("sweep");
         assert_eq!(report.already_deleted, 0);
@@ -4493,7 +4563,12 @@ mod tests {
             id
         };
         let store = FjallStore::open(dir.path()).expect("reopen");
-        assert!(store.messages.contains_key(id.as_bytes()).unwrap());
+        assert!(
+            store
+                .messages
+                .contains_key(record_key(&id, &alice).as_bytes())
+                .unwrap()
+        );
         assert_eq!(store.forward_queue_len().await.unwrap(), 1);
     }
 
@@ -5531,7 +5606,7 @@ mod tests {
             .expect("store");
 
         let state = store
-            .delivery_state(&id)
+            .delivery_state(&bob, &id)
             .await
             .expect("state")
             .expect("exists");
@@ -5539,16 +5614,16 @@ mod tests {
         assert_eq!(state.attempts, 0);
 
         store
-            .mark_delivered(std::slice::from_ref(&id), 1_000, 0)
+            .mark_delivered(&bob, std::slice::from_ref(&id), 1_000, 0)
             .await
             .expect("mark");
         store
-            .mark_delivered(std::slice::from_ref(&id), 5_000, 0)
+            .mark_delivered(&bob, std::slice::from_ref(&id), 5_000, 0)
             .await
             .expect("mark");
 
         let state = store
-            .delivery_state(&id)
+            .delivery_state(&bob, &id)
             .await
             .expect("state")
             .expect("exists");
@@ -5584,7 +5659,7 @@ mod tests {
             .expect("store");
 
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 0, 3_600)
+            .mark_delivered(&bob, std::slice::from_ref(&id), 0, 3_600)
             .await
             .expect("mark");
         assert_eq!(report.first_delivered, 1);
@@ -5632,11 +5707,11 @@ mod tests {
             .expect("store");
 
         store
-            .mark_delivered(std::slice::from_ref(&id), 0, 3_600)
+            .mark_delivered(&bob, std::slice::from_ref(&id), 0, 3_600)
             .await
             .expect("first");
         let report = store
-            .mark_delivered(std::slice::from_ref(&id), 3_000_000, 3_600)
+            .mark_delivered(&bob, std::slice::from_ref(&id), 3_000_000, 3_600)
             .await
             .expect("redelivery");
         assert_eq!(report.first_delivered, 0);
@@ -5682,13 +5757,14 @@ mod tests {
     async fn marking_a_vanished_message_is_not_an_error() {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
+        let bob = hash("bob");
         store
-            .mark_delivered(&["never-existed".to_string()], 1_000, 0)
+            .mark_delivered(&bob, &["never-existed".to_string()], 1_000, 0)
             .await
             .expect("marking an absent message must not fail a delivery");
         assert!(
             store
-                .delivery_state("never-existed")
+                .delivery_state(&bob, "never-existed")
                 .await
                 .expect("state")
                 .is_none()
@@ -5753,5 +5829,136 @@ mod idempotent_store_tests {
         assert_eq!(sender.send_queue_bytes, 0);
         assert_eq!(recipient.receive_queue_count, 0, "nor the recipient's");
         assert_eq!(store.peer_queue_count(&from, &to).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod per_recipient_record_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn hash(s: &str) -> String {
+        digest(s.as_bytes())
+    }
+
+    async fn counters(store: &FjallStore, did: &str) -> (u32, u32) {
+        store
+            .account_get(did)
+            .await
+            .expect("account_get")
+            .map(|a| (a.receive_queue_count, a.send_queue_count))
+            .unwrap_or_default()
+    }
+
+    /// Rewrites `to`'s row of `msg_id` in the layout used before rows were
+    /// per recipient: keyed by the bare id, with a bare-id expiry entry.
+    fn make_legacy(store: &FjallStore, msg_id: &str, to: &str) {
+        let key = record_key(msg_id, to);
+        let raw = store
+            .messages
+            .get(key.as_bytes())
+            .expect("get")
+            .expect("row present");
+        let stored: StoredMessage = FjallStore::decode(&raw).expect("decode");
+        let mut batch = store.db.batch();
+        batch.remove(&store.messages, key.as_bytes());
+        batch.insert(&store.messages, msg_id.as_bytes(), raw.to_vec());
+        if stored.expires_at > 0 {
+            batch.remove(&store.expiry, expiry_key(stored.expires_at, &key));
+            batch.insert(
+                &store.expiry,
+                expiry_key(stored.expires_at, msg_id),
+                Vec::<u8>::new(),
+            );
+        }
+        batch.commit().expect("commit");
+    }
+
+    /// A row written before rows were per recipient keeps working for its
+    /// recipient: fetched, read, stored again as one record, deleted with
+    /// every counter released, and expired from its bare-id entry. The same
+    /// bytes for another recipient get a row of their own beside it.
+    #[tokio::test]
+    async fn a_legacy_row_keeps_working_beside_per_recipient_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let (a, b, from) = (hash("a"), hash("b"), hash("sender"));
+        for did in [&a, &b, &from] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account_add");
+        }
+        let body = "legacy-row";
+
+        let id = store
+            .store_message("s", body, &a, Some(&from), 0, 0)
+            .await
+            .expect("store");
+        make_legacy(&store, &id, &a);
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_some());
+
+        // Read, and stored again for its recipient as the same one record.
+        let read = store.get_message(&a, &id).await.unwrap().expect("a reads");
+        assert_eq!(read.msg.as_deref(), Some(body));
+        store
+            .store_message("s", body, &a, Some(&from), 0, 0)
+            .await
+            .expect("store again");
+        assert_eq!(counters(&store, &a).await, (1, 0));
+
+        // Another recipient: a row of its own; the legacy row is untouched.
+        store
+            .store_message("s", body, &b, Some(&from), 0, 0)
+            .await
+            .expect("store for b");
+        assert_eq!(counters(&store, &b).await, (1, 0));
+        assert_eq!(counters(&store, &from).await, (0, 2));
+        assert_eq!(
+            store
+                .get_message(&a, &id)
+                .await
+                .unwrap()
+                .and_then(|m| m.to_address),
+            Some(a.clone())
+        );
+
+        // Fetch and delete as the recipient.
+        let fetched = store
+            .fetch_messages(
+                "s",
+                &a,
+                &FetchOptions {
+                    limit: 10,
+                    start_id: None,
+                    delete_policy: FetchDeletePolicy::Optimistic,
+                },
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(fetched.success.len(), 1);
+        assert_eq!(fetched.success[0].msg.as_deref(), Some(body));
+        assert!(fetched.delete_errors.is_empty(), "{:?}", fetched.delete_errors);
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 1));
+        assert_eq!(store.peer_queue_count(&from, &a).await.unwrap(), 0);
+        assert!(store.get_message(&b, &id).await.unwrap().is_some());
+
+        // A legacy row expires from its bare-id entry.
+        let now = now_ms() / 1_000;
+        let expiring = store
+            .store_message("s", "legacy-expiring", &a, Some(&from), now - 10, 0)
+            .await
+            .expect("store expiring");
+        make_legacy(&store, &expiring, &a);
+        let report = store
+            .sweep_expired_messages(now, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 1, "{report:?}");
+        assert!(store.messages.get(expiring.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 1), "b's copy remains");
     }
 }

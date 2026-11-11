@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::task_specs::messaging::{message, monitor, queue, stats};
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
-    DeletionAuthority, DeliveryState, SentMessageState,
+    DeletionAuthority, DeliveryState, MessageRef, MessageScope, SentMessageState,
 };
 use affinidi_messaging_mediator_common::store::{PurgeFilter, PurgeReport, ops};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
@@ -542,10 +542,22 @@ pub(crate) async fn consume_message_list(
         }
     }
 
-    let ids: Vec<String> = kept.iter().map(|m| m.msg_id.clone()).collect();
+    // Each listed entry is one recipient's copy: the target's own in a
+    // receive queue, the entry's recipient in a send queue.
+    let records: Vec<MessageRef> = kept
+        .iter()
+        .map(|m| {
+            let to = if receive {
+                target.as_str()
+            } else {
+                m.to_address.as_deref().unwrap_or(target.as_str())
+            };
+            MessageRef::new(to, m.msg_id.clone())
+        })
+        .collect();
     let states = state
         .database
-        .delivery_states(&ids)
+        .delivery_states(&records)
         .await
         .unwrap_or_default();
     let queue_name = if receive { "receive" } else { "send" };
@@ -664,7 +676,12 @@ pub(crate) async fn consume_message_get(
     if let Some(to) = &stored.to_address {
         meta["to"] = json!(to);
     }
-    let delivery = state.database.delivery_state(&msg_id).await.ok().flatten();
+    let delivery = state
+        .database
+        .delivery_state(stored.to_address.as_deref().unwrap_or(&target), &msg_id)
+        .await
+        .ok()
+        .flatten();
     apply_delivery_state(&mut meta, delivery);
 
     if cross_account {
@@ -1005,12 +1022,19 @@ pub(crate) async fn consume_message_delete(
     for id in &payload.msg_ids {
         let id = id.to_string();
         // Only messages the target account sends or receives are in scope;
-        // `get_message` answers `None` for anything else.
+        // `get_message` answers `None` for anything else. The delete is
+        // scoped the same way: the target's own copy, else the copies it
+        // sent — never another recipient's copy of the same bytes, even
+        // when an admin is acting.
         let Some(stored) = state.database.get_message(&target, &id).await? else {
             results.push(json!({ "msgId": id, "deleted": false, "reason": "notFound" }));
             continue;
         };
-        match state.database.delete_message(&id, authority.clone()).await {
+        match state
+            .database
+            .delete_message_in(&id, MessageScope::Party(&target), authority.clone())
+            .await
+        {
             Ok(()) => {
                 state.monitor.deleted(
                     &id,

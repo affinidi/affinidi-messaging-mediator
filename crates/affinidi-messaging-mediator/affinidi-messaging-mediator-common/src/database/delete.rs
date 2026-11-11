@@ -3,8 +3,9 @@
  * both the mediator and the processors (message_expiry for example)
  */
 use super::DatabaseHandler;
+use crate::database::keys::Keys;
 use crate::errors::{MediatorError, StorageCap};
-use crate::store::types::{DeletionAuthority, OutboxReceipt};
+use crate::store::types::{DeletionAuthority, MessageScope, OutboxReceipt};
 use crate::store::{OUTBOX_RECEIPT_TTL, ops};
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
 use axum::http::StatusCode;
@@ -24,12 +25,31 @@ const CLAIM_ATTEMPTS: u32 = 6;
 /// Pause before each further claim attempt, multiplied by the attempt number.
 const CLAIM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// One record a delete removed: its recipient, its sender ("" for an
+/// anonymous one), and whether it sat in the sender's outbox — which is when
+/// the sender is owed a receipt.
+struct Removed {
+    to: String,
+    from: String,
+    in_outbox: bool,
+}
+
+/// A Redis error carrying `code`, which the reply mapping in
+/// [`DatabaseHandler::delete_message`] recognises like a Lua error reply.
+fn coded_error(code: &'static str, detail: String) -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Client, code, detail))
+}
+
 impl DatabaseHandler {
-    /// Deletes a message in the database.
+    /// Deletes the records of `message_hash` that `scope` names (see
+    /// `ops::select_records`; the Lua `delete_message` and the cluster path
+    /// below follow the same rules).
     ///
-    /// The Lua `delete_message` function performs an ownership check:
-    /// the requesting DID must be the message's TO, FROM, or match
-    /// the `admin_did_hash` (for system operations like expiry cleanup).
+    /// Each removed record is authorised on its own: the requesting DID must
+    /// be its TO or FROM, or match `admin_did_hash` (for system operations
+    /// like expiry cleanup). `expiry_slot` is set by the expiry sweep only: a
+    /// record whose current expiry is later than the slot is not due and is
+    /// answered as not found, leaving it in place.
     ///
     /// Returns specific errors for not-found and permission-denied cases.
     pub async fn delete_message(
@@ -37,8 +57,9 @@ impl DatabaseHandler {
         session_id: Option<&str>,
         did_hash: &str,
         message_hash: &str,
-        request_msg_id: Option<&str>,
+        scope: MessageScope<'_>,
         admin_did_hash: Option<&str>,
+        expiry_slot: Option<u64>,
     ) -> Result<(), MediatorError> {
         let _span = span!(
             Level::INFO,
@@ -50,85 +71,74 @@ impl DatabaseHandler {
         async move {
             let mut conn = self.get_async_connection().await?;
 
-            // The sender and recipient, for the outbox receipt. The receipt is
-            // written here in Rust rather than in the stored function for the
-            // reason `mark_delivered` gives: a stale function library loads
-            // without complaint and would silently never write it.
-            let mut parties: Option<(String, String)> = None;
-
-            let result: Result<String, redis::RedisError> = if self.keys.cluster_mode() {
-                // The claim waits out a store in progress and returns the
-                // parties, so no read beforehand is needed.
-                self.delete_message_in_steps(&mut conn, message_hash, did_hash, admin_did_hash)
-                    .await
-                    .map(|(to, from, in_outbox)| {
-                        // As the library path: a receipt only for a message
-                        // that sat in a sender's outbox.
-                        parties = (in_outbox && !from.is_empty()).then_some((to, from));
-                        "OK".to_string()
-                    })
+            // The receipts are written here in Rust rather than in the stored
+            // function for the reason `mark_delivered` gives: a stale function
+            // library loads without complaint and would silently never write
+            // them. Both paths report the parties of each record removed.
+            let result: Result<Vec<Removed>, redis::RedisError> = if self.keys.cluster_mode() {
+                self.delete_records_in_steps(
+                    &mut conn,
+                    message_hash,
+                    did_hash,
+                    scope,
+                    admin_did_hash,
+                    expiry_slot,
+                )
+                .await
             } else {
-                // Read before the delete, because the delete removes the
-                // metadata. A read that fails only costs the receipt.
-                parties = redis::cmd("HMGET")
-                    .arg(self.keys.msg_meta(message_hash))
-                    .arg("TO")
-                    .arg("FROM")
-                    .arg("SEND_ID")
-                    .query_async::<Vec<Option<String>>>(&mut conn)
-                    .await
-                    .ok()
-                    .and_then(|fields| match fields.as_slice() {
-                        // `SEND_ID` is present exactly when the message sits
-                        // in a sender's outbox, i.e. has a recorded sender.
-                        [Some(to), Some(from), Some(_)] => Some((to.clone(), from.clone())),
-                        _ => None,
-                    });
-                let mut cmd = redis::cmd("FCALL");
-                cmd.arg("delete_message")
+                let (kind, scope_did) = match scope {
+                    MessageScope::Recipient(to) => ("R", to),
+                    MessageScope::Party(party) => ("P", party),
+                    MessageScope::All => ("A", ""),
+                };
+                redis::cmd("FCALL")
+                    .arg("delete_message")
                     .arg(1)
                     .arg(message_hash)
-                    .arg(did_hash);
-                if let Some(admin_hash) = admin_did_hash {
-                    cmd.arg(admin_hash);
-                }
-                cmd.query_async(&mut conn).await
+                    .arg(did_hash)
+                    .arg(admin_did_hash.unwrap_or(""))
+                    .arg(kind)
+                    .arg(scope_did)
+                    .arg(expiry_slot.map(|slot| slot.to_string()).unwrap_or_default())
+                    .query_async::<Vec<Vec<String>>>(&mut conn)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .filter_map(|row| match row.as_slice() {
+                                [to, from, _bytes, outbox] => Some(Removed {
+                                    to: to.clone(),
+                                    from: from.clone(),
+                                    in_outbox: outbox == "1",
+                                }),
+                                _ => None,
+                            })
+                            .collect()
+                    })
             };
 
             match result {
-                Ok(response) if response == "OK" => {
-                    info!("Successfully deleted message_hash({})", message_hash);
-                    if let Some((to, from)) = parties {
-                        self.record_outbox_receipt(
-                            &mut conn,
-                            message_hash,
-                            did_hash,
-                            admin_did_hash.is_some(),
-                            &to,
-                            &from,
-                        )
-                        .await;
+                Ok(removed) => {
+                    info!(
+                        "Successfully deleted message_hash({}), {} record(s)",
+                        message_hash,
+                        removed.len()
+                    );
+                    for record in removed {
+                        // A receipt only for a record that sat in a sender's
+                        // outbox, i.e. has a recorded sender.
+                        if record.in_outbox && !record.from.is_empty() {
+                            self.record_outbox_receipt(
+                                &mut conn,
+                                message_hash,
+                                did_hash,
+                                admin_did_hash.is_some(),
+                                &record.to,
+                                &record.from,
+                            )
+                            .await;
+                        }
                     }
                     Ok(())
-                }
-                Ok(response) => {
-                    // Lua returned a non-OK status (shouldn't happen with current script)
-                    warn!(
-                        "delete_message returned unexpected status: {} for message_hash({})",
-                        response, message_hash
-                    );
-                    Err(MediatorError::problem_with_log(
-                        11,
-                        "NA",
-                        request_msg_id.map(|s| s.to_string()),
-                        ProblemReportSorter::Warning,
-                        ProblemReportScope::Message,
-                        "database.message.delete.status",
-                        "delete returned unexpected status ({1}) for message ({2})",
-                        vec![response.to_string(), message_hash.to_string()],
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("delete returned unexpected status ({response}) for message ({message_hash})"),
-                    ))
                 }
                 Err(err) => {
                     let err_str = err.to_string();
@@ -139,19 +149,19 @@ impl DatabaseHandler {
                             "Message not found for deletion: message_hash({})",
                             message_hash
                         );
-                        Err(ops::delete_not_found(message_hash, request_msg_id))
+                        Err(ops::delete_not_found(message_hash, None))
                     } else if err_str.contains("PERMISSION_DENIED") {
                         warn!(
                             "Permission denied deleting message_hash({}) by did_hash({})",
                             message_hash, did_hash
                         );
-                        Err(ops::delete_permission_denied(message_hash, request_msg_id))
+                        Err(ops::delete_permission_denied(message_hash, None))
                     } else if let Some(cap) = StorageCap::of_redis(&err) {
                         Err(MediatorError::storage_cap(
                             cap,
                             10,
                             "NA",
-                            request_msg_id.map(|s| s.to_string()),
+                            None,
                             format!("Couldn't delete message_hash ({message_hash}). Reason: {err}"),
                         ))
                     } else {
@@ -159,7 +169,7 @@ impl DatabaseHandler {
                         Err(MediatorError::problem_with_log(
                             10,
                             "NA",
-                            request_msg_id.map(|s| s.to_string()),
+                            None,
                             ProblemReportSorter::Warning,
                             ProblemReportScope::Message,
                             "database.message.delete.error",
@@ -176,7 +186,139 @@ impl DatabaseHandler {
         .await
     }
 
-    /// `delete_message` for cluster mode, in steps a repeated delete can finish:
+    /// Cluster mode: resolve `scope` to records in Rust (a script may touch
+    /// only the keys it declares, and the records of an id are found through
+    /// its recipient index), then remove each in steps. Each removal claims
+    /// its record and re-checks ownership atomically, so a record that went
+    /// away since it was listed is skipped, never removed twice.
+    async fn delete_records_in_steps(
+        &self,
+        conn: &mut super::RedisConnection,
+        message_hash: &str,
+        did_hash: &str,
+        scope: MessageScope<'_>,
+        admin_did_hash: Option<&str>,
+        expiry_slot: Option<u64>,
+    ) -> redis::RedisResult<Vec<Removed>> {
+        let by = match admin_did_hash {
+            Some(admin) if admin == did_hash => DeletionAuthority::Admin {
+                admin_did_hash: admin.to_string(),
+            },
+            _ => DeletionAuthority::Owner {
+                did_hash: did_hash.to_string(),
+            },
+        };
+        let records = self.records_of(conn, message_hash).await?;
+        let parties: Vec<ops::RecordParties<'_>> = records
+            .iter()
+            .map(|(_, to, from)| ops::RecordParties {
+                to_did_hash: to,
+                from_did_hash: from.as_deref(),
+            })
+            .collect();
+        let chosen = ops::select_records(scope, &by, &parties).map_err(|err| match err {
+            ops::SelectError::NotFound => {
+                coded_error("NOT_FOUND", format!("message_hash ({message_hash})"))
+            }
+            ops::SelectError::PermissionDenied => coded_error(
+                "PERMISSION_DENIED",
+                "Requesting DID does not have ownership of this message".to_string(),
+            ),
+        })?;
+
+        let mut removed = Vec::new();
+        let mut failure = None;
+        for index in chosen {
+            let (key_to, _, _) = &records[index];
+            match self
+                .delete_record_in_steps(
+                    conn,
+                    message_hash,
+                    key_to.as_deref(),
+                    did_hash,
+                    admin_did_hash,
+                    expiry_slot,
+                )
+                .await
+            {
+                Ok((to, from, in_outbox)) => removed.push(Removed {
+                    to,
+                    from,
+                    in_outbox,
+                }),
+                Err(err) if err.to_string().contains("NOT_FOUND") => {}
+                Err(err) => failure = Some(err),
+            }
+        }
+        if let Some(err) = failure {
+            // Receipts for what did go are still owed; the caller reports
+            // the failure, so nothing claims the rest were removed.
+            for record in &removed {
+                if record.in_outbox && !record.from.is_empty() {
+                    self.record_outbox_receipt(
+                        conn,
+                        message_hash,
+                        did_hash,
+                        admin_did_hash.is_some(),
+                        &record.to,
+                        &record.from,
+                    )
+                    .await;
+                }
+            }
+            return Err(err);
+        }
+        if removed.is_empty() {
+            return Err(coded_error(
+                "NOT_FOUND",
+                format!("message_hash ({message_hash}) was removed by another delete"),
+            ));
+        }
+        Ok(removed)
+    }
+
+    /// Every record of `message_hash`, cluster mode: `(key recipient, TO,
+    /// FROM)`, where the key recipient is `None` for a legacy per-id record.
+    /// Index members whose record is gone are skipped.
+    async fn records_of(
+        &self,
+        conn: &mut super::RedisConnection,
+        message_hash: &str,
+    ) -> redis::RedisResult<Vec<(Option<String>, String, Option<String>)>> {
+        let keys = self.keys;
+        let (legacy, members): (Vec<Option<String>>, Vec<String>) = redis::pipe()
+            .cmd("HMGET")
+            .arg(keys.msg_meta(message_hash, None))
+            .arg("TO")
+            .arg("FROM")
+            .cmd("SMEMBERS")
+            .arg(keys.msg_recipients(message_hash))
+            .query_async(conn)
+            .await?;
+        let mut records = Vec::new();
+        if let [Some(to), from] = legacy.as_slice() {
+            records.push((None, to.clone(), from.clone()));
+        }
+        if members.is_empty() {
+            return Ok(records);
+        }
+        let mut pipe = redis::pipe();
+        for to in &members {
+            pipe.cmd("HMGET")
+                .arg(keys.msg_meta(message_hash, Some(to)))
+                .arg("TO")
+                .arg("FROM");
+        }
+        let rows: Vec<Vec<Option<String>>> = pipe.query_async(conn).await?;
+        for (member, row) in members.into_iter().zip(rows) {
+            if let [Some(to), from] = row.as_slice() {
+                records.push((Some(member), to.clone(), from.clone()));
+            }
+        }
+        Ok(records)
+    }
+
+    /// One record's delete in cluster mode, in steps a repeated delete can finish:
     ///
     /// 1. claim the message in its own slot: check ownership and take it for
     ///    this delete alone. A store still queueing it, or another delete
@@ -198,32 +340,37 @@ impl DatabaseHandler {
     ///
     /// Returns the message's TO and FROM ("" for an anonymous sender), and
     /// whether it sat in the sender's outbox, which is when a receipt is due.
-    async fn delete_message_in_steps(
+    ///
+    /// `to` names the record (`None` for a legacy per-id record).
+    async fn delete_record_in_steps(
         &self,
         conn: &mut super::RedisConnection,
         message_hash: &str,
+        to_key: Option<&str>,
         did_hash: &str,
         admin_did_hash: Option<&str>,
+        expiry_slot: Option<u64>,
     ) -> redis::RedisResult<(String, String, bool)> {
         use crate::store::redis::database::cluster_scripts::{
             ABANDON_DELETE, CLAIM_MESSAGE, DELETE_LEASE_MS, FINISH_DELETE, STORE_LEASE_MS,
         };
 
         let keys = self.keys;
+        let meta_key = keys.msg_meta(message_hash, to_key);
+        let member = Keys::record_member(message_hash, to_key);
         let token = uuid::Uuid::new_v4().to_string();
         let mut attempt = 1;
         let claimed: [String; 10] = loop {
             let mut claim = CLAIM_MESSAGE.prepare_invoke();
             claim
-                .key(keys.msg_meta(message_hash))
+                .key(&meta_key)
                 .arg(message_hash)
                 .arg(did_hash)
                 .arg(&token)
                 .arg(STORE_LEASE_MS)
-                .arg(DELETE_LEASE_MS);
-            if let Some(admin_hash) = admin_did_hash {
-                claim.arg(admin_hash);
-            }
+                .arg(DELETE_LEASE_MS)
+                .arg(admin_did_hash.unwrap_or(""))
+                .arg(expiry_slot.map(|slot| slot.to_string()).unwrap_or_default());
             match claim.invoke_async::<Vec<String>>(conn).await {
                 Ok(claimed) => {
                     break <[String; 10]>::try_from(claimed).map_err(|reply| {
@@ -270,7 +417,7 @@ impl DatabaseHandler {
                     let (_, outbox) = self
                         .release_queues(
                             conn,
-                            message_hash,
+                            &member,
                             &release_to,
                             &release_from,
                             &release_bytes,
@@ -282,7 +429,7 @@ impl DatabaseHandler {
                 }
                 self.release_queues(
                     conn,
-                    message_hash,
+                    &member,
                     &to,
                     &from,
                     &bytes,
@@ -307,7 +454,7 @@ impl DatabaseHandler {
                     // over at once instead of waiting. The releases are
                     // idempotent, so whoever takes over finishes them.
                     if let Err(abandon) = ABANDON_DELETE
-                        .key(keys.msg_meta(message_hash))
+                        .key(&meta_key)
                         .arg(&token)
                         .invoke_async::<i64>(conn)
                         .await
@@ -322,9 +469,11 @@ impl DatabaseHandler {
         }
 
         let removed: i64 = FINISH_DELETE
-            .key(keys.msg(message_hash))
-            .key(keys.msg_meta(message_hash))
+            .key(keys.msg(message_hash, to_key))
+            .key(&meta_key)
+            .key(keys.msg_recipients(message_hash))
             .arg(&token)
+            .arg(to_key.unwrap_or(""))
             .invoke_async(conn)
             .await?;
         if removed == 0 {
@@ -353,16 +502,17 @@ impl DatabaseHandler {
         Ok((to, from, in_outbox))
     }
 
-    /// Releases a message's inbox and outbox entries concurrently, each in its
-    /// own slot, and returns how many of each were released (0 or 1). An
-    /// empty `from` is an anonymous sender; an empty entry id releases
-    /// whatever entry is queued for the message. Idempotent: an entry already
+    /// Releases a record's inbox and outbox entries concurrently, each in its
+    /// own slot, and returns how many of each were released (0 or 1). The
+    /// entries are found by `member` (`Keys::record_member`) in the queue-id
+    /// hashes. An empty `from` is an anonymous sender; an empty entry id
+    /// releases whatever entry is queued for the record. Idempotent: an entry already
     /// released, or replaced by a new copy of the message, is left alone.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn release_queues(
         &self,
         conn: &super::RedisConnection,
-        message_hash: &str,
+        member: &str,
         to: &str,
         from: &str,
         bytes: &str,
@@ -370,8 +520,8 @@ impl DatabaseHandler {
         send_id: &str,
     ) -> redis::RedisResult<(i64, i64)> {
         let (inbox, outbox) = futures_util::future::join(
-            self.release_inbox(conn.clone(), to, message_hash, bytes, receive_id),
-            self.release_outbox(conn.clone(), from, to, message_hash, bytes, send_id),
+            self.release_inbox(conn.clone(), to, member, bytes, receive_id),
+            self.release_outbox(conn.clone(), from, to, member, bytes, send_id),
         )
         .await;
         Ok((inbox?, outbox?))

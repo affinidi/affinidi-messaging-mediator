@@ -4,7 +4,9 @@
 //! that must share a cluster slot carry a hash tag (`DID:{abc}`):
 //!
 //! - everything about one account, tagged with its DID hash;
-//! - a message's body and metadata, tagged with the message hash;
+//! - every record of one message id — each recipient's body and metadata, the
+//!   legacy single record, and the id's recipient index — tagged with the
+//!   message hash, so one script can resolve and remove them together;
 //! - the streaming registry, tagged `streaming`;
 //! - every mux record and principal index, tagged `mux`, since one grant
 //!   change updates a record and the indexes of several principals at once.
@@ -100,14 +102,54 @@ impl Keys {
         [&self.tagged("RECEIPT:", from_hash), ":", message_hash].concat()
     }
 
-    /// Message body.
-    pub fn msg(self, message_hash: &str) -> String {
-        self.tagged("MSG:", message_hash)
+    /// Message body of the record held for `to` (`MSG:<id>:<to>`), or of the
+    /// single per-id record written before records were per recipient
+    /// (`MSG:<id>`) when `to` is `None`. See [`record_member`](Self::record_member).
+    pub fn msg(self, message_hash: &str, to: Option<&str>) -> String {
+        Self::per_recipient(self.tagged("MSG:", message_hash), to)
     }
 
-    /// Message metadata hash.
-    pub fn msg_meta(self, message_hash: &str) -> String {
-        self.tagged("MSG:META:", message_hash)
+    /// Message metadata hash of the record held for `to`, or of the legacy
+    /// per-id record when `to` is `None`, as [`msg`](Self::msg).
+    pub fn msg_meta(self, message_hash: &str, to: Option<&str>) -> String {
+        Self::per_recipient(self.tagged("MSG:META:", message_hash), to)
+    }
+
+    /// The recipients holding a per-recipient record of a message id: a set,
+    /// in the id's slot. Lets an operation that has only the id (a sender
+    /// withdrawing it, an admin removing it, a sender's status query) find
+    /// every copy. A legacy per-id record is not listed; it is read directly.
+    pub fn msg_recipients(self, message_hash: &str) -> String {
+        self.tagged("MSG:RCPT:", message_hash)
+    }
+
+    /// How a record is named where a single string must name it: in an
+    /// expiry bucket, and as the field of the cluster-mode queue-id hashes.
+    /// `<id>:<to>` for a per-recipient record, `<id>` for a legacy one —
+    /// which is exactly what those places held before, so legacy entries
+    /// keep resolving. [`parse_record_member`](Self::parse_record_member)
+    /// reverses it.
+    pub fn record_member(message_hash: &str, to: Option<&str>) -> String {
+        match to {
+            Some(to) => [message_hash, ":", to].concat(),
+            None => message_hash.to_string(),
+        }
+    }
+
+    /// `(id, Some(to))` for a per-recipient member, `(id, None)` for a legacy
+    /// one. A message id is a hex digest, so the first `:` splits the two.
+    pub fn parse_record_member(member: &str) -> (&str, Option<&str>) {
+        match member.split_once(':') {
+            Some((id, to)) => (id, Some(to)),
+            None => (member, None),
+        }
+    }
+
+    fn per_recipient(base: String, to: Option<&str>) -> String {
+        match to {
+            Some(to) => [base.as_str(), ":", to].concat(),
+            None => base,
+        }
     }
 
     /// One mediator instance's streaming sessions.
@@ -202,8 +244,11 @@ mod tests {
             keys.activity(H),
             keys.v1_keys(H),
             keys.outbox_receipt(H, "m1"),
-            keys.msg("m1"),
-            keys.msg_meta("m1"),
+            keys.msg("m1", None),
+            keys.msg_meta("m1", None),
+            keys.msg("m1", Some(H)),
+            keys.msg_meta("m1", Some(H)),
+            keys.msg_recipients("m1"),
             keys.streaming_sessions("u1"),
             keys.global_streaming().to_string(),
             keys.streaming_waiting().to_string(),
@@ -229,6 +274,9 @@ mod tests {
                 "RECEIPT:abc123:m1",
                 "MSG:m1",
                 "MSG:META:m1",
+                "MSG:m1:abc123",
+                "MSG:META:m1:abc123",
+                "MSG:RCPT:m1",
                 "STREAMING_SESSIONS:u1",
                 "GLOBAL_STREAMING",
                 "STREAMING_WAITING",
@@ -255,6 +303,9 @@ mod tests {
                 "RECEIPT:{abc123}:m1",
                 "MSG:{m1}",
                 "MSG:META:{m1}",
+                "MSG:{m1}:abc123",
+                "MSG:META:{m1}:abc123",
+                "MSG:RCPT:{m1}",
                 "STREAMING_SESSIONS:{streaming}:u1",
                 "GLOBAL_STREAMING:{streaming}",
                 "STREAMING_WAITING:{streaming}",
@@ -263,6 +314,14 @@ mod tests {
                 "MUX_PRINCIPAL:{mux}:p1",
             ]
         );
+    }
+
+    #[test]
+    fn a_record_member_round_trips() {
+        assert_eq!(Keys::record_member("m1", Some(H)), "m1:abc123");
+        assert_eq!(Keys::record_member("m1", None), "m1");
+        assert_eq!(Keys::parse_record_member("m1:abc123"), ("m1", Some(H)));
+        assert_eq!(Keys::parse_record_member("m1"), ("m1", None));
     }
 
     #[test]
@@ -285,7 +344,16 @@ mod tests {
         ] {
             assert_eq!(slot(&k), account, "{k} is not in the account's slot");
         }
-        assert_eq!(slot(&keys.msg("m1")), slot(&keys.msg_meta("m1")));
+        let message = slot(&keys.msg("m1", None));
+        for k in [
+            keys.msg_meta("m1", None),
+            keys.msg("m1", Some(H)),
+            keys.msg_meta("m1", Some(H)),
+            keys.msg("m1", Some("other")),
+            keys.msg_recipients("m1"),
+        ] {
+            assert_eq!(slot(&k), message, "{k} is not in the message's slot");
+        }
         assert_eq!(
             slot(&keys.streaming_sessions("u1")),
             slot(keys.global_streaming())

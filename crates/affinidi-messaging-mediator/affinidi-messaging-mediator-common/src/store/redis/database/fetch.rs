@@ -1,6 +1,7 @@
 use super::Database;
 use crate::database::RedisConnection;
 use crate::errors::MediatorError;
+use crate::store::types::MessageScope;
 use crate::types::messages::{
     FetchDeletePolicy, FetchOptions, GetMessagesResponse, MessageListElement,
 };
@@ -83,7 +84,14 @@ impl Database {
                 if let FetchDeletePolicy::Optimistic = options.delete_policy {
                     match self
                         .handler
-                        .delete_message(Some(session_id), did_hash, &message.msg_id, None, None)
+                        .delete_message(
+                            Some(session_id),
+                            did_hash,
+                            &message.msg_id,
+                            MessageScope::Recipient(did_hash),
+                            None,
+                            None,
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -145,15 +153,32 @@ impl Database {
                             .unwrap_or_default()
                     };
                     let (msg_id, from) = (field("MSG_ID"), field("FROM"));
-                    // Atomic so a delete cannot land between the two reads:
-                    // that would return a deleted message with no metadata
-                    // (no RECEIVE_ID), and it would be delivered again.
-                    let (body, meta): (Option<String>, HashMap<String, String>) = redis::pipe()
+                    // Atomic so a delete cannot land between the reads: that
+                    // would return a deleted message with no metadata (no
+                    // RECEIVE_ID), and it would be delivered again. This
+                    // recipient's record, else a legacy per-id record that
+                    // is this recipient's (all in the id's slot).
+                    #[allow(clippy::type_complexity)]
+                    let (body, meta, legacy_body, legacy_meta): (
+                        Option<String>,
+                        HashMap<String, String>,
+                        Option<String>,
+                        HashMap<String, String>,
+                    ) = redis::pipe()
                         .atomic()
-                        .get(keys.msg(&msg_id))
-                        .hgetall(keys.msg_meta(&msg_id))
+                        .get(keys.msg(&msg_id, Some(did_hash)))
+                        .hgetall(keys.msg_meta(&msg_id, Some(did_hash)))
+                        .get(keys.msg(&msg_id, None))
+                        .hgetall(keys.msg_meta(&msg_id, None))
                         .query_async(&mut conn)
                         .await?;
+                    let (body, meta) = if !meta.is_empty() {
+                        (body, meta)
+                    } else if legacy_meta.get("TO").map(String::as_str) == Some(did_hash) {
+                        (legacy_body, legacy_meta)
+                    } else {
+                        (None, meta)
+                    };
                     Ok::<_, redis::RedisError>(body.map(|body| {
                         let mut row = vec![
                             "STREAM_ID".to_string(),

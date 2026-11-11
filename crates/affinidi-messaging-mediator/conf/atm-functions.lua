@@ -1,5 +1,56 @@
 #!lua name=atm
 
+-- Message records
+--
+-- A message id is the hash of the body alone (clients derive it from the
+-- bytes), but one body may be stored for several recipients, and ownership,
+-- queue entries, counters and expiry belong to one recipient. So each
+-- recipient gets its own record:
+--   MSG:<id>:<to>       body
+--   MSG:META:<id>:<to>  metadata (BYTES, TO, FROM, TIMESTAMP, EXPIRES_AT,
+--                       RECEIVE_ID, SEND_ID, delivery fields)
+--   MSG:RCPT:<id>       set of recipients holding a record of <id>
+-- Expiry buckets hold '<id>:<to>'. Inbox and outbox entries still carry the
+-- plain id; the recipient is the inbox's owner, or the outbox entry's TO.
+--
+-- Records written before this layout are one per id (MSG:<id>,
+-- MSG:META:<id>, bucket member '<id>') and stay readable and removable: a
+-- recipient whose TO matches resolves to it. Nothing writes that layout any
+-- more, so once every message stored before the upgrade has expired or been
+-- removed no such key remains and the fallback can be dropped.
+
+-- The metadata key suffix of the record of <id> held for <to>: '<id>:<to>',
+-- or '<id>' for a legacy record whose TO is <to>. nil when there is none.
+local function record_for(id, to)
+    if redis.call('EXISTS', 'MSG:META:' .. id .. ':' .. to) == 1 then
+        return id .. ':' .. to
+    end
+    if redis.call('HGET', 'MSG:META:' .. id, 'TO') == to then
+        return id
+    end
+    return nil
+end
+
+-- Every record of <id>: { {suffix, meta}, ... }. Drops index members whose
+-- record is gone (an interrupted write); they name nothing.
+local function records_of(id)
+    local found = {}
+    local legacy = redis.call('HGETALL', 'MSG:META:' .. id)
+    if next(legacy.map) ~= nil then
+        table.insert(found, { id, legacy.map })
+    end
+    local members = redis.call('SMEMBERS', 'MSG:RCPT:' .. id)
+    for to, _ in pairs(members.set) do
+        local meta = redis.call('HGETALL', 'MSG:META:' .. id .. ':' .. to)
+        if next(meta.map) == nil then
+            redis.call('SREM', 'MSG:RCPT:' .. id, to)
+        else
+            table.insert(found, { id .. ':' .. to, meta.map })
+        end
+    end
+    return found
+end
+
 -- store_message
 -- keys = message_hash
 -- args = [1] message
@@ -32,17 +83,17 @@ local function store_message(keys, args)
         queue_maxlen = tonumber(args[6]) or 0
     end
 
-    -- Idempotent on the message hash. A re-submitted message (the same bytes,
-    -- e.g. an outbox re-send after a lost acknowledgement) used to add a second
-    -- inbox/outbox entry and a second counter increment over one MSG row; the
-    -- single delete released one of each and the rest leaked for good. Same
-    -- rule as the Fjall and memory backends: a no-op for the same recipient.
-    if redis.call('HGET', 'MSG:META:' .. keys[1], 'TO') == args[4] then
+    -- Idempotent per recipient. A re-submitted message (the same bytes for
+    -- the same recipient, e.g. an outbox re-send after a lost
+    -- acknowledgement) is one record, queued and counted once. The same
+    -- bytes for another recipient get a record of their own below.
+    if record_for(keys[1], args[4]) ~= nil then
         return redis.status_reply('OK')
     end
+    local record = keys[1] .. ':' .. args[4]
 
     -- Store message
-    redis.call('SET', 'MSG:' .. keys[1], args[1])
+    redis.call('SET', 'MSG:' .. record, args[1])
 
     -- Set Global Metrics
     redis.call('HINCRBY', 'GLOBAL', 'RECEIVED_BYTES', bytes)
@@ -50,7 +101,7 @@ local function store_message(keys, args)
 
     -- Create Message Expiry Record
     redis.call('ZADD', 'MSG_EXPIRY', 'NX', args[2], 'MSG_EXPIRY:' ..args[2])
-    redis.call('SADD', 'MSG_EXPIRY:' ..args[2], keys[1])
+    redis.call('SADD', 'MSG_EXPIRY:' ..args[2], record)
 
     -- Update the receiver records
     redis.call('HINCRBY', 'DID:' .. args[4], 'RECEIVE_QUEUE_BYTES', bytes)
@@ -85,18 +136,75 @@ local function store_message(keys, args)
     end
 
     -- Update message MetaData
-    redis.call('HMSET', 'MSG:META:' .. keys[1], 'BYTES', bytes, 'TO', args[4], 'TIMESTAMP', time, 'RECEIVE_ID', RQ)
+    redis.call('HSET', 'MSG:META:' .. record, 'BYTES', bytes, 'TO', args[4], 'TIMESTAMP', time,
+        'RECEIVE_ID', RQ, 'EXPIRES_AT', args[2])
     if SQ ~= nil then
-        redis.call('HMSET', 'MSG:META:' .. keys[1], 'FROM', args[5], 'SEND_ID', SQ)
+        redis.call('HSET', 'MSG:META:' .. record, 'FROM', args[5], 'SEND_ID', SQ)
     end
+    redis.call('SADD', 'MSG:RCPT:' .. keys[1], args[4])
 
     return redis.status_reply('OK')
 end
 
+-- Removes one record and everything it holds. meta is its metadata map.
+-- Returns { TO, FROM or '', BYTES, '1' when it sat in an outbox else '0' }.
+local function remove_record(id, suffix, meta)
+    local bytes = meta.BYTES
+
+    -- Delete message
+    redis.call('DEL', 'MSG:' .. suffix)
+
+    -- Set Global Metrics
+    redis.call('HINCRBY', 'GLOBAL', 'DELETED_BYTES', bytes)
+    redis.call('HINCRBY', 'GLOBAL', 'DELETED_COUNT', 1)
+
+    -- Remove the receiver records
+    redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_BYTES', -bytes)
+    redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_COUNT', -1)
+    redis.call('XDEL', 'RECEIVE_Q:' .. meta.TO, meta.RECEIVE_ID)
+
+    -- Remove the sender records
+    local outbox = '0'
+    if meta.SEND_ID ~= nil then
+        redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_BYTES', -bytes)
+        redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_COUNT', -1)
+        -- Per-relationship depth. HDEL at zero so a sender that has messaged
+        -- many peers does not keep a field for each of them forever.
+        local peer_left = redis.call('HINCRBY', 'PEER_Q:' .. meta.FROM, meta.TO, -1)
+        if tonumber(peer_left) <= 0 then
+            redis.call('HDEL', 'PEER_Q:' .. meta.FROM, meta.TO)
+        end
+        redis.call('XDEL', 'SEND_Q:' .. meta.FROM, meta.SEND_ID)
+        outbox = '1'
+    end
+
+    -- Remove the message metadata, its recipient index entry and its
+    -- current expiry entry (earlier entries are dropped by the sweeper)
+    redis.call('DEL', 'MSG:META:' .. suffix)
+    if suffix ~= id then
+        redis.call('SREM', 'MSG:RCPT:' .. id, meta.TO)
+    end
+    if meta.EXPIRES_AT ~= nil then
+        redis.call('SREM', 'MSG_EXPIRY:' .. meta.EXPIRES_AT, suffix)
+    end
+
+    return { meta.TO, meta.FROM or '', tostring(bytes), outbox }
+end
+
 -- delete_message
 -- keys = message_hash
--- args = [1] did_hash (owner requesting deletion)
---        [2] admin_did_hash (the mediator's admin DID hash, for permission check)
+-- args = [1] did_hash (requesting deletion)
+--        [2] admin_did_hash (the mediator's admin DID hash, for permission
+--            check; '' for none)
+--        [3] scope: 'R' the record held for [4], 'P' the records in [4]'s
+--            queues (its own inbox copy, else every copy it sent), 'A' every
+--            record (admin only). Default: 'A' for an admin, else 'P' of [1].
+--        [4] scope did_hash
+--        [5] expiry slot (epoch seconds) when the expiry sweep is deleting:
+--            a record whose current expiry is later is not due and is left
+--            alone ('' for none)
+-- Returns one { TO, FROM, BYTES, OUTBOX } per removed record. The rules are
+-- the same as `ops::select_records` in the Rust backends.
 local function delete_message(keys, args)
     -- Correct number of keys?
     if #keys ~= 1 then
@@ -104,65 +212,77 @@ local function delete_message(keys, args)
     end
 
     -- Correct number of args?
-    if #args < 1 or #args > 2 then
-        return redis.error_reply('delete_message: Requires 1-2 arguments (did_hash, optional admin_did_hash)')
+    if #args < 1 or #args > 5 then
+        return redis.error_reply('delete_message: Requires 1-5 arguments')
     end
 
     -- set response type to Version 3
     redis.setresp(3)
 
-    -- Retrieve message metadata
-    local meta = redis.call('HGETALL', 'MSG:META:' .. keys[1])
-    local next = next
-    if next(meta.map) == nil then
-        return redis.error_reply('NOT_FOUND: message_hash ('.. keys[1] ..')')
+    local id = keys[1]
+    local requester = args[1]
+    local is_admin = (#args >= 2 and args[2] ~= '' and args[1] == args[2])
+    local scope = args[3] or ''
+    local scope_did = args[4] or ''
+    if scope == '' then
+        if is_admin then scope = 'A' else scope = 'P' end
+        scope_did = requester
+    end
+    if scope == 'A' and not is_admin then
+        scope = 'P'
+        scope_did = requester
     end
 
-    -- Check that the requesting DID has some form of ownership of this message
-    -- Allowed if: requester is TO, requester is FROM, or requester matches admin_did_hash
-    local is_owner = (meta.map.TO == args[1]) or (meta.map.FROM == args[1])
-    local is_admin = (#args >= 2 and args[1] == args[2])
-    if not is_owner and not is_admin then
-        return redis.error_reply('PERMISSION_DENIED: Requesting DID does not have ownership of this message')
-    end
-
-    local bytes = meta.map.BYTES
-    if bytes == nil then
-        redis.log(redis.LOG_WARNING, 'message (' .. keys[1] .. ') metadata did not contain BYTES field.')
-        return redis.error_reply('message (' .. keys[1] .. ') metadata did not contain BYTES field.')
-    end
-
-    -- Delete message
-    redis.call('DEL', 'MSG:' .. keys[1])
-
-    -- Set Global Metrics
-    redis.call('HINCRBY', 'GLOBAL', 'DELETED_BYTES', bytes)
-    redis.call('HINCRBY', 'GLOBAL', 'DELETED_COUNT', 1)
-
-    -- Remove the receiver records
-    redis.call('HINCRBY', 'DID:' .. meta.map.TO, 'RECEIVE_QUEUE_BYTES', -bytes)
-    redis.call('HINCRBY', 'DID:' .. meta.map.TO, 'RECEIVE_QUEUE_COUNT', -1)
-    redis.call('XDEL', 'RECEIVE_Q:' .. meta.map.TO, meta.map.RECEIVE_ID)
-
-    -- Remove the sender records
-    local SQ = nil
-    if meta.map.SEND_ID ~= nil then
-        -- Remove the sender records
-        redis.call('HINCRBY', 'DID:' .. meta.map.FROM, 'SEND_QUEUE_BYTES', -bytes)
-        redis.call('HINCRBY', 'DID:' .. meta.map.FROM, 'SEND_QUEUE_COUNT', -1)
-        -- Per-relationship depth. HDEL at zero so a sender that has messaged
-        -- many peers does not keep a field for each of them forever.
-        local peer_left = redis.call('HINCRBY', 'PEER_Q:' .. meta.map.FROM, meta.map.TO, -1)
-        if tonumber(peer_left) <= 0 then
-            redis.call('HDEL', 'PEER_Q:' .. meta.map.FROM, meta.map.TO)
+    local chosen = {}
+    if scope == 'R' or scope == 'P' then
+        local own = record_for(id, scope_did)
+        if own ~= nil then
+            local meta = redis.call('HGETALL', 'MSG:META:' .. own)
+            table.insert(chosen, { own, meta.map })
         end
-        SQ = redis.call('XDEL', 'SEND_Q:' .. meta.map.FROM, meta.map.SEND_ID)
+    end
+    if scope ~= 'R' and #chosen == 0 then
+        local all = records_of(id)
+        for _, record in ipairs(all) do
+            if scope == 'A' or record[2].FROM == scope_did then
+                table.insert(chosen, record)
+            end
+        end
+    end
+    -- Nothing in the queues asked about: not found, even when other accounts
+    -- hold copies under the id (a second delete of one's own copy is
+    -- "already gone", and a non-party learns nothing of other accounts).
+    if #chosen == 0 then
+        return redis.error_reply('NOT_FOUND: message_hash (' .. id .. ')')
     end
 
-    -- Remove the message metadata
-    redis.call('DEL', 'MSG:META:' .. keys[1])
+    for _, record in ipairs(chosen) do
+        local meta = record[2]
+        -- Allowed if: requester is TO, requester is FROM, or requester is the admin
+        if not (is_admin or meta.TO == requester or meta.FROM == requester) then
+            return redis.error_reply('PERMISSION_DENIED: Requesting DID does not have ownership of this message')
+        end
+        if meta.BYTES == nil then
+            redis.log(redis.LOG_WARNING, 'message (' .. record[1] .. ') metadata did not contain BYTES field.')
+            return redis.error_reply('message (' .. record[1] .. ') metadata did not contain BYTES field.')
+        end
+        -- An expiry entry left by a deadline the record no longer has (an
+        -- earlier copy of the same bytes, or the original deadline of one
+        -- brought forward) must not remove it. Legacy records carry no
+        -- EXPIRES_AT and are due, as before.
+        if #args >= 5 and args[5] ~= '' and meta.EXPIRES_AT ~= nil then
+            local expires = tonumber(meta.EXPIRES_AT) or 0
+            if expires == 0 or expires > tonumber(args[5]) then
+                return redis.error_reply('NOT_FOUND: message_hash (' .. id .. ') is not due at this expiry')
+            end
+        end
+    end
 
-    return redis.status_reply('OK')
+    local removed = {}
+    for _, record in ipairs(chosen) do
+        table.insert(removed, remove_record(id, record[1], record[2]))
+    end
+    return removed
 end
 
 -- fetch_messages
@@ -187,55 +307,27 @@ local function fetch_messages(keys, args)
     -- Get list of messages from stream
     local list = redis.call('XRANGE', 'RECEIVE_Q:' .. keys[1], start_id, '+', 'COUNT', args[2])
 
-    -- Collect message IDs for batch retrieval
-    local msg_ids = {}
-    local stream_entries = {}
-    for x, element in ipairs(list) do
-        stream_entries[x] = element
-        -- element[2] is the fields array: [MSG_ID, id, BYTES, bytes, FROM, from]
-        msg_ids[x] = element[2][2]
-    end
-
-    -- Batch fetch all message bodies with MGET
-    local msg_bodies = {}
-    if #msg_ids > 0 then
-        local mget_keys = {}
-        for i, id in ipairs(msg_ids) do
-            mget_keys[i] = 'MSG:' .. id
-        end
-        msg_bodies = redis.call('MGET', unpack(mget_keys))
-    end
-
     local fetched_messages = {}
-    for x, element in ipairs(stream_entries) do
+    for x, element in ipairs(list) do
         -- element[1] = stream_id
-        -- element[2] = array of Stream Fields
-        for i, sub_element in ipairs(element) do
-            if i == 1 then
-                -- This is the stream ID
-                fetched_messages[x] = { 'STREAM_ID', sub_element }
-            else
-                -- [1] = MSG_ID
-                -- [2] = message_id
-                -- [3] = BYTES
-                -- [4] = bytes
-                -- [5] = FROM
-                -- [6] = from_did
-                table.insert(fetched_messages[x], sub_element[1])
-                table.insert(fetched_messages[x], sub_element[2])
-                table.insert(fetched_messages[x], 'FROM_DID')
-                table.insert(fetched_messages[x], sub_element[6])
+        -- element[2] = fields: [MSG_ID, id, BYTES, bytes, FROM, from]
+        local fields = element[2]
+        local msg_id = fields[2]
+        fetched_messages[x] = { 'STREAM_ID', element[1], 'MSG_ID', msg_id, 'FROM_DID', fields[6] }
 
-                -- Use pre-fetched message body from MGET
+        -- This recipient's record of the message
+        local record = record_for(msg_id, keys[1])
+        if record ~= nil then
+            local body = redis.call('GET', 'MSG:' .. record)
+            if body then
                 table.insert(fetched_messages[x], 'MSG')
-                table.insert(fetched_messages[x], msg_bodies[x])
+                table.insert(fetched_messages[x], body)
+            end
 
-                -- fetch the message metadata (still per-message, small fixed-size hash)
-                local meta = redis.call('HGETALL', 'MSG:META:' .. sub_element[2])
-                for k, v in pairs(meta.map) do
-                    table.insert(fetched_messages[x], 'META_' .. k)
-                    table.insert(fetched_messages[x], v)
-                end
+            local meta = redis.call('HGETALL', 'MSG:META:' .. record)
+            for k, v in pairs(meta.map) do
+                table.insert(fetched_messages[x], 'META_' .. k)
+                table.insert(fetched_messages[x], v)
             end
         end
     end -- end of XRANGE list

@@ -305,7 +305,8 @@ pub mod redis;
 
 pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueClaimPage,
-    ForwardQueueEntry, InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt,
+    ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageRef, MessageScope, MetadataStats,
+    OutboxReceipt,
     PubSubRecord, RefreshRotation, RemovalReason, SentMessageState, Session, SessionClaims,
     SessionState, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClaim,
     StreamingClientState, StreamingKind, StreamingWrite,
@@ -424,9 +425,15 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// Store a message in the database and enqueue it on both the
     /// recipient's inbox and (if non-anonymous) the sender's outbox.
     ///
-    /// Returns the message ID (SHA-256 of the message body). The ID is
-    /// idempotent — re-storing the same body returns the same ID and is a
-    /// no-op.
+    /// Returns the message ID (SHA-256 of the message body). Storing the same
+    /// body again **for the same recipient** returns the same ID and is a
+    /// no-op: one record, queued and counted once.
+    ///
+    /// The same body stored for a **different** recipient gets a record of
+    /// its own, under the same ID — see [`MessageRef`]. Each record has its
+    /// own sender, queue entries, counters and expiry, and is removed on its
+    /// own; the ID alone no longer names one record, so the operations below
+    /// say which record they act on ([`MessageScope`]).
     ///
     /// `queue_maxlen` bounds the per-DID inbox/outbox stream; `0` means
     /// unbounded. Backends may apply approximate trimming for performance.
@@ -443,7 +450,10 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         queue_maxlen: usize,
     ) -> Result<String, MediatorError>;
 
-    /// Delete a message by ID.
+    /// Delete a message by ID alone, acting on the records
+    /// [`MessageScope::for_authority`] names: an owner's own inbox copy, or
+    /// every copy it sent; for an admin, every copy. See
+    /// [`delete_message_in`](Self::delete_message_in), which this calls.
     ///
     /// Authorisation is encoded in [`DeletionAuthority`]:
     /// - `Owner { did_hash }`: must match the message's TO or FROM, else
@@ -469,10 +479,39 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         &self,
         message_hash: &str,
         by: DeletionAuthority,
+    ) -> Result<(), MediatorError> {
+        let scope = match &by {
+            DeletionAuthority::Owner { did_hash } => MessageScope::Party(did_hash.as_str()),
+            DeletionAuthority::Admin { .. } => MessageScope::All,
+        };
+        self.delete_message_in(message_hash, scope, by.clone())
+            .await
+    }
+
+    /// Delete the records of `message_hash` that `scope` names
+    /// ([`ops::select_records`] gives the rules, which every backend follows).
+    ///
+    /// Each chosen record is removed exactly once with its queue entries,
+    /// counters and expiry entry, and leaves its sender a receipt, as
+    /// [`delete_message`](Self::delete_message) describes. Returns
+    /// `not_found` when no record is in scope, `permission_denied` when `by`
+    /// may not remove one that is. Several records are removed together
+    /// where the backend can (one Lua call, one Fjall batch, one lock), and
+    /// otherwise each on its own, never leaving one half-removed.
+    ///
+    /// Callers that know the recipient — a fetch, a purge of an inbox, the
+    /// expiry sweep — pass [`MessageScope::Recipient`], so they never touch
+    /// another recipient's copy of the same bytes.
+    async fn delete_message_in(
+        &self,
+        message_hash: &str,
+        scope: MessageScope<'_>,
+        by: DeletionAuthority,
     ) -> Result<(), MediatorError>;
 
     /// Where each of `msg_ids` stands for `sender_did_hash`, in the order asked
-    /// (`messaging/message/status/0.1`).
+    /// (`messaging/message/status/0.1`). An id the sender stored for several
+    /// recipients answers for all of its copies ([`ops::sent_message_state`]).
     ///
     /// A held message answers `Queued` or `Delivered`, and a removed one
     /// answers from its receipt, but only when `sender_did_hash` is the
@@ -490,7 +529,10 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(vec![SentMessageState::Unknown; msg_ids.len()])
     }
 
-    /// Retrieve one message by ID with the body and metadata.
+    /// Retrieve one message by ID with the body and metadata, resolved as
+    /// [`MessageScope::Party`] of `did_hash`: its own inbox copy when it has
+    /// one, else a copy it sent (the body is the same in every copy; the
+    /// metadata is that copy's).
     ///
     /// Returns `None` when the requesting DID is neither sender nor
     /// recipient — leaking a permission-denied error here would reveal
@@ -591,8 +633,9 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
 
             if matches!(options.delete_policy, FetchDeletePolicy::Optimistic)
                 && let Err(e) = self
-                    .delete_message(
+                    .delete_message_in(
                         id,
+                        MessageScope::Recipient(did_hash),
                         DeletionAuthority::Owner {
                             did_hash: did_hash.to_string(),
                         },
@@ -661,12 +704,13 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // could not read, and stamping those would record a handover that
         // never happened.
         let delivered: Vec<String> = response.success.iter().map(|m| m.msg_id.clone()).collect();
-        self.record_delivered(&delivered, now_ms, delivered_ttl_secs)
+        self.record_delivered(did_hash, &delivered, now_ms, delivered_ttl_secs)
             .await?;
         Ok(response)
     }
 
-    /// Stamp `msg_ids` as handed over, as
+    /// Stamp `msg_ids` as handed over to `recipient_did_hash` (that
+    /// recipient's copy only), as
     /// [`fetch_messages_delivering`](Self::fetch_messages_delivering) does for
     /// what it returns, and publish the delivery metrics. For a caller that
     /// fetches with [`fetch_messages`](Self::fetch_messages) and writes the
@@ -674,21 +718,23 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// message it skips keeps its expiry.
     async fn record_delivered(
         &self,
+        recipient_did_hash: &str,
         msg_ids: &[String],
         now_ms: u64,
         delivered_ttl_secs: u64,
     ) -> Result<(), MediatorError> {
         if !msg_ids.is_empty() {
             let report = self
-                .mark_delivered(msg_ids, now_ms, delivered_ttl_secs)
+                .mark_delivered(recipient_did_hash, msg_ids, now_ms, delivered_ttl_secs)
                 .await?;
             publish_delivery_metrics(&report);
         }
         Ok(())
     }
 
-    /// Record that `msg_ids` have been handed to their recipient: stamp the
-    /// first-delivery time if unset, and bump the attempt count.
+    /// Record that `msg_ids` have been handed to `recipient_did_hash`: stamp
+    /// the first-delivery time on that recipient's copy if unset, and bump its
+    /// attempt count. Another recipient's copy of the same bytes is untouched.
     ///
     /// Called by the mediator after a pickup or a live push, **not** inside the
     /// read itself. On Redis the read is a stored Lua function, so stamping
@@ -734,13 +780,13 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// sender's queue allowance for a full week. `0` disables that and is the
     /// default.
     ///
-    /// The index entry is **added, not moved**. Removing the original would
-    /// need each backend to know the prior expiry, which the Redis metadata
-    /// hash does not carry — and it is unnecessary, because every sweeper
-    /// already counts a message that is gone as `already_deleted` rather than
-    /// failing. The earlier slot deletes the message; the later slot resolves
-    /// to a no-op. That is how the Redis backend has always behaved anyway,
-    /// since its stored `delete_message` never removed the expiry entry.
+    /// The record's expiry becomes the deadline, and an index entry is
+    /// **added** for it; the original entry is left. Every sweeper removes a
+    /// record only from an entry at or after the record's current expiry
+    /// ([`ops::expiry_entry_is_due`]), so the deadline's entry removes it and
+    /// the original, reached later, finds it gone (`already_deleted`) and is
+    /// dropped. The same rule keeps an entry left by an earlier copy of the
+    /// same bytes for the same recipient from removing a later copy early.
     ///
     /// **Only the first delivery moves it.** A redelivery must not keep pushing
     /// the deadline out, or a client that reconnects often would pin its
@@ -750,6 +796,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// recipient decide when a sender's messages die.
     async fn mark_delivered(
         &self,
+        _recipient_did_hash: &str,
         _msg_ids: &[String],
         _now_ms: u64,
         _delivered_ttl_secs: u64,
@@ -757,12 +804,17 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(DeliveryMarkReport::default())
     }
 
-    /// What the mediator knows about `msg_id` having been handed over.
+    /// What the mediator knows about `msg_id` having been handed to
+    /// `recipient_did_hash`.
     ///
-    /// `None` when the message does not exist. A message that exists but has
+    /// `None` when that recipient holds no copy of the message. A message that exists but has
     /// never been delivered returns a default [`DeliveryState`], which is the
     /// honest answer — not an error, and not the same as "not found".
-    async fn delivery_state(&self, _msg_id: &str) -> Result<Option<DeliveryState>, MediatorError> {
+    async fn delivery_state(
+        &self,
+        _recipient_did_hash: &str,
+        _msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
         Ok(None)
     }
 
@@ -774,21 +826,23 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// looping, which is no worse than the caller doing it.
     async fn delivery_states(
         &self,
-        msg_ids: &[String],
+        records: &[MessageRef],
     ) -> Result<Vec<Option<DeliveryState>>, MediatorError> {
-        let mut out = Vec::with_capacity(msg_ids.len());
-        for id in msg_ids {
-            out.push(self.delivery_state(id).await?);
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            out.push(
+                self.delivery_state(&record.to_did_hash, &record.msg_id)
+                    .await?,
+            );
         }
         Ok(out)
     }
 
-    /// Retrieve message metadata without the body. Used by handlers that
-    /// need to authorise an action before fetching the (potentially large)
-    /// body.
+    /// Retrieve the metadata of the copy of `message_hash` held for
+    /// `recipient_did_hash`, without the body.
     async fn get_message_metadata(
         &self,
-        session_id: &str,
+        recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError>;
 
@@ -956,7 +1010,18 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
                     continue;
                 }
 
-                match self.delete_message(&element.msg_id, by.clone()).await {
+                // The copy in this folder, named by its recipient: the owner
+                // in an inbox, the listed recipient in an outbox. Never
+                // another recipient's copy of the same bytes.
+                let scope = match (&folder, element.to_address.as_deref()) {
+                    (Folder::Inbox, _) => MessageScope::Recipient(did_hash),
+                    (Folder::Outbox, Some(to)) => MessageScope::Recipient(to),
+                    (Folder::Outbox, None) => MessageScope::Party(did_hash),
+                };
+                match self
+                    .delete_message_in(&element.msg_id, scope, by.clone())
+                    .await
+                {
                     Ok(()) => {
                         report.count += 1;
                         report.bytes += element.size as usize;

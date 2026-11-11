@@ -2389,6 +2389,7 @@ async fn drain_tsp_page(
     if let Err(err) = state
         .database
         .record_delivered(
+            did_hash,
             &written,
             state.clock.unix_millis() as u64,
             state.config.limits.delivered_expiry_seconds,

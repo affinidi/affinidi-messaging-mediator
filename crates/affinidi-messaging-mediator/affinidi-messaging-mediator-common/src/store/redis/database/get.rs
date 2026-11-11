@@ -7,6 +7,67 @@ use subtle::ConstantTimeEq;
 use tracing::{Instrument, Level, debug, event, span};
 
 impl Database {
+    /// The body and metadata (flat field/value list) of the record of
+    /// `msg_id` that `did_hash` may read, resolved as `MessageScope::Party`:
+    /// its own inbox copy (per-recipient, else a legacy per-id record whose
+    /// TO it is), else a copy it sent. `None` when it is a party to none.
+    async fn party_record(
+        &self,
+        conn: &mut crate::database::RedisConnection,
+        did_hash: &str,
+        msg_id: &str,
+    ) -> redis::RedisResult<Option<(Value, Vec<String>)>> {
+        let keys = self.keys();
+        // One atomic read of the candidates that need no index lookup.
+        #[allow(clippy::type_complexity)]
+        let (own_body, own_meta, legacy_body, legacy_meta): (
+            Value,
+            Vec<String>,
+            Value,
+            Vec<String>,
+        ) = redis::pipe()
+            .atomic()
+            .get(keys.msg(msg_id, Some(did_hash)))
+            .hgetall(keys.msg_meta(msg_id, Some(did_hash)))
+            .get(keys.msg(msg_id, None))
+            .hgetall(keys.msg_meta(msg_id, None))
+            .query_async(conn)
+            .await?;
+        if !own_meta.is_empty() {
+            return Ok(Some((own_body, own_meta)));
+        }
+        let field = |meta: &[String], name: &str| {
+            meta.iter()
+                .tuples()
+                .find(|(k, _)| k.as_str() == name)
+                .map(|(_, v)| v.clone())
+        };
+        let legacy_to = field(&legacy_meta, "TO");
+        if legacy_to.as_deref() == Some(did_hash) {
+            return Ok(Some((legacy_body, legacy_meta)));
+        }
+        if field(&legacy_meta, "FROM").as_deref() == Some(did_hash) {
+            return Ok(Some((legacy_body, legacy_meta)));
+        }
+        // A copy it sent to someone else: found through the id's index.
+        let recipients: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(keys.msg_recipients(msg_id))
+            .query_async(conn)
+            .await?;
+        for to in recipients {
+            let (body, meta): (Value, Vec<String>) = redis::pipe()
+                .atomic()
+                .get(keys.msg(msg_id, Some(&to)))
+                .hgetall(keys.msg_meta(msg_id, Some(&to)))
+                .query_async(conn)
+                .await?;
+            if field(&meta, "FROM").as_deref() == Some(did_hash) {
+                return Ok(Some((body, meta)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Get a message from the database
     /// - did_hash: DID Hash of the requesting DID (could be sender or receiver)
     /// - msg_id: The unique identifier of the message
@@ -18,16 +79,8 @@ impl Database {
         let _span = span!(Level::DEBUG, "get_message", msg_id = msg_id,);
         async move {
             let mut conn = self.get_connection().await?;
-
-            let (didcomm_message, meta_data): (Value, Vec<String>) = redis::pipe()
-                .atomic()
-                .cmd("GET")
-                .arg(self.keys().msg(msg_id))
-                .cmd("HGETALL")
-                .arg(self.keys().msg_meta(msg_id))
-                .query_async(&mut conn)
-                .await
-                .map_err(|err| {
+            let Some((didcomm_message, meta_data)) =
+                self.party_record(&mut conn, did_hash, msg_id).await.map_err(|err| {
                     event!(
                         Level::ERROR,
                         "Couldn't get message_id({}) from database: {}",
@@ -40,7 +93,10 @@ impl Database {
                         &err,
                         format!("Couldn't get message_id({msg_id}) from database: {err}"),
                     )
-                })?;
+                })?
+            else {
+                return Ok(None);
+            };
 
             let didcomm_message: String = match didcomm_message {
                 Value::Nil => {
