@@ -72,9 +72,9 @@ use affinidi_messaging_mediator_common::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
         MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS,
-        PubSubRecord, RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState,
-        SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
-        TrustTaskClaim, ops,
+        PubSubRecord, RefreshRotation, RemovalReason, RemovedCopy, SentMessageState, Session,
+        SessionState, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef,
+        StreamingClientState, TrustTaskClaim, acknowledged_until, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -289,6 +289,19 @@ fn outbox_receipt_copy_key(from: &str, msg_id: &str, to: &str) -> Vec<u8> {
     let mut key = outbox_receipt_key(from, msg_id);
     key.push(b':');
     key.extend_from_slice(to.as_bytes());
+    key
+}
+
+/// Key of the record that `to` removed its own copy of `msg_id` itself
+/// (`MediatorStore::acknowledged`): `"ACK\0" || to || 0xFF || msg_id`. Kept in
+/// the `outbox_receipts` keyspace, which the receipt sweep prunes through
+/// `outbox_receipt_expiry`; a sender hash is hex, so no receipt key starts
+/// with `ACK\0`.
+fn acknowledged_key(to: &str, msg_id: &str) -> Vec<u8> {
+    let mut key = b"ACK\0".to_vec();
+    key.extend_from_slice(to.as_bytes());
+    key.push(PEER_QUEUE_SEP);
+    key.extend_from_slice(msg_id.as_bytes());
     key
 }
 
@@ -900,6 +913,28 @@ impl FjallStore {
                             at_ms: now_ms(),
                         },
                         expires_at,
+                    })?,
+                );
+            }
+            // The recipient removing its own copy is an acknowledgement.
+            if matches!(by, DeletionAuthority::Owner { did_hash } if *did_hash == stored.to_did_hash)
+            {
+                let until = acknowledged_until(stored.expires_at, now_ms() / 1_000);
+                let key = acknowledged_key(&stored.to_did_hash, message_hash);
+                batch.insert(
+                    &self.outbox_receipt_expiry,
+                    outbox_receipt_expiry_key(until, &key),
+                    Vec::<u8>::new(),
+                );
+                batch.insert(
+                    &self.outbox_receipts,
+                    key,
+                    Self::encode(&StoredOutboxReceipt {
+                        receipt: OutboxReceipt {
+                            reason: RemovalReason::Collected,
+                            at_ms: now_ms(),
+                        },
+                        expires_at: until,
                     })?,
                 );
             }
@@ -1559,6 +1594,21 @@ impl MediatorStore for FjallStore {
             .collect())
     }
 
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(false);
+        }
+        let now = now_ms() / 1_000;
+        match self
+            .outbox_receipts
+            .get(acknowledged_key(to_did_hash, msg_id))
+            .map_err(|e| Self::db_err("acknowledged:get", e))?
+        {
+            Some(raw) => Ok(Self::decode::<StoredOutboxReceipt>(&raw)?.expires_at > now),
+            None => Ok(false),
+        }
+    }
+
     async fn outbox_receipts(
         &self,
         from_did_hash: &str,
@@ -1579,7 +1629,6 @@ impl MediatorStore for FjallStore {
         sender_did_hash: &str,
         msg_ids: &[String],
     ) -> Result<Vec<SentMessageState>, MediatorError> {
-        let now = now_ms() / 1_000;
         let mut states = Vec::with_capacity(msg_ids.len());
         for id in msg_ids {
             if !ops::is_message_id(id) {

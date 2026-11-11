@@ -33,6 +33,8 @@ struct Removed {
     to: String,
     from: String,
     in_outbox: bool,
+    /// The record's expiry (Unix seconds), `0` when it had none recorded.
+    expires_at: u64,
 }
 
 /// A Redis error carrying `code`, which the reply mapping in
@@ -116,10 +118,11 @@ impl DatabaseHandler {
                 reply.map(|rows| {
                     rows.into_iter()
                         .filter_map(|row| match row.as_slice() {
-                            [to, from, _bytes, outbox] => Some(Removed {
+                            [to, from, _bytes, outbox, rest @ ..] => Some(Removed {
                                 to: to.clone(),
                                 from: from.clone(),
                                 in_outbox: outbox == "1",
+                                expires_at: rest.first().and_then(|v| v.parse().ok()).unwrap_or(0),
                             }),
                             _ => None,
                         })
@@ -136,6 +139,17 @@ impl DatabaseHandler {
                     );
                     let mut copies = Vec::with_capacity(removed.len());
                     for record in removed {
+                        // The recipient removing its own copy is an
+                        // acknowledgement (`MediatorStore::acknowledged`).
+                        if admin_did_hash.is_none() && record.to == did_hash {
+                            self.record_acknowledged(
+                                &mut conn,
+                                message_hash,
+                                &record.to,
+                                record.expires_at,
+                            )
+                            .await;
+                        }
                         // A receipt only for a record that sat in a sender's
                         // outbox, i.e. has a recorded sender.
                         if record.in_outbox && !record.from.is_empty() {
@@ -257,10 +271,11 @@ impl DatabaseHandler {
                 )
                 .await
             {
-                Ok((to, from, in_outbox)) => removed.push(Removed {
+                Ok((to, from, in_outbox, expires_at)) => removed.push(Removed {
                     to,
                     from,
                     in_outbox,
+                    expires_at,
                 }),
                 Err(err) if err.to_string().contains("NOT_FOUND") => {}
                 Err(err) => failure = Some(err),
@@ -366,7 +381,7 @@ impl DatabaseHandler {
         did_hash: &str,
         admin_did_hash: Option<&str>,
         expiry_slot: Option<u64>,
-    ) -> redis::RedisResult<(String, String, bool)> {
+    ) -> redis::RedisResult<(String, String, bool, u64)> {
         use crate::store::redis::database::cluster_scripts::{
             ABANDON_DELETE, CLAIM_MESSAGE, DELETE_LEASE_MS, FINISH_DELETE, STORE_LEASE_MS,
         };
@@ -376,7 +391,7 @@ impl DatabaseHandler {
         let member = Keys::record_member(message_hash, to_key);
         let token = uuid::Uuid::new_v4().to_string();
         let mut attempt = 1;
-        let claimed: [String; 10] = loop {
+        let claimed: [String; 11] = loop {
             let mut claim = CLAIM_MESSAGE.prepare_invoke();
             claim
                 .key(&meta_key)
@@ -389,11 +404,11 @@ impl DatabaseHandler {
                 .arg(expiry_slot.map(|slot| slot.to_string()).unwrap_or_default());
             match claim.invoke_async::<Vec<String>>(conn).await {
                 Ok(claimed) => {
-                    break <[String; 10]>::try_from(claimed).map_err(|reply| {
+                    break <[String; 11]>::try_from(claimed).map_err(|reply| {
                         redis::RedisError::from((
                             redis::ErrorKind::Client,
                             "CLAIM_MESSAGE reply",
-                            format!("expected 10 fields, got {reply:?}"),
+                            format!("expected 11 fields, got {reply:?}"),
                         ))
                     })?;
                 }
@@ -423,7 +438,9 @@ impl DatabaseHandler {
             release_bytes,
             release_receive_id,
             release_send_id,
+            expires_at,
         ] = claimed;
+        let expires_at: u64 = expires_at.parse().unwrap_or(0);
         let mut in_outbox = !send_id.is_empty();
         for attempt in 1..=RELEASE_ATTEMPTS {
             // The entries of a taken-over delete whose store died before
@@ -507,7 +524,7 @@ impl DatabaseHandler {
         if let Err(err) = counted.exec_async(conn).await {
             warn!("Couldn't count deleted message {message_hash}: {err}");
         }
-        Ok((to, from, in_outbox))
+        Ok((to, from, in_outbox, expires_at))
     }
 
     /// Releases a record's inbox and outbox entries concurrently, each in its
@@ -588,6 +605,31 @@ impl DatabaseHandler {
             .arg(send_id)
             .invoke_async(&mut conn)
             .await
+    }
+
+    /// Record that `to` removed its own copy of `message_hash` itself, until
+    /// that copy's expiry (`store::acknowledged_until`). Best-effort, like the
+    /// receipt: a missing record only makes a later repeated delete by `to`
+    /// read as a withdrawal attempt, which removes nothing of another
+    /// recipient's unless `to` also sent the same bytes to it.
+    async fn record_acknowledged(
+        &self,
+        conn: &mut super::RedisConnection,
+        message_hash: &str,
+        to: &str,
+        expires_at: u64,
+    ) {
+        let until = crate::store::acknowledged_until(expires_at, now_ms() / 1_000);
+        let written: Result<(), redis::RedisError> = redis::cmd("SET")
+            .arg(self.keys.acknowledged(to, message_hash))
+            .arg(1)
+            .arg("EXAT")
+            .arg(until)
+            .query_async(conn)
+            .await;
+        if let Err(err) = written {
+            warn!("Couldn't record the acknowledgement of message_hash({message_hash}): {err}");
+        }
     }
 
     /// Leave `from` a receipt saying why its copy of `message_hash` held for

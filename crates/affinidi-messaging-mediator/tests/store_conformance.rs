@@ -3766,6 +3766,10 @@ async fn check_acknowledgement_never_removes_another_copy(store: Arc<dyn Mediato
     );
     assert_eq!(queue_counters(&store, b).await.0, 1);
 
+    // a acknowledged its own copy; b did nothing.
+    assert!(store.acknowledged(a, &id).await.unwrap());
+    assert!(!store.acknowledged(b, &id).await.unwrap());
+
     // The sender's receipt names the copy that went: a's own.
     let receipts = store.outbox_receipts(a, &id).await.expect("receipts");
     assert_eq!(receipts.len(), 1, "{receipts:?}");
@@ -3780,6 +3784,107 @@ async fn check_acknowledgement_never_removes_another_copy(store: Arc<dyn Mediato
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].to_did_hash, b);
     assert_nothing_queued(&store, a, &[a, b]).await;
+}
+
+/// Only a recipient removing its own copy records an acknowledgement: a copy
+/// removed by the mediator (expiry, an administrator) or withdrawn by its
+/// sender does not, so it never makes a later delete read as a repeat.
+async fn check_only_the_recipient_acknowledges(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
+
+    let (a, b, from) = (
+        "did_hash_only_recipient_a",
+        "did_hash_only_recipient_b",
+        "did_hash_only_recipient_sender",
+    );
+    for did in [a, b, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = "{\"protected\":\"only-the-recipient\"}";
+    let id = store
+        .store_message("s", body, a, Some(from), now - 10, 0)
+        .await
+        .expect("store for a");
+    store
+        .store_message("s", body, b, Some(from), NEVER, 0)
+        .await
+        .expect("store for b");
+
+    // a's copy expires; b's is withdrawn by the sender.
+    let report = store
+        .sweep_expired_messages(now, "did_hash_only_recipient_admin")
+        .await
+        .expect("sweep");
+    assert_eq!(report.expired, 1, "{report:?}");
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Party(from),
+            DeletionAuthority::Owner {
+                did_hash: from.to_string(),
+            },
+        )
+        .await
+        .expect("withdrawn");
+    assert!(!store.acknowledged(a, &id).await.unwrap(), "expiry is not");
+    assert!(
+        !store.acknowledged(b, &id).await.unwrap(),
+        "withdrawal is not"
+    );
+    assert!(!store.acknowledged(from, &id).await.unwrap());
+
+    // An administrator's removal is not either; the recipient's own is.
+    let id = store
+        .store_message(
+            "s",
+            "{\"protected\":\"admin-then-own\"}",
+            a,
+            Some(from),
+            NEVER,
+            0,
+        )
+        .await
+        .expect("store");
+    store
+        .store_message(
+            "s",
+            "{\"protected\":\"admin-then-own\"}",
+            b,
+            Some(from),
+            NEVER,
+            0,
+        )
+        .await
+        .expect("store");
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Recipient(a),
+            DeletionAuthority::Admin {
+                admin_did_hash: "did_hash_only_recipient_admin".to_string(),
+            },
+        )
+        .await
+        .expect("admin removal");
+    assert!(!store.acknowledged(a, &id).await.unwrap());
+    store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: b.to_string(),
+            },
+        )
+        .await
+        .expect("b acknowledges");
+    assert!(store.acknowledged(b, &id).await.unwrap());
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
 }
 
 /// The sender's receipts are kept per recipient, and its status never hides a
@@ -4040,6 +4145,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_same_body_for_two_recipients(store.clone()).await;
     check_stale_expiry_entry_keeps_a_later_copy(store.clone()).await;
     check_acknowledgement_never_removes_another_copy(store.clone()).await;
+    check_only_the_recipient_acknowledges(store.clone()).await;
     check_receipts_are_per_recipient(store.clone()).await;
     check_non_ids_name_nothing(store.clone()).await;
     check_scid_sources(store.clone()).await;
@@ -4223,6 +4329,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn acknowledgement_never_removes_another_copy() {
                 check_acknowledgement_never_removes_another_copy(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn only_the_recipient_acknowledges() {
+                check_only_the_recipient_acknowledges(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn receipts_are_per_recipient() {
@@ -4650,6 +4760,67 @@ async fn check_redis_legacy_records_keep_working(
             .expect("an earlier build's delete call");
         assert_eq!(reply, "OK");
         assert!(dyn_store.get_message(a, &id).await.unwrap().is_none());
+        assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+    }
+
+    // An earlier build's sweeper passes bucket members, now `<id>:<to>`, as
+    // the admin: a record whose expiry has not come is left alone, one whose
+    // expiry has passed is removed. A bare id from it reaches only a legacy
+    // record, never a per-recipient one.
+    if !std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let admin = "did_hash_legacy_older_sweeper";
+        let mut conn = store.get_connection().await.expect("redis connection");
+        let mut older_sweeper = async |member: &str| -> ::redis::RedisResult<String> {
+            ::redis::cmd("FCALL")
+                .arg("delete_message")
+                .arg(1)
+                .arg(member)
+                .arg(admin)
+                .arg(admin)
+                .query_async(&mut conn)
+                .await
+        };
+        let kept = dyn_store
+            .store_message("s", "{\"protected\":\"not-due\"}", a, Some(from), NEVER, 0)
+            .await
+            .expect("store");
+        let refused = older_sweeper(&format!("{kept}:{a}")).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("NOT_FOUND")),
+            "{refused:?}"
+        );
+        let refused = older_sweeper(&kept).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("NOT_FOUND")),
+            "a bare id reaches no per-recipient record: {refused:?}"
+        );
+        assert!(dyn_store.get_message(a, &kept).await.unwrap().is_some());
+        let due = dyn_store
+            .store_message("s", "{\"protected\":\"due\"}", a, Some(from), now - 10, 0)
+            .await
+            .expect("store");
+        assert_eq!(
+            older_sweeper(&format!("{due}:{a}")).await.expect("due"),
+            "OK"
+        );
+        assert!(dyn_store.get_message(a, &due).await.unwrap().is_none());
+        dyn_store
+            .delete_message(
+                &kept,
+                DeletionAuthority::Owner {
+                    did_hash: a.to_string(),
+                },
+            )
+            .await
+            .expect("delete");
         assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
     }
 

@@ -110,6 +110,13 @@ impl Keys {
         [&self.tagged("RECEIPTS:", from_hash), ":", message_hash].concat()
     }
 
+    /// That `to` removed its own copy of a message itself
+    /// (`MediatorStore::acknowledged`): a flag that expires with the copy.
+    /// Keyed under the recipient, in its account's slot.
+    pub fn acknowledged(self, to_hash: &str, message_hash: &str) -> String {
+        [&self.tagged("ACKED:", to_hash), ":", message_hash].concat()
+    }
+
     /// Message body of the record held for `to` (`MSG:<id>:<to>`), or of the
     /// single per-id record written before records were per recipient
     /// (`MSG:<id>`) when `to` is `None`. See [`record_member`](Self::record_member).
@@ -350,6 +357,7 @@ mod tests {
             keys.v1_keys(H),
             keys.outbox_receipt(H, "m1"),
             keys.outbox_receipts(H, "m1"),
+            keys.acknowledged(H, "m1"),
         ] {
             assert_eq!(slot(&k), account, "{k} is not in the account's slot");
         }

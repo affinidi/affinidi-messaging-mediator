@@ -342,6 +342,26 @@ pub fn session_not_awaiting_answer(session_id: &str) -> MediatorError {
 /// it must treat as no evidence either way.
 pub const OUTBOX_RECEIPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long an acknowledgement is remembered
+/// ([`MediatorStore::acknowledged`]) for a copy whose own expiry is not
+/// known: one stored with no expiry, or by an earlier build that did not
+/// record it. The default `limits.message_expiry_seconds`.
+pub const ACKNOWLEDGED_FALLBACK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Until when (Unix seconds) an acknowledgement of a copy expiring at
+/// `copy_expires_at` (`0` = unknown) is remembered, from `now_secs`.
+pub fn acknowledged_until(copy_expires_at: u64, now_secs: u64) -> u64 {
+    if copy_expires_at > now_secs {
+        copy_expires_at
+    } else if copy_expires_at == 0 {
+        now_secs + ACKNOWLEDGED_FALLBACK_TTL.as_secs()
+    } else {
+        // Already past its expiry: nothing can redeliver it, but keep the
+        // record briefly so a delete racing the removal still reads it.
+        now_secs + 60
+    }
+}
+
 /// Fail-closed session rename used by the default
 /// [`MediatorStore::update_session_authenticated`]: delete the old session
 /// *before* writing the new one.
@@ -508,6 +528,22 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         scope: MessageScope<'_>,
         by: DeletionAuthority,
     ) -> Result<Vec<RemovedCopy>, MediatorError>;
+
+    /// Whether `to_did_hash` removed its own copy of `msg_id` itself — an
+    /// acknowledgement — while that copy could still have been redelivered.
+    ///
+    /// Every backend records this when an owner's delete removes the copy
+    /// held for that owner, and keeps it until the copy's own expiry (or
+    /// [`ACKNOWLEDGED_FALLBACK_TTL`] for a copy stored without one): no
+    /// redelivery of that copy can arrive later. Removals by the sender or
+    /// the mediator (withdrawal, expiry, admin, account removal) record
+    /// nothing. A client delete uses it to tell a repeated acknowledgement
+    /// from a withdrawal (`messages::client_delete` in the mediator).
+    ///
+    /// The default answers `false`, as for a backend that records nothing.
+    async fn acknowledged(&self, _to_did_hash: &str, _msg_id: &str) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
 
     /// The receipts `from_did_hash` holds for the copies of `msg_id` removed
     /// within [`OUTBOX_RECEIPT_TTL`], one per recipient:

@@ -82,7 +82,20 @@ impl Database {
                 if queue_maxlen > 0 {
                     cmd.arg(queue_maxlen);
                 }
-                cmd.exec_async(&mut conn).await
+                match cmd.query_async::<String>(&mut conn).await {
+                    // This build's library answers `STORED`. `OK` is the
+                    // library of an earlier build, loaded over this one by an
+                    // instance of that build: the message is stored, in the
+                    // per-id layout this build still reads, so it is not
+                    // stored again — only this build's library is loaded
+                    // again for the calls that follow.
+                    Ok(reply) if reply == "OK" => {
+                        self.handler.ensure_library(&mut conn).await;
+                        Ok(())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err),
+                }
             };
             stored.map_err(|err| {
                 event!(Level::ERROR, "Couldn't store message in database: {}", err);

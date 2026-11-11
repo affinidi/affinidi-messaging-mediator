@@ -87,8 +87,10 @@ local function store_message(keys, args)
     -- the same recipient, e.g. an outbox re-send after a lost
     -- acknowledgement) is one record, queued and counted once. The same
     -- bytes for another recipient get a record of their own below.
+    -- 'STORED' rather than 'OK' tells the caller this library stores
+    -- per-recipient records; an earlier library answers 'OK'.
     if record_for(keys[1], args[4]) ~= nil then
-        return redis.status_reply('OK')
+        return redis.status_reply('STORED')
     end
     local record = keys[1] .. ':' .. args[4]
 
@@ -143,11 +145,12 @@ local function store_message(keys, args)
     end
     redis.call('SADD', 'MSG:RCPT:' .. keys[1], args[4])
 
-    return redis.status_reply('OK')
+    return redis.status_reply('STORED')
 end
 
 -- Removes one record and everything it holds. meta is its metadata map.
--- Returns { TO, FROM or '', BYTES, '1' when it sat in an outbox else '0' }.
+-- Returns { TO, FROM or '', BYTES, '1' when it sat in an outbox else '0',
+-- EXPIRES_AT or '' }.
 local function remove_record(id, suffix, meta)
     local bytes = meta.BYTES
 
@@ -188,7 +191,7 @@ local function remove_record(id, suffix, meta)
         redis.call('SREM', 'MSG_EXPIRY:' .. meta.EXPIRES_AT, suffix)
     end
 
-    return { meta.TO, meta.FROM or '', tostring(bytes), outbox }
+    return { meta.TO, meta.FROM or '', tostring(bytes), outbox, meta.EXPIRES_AT or '' }
 end
 
 -- delete_message
@@ -203,7 +206,7 @@ end
 --        [5] expiry slot (epoch seconds) when the expiry sweep is deleting:
 --            a record whose current expiry is later is not due and is left
 --            alone ('' for none)
--- Returns one { TO, FROM, BYTES, OUTBOX } per removed record. The rules are
+-- Returns one { TO, FROM, BYTES, OUTBOX, EXPIRES_AT } per removed record. The rules are
 -- the same as `ops::select_records` in the Rust backends.
 --
 -- Called with one or two arguments, as a mediator built before records were
@@ -230,6 +233,35 @@ local function delete_message(keys, args)
     local is_admin = (#args >= 2 and args[2] ~= '' and args[1] == args[2])
     local scope = args[3] or ''
     local scope_did = args[4] or ''
+    local slot = args[5] or ''
+    if legacy_call then
+        -- An earlier build's expiry sweeper passes a bucket member, which is
+        -- now '<id>:<to>': resolve it to that recipient's record, due only
+        -- when its expiry has passed (the entry may be a stale one). Any
+        -- other key that is not a message id names nothing.
+        local member_id, member_to = string.match(id, '^([0-9a-f]+):(.+)$')
+        if member_id ~= nil then
+            id = member_id
+            scope = 'R'
+            scope_did = member_to
+            if is_admin then
+                slot = redis.call('TIME')[1]
+            end
+        end
+        if string.len(id) ~= 64 or string.match(id, '^[0-9a-f]+$') == nil then
+            return redis.error_reply('NOT_FOUND: message_hash (' .. keys[1] .. ')')
+        end
+        -- A bare id from an earlier build's admin (its sweeper, or its
+        -- account removal) meant the one record it knew: the legacy one.
+        if member_id == nil and is_admin then
+            local legacy_to = redis.call('HGET', 'MSG:META:' .. id, 'TO')
+            if not legacy_to then
+                return redis.error_reply('NOT_FOUND: message_hash (' .. id .. ')')
+            end
+            scope = 'R'
+            scope_did = legacy_to
+        end
+    end
     if scope == '' then
         if is_admin then scope = 'A' else scope = 'P' end
         scope_did = requester
@@ -276,9 +308,9 @@ local function delete_message(keys, args)
         -- earlier copy of the same bytes, or the original deadline of one
         -- brought forward) must not remove it. Legacy records carry no
         -- EXPIRES_AT and are due, as before.
-        if #args >= 5 and args[5] ~= '' and meta.EXPIRES_AT ~= nil then
+        if slot ~= '' and meta.EXPIRES_AT ~= nil then
             local expires = tonumber(meta.EXPIRES_AT) or 0
-            if expires == 0 or expires > tonumber(args[5]) then
+            if expires == 0 or expires > tonumber(slot) then
                 return redis.error_reply('NOT_FOUND: message_hash (' .. id .. ') is not due at this expiry')
             end
         end

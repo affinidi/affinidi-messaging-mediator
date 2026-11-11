@@ -653,6 +653,24 @@ impl MediatorStore for RedisStore {
             .await
     }
 
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(false);
+        }
+        let mut conn = self.get_connection().await?;
+        redis::cmd("EXISTS")
+            .arg(self.keys().acknowledged(to_did_hash, msg_id))
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".into(),
+                    format!("Couldn't read the acknowledgement: {err}"),
+                )
+            })
+    }
+
     async fn outbox_receipts(
         &self,
         from_did_hash: &str,

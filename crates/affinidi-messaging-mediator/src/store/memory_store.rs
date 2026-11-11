@@ -36,7 +36,7 @@ use affinidi_messaging_mediator_common::{
         MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS,
         PubSubRecord, RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState,
         SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
-        TrustTaskClaim, ops,
+        TrustTaskClaim, acknowledged_until, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -243,6 +243,10 @@ struct MemoryState {
     /// why each copy of a sent message left the queue, per recipient. Pruned
     /// by `sweep_expired_messages`.
     receipts: HashMap<(String, String), HashMap<String, (OutboxReceipt, u64)>>,
+    /// `(recipient_hash, msg_id) -> until_secs`: the recipient removed its own
+    /// copy itself. See `MediatorStore::acknowledged`. Pruned by
+    /// `sweep_expired_messages`.
+    acknowledged: HashMap<(String, String), u64>,
 
     // ─── Sessions ───────────────────────────────────────────────────
     sessions: HashMap<String, SessionRecord>,
@@ -429,6 +433,15 @@ impl MemoryState {
                 .entry((from.clone(), message_hash.to_string()))
                 .or_default()
                 .insert(record.to_did_hash.clone(), (receipt, expires));
+        }
+
+        // The recipient removing its own copy is an acknowledgement.
+        if matches!(by, DeletionAuthority::Owner { did_hash } if *did_hash == record.to_did_hash) {
+            let now = unix_timestamp_secs();
+            self.acknowledged.insert(
+                (record.to_did_hash.clone(), message_hash.to_string()),
+                acknowledged_until(record.expires_at, now),
+            );
         }
 
         // Counters
@@ -742,6 +755,15 @@ impl MediatorStore for MemoryStore {
             state.remove_record(key, &by);
         }
         Ok(removed)
+    }
+
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        let now = unix_timestamp_secs();
+        let state = self.state.lock().await;
+        Ok(state
+            .acknowledged
+            .get(&(to_did_hash.to_string(), msg_id.to_string()))
+            .is_some_and(|until| *until > now))
     }
 
     async fn outbox_receipts(
@@ -2499,6 +2521,11 @@ impl MediatorStore for MemoryStore {
             per_recipient.retain(|_, (_, expires)| *expires > now_secs);
             !per_recipient.is_empty()
         });
+        self.state
+            .lock()
+            .await
+            .acknowledged
+            .retain(|_, until| *until > now_secs);
         Ok(report)
     }
 

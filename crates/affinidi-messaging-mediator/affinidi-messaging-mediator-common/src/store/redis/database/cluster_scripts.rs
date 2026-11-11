@@ -228,7 +228,7 @@ return 1
 /// outbox entry ids ("" when not recorded), which bind the releases to the
 /// entries this claim saw. Then the five `RELEASE_*` fields of a taken-over
 /// delete whose store died before releasing them ("" when none): the delete
-/// releases those entries too.
+/// releases those entries too. Last, the record's `EXPIRES_AT` ("" for none).
 pub(crate) static CLAIM_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -277,7 +277,7 @@ if #expired > 0 then
 end
 return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta.SEND_ID or '',
     meta.RELEASE_TO or '', meta.RELEASE_FROM or '', meta.RELEASE_BYTES or '',
-    meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '' }
+    meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '', meta.EXPIRES_AT or '' }
 "#,
     )
 });
