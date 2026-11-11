@@ -45,9 +45,9 @@ case "$version" in
   *) version="v${version}" ;;
 esac
 
-# A dispatch from a branch with no version input publishes a dev build of the
-# workspace version: release versions are published only from their tag
-# (check-dispatch.sh enforces that).
+# A dispatch from a branch with no version input gets a dev build of the
+# workspace version. check-dispatch.sh allows nothing else from a branch, and
+# only from main or release/*: release versions are published from their tag.
 if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF_TYPE" != "tag" ] && [ -z "$INPUT_VERSION" ]; then
   if [ -z "$SHA" ]; then
     echo "::error::SHA must be set for a branch dispatch without a version input" >&2

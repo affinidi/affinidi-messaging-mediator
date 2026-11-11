@@ -15,12 +15,13 @@ name: publish-images
 #                              made with GITHUB_TOKEN triggers no `push` run);
 #                              a tag pushed by a person triggers `push: tags`.
 #   * workflow_dispatch     -> build, verify, publish. On a release tag it
-#                              publishes only that tag's version. On a branch
-#                              it publishes `v<workspace>-dev.<sha>` by default,
-#                              and never a release version (`vX.Y.Z[-rc.N]`) or
-#                              an existing git tag. A version already in GHCR is
-#                              replaced only with `overwrite: true`
-#                              (docker/ci/check-dispatch.sh).
+#                              publishes only that tag's version. On `main` or
+#                              `release/*` it publishes only a dev version,
+#                              `v<workspace>-dev.<sha>` (the default); other
+#                              branches are refused. A version already in GHCR
+#                              is replaced only with `overwrite: true`
+#                              (docker/ci/check-dispatch.sh, re-checked by
+#                              publish-manifest.sh before the tag moves).
 #   * PR labelled `ci:image`-> build + verify only (opt-in; no publish)
 # Add the `ci:image` label to any PR that touches docker/ or this workflow.
 #
@@ -41,7 +42,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag to publish. On a release tag: that tag (the default). On a branch: a non-release name; defaults to v<workspace version>-dev.<sha>."
+        description: "Image version tag to publish. On a release tag: that tag (the default). On main or release/*: only vX.Y.Z-dev.<hex sha>; the default is the workspace version plus -dev.<sha>."
         required: false
         type: string
       overwrite:
@@ -255,6 +256,10 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     environment: release
+    # One run at a time moves a given version's tag; a second waits.
+    concurrency:
+      group: publish-images-manifest-${{ needs.version.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -293,6 +298,8 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           VERSION: ${{ needs.version.outputs.version }}
           IS_LATEST: ${{ needs.version.outputs.is_latest }}
+          EVENT_NAME: ${{ github.event_name }}
+          OVERWRITE: ${{ inputs.overwrite }}
         run: bash "$GITHUB_WORKSPACE/docker/ci/publish-manifest.sh"
 
       - name: Attest build provenance (GHCR)

@@ -2,13 +2,14 @@
 # Decide whether a manual (workflow_dispatch) run of publish-images may publish
 # VERSION. Run by the `version` job before anything is built.
 #
-#   * A dispatch on a release tag (`refs/tags/vX.Y.Z[-rc.N]`) publishes only
+#   * A dispatch on a release tag (`vX.Y.Z` / `vX.Y.Z-rc.N`) publishes only
 #     that tag's version.
-#   * A dispatch on a branch may not publish a release-shaped version
-#     (`vX.Y.Z` / `vX.Y.Z-rc.N`) or the name of any existing git tag: those
-#     are published from their tag. Its default is `v<workspace>-dev.<sha>`.
+#   * A dispatch on a branch must be on `main` or `release/*`, and publishes
+#     only a dev version, `vX.Y.Z-dev.<hex sha>` (its default). Release
+#     versions are published from their tag.
 #   * A version already present in the registry is replaced only when
-#     OVERWRITE is `true`.
+#     OVERWRITE is `true` (publish-manifest.sh checks again just before it
+#     moves the tag).
 #
 # Inputs (environment):
 #   VERSION    - resolved image version (from resolve-version.sh)
@@ -17,8 +18,7 @@
 #   OVERWRITE  - the dispatch's `overwrite` input (`true` / `false`)
 #   IMAGE      - registry repository, e.g. ghcr.io/<owner>/messaging-mediator.
 #                Empty skips the registry lookup (local runs).
-#   INSPECT    - command used to look the tag up (default:
-#                `docker buildx imagetools inspect`); tests replace it.
+#   INSPECT    - registry lookup command (see registry-lib.sh); tests replace it.
 # Diagnostics go to stderr; a refusal exits 1.
 set -euo pipefail
 
@@ -27,7 +27,9 @@ set -euo pipefail
 : "${REF_NAME:?REF_NAME must be set}"
 : "${OVERWRITE:=false}"
 : "${IMAGE:=}"
-: "${INSPECT:=docker buildx imagetools inspect}"
+
+# shellcheck source=docker/ci/registry-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/registry-lib.sh"
 
 refuse() {
   echo "::error::$*" >&2
@@ -35,32 +37,29 @@ refuse() {
 }
 
 release_re='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+dev_re='^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9a-f]{7,40}$'
 
 if [ "$REF_TYPE" = "tag" ]; then
+  [[ "$REF_NAME" =~ $release_re ]] ||
+    refuse "tag $REF_NAME is not a release tag (vX.Y.Z or vX.Y.Z-rc.N); nothing to publish"
   [ "$VERSION" = "$REF_NAME" ] ||
     refuse "a dispatch on tag $REF_NAME publishes only :$REF_NAME, not :$VERSION"
 else
-  if [[ "$VERSION" =~ $release_re ]]; then
-    refuse "$VERSION is a release version; release images are published from their tag (dispatch on refs/tags/$VERSION), not from branch $REF_NAME"
-  fi
-  if git rev-parse -q --verify "refs/tags/$VERSION" > /dev/null; then
-    refuse "$VERSION is an existing git tag; publish it by dispatching on that tag"
-  fi
+  case "$REF_NAME" in
+    main | release/*) ;;
+    *) refuse "images are published only from main, release/* or a release tag, not from branch $REF_NAME" ;;
+  esac
+  [[ "$VERSION" =~ $dev_re ]] ||
+    refuse "invalid version $VERSION for a branch dispatch: a branch publishes only vX.Y.Z-dev.<hex sha> (the default); release versions are published from their tag"
 fi
 
 if [ -n "$IMAGE" ]; then
-  # Read the registry's answer rather than the exit code alone: a lookup that
-  # fails for any reason other than "not found" must not read as "absent".
-  if out=$($INSPECT "${IMAGE}:${VERSION}" 2>&1); then
-    if [ "$OVERWRITE" != "true" ]; then
-      refuse "${IMAGE}:${VERSION} already exists; re-run with overwrite=true to replace it"
-    fi
-    echo "Replacing existing ${IMAGE}:${VERSION} (overwrite=true)" >&2
-  elif grep -qi 'not found\|manifest unknown' <<< "$out"; then
-    :
-  else
-    echo "$out" >&2
+  state=$(registry_tag_state "${IMAGE}:${VERSION}") ||
     refuse "could not check whether ${IMAGE}:${VERSION} exists"
+  if [ "$state" = present ]; then
+    [ "$OVERWRITE" = "true" ] ||
+      refuse "${IMAGE}:${VERSION} already exists; re-run with overwrite=true to replace it"
+    echo "Replacing existing ${IMAGE}:${VERSION} (overwrite=true)" >&2
   fi
 fi
 
