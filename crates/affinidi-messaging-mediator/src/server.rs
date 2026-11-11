@@ -664,13 +664,12 @@ pub async fn serve_internal(
     ::metrics::gauge!(WS_SEND_BUFFER_AVAILABLE_BYTES).set(ws_send_budget.total_bytes() as f64);
 
     let streaming_task = if config.streaming_enabled {
-        Some(StreamingTask::spawn_supervised_with_monitor(
+        Some(StreamingTask::spawn_supervised(
             &supervisor,
             store.clone(),
             &config.streaming_uuid,
             ws_send_budget.clone(),
             config.limits.delivered_expiry_seconds,
-            monitor.clone(),
         ))
     } else {
         None
