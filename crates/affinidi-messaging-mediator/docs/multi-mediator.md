@@ -305,13 +305,26 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   application/didcomm-encrypted+json` for DIDComm, `application/tsp` (raw qb2)
   for TSP. TSP always goes over REST regardless of rate.
 - **Concurrency.** Up to `max_concurrent_endpoints` (32) next-hop endpoints
-  are delivered to at once; messages for one endpoint go out in order, one at
-  a time. Each attempt is bounded by `delivery_timeout_seconds` (60).
+  are delivered to at once. Messages for one endpoint go out one at a time,
+  usually in queue order; a retried message can go after later ones. Each
+  attempt is bounded by `delivery_timeout_seconds` (90). A processor holds at
+  most `batch_size` × `max_concurrent_endpoints` claimed entries, one
+  endpoint at most half of them, so a backlog for one peer does not stop the
+  others' forwards being read.
 - **Retry.** `max_retries` (5) with exponential backoff from
   `initial_backoff_ms` to `max_backoff_ms`, per endpoint. A failed message is
   queued again with a not-before at the end of the endpoint's backoff, which
-  every processor sharing the queue honours; the rest of that endpoint's
-  messages are deferred to the same time rather than sent into the failure.
+  every processor sharing the queue honours. The rest of that endpoint's
+  messages are held until the same time rather than sent into the failure;
+  they were not sent, so they keep their retry budget.
+- **Claims and recovery.** A processor refreshes the claims on everything it
+  holds four times per `reclaim_idle_seconds` (60). An entry whose claim goes
+  idle that long — its processor stopped, or it was left for later (a long
+  requested delay, an endpoint's share exceeded) — is taken over by the next
+  reclaim sweep of any processor in the group. A refresh never moves a claim
+  another processor has taken, so each entry is delivered by whichever
+  processor holds it. Delivered entries are acked one at a time, as soon as
+  the peer accepts them.
 - **Refusal.** A peer's 4xx (other than 408/425/429) is final
   (`e.p.me.res.forwarding.refused`), as is a next hop whose URL does not parse
   or that the egress policy does not admit

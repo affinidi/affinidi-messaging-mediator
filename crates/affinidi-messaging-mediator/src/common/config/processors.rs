@@ -136,7 +136,14 @@ pub(crate) fn forwarding_config_from_raw(
         delivery_timeout_seconds: match raw.delivery_timeout_seconds.parse() {
             Ok(n) if n > 0 => n,
             _ => {
-                warn_default("delivery_timeout_seconds", "60");
+                warn_default("delivery_timeout_seconds", "90");
+                90
+            }
+        },
+        reclaim_idle_seconds: match raw.reclaim_idle_seconds.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                warn_default("reclaim_idle_seconds", "60");
                 60
             }
         },
@@ -186,7 +193,8 @@ mod tests {
         assert_eq!(config.initial_backoff_ms, 1000);
         assert_eq!(config.max_backoff_ms, 60000);
         assert_eq!(config.max_concurrent_endpoints, 32);
-        assert_eq!(config.delivery_timeout_seconds, 60);
+        assert_eq!(config.delivery_timeout_seconds, 90);
+        assert_eq!(config.reclaim_idle_seconds, 60);
         assert_eq!(config.consumer_group, "forwarding");
         assert!(!config.accept_invalid_certs);
         assert_eq!(config.max_hops, 10);
@@ -210,8 +218,8 @@ mod tests {
             max_backoff_ms: "60000".to_string(),
 
             max_concurrent_endpoints: "32".to_string(),
-
-            delivery_timeout_seconds: "60".to_string(),
+            delivery_timeout_seconds: "90".to_string(),
+            reclaim_idle_seconds: "60".to_string(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: "false".to_string(),
             max_hops: "10".to_string(),
@@ -254,8 +262,8 @@ mod tests {
             max_backoff_ms: "120000".to_string(),
 
             max_concurrent_endpoints: "8".to_string(),
-
             delivery_timeout_seconds: "15".to_string(),
+            reclaim_idle_seconds: "20".to_string(),
             consumer_group: "custom_group".to_string(),
             accept_invalid_certs: "false".to_string(),
             max_hops: "5".to_string(),
@@ -278,6 +286,7 @@ mod tests {
         assert_eq!(config.max_backoff_ms, 120000);
         assert_eq!(config.max_concurrent_endpoints, 8);
         assert_eq!(config.delivery_timeout_seconds, 15);
+        assert_eq!(config.reclaim_idle_seconds, 20);
         assert_eq!(config.consumer_group, "custom_group");
         // relay_mode parses case-insensitively; the trusted-mediator list is
         // comma-split with surrounding whitespace trimmed and blanks dropped.
@@ -313,8 +322,8 @@ mod tests {
             max_backoff_ms: "60000".to_string(),
 
             max_concurrent_endpoints: "32".to_string(),
-
-            delivery_timeout_seconds: "60".to_string(),
+            delivery_timeout_seconds: "90".to_string(),
+            reclaim_idle_seconds: "60".to_string(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: "false".to_string(),
             max_hops: "10".to_string(),
@@ -342,8 +351,8 @@ mod tests {
             max_backoff_ms: "bad".to_string(),
 
             max_concurrent_endpoints: "bad".to_string(),
-
             delivery_timeout_seconds: "0".to_string(),
+            reclaim_idle_seconds: "bad".to_string(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: "bad".to_string(),
             max_hops: "bad".to_string(),
@@ -366,7 +375,8 @@ mod tests {
         assert_eq!(config.max_backoff_ms, 60000);
         // Zero would stall or disable delivery, so it is refused like garbage.
         assert_eq!(config.max_concurrent_endpoints, 32);
-        assert_eq!(config.delivery_timeout_seconds, 60);
+        assert_eq!(config.delivery_timeout_seconds, 90);
+        assert_eq!(config.reclaim_idle_seconds, 60);
         assert!(!config.accept_invalid_certs); // default false
         assert_eq!(config.max_hops, 10); // default 10
     }

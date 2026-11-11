@@ -60,16 +60,26 @@ pub struct ForwardingConfig {
     /// Maximum backoff delay in milliseconds for retry
     pub max_backoff_ms: u64,
     /// How many next-hop endpoints are delivered to at once. Messages for one
-    /// endpoint go out in order, one at a time; different endpoints proceed in
-    /// parallel up to this limit, so a slow endpoint holds one slot rather
-    /// than the whole processor.
+    /// endpoint go out one at a time; different endpoints proceed in parallel
+    /// up to this limit, so a slow endpoint holds one slot rather than the
+    /// whole processor.
     #[serde(default = "default_max_concurrent_endpoints")]
     pub max_concurrent_endpoints: usize,
     /// Upper bound, in seconds, on one delivery attempt (connect, send and
     /// the peer's answer, including a WebSocket attempt and its REST
-    /// fallback). An attempt that runs over is a retryable failure.
+    /// fallback). An attempt that runs over is a retryable failure. Keep it
+    /// above 60: a WebSocket attempt can wait 30 s for the peer's ack before
+    /// the REST fallback, which has 30 s of its own.
     #[serde(default = "default_delivery_timeout_seconds")]
     pub delivery_timeout_seconds: u64,
+    /// Seconds a claimed queue entry may sit untouched before any processor
+    /// in the consumer group takes it over: how soon the entries a stopped or
+    /// restarted processor held are delivered by another. A running processor
+    /// refreshes its claims four times in this window, so it never loses one
+    /// it is still working on. The same sweep picks up a requested delay
+    /// longer than `max_backoff_ms` once it is due.
+    #[serde(default = "default_reclaim_idle_seconds")]
+    pub reclaim_idle_seconds: u64,
     /// Redis consumer group name for forwarding processors
     pub consumer_group: String,
     /// Whether to accept invalid TLS certificates when forwarding to remote mediators.
@@ -109,6 +119,10 @@ fn default_max_concurrent_endpoints() -> usize {
 }
 
 fn default_delivery_timeout_seconds() -> u64 {
+    90
+}
+
+fn default_reclaim_idle_seconds() -> u64 {
     60
 }
 
@@ -129,6 +143,7 @@ impl Default for ForwardingConfig {
             max_backoff_ms: 60000,
             max_concurrent_endpoints: default_max_concurrent_endpoints(),
             delivery_timeout_seconds: default_delivery_timeout_seconds(),
+            reclaim_idle_seconds: default_reclaim_idle_seconds(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: false,
             max_hops: 10,

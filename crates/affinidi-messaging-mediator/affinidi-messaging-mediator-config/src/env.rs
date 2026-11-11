@@ -296,7 +296,11 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
     env_override!(
         config.processors.forwarding.delivery_timeout_seconds,
-        "PROCESSOR_FORWARDING_DELIVERY_TIMEOUT"
+        "PROCESSOR_FORWARDING_DELIVERY_TIMEOUT_SECONDS"
+    );
+    env_override!(
+        config.processors.forwarding.reclaim_idle_seconds,
+        "PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS"
     );
     env_override!(
         config.processors.forwarding.consumer_group,

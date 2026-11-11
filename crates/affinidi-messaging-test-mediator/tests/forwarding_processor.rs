@@ -525,8 +525,20 @@ async fn an_endpoint_that_is_not_permitted_is_dropped_without_retrying() {
 /// second processor sharing the queue, which has seen no failure itself.
 #[tokio::test]
 async fn a_retry_waits_out_the_backoff_on_every_processor() {
+    retry_waits_out_the_backoff(Arc::new(MemoryStore::new())).await;
+}
+
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn a_retry_waits_out_the_backoff_on_every_processor_redis() {
+    let Some(store) = redis_store(11).await else {
+        return;
+    };
+    retry_waits_out_the_backoff(store).await;
+}
+
+async fn retry_waits_out_the_backoff(store: Arc<dyn MediatorStore>) {
     let mut stub = spawn_stub_mediator(1).await;
-    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
 
     store
         .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, "retried-forward"), 0)
@@ -560,4 +572,279 @@ async fn a_retry_waits_out_the_backoff_on_every_processor() {
         "the retry went out {waited:?} after the failure, inside the 800ms backoff"
     );
     assert_queue_drains(&store).await;
+}
+
+// ─── Claims across processors, held-back messages, shares ───────────────────
+
+/// A Redis store on logical DB `db`, flushed and initialised, or `None` (the
+/// test is skipped) when `REDIS_URL` is unset.
+#[cfg(feature = "redis-backend")]
+async fn redis_store(db: u8) -> Option<Arc<dyn MediatorStore>> {
+    use affinidi_messaging_mediator::store::RedisStore;
+    use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
+
+    let base = match std::env::var("REDIS_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            eprintln!("SKIP redis forwarding test (db {db}): REDIS_URL not set");
+            return None;
+        }
+    };
+    let config = DatabaseConfig {
+        functions_file: Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../affinidi-messaging-mediator/conf/atm-functions.lua"
+            )
+            .to_string(),
+        ),
+        database_url: format!("{}/{db}", base.trim_end_matches('/')),
+        database_timeout: 2,
+        cluster_mode: false,
+        circuit_breaker_threshold: 5,
+        circuit_breaker_recovery_secs: 10,
+    };
+    let handler = DatabaseHandler::new(&config)
+        .await
+        .expect("connect to REDIS_URL");
+    let store = RedisStore::new(handler, 5, 10, config.functions_file.clone());
+    let mut conn = store.get_connection().await.expect("redis connection");
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .expect("FLUSHDB");
+    store.initialize().await.expect("store initialize");
+    Some(Arc::new(store))
+}
+
+/// Stub remote mediator that never answers its first request and accepts
+/// every later one, counting the accepted bodies.
+struct CountingMediator {
+    endpoint_url: String,
+    first_arrived: Arc<tokio::sync::Notify>,
+    accepted: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+}
+
+async fn spawn_counting_mediator_that_stalls_once() -> CountingMediator {
+    #[derive(Clone)]
+    struct StubState {
+        seen: Arc<AtomicU32>,
+        first_arrived: Arc<tokio::sync::Notify>,
+        accepted: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    }
+
+    async fn inbound(State(state): State<StubState>, body: String) -> StatusCode {
+        if state.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            state.first_arrived.notify_one();
+            std::future::pending::<()>().await;
+        }
+        *state
+            .accepted
+            .lock()
+            .expect("accepted log")
+            .entry(body)
+            .or_default() += 1;
+        StatusCode::OK
+    }
+
+    let first_arrived = Arc::new(tokio::sync::Notify::new());
+    let accepted = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let app = Router::new()
+        .route("/inbound", post(inbound))
+        .with_state(StubState {
+            seen: Arc::new(AtomicU32::new(0)),
+            first_arrived: first_arrived.clone(),
+            accepted: accepted.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub mediator");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub mediator serve");
+    });
+    CountingMediator {
+        endpoint_url: format!("http://{addr}"),
+        first_arrived,
+        accepted,
+    }
+}
+
+/// A processor stopped while it holds claimed entries — one mid-delivery,
+/// the rest waiting their turn — does not strand them: once their claims go
+/// idle, the processors still running take them over and each is accepted by
+/// the peer exactly once, though two processors are sweeping for them.
+#[tokio::test]
+async fn entries_held_by_a_stopped_processor_are_delivered_once() {
+    held_entries_survive_a_stopped_processor(Arc::new(MemoryStore::new())).await;
+}
+
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+async fn entries_held_by_a_stopped_processor_are_delivered_once_redis() {
+    let Some(store) = redis_store(12).await else {
+        return;
+    };
+    held_entries_survive_a_stopped_processor(store).await;
+}
+
+async fn held_entries_survive_a_stopped_processor(store: Arc<dyn MediatorStore>) {
+    let stub = spawn_counting_mediator_that_stalls_once().await;
+    let messages: Vec<String> = (0..6).map(|i| format!("held-forward-{i}")).collect();
+    for message in &messages {
+        store
+            .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, message), 0)
+            .await
+            .expect("enqueue");
+    }
+    let config = ForwardingConfig {
+        reclaim_idle_seconds: 1,
+        delivery_timeout_seconds: 30,
+        ..test_config()
+    };
+
+    // The first processor claims all six and stalls on the first delivery.
+    let first = ForwardingProcessor::new(config.clone(), store.clone()).expect("create processor");
+    let first = tokio::spawn(async move {
+        let _ = first.start().await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), stub.first_arrived.notified())
+        .await
+        .expect("the first processor never attempted a delivery");
+    first.abort();
+    let _ = first.await;
+
+    spawn_processor(config.clone(), store.clone());
+    spawn_processor(config, store.clone());
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if store.forward_queue_len().await.expect("queue len") == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stopped processor's entries were not taken over");
+    // Let any duplicate still in flight land before counting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let accepted = stub.accepted.lock().expect("accepted log").clone();
+    for message in &messages {
+        assert_eq!(
+            accepted.get(message).copied(),
+            Some(1),
+            "{message} accepted exactly once: {accepted:?}"
+        );
+    }
+}
+
+/// Messages held back because their endpoint is backing off were never sent,
+/// so they keep their retry budget: with no retries allowed, the one that
+/// failed is abandoned and the rest are delivered after the backoff.
+#[tokio::test]
+async fn held_back_messages_keep_their_retry_budget() {
+    let mut stub = spawn_stub_mediator(1).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    let observer = Arc::new(RecordingObserver::default());
+
+    for i in 0..4 {
+        store
+            .forward_queue_enqueue(
+                &forward_entry(&stub.endpoint_url, &format!("budget-{i}")),
+                0,
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let processor = ForwardingProcessor::new(
+        ForwardingConfig {
+            max_retries: 0,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            ..test_config()
+        },
+        store.clone(),
+    )
+    .expect("create processor")
+    .with_observer(observer.clone());
+    tokio::spawn(async move {
+        let _ = processor.start().await;
+    });
+
+    for _ in 0..4 {
+        tokio::time::timeout(Duration::from_secs(10), stub.received.recv())
+            .await
+            .expect("timed out waiting for a delivery")
+            .expect("stub channel closed");
+    }
+    assert_queue_drains(&store).await;
+
+    let outcomes = observer.outcomes.lock().expect("observer log").clone();
+    let abandoned: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, ForwardOutcome::Abandoned { .. }))
+        .collect();
+    let relayed = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, ForwardOutcome::Relayed { .. }))
+        .count();
+    assert_eq!(
+        abandoned.len(),
+        1,
+        "only the message that was sent and failed: {outcomes:?}"
+    );
+    assert_eq!(abandoned[0].0, "budget-0");
+    assert_eq!(relayed, 3, "{outcomes:?}");
+    assert!(
+        !outcomes
+            .iter()
+            .any(|(_, o)| matches!(o, ForwardOutcome::Retrying { .. })),
+        "holding a message back is not a retry: {outcomes:?}"
+    );
+}
+
+/// A backlog for one endpoint that cannot drain holds only its share of what
+/// the processor takes in, so a forward to another endpoint queued behind it
+/// is still read and delivered.
+#[tokio::test]
+async fn a_backlogged_endpoint_does_not_stop_others_being_read() {
+    let mut healthy = spawn_stub_mediator(0).await;
+    let stalled = spawn_unresponsive_endpoint().await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+
+    for i in 0..10 {
+        store
+            .forward_queue_enqueue(&forward_entry(&stalled, &format!("backlog-{i}")), 0)
+            .await
+            .expect("enqueue");
+    }
+    store
+        .forward_queue_enqueue(
+            &forward_entry(&healthy.endpoint_url, "behind-the-backlog"),
+            0,
+        )
+        .await
+        .expect("enqueue");
+
+    // At most 2 x 2 = 4 entries held, 2 of them for any one endpoint.
+    spawn_processor(
+        ForwardingConfig {
+            batch_size: 2,
+            max_concurrent_endpoints: 2,
+            delivery_timeout_seconds: 30,
+            ..test_config()
+        },
+        store.clone(),
+    );
+
+    let body = tokio::time::timeout(Duration::from_secs(5), healthy.received.recv())
+        .await
+        .expect("the backlog stopped the other endpoint's forward being read")
+        .expect("stub channel closed");
+    assert_eq!(body, "behind-the-backlog");
 }

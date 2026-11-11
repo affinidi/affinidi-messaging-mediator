@@ -745,17 +745,33 @@ max_backoff_ms = "60000"
 
 ### Env: PROCESSOR_FORWARDING_MAX_CONCURRENT_ENDPOINTS
 ### How many next-hop endpoints are delivered to at once. Messages for one
-### endpoint go out in order, one at a time; different endpoints proceed in
-### parallel up to this limit, so a slow endpoint holds one slot instead of
-### the whole processor. Must be at least 1.
+### endpoint go out one at a time, usually in queue order (a retried message
+### can go after later ones); different endpoints proceed in parallel up to
+### this limit, so a slow endpoint holds one slot instead of the whole
+### processor. A processor holds at most batch_size x this many claimed
+### entries, and one endpoint at most half of that; an endpoint's entries
+### beyond its share are picked up again by the reclaim sweep (see
+### reclaim_idle_seconds). Must be at least 1.
 ### Scale: raise for relay/hub mediators forwarding to many peers.
 max_concurrent_endpoints = "32"
 
-### Env: PROCESSOR_FORWARDING_DELIVERY_TIMEOUT
-### Seconds one delivery attempt may take (connect, send and the peer's
-### answer, including a WebSocket attempt and its REST fallback) before it
-### counts as a failed attempt. Must be at least 1.
-delivery_timeout_seconds = "60"
+### Env: PROCESSOR_FORWARDING_DELIVERY_TIMEOUT_SECONDS
+### Seconds (not milliseconds) one delivery attempt may take — connect, send
+### and the peer's answer, including a WebSocket attempt and its REST
+### fallback — before it counts as a failed attempt. Keep it above 60: a
+### WebSocket attempt may wait 30 s for the peer's ack before falling back to
+### REST, which has 30 s of its own. Must be at least 1.
+delivery_timeout_seconds = "90"
+
+### Env: PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS
+### Seconds a claimed forwarding-queue entry may sit untouched before any
+### processor in the consumer group takes it over. This is how entries held by
+### a processor that stopped or restarted get delivered by another (or by it,
+### once back). A running processor refreshes its claims four times in this
+### window, so it never loses one it is still working on. The same sweep
+### picks up a requested forward delay longer than max_backoff_ms when due.
+### Must be at least 1.
+reclaim_idle_seconds = "60"
 
 ### Env: PROCESSOR_FORWARDING_CONSUMER_GROUP
 ### Consumer group name for the forwarding queue. On Redis this is the

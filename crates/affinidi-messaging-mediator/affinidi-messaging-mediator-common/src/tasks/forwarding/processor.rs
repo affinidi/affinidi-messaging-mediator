@@ -13,7 +13,10 @@
 //!
 //! Scheduling:
 //! - Endpoints are delivered to concurrently, up to `max_concurrent_endpoints`;
-//!   messages for one endpoint go out in order, one at a time
+//!   messages for one endpoint go out one at a time, usually in queue order
+//!   (a retried message can go after later ones)
+//! - Held entries' claims are refreshed; an entry idle for
+//!   `reclaim_idle_seconds` is taken over by any processor's reclaim sweep
 //! - Each attempt is bounded by `delivery_timeout_seconds`
 //!
 //! Error handling:
@@ -378,18 +381,27 @@ fn due_at_ms(entry: &ForwardQueueEntry) -> u128 {
 ///
 /// Each held entry is in exactly one of `parked`, `queued`, or a running
 /// delivery task (its endpoint is then in `busy`), and its stream id is in
-/// `held` until that task finishes. An endpoint is in `waiting` exactly when
-/// it has queued entries and no running task.
+/// `held` until that task finishes or it is forgotten. An endpoint is in
+/// `waiting` exactly when it has queued entries and no running task.
+///
+/// An entry that is not held stays claimed in the store with its idle time
+/// running, so the reclaim sweep hands it back later (to this processor or
+/// another): that is how a delay beyond the park horizon, and an endpoint's
+/// overflow beyond its share, are picked up again.
 struct Scheduler {
     max_concurrent: usize,
     batch_size: usize,
     /// Stop reading once this many entries are held.
     max_held: usize,
-    /// The longest an entry is parked for. Retries never ask for more than
-    /// `max_backoff_ms`; a sender-requested delay beyond it is left claimed
-    /// in the store, as before.
+    /// The most entries one endpoint may hold, so a backlogged endpoint
+    /// cannot take the whole budget and stop other endpoints being read.
+    max_held_per_endpoint: usize,
+    /// The longest an entry is parked for on arrival. Retries never ask for
+    /// more than `max_backoff_ms`; a longer requested delay is left to the
+    /// reclaim sweep.
     park_horizon_ms: u128,
     held: HashSet<String>,
+    held_by_endpoint: HashMap<String, usize>,
     /// Entries not yet due, by (due unix ms, arrival order).
     parked: BTreeMap<(u128, u64), ForwardQueueEntry>,
     arrivals: u64,
@@ -402,12 +414,15 @@ impl Scheduler {
     fn new(config: &ForwardingConfig) -> Self {
         let max_concurrent = config.max_concurrent_endpoints.max(1);
         let batch_size = config.batch_size.max(1);
+        let max_held = batch_size.saturating_mul(max_concurrent);
         Scheduler {
             max_concurrent,
             batch_size,
-            max_held: batch_size.saturating_mul(max_concurrent),
+            max_held,
+            max_held_per_endpoint: (max_held / 2).max(batch_size),
             park_horizon_ms: config.max_backoff_ms.max(config.initial_backoff_ms) as u128,
             held: HashSet::new(),
+            held_by_endpoint: HashMap::new(),
             parked: BTreeMap::new(),
             arrivals: 0,
             queued: HashMap::new(),
@@ -420,37 +435,78 @@ impl Scheduler {
         self.held.len() < self.max_held
     }
 
-    /// Take newly read entries: due ones are queued for their endpoint, the
-    /// rest parked until due.
+    fn held_ids(&self) -> Vec<String> {
+        self.held.iter().cloned().collect()
+    }
+
+    fn hold(&mut self, entry: &ForwardQueueEntry) {
+        self.held.insert(entry.stream_id.clone());
+        *self
+            .held_by_endpoint
+            .entry(entry.endpoint_url.clone())
+            .or_default() += 1;
+    }
+
+    fn release(&mut self, stream_id: &str, endpoint_url: &str) {
+        if !self.held.remove(stream_id) {
+            return;
+        }
+        if let Some(count) = self.held_by_endpoint.get_mut(endpoint_url) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.held_by_endpoint.remove(endpoint_url);
+            }
+        }
+    }
+
+    /// Take newly claimed entries: due ones are queued for their endpoint,
+    /// the rest parked until due. An entry already held is ignored, so a
+    /// repeat (a read and a reclaim of the same entry) is handled once.
     fn accept(&mut self, entries: Vec<ForwardQueueEntry>, now_ms: u128) {
         for entry in entries {
-            if !self.held.insert(entry.stream_id.clone()) {
+            if self.held.contains(&entry.stream_id) {
                 debug!(
                     "FORWARD_Q entry {} is already held; ignoring the repeat",
                     entry.stream_id
                 );
                 continue;
             }
+            let held_here = self
+                .held_by_endpoint
+                .get(&entry.endpoint_url)
+                .copied()
+                .unwrap_or(0);
+            if held_here >= self.max_held_per_endpoint {
+                debug!(
+                    "Endpoint {} already holds {} entries; leaving {} for the reclaim sweep",
+                    entry.endpoint_url, held_here, entry.stream_id
+                );
+                continue;
+            }
             let due = due_at_ms(&entry);
             if due <= now_ms {
+                self.hold(&entry);
                 self.enqueue(entry);
             } else if entry.not_before_ms == 0 && due - now_ms > self.park_horizon_ms {
                 debug!(
-                    "Forward {} is delayed {}ms, beyond the {}ms park horizon; leaving it claimed",
+                    "Forward {} is delayed {}ms, beyond the {}ms park horizon; leaving it for the reclaim sweep",
                     entry.stream_id,
                     due - now_ms,
                     self.park_horizon_ms
                 );
-                self.held.remove(&entry.stream_id);
             } else {
                 // A retry's not-before is at most `max_backoff_ms` ahead when
                 // written; the clamp only bites on clock skew between
                 // processors, where an early attempt beats holding it forever.
-                let until = due.min(now_ms + self.park_horizon_ms);
-                self.arrivals += 1;
-                self.parked.insert((until, self.arrivals), entry);
+                self.hold(&entry);
+                self.park(due.min(now_ms + self.park_horizon_ms), entry);
             }
         }
+    }
+
+    fn park(&mut self, until_ms: u128, entry: ForwardQueueEntry) {
+        self.arrivals += 1;
+        self.parked.insert((until_ms, self.arrivals), entry);
     }
 
     /// Move parked entries that are now due onto their endpoint's queue.
@@ -496,14 +552,61 @@ impl Scheduler {
     }
 
     /// A delivery task for `endpoint_url` has finished with `stream_ids`.
-    fn finished(&mut self, endpoint_url: &str, stream_ids: &[String]) {
+    /// `deferred` are entries it did not attempt because the endpoint was
+    /// backing off; they stay held, parked until the given time.
+    fn finished(
+        &mut self,
+        endpoint_url: &str,
+        stream_ids: &[String],
+        deferred: Vec<(u128, ForwardQueueEntry)>,
+    ) {
         for id in stream_ids {
-            self.held.remove(id);
+            self.release(id, endpoint_url);
+        }
+        for (until_ms, entry) in deferred {
+            self.hold(&entry);
+            self.park(until_ms, entry);
         }
         self.busy.remove(endpoint_url);
         if self.queued.get(endpoint_url).is_some_and(|q| !q.is_empty()) {
             self.waiting.push_back(endpoint_url.to_string());
         }
+    }
+
+    /// Stop holding entries this processor no longer has claimed (another
+    /// processor took them over). Those parked or queued are dropped here;
+    /// the ids of those inside a running delivery task are returned, for the
+    /// task to skip.
+    fn forget(&mut self, stream_ids: &[String]) -> Vec<String> {
+        let lost: HashSet<&str> = stream_ids.iter().map(String::as_str).collect();
+        let mut dropped: Vec<(String, String)> = Vec::new();
+        self.parked.retain(|_, entry| {
+            let keep = !lost.contains(entry.stream_id.as_str());
+            if !keep {
+                dropped.push((entry.stream_id.clone(), entry.endpoint_url.clone()));
+            }
+            keep
+        });
+        for queue in self.queued.values_mut() {
+            queue.retain(|entry| {
+                let keep = !lost.contains(entry.stream_id.as_str());
+                if !keep {
+                    dropped.push((entry.stream_id.clone(), entry.endpoint_url.clone()));
+                }
+                keep
+            });
+        }
+        self.queued.retain(|_, queue| !queue.is_empty());
+        self.waiting
+            .retain(|endpoint_url| self.queued.contains_key(endpoint_url));
+        for (id, endpoint_url) in &dropped {
+            self.release(id, endpoint_url);
+        }
+        stream_ids
+            .iter()
+            .filter(|id| self.held.contains(id.as_str()))
+            .cloned()
+            .collect()
     }
 
     fn next_due_ms(&self) -> Option<u128> {
@@ -527,6 +630,9 @@ pub struct ForwardingProcessor {
     packer: Option<Arc<dyn SystemMessagePacker>>,
     /// Told the fate of every relay attempt — see [`ForwardingObserver`].
     observer: Option<Arc<dyn ForwardingObserver>>,
+    /// Entries handed to a delivery task that another processor has since
+    /// taken over: the task skips them.
+    revoked: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl ForwardingProcessor {
@@ -557,6 +663,7 @@ impl ForwardingProcessor {
             ws_pool: Arc::new(Mutex::new(HashMap::new())),
             packer: None,
             observer: None,
+            revoked: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -588,7 +695,9 @@ impl ForwardingProcessor {
     /// Start the forwarding processor. This runs indefinitely.
     ///
     /// Reading and delivering are decoupled. A reader task claims batches from
-    /// the queue; this loop sorts each entry into "ready now" or "parked until
+    /// the queue, and periodically reclaims entries left idle (a crashed or
+    /// restarted processor's, a long requested delay, an endpoint's
+    /// overflow). This loop sorts each entry into "ready now" or "parked until
     /// its not-before", and hands ready entries to one delivery task per
     /// endpoint, at most `max_concurrent_endpoints` at a time. A slow or
     /// failing endpoint therefore occupies one slot, and its backoff is a
@@ -597,18 +706,28 @@ impl ForwardingProcessor {
     /// Every claimed entry is held in exactly one place — parked, queued for
     /// its endpoint, or inside that endpoint's delivery task — and only the
     /// delivery task acks or deletes it, once. An endpoint never has two
-    /// delivery tasks at a time, which keeps its messages in order and its
-    /// pooled WebSocket single-user.
+    /// delivery tasks at a time, which keeps its pooled WebSocket single-user.
+    ///
+    /// Held entries have their claims refreshed every quarter of
+    /// `reclaim_idle_seconds`, so another processor's reclaim sweep (which only
+    /// takes entries idle that long) does not take them. Entries arriving from
+    /// the reader are checked the same way before they are held, and any the
+    /// refresh finds taken over are dropped here or skipped by their delivery
+    /// task: an entry is delivered by whichever processor holds its claim.
+    ///
+    /// The background tasks live as long as this call: dropping or aborting
+    /// it stops them.
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // The consumer group is created lazily on the first
         // `forward_queue_read` call; no explicit ensure step needed.
         info!(
-            "ForwardingProcessor started: consumer={}, group={}, batch_size={}, max_concurrent_endpoints={}, delivery_timeout={}s, ws_threshold={} msgs/10s, ws_idle_timeout={}s",
+            "ForwardingProcessor started: consumer={}, group={}, batch_size={}, max_concurrent_endpoints={}, delivery_timeout={}s, reclaim_idle={}s, ws_threshold={} msgs/10s, ws_idle_timeout={}s",
             self.consumer_name,
             self.config.consumer_group,
             self.config.batch_size,
             self.config.max_concurrent_endpoints,
             self.config.delivery_timeout_seconds,
+            self.config.reclaim_idle_seconds,
             self.config.ws_threshold_msgs_per_10s,
             self.config.ws_idle_timeout_seconds
         );
@@ -624,40 +743,25 @@ impl ForwardingProcessor {
             );
         }
 
-        // Spawn a background task to periodically reclaim stale messages.
-        //
-        // The reclaimed entries are not delivered from here. If that changes,
-        // it must skip entries this processor already holds (see `held` in
-        // the loop below): a parked retry sits claimed but idle for up to
-        // `max_backoff_ms`, which can exceed the 60 s idle threshold.
-        let db_clone = self.database.clone();
-        let group = self.config.consumer_group.clone();
-        let consumer = self.consumer_name.clone();
-        let batch_size = self.config.batch_size;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                match db_clone
-                    .forward_queue_autoclaim(&group, &consumer, Duration::from_secs(60), batch_size)
-                    .await
-                {
-                    Ok(entries) if !entries.is_empty() => {
-                        info!("Autoclaimed {} stale forwarding messages", entries.len());
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Autoclaim error: {}", e);
-                    }
-                }
-            }
-        });
+        // Whatever a previous run of this processor held is no longer held:
+        // its claims go idle and the reclaim sweep hands them back.
+        self.revoked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
-        // Spawn a background task to clean up idle WebSocket connections and
-        // idle per-endpoint state.
+        let reclaim_idle = Duration::from_secs(self.config.reclaim_idle_seconds.max(1));
+        let refresh_every = reclaim_idle / 4;
+        let sweep_every = reclaim_idle / 2;
+
+        // Background tasks, aborted when this call returns or is dropped.
+        let mut background: JoinSet<()> = JoinSet::new();
+
+        // Clean up idle WebSocket connections and idle per-endpoint state.
         let ws_pool = self.ws_pool.clone();
         let endpoints = self.endpoints.clone();
         let idle_timeout = Duration::from_secs(self.config.ws_idle_timeout_seconds);
-        tokio::spawn(async move {
+        background.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let mut pool = ws_pool.lock().await;
@@ -708,21 +812,56 @@ impl ForwardingProcessor {
             }
         });
 
-        // The read runs in its own task because it is not cancel-safe: a
-        // Redis XREADGROUP abandoned mid-flight still claims what it read.
-        // The channel holds one batch, so the reader stays at most one batch
-        // ahead of what this loop has accepted.
+        // The reader: new entries, and every `sweep_every` the entries left
+        // idle for `reclaim_idle`. It runs in its own task because a read is
+        // not cancel-safe: a Redis XREADGROUP abandoned mid-flight still
+        // claims what it read. The channel holds one batch, so the reader
+        // stays at most one batch ahead of what this loop has accepted.
         let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<ForwardQueueEntry>>(1);
-        let mut reader = JoinSet::new();
         {
             let database = self.database.clone();
             let group = self.config.consumer_group.clone();
             let consumer = self.consumer_name.clone();
-            let batch_size = self.config.batch_size;
-            reader.spawn(async move {
+            let batch_size = self.config.batch_size.max(1);
+            let block = sweep_every.min(Duration::from_secs(5));
+            background.spawn(async move {
+                let mut next_sweep = Instant::now() + sweep_every;
                 loop {
+                    if Instant::now() >= next_sweep {
+                        next_sweep = Instant::now() + sweep_every;
+                        // Until a sweep comes back short: an entry it returns
+                        // has had its idle time reset, so the next call moves
+                        // on to others.
+                        loop {
+                            match database
+                                .forward_queue_autoclaim(
+                                    &group,
+                                    &consumer,
+                                    reclaim_idle,
+                                    batch_size,
+                                )
+                                .await
+                            {
+                                Ok(entries) if entries.is_empty() => break,
+                                Ok(entries) => {
+                                    let full = entries.len() >= batch_size;
+                                    debug!("Reclaimed {} idle forwarding entries", entries.len());
+                                    if batch_tx.send(entries).await.is_err() {
+                                        return;
+                                    }
+                                    if !full {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Error reclaiming idle FORWARD_Q entries: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     match database
-                        .forward_queue_read(&group, &consumer, batch_size, Duration::from_secs(5))
+                        .forward_queue_read(&group, &consumer, batch_size, block)
                         .await
                     {
                         Ok(entries) if entries.is_empty() => {}
@@ -742,9 +881,11 @@ impl ForwardingProcessor {
 
         let this = Arc::new(self.clone());
         let mut scheduler = Scheduler::new(&self.config);
-        let mut deliveries: JoinSet<()> = JoinSet::new();
+        let mut deliveries: JoinSet<Vec<(u128, ForwardQueueEntry)>> = JoinSet::new();
         // Which endpoint, and which entries, each delivery task holds.
         let mut running: HashMap<tokio::task::Id, (String, Vec<String>)> = HashMap::new();
+        let mut refresh = tokio::time::interval(refresh_every);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             let now_ms = unix_timestamp_millis();
@@ -760,7 +901,7 @@ impl ForwardingProcessor {
                 let handle = deliveries.spawn(async move {
                     processor
                         .process_endpoint_batch(&task_endpoint, batch)
-                        .await;
+                        .await
                 });
                 running.insert(handle.id(), (endpoint_url, ids));
             }
@@ -773,17 +914,23 @@ impl ForwardingProcessor {
 
             tokio::select! {
                 Some(done) = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
-                    let id = match done {
-                        Ok((id, ())) => id,
+                    let (id, deferred) = match done {
+                        Ok((id, deferred)) => (id, deferred),
                         Err(e) => {
                             // The entries stay claimed in the store, as they
-                            // would after a crash; nothing here acks them.
+                            // would after a crash: no longer refreshed, they
+                            // go idle and the reclaim sweep hands them back.
                             error!("Forwarding delivery task failed: {e}");
-                            e.id()
+                            (e.id(), Vec::new())
                         }
                     };
                     if let Some((endpoint_url, ids)) = running.remove(&id) {
-                        scheduler.finished(&endpoint_url, &ids);
+                        let mut revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+                        for id in &ids {
+                            revoked.remove(id);
+                        }
+                        drop(revoked);
+                        scheduler.finished(&endpoint_url, &ids, deferred);
                     }
                 }
                 batch = batch_rx.recv(), if can_read => {
@@ -791,23 +938,82 @@ impl ForwardingProcessor {
                         return Err("forwarding queue reader stopped".into());
                     };
                     debug!("Read {} entries from FORWARD_Q", entries.len());
-                    scheduler.accept(entries, unix_timestamp_millis());
+                    // The batch may have waited in the channel; hold only what
+                    // is still ours, so nothing another processor took over in
+                    // the meantime is delivered twice.
+                    let ids: Vec<&str> = entries.iter().map(|e| e.stream_id.as_str()).collect();
+                    match self
+                        .database
+                        .forward_queue_refresh_claims(&self.config.consumer_group, &self.consumer_name, &ids)
+                        .await
+                    {
+                        Ok(lost) => {
+                            let lost: HashSet<String> = lost.into_iter().collect();
+                            let entries = entries
+                                .into_iter()
+                                .filter(|e| !lost.contains(&e.stream_id))
+                                .collect();
+                            scheduler.accept(entries, unix_timestamp_millis());
+                        }
+                        Err(e) => {
+                            // Not held, so they go idle and come back through
+                            // the reclaim sweep.
+                            warn!("Could not confirm claims on {} FORWARD_Q entries; leaving them for the reclaim sweep: {e}", ids.len());
+                        }
+                    }
+                }
+                _ = refresh.tick() => {
+                    let held = scheduler.held_ids();
+                    if !held.is_empty() {
+                        let ids: Vec<&str> = held.iter().map(String::as_str).collect();
+                        match self
+                            .database
+                            .forward_queue_refresh_claims(&self.config.consumer_group, &self.consumer_name, &ids)
+                            .await
+                        {
+                            Ok(lost) if lost.is_empty() => {}
+                            Ok(lost) => {
+                                // Usually entries a task has just finished
+                                // with; anything else was taken over.
+                                let in_flight = scheduler.forget(&lost);
+                                self.revoked
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .extend(in_flight);
+                            }
+                            Err(e) => warn!("Could not refresh claims on held FORWARD_Q entries: {e}"),
+                        }
+                    }
                 }
                 _ = tokio::time::sleep(wake_in) => {}
             }
         }
     }
 
+    /// Whether another processor has taken this entry over since it was
+    /// handed to a delivery task.
+    fn is_revoked(&self, stream_id: &str) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(stream_id)
+    }
+
     /// Deliver a batch of entries, all due now, for one endpoint.
     ///
-    /// Messages go out one at a time, in order. Each ends in exactly one
-    /// queue update: acked and deleted (delivered, refused, not permitted,
-    /// expired or abandoned), or replaced by a retry entry carrying a
-    /// not-before and then deleted. Once one attempt fails, the endpoint backs
-    /// off and the rest of the batch are retried after the backoff without
-    /// being sent now; so a failing endpoint costs one attempt per backoff
-    /// window, not one per message.
-    async fn process_endpoint_batch(&self, endpoint_url: &str, messages: Vec<ForwardQueueEntry>) {
+    /// Messages go out one at a time. Each attempted message ends in exactly
+    /// one queue update, made as soon as its outcome is known: acked and
+    /// deleted (delivered, refused, not permitted, expired or abandoned), or
+    /// replaced by a retry entry carrying a not-before and then deleted. Once
+    /// an attempt fails the endpoint backs off, and the rest of the batch is
+    /// returned unattempted, to be held until the backoff ends — without
+    /// spending their retries, since nothing was sent. So a failing endpoint
+    /// costs one attempt per backoff window, not one per message.
+    async fn process_endpoint_batch(
+        &self,
+        endpoint_url: &str,
+        messages: Vec<ForwardQueueEntry>,
+    ) -> Vec<(u128, ForwardQueueEntry)> {
         let msg_count = messages.len();
         debug!(
             "Processing {} messages for endpoint: {}",
@@ -848,11 +1054,12 @@ impl ForwardingProcessor {
             }
         }
 
+        let mut deferred = Vec::new();
         if ready.is_empty() {
-            return;
+            return deferred;
         }
 
-        // Update rate tracker and decide transport
+        // Decide transport from the rate so far.
         let use_websocket = {
             let mut endpoints = self.endpoints.write().await;
             let state = endpoints
@@ -860,7 +1067,6 @@ impl ForwardingProcessor {
                 .or_insert_with(|| EndpointState::new(self.config.rate_window_seconds));
 
             let now = Instant::now();
-            state.rate_tracker.record_and_rate(ready.len() as u32);
             state.last_activity = now;
 
             let rate = state.rate_tracker.current_rate();
@@ -889,24 +1095,31 @@ impl ForwardingProcessor {
         );
 
         let delivery_timeout = Duration::from_secs(self.config.delivery_timeout_seconds.max(1));
-        let mut succeeded = Vec::new();
+        let mut attempted = 0u32;
 
-        for msg in &ready {
+        for msg in ready {
+            if self.is_revoked(&msg.stream_id) {
+                debug!(
+                    "FORWARD_Q entry {} was taken over by another processor; not sending it",
+                    msg.stream_id
+                );
+                continue;
+            }
             // Checked per message, not once per batch: the attempt before this
             // one may just have failed and opened the backoff window.
             if let Some(retry_after_ms) = self.endpoint_backing_off(endpoint_url).await {
                 debug!(
-                    "Endpoint {} is backing off; deferring message (retry_count={})",
-                    endpoint_url, msg.retry_count
+                    "Endpoint {} is backing off; holding message {} until it ends",
+                    endpoint_url, msg.stream_id
                 );
-                self.retry_or_abandon(msg, endpoint_url, retry_after_ms)
-                    .await;
+                deferred.push((retry_after_ms, msg));
                 continue;
             }
 
+            attempted += 1;
             let attempt = tokio::time::timeout(
                 delivery_timeout,
-                self.deliver_message(endpoint_url, msg, use_websocket),
+                self.deliver_message(endpoint_url, &msg, use_websocket),
             )
             .await
             .unwrap_or_else(|_| {
@@ -935,8 +1148,18 @@ impl ForwardingProcessor {
                         forward_time_ms,
                         delay_info,
                     );
-                    self.observe(msg, relayed);
-                    succeeded.push(msg.stream_id.as_str());
+                    self.observe(&msg, relayed);
+                    // Acked at once rather than with the rest of the batch, so
+                    // a restart mid-batch does not leave a delivered entry to
+                    // be sent again.
+                    let ids = [msg.stream_id.as_str()];
+                    if let Err(e) = self
+                        .database
+                        .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
+                        .await
+                    {
+                        warn!("Failed to ACK and delete delivered entry: {e}");
+                    }
                     self.record_endpoint_success(endpoint_url).await;
                 }
                 // A refusal is final: drop it now and tell the sender. The peer
@@ -947,7 +1170,7 @@ impl ForwardingProcessor {
                         "FORWARD_REFUSED: to_did_hash={} from_did_hash={} endpoint={} status={} error={}",
                         msg.to_did_hash, msg.from_did_hash, endpoint_url, status, reason
                     );
-                    self.drop_final(msg, endpoint_url, ForwardOutcome::Refused { status })
+                    self.drop_final(&msg, endpoint_url, ForwardOutcome::Refused { status })
                         .await;
                 }
                 // So is an endpoint we will not send to: no retry changes the
@@ -957,7 +1180,7 @@ impl ForwardingProcessor {
                         "FORWARD_NOT_PERMITTED: to_did_hash={} from_did_hash={} endpoint={} error={}",
                         msg.to_did_hash, msg.from_did_hash, endpoint_url, reason
                     );
-                    self.drop_final(msg, endpoint_url, ForwardOutcome::NotPermitted)
+                    self.drop_final(&msg, endpoint_url, ForwardOutcome::NotPermitted)
                         .await;
                 }
                 Err(e @ RelayFailure::Retryable(_)) => {
@@ -975,27 +1198,23 @@ impl ForwardingProcessor {
                         }
                     }
 
-                    self.retry_or_abandon(msg, endpoint_url, retry_after_ms)
+                    self.retry_or_abandon(&msg, endpoint_url, retry_after_ms)
                         .await;
                 }
             }
         }
 
-        // ACK and delete succeeded messages
-        if !succeeded.is_empty() {
-            let count = succeeded.len();
-            if let Err(e) = self
-                .database
-                .forward_queue_ack_and_delete(&self.config.consumer_group, &succeeded)
-                .await
-            {
-                warn!(
-                    "Failed to ACK and delete {} succeeded entries: {}",
-                    count, e
-                );
+        // Only what was actually sent counts towards the WebSocket threshold:
+        // a held-back message would otherwise count again each time it is
+        // handed out.
+        if attempted > 0 {
+            let mut endpoints = self.endpoints.write().await;
+            if let Some(state) = endpoints.get_mut(endpoint_url) {
+                state.rate_tracker.record_and_rate(attempted);
             }
-            debug!("ACKed {} forwarded messages for {}", count, endpoint_url);
         }
+
+        deferred
     }
 
     /// When the endpoint's backoff ends (unix ms), if it is backing off now.
@@ -2004,7 +2223,7 @@ mod tests {
             "the busy endpoint gets no second task"
         );
 
-        s.finished("https://slow", &["1-0".to_string()]);
+        s.finished("https://slow", &["1-0".to_string()], Vec::new());
         let (again, batch) = s.next_batch().expect("its queued entry, once it is free");
         assert_eq!(again, "https://slow");
         assert_eq!(batch[0].stream_id, "3-0");
@@ -2055,8 +2274,81 @@ mod tests {
 
         let (endpoint, batch) = s.next_batch().expect("a batch");
         let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
-        s.finished(&endpoint, &ids);
+        s.finished(&endpoint, &ids, Vec::new());
         assert!(s.has_room());
+    }
+
+    /// One endpoint holds at most its share, so entries for others are still
+    /// taken while it is backlogged.
+    #[test]
+    fn a_backlogged_endpoint_holds_only_its_share() {
+        // 2 x 2 = 4 held at most, 2 of them for any one endpoint.
+        let mut s = scheduler(2, 2);
+        let backlog: Vec<_> = (0..10)
+            .map(|i| queued(&format!("{i}-0"), "https://backlogged"))
+            .collect();
+        s.accept(backlog, 5_000);
+        assert_eq!(s.held.len(), 2, "the rest is left to the reclaim sweep");
+        assert!(s.has_room(), "room remains for other endpoints");
+
+        s.accept(vec![queued("99-0", "https://other")], 5_000);
+        let mut endpoints = Vec::new();
+        while let Some((endpoint, _)) = s.next_batch() {
+            endpoints.push(endpoint);
+        }
+        assert!(endpoints.contains(&"https://other".to_string()));
+    }
+
+    /// Entries a delivery task held back stay held and parked until the
+    /// endpoint's backoff ends, unchanged: same id, same retry count.
+    #[test]
+    fn held_back_entries_wait_for_the_backoff_unchanged() {
+        let mut s = scheduler(10, 4);
+        s.accept(
+            vec![queued("1-0", "https://peer"), queued("2-0", "https://peer")],
+            5_000,
+        );
+        let (endpoint, batch) = s.next_batch().expect("a batch");
+        let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
+        // The first was attempted and failed; the second was held back.
+        let held_back = batch[1].clone();
+        s.finished(&endpoint, &ids, vec![(9_000, held_back)]);
+
+        assert_eq!(s.held.len(), 1);
+        assert!(s.next_batch().is_none(), "not before the backoff ends");
+        s.release_due(9_000);
+        let (_, batch) = s.next_batch().expect("due now");
+        assert_eq!(batch[0].stream_id, "2-0");
+        assert_eq!(batch[0].retry_count, 0, "its retry budget is untouched");
+    }
+
+    /// Entries another processor took over are dropped if parked or queued,
+    /// and reported if a delivery task has them.
+    #[test]
+    fn entries_taken_over_are_let_go() {
+        let mut s = scheduler(1, 4);
+        let mut later = queued("2-0", "https://parked");
+        later.not_before_ms = 9_000;
+        s.accept(
+            vec![
+                queued("1-0", "https://busy"),
+                later,
+                queued("3-0", "https://queued"),
+            ],
+            5_000,
+        );
+        let (busy, _) = s.next_batch().expect("a batch");
+        assert_eq!(busy, "https://busy");
+
+        let in_flight = s.forget(&["1-0".to_string(), "2-0".to_string(), "3-0".to_string()]);
+        assert_eq!(in_flight, vec!["1-0".to_string()]);
+        assert_eq!(
+            s.held.len(),
+            1,
+            "only the in-flight one, until its task ends"
+        );
+        assert!(s.next_due_ms().is_none());
+        assert!(s.next_batch().is_none());
     }
 
     /// A delay the sender asked for that is beyond what the processor parks
