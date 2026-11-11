@@ -96,6 +96,9 @@ return 0
     )
 });
 
+/// DIDs read per `HMGET` in [`Database::streaming_owners`].
+const OWNERS_BATCH: usize = 500;
+
 /// A GLOBAL_STREAMING value: (owner uuid, live).
 fn parse_owner(row: &str) -> Option<(&str, bool)> {
     let (owner, live) = row.split_once(':')?;
@@ -210,6 +213,41 @@ impl Database {
                 None
             }
         }
+    }
+
+    /// The streaming owner of each of `did_hashes`, live or not, in the order
+    /// asked; `None` where there is no entry. Read with `HMGET`, in batches
+    /// of `OWNERS_BATCH`; a failed read is an error.
+    pub async fn streaming_owners(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<Option<String>>, MediatorError> {
+        let mut owners = Vec::with_capacity(did_hashes.len());
+        if did_hashes.is_empty() {
+            return Ok(owners);
+        }
+        let mut conn = self.get_connection().await?;
+        for batch in did_hashes.chunks(OWNERS_BATCH) {
+            let rows: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg(self.keys().global_streaming())
+                .arg(batch)
+                .query_async(&mut conn)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        14,
+                        "NA".into(),
+                        &err,
+                        format!("streaming_owners() failed. Reason: {err}"),
+                    )
+                })?;
+            owners.extend(rows.into_iter().map(|row| {
+                row.as_deref()
+                    .and_then(parse_owner)
+                    .map(|(owner, _)| owner.to_string())
+            }));
+        }
+        Ok(owners)
     }
 
     /// Publishes a live message to the streaming service

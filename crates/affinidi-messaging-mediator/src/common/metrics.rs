@@ -144,6 +144,12 @@ pub mod names {
     /// `drop` rate points at frames queued for members just revoked or
     /// narrowed; `nudge` tracks pickup-only traffic.
     pub const MUX_LIVE_FRAMES_WITHHELD_TOTAL: &str = "mux_live_frames_withheld_total";
+    /// counter: Live-streaming entries this instance found missing from the
+    /// store and claimed back (label `kind`: `direct` or `mux`), each followed
+    /// by an inbox redelivery. Normally 0. It counts while instances on a
+    /// release before 0.52 share the store (a rolling upgrade: they remove
+    /// entries without checking the owner), or after the store lost data.
+    pub const STREAMING_ENTRIES_RECLAIMED_TOTAL: &str = "streaming_entries_reclaimed_total";
     /// gauge: Bytes currently free in the global WebSocket send-buffer pool.
     pub const WS_SEND_BUFFER_AVAILABLE_BYTES: &str = "ws_send_buffer_available_bytes";
     /// counter: Old WebSocket sessions displaced by a newer duplicate for the same DID

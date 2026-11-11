@@ -2523,6 +2523,53 @@ async fn check_streaming_deregister_keeps_another_owner(store: Arc<dyn MediatorS
     );
 }
 
+/// `streaming_owners` answers in the order asked: the owning instance for a
+/// registered DID, live or not, and `None` for one nobody registered, across
+/// more DIDs than one batch.
+async fn check_streaming_owners(store: Arc<dyn MediatorStore>) {
+    assert!(
+        store
+            .streaming_owners(&[])
+            .await
+            .expect("no DIDs")
+            .is_empty()
+    );
+    let (a, b) = ("conformance-owners-a", "conformance-owners-b");
+    let dids: Vec<String> = (0..1203)
+        .map(|i| format!("did_hash_streaming_owners_{i}"))
+        .collect();
+    let mut expected = Vec::with_capacity(dids.len());
+    for (i, did) in dids.iter().enumerate() {
+        let owner = match i % 3 {
+            0 => None,
+            1 => Some((a, StreamingClientState::Registered)),
+            _ => Some((b, StreamingClientState::Live)),
+        };
+        if let Some((uuid, state)) = owner {
+            store
+                .streaming_set_state(did, uuid, state)
+                .await
+                .expect("streaming_set_state");
+        }
+        expected.push(owner.map(|(uuid, _)| uuid.to_string()));
+    }
+    assert_eq!(
+        store
+            .streaming_owners(&dids)
+            .await
+            .expect("streaming_owners"),
+        expected
+    );
+    for (did, owner) in dids.iter().zip(&expected) {
+        if let Some(uuid) = owner {
+            store
+                .streaming_set_state(did, uuid, StreamingClientState::Deregistered)
+                .await
+                .expect("deregister");
+        }
+    }
+}
+
 /// Cross-instance precedence on a shared store (Redis): a direct socket
 /// outranks a mux entry on another instance, the newest registration wins
 /// otherwise, a stale instance never overwrites the owner, and a mux entry
@@ -3241,6 +3288,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
     check_streaming_deregister_keeps_another_owner(store.clone()).await;
+    check_streaming_owners(store.clone()).await;
     check_streaming_cross_instance_precedence(store.clone()).await;
     check_repeated_store(store.clone()).await;
     check_concurrent_delete(store.clone()).await;
@@ -3402,6 +3450,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn streaming_deregister_keeps_another_owner() {
                 check_streaming_deregister_keeps_another_owner(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn streaming_owners() {
+                check_streaming_owners(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn repeated_store() {

@@ -1837,6 +1837,26 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         force_delivery: bool,
     ) -> Option<String>;
 
+    /// The instance holding each of `did_hashes`, in the order asked: its
+    /// streaming uuid for a DID with an entry (live or not), `None` for a DID
+    /// no instance has registered. Unlike
+    /// [`streaming_is_client_live`](Self::streaming_is_client_live), a failed
+    /// read is an error, never "nobody", so a caller can act on a missing
+    /// entry.
+    ///
+    /// The default asks one DID at a time; a store shared between processes
+    /// reads them in batches.
+    async fn streaming_owners(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<Option<String>>, MediatorError> {
+        let mut owners = Vec::with_capacity(did_hashes.len());
+        for did_hash in did_hashes {
+            owners.push(self.streaming_is_client_live(did_hash, true).await);
+        }
+        Ok(owners)
+    }
+
     /// Publish a delivery notification to the streaming channel for
     /// `mediator_uuid`. Subscribers (the WebSocket task on that mediator
     /// instance) deliver the message to the connected client.
