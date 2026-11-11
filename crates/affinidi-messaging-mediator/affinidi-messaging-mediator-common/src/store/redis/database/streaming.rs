@@ -217,7 +217,7 @@ impl Database {
 
     /// The streaming owner of each of `did_hashes`, live or not, in the order
     /// asked; `None` where there is no entry. Read with `HMGET`, in batches
-    /// of [`OWNERS_BATCH`]; a failed read is an error.
+    /// of `OWNERS_BATCH`; a failed read is an error.
     pub async fn streaming_owners(
         &self,
         did_hashes: &[String],
