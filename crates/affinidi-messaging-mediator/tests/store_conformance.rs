@@ -602,6 +602,53 @@ async fn check_access_list_lifecycle(store: Arc<dyn MediatorStore>) {
         .await
         .expect("access_list_clear");
     assert_eq!(access_list_len(&store, owner).await, 0);
+
+    // The limit holds below, at and above it, the same on every backend.
+    let limited = "did_hash_access_list_limited";
+    let batch = |from: usize, n: usize| -> Vec<String> {
+        (from..from + n).map(|i| format!("did_hash_member_{i}")).collect()
+    };
+
+    let empty = store
+        .access_list_add(3, limited, &[])
+        .await
+        .expect("access_list_add with nothing to add");
+    assert!(empty.did_hashes.is_empty() && !empty.truncated);
+
+    let below = store
+        .access_list_add(3, limited, &batch(0, 2))
+        .await
+        .expect("access_list_add below the limit");
+    assert_eq!(below.did_hashes, batch(0, 2));
+    assert!(!below.truncated);
+
+    let to_limit = store
+        .access_list_add(3, limited, &batch(2, 3))
+        .await
+        .expect("access_list_add across the limit");
+    assert_eq!(to_limit.did_hashes, batch(2, 1), "only the room left is used");
+    assert!(to_limit.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+
+    let at_limit = store
+        .access_list_add(3, limited, &batch(5, 2))
+        .await
+        .expect("access_list_add at the limit");
+    assert!(at_limit.did_hashes.is_empty(), "a full list takes nothing");
+    assert!(at_limit.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+
+    // A limit lowered below the current size adds nothing and does not fail.
+    let above = store
+        .access_list_add(1, limited, &batch(7, 1))
+        .await
+        .expect("access_list_add over a lowered limit");
+    assert!(above.did_hashes.is_empty() && above.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+    store
+        .access_list_clear(limited)
+        .await
+        .expect("access_list_clear");
 }
 
 /// Forward-queue: an unread enqueued entry can be deleted directly, dropping

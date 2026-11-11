@@ -312,7 +312,10 @@ impl Database {
         .await
     }
 
-    /// Adds a number of DID hashes to the Access List
+    /// Adds a number of DID hashes to the Access List, up to
+    /// `access_list_limit` entries in total. When the request does not fit,
+    /// the first `limit - current` hashes are added and `truncated` is set,
+    /// as on the other backends.
     /// - `did_hash` - DID Hash to add to
     /// - `hashes` - Hashes to add
     ///
@@ -333,35 +336,34 @@ impl Database {
         async move {
             debug!("Adding to Access List");
 
-            let count = self.access_list_count(did_hash).await?;
-            let mut truncated = false;
-
-            let hashes = if hashes.len() + count > access_list_limit {
-                truncated = true;
-                &hashes[0..(hashes.len() - (access_list_limit - count))]
-            } else {
-                hashes
-            };
-
-            let mut con = self.get_connection().await?;
-            let mut query = redis::cmd("SADD");
-            let mut query = query.arg(self.keys().access_list(did_hash));
-
-            for hash in hashes {
-                query = query.arg(hash);
+            if hashes.is_empty() {
+                return Ok(MediatorAccessListAddResponse {
+                    did_hashes: Vec::new(),
+                    truncated: false,
+                });
             }
 
-            query.exec_async(&mut con).await.map_err(|err| {
-                MediatorError::database_from_redis(
-                    14,
-                    "NA".to_string(),
-                    &err,
-                    format!("access_list_add failed. Reason: {err}"),
-                )
-            })?;
+            // Count, truncate and add in one step, so concurrent adds cannot
+            // each see room that only one of them has.
+            let mut con = self.get_connection().await?;
+            let (truncated, hashes): (i64, Vec<String>) = ACCESS_LIST_ADD
+                .key(self.keys().access_list(did_hash))
+                .arg(access_list_limit)
+                .arg(hashes)
+                .invoke_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        14,
+                        "NA".to_string(),
+                        &err,
+                        format!("access_list_add failed. Reason: {err}"),
+                    )
+                })?;
+            let truncated = truncated != 0;
 
             Ok(MediatorAccessListAddResponse {
-                did_hashes: hashes.to_vec(),
+                did_hashes: hashes,
                 truncated,
             })
         }
@@ -493,3 +495,29 @@ impl Database {
         .await
     }
 }
+
+/// Add ARGV[2..] to the set KEYS[1] while it holds fewer than ARGV[1]
+/// members: when they do not all fit, only the first `limit - SCARD` are
+/// added. Returns `{truncated (0/1), added}`.
+static ACCESS_LIST_ADD: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local limit = tonumber(ARGV[1])
+local count = redis.call('SCARD', KEYS[1])
+local n = #ARGV - 1
+local take = n
+local truncated = 0
+if count + n > limit then
+  truncated = 1
+  take = limit - count
+  if take < 0 then take = 0 end
+end
+local added = {}
+for i = 2, take + 1 do added[#added + 1] = ARGV[i] end
+for i = 1, #added, 500 do
+  redis.call('SADD', KEYS[1], unpack(added, i, math.min(i + 499, #added)))
+end
+return {truncated, added}
+"#,
+    )
+});
