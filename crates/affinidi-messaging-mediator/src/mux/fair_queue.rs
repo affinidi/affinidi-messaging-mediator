@@ -23,7 +23,7 @@
 //!   their own that is always written first.
 //!
 //! Neither piece writes anything, acknowledges anything or deletes anything:
-//! the socket loop still writes one frame at a time, after its `may_write`
+//! the socket loop still writes one frame at a time, after its `live_frame`
 //! check, exactly as before. Direct sockets use neither and are unchanged.
 
 use std::collections::{HashMap, HashSet, VecDeque};

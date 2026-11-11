@@ -33,6 +33,14 @@ use crate::tasks::websocket_streaming::{
     EntryKind, QueuedCommand, StreamingTask, StreamingUpdate, StreamingUpdateState,
 };
 
+/// [`MuxConn::live_frame`]'s answer for one queued live frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveFrame {
+    Write,
+    Nudge,
+    Drop,
+}
+
 /// One live mux connection.
 pub struct MuxConn {
     pub session: Mutex<MuxSession>,
@@ -81,7 +89,10 @@ impl MuxConn {
     }
 
     /// Register `member` with the streaming task on this connection's queue,
-    /// and turn live delivery on when its scope includes `receive`.
+    /// and turn live delivery on when its scope includes `receive` or
+    /// `pickup`. A `pickup`-only member's frames are not written: each one
+    /// becomes a resync, so the principal learns mail waits without polling
+    /// ([`live_frame`](Self::live_frame)).
     pub async fn register_member(&self, streaming: &StreamingTask, member: &MuxMember) {
         // A fresh registration: the streaming task says again if another
         // connection holds the member's traffic.
@@ -101,10 +112,8 @@ impl MuxConn {
                 },
             })
             .await;
-        if member
-            .scope
-            .contains(affinidi_messaging_mediator_common::store::mux::MuxCapability::Receive)
-        {
+        use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
+        if member.scope.contains(Cap::Receive) || member.scope.contains(Cap::Pickup) {
             let _ = streaming
                 .channel
                 .send(StreamingUpdate {
@@ -217,11 +226,35 @@ impl MuxConn {
         gone
     }
 
-    /// Whether a frame tagged for `did_hash` may still be written: it is the
-    /// principal's own, or a current member's.
-    pub async fn may_write(&self, did_hash: &str) -> bool {
+    /// What to do with a live frame tagged for `did_hash`, decided when the
+    /// socket is about to write it, against the member's scope *now*:
+    ///
+    /// - the principal's own, or a member holding `receive`: write it;
+    /// - a member holding `pickup` but not `receive`: do not push the frame,
+    ///   but tell the principal mail waits for it (a resync: a pickup
+    ///   `status` on DIDComm, a drain on raw TSP);
+    /// - anything else (a member that left, or that holds neither): drop it.
+    ///   The message stays in the member's inbox (§7.3, R1.1).
+    pub async fn live_frame(&self, did_hash: &str) -> LiveFrame {
+        use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
         let s = self.session.lock().await;
-        did_hash == s.principal_hash || s.get(did_hash).is_some()
+        if did_hash == s.principal_hash {
+            return LiveFrame::Write;
+        }
+        match s.get(did_hash) {
+            Some(m) if m.scope.contains(Cap::Receive) => LiveFrame::Write,
+            Some(m) if m.scope.contains(Cap::Pickup) => LiveFrame::Nudge,
+            _ => LiveFrame::Drop,
+        }
+    }
+
+    /// Owe `did_hash` a resync: the socket tells the principal its mail waits.
+    pub fn nudge(&self, did_hash: &str) {
+        if let Some(slots) = &self.slots {
+            slots.raise_resync(did_hash);
+        }
+        self.resync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
