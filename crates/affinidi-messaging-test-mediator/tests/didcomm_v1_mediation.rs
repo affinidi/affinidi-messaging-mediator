@@ -572,8 +572,22 @@ async fn by_default_only_the_authenticating_key_can_be_registered() {
     assert_eq!(keys[0]["recipient_key"], client.identity.verkey.to_base58());
 }
 
-/// A key already registered to one account stays there when a second account
-/// asks for it, even when that second account authenticates *with* that key.
+/// The keys `client` holds, as base58 strings.
+async fn keylist_of(client: &Client) -> Vec<String> {
+    let query = client
+        .request(&MessageV1::new(cm::KEYLIST_QUERY_TYPE, serde_json::json!({})).unwrap())
+        .await
+        .expect("keylist");
+    query.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|k| k["recipient_key"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A key its holder registered stays with the holder: another account's add
+/// is refused, even with unproven keys allowed.
 #[tokio::test]
 async fn a_registered_key_is_not_moved_to_another_account() {
     let mediator = TestMediator::builder()
@@ -583,34 +597,167 @@ async fn a_registered_key_is_not_moved_to_another_account() {
         .spawn()
         .await
         .expect("spawn mediator");
-    let first = new_client(&mediator);
-    let second = new_client(&mediator);
+    let holder = new_client(&mediator);
+    let other = new_client(&mediator);
 
-    // `first` registers `second`'s key before `second` does.
-    let claimed = first
-        .request(&add_key(second.identity.verkey))
+    let own = holder
+        .request(&add_key(holder.identity.verkey))
         .await
         .expect("update response");
-    assert_eq!(claimed.body["updated"][0]["result"], "success");
+    assert_eq!(own.body["updated"][0]["result"], "success");
 
-    let response = second
-        .request(&add_key(second.identity.verkey))
+    let response = other
+        .request(&add_key(holder.identity.verkey))
         .await
         .expect("update response");
     assert_eq!(
         response.body["updated"][0]["result"], "client_error",
         "a key held by another account must not be re-registered"
     );
-
-    let query = first
-        .request(&MessageV1::new(cm::KEYLIST_QUERY_TYPE, serde_json::json!({})).unwrap())
-        .await
-        .expect("keylist");
     assert_eq!(
-        query.body["keys"][0]["recipient_key"],
-        second.identity.verkey.to_base58(),
+        keylist_of(&holder).await,
+        vec![holder.identity.verkey.to_base58()],
         "the key stays with the account that registered it"
     );
+    assert!(keylist_of(&other).await.is_empty());
+}
+
+/// A key another account registered without proof is taken over by its
+/// holder when the holder adds it with a request that key authenticates.
+#[tokio::test]
+async fn the_keys_holder_takes_over_an_unproven_registration() {
+    let mediator = TestMediator::builder()
+        .didcomm_v1(true, true)
+        .didcomm_v1_routing_keys(true, 256)
+        .global_acl_default(MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap())
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    let first = new_client(&mediator);
+    let holder = new_client(&mediator);
+
+    // `first` registers the holder's key before the holder does.
+    let claimed = first
+        .request(&add_key(holder.identity.verkey))
+        .await
+        .expect("update response");
+    assert_eq!(claimed.body["updated"][0]["result"], "success");
+
+    let response = holder
+        .request(&add_key(holder.identity.verkey))
+        .await
+        .expect("update response");
+    assert_eq!(
+        response.body["updated"][0]["result"], "success",
+        "the key's holder must be able to take it over"
+    );
+    assert_eq!(
+        keylist_of(&holder).await,
+        vec![holder.identity.verkey.to_base58()]
+    );
+    assert!(
+        keylist_of(&first).await.is_empty(),
+        "the unproven registration is gone"
+    );
+
+    // And `first` cannot take it back.
+    let again = first
+        .request(&add_key(holder.identity.verkey))
+        .await
+        .expect("update response");
+    assert_eq!(again.body["updated"][0]["result"], "client_error");
+}
+
+/// Re-adding a key the account already holds is `no_change` under the default
+/// policy too, and still after the account loses `RECEIVE_MESSAGES`; a remove
+/// needs no `RECEIVE_MESSAGES`.
+#[tokio::test]
+async fn own_keys_re_add_as_no_change_and_remove_without_receive() {
+    let mediator = TestMediator::builder()
+        .didcomm_v1(true, true)
+        .global_acl_default(MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap())
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    let client = new_client(&mediator);
+    let own = client.identity.verkey;
+
+    let added = client
+        .request(&add_key(own))
+        .await
+        .expect("update response");
+    assert_eq!(added.body["updated"][0]["result"], "success");
+    let again = client
+        .request(&add_key(own))
+        .await
+        .expect("update response");
+    assert_eq!(again.body["updated"][0]["result"], "no_change");
+
+    let mut acls = MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap();
+    acls.set_receive_messages(false, true, true)
+        .expect("revoke receive_messages");
+    mediator
+        .set_acl(&own.to_did_key(), acls)
+        .await
+        .expect("set ACLs");
+
+    let after_revoke = client
+        .request(&add_key(own))
+        .await
+        .expect("update response");
+    assert_eq!(after_revoke.body["updated"][0]["result"], "no_change");
+
+    let remove = cm::keylist_update(
+        &[cm::KeylistUpdate {
+            recipient_key: own,
+            action: cm::KeylistAction::Remove,
+        }],
+        cm::KeyFormat::Base58,
+    )
+    .unwrap();
+    let removed = client.request(&remove).await.expect("update response");
+    assert_eq!(
+        removed.body["updated"][0]["result"], "success",
+        "a remove must not need RECEIVE_MESSAGES"
+    );
+    assert!(keylist_of(&client).await.is_empty());
+}
+
+/// Another account claiming a key between the add's checks and its bind gets
+/// the add a `client_error`, not a `server_error`, and the key stays with the
+/// account that bound it.
+#[tokio::test]
+async fn an_add_that_loses_a_race_for_the_key_is_a_client_error() {
+    use affinidi_messaging_mediator::messages::v1_mediation::test_hooks::pause_before_bind;
+
+    let mediator = TestMediator::builder()
+        .didcomm_v1(true, true)
+        .didcomm_v1_routing_keys(true, 256)
+        .global_acl_default(MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap())
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    let slow = new_client(&mediator);
+    let fast = new_client(&mediator);
+    let key = PrivateIdentity::generate("did:example:contested")
+        .unwrap()
+        .verkey;
+
+    let (reached, resume) = pause_before_bind(&key.to_base58());
+    let slow_add = add_key(key);
+    let (slow_result, ()) = tokio::join!(slow.request(&slow_add), async {
+        reached.await.expect("the slow add reaches the bind");
+        let won = fast.request(&add_key(key)).await.expect("update response");
+        assert_eq!(won.body["updated"][0]["result"], "success");
+        let _ = resume.send(());
+    });
+    let slow_result = slow_result.expect("update response");
+    assert_eq!(
+        slow_result.body["updated"][0]["result"], "client_error",
+        "losing the race is a refusal, not a fault"
+    );
+    assert_eq!(keylist_of(&fast).await, vec![key.to_base58()]);
+    assert!(keylist_of(&slow).await.is_empty());
 }
 
 /// `max_routing_keys_per_account` caps what one account holds: the add past it

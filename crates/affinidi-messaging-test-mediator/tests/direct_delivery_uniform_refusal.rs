@@ -174,3 +174,76 @@ async fn sender_refusals_do_not_depend_on_the_recipient() {
 
     env.shutdown().await.expect("shutdown");
 }
+
+/// A sender without `SEND_MESSAGES` gets the same refusal whether the
+/// recipient exists or not.
+#[tokio::test]
+async fn a_sender_that_may_not_send_is_answered_the_same_for_any_recipient() {
+    init_tracing();
+    let env = spawn_direct_delivery_env().await;
+    let alice = env.add_user("alice").await.expect("add alice");
+    let bob = env.add_user("bob").await.expect("add bob");
+
+    let mut acls = acl::allow_all();
+    acls.set_send_messages(false, true, true)
+        .expect("revoke send_messages");
+    env.mediator
+        .set_acl(&alice.did, acls)
+        .await
+        .expect("set ACLs");
+
+    let known = send_direct(&env, &alice, &bob.did, true)
+        .await
+        .expect_err("a sender without SEND_MESSAGES must be refused");
+    let unknown = send_direct(&env, &alice, &unknown_did(&env), true)
+        .await
+        .expect_err("a sender without SEND_MESSAGES must be refused");
+
+    assert!(
+        known.contains("authorization.send"),
+        "expected the sender-side refusal, got: {known}"
+    );
+    assert_eq!(
+        known, unknown,
+        "whether the recipient exists must not change the answer to a sender without SEND_MESSAGES"
+    );
+
+    env.shutdown().await.expect("shutdown");
+}
+
+/// With session matching off and anonymous direct delivery not allowed, an
+/// anonymous envelope gets the same refusal whether the recipient exists or
+/// not.
+#[tokio::test]
+async fn an_anonymous_sender_is_answered_the_same_for_any_recipient() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .local_direct_delivery(true, false)
+        .force_session_did_match(false)
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    let env = TestEnvironment::new(mediator)
+        .await
+        .expect("wire the SDK to the mediator");
+    let alice = env.add_user("alice").await.expect("add alice");
+    let bob = env.add_user("bob").await.expect("add bob");
+
+    let known = send_direct(&env, &alice, &bob.did, false)
+        .await
+        .expect_err("anonymous direct delivery must be refused");
+    let unknown = send_direct(&env, &alice, &unknown_did(&env), false)
+        .await
+        .expect_err("anonymous direct delivery must be refused");
+
+    assert!(
+        known.contains("message.anonymous"),
+        "expected the anonymous-sender refusal, got: {known}"
+    );
+    assert_eq!(
+        known, unknown,
+        "whether the recipient exists must not change the answer to an anonymous sender"
+    );
+
+    env.shutdown().await.expect("shutdown");
+}

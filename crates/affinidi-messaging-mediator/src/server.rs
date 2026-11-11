@@ -933,6 +933,16 @@ pub async fn serve_internal(
                  required for stock Credo wallets; it does NOT open anonymous DIDComm v2 inbound."
             );
         }
+        if shared_state.config.didcomm_v1.allow_unproven_routing_keys {
+            warn!(
+                "DIDComm v1: allow_unproven_routing_keys is ON. keylist-update registers any key \
+                 a client lists, with no proof it holds that key; the first account to list a \
+                 key receives forwards addressed to it until the key's holder takes it over by \
+                 registering it with a request that key authenticates. Required for stock \
+                 Aries wallets. Each account holds at most {} routing keys.",
+                shared_state.config.didcomm_v1.max_routing_keys_per_account
+            );
+        }
     }
 
     let app: Router = application_routes(&api_prefix, &shared_state);

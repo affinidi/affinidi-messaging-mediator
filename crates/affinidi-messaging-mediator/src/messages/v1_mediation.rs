@@ -228,15 +228,27 @@ async fn coordinate_mediation(
                 false
             };
 
-            let mut results = Vec::with_capacity(updates.len());
-            for update in updates {
-                let result = apply_keylist_update(state, account, can_receive, &update).await;
-                results.push(cm::KeylistUpdated {
+            let mut batch = KeylistBatch {
+                can_receive,
+                held: None,
+                added: Vec::new(),
+            };
+            let mut outcomes = Vec::with_capacity(updates.len());
+            for (index, update) in updates.iter().enumerate() {
+                outcomes
+                    .push(apply_keylist_update(state, account, &mut batch, index, update).await);
+            }
+            batch.settle(state, account, &mut outcomes).await;
+
+            let results: Vec<cm::KeylistUpdated> = updates
+                .into_iter()
+                .zip(outcomes)
+                .map(|(update, result)| cm::KeylistUpdated {
                     recipient_key: update.recipient_key,
                     action: update.action,
                     result,
-                });
-            }
+                })
+                .collect();
 
             cm::keylist_update_response(&msg.id, &results, cm::KeyFormat::Base58)
                 .map_err(|e| v1_build_error(session, e))
@@ -295,31 +307,135 @@ async fn account_can_receive(
         .is_some_and(|acls| authz::require_capability(&acls, Capability::ReceiveMessages).is_ok()))
 }
 
+/// What one `keylist-update` has done so far, so the account's keys are
+/// counted once per request rather than once per entry.
+struct KeylistBatch {
+    /// The account holds `RECEIVE_MESSAGES`.
+    can_receive: bool,
+    /// Keys the account holds, counted when first needed and kept current as
+    /// this request adds and removes.
+    held: Option<usize>,
+    /// Entries this request added, by index and verkey, in order.
+    added: Vec<(usize, String)>,
+}
+
+impl KeylistBatch {
+    /// How many keys the account holds, counting only on first use.
+    async fn held(
+        &mut self,
+        state: &SharedData,
+        account: &ClientAccount,
+    ) -> Result<usize, MediatorError> {
+        if let Some(held) = self.held {
+            return Ok(held);
+        }
+        let held = held_routing_keys(state, account).await?;
+        self.held = Some(held);
+        Ok(held)
+    }
+
+    fn record_add(&mut self, index: usize, verkey: String) {
+        if let Some(held) = self.held.as_mut() {
+            *held += 1;
+        }
+        self.added.push((index, verkey));
+    }
+
+    fn record_remove(&mut self, verkey: &str) {
+        if let Some(held) = self.held.as_mut() {
+            *held = held.saturating_sub(1);
+        }
+        self.added.retain(|(_, added)| added != verkey);
+    }
+
+    /// Enforce the limit once more against what the store now holds.
+    ///
+    /// Concurrent requests for one account can each pass their own count.
+    /// Counting again after this request's adds catches that: if the account
+    /// is over its limit, this request's newest adds are withdrawn (only
+    /// while still bound to this account) and reported as refused. Two
+    /// racing requests may then both lose keys, but the account never keeps
+    /// more than its limit.
+    async fn settle(
+        &self,
+        state: &SharedData,
+        account: &ClientAccount,
+        outcomes: &mut [cm::KeylistResult],
+    ) {
+        if self.added.is_empty() {
+            return;
+        }
+        let max = state.config.didcomm_v1.max_routing_keys_per_account as usize;
+        let (withdraw, refused) = match held_routing_keys(state, account).await {
+            Ok(held) if held <= max => return,
+            Ok(held) => {
+                warn!(
+                    did = %account.did,
+                    held,
+                    max,
+                    "v1 keylist adds withdrawn: concurrent adds took the account over its limit"
+                );
+                (held - max, cm::KeylistResult::ClientError)
+            }
+            Err(e) => {
+                warn!(
+                    did = %account.did,
+                    error = %e,
+                    "v1 keylist recount failed; withdrawing this request's adds"
+                );
+                (self.added.len(), cm::KeylistResult::ServerError)
+            }
+        };
+
+        for (index, verkey) in self.added.iter().rev().take(withdraw) {
+            outcomes[*index] = match state
+                .database
+                .v1_routing_key_unbind_if_owner(verkey, &account.did)
+                .await
+            {
+                Ok(_) => refused,
+                Err(e) => {
+                    warn!(%verkey, error = %e, "v1 keylist add could not be withdrawn");
+                    cm::KeylistResult::ServerError
+                }
+            };
+        }
+    }
+}
+
 /// Apply one keylist change, reporting the per-key outcome rather than failing
 /// the whole batch — RFC 0211 expects a result for every entry.
 async fn apply_keylist_update(
     state: &SharedData,
     account: &ClientAccount,
-    can_receive: bool,
+    batch: &mut KeylistBatch,
+    index: usize,
     update: &cm::KeylistUpdate,
 ) -> cm::KeylistResult {
     let verkey = update.recipient_key.to_base58();
 
     match update.action {
-        cm::KeylistAction::Add => add_routing_key(state, account, can_receive, update).await,
+        cm::KeylistAction::Add => add_routing_key(state, account, batch, index, update).await,
 
         cm::KeylistAction::Remove => {
             match state.database.v1_routing_key_lookup(&verkey).await {
-                Ok(Some(owner)) if owner == account.did => {
-                    match state.database.v1_routing_key_unbind(&verkey).await {
-                        Ok(true) => cm::KeylistResult::Success,
-                        Ok(false) => cm::KeylistResult::NoChange,
-                        Err(e) => {
-                            warn!(%verkey, error = %e, "v1 keylist remove failed");
-                            cm::KeylistResult::ServerError
-                        }
+                // Removed only while still this account's: a binding another
+                // account made in the meantime is left alone.
+                Ok(Some(owner)) if owner == account.did => match state
+                    .database
+                    .v1_routing_key_unbind_if_owner(&verkey, &account.did)
+                    .await
+                {
+                    Ok(true) => {
+                        batch.record_remove(&verkey);
+                        cm::KeylistResult::Success
                     }
-                }
+                    Ok(false) => cm::KeylistResult::NoChange,
+                    Err(e) => {
+                        warn!(%verkey, error = %e, "v1 keylist remove failed");
+                        cm::KeylistResult::ServerError
+                    }
+                },
                 // Not bound at all — a no-op, not an error.
                 Ok(None) => cm::KeylistResult::NoChange,
                 // Bound to someone else: refuse, and report it the same way as
@@ -340,16 +456,37 @@ async fn apply_keylist_update(
 
 /// Register one routing key for `account`. Every refusal is `client_error`,
 /// so the reply does not say which rule applied; the reason is logged.
+///
+/// A key belongs to at most one account. The one exception to "first add
+/// wins": a key registered by an account that never showed it holds it can
+/// be taken over by the key's own holder, the account whose requests that
+/// key authenticates. Otherwise, with `allow_unproven_routing_keys` on, the
+/// first account to list a key could keep its real holder from ever
+/// registering it.
 async fn add_routing_key(
     state: &SharedData,
     account: &ClientAccount,
-    can_receive: bool,
+    batch: &mut KeylistBatch,
+    index: usize,
     update: &cm::KeylistUpdate,
 ) -> cm::KeylistResult {
     let verkey = update.recipient_key.to_base58();
     let policy = &state.config.didcomm_v1;
 
-    if !can_receive {
+    let owner = match state.database.v1_routing_key_lookup(&verkey).await {
+        Ok(owner) => owner,
+        Err(e) => {
+            warn!(%verkey, error = %e, "v1 keylist lookup failed");
+            return cm::KeylistResult::ServerError;
+        }
+    };
+    // Already ours: nothing to do, and say so rather than claiming to have
+    // made a change.
+    if owner.as_deref() == Some(account.did.as_str()) {
+        return cm::KeylistResult::NoChange;
+    }
+
+    if !batch.can_receive {
         warn!(
             did = %account.did,
             %verkey,
@@ -363,7 +500,8 @@ async fn add_routing_key(
     // one it has demonstrably used, so by default it is the only one it may
     // register. Deployments serving Aries wallets, which register a new key
     // per connection, opt in to accepting the others.
-    if update.recipient_key != account.verkey && !policy.allow_unproven_routing_keys {
+    let proven = update.recipient_key == account.verkey;
+    if !proven && !policy.allow_unproven_routing_keys {
         warn!(
             did = %account.did,
             %verkey,
@@ -373,29 +511,20 @@ async fn add_routing_key(
         return cm::KeylistResult::ClientError;
     }
 
-    match state.database.v1_routing_key_lookup(&verkey).await {
-        // Already ours: nothing to do, and say so rather than claiming to have
-        // made a change.
-        Ok(Some(owner)) if owner == account.did => return cm::KeylistResult::NoChange,
-        // Someone else's key. It stays where it is: moving it would hand this
-        // client another account's inbound traffic.
-        Ok(Some(_)) => {
-            warn!(
-                did = %account.did,
-                %verkey,
-                "v1 keylist add refused: the key is registered to another account"
-            );
-            return cm::KeylistResult::ClientError;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(%verkey, error = %e, "v1 keylist lookup failed");
-            return cm::KeylistResult::ServerError;
-        }
+    // Another account holds it. Only the key's holder may take it over, and
+    // only from an account other than the holder's own (which, the account
+    // being the holder's `did:key`, is the one case `proven` excludes here).
+    if owner.is_some() && !proven {
+        warn!(
+            did = %account.did,
+            %verkey,
+            "v1 keylist add refused: the key is registered to another account"
+        );
+        return cm::KeylistResult::ClientError;
     }
 
     let max = policy.max_routing_keys_per_account as usize;
-    match held_routing_keys(state, account).await {
+    match batch.held(state, account).await {
         Ok(held) if held >= max => {
             warn!(
                 did = %account.did,
@@ -413,41 +542,56 @@ async fn add_routing_key(
         }
     }
 
-    if let Err(e) = state
+    if let Some(previous) = owner.as_deref() {
+        // Released only while `previous` still holds it; if it changed hands
+        // meanwhile, the bind below finds the new owner and is refused.
+        match state
+            .database
+            .v1_routing_key_unbind_if_owner(&verkey, previous)
+            .await
+        {
+            Ok(_) => warn!(
+                did = %account.did,
+                previous_owner = %previous,
+                %verkey,
+                "v1 routing key taken over by its holder from an account that registered it \
+                 without proof"
+            ),
+            Err(e) => {
+                warn!(%verkey, error = %e, "v1 keylist takeover failed");
+                return cm::KeylistResult::ServerError;
+            }
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    test_hooks::on_before_bind(&verkey).await;
+
+    match state
         .database
         .v1_routing_key_bind(&verkey, &account.did)
         .await
     {
-        warn!(%verkey, error = %e, "v1 keylist add failed");
-        return cm::KeylistResult::ServerError;
-    }
-
-    // Concurrent adds for one account can each pass the count above. Count
-    // again now that this key is in, and take it back out if the account went
-    // over: two racing requests may then both be refused, never both kept.
-    let refused = match held_routing_keys(state, account).await {
-        Ok(held) if held <= max => return cm::KeylistResult::Success,
-        Ok(held) => {
-            warn!(
-                did = %account.did,
-                %verkey,
-                held,
-                max,
-                "v1 keylist add withdrawn: a concurrent add took the account over its limit"
-            );
-            cm::KeylistResult::ClientError
+        Ok(()) => {
+            batch.record_add(index, verkey);
+            cm::KeylistResult::Success
         }
-        Err(e) => {
-            warn!(%verkey, error = %e, "v1 keylist recount failed; withdrawing the add");
-            cm::KeylistResult::ServerError
-        }
-    };
-    match state.database.v1_routing_key_unbind(&verkey).await {
-        Ok(_) => refused,
-        Err(e) => {
-            warn!(%verkey, error = %e, "v1 keylist add could not be withdrawn");
-            cm::KeylistResult::ServerError
-        }
+        // The bind is refused when another account took the key after the
+        // lookup above. That is a refusal like any other, not a fault.
+        Err(e) => match state.database.v1_routing_key_lookup(&verkey).await {
+            Ok(Some(other)) if other != account.did => {
+                warn!(
+                    did = %account.did,
+                    %verkey,
+                    "v1 keylist add refused: the key is registered to another account"
+                );
+                cm::KeylistResult::ClientError
+            }
+            _ => {
+                warn!(%verkey, error = %e, "v1 keylist add failed");
+                cm::KeylistResult::ServerError
+            }
+        },
     }
 }
 
@@ -461,6 +605,47 @@ async fn held_routing_keys(
         .v1_routing_keys_for(&account.did_hash)
         .await?
         .len())
+}
+
+/// Pause points for tests that need to land a change inside a race window.
+/// Compiled only with the `test-hooks` feature, which no release build enables.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+
+    struct Pause {
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    static BEFORE_BIND: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Default::default);
+
+    /// Pause the next `keylist-update` add of `verkey` (base58) after its
+    /// checks and before it binds the key. The first receiver fires once the
+    /// add is paused there; sending on (or dropping) the returned sender lets
+    /// it go on.
+    pub fn pause_before_bind(verkey: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        BEFORE_BIND.lock().expect("hook map").insert(
+            verkey.to_string(),
+            Pause {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn on_before_bind(verkey: &str) {
+        let pause = BEFORE_BIND.lock().expect("hook map").remove(verkey);
+        if let Some(p) = pause {
+            let _ = p.reached.send(());
+            let _ = p.resume.await;
+        }
+    }
 }
 
 async fn message_pickup(

@@ -4,6 +4,12 @@ Checks the mediator's Aries coordinate-mediation 1.0 and message-pickup 2.0
 messages against Credo's own message classes, in both directions. See the
 header of `mediation.mjs` for what each half proves.
 
+The test mediator in these tests sets `[didcomm_v1]
+allow_unproven_routing_keys = true`. Credo registers a new key for each
+connection, not the key it authenticates with, and the mediator accepts such
+keys only when this setting is on. A mediator that serves Credo wallets needs
+the same setting.
+
 ```sh
 cd interop/didcomm-v1
 npm install

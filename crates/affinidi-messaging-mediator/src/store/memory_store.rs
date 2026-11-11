@@ -1383,6 +1383,23 @@ impl MediatorStore for MemoryStore {
             .is_some())
     }
 
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        if state
+            .v1_routing_keys
+            .get(verkey)
+            .is_some_and(|(owner, _)| owner == did)
+        {
+            state.v1_routing_keys.remove(verkey);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
         let state = self.state.lock().await;
         let mut keys: Vec<String> = state

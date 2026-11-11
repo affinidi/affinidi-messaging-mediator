@@ -70,8 +70,14 @@ The rules for registering keys:
   `keylist-update`. Coordinate-mediation 1.0 carries no proof that a client
   holds any other key it lists. Aries wallets register a new key per
   connection, so they need `[didcomm_v1] allow_unproven_routing_keys = true`.
-- A key belongs to one account. Another account's add for it is refused, and
-  the key is never moved.
+- A key belongs to one account, and another account's add for it is refused.
+  One exception: a key that another account registered without proof can be
+  taken over by its holder. The holder does this by adding the key in a
+  request that key authenticates.
+- With `allow_unproven_routing_keys` on, the first account to list a key
+  receives the forwards addressed to it until the holder takes it over.
+  Enable it only for deployments that serve Aries wallets. The mediator
+  warns about it at startup.
 - An account holds at most `[didcomm_v1] max_routing_keys_per_account` keys
   (default 256).
 - One request carries at most 100 updates.

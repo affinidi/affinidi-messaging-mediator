@@ -172,9 +172,12 @@ pub struct DidCommV1ConfigRaw {
     /// Coordinate-mediation 1.0 carries no proof that a client holds any
     /// *other* key it lists, and Aries wallets register a fresh key per
     /// connection, so `true` is required for stock Aries interop. With it on,
-    /// a key is registered to whichever account claims it first; it is never
-    /// moved to another account, the account must be able to receive, and
-    /// `max_routing_keys_per_account` still applies.
+    /// a key is registered to whichever account claims it first, and that
+    /// account receives forwards for it. The only exception is the key's own
+    /// holder, who can take the key over by adding it in a request that key
+    /// authenticates. The account must be able to receive, and
+    /// `max_routing_keys_per_account` still applies. The mediator warns at
+    /// startup when this is on.
     #[serde(default)]
     pub allow_unproven_routing_keys: bool,
     /// Most routing keys one account may hold. Default
