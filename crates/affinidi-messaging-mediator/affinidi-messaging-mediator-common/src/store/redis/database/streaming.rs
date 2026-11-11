@@ -300,7 +300,8 @@ impl Database {
         }
     }
 
-    /// [`RELEASE`]: returns whether a mux entry waits for the DID.
+    /// Deregister through the `RELEASE` script: returns whether a mux entry
+    /// waits for the DID.
     pub async fn streaming_release(
         &self,
         did_hash: &str,
@@ -333,7 +334,8 @@ impl Database {
         Ok(outcome == 2)
     }
 
-    /// [`CLAIM`]: register `did_hash` on this instance as `kind`.
+    /// Register `did_hash` on this instance as `kind`, through the `CLAIM`
+    /// script.
     pub async fn streaming_claim(
         &self,
         did_hash: &str,

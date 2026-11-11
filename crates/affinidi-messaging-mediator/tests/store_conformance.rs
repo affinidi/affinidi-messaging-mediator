@@ -1793,6 +1793,7 @@ async fn check_streaming_deregister_keeps_another_owner(store: Arc<dyn MediatorS
 /// outranks a mux entry on another instance, the newest registration wins
 /// otherwise, a stale instance never overwrites the owner, and a mux entry
 /// kept from or displaced from a DID learns when it may take it back.
+#[cfg(feature = "redis-backend")]
 async fn check_streaming_cross_instance_precedence(store: Arc<dyn MediatorStore>) {
     use affinidi_messaging_mediator_common::store::{StreamingKind, StreamingWrite};
     let did = "did_hash_streaming_precedence";
