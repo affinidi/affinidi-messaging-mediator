@@ -2212,14 +2212,9 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ) -> Result<(), MediatorError> {
         // We don't know the DID at this layer; pass empty so the
         // join-with-account in `get_session` is best-effort. Backends
-        // that need the DID for the refresh path should override.
-        let mut session = self
-            .get_session(session_id, "")
-            .await
-            .unwrap_or_else(|_| Session {
-                session_id: session_id.to_string(),
-                ..Default::default()
-            });
+        // that need the DID for the refresh path should override. A session
+        // that has ended is not recreated: the update fails.
+        let mut session = self.get_session(session_id, "").await?;
         session.refresh_token_hash = Some(refresh_token_hash.to_string());
         self.put_session(&session, std::time::Duration::from_secs(86_400))
             .await
