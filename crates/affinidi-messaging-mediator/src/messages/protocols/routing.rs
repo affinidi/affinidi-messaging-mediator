@@ -673,6 +673,9 @@ async fn check_remote_next_hop(
         .account_get(next_did_hash)
         .await
         .map_err(|e| {
+            if e.is_storage_cap() {
+                return e;
+            }
             MediatorError::problem_with_log(
                 14,
                 &session.session_id,

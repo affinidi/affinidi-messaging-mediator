@@ -29,9 +29,10 @@ impl Database {
             .query_pair(&mut con, session_cmd, did_cmd)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     session_id.into(),
+                    &err,
                     format!("Failed to retrieve session ({session_id}). Reason: {err}"),
                 )
             })?;
@@ -210,9 +211,10 @@ impl Database {
             .exec_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     old_session_id.into(),
+                    &err,
                     format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
                 )
             })?;
@@ -249,7 +251,14 @@ impl Database {
             .del(&old_sid)
             .query_async(&mut con)
             .await
-            .map_err(|err| failed(err.to_string()))?;
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    14,
+                    old_session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
+                )
+            })?;
         if fields.is_empty() {
             return Err(failed("no such session".into()));
         }
@@ -263,7 +272,14 @@ impl Database {
             .expire(&new_sid, 86400)
             .exec_async(&mut con)
             .await
-            .map_err(|err| failed(err.to_string()))?;
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    14,
+                    old_session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
+                )
+            })?;
 
         // Bookkeeping beside a login that has already succeeded: a failure
         // here must not fail the login.
@@ -295,9 +311,10 @@ impl Database {
             .exec_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     session_id.into(),
+                    &err,
                     format!("Failed to update refresh token hash for session ({session_id}). Reason: {err}"),
                 )
             })?;
@@ -330,9 +347,10 @@ impl Database {
         .invoke_async(&mut con)
         .await
         .map_err(|err| {
-            MediatorError::SessionError(
+            MediatorError::session_from_redis(
                 14,
                 session_id.into(),
+                &err,
                 format!(
                     "Failed to rotate refresh token hash for session ({session_id}). Reason: {err}"
                 ),
@@ -359,9 +377,10 @@ impl Database {
             .query_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     session_id.into(),
+                    &err,
                     format!(
                         "Failed to get refresh token hash for session ({session_id}). Reason: {err}"
                     ),

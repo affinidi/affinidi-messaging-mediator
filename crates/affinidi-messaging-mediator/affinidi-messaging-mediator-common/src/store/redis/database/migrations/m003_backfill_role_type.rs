@@ -47,9 +47,10 @@ pub(crate) async fn up(db: &Database, _config: &RedisInitConfig) -> Result<(), M
                 .query_async(&mut conn)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         account.did_hash.clone(),
+                        &err,
                         format!("HGET ROLE_TYPE failed: {err}"),
                     )
                 })?;
@@ -69,9 +70,10 @@ pub(crate) async fn up(db: &Database, _config: &RedisInitConfig) -> Result<(), M
                 .exec_async(&mut conn)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         account.did_hash.clone(),
+                        &err,
                         format!("HSET ROLE_TYPE failed: {err}"),
                     )
                 })?;

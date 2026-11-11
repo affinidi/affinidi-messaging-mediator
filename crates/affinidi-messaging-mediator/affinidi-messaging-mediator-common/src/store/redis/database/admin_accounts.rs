@@ -1,5 +1,5 @@
 //! Database routines to add/remove/list admin accounts
-use crate::errors::{MediatorError, is_storage_full};
+use crate::errors::{MediatorError, StorageCap};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use tracing::{Instrument, Level, debug, info, span, warn};
 
@@ -52,7 +52,7 @@ impl Database {
             // set up as asked, so a mediator can restart while full (and then
             // free space); otherwise fail as before.
             Err(err)
-                if is_storage_full(&err.to_string())
+                if StorageCap::of_redis(&err) == Some(StorageCap::Full)
                     && self
                         .admin_account_in_place(&mut con, admin_did_hash, admin_type)
                         .await =>
@@ -62,9 +62,10 @@ impl Database {
                 );
             }
             Err(err) => {
-                return Err(MediatorError::DatabaseError(
+                return Err(MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("Failed to set up admin account for ({admin_did_hash}). Reason: {err}"),
                 ));
             }
@@ -105,9 +106,10 @@ impl Database {
             .query_pair(&mut con, listed, role)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("Failed to check admin account for ({did_hash}). Reason: {err}"),
                 )
             })?;
@@ -212,9 +214,10 @@ impl Database {
                 .query_fanout_then(&mut con, roles, unlisted)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to remove admin account. Reason: {err}"),
                     )
                 })?;

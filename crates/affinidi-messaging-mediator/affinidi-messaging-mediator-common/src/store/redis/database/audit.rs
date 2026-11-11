@@ -44,9 +44,10 @@ impl Database {
                 .exec_async(&mut con)
                 .await
                 .map_err(|e| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".into(),
+                        &e,
                         format!("audit_log_record failed: {e}"),
                     )
                 })?;
@@ -84,9 +85,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|e| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".into(),
+                        &e,
                         format!("audit_log_list failed at cursor ({cursor}): {e}"),
                     )
                 })?;
