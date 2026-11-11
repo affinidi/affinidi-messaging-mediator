@@ -312,7 +312,8 @@ async fn deliver_forward(
     next: &str,
     next_did_hash: &str,
     next_acls: Option<&MediatorACLSet>,
-    sender_of_record: Option<&str>,
+    sender_of_record: &str,
+    sender_has_account: bool,
     data: &str,
     delay_milli: i64,
     expires_at: u64,
@@ -361,19 +362,38 @@ async fn deliver_forward(
     );
 
     if ephemeral {
-        // Live stream the message?
-        if let Some(stream_uuid) = state
+        // Live stream only: an ephemeral message is never stored, so it is
+        // accepted only when it is actually handed to a live stream.
+        let Some(stream_uuid) = state
             .database
             .streaming_is_client_live(next_did_hash, false)
             .await
-            && state
-                .database
-                .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
-                .await
-                .is_ok()
+        else {
+            return Err(crate::messages::delivery_refused(
+                session,
+                Some(msg.id.to_string()),
+                "ephemeral message for a recipient with no live stream",
+            ));
+        };
+        if let Err(e) = state
+            .database
+            .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
+            .await
         {
-            debug!("Live streaming message to UUID: {}", stream_uuid);
+            return Err(MediatorError::problem_with_log(
+                14,
+                &session.session_id,
+                Some(msg.id.to_string()),
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "me.res.storage.error",
+                "Database transaction error: {1}",
+                vec![e.to_string()],
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Couldn't publish an ephemeral message to its live stream: {e}"),
+            ));
         }
+        debug!("Live streaming message to UUID: {}", stream_uuid);
     } else {
         if let Some(RemoteHop {
             endpoint: endpoint_url,
@@ -413,7 +433,7 @@ async fn deliver_forward(
 
             // The sender's full DID, for problem reports. Only a sender with an
             // account here has an inbox to receive one.
-            let from_did = if sender_of_record.is_some_and(|h| !h.is_empty()) {
+            let from_did = if sender_has_account && !sender_of_record.is_empty() {
                 msg.from.as_deref().unwrap_or("").to_string()
             } else {
                 String::new()
@@ -433,7 +453,7 @@ async fn deliver_forward(
                 stream_id: String::new(), // Set by Redis on XADD
                 message: relay_message,
                 to_did_hash: next_did_hash.to_string(),
-                from_did_hash: sender_of_record.unwrap_or_default().to_string(),
+                from_did_hash: sender_of_record.to_string(),
                 from_did,
                 to_did: next.to_string(),
                 endpoint_url: endpoint_url.clone(),
@@ -472,9 +492,7 @@ async fn deliver_forward(
             );
             info!(
                 "FORWARD_ENQUEUED: to_did_hash={} from_did_hash={} endpoint={}",
-                next_did_hash,
-                sender_of_record.unwrap_or_default(),
-                endpoint_url
+                next_did_hash, sender_of_record, endpoint_url
             );
         } else {
             // Local destination — store as before
@@ -482,7 +500,7 @@ async fn deliver_forward(
                 state,
                 session,
                 data,
-                sender_of_record,
+                Some(sender_of_record),
                 next,
                 Some(expires_at),
             )
@@ -515,13 +533,15 @@ enum NextHop {
     Remote(RemoteHop),
     /// No route this mediator can use. Storing the message here would never
     /// reach the recipient, so the forward is refused. `retryable` when the
-    /// cause is a resolution failure that may clear.
+    /// cause is a failure to resolve the mediator the next hop names, which
+    /// may clear.
     Unroutable { reason: String, retryable: bool },
 }
 
 /// Classify a forward's next hop by resolving its DID document (and, one hop
 /// further, a mediator it names). Only when external forwarding is enabled;
-/// otherwise every next hop is local.
+/// otherwise every next hop is local. A next hop whose own DID cannot be
+/// resolved is local too.
 async fn classify_next_hop(state: &SharedData, next: &str) -> NextHop {
     if !state.config.processors.forwarding.external_forwarding {
         return NextHop::Local;
@@ -539,10 +559,15 @@ async fn classify_next_hop(state: &SharedData, next: &str) -> NextHop {
             }
             hop
         }
-        Err(e) => NextHop::Unroutable {
-            reason: format!("next hop ({next}) couldn't be resolved: {e}"),
-            retryable: true,
-        },
+        // Classed as local, so it is delivered only to an account here: a
+        // resolver outage does not stop local delivery, and a next hop with no
+        // account gets the same `delivery_refused` either way.
+        Err(e) => {
+            warn!(
+                "Next hop ({next}) couldn't be resolved ({e}); delivering only to a local account"
+            );
+            NextHop::Local
+        }
     }
 }
 
@@ -554,7 +579,7 @@ fn unroutable(session: &Session, msg: &Message, reason: &str, retryable: bool) -
         warn!(
             session = %session.session_id,
             reason = %reason,
-            "forward refused: next hop could not be resolved"
+            "forward refused: the next hop's mediator could not be resolved"
         );
         MediatorError::problem(
             74,
@@ -563,7 +588,7 @@ fn unroutable(session: &Session, msg: &Message, reason: &str, retryable: bool) -
             ProblemReportSorter::Error,
             ProblemReportScope::Protocol,
             "did.resolve",
-            "The forward's next hop couldn't be resolved; try again later",
+            "The forward's next hop couldn't be routed; try again later",
             vec![],
             StatusCode::SERVICE_UNAVAILABLE,
         )
@@ -716,17 +741,17 @@ struct ForwardSender {
     /// What the sender checks run against: `SEND_FORWARDED`, the recipient's
     /// access list and the queue limits.
     account: Account,
-    /// Whether the sender holds an account here. Only then is the message
-    /// attributed to it in storage (queue counters, outbox, problem reports);
-    /// attributing it otherwise would create a record for a DID this mediator
-    /// never admitted.
+    /// Whether the sender holds an account here. A sender without one is
+    /// still counted per relationship (`limits.queue.peer`) — counters alone
+    /// do not make an account in any store — but it has no inbox here for a
+    /// relay failure report.
     registered: bool,
 }
 
 /// Resolve the account a forward is *from*: the DID that signed or authcrypted
 /// it, or — for an anonymous forward — a synthetic account carrying the
 /// global default ACL. A signing sender with no account here is checked
-/// against [`relay_sender_acls`] and nothing is stored for it. Enforces the
+/// against [`relay_sender_acls`] and no account is created for it. Enforces the
 /// `SEND_FORWARDED` capability on the resolved sender.
 ///
 /// The plaintext `from` is never used on its own: it is accepted only when it
@@ -894,7 +919,7 @@ pub(crate) async fn process(
 
         let sender = resolve_forward_sender(state, session, msg, metadata).await?;
         let from_account = sender.account;
-        let sender_of_record = sender.registered.then_some(from_account.did_hash.as_str());
+        let sender_has_account = sender.registered;
 
         // Check queue + attachment + forward-task-queue limits before accepting.
         // Per-relationship first: when a sender is genuinely flooding one peer,
@@ -1066,7 +1091,8 @@ pub(crate) async fn process(
             &next,
             &next_did_hash,
             next_acls.as_ref(),
-            sender_of_record,
+            &from_account.did_hash,
+            sender_has_account,
             &data,
             delay_milli,
             expires_at,

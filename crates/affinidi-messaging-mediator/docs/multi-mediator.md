@@ -88,8 +88,11 @@ endpoint URI it publishes:
 A next hop that publishes no `DIDCommMessaging` service at all is local. A
 local next hop is stored only if it holds an account on this mediator;
 otherwise the forward is refused with `73 delivery.refused`. A forward never
-creates an account. If the next hop's DID, or the mediator it names, cannot
-be resolved, the forward is refused with `74 did.resolve` (503, retryable).
+creates an account. A next hop whose own DID cannot be resolved is treated
+as local: delivered if it holds an account here (so a resolver outage does
+not stop local delivery), refused with `73` otherwise. If the next hop names
+a mediator whose DID cannot be resolved, the forward is refused with
+`74 did.resolve` (503, retryable).
 
 Rules that matter in production:
 
@@ -110,7 +113,7 @@ Rules that matter in production:
   versions stored such a forward locally, answered `200`, and logged
   "Storing locally — it will not be delivered". The sender now gets the
   refusal, and the mediator logs the reason (`delivery refused` or
-  `forward refused: next hop could not be resolved`).
+  `forward refused: the next hop's mediator could not be resolved`).
 
 Setting `processors.forwarding.external_forwarding = "false"` skips this
 classification entirely and makes every forward local (still only to a next
@@ -266,10 +269,11 @@ connection errors are still retried until `max_retries`, then abandoned with
 On a double forward Alice is an account-less forward sender on B, so B
 checks her against `relay_sender_acls` — `SEND_FORWARDED` **only if B's
 `global_acl_default` grants it**, and nothing else (no `LOCAL`, no
-`RECEIVE_*`, no invites, no self-management). B stores nothing for her: no
-account, no queue counters, and the message is not attributed to her in
-B's storage. A DID that has only ever relayed a forward through B gains
-nothing there.
+`RECEIVE_*`, no invites, no self-management). B creates no account for her.
+Her queued messages are still counted against her per recipient, so
+`limits.queue.peer` holds her as it holds any sender; those counters alone
+are not an account in any storage backend. A DID that has only ever relayed
+a forward through B gains nothing there.
 
 Consequence worth stating plainly: **the shipped default
 `global_acl_default = "DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES"` is not
@@ -420,7 +424,7 @@ mediator **DIDs**, not URLs).
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Error 73 `delivery.refused` at A for a recipient homed elsewhere | A classified the next hop as local (it has no account on A), or its DID document publishes no usable DIDComm endpoint (§2) | A's log names the reason; publish the mediator's DID in the user's service entry |
-| Error 74 `did.resolve` (503) at A | the next hop's DID, or the mediator it names, couldn't be resolved | retry; check the DID and A's resolver |
+| Error 74 `did.resolve` (503) at A | the mediator the next hop names couldn't be resolved | retry; check that DID and A's resolver |
 | Message loops back to A | A's public hostname doesn't match its bind address | set `server.local_endpoints` to every public URL in A's DID document |
 | B returns `401` on `/inbound` | B isn't configured as a relay | `security.enable_inter_mediator_relay = "true"` on B |
 | Error 60 `authorization.send_forwarded` at B | B's `global_acl_default` doesn't grant `SEND_FORWARDED`, so a sender with no account on B gets nothing | widen B's default (§6) |

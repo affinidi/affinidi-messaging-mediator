@@ -42,12 +42,17 @@ fn _to_account(map: HashMap<String, String>, access_list_count: u32) -> Account 
 // have at least one caller via the trait impl in
 // `store/redis/store.rs`.
 impl Database {
-    /// Quick and efficient check if an account exists locally in the mediator
+    /// Whether an account exists locally in the mediator.
+    ///
+    /// An account is a `DID:<hash>` record carrying `ACLS` or `ROLE_TYPE`.
+    /// Storing a message for a party with no account leaves a record holding
+    /// only queue counters; that is not an account.
     pub(crate) async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         let mut con = self.get_connection().await?;
 
-        redis::cmd("EXISTS")
-            .arg(self.keys().did(did_hash))
+        let (acls, role): (bool, bool) = redis::pipe()
+            .hexists(self.keys().did(did_hash), "ACLS")
+            .hexists(self.keys().did(did_hash), "ROLE_TYPE")
             .query_async(&mut con)
             .await
             .map_err(|err| {
@@ -56,7 +61,8 @@ impl Database {
                     "NA".to_string(),
                     format!("Failed to check account existence. Reason: {err}"),
                 )
-            })
+            })?;
+        Ok(acls || role)
     }
 
     /// Grab Account information
@@ -89,7 +95,9 @@ impl Database {
                 )
             })?;
 
-        if details.is_empty() {
+        // A record holding only queue counters is not an account (see
+        // `account_exists`).
+        if !details.contains_key("ACLS") && !details.contains_key("ROLE_TYPE") {
             debug!("Account {} does not exist", did_hash);
             return Ok(None);
         }
@@ -156,9 +164,13 @@ return 1
                 )
             })?;
 
-            // Listed whether or not this call created the record: a failure
-            // between the two steps leaves an unlisted account, which the next
-            // add or login lists again.
+            if created == 0 {
+                debug!("Account already exists; left unchanged");
+                return Ok(None);
+            }
+
+            // Record before list entry: a failure between them leaves an
+            // unlisted account, which the next login lists again.
             let mut listed = redis::pipe();
             listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
             self.exec_steps(&mut con, vec![listed])
@@ -170,11 +182,6 @@ return 1
                         format!("Failed to list account. Reason: {err}"),
                     )
                 })?;
-
-            if created == 0 {
-                debug!("Account already exists; left unchanged");
-                return Ok(None);
-            }
             debug!("Account added successfully");
 
             Ok(Some(Account {

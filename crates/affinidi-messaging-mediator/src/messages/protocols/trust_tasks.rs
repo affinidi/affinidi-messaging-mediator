@@ -1313,11 +1313,6 @@ async fn consume_account_add(
         // role this build does not know cannot be decoded, so it is never
         // stored as a privilege level the mediator cannot reason about.
     };
-    let is_admin = matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    );
-
     let denied = |reason: &str| {
         tt_problem(
             session,
@@ -1327,11 +1322,22 @@ async fn consume_account_add(
         )
     };
 
-    if !is_admin {
+    // Read from the store, not the session: a role removed since the session
+    // was issued no longer grants this.
+    if !state
+        .database
+        .check_admin_account(&session.did_hash)
+        .await?
+    {
         return Err(denied("admin access is required to add accounts"));
     }
+    let caller_role = state
+        .database
+        .account_get(&session.did_hash)
+        .await?
+        .map(|a| a._type);
     // Creating a privileged account requires the matching privilege.
-    if new_type == AccountType::RootAdmin && session.account_type != AccountType::RootAdmin {
+    if new_type == AccountType::RootAdmin && caller_role != Some(AccountType::RootAdmin) {
         return Err(denied(
             "root-admin access is required to create a root-admin account",
         ));

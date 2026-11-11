@@ -16,10 +16,18 @@ impl Database {
         admin_type: AccountType,
         acls: &MediatorACLSet,
     ) -> Result<(), MediatorError> {
-        // Check if the admin account already exists
-        if !self.account_exists(admin_did_hash).await? {
-            debug!("Admin account doesn't exist, creating: {}", admin_did_hash);
-            self.account_create(admin_did_hash, acls, None).await?;
+        // `account_exists` is false for a `DID:<hash>` record holding only
+        // queue counters, so such a record is completed before the role is
+        // set: an admin is never left without `ACLS`. The read comes first
+        // because this runs on every start, and a full database refuses the
+        // create script even when it would change nothing.
+        if !self.account_exists(admin_did_hash).await?
+            && self
+                .account_create(admin_did_hash, acls, None)
+                .await?
+                .is_some()
+        {
+            debug!("Admin account didn't exist, created: {}", admin_did_hash);
         }
         let mut con = self.get_connection().await?;
 

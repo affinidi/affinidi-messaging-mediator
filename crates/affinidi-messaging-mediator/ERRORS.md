@@ -99,7 +99,7 @@ places with different statuses. Queue-limit refusals (61, 62, 95) include a
 |         71 |       403        | w.m.direct_delivery.denied                         |     No     | Mediator is not accepting direct delivery of DIDComm messages. They must be wrapped in a forwarding envelope                |
 |         72 |        —         | w.m.direct_delivery.recipient.unknown              |     —      | No longer returned; reported as 73 |
 |         73 |       403        | e.p.delivery.refused                               |     No     | Message not accepted for delivery: unknown or non-local recipient (including a forward's next hop with no account, or one that publishes no usable DIDComm endpoint), missing receive permission, or blocked by the access list. The reason is logged, not returned |
-|         74 |    500 / 503     | e.p.did.resolve                                    |   Maybe    | DID could not be resolved. On a forward (503, retryable): its next hop, or the mediator that next hop names, could not be resolved |
+|         74 |    500 / 503     | e.p.did.resolve                                    |   Maybe    | DID could not be resolved. On a forward (503, retryable): the mediator its next hop names could not be resolved |
 |         75 |       500        | e.p.message.recipients.missing                     |     No     | There are no recipients for this message |
 |         76 |       500        | e.p.message.recipients.too_many                    |     No     | There are too many recipients for this message |
 |         77 |       500        | e.p.me.storage.message.error                       |     No     | There was in internal error when storing the message                                                                        |

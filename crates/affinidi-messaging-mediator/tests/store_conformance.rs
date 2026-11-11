@@ -288,6 +288,107 @@ async fn check_account_add_keeps_existing_account(store: Arc<dyn MediatorStore>)
     assert_eq!(created, 1, "exactly one concurrent create wins");
 }
 
+/// Storing a message for a sender with no account keeps its queue counters
+/// but does not make it an account, in every backend: it is not found, listed
+/// or given ACLs, `account_create` completes the record (keeping the
+/// counters), and admin set-up on such a record leaves an account with ACLs.
+async fn check_counters_only_record_is_not_an_account(store: Arc<dyn MediatorStore>) {
+    let to = "did_hash_counters_only_recipient";
+    let sender = "did_hash_counters_only_sender";
+    let admin = "did_hash_counters_only_admin";
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add recipient");
+    for from in [sender, admin] {
+        store
+            .store_message(
+                "session-id",
+                &format!("{{\"protected\":\"{from}\"}}"),
+                to,
+                Some(from),
+                NEVER,
+                1000,
+            )
+            .await
+            .expect("store_message");
+    }
+
+    assert!(
+        !store.account_exists(sender).await.expect("account_exists"),
+        "a counters-only record is not an account"
+    );
+    assert!(
+        store
+            .account_get(sender)
+            .await
+            .expect("account_get")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_did_acl(sender)
+            .await
+            .expect("get_did_acl")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_did_acls(&[sender.to_string()], AccessListModeType::ExplicitDeny)
+            .await
+            .expect("get_did_acls")
+            .acl_response
+            .is_empty(),
+        "a counters-only record has no ACL"
+    );
+    let listed = store.account_list(0, 100).await.expect("account_list");
+    assert!(
+        !listed.accounts.iter().any(|a| a.did_hash == sender),
+        "a counters-only record is not listed"
+    );
+    assert_eq!(
+        store
+            .peer_queue_count(sender, to)
+            .await
+            .expect("peer_queue_count"),
+        1,
+        "the sender is still counted per relationship"
+    );
+
+    assert!(
+        store
+            .account_create(sender, &allow_all(), None)
+            .await
+            .expect("account_create")
+            .is_some(),
+        "account_create completes a counters-only record"
+    );
+    let created = store
+        .account_get(sender)
+        .await
+        .expect("account_get")
+        .expect("an account now");
+    assert_eq!(created.acls, allow_all().to_u64(), "given ACLs applied");
+    assert_eq!(created._type, AccountType::Standard);
+    assert_eq!(created.send_queue_count, 1, "queued message still counted");
+
+    store
+        .setup_admin_account(admin, AccountType::Admin, &allow_all())
+        .await
+        .expect("setup_admin_account");
+    let admin_account = store
+        .account_get(admin)
+        .await
+        .expect("account_get")
+        .expect("admin account present");
+    assert_eq!(admin_account._type, AccountType::Admin);
+    assert_eq!(
+        admin_account.acls,
+        allow_all().to_u64(),
+        "an admin set up over a counters-only record has its ACLs"
+    );
+}
+
 /// Setting a DID's ACL is read back verbatim.
 async fn check_acl_set_get_roundtrip(store: Arc<dyn MediatorStore>) {
     let did = "did_hash_acl_roundtrip";
@@ -2796,6 +2897,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     // hide them.
     check_admin_roles(store.clone()).await;
     check_account_add_keeps_existing_account(store.clone()).await;
+    check_counters_only_record_is_not_an_account(store.clone()).await;
     check_login_session(store.clone()).await;
     check_challenge_session_without_account(store.clone()).await;
     check_refresh_rotation(store.clone()).await;
@@ -2837,6 +2939,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn account_add_keeps_existing_account() {
                 check_account_add_keeps_existing_account(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn counters_only_record_is_not_an_account() {
+                check_counters_only_record_is_not_an_account(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn message_store_and_counters() {

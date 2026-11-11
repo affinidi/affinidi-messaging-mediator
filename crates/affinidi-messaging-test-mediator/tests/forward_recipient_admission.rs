@@ -3,9 +3,9 @@
 //! A forward names its next hop in plaintext, so it is not evidence that the
 //! next hop belongs on this mediator. These tests pin that a forward never
 //! creates an account, in either `mediator_acl_mode`: a local next hop with no
-//! account is refused with the uniform `delivery.refused`, and a next hop that
-//! cannot be resolved is refused as retryable instead of being stored where
-//! nothing would collect it.
+//! account is refused with the uniform `delivery.refused`. A next hop whose DID
+//! cannot be resolved is treated as local: delivered to an account here, and
+//! otherwise refused the same way.
 
 mod common;
 
@@ -125,7 +125,7 @@ async fn forward_to_a_local_did_without_an_account_is_refused() {
 }
 
 #[tokio::test]
-async fn forward_to_an_unresolvable_next_hop_is_refused_as_retryable() {
+async fn forward_to_an_unresolvable_next_hop_without_an_account_is_refused() {
     init_tracing();
 
     let env = spawn(AccessListModeType::ExplicitDeny).await;
@@ -135,10 +135,10 @@ async fn forward_to_an_unresolvable_next_hop_is_refused_as_retryable() {
 
     let error = send_forward(&env, &alice, &bob.did, nowhere)
         .await
-        .expect_err("an unresolvable next hop is refused");
+        .expect_err("an unresolvable next hop with no account is refused");
     assert!(
-        error.contains("did.resolve"),
-        "expected did.resolve, got: {error}"
+        error.contains("delivery.refused"),
+        "expected delivery.refused, got: {error}"
     );
     assert!(
         !env.mediator
@@ -147,6 +147,39 @@ async fn forward_to_an_unresolvable_next_hop_is_refused_as_retryable() {
             .await
             .expect("account_exists"),
         "the forward must not create an account for its next hop"
+    );
+
+    env.shutdown().await.expect("shutdown");
+}
+
+/// A next hop whose DID cannot be resolved (a resolver outage, say) but which
+/// holds an account here is still delivered locally.
+#[tokio::test]
+async fn forward_to_an_unresolvable_next_hop_with_an_account_is_stored() {
+    init_tracing();
+
+    let env = spawn(AccessListModeType::ExplicitDeny).await;
+    let alice = env.add_user("Alice").await.expect("add Alice");
+    let bob = env.add_user("Bob").await.expect("add Bob");
+    let unresolvable = "did:example:local-account";
+    let hash = sha256::digest(unresolvable);
+    let store = env.mediator.store();
+    store
+        .account_add(&hash, &acl::allow_all(), None)
+        .await
+        .expect("register the unresolvable DID");
+
+    send_forward(&env, &alice, &bob.did, unresolvable)
+        .await
+        .expect("delivered to the local account");
+    assert_eq!(
+        store
+            .inbox_status(&hash)
+            .await
+            .expect("inbox_status")
+            .message_count,
+        1,
+        "the forward is stored for the local account"
     );
 
     env.shutdown().await.expect("shutdown");

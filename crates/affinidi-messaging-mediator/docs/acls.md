@@ -150,7 +150,10 @@ Forwards do **not** create accounts. A forward whose `next` hop has no
 account here is refused with `delivery.refused`; a forward from a DID with no
 account here is checked against a least-privilege ACL (`DENY_ALL` +
 `SEND_FORWARDED`, and only if `global_acl_default` grants `SEND_FORWARDED` —
-`relay_sender_acls`) and nothing is stored for that DID.
+`relay_sender_acls`) and no account is created for that DID. Its queued
+messages still count towards `limits.queue.peer`; queue counters on their own
+are not an account in any storage backend (not admitted, listed, or given
+ACLs), and `account_add` later completes such a record, keeping its counts.
 
 The first path is the one that surprises people: in `explicit_deny` mode,
 **registration is automatic and unconditional** — there is no approval
@@ -262,7 +265,8 @@ to admit or refuse.
 ├─ sender has SEND_FORWARDED?                   else 403 authorization.send_forwarded
 ├─ (queue, attachment, delay and forward-queue limits)
 ├─ next hop local or remote? (resolves its DID document)
-│  ├─ couldn't be resolved (it or its mediator)  503 did.resolve (retryable)
+│  ├─ its DID couldn't be resolved               treated as local (below)
+│  ├─ its mediator's DID couldn't be resolved    503 did.resolve (retryable)
 │  └─ publishes no usable DIDComm endpoint       403 delivery.refused
 ├─ local next hop:
 │  ├─ has an account here?                      else 403 delivery.refused
