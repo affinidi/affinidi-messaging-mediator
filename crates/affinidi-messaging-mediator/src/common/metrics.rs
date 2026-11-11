@@ -132,6 +132,14 @@ pub mod names {
     /// job: without it the busy member's frames would have taken the other
     /// members' room. A steady rate points at one member outpacing its client.
     pub const MUX_QUEUE_FAIRNESS_SKIPS_TOTAL: &str = "mux_queue_fairness_skips_total";
+    /// counter: Live frames for a mux member that the socket did not write,
+    /// decided against the member's scope when the frame came up (label
+    /// `outcome`): `nudge` for a member holding `pickup` but not `receive`
+    /// (its principal is told mail waits instead), `drop` for a member that
+    /// left or holds neither. The message stays stored either way. A steady
+    /// `drop` rate points at frames queued for members just revoked or
+    /// narrowed; `nudge` tracks pickup-only traffic.
+    pub const MUX_LIVE_FRAMES_WITHHELD_TOTAL: &str = "mux_live_frames_withheld_total";
     /// gauge: Bytes currently free in the global WebSocket send-buffer pool.
     pub const WS_SEND_BUFFER_AVAILABLE_BYTES: &str = "ws_send_buffer_available_bytes";
     /// counter: Old WebSocket sessions displaced by a newer duplicate for the same DID

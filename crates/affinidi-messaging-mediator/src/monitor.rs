@@ -385,17 +385,34 @@ impl TrafficMonitor {
         channel: Channel,
         body: Option<&str>,
     ) {
+        self.delivered_as(
+            msg_id,
+            from,
+            to,
+            size,
+            channel,
+            body.map_or(Protocol::Other, Protocol::detect),
+        );
+    }
+
+    /// [`delivered`](Self::delivered), with the protocol already known: for
+    /// a report made before the write, which keeps the protocol rather than
+    /// a copy of the body.
+    pub(crate) fn delivered_as(
+        &self,
+        msg_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        size: u64,
+        channel: Channel,
+        protocol: Protocol,
+    ) {
         self.emit(|| TrafficEvent {
             msg_id: Some(msg_id.to_string()),
             from: from.map(str::to_string),
             to: to.map(str::to_string),
             size: Some(size),
-            ..TrafficEvent::new(
-                Direction::Outbound,
-                Stage::Delivered,
-                channel,
-                body.map_or(Protocol::Other, Protocol::detect),
-            )
+            ..TrafficEvent::new(Direction::Outbound, Stage::Delivered, channel, protocol)
         });
     }
 

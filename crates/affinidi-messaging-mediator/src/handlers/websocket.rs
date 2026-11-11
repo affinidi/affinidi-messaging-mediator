@@ -1,5 +1,6 @@
 use crate::common::metrics::names::{
-    ACTIVE_WEBSOCKET_CONNECTIONS, WS_LIVE_RESYNC_SENT, WS_LIVE_RESYNC_SUPPRESSED,
+    ACTIVE_WEBSOCKET_CONNECTIONS, MUX_LIVE_FRAMES_WITHHELD_TOTAL, WS_LIVE_RESYNC_SENT,
+    WS_LIVE_RESYNC_SUPPRESSED,
 };
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
@@ -1217,11 +1218,13 @@ async fn handle_socket(
                             match conn.live_frame(for_did).await {
                                 LiveFrame::Write => {}
                                 LiveFrame::Nudge => {
+                                    metrics::counter!(MUX_LIVE_FRAMES_WITHHELD_TOTAL, "outcome" => "nudge").increment(1);
                                     debug!(did_hash = %for_did, "pickup-only mux member has mail; resync raised");
                                     conn.nudge(for_did);
                                     write = false;
                                 }
                                 LiveFrame::Drop => {
+                                    metrics::counter!(MUX_LIVE_FRAMES_WITHHELD_TOTAL, "outcome" => "drop").increment(1);
                                     debug!(did_hash = %for_did, "dropping a queued frame for a mux member without receive");
                                     continue;
                                 }

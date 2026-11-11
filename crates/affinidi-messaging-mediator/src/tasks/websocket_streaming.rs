@@ -296,20 +296,21 @@ pub struct DeliveryReport {
     pub from: Option<String>,
     pub to: Option<String>,
     pub size: u64,
-    /// The body, only while the monitor has a subscriber.
-    pub body: Option<String>,
+    /// The frame's protocol, read from the body when the report is made. The
+    /// report holds no copy of the body: the monitor never publishes one.
+    pub protocol: crate::monitor::Protocol,
 }
 
 impl DeliveryReport {
     /// Report the delivery: call once the frame is on the wire.
     pub fn emit(self, monitor: &crate::monitor::TrafficMonitor) {
-        monitor.delivered(
+        monitor.delivered_as(
             &self.msg_id,
             self.from.as_deref(),
             self.to.as_deref(),
             self.size,
             crate::monitor::Channel::Websocket,
-            self.body.as_deref(),
+            self.protocol,
         );
     }
 }
@@ -467,8 +468,6 @@ pub struct StreamingTask {
     /// records handovers on the same terms as every other delivery path. `0`
     /// leaves expiry untouched, which is the default.
     pub delivered_expiry_seconds: u64,
-    /// Where inbox redelivery reports what it hands to a socket.
-    pub(crate) monitor: crate::monitor::TrafficMonitor,
 }
 
 impl StreamingTask {
@@ -494,27 +493,6 @@ impl StreamingTask {
         send_budget: WsSendBudget,
         delivered_expiry_seconds: u64,
     ) -> Self {
-        Self::spawn_supervised_with_monitor(
-            supervisor,
-            database,
-            mediator_uuid,
-            send_budget,
-            delivered_expiry_seconds,
-            crate::monitor::TrafficMonitor::new(),
-        )
-    }
-
-    /// [`Self::spawn_supervised`], reporting redeliveries to `monitor` — the
-    /// mediator's traffic monitor, so a subscriber sees messages handed to a
-    /// socket on reconnect.
-    pub fn spawn_supervised_with_monitor(
-        supervisor: &TaskSupervisor,
-        database: Arc<dyn MediatorStore>,
-        mediator_uuid: &str,
-        send_budget: WsSendBudget,
-        delivered_expiry_seconds: u64,
-        monitor: crate::monitor::TrafficMonitor,
-    ) -> Self {
         // Control-plane channel (register/start/stop/deregister). Carries no
         // message bodies — a handful of small structs — so a slot count is the
         // right bound here and 10 is plenty.
@@ -524,7 +502,6 @@ impl StreamingTask {
             uuid: mediator_uuid.to_string(),
             send_budget,
             delivered_expiry_seconds,
-            monitor,
         };
         let rx = Arc::new(Mutex::new(rx));
 
@@ -739,7 +716,7 @@ impl StreamingTask {
                             from: stored.from_did_hash,
                             to: Some(did_hash.clone()),
                             size: message.len() as u64,
-                            body: self.monitor.is_active().then(|| message.clone()),
+                            protocol: crate::monitor::Protocol::detect(&message),
                         });
                         // Moved, not cloned: the body already exists in the
                         // broadcast ring slot, and `payload` is owned here.
@@ -886,7 +863,6 @@ impl StreamingTask {
                     session_id.to_string(),
                     Arc::clone(replay_in_progress),
                     self.delivered_expiry_seconds,
-                    self.monitor.clone(),
                 );
             } else {
                 debug!(
@@ -1178,7 +1154,6 @@ impl StreamingTask {
                     session_id,
                     Arc::clone(replay_in_progress),
                     self.delivered_expiry_seconds,
-                    self.monitor.clone(),
                 );
             } else {
                 debug!(
@@ -1284,7 +1259,6 @@ fn spawn_inbox_redelivery(
     session_id: String,
     replay_in_progress: Arc<DashSet<String>>,
     delivered_expiry_seconds: u64,
-    monitor: crate::monitor::TrafficMonitor,
 ) {
     tokio::spawn(async move {
         let mut start_id: Option<String> = None;
@@ -1339,7 +1313,7 @@ fn spawn_inbox_redelivery(
                     from: element.from_address,
                     to: element.to_address,
                     size: element.size,
-                    body: monitor.is_active().then(|| msg.clone()),
+                    protocol: crate::monitor::Protocol::detect(&msg),
                 };
 
                 // Fetched with `DoNotDelete`, so anything not queued here stays
@@ -1414,7 +1388,6 @@ mod tests {
             // buffer exhaustion (which `ws_budget` covers directly).
             send_budget: WsSendBudget::new(16 * 1024 * 1024),
             delivered_expiry_seconds: 0,
-            monitor: crate::monitor::TrafficMonitor::new(),
         }
     }
 
@@ -1572,7 +1545,8 @@ mod tests {
         use affinidi_messaging_mediator_common::store::StoredMessageRef;
 
         let task = streaming_task();
-        let mut events = task.monitor.tap();
+        let monitor = crate::monitor::TrafficMonitor::new();
+        let mut events = monitor.tap();
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         // One slot: the first push is queued, the next is dropped.
         let (tx, mut rx) = mpsc::channel::<QueuedCommand>(1);
@@ -1623,10 +1597,12 @@ mod tests {
         assert_eq!(report.msg_id, "m1");
         assert_eq!(report.from.as_deref(), Some("alice"));
         assert_eq!(report.to.as_deref(), Some("bob"));
+        // The report keeps the frame's protocol, never a copy of its body.
+        assert_eq!(report.protocol, crate::monitor::Protocol::Other);
         assert!(rx.try_recv().is_err(), "the second push was dropped");
 
         // The socket loop emits it once the frame is written.
-        report.emit(&task.monitor);
+        report.emit(&monitor);
         let event = events.try_recv().expect("reported after the write");
         assert_eq!(event.stage, crate::monitor::Stage::Delivered);
         assert_eq!(event.msg_id.as_deref(), Some("m1"));
