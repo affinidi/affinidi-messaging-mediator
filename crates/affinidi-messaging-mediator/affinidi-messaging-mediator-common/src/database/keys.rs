@@ -102,6 +102,14 @@ impl Keys {
         [&self.tagged("RECEIPT:", from_hash), ":", message_hash].concat()
     }
 
+    /// A sender's receipts for the copies of one message that left its
+    /// outbox: a hash of recipient → receipt, keyed under the sender like
+    /// [`outbox_receipt`](Self::outbox_receipt), which holds the single
+    /// receipt per id written before receipts were per recipient.
+    pub fn outbox_receipts(self, from_hash: &str, message_hash: &str) -> String {
+        [&self.tagged("RECEIPTS:", from_hash), ":", message_hash].concat()
+    }
+
     /// Message body of the record held for `to` (`MSG:<id>:<to>`), or of the
     /// single per-id record written before records were per recipient
     /// (`MSG:<id>`) when `to` is `None`. See [`record_member`](Self::record_member).
@@ -341,6 +349,7 @@ mod tests {
             keys.activity(H),
             keys.v1_keys(H),
             keys.outbox_receipt(H, "m1"),
+            keys.outbox_receipts(H, "m1"),
         ] {
             assert_eq!(slot(&k), account, "{k} is not in the account's slot");
         }

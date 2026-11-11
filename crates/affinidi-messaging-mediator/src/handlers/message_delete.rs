@@ -2,11 +2,9 @@ use crate::{
     SharedData,
     common::authz::{self, Capability},
     common::session::Session,
+    messages::client_delete::delete_for_client,
 };
-use affinidi_messaging_mediator_common::{
-    errors::{AppError, MediatorError, SuccessResponse},
-    store::DeletionAuthority,
-};
+use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::{
     DeleteMessageRequest, DeleteMessageResponse, GenericDataStruct,
@@ -72,7 +70,15 @@ pub async fn message_delete_handler(
             .into());
         }
         let mut deleted: DeleteMessageResponse = DeleteMessageResponse::default();
-        for r in delete_for_session(&state, &session, &body.message_ids, crate::monitor::Channel::Rest).await {
+        for r in delete_for_session(
+            &state,
+            &session,
+            &body.message_ids,
+            crate::monitor::Channel::Rest,
+            DeleteKind::AcknowledgeOrWithdraw,
+        )
+        .await
+        {
             match r.outcome {
                 Ok(()) => deleted.success.push(r.id),
                 Err(err) => {
@@ -109,92 +115,101 @@ pub(crate) struct DeleteResult {
     pub member_without_delete: bool,
 }
 
+/// How [`delete_for_session`] reads an id (see `messages::client_delete`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteKind {
+    /// An acknowledgement only: an owner's own copy, never a copy an owner
+    /// sent to someone else (`messaging/mux/ack`).
+    Acknowledge,
+    /// As `DELETE /delete`: an owner's own copy, else what an owner sent,
+    /// unless the delete repeats an acknowledgement.
+    AcknowledgeOrWithdraw,
+}
+
 /// Delete `ids` with `session`'s authority: its own messages, and on a mux
 /// connection (the same session) each member's while the member holds
-/// `delete` and its account stands. The store authorises each delete; the
-/// first owner it accepts wins. A message held for no one this session may
-/// act for is reported as not found, whoever it belongs to: an id is a hash
-/// of the message, and the answer must not confirm another DID's mail.
+/// `delete` and its account stands. Which copy of an id is removed follows
+/// `kind` and `messages::client_delete`. A message held for no one this
+/// session may act for is reported as not found, whoever it belongs to: an
+/// id is a hash of the message, and the answer must not confirm another
+/// DID's mail.
 pub(crate) async fn delete_for_session(
     state: &SharedData,
     session: &Session,
     ids: &[String],
     channel: crate::monitor::Channel,
+    kind: DeleteKind,
 ) -> Vec<DeleteResult> {
     use affinidi_messaging_mediator_common::store::mux::MuxCapability;
-    let mut owners = vec![session.did_hash.clone()];
-    owners.extend(
+    let members =
         crate::mux::connection::members_with(state, &session.session_id, MuxCapability::Delete)
-            .await,
-    );
+            .await;
     let mut results = Vec::with_capacity(ids.len());
     for message in ids {
-        let mut result: Result<(), MediatorError> = Err(MediatorError::RequestDataError(
-            44,
-            session.session_id.clone(),
-            "message not found for this session".into(),
-        ));
-        let mut deleted_as = session.did_hash.clone();
-        let mut parties = None;
-        for owner in &owners {
-            let for_member = *owner != session.did_hash;
-            // Read the message for a mux member, to know it is that member's
-            // before its standing is checked; otherwise only while someone is
-            // watching, so its `deleted` event names both parties.
-            let stored = if for_member || state.monitor.is_active() {
-                match state.database.get_message(owner, message).await {
-                    Ok(Some(m)) => Some(m),
-                    _ if for_member => continue,
-                    _ => None,
-                }
-            } else {
-                None
+        // The owners this id may be deleted as: the session's own DID, then
+        // each member it belongs to (read first, to know it is that member's
+        // before its standing is checked) while the member's own account
+        // still stands — checked for the members the id belongs to, not for
+        // every member the connection carries.
+        let mut owners = vec![session.did_hash.clone()];
+        // Only while someone is watching: the body, so each `deleted` event
+        // names the wire protocol. The same in every copy.
+        let mut body_seen: Option<String> = None;
+        for member in &members {
+            let Ok(Some(stored)) = state.database.get_message(member, message).await else {
+                continue;
             };
-            // A member's message is deleted only while the member's own
-            // account still stands; checked for the one member the id belongs
-            // to, not for every member the connection carries.
-            if for_member
-                && !crate::mux::connection::allows(
-                    state,
-                    &session.session_id,
-                    owner,
-                    MuxCapability::Delete,
-                )
-                .await
+            if !crate::mux::connection::allows(
+                state,
+                &session.session_id,
+                member,
+                MuxCapability::Delete,
+            )
+            .await
             {
                 continue;
             }
-            let seen = stored.map(|m| (m.from_address, m.to_address, m.msg));
-            result = state
-                .database
-                .delete_message(
-                    message,
-                    DeletionAuthority::Owner {
-                        did_hash: owner.clone(),
-                    },
-                )
-                .await;
-            if result.is_ok() {
-                deleted_as = owner.clone();
-                parties = seen;
-                break;
+            if body_seen.is_none() && state.monitor.is_active() {
+                body_seen = stored.msg;
             }
+            owners.push(member.clone());
+        }
+        if body_seen.is_none()
+            && state.monitor.is_active()
+            && let Ok(Some(stored)) = state.database.get_message(&session.did_hash, message).await
+        {
+            body_seen = stored.msg;
         }
 
+        // An owner's own copy (an acknowledgement), else — for
+        // `AcknowledgeOrWithdraw` — what an owner sent (a withdrawal) unless
+        // the delete repeats an acknowledgement.
+        let result = delete_for_client(
+            &*state.database,
+            &owners,
+            message,
+            kind == DeleteKind::AcknowledgeOrWithdraw,
+        )
+        .await;
+
         let mut member_without_delete = false;
-        match &result {
-            Ok(()) => {
-                let (from, to, body) = parties.unwrap_or_default();
-                state.monitor.deleted(
-                    message,
-                    &deleted_as,
-                    from.as_deref(),
-                    to.as_deref(),
-                    channel,
-                    body.as_deref(),
-                );
+        let outcome = match result {
+            Ok(removed) => {
+                // One event per copy removed: a withdrawal may remove
+                // several, one per recipient.
+                for copy in &removed.copies {
+                    state.monitor.deleted(
+                        message,
+                        &removed.owner,
+                        copy.from_did_hash.as_deref(),
+                        Some(copy.to_did_hash.as_str()),
+                        channel,
+                        body_seen.as_deref(),
+                    );
+                }
+                Ok(())
             }
-            Err(_) => {
+            Err(err) => {
                 // Held for a member whose mail this connection reads, which
                 // may not delete it? Only such a member is told apart: for
                 // any other, the answer would confirm a message the principal
@@ -216,11 +231,12 @@ pub(crate) async fn delete_for_session(
                         break;
                     }
                 }
+                Err(err)
             }
-        }
+        };
         results.push(DeleteResult {
             id: message.clone(),
-            outcome: result,
+            outcome,
             member_without_delete,
         });
     }

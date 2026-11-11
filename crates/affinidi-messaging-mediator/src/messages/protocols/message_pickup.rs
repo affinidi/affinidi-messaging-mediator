@@ -5,7 +5,10 @@
  * They are fire and forget messages
  */
 use affinidi_messaging_didcomm::message::{Attachment, Message};
-use affinidi_messaging_mediator_common::{errors::MediatorError, store::DeletionAuthority};
+use affinidi_messaging_mediator_common::{
+    errors::MediatorError,
+    store::{DeletionAuthority, MessageScope},
+};
 use affinidi_messaging_sdk::{
     messages::{
         fetch::FetchOptions,
@@ -498,8 +501,11 @@ pub(crate) async fn messages_received(
                 debug!("Deleting message: {}", msg_id);
                 match state
                     .database
-                    .delete_message(
+                    // An acknowledgement: the owner's own copy only, never
+                    // a copy it sent to someone else.
+                    .delete_message_in(
                         msg_id,
+                        MessageScope::Recipient(owner_hash),
                         DeletionAuthority::Owner {
                             did_hash: owner_hash.clone(),
                         },

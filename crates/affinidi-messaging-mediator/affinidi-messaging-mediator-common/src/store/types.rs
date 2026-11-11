@@ -185,6 +185,15 @@ impl MessageRef {
     }
 }
 
+/// One copy a delete removed: the recipient it was held for and its sender
+/// (`None` for an anonymous one). A delete that withdraws several copies
+/// reports each, so callers can report each removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedCopy {
+    pub to_did_hash: String,
+    pub from_did_hash: Option<String>,
+}
+
 /// Which of the records stored under one message id an operation acts on.
 ///
 /// See [`MessageRef`] for why one id can name several records. A caller that
@@ -198,6 +207,10 @@ pub enum MessageScope<'a> {
     /// The records in this account's queues: the one held for it as
     /// recipient when there is one; otherwise every record it sent under
     /// the id (a sender withdrawing by id withdraws every copy it sent).
+    ///
+    /// Never use this to acknowledge a delivery: once the recipient's own
+    /// copy is gone it falls through to the copies it sent, which belong to
+    /// other recipients. Acknowledgements use [`Recipient`](Self::Recipient).
     Party(&'a str),
     /// Every record stored under the id. Only an admin acts on these; an
     /// owner asking for `All` is treated as [`Party`](Self::Party) of itself.
@@ -205,11 +218,12 @@ pub enum MessageScope<'a> {
 }
 
 impl<'a> MessageScope<'a> {
-    /// The scope an id-only delete or read uses for `by`: an owner acts on its
-    /// own queues, an admin on every copy.
+    /// The scope an id-only delete uses for `by`: an owner acts on its own
+    /// inbox copy only, an admin on every copy. Withdrawing what one sent is
+    /// always asked for explicitly, with [`Party`](Self::Party).
     pub fn for_authority(by: &'a DeletionAuthority) -> Self {
         match by {
-            DeletionAuthority::Owner { did_hash } => MessageScope::Party(did_hash),
+            DeletionAuthority::Owner { did_hash } => MessageScope::Recipient(did_hash),
             DeletionAuthority::Admin { .. } => MessageScope::All,
         }
     }

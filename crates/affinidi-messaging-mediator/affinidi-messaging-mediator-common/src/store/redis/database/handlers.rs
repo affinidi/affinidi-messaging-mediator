@@ -42,6 +42,7 @@ impl Database {
                     "Loaded LUA scripts into the database from file: {}",
                     scripts_path
                 );
+                self.handler.remember_library(lua_scripts);
                 Ok(())
             }
             // A full database refuses FUNCTION LOAD (it is DENYOOM). That
@@ -56,6 +57,7 @@ impl Database {
                     "Database is full and refused FUNCTION LOAD, but the loaded library already matches {}; continuing",
                     scripts_path
                 );
+                self.handler.remember_library(lua_scripts);
                 Ok(())
             }
             Err(err) => {
@@ -113,6 +115,44 @@ fn find_library_code(value: &Value) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+impl crate::database::DatabaseHandler {
+    /// Keep `source` as the library this instance runs against.
+    pub(crate) fn remember_library(&self, source: String) {
+        if let Ok(mut held) = self.functions_source.write() {
+            *held = Some(source);
+        }
+    }
+
+    /// Load this instance's library again, after a call showed the server
+    /// holding an older one: an instance of an earlier build sharing the
+    /// server loads its own library when it starts, replacing this one for
+    /// every instance. Logged as an error because two builds sharing one
+    /// server keep replacing each other's library; the deploy must stop every
+    /// older instance first (see CHANGELOG). Returns whether it was loaded.
+    pub(crate) async fn ensure_library(&self, conn: &mut RedisConnection) -> bool {
+        let Some(source) = self.functions_source.read().ok().and_then(|s| s.clone()) else {
+            return false;
+        };
+        event!(
+            Level::ERROR,
+            "The server holds an older stored-function library than this build; loading this build's again. An instance of an earlier build is sharing this database: stop it."
+        );
+        redis::cmd("FUNCTION")
+            .arg("LOAD")
+            .arg("REPLACE")
+            .arg(&source)
+            .exec_async(conn)
+            .await
+            .is_ok()
+    }
+}
+
+/// Whether a stored-function error says the server is running the library of
+/// an earlier build (its `delete_message` took at most two arguments).
+pub(crate) fn is_older_library_error(err: &str) -> bool {
+    err.contains("Requires 1-2 arguments")
 }
 
 #[cfg(test)]

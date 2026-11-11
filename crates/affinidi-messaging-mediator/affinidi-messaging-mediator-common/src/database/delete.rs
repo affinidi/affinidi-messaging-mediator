@@ -5,7 +5,8 @@
 use super::DatabaseHandler;
 use crate::database::keys::Keys;
 use crate::errors::{MediatorError, StorageCap};
-use crate::store::types::{DeletionAuthority, MessageScope, OutboxReceipt};
+use crate::store::redis::database::handlers::is_older_library_error;
+use crate::store::types::{DeletionAuthority, MessageScope, OutboxReceipt, RemovedCopy};
 use crate::store::{OUTBOX_RECEIPT_TTL, ops};
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
 use axum::http::StatusCode;
@@ -60,7 +61,7 @@ impl DatabaseHandler {
         scope: MessageScope<'_>,
         admin_did_hash: Option<&str>,
         expiry_slot: Option<u64>,
-    ) -> Result<(), MediatorError> {
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
         let _span = span!(
             Level::INFO,
             "database_delete",
@@ -69,6 +70,9 @@ impl DatabaseHandler {
             message_hash = message_hash,
         );
         async move {
+            if !ops::is_message_id(message_hash) {
+                return Err(ops::delete_not_found(message_hash, None));
+            }
             let mut conn = self.get_async_connection().await?;
 
             // The receipts are written here in Rust rather than in the stored
@@ -91,29 +95,36 @@ impl DatabaseHandler {
                     MessageScope::Party(party) => ("P", party),
                     MessageScope::All => ("A", ""),
                 };
-                redis::cmd("FCALL")
-                    .arg("delete_message")
+                let mut cmd = redis::cmd("FCALL");
+                cmd.arg("delete_message")
                     .arg(1)
                     .arg(message_hash)
                     .arg(did_hash)
                     .arg(admin_did_hash.unwrap_or(""))
                     .arg(kind)
                     .arg(scope_did)
-                    .arg(expiry_slot.map(|slot| slot.to_string()).unwrap_or_default())
-                    .query_async::<Vec<Vec<String>>>(&mut conn)
-                    .await
-                    .map(|rows| {
-                        rows.into_iter()
-                            .filter_map(|row| match row.as_slice() {
-                                [to, from, _bytes, outbox] => Some(Removed {
-                                    to: to.clone(),
-                                    from: from.clone(),
-                                    in_outbox: outbox == "1",
-                                }),
-                                _ => None,
-                            })
-                            .collect()
-                    })
+                    .arg(expiry_slot.map(|slot| slot.to_string()).unwrap_or_default());
+                let mut reply = cmd.query_async::<Vec<Vec<String>>>(&mut conn).await;
+                // An instance of an earlier build reloaded its own library
+                // over this one: load ours again and retry once.
+                if let Err(err) = &reply
+                    && is_older_library_error(&err.to_string())
+                    && self.ensure_library(&mut conn).await
+                {
+                    reply = cmd.query_async::<Vec<Vec<String>>>(&mut conn).await;
+                }
+                reply.map(|rows| {
+                    rows.into_iter()
+                        .filter_map(|row| match row.as_slice() {
+                            [to, from, _bytes, outbox] => Some(Removed {
+                                to: to.clone(),
+                                from: from.clone(),
+                                in_outbox: outbox == "1",
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
             };
 
             match result {
@@ -123,6 +134,7 @@ impl DatabaseHandler {
                         message_hash,
                         removed.len()
                     );
+                    let mut copies = Vec::with_capacity(removed.len());
                     for record in removed {
                         // A receipt only for a record that sat in a sender's
                         // outbox, i.e. has a recorded sender.
@@ -137,8 +149,12 @@ impl DatabaseHandler {
                             )
                             .await;
                         }
+                        copies.push(RemovedCopy {
+                            from_did_hash: (!record.from.is_empty()).then_some(record.from),
+                            to_did_hash: record.to,
+                        });
                     }
-                    Ok(())
+                    Ok(copies)
                 }
                 Err(err) => {
                     let err_str = err.to_string();
@@ -427,16 +443,8 @@ impl DatabaseHandler {
                         .await?;
                     in_outbox |= outbox > 0 && release_from == from;
                 }
-                self.release_queues(
-                    conn,
-                    &member,
-                    &to,
-                    &from,
-                    &bytes,
-                    &receive_id,
-                    &send_id,
-                )
-                .await
+                self.release_queues(conn, &member, &to, &from, &bytes, &receive_id, &send_id)
+                    .await
             }
             .await;
             match released {
@@ -582,7 +590,11 @@ impl DatabaseHandler {
             .await
     }
 
-    /// Leave `from` a receipt saying why `message_hash` left its outbox.
+    /// Leave `from` a receipt saying why its copy of `message_hash` held for
+    /// `to` left its outbox. One field per recipient in the sender's
+    /// `RECEIPTS:<from>:<id>` hash, so one copy's removal never stands for
+    /// another's; the hash expires [`OUTBOX_RECEIPT_TTL`] after the latest
+    /// removal, and readers drop fields older than that.
     ///
     /// Best-effort: the message is already gone, and a receipt that could not
     /// be written reads as `Unknown` to the sender, which it treats as no
@@ -612,11 +624,11 @@ impl DatabaseHandler {
             reason,
             at_ms: now_ms(),
         };
-        let written: Result<(), redis::RedisError> = redis::cmd("SET")
-            .arg(self.keys.outbox_receipt(from, message_hash))
-            .arg(receipt.encode())
-            .arg("EX")
-            .arg(OUTBOX_RECEIPT_TTL.as_secs())
+        let key = self.keys.outbox_receipts(from, message_hash);
+        let written: Result<(), redis::RedisError> = redis::pipe()
+            .atomic()
+            .hset(&key, to, receipt.encode())
+            .expire(&key, OUTBOX_RECEIPT_TTL.as_secs() as i64)
             .query_async(conn)
             .await;
         if let Err(err) = written {

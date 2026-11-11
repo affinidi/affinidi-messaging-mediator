@@ -33,10 +33,10 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
-        MessageScope,
-        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
-        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
+        MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS,
+        PubSubRecord, RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState,
+        SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
+        TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -239,9 +239,10 @@ struct MemoryState {
     expiry: BTreeMap<u64, HashSet<RecordKey>>,
 
     // ─── Outbox receipts ────────────────────────────────────────────
-    /// `(sender_hash, msg_id) -> (receipt, expires_at_secs)`: why a sent
-    /// message left the queue. Pruned by `sweep_expired_messages`.
-    receipts: HashMap<(String, String), (OutboxReceipt, u64)>,
+    /// `(sender_hash, msg_id) -> recipient -> (receipt, expires_at_secs)`:
+    /// why each copy of a sent message left the queue, per recipient. Pruned
+    /// by `sweep_expired_messages`.
+    receipts: HashMap<(String, String), HashMap<String, (OutboxReceipt, u64)>>,
 
     // ─── Sessions ───────────────────────────────────────────────────
     sessions: HashMap<String, SessionRecord>,
@@ -425,7 +426,9 @@ impl MemoryState {
             };
             let expires = unix_timestamp_secs() + OUTBOX_RECEIPT_TTL.as_secs();
             self.receipts
-                .insert((from.clone(), message_hash.to_string()), (receipt, expires));
+                .entry((from.clone(), message_hash.to_string()))
+                .or_default()
+                .insert(record.to_did_hash.clone(), (receipt, expires));
         }
 
         // Counters
@@ -717,7 +720,10 @@ impl MediatorStore for MemoryStore {
         message_hash: &str,
         scope: MessageScope<'_>,
         by: DeletionAuthority,
-    ) -> Result<(), MediatorError> {
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
+        if !ops::is_message_id(message_hash) {
+            return Err(ops::delete_not_found(message_hash, None));
+        }
         let mut state = self.state.lock().await;
         // Authorisation and the choice of records are shared with the Fjall
         // backend via `store::ops` so the two can't drift. Every chosen record
@@ -725,10 +731,34 @@ impl MediatorStore for MemoryStore {
         let chosen = state
             .select(message_hash, scope, &by)
             .map_err(|e| e.into_delete_error(message_hash))?;
+        let mut removed = Vec::with_capacity(chosen.len());
         for key in &chosen {
+            if let Some(record) = state.messages.get(key) {
+                removed.push(RemovedCopy {
+                    to_did_hash: record.to_did_hash.clone(),
+                    from_did_hash: record.from_did_hash.clone(),
+                });
+            }
             state.remove_record(key, &by);
         }
-        Ok(())
+        Ok(removed)
+    }
+
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        let now = unix_timestamp_secs();
+        let state = self.state.lock().await;
+        Ok(state
+            .receipts
+            .get(&(from_did_hash.to_string(), msg_id.to_string()))
+            .into_iter()
+            .flatten()
+            .filter(|(_, (_, expires))| *expires > now)
+            .map(|(to, (receipt, _))| (to.clone(), *receipt))
+            .collect())
     }
 
     async fn sent_message_states(
@@ -745,16 +775,20 @@ impl MediatorStore for MemoryStore {
                     .records_of(id)
                     .into_iter()
                     .map(|(_, record)| ops::HeldMessage {
+                        to_did_hash: &record.to_did_hash,
                         from_did_hash: record.from_did_hash.as_deref(),
                         first_delivered_at_ms: record.first_delivered_at_ms,
                     })
                     .collect();
-                let receipt = state
+                let receipts: Vec<(String, OutboxReceipt)> = state
                     .receipts
                     .get(&(sender_did_hash.to_string(), id.clone()))
-                    .filter(|(_, expires)| *expires > now)
-                    .map(|(receipt, _)| *receipt);
-                ops::sent_message_state(sender_did_hash, &held, receipt)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, (_, expires))| *expires > now)
+                    .map(|(to, (receipt, _))| (to.clone(), *receipt))
+                    .collect();
+                ops::sent_message_state(sender_did_hash, &held, &receipts)
             })
             .collect())
     }
@@ -2461,11 +2495,10 @@ impl MediatorStore for MemoryStore {
                 }
             }
         }
-        self.state
-            .lock()
-            .await
-            .receipts
-            .retain(|_, (_, expires)| *expires > now_secs);
+        self.state.lock().await.receipts.retain(|_, per_recipient| {
+            per_recipient.retain(|_, (_, expires)| *expires > now_secs);
+            !per_recipient.is_empty()
+        });
         Ok(report)
     }
 
@@ -3505,7 +3538,11 @@ mod tests {
             .expect("sweep");
         assert_eq!(swept.expired, 0);
         assert!(
-            store.delivery_state("bob", &id).await.expect("state").is_some(),
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_some(),
             "still held before its shortened deadline"
         );
 
@@ -3515,7 +3552,13 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(swept.expired, 1);
-        assert!(store.delivery_state("bob", &id).await.expect("state").is_none());
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_none()
+        );
     }
 
     /// Off by default. A deployment that does not opt in keeps the behaviour it
@@ -3546,7 +3589,13 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(swept.expired, 0, "no shortening without the limit set");
-        assert!(store.delivery_state("bob", &id).await.expect("state").is_some());
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_some()
+        );
     }
 
     /// **The bug this design exists to avoid.** A client that reconnects often
@@ -3873,7 +3922,11 @@ mod tests {
         // The message is gone, so it has no delivery state — not a default
         // one, and emphatically not a resurrected record.
         assert!(
-            store.delivery_state("bob", &id).await.expect("state").is_none(),
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_none(),
             "an optimistically fetched message is deleted; marking it would \
              recreate metadata for a message that no longer exists"
         );

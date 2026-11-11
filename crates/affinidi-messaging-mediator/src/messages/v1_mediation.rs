@@ -30,7 +30,7 @@ use affinidi_messaging_didcomm_v1::message::MessageV1;
 use affinidi_messaging_didcomm_v1::protocols::coordinate_mediation as cm;
 use affinidi_messaging_didcomm_v1::protocols::message_pickup as mp;
 use affinidi_messaging_mediator_common::errors::MediatorError;
-use affinidi_messaging_mediator_common::store::types::DeletionAuthority;
+use affinidi_messaging_mediator_common::store::types::{DeletionAuthority, MessageScope};
 use affinidi_messaging_mediator_common::types::messages::{FetchDeletePolicy, FetchOptions};
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
@@ -749,15 +749,17 @@ async fn message_pickup(
                 // another's messages by guessing ids.
                 match state
                     .database
-                    .delete_message(
+                    // An acknowledgement: this mailbox's own copy only.
+                    .delete_message_in(
                         id,
+                        MessageScope::Recipient(&account.did_hash),
                         DeletionAuthority::Owner {
                             did_hash: account.did_hash.clone(),
                         },
                     )
                     .await
                 {
-                    Ok(()) => state.monitor.deleted(
+                    Ok(_) => state.monitor.deleted(
                         id,
                         &account.did_hash,
                         None,

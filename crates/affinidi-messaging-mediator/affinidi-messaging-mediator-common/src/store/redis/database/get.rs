@@ -78,9 +78,14 @@ impl Database {
     ) -> Result<Option<MessageListElement>, MediatorError> {
         let _span = span!(Level::DEBUG, "get_message", msg_id = msg_id,);
         async move {
+            if !crate::store::ops::is_message_id(msg_id) {
+                return Ok(None);
+            }
             let mut conn = self.get_connection().await?;
-            let Some((didcomm_message, meta_data)) =
-                self.party_record(&mut conn, did_hash, msg_id).await.map_err(|err| {
+            let Some((didcomm_message, meta_data)) = self
+                .party_record(&mut conn, did_hash, msg_id)
+                .await
+                .map_err(|err| {
                     event!(
                         Level::ERROR,
                         "Couldn't get message_id({}) from database: {}",

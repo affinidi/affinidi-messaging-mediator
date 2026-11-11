@@ -29,14 +29,27 @@ impl Database {
                 self.fetch_messages_in_steps(&mut conn, did_hash, start_id, options.limit)
                     .await
             } else {
-                redis::cmd("FCALL")
-                    .arg("fetch_messages")
+                let mut cmd = redis::cmd("FCALL");
+                cmd.arg("fetch_messages")
                     .arg(1)
                     .arg(did_hash)
                     .arg(start_id)
-                    .arg(options.limit)
-                    .query_async(&mut conn)
-                    .await
+                    .arg(options.limit);
+                let mut rows: redis::RedisResult<Vec<Value>> = cmd.query_async(&mut conn).await;
+                // Rows without the layout marker come from the library of an
+                // earlier build, which reads the old per-id records and would
+                // hand back bodies-less rows for per-recipient ones. Load this
+                // build's library again and read once more.
+                if rows.as_ref().is_ok_and(|rows| {
+                    rows.first().is_some_and(|row| {
+                        !from_redis_value::<Vec<String>>(row.clone())
+                            .is_ok_and(|fields| fields.first().is_some_and(|f| f == "LAYOUT"))
+                    })
+                }) && self.handler.ensure_library(&mut conn).await
+                {
+                    rows = cmd.query_async(&mut conn).await;
+                }
+                rows
             }
             .map_err(|err| {
                 event!(

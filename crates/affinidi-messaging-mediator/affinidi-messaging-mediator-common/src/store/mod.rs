@@ -306,10 +306,9 @@ pub mod redis;
 pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueClaimPage,
     ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageRef, MessageScope, MetadataStats,
-    OutboxReceipt,
-    PubSubRecord, RefreshRotation, RemovalReason, SentMessageState, Session, SessionClaims,
-    SessionState, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClaim,
-    StreamingClientState, StreamingKind, StreamingWrite,
+    OutboxReceipt, PubSubRecord, RefreshRotation, RemovalReason, RemovedCopy, SentMessageState,
+    Session, SessionClaims, SessionState, SessionSweepReport, StatCounter, StoreHealth,
+    StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind, StreamingWrite,
 };
 
 /// The error every backend's `get_session` returns for a session past the
@@ -451,9 +450,11 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ) -> Result<String, MediatorError>;
 
     /// Delete a message by ID alone, acting on the records
-    /// [`MessageScope::for_authority`] names: an owner's own inbox copy, or
-    /// every copy it sent; for an admin, every copy. See
-    /// [`delete_message_in`](Self::delete_message_in), which this calls.
+    /// [`MessageScope::for_authority`] names: an owner's own inbox copy only
+    /// (an acknowledgement); for an admin, every copy. A sender withdrawing
+    /// what it sent asks for it with
+    /// [`delete_message_in`](Self::delete_message_in) and
+    /// [`MessageScope::Party`].
     ///
     /// Authorisation is encoded in [`DeletionAuthority`]:
     /// - `Owner { did_hash }`: must match the message's TO or FROM, else
@@ -480,12 +481,10 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         message_hash: &str,
         by: DeletionAuthority,
     ) -> Result<(), MediatorError> {
-        let scope = match &by {
-            DeletionAuthority::Owner { did_hash } => MessageScope::Party(did_hash.as_str()),
-            DeletionAuthority::Admin { .. } => MessageScope::All,
-        };
+        let scope = MessageScope::for_authority(&by);
         self.delete_message_in(message_hash, scope, by.clone())
             .await
+            .map(|_| ())
     }
 
     /// Delete the records of `message_hash` that `scope` names
@@ -494,8 +493,9 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// Each chosen record is removed exactly once with its queue entries,
     /// counters and expiry entry, and leaves its sender a receipt, as
     /// [`delete_message`](Self::delete_message) describes. Returns
-    /// `not_found` when no record is in scope, `permission_denied` when `by`
-    /// may not remove one that is. Several records are removed together
+    /// `not_found` when no record is in scope (or `message_hash` is not a
+    /// message id, [`ops::is_message_id`]), `permission_denied` when `by` may
+    /// not remove one that is. On success, the copies removed. Several records are removed together
     /// where the backend can (one Lua call, one Fjall batch, one lock), and
     /// otherwise each on its own, never leaving one half-removed.
     ///
@@ -507,11 +507,26 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         message_hash: &str,
         scope: MessageScope<'_>,
         by: DeletionAuthority,
-    ) -> Result<(), MediatorError>;
+    ) -> Result<Vec<RemovedCopy>, MediatorError>;
+
+    /// The receipts `from_did_hash` holds for the copies of `msg_id` removed
+    /// within [`OUTBOX_RECEIPT_TTL`], one per recipient:
+    /// `(recipient, receipt)`. Receipts are per recipient, so one copy's
+    /// removal never stands for another's.
+    ///
+    /// The default answers none, as for a backend that keeps no receipts.
+    async fn outbox_receipts(
+        &self,
+        _from_did_hash: &str,
+        _msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        Ok(Vec::new())
+    }
 
     /// Where each of `msg_ids` stands for `sender_did_hash`, in the order asked
     /// (`messaging/message/status/0.1`). An id the sender stored for several
-    /// recipients answers for all of its copies ([`ops::sent_message_state`]).
+    /// recipients answers for all of its copies, held and removed
+    /// ([`ops::sent_message_state`]).
     ///
     /// A held message answers `Queued` or `Delivered`, and a removed one
     /// answers from its receipt, but only when `sender_did_hash` is the
@@ -1022,7 +1037,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
                     .delete_message_in(&element.msg_id, scope, by.clone())
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         report.count += 1;
                         report.bytes += element.size as usize;
                     }

@@ -95,6 +95,10 @@ pub struct DatabaseHandler {
     redis_url: String,
     /// Key names for the configured `cluster_mode`.
     pub(crate) keys: keys::Keys,
+    /// The stored-function library this instance loaded at start, kept so it
+    /// can be loaded again if an instance running an older build replaces it
+    /// on the shared server while this one runs (see `ensure_library`).
+    pub(crate) functions_source: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 #[cfg(feature = "redis-backend")]
@@ -208,6 +212,7 @@ impl DatabaseHandler {
             connection,
             redis_url: config.database_url.clone(),
             keys: keys::Keys::new(config.cluster_mode),
+            functions_source: Default::default(),
         };
 
         // Warn if Redis connection has no authentication

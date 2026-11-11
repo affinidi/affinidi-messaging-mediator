@@ -39,6 +39,15 @@ pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 /// recipient is added to the id's recipient index, and the record carries its
 /// expiry so the sweeper can tell a current expiry entry from a stale one.
 ///
+/// Known edge, left as is: a legacy record for `to` whose own store was
+/// interrupted by an earlier build (no `RECEIVE_ID` yet) or is being deleted
+/// does not count as stored, so the same bytes stored again get a
+/// per-recipient record beside it. The two are separate records with their
+/// own queue entries and counters, each removed on its own (the legacy one by
+/// the delete or sweep that takes its lapsed hold over), so nothing leaks; the
+/// recipient may see the message twice. It needs an earlier build to have
+/// died mid-store of exactly these bytes just before the upgrade.
+///
 /// KEYS: body, metadata, legacy metadata, recipient index. ARGV: body, bytes,
 /// to, from (`ANONYMOUS` for none), delete lease ms, store token, store lease
 /// ms, expires at (epoch secs).

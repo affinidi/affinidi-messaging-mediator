@@ -24,7 +24,7 @@ use crate::{
 use affinidi_messaging_didcomm::message::Message as DidcommMessage;
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError};
 #[cfg(feature = "tsp")]
-use affinidi_messaging_mediator_common::store::DeletionAuthority;
+use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
 use affinidi_messaging_mediator_common::store::{MediatorStore, StatCounter};
 use affinidi_messaging_mediator_common::tasks::forwarding::relay_ack::{
     RELAY_ACK_SUBPROTOCOL, RelayAck, frame_id,
@@ -2490,15 +2490,17 @@ async fn drain_tsp_elements(
             // on the wire, so we continue.
             match state
                 .database
-                .delete_message(
+                // The copy just delivered to this DID, never one it sent.
+                .delete_message_in(
                     &id,
+                    MessageScope::Recipient(did_hash),
                     DeletionAuthority::Owner {
                         did_hash: did_hash.to_string(),
                     },
                 )
                 .await
             {
-                Ok(()) => state.monitor.deleted(
+                Ok(_) => state.monitor.deleted(
                     &id,
                     did_hash,
                     parties.0.as_deref(),

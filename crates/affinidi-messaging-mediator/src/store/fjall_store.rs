@@ -71,9 +71,10 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
-        MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
-        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
+        MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS,
+        PubSubRecord, RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState,
+        SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
+        TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -276,6 +277,18 @@ fn outbox_receipt_key(from: &str, msg_id: &str) -> Vec<u8> {
     key.extend_from_slice(from.as_bytes());
     key.push(PEER_QUEUE_SEP);
     key.extend_from_slice(msg_id.as_bytes());
+    key
+}
+
+/// Receipt key for the copy of `msg_id` held for `to`:
+/// `outbox_receipt_key(from, msg_id) || ':' || to`. Receipts are per
+/// recipient, so one copy's removal never stands for another's. A key
+/// without the suffix was written before that and is read as a receipt for an
+/// unknown recipient until it expires.
+fn outbox_receipt_copy_key(from: &str, msg_id: &str, to: &str) -> Vec<u8> {
+    let mut key = outbox_receipt_key(from, msg_id);
+    key.push(b':');
+    key.extend_from_slice(to.as_bytes());
     key
 }
 
@@ -724,6 +737,9 @@ impl FjallStore {
         msg_id: &str,
         to: &str,
     ) -> Result<Option<(String, StoredMessage)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(None);
+        }
         let key = record_key(msg_id, to);
         if let Some(raw) = self
             .messages
@@ -745,10 +761,41 @@ impl FjallStore {
         Ok(None)
     }
 
+    /// Every current receipt `from` holds for `msg_id`: one per recipient
+    /// (`...:<to>`), and one written before receipts were per recipient (no
+    /// suffix), reported with an empty recipient.
+    fn receipts_for(
+        &self,
+        from: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        let now = now_ms() / 1_000;
+        let base = outbox_receipt_key(from, msg_id);
+        let mut receipts = Vec::new();
+        for guard in self.outbox_receipts.prefix(&base) {
+            let (key, raw) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("receipts_for:prefix", e))?;
+            let stored: StoredOutboxReceipt = Self::decode(&raw)?;
+            if stored.expires_at <= now {
+                continue;
+            }
+            let to = key
+                .get(base.len() + 1..)
+                .map(|to| String::from_utf8_lossy(to).into_owned())
+                .unwrap_or_default();
+            receipts.push((to, stored.receipt));
+        }
+        Ok(receipts)
+    }
+
     /// Every row of `msg_id`: a legacy bare-id row if there is one, then the
     /// per-recipient rows (`{msg_id}:` prefix), each with its key.
     fn records_of(&self, msg_id: &str) -> Result<Vec<(String, StoredMessage)>, MediatorError> {
         let mut rows = Vec::new();
+        if !ops::is_message_id(msg_id) {
+            return Ok(rows);
+        }
         if let Some(raw) = self
             .messages
             .get(msg_id.as_bytes())
@@ -838,7 +885,7 @@ impl FjallStore {
                 && let Some(reason) = ops::removal_reason(by, &stored.to_did_hash, Some(from))
             {
                 let expires_at = now_ms() / 1_000 + OUTBOX_RECEIPT_TTL.as_secs();
-                let receipt_key = outbox_receipt_key(from, message_hash);
+                let receipt_key = outbox_receipt_copy_key(from, message_hash, &stored.to_did_hash);
                 batch.insert(
                     &self.outbox_receipt_expiry,
                     outbox_receipt_expiry_key(expires_at, &receipt_key),
@@ -1482,7 +1529,10 @@ impl MediatorStore for FjallStore {
         message_hash: &str,
         scope: MessageScope<'_>,
         by: DeletionAuthority,
-    ) -> Result<(), MediatorError> {
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
+        if !ops::is_message_id(message_hash) {
+            return Err(ops::delete_not_found(message_hash, None));
+        }
         let _guard = self.write_lock.lock().await;
 
         // Which rows, and whether `by` may remove them: shared with the
@@ -1499,7 +1549,29 @@ impl MediatorStore for FjallStore {
             .map_err(|e| e.into_delete_error(message_hash))?;
         let chosen: Vec<(String, StoredMessage)> =
             chosen.into_iter().map(|i| records[i].clone()).collect();
-        self.remove_records_locked(message_hash, &chosen, &by)
+        self.remove_records_locked(message_hash, &chosen, &by)?;
+        Ok(chosen
+            .into_iter()
+            .map(|(_, stored)| RemovedCopy {
+                to_did_hash: stored.to_did_hash,
+                from_did_hash: stored.from_did_hash,
+            })
+            .collect())
+    }
+
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .receipts_for(from_did_hash, msg_id)?
+            .into_iter()
+            .filter(|(to, _)| !to.is_empty())
+            .collect())
     }
 
     async fn sent_message_states(
@@ -1510,25 +1582,21 @@ impl MediatorStore for FjallStore {
         let now = now_ms() / 1_000;
         let mut states = Vec::with_capacity(msg_ids.len());
         for id in msg_ids {
+            if !ops::is_message_id(id) {
+                states.push(SentMessageState::Unknown);
+                continue;
+            }
             let held = self.records_of(id)?;
-            let receipt = match self
-                .outbox_receipts
-                .get(outbox_receipt_key(sender_did_hash, id))
-                .map_err(|e| Self::db_err("sent_message_states:receipts.get", e))?
-            {
-                Some(raw) => Some(Self::decode::<StoredOutboxReceipt>(&raw)?)
-                    .filter(|stored| stored.expires_at > now)
-                    .map(|stored| stored.receipt),
-                None => None,
-            };
+            let receipts = self.receipts_for(sender_did_hash, id)?;
             let held: Vec<ops::HeldMessage<'_>> = held
                 .iter()
                 .map(|(_, message)| ops::HeldMessage {
+                    to_did_hash: &message.to_did_hash,
                     from_did_hash: message.from_did_hash.as_deref(),
                     first_delivered_at_ms: message.first_delivered_at_ms,
                 })
                 .collect();
-            states.push(ops::sent_message_state(sender_did_hash, &held, receipt));
+            states.push(ops::sent_message_state(sender_did_hash, &held, &receipts));
         }
         Ok(states)
     }
@@ -1611,6 +1679,9 @@ impl MediatorStore for FjallStore {
         did_hash: &str,
         msg_id: &str,
     ) -> Result<Option<MessageListElement>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(None);
+        }
         // Its own inbox copy, else a copy it sent (`MessageScope::Party`).
         // Anyone else gets `None`: don't leak existence to non-owners.
         let stored = match self.record_for(msg_id, did_hash)? {
@@ -4034,7 +4105,12 @@ impl MediatorStore for FjallStore {
                 None => None,
             };
             let msg_id = row_key.split(':').next().unwrap_or_default().to_string();
-            match row.filter(|stored| ops::expiry_entry_is_due(stored.expires_at, ts)) {
+            // A legacy bare-id row is due from any of its entries, as on
+            // Redis: the earlier `mark_delivered` added a delivered-TTL entry
+            // without recording the deadline on the row, so its expiry
+            // cannot be compared.
+            let legacy = !row_key.contains(':');
+            match row.filter(|stored| legacy || ops::expiry_entry_is_due(stored.expires_at, ts)) {
                 Some(stored) => {
                     let meta = MessageMetaData {
                         bytes: stored.bytes,
@@ -5938,7 +6014,11 @@ mod per_recipient_record_tests {
             .expect("fetch");
         assert_eq!(fetched.success.len(), 1);
         assert_eq!(fetched.success[0].msg.as_deref(), Some(body));
-        assert!(fetched.delete_errors.is_empty(), "{:?}", fetched.delete_errors);
+        assert!(
+            fetched.delete_errors.is_empty(),
+            "{:?}",
+            fetched.delete_errors
+        );
         assert!(store.messages.get(id.as_bytes()).unwrap().is_none());
         assert_eq!(counters(&store, &a).await, (0, 0));
         assert_eq!(counters(&store, &from).await, (0, 1));
@@ -5960,5 +6040,41 @@ mod per_recipient_record_tests {
         assert!(store.messages.get(expiring.as_bytes()).unwrap().is_none());
         assert_eq!(counters(&store, &a).await, (0, 0));
         assert_eq!(counters(&store, &from).await, (0, 1), "b's copy remains");
+    }
+
+    /// A legacy row whose delivery brought its deadline forward under the
+    /// earlier build — an extra expiry entry, the row's own `expires_at`
+    /// unchanged — expires from that entry, as it did before the upgrade.
+    #[tokio::test]
+    async fn a_legacy_rows_delivered_deadline_still_expires_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let (a, from) = (hash("a"), hash("sender"));
+        for did in [&a, &from] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account_add");
+        }
+        let now = now_ms() / 1_000;
+        let id = store
+            .store_message("s", "legacy-delivered", &a, Some(&from), now + 3_600, 0)
+            .await
+            .expect("store");
+        make_legacy(&store, &id, &a);
+        // The earlier build's `mark_delivered`: an entry at the deadline, the
+        // row left as it was.
+        let mut batch = store.db.batch();
+        batch.insert(&store.expiry, expiry_key(now - 5, &id), Vec::<u8>::new());
+        batch.commit().expect("commit");
+
+        let report = store
+            .sweep_expired_messages(now, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 1, "{report:?}");
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 0));
     }
 }

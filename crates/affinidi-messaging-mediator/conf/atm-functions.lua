@@ -205,6 +205,11 @@ end
 --            alone ('' for none)
 -- Returns one { TO, FROM, BYTES, OUTBOX } per removed record. The rules are
 -- the same as `ops::select_records` in the Rust backends.
+--
+-- Called with one or two arguments, as a mediator built before records were
+-- per recipient calls it, it keeps that contract: the requester's own copy,
+-- else the copies it sent (every copy for the admin), answered 'OK'. That
+-- keeps an older instance working against this library during an upgrade.
 local function delete_message(keys, args)
     -- Correct number of keys?
     if #keys ~= 1 then
@@ -220,6 +225,7 @@ local function delete_message(keys, args)
     redis.setresp(3)
 
     local id = keys[1]
+    local legacy_call = (#args <= 2)
     local requester = args[1]
     local is_admin = (#args >= 2 and args[2] ~= '' and args[1] == args[2])
     local scope = args[3] or ''
@@ -282,6 +288,9 @@ local function delete_message(keys, args)
     for _, record in ipairs(chosen) do
         table.insert(removed, remove_record(id, record[1], record[2]))
     end
+    if legacy_call then
+        return redis.status_reply('OK')
+    end
     return removed
 end
 
@@ -313,7 +322,10 @@ local function fetch_messages(keys, args)
         -- element[2] = fields: [MSG_ID, id, BYTES, bytes, FROM, from]
         local fields = element[2]
         local msg_id = fields[2]
-        fetched_messages[x] = { 'STREAM_ID', element[1], 'MSG_ID', msg_id, 'FROM_DID', fields[6] }
+        -- LAYOUT tells the caller this library reads per-recipient records;
+        -- a row without it came from an older library.
+        fetched_messages[x] = { 'LAYOUT', '2', 'STREAM_ID', element[1], 'MSG_ID', msg_id,
+            'FROM_DID', fields[6] }
 
         -- This recipient's record of the message
         local record = record_for(msg_id, keys[1])

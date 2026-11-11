@@ -138,7 +138,7 @@ impl Database {
                 )
                 .await
             {
-                Ok(()) => (1, bytes),
+                Ok(_) => (1, bytes),
                 Err(e) if ops::is_delete_not_found(&e) => (0, 0),
                 Err(e) => return Err(e),
             };

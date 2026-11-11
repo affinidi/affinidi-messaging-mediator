@@ -327,6 +327,13 @@ impl Database {
             message_hash = message_hash
         );
         async move {
+            if !crate::store::ops::is_message_id(message_hash) {
+                return Err(MediatorError::DatabaseError(
+                    22,
+                    session_id.into(),
+                    format!("No usable metadata for message {message_hash}"),
+                ));
+            }
             // The `store_message` Lua function keeps a message's metadata in
             // the hash `MSG:META:{id}`: BYTES, TO, TIMESTAMP (unix ms), and
             // FROM when the sender is known. (This read used to look for a

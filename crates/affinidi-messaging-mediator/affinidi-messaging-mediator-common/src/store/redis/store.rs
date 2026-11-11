@@ -13,16 +13,26 @@
 //! subscribers can share one Redis pubsub bridge.
 
 use crate::circuit_breaker::CircuitBreaker;
+use crate::database::keys::Keys;
+use crate::store::redis::database::cluster_scripts::MARK_DELIVERED;
 use crate::store::redis::database::{
     forwarding::ForwardQueueEntry as InnerForwardEntry, stats::MetadataStats as InnerMetadataStats,
     store::MessageMetaData as InnerMessageMetaData,
 };
-use crate::database::keys::Keys;
-use crate::store::redis::database::cluster_scripts::MARK_DELIVERED;
 use crate::store::{
-    DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope, OutboxReceipt,
-    SentMessageState, StoredMessageRef, mux, ops,
+    DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope,
+    OUTBOX_RECEIPT_TTL, OutboxReceipt, RemovedCopy, SentMessageState, StoredMessageRef, mux, ops,
 };
+
+/// Whether a per-recipient receipt is still within [`OUTBOX_RECEIPT_TTL`]. Its
+/// hash lives as long as the latest removal, so older fields are dropped here.
+fn receipt_is_current(receipt: &OutboxReceipt) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    receipt.at_ms + OUTBOX_RECEIPT_TTL.as_millis() as u64 > now_ms
+}
 use crate::types::{
     accounts::{
         Account, AccountActivity, AccountStats, AccountStatsDelta, AccountType, ActivityKind,
@@ -629,7 +639,7 @@ impl MediatorStore for RedisStore {
         message_hash: &str,
         scope: MessageScope<'_>,
         by: DeletionAuthority,
-    ) -> Result<(), MediatorError> {
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
         let (did_hash, admin) = match &by {
             DeletionAuthority::Owner { did_hash } => (did_hash.as_str(), None),
             DeletionAuthority::Admin { admin_did_hash } => {
@@ -643,6 +653,33 @@ impl MediatorStore for RedisStore {
             .await
     }
 
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let raw: HashMap<String, String> = redis::cmd("HGETALL")
+            .arg(self.keys().outbox_receipts(from_did_hash, msg_id))
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::DatabaseError(
+                    14,
+                    "NA".into(),
+                    format!("Couldn't read outbox receipts: {err}"),
+                )
+            })?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(to, raw)| Some((to, OutboxReceipt::decode(&raw)?)))
+            .filter(|(_, receipt)| receipt_is_current(receipt))
+            .collect())
+    }
+
     async fn mark_delivered(
         &self,
         recipient_did_hash: &str,
@@ -651,6 +688,12 @@ impl MediatorStore for RedisStore {
         delivered_ttl_secs: u64,
     ) -> Result<DeliveryMarkReport, MediatorError> {
         let mut report = DeliveryMarkReport::default();
+        let msg_ids: Vec<String> = msg_ids
+            .iter()
+            .filter(|id| ops::is_message_id(id))
+            .cloned()
+            .collect();
+        let msg_ids = msg_ids.as_slice();
         if msg_ids.is_empty() {
             return Ok(report);
         }
@@ -672,8 +715,8 @@ impl MediatorStore for RedisStore {
             now_ms / 1_000 + delivered_ttl_secs
         };
         let keys = self.keys();
-        let replies: Vec<Vec<i64>> = match futures_util::future::try_join_all(msg_ids.iter().map(
-            |id| {
+        let replies: Vec<Vec<i64>> =
+            match futures_util::future::try_join_all(msg_ids.iter().map(|id| {
                 let mut conn = conn.clone();
                 async move {
                     MARK_DELIVERED
@@ -685,24 +728,23 @@ impl MediatorStore for RedisStore {
                         .invoke_async::<Vec<i64>>(&mut conn)
                         .await
                 }
-            },
-        ))
-        .await
-        {
-            Ok(replies) => replies,
-            // Best-effort by the trait's contract: this is bookkeeping beside
-            // a pickup that has already succeeded, and failing the pickup
-            // because the bookkeeping failed would trade a real delivery for
-            // a statistic.
-            Err(err) => {
-                warn!(
-                    "Couldn't record delivery for {} message(s): {}",
-                    msg_ids.len(),
-                    err
-                );
-                return Ok(report);
-            }
-        };
+            }))
+            .await
+            {
+                Ok(replies) => replies,
+                // Best-effort by the trait's contract: this is bookkeeping beside
+                // a pickup that has already succeeded, and failing the pickup
+                // because the bookkeeping failed would trade a real delivery for
+                // a statistic.
+                Err(err) => {
+                    warn!(
+                        "Couldn't record delivery for {} message(s): {}",
+                        msg_ids.len(),
+                        err
+                    );
+                    return Ok(report);
+                }
+            };
 
         // Bring the deadline forward, for first deliveries only, and only
         // where the script moved the record's own expiry (a legacy record,
@@ -775,43 +817,60 @@ impl MediatorStore for RedisStore {
                 format!("Couldn't read sent-message states: {err}"),
             )
         };
+        // Anything that is not a message id is `Unknown`, unread.
+        let valid: Vec<&String> = msg_ids.iter().filter(|id| ops::is_message_id(id)).collect();
 
-        // First round trip: each id's legacy record, its recipient index and
-        // the requester's receipt for it.
+        // First round trip: each id's legacy record, its recipient index, the
+        // requester's per-recipient receipts and its receipt from before
+        // receipts were per recipient.
         let mut pipe = redis::pipe();
-        for id in msg_ids {
+        for id in &valid {
             pipe.cmd("HMGET")
                 .arg(keys.msg_meta(id, None))
+                .arg("TO")
                 .arg("FROM")
                 .arg("FIRST_DELIVERED_AT");
             pipe.cmd("SMEMBERS").arg(keys.msg_recipients(id));
+            pipe.cmd("HGETALL")
+                .arg(keys.outbox_receipts(sender_did_hash, id));
             pipe.cmd("GET")
                 .arg(keys.outbox_receipt(sender_did_hash, id));
         }
-        let replies: Vec<redis::Value> = self
-            .query_each(&mut conn, pipe)
-            .await
-            .map_err(read_err)?;
-        type Row = (Vec<Option<String>>, Vec<String>, Option<String>);
-        let mut rows: Vec<Row> = Vec::with_capacity(msg_ids.len());
+        let replies: Vec<redis::Value> = if valid.is_empty() {
+            Vec::new()
+        } else {
+            self.query_each(&mut conn, pipe).await.map_err(read_err)?
+        };
+        type Row = (
+            Vec<Option<String>>,
+            Vec<String>,
+            HashMap<String, String>,
+            Option<String>,
+        );
+        let mut rows: Vec<Row> = Vec::with_capacity(valid.len());
         let mut replies = replies.into_iter();
-        while let (Some(legacy), Some(members), Some(receipt)) =
-            (replies.next(), replies.next(), replies.next())
-        {
+        while let (Some(legacy), Some(members), Some(receipts), Some(old_receipt)) = (
+            replies.next(),
+            replies.next(),
+            replies.next(),
+            replies.next(),
+        ) {
             rows.push((
                 redis::from_redis_value(legacy).unwrap_or_default(),
                 redis::from_redis_value(members).unwrap_or_default(),
-                redis::from_redis_value(receipt).unwrap_or(None),
+                redis::from_redis_value(receipts).unwrap_or_default(),
+                redis::from_redis_value(old_receipt).unwrap_or(None),
             ));
         }
 
         // Second round trip: every per-recipient copy's sender and stamp.
         let mut pipe = redis::pipe();
         let mut copies = 0;
-        for (id, (_, members, _)) in msg_ids.iter().zip(&rows) {
+        for (id, (_, members, _, _)) in valid.iter().zip(&rows) {
             for to in members {
                 pipe.cmd("HMGET")
                     .arg(keys.msg_meta(id, Some(to)))
+                    .arg("TO")
                     .arg("FROM")
                     .arg("FIRST_DELIVERED_AT");
                 copies += 1;
@@ -820,10 +879,8 @@ impl MediatorStore for RedisStore {
         let copy_rows: Vec<Vec<Option<String>>> = if copies == 0 {
             Vec::new()
         } else {
-            let replies: Vec<redis::Value> = self
-                .query_each(&mut conn, pipe)
-                .await
-                .map_err(read_err)?;
+            let replies: Vec<redis::Value> =
+                self.query_each(&mut conn, pipe).await.map_err(read_err)?;
             replies
                 .into_iter()
                 .map(|v| redis::from_redis_value(v).unwrap_or_default())
@@ -831,32 +888,48 @@ impl MediatorStore for RedisStore {
         };
 
         let mut copy_rows = copy_rows.into_iter();
-        let mut states = Vec::with_capacity(msg_ids.len());
-        for (legacy, members, receipt) in rows {
-            // `HMGET` on a missing key answers with nulls, so no `FROM` is how
-            // a removed copy presents.
-            let mut held: Vec<(String, Option<String>)> = Vec::new();
-            for fields in std::iter::once(legacy)
-                .chain(members.iter().map_while(|_| copy_rows.next()))
+        let mut by_id: HashMap<&str, SentMessageState> = HashMap::new();
+        for (id, (legacy, members, receipts, old_receipt)) in valid.iter().zip(rows) {
+            // `HMGET` on a missing key answers with nulls, so no `TO` is how a
+            // removed copy presents.
+            let mut held: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+            for fields in
+                std::iter::once(legacy).chain(members.iter().map_while(|_| copy_rows.next()))
             {
-                if let Some(Some(from)) = fields.first() {
-                    held.push((from.clone(), fields.get(1).cloned().flatten()));
+                if let [Some(to), from, first] = fields.as_slice() {
+                    held.push((to.clone(), from.clone(), first.clone()));
                 }
             }
             let held: Vec<ops::HeldMessage<'_>> = held
                 .iter()
-                .map(|(from, first)| ops::HeldMessage {
-                    from_did_hash: Some(from.as_str()),
+                .map(|(to, from, first)| ops::HeldMessage {
+                    to_did_hash: to,
+                    from_did_hash: from.as_deref(),
                     first_delivered_at_ms: first.as_ref().and_then(|v| v.parse().ok()),
                 })
                 .collect();
-            states.push(ops::sent_message_state(
-                sender_did_hash,
-                &held,
-                receipt.as_deref().and_then(OutboxReceipt::decode),
-            ));
+            let mut found: Vec<(String, OutboxReceipt)> = receipts
+                .into_iter()
+                .filter_map(|(to, raw)| Some((to, OutboxReceipt::decode(&raw)?)))
+                .filter(|(_, receipt)| receipt_is_current(receipt))
+                .collect();
+            if let Some(receipt) = old_receipt.as_deref().and_then(OutboxReceipt::decode) {
+                found.push((String::new(), receipt));
+            }
+            by_id.insert(
+                id.as_str(),
+                ops::sent_message_state(sender_did_hash, &held, &found),
+            );
         }
-        Ok(states)
+        Ok(msg_ids
+            .iter()
+            .map(|id| {
+                by_id
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(SentMessageState::Unknown)
+            })
+            .collect())
     }
 
     async fn delivery_state(
@@ -916,6 +989,10 @@ impl MediatorStore for RedisStore {
                 out.push(None);
                 continue;
             };
+            if !ops::is_message_id(&record.msg_id) {
+                out.push(None);
+                continue;
+            }
             let fields = if own.first().is_some_and(Option::is_some) {
                 own
             } else if legacy.first().cloned().flatten().as_deref()
