@@ -96,6 +96,65 @@ return 0
     )
 });
 
+/// Renew this instance's heartbeat, list it among the instances that keep
+/// one, and drop from that list instances whose last beat is older than the
+/// prune horizon (instance uuids are often random per start, so the list
+/// would otherwise grow with every restart).
+///
+/// KEYS: [1] this instance's STREAMING_ALIVE key, [2] STREAMING_INSTANCES.
+/// ARGV: [1] this instance's uuid, [2] heartbeat lifetime in milliseconds,
+/// [3] now (unix seconds), [4] prune beats older than this (unix seconds).
+/// Returns 1 when this instance was listed but its heartbeat had lapsed:
+/// other instances may have taken its entries over meanwhile.
+static HEARTBEAT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local alive = redis.call('EXISTS', KEYS[1])
+local listed = redis.call('HEXISTS', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[1], '1', 'PX', ARGV[2])
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
+local all = redis.call('HGETALL', KEYS[2])
+for i = 1, #all, 2 do
+  if (tonumber(all[i + 1]) or 0) < tonumber(ARGV[4]) then
+    redis.call('HDEL', KEYS[2], all[i])
+  end
+end
+if listed == 1 and alive == 0 then
+  return 1
+end
+return 0
+"#,
+    )
+});
+
+/// Remove `did_hash`'s streaming entry when it belongs to a dead instance:
+/// one listed in STREAMING_INSTANCES whose heartbeat has expired. Both are
+/// checked again here, so an instance that beat again, or a DID another
+/// instance took meanwhile, is left alone.
+///
+/// KEYS: [1] GLOBAL_STREAMING, [2] STREAMING_KIND, [3] the dead instance's
+/// STREAMING_SESSIONS set, [4] its STREAMING_ALIVE key,
+/// [5] STREAMING_INSTANCES.
+/// ARGV: [1] did_hash, [2] the dead instance's uuid.
+/// Returns 1 when the entry was removed.
+static EVICT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('HEXISTS', KEYS[5], ARGV[2]) == 0 then
+  return 0
+end
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if not cur or string.match(cur, '^([^:]*):') ~= ARGV[2] then
+  return 0
+end
+redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
+"#,
+    )
+});
+
 /// DIDs read per `HMGET` in [`Database::streaming_owners`].
 const OWNERS_BATCH: usize = 500;
 
@@ -423,5 +482,132 @@ impl Database {
             held_here: held == 1,
             displaced_mux: (!displaced.is_empty()).then_some(displaced),
         })
+    }
+
+    /// Renew `stream_uuid`'s heartbeat for `lifetime` through the
+    /// `HEARTBEAT` script; `prune_after` is how old a listed instance's last
+    /// beat may get before it leaves the list. Returns whether the heartbeat
+    /// had lapsed.
+    pub async fn streaming_heartbeat(
+        &self,
+        stream_uuid: &str,
+        lifetime: std::time::Duration,
+        prune_after: std::time::Duration,
+    ) -> Result<bool, MediatorError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut conn = self.get_connection().await?;
+        let lapsed: i64 = HEARTBEAT
+            .key(self.keys().streaming_alive(stream_uuid))
+            .key(self.keys().streaming_instances())
+            .arg(stream_uuid)
+            .arg(lifetime.as_millis().max(1) as u64)
+            .arg(now)
+            .arg(now.saturating_sub(prune_after.as_secs()))
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &err,
+                    format!("streaming_heartbeat() failed. Reason: {err}"),
+                )
+            })?;
+        Ok(lapsed == 1)
+    }
+
+    /// Whether each of `stream_uuids` is a dead instance: listed among the
+    /// instances that keep a heartbeat, with its heartbeat expired. An
+    /// instance that never kept one is not dead.
+    pub async fn streaming_dead_instances(
+        &self,
+        stream_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        if stream_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let mut pipe = redis::pipe();
+        for uuid in stream_uuids {
+            pipe.cmd("HEXISTS")
+                .arg(self.keys().streaming_instances())
+                .arg(uuid)
+                .cmd("EXISTS")
+                .arg(self.keys().streaming_alive(uuid));
+        }
+        let flags: Vec<bool> = pipe.query_async(&mut conn).await.map_err(|err| {
+            MediatorError::database_from_redis(
+                14,
+                "NA".into(),
+                &err,
+                format!("streaming_dead_instances() failed. Reason: {err}"),
+            )
+        })?;
+        Ok(flags
+            .chunks(2)
+            .map(|pair| pair[0] && !pair.get(1).copied().unwrap_or(true))
+            .collect())
+    }
+
+    /// Remove `did_hash`'s entry if `dead_uuid` owns it and is still dead,
+    /// through the `EVICT` script. Returns whether it was removed.
+    pub async fn streaming_evict(
+        &self,
+        did_hash: &str,
+        dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let removed: i64 = EVICT
+            .key(self.keys().global_streaming())
+            .key(self.keys().streaming_kind())
+            .key(self.keys().streaming_sessions(dead_uuid))
+            .key(self.keys().streaming_alive(dead_uuid))
+            .key(self.keys().streaming_instances())
+            .arg(did_hash)
+            .arg(dead_uuid)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &err,
+                    format!("streaming_evict() for did_hash({did_hash}) failed. Reason: {err}"),
+                )
+            })?;
+        Ok(removed == 1)
+    }
+
+    /// Whether each of `did_hashes` is held by a mux entry (rather than the
+    /// DID's own socket), in the order asked. A DID with no entry is not.
+    pub async fn streaming_mux_owned(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        let mut owned = Vec::with_capacity(did_hashes.len());
+        if did_hashes.is_empty() {
+            return Ok(owned);
+        }
+        let mut conn = self.get_connection().await?;
+        for batch in did_hashes.chunks(OWNERS_BATCH) {
+            let rows: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg(self.keys().streaming_kind())
+                .arg(batch)
+                .query_async(&mut conn)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        14,
+                        "NA".into(),
+                        &err,
+                        format!("streaming_mux_owned() failed. Reason: {err}"),
+                    )
+                })?;
+            owned.extend(rows.into_iter().map(|row| row.as_deref() == Some("mux")));
+        }
+        Ok(owned)
     }
 }

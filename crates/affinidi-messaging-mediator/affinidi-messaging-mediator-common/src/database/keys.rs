@@ -146,6 +146,25 @@ impl Keys {
         }
     }
 
+    /// Instances that keep a heartbeat: streaming uuid → unix seconds of its
+    /// last beat. An instance listed here whose
+    /// [`streaming_alive`](Self::streaming_alive) key has expired is dead,
+    /// and its streaming entries may be taken over. An instance not listed
+    /// (one on a release without heartbeats) is never taken for dead.
+    pub fn streaming_instances(self) -> &'static str {
+        if self.cluster {
+            "STREAMING_INSTANCES:{streaming}"
+        } else {
+            "STREAMING_INSTANCES"
+        }
+    }
+
+    /// One instance's heartbeat: present while the instance is alive, as it
+    /// keeps renewing its expiry.
+    pub fn streaming_alive(self, mediator_uuid: &str) -> String {
+        self.shared("STREAMING_ALIVE:", "streaming", mediator_uuid)
+    }
+
     /// One member DID's mux record: a hash `{ v: version, r: record JSON }`.
     pub fn mux_record(self, did_hash: &str) -> String {
         self.shared("MUX_DID:", "mux", did_hash)

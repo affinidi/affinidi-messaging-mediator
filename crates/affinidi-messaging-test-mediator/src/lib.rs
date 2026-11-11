@@ -356,6 +356,9 @@ pub struct TestMediatorBuilder {
     mux_enabled: bool,
     /// Override for `[limits.mux] max_dids_per_connection`.
     mux_max_dids_per_connection: Option<usize>,
+    /// See [`TestMediatorBuilder::streaming_liveness`].
+    streaming_liveness:
+        Option<affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness>,
     /// Override for `LimitsConfig.queued_send_messages_per_peer`.
     queue_send_limit_per_peer: Option<i32>,
     /// See [`TestMediatorBuilder::message_size`].
@@ -413,6 +416,7 @@ impl Default for TestMediatorBuilder {
             did_rate_limit: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
+            streaming_liveness: None,
             queue_send_limit_per_peer: None,
             message_size: None,
             clock: None,
@@ -670,6 +674,17 @@ impl TestMediatorBuilder {
     /// Set `[limits.mux] enabled`. Off by default, as in production.
     pub fn mux_enabled(mut self, enabled: bool) -> Self {
         self.mux_enabled = enabled;
+        self
+    }
+
+    /// Set the streaming heartbeat and ownership-recheck timing
+    /// (`MediatorBuilder::streaming_liveness`), so a test that kills an
+    /// instance sees another take over its DIDs within seconds.
+    pub fn streaming_liveness(
+        mut self,
+        liveness: affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness,
+    ) -> Self {
+        self.streaming_liveness = Some(liveness);
         self
     }
 
@@ -1066,6 +1081,9 @@ impl TestMediatorBuilder {
         }
         if let Some(clock) = self.clock.clone() {
             builder = builder.clock(clock);
+        }
+        if let Some(liveness) = self.streaming_liveness {
+            builder = builder.streaming_liveness(liveness);
         }
         let inner = builder.start(token.clone()).await?;
 

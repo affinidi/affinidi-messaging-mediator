@@ -31,7 +31,8 @@
  Fjall's in-process broadcast, or the test MemoryStore.
 */
 use crate::common::metrics::names::{
-    MUX_QUEUE_FAIRNESS_SKIPS_TOTAL, STREAMING_ENTRIES_RECLAIMED_TOTAL,
+    MUX_QUEUE_FAIRNESS_SKIPS_TOTAL, STREAMING_ENTRIES_EVICTED_TOTAL,
+    STREAMING_ENTRIES_RECLAIMED_TOTAL, STREAMING_HEARTBEAT_LAPSES_TOTAL,
     WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
     WEBSOCKET_DUPLICATE_REPLACEMENTS_TOTAL, WEBSOCKET_REDELIVERED_MESSAGES_TOTAL,
     WS_LIVE_DELIVERY_DROPPED,
@@ -48,7 +49,7 @@ use affinidi_messaging_mediator_common::{
     },
     types::messages::FetchOptions,
 };
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashSet;
 use std::{
     sync::Arc,
@@ -86,6 +87,75 @@ const REDELIVERY_MAX: usize = 1000;
 /// between its store write and its publish, or a dropped pub/sub message), so
 /// a member is never reported in the wrong state for longer than this.
 const OWNERSHIP_RECHECK: Duration = Duration::from_secs(60);
+
+/// How often the task renews its heartbeat in the store, so the instances
+/// sharing it can tell it is alive.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
+
+/// How long a heartbeat lasts without renewal. An instance whose heartbeat
+/// has expired is dead: the next ownership recheck on another instance that
+/// carries one of its DIDs takes that DID over. Several missed renewals in a
+/// row, so a brief store hiccup doesn't count.
+const HEARTBEAT_LIFETIME: Duration = Duration::from_secs(45);
+
+/// How long a dead instance stays listed among those that keep a heartbeat.
+/// Streaming uuids are random per start unless configured, so the list would
+/// otherwise grow with every restart. An instance forgotten this way is
+/// treated as on an older release (never dead); its entries are long gone by
+/// then, taken over or deregistered.
+const HEARTBEAT_PRUNE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the streaming task proves it is alive to the other instances
+/// sharing its store, and rechecks which instance streams each DID it
+/// carries. A DID held by a dead instance is taken over within about
+/// `heartbeat_lifetime + ownership_recheck`.
+///
+/// The defaults suit production; set others through
+/// [`MediatorBuilder::streaming_liveness`](crate::builder::MediatorBuilder::streaming_liveness),
+/// mainly to make tests that kill an instance quick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamingLiveness {
+    /// How often the heartbeat is renewed. Default 10 s.
+    pub heartbeat_every: Duration,
+    /// How long a heartbeat lasts without renewal; an instance whose
+    /// heartbeat has expired is dead. Keep it several times
+    /// `heartbeat_every`, so a brief store hiccup doesn't count. Default 45 s.
+    pub heartbeat_lifetime: Duration,
+    /// How often the entries this instance carries are rechecked against the
+    /// store's owners. Default 60 s.
+    pub ownership_recheck: Duration,
+}
+
+impl Default for StreamingLiveness {
+    fn default() -> Self {
+        StreamingLiveness {
+            heartbeat_every: HEARTBEAT_EVERY,
+            heartbeat_lifetime: HEARTBEAT_LIFETIME,
+            ownership_recheck: OWNERSHIP_RECHECK,
+        }
+    }
+}
+
+/// Why [`StreamingTask::reclaim`] claims a DID back.
+#[derive(Clone, Copy, Debug)]
+enum ReclaimReason {
+    /// The store had no entry for the DID.
+    Missing,
+    /// The entry belonged to a dead instance and was just removed.
+    DeadOwner,
+    /// A direct socket here found the DID held by a mux entry elsewhere.
+    OutranksMux,
+}
+
+impl ReclaimReason {
+    fn label(self) -> &'static str {
+        match self {
+            ReclaimReason::Missing => "missing",
+            ReclaimReason::DeadOwner => "dead_owner",
+            ReclaimReason::OutranksMux => "outranks_mux",
+        }
+    }
+}
 
 /// Slots in a single connection's send queue.
 ///
@@ -543,6 +613,8 @@ pub struct StreamingTask {
     /// records handovers on the same terms as every other delivery path. `0`
     /// leaves expiry untouched, which is the default.
     pub delivered_expiry_seconds: u64,
+    /// Heartbeat and ownership-recheck timing.
+    pub liveness: StreamingLiveness,
 }
 
 impl StreamingTask {
@@ -567,6 +639,7 @@ impl StreamingTask {
         mediator_uuid: &str,
         send_budget: WsSendBudget,
         delivered_expiry_seconds: u64,
+        liveness: StreamingLiveness,
     ) -> Self {
         // Control-plane channel (register/start/stop/deregister). Carries no
         // message bodies — a handful of small structs — so a slot count is the
@@ -577,6 +650,7 @@ impl StreamingTask {
             uuid: mediator_uuid.to_string(),
             send_budget,
             delivered_expiry_seconds,
+            liveness,
         };
         let rx = Arc::new(Mutex::new(rx));
 
@@ -630,13 +704,38 @@ impl StreamingTask {
             // already-decoded `PubSubRecord`s.
             let mut rx = database.streaming_subscribe(&self.uuid).await?;
             let mut ownership = tokio::time::interval_at(
-                tokio::time::Instant::now() + OWNERSHIP_RECHECK,
-                OWNERSHIP_RECHECK,
+                tokio::time::Instant::now() + self.liveness.ownership_recheck,
+                self.liveness.ownership_recheck,
             );
             ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick is immediate, so the instance is listed as alive
+            // before it serves anyone.
+            let mut heartbeat = tokio::time::interval(self.liveness.heartbeat_every);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // A lapse before this run's first beat is the previous run's (a
+            // restart with the same uuid): its entries went in the clean
+            // start above, so there is nothing to take back.
+            let mut first_beat = true;
 
             loop {
                 select! {
+                    _ = heartbeat.tick() => {
+                        let beat = database
+                            .streaming_heartbeat(&self.uuid, self.liveness.heartbeat_lifetime, HEARTBEAT_PRUNE_AFTER)
+                            .await;
+                        let fresh = std::mem::replace(&mut first_beat, false);
+                        match beat {
+                            Ok(true) if !fresh => {
+                                warn!(
+                                    "this instance's streaming heartbeat had lapsed; other instances may have taken over its DIDs. Rechecking ownership now"
+                                );
+                                metrics::counter!(STREAMING_HEARTBEAT_LAPSES_TOTAL).increment(1);
+                                self.recheck_ownership(&database, &mut clients, &mut standby, &replay_in_progress).await;
+                            }
+                            Ok(_) => {}
+                            Err(err) => warn!("couldn't renew the streaming heartbeat: {err}"),
+                        }
+                    }
                     _ = ownership.tick() => {
                         self.recheck_ownership(&database, &mut clients, &mut standby, &replay_in_progress).await;
                     }
@@ -1346,22 +1445,29 @@ impl StreamingTask {
     }
 
     /// Bring this instance's entries in step with the store's owners
-    /// ([`OWNERSHIP_RECHECK`]), for a handoff that never arrived and for an
-    /// entry that went missing:
+    /// ([`OWNERSHIP_RECHECK`]), for a handoff that never arrived, for an
+    /// entry that went missing, and for an owner that died:
     ///
     /// - an entry this instance holds whose DID nobody holds any more is
     ///   claimed back, with an inbox redelivery: messages for it were stored
     ///   but not pushed while its record was gone. The record goes when an
     ///   instance that doesn't check owners removes it (one on the previous
     ///   release, during a rolling upgrade), or when the store loses data;
+    /// - a DID held by a dead instance (its heartbeat expired) is treated
+    ///   the same way, once its entry is removed: the entry here claims it,
+    ///   or a mux entry standing by for it takes it;
     /// - a live mux entry whose DID another instance now streams stands by
     ///   (`superseded`), as on `RemoteTaken`;
+    /// - a direct socket here whose DID a mux entry elsewhere holds claims it
+    ///   back, since a direct socket outranks a mux entry. That happens after
+    ///   this instance was taken for dead while still serving;
     /// - a mux entry standing by for a DID nobody streams any more takes it
     ///   (`reactivated`), as on `RemoteReleased`.
     ///
-    /// A direct socket whose DID another instance holds is left alone: a
-    /// newer socket there replaced it by the newest-wins rule. The owners are
-    /// read in batches; a failed read changes nothing until the next pass.
+    /// A direct socket whose DID another instance's direct socket holds is
+    /// left alone: a newer socket there replaced it by the newest-wins rule.
+    /// The owners are read in batches; a failed read changes nothing until
+    /// the next pass.
     async fn recheck_ownership(
         &self,
         database: &Arc<dyn MediatorStore>,
@@ -1377,19 +1483,67 @@ impl StreamingTask {
                 return;
             }
         };
+        let dead = self.dead_owners(database, &owners).await;
+        let mut behind_other: Vec<String> = Vec::new();
         for (did_hash, owner) in held.into_iter().zip(owners) {
             match owner {
                 Some(owner) if owner == self.uuid => {}
+                Some(owner) if dead.contains(&owner) => {
+                    if self.evict(database, &did_hash, &owner).await {
+                        self.reclaim(
+                            database,
+                            clients,
+                            standby,
+                            replay_in_progress,
+                            &did_hash,
+                            ReclaimReason::DeadOwner,
+                        )
+                        .await;
+                    }
+                }
                 Some(_) => {
-                    if stand_by_taken(clients, standby, &did_hash) {
+                    if clients
+                        .get(&did_hash)
+                        .is_some_and(|e| e.kind == EntryKind::Direct)
+                    {
+                        behind_other.push(did_hash);
+                    } else if stand_by_taken(clients, standby, &did_hash) {
                         info!(did_hash = %did_hash, "a lost handoff: another instance streams this DID; mux entry stood by");
                     }
                 }
                 None => {
-                    self.reclaim(database, clients, standby, replay_in_progress, &did_hash)
-                        .await;
+                    self.reclaim(
+                        database,
+                        clients,
+                        standby,
+                        replay_in_progress,
+                        &did_hash,
+                        ReclaimReason::Missing,
+                    )
+                    .await;
                 }
             }
+        }
+
+        // A direct socket here behind another instance's mux entry takes the
+        // DID back; behind a direct socket it stays (newest wins).
+        match database.streaming_mux_owned(&behind_other).await {
+            Ok(mux_owned) => {
+                for (did_hash, mux) in behind_other.into_iter().zip(mux_owned) {
+                    if mux {
+                        self.reclaim(
+                            database,
+                            clients,
+                            standby,
+                            replay_in_progress,
+                            &did_hash,
+                            ReclaimReason::OutranksMux,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(err) => warn!("couldn't recheck which DIDs mux entries hold: {err}"),
         }
 
         let waiting: Vec<String> = standby
@@ -1404,13 +1558,71 @@ impl StreamingTask {
                 return;
             }
         };
+        let dead = self.dead_owners(database, &owners).await;
         for (did_hash, owner) in waiting.into_iter().zip(owners) {
-            if owner.is_none()
+            let free = match owner {
+                None => true,
+                Some(owner) if dead.contains(&owner) => {
+                    self.evict(database, &did_hash, &owner).await
+                }
+                Some(_) => false,
+            };
+            if free
                 && self
                     .promote_standby(database, clients, standby, replay_in_progress, &did_hash)
                     .await
             {
-                info!(did_hash = %did_hash, "a lost handoff: nobody streams this DID; mux entry took it back");
+                info!(did_hash = %did_hash, "nobody live streams this DID; mux entry took it back");
+            }
+        }
+    }
+
+    /// Which of the instances in `owners` (other than this one) are dead. A
+    /// failed read counts nobody dead, so a store outage takes nothing over.
+    async fn dead_owners(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        owners: &[Option<String>],
+    ) -> HashSet<String> {
+        let mut others: Vec<String> = owners
+            .iter()
+            .flatten()
+            .filter(|o| **o != self.uuid)
+            .cloned()
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        match database.streaming_dead_instances(&others).await {
+            Ok(dead) => others
+                .into_iter()
+                .zip(dead)
+                .filter_map(|(uuid, dead)| dead.then_some(uuid))
+                .collect(),
+            Err(err) => {
+                warn!("couldn't check which streaming instances are alive: {err}");
+                HashSet::new()
+            }
+        }
+    }
+
+    /// Remove `did_hash`'s entry, held by the dead instance `owner`. Returns
+    /// whether it was removed; when the instance beat again, or another
+    /// instance took the DID meanwhile, it is left alone.
+    async fn evict(&self, database: &Arc<dyn MediatorStore>, did_hash: &str, owner: &str) -> bool {
+        match database.streaming_evict(did_hash, owner).await {
+            Ok(true) => {
+                warn!(
+                    did_hash = %did_hash,
+                    dead_instance = %owner,
+                    "the instance streaming this DID stopped renewing its heartbeat; took over its entry"
+                );
+                metrics::counter!(STREAMING_ENTRIES_EVICTED_TOTAL).increment(1);
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                warn!(did_hash = %did_hash, "couldn't take over a dead instance's streaming entry: {err}");
+                false
             }
         }
     }
@@ -1426,6 +1638,7 @@ impl StreamingTask {
         standby: &mut HashMap<String, Vec<ClientEntry>>,
         replay_in_progress: &Arc<DashSet<String>>,
         did_hash: &str,
+        reason: ReclaimReason,
     ) {
         if clients.get(did_hash).is_none_or(|e| e.tx.is_closed()) {
             return;
@@ -1437,14 +1650,16 @@ impl StreamingTask {
         warn!(
             did_hash = %did_hash,
             kind = ?kind,
-            "this instance's streaming entry had gone from the store; claiming it back"
+            reason = ?reason,
+            "claiming this instance's streaming entry back"
         );
         metrics::counter!(
             STREAMING_ENTRIES_RECLAIMED_TOTAL,
             "kind" => match kind {
                 EntryKind::Direct => "direct",
                 EntryKind::Mux => "mux",
-            }
+            },
+            "reason" => reason.label()
         )
         .increment(1);
         let replay = entry.active;
@@ -1753,6 +1968,7 @@ mod tests {
             // Generous budget: these tests exercise registration/redelivery, not
             // buffer exhaustion (which `ws_budget` covers directly).
             send_budget: WsSendBudget::new(16 * 1024 * 1024),
+            liveness: StreamingLiveness::default(),
             delivered_expiry_seconds: 0,
         }
     }

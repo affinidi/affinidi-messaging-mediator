@@ -12,6 +12,11 @@
 //!    reconnects to A, and the member's mail is pushed there (the message B
 //!    pushed but nobody acknowledged first), although B never released the
 //!    member's streaming entry.
+//! 3. B is started again, and `work`'s own socket opens there, which outranks
+//!    the device's mux entry on A: A's entry stands by. B is killed. Its
+//!    heartbeat expires, A takes the DID over from the dead instance's
+//!    entry, and `work` is active and pushed on A again, though `work`
+//!    never reconnects.
 //!
 //! Needs a Redis server:
 //! ```text
@@ -30,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use affinidi_messaging_didcomm::Message as DidcommMessage;
+use affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness;
 use affinidi_messaging_mediator_common::store::MediatorStore;
 use affinidi_messaging_sdk::protocols::mux::{MuxCapability, sign_grant};
 use affinidi_messaging_test_mediator::{ReplicaIdentity, TestEnvironment, TestMediator, TestUser};
@@ -54,6 +60,16 @@ const READY: &str = "REPLICA_READY ";
 
 const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/event/0.1";
 const BASIC: &str = "https://didcomm.org/basicmessage/2.0/message";
+
+/// Both instances beat often, and take a dead one's DIDs over within a
+/// couple of seconds, so scenario 3 doesn't wait out the production timing.
+fn fast_liveness() -> StreamingLiveness {
+    StreamingLiveness {
+        heartbeat_every: Duration::from_millis(250),
+        heartbeat_lifetime: Duration::from_millis(1500),
+        ownership_recheck: Duration::from_secs(1),
+    }
+}
 
 /// One instance's own connection to the shared database.
 async fn redis_store(flush: bool) -> Option<Arc<dyn MediatorStore>> {
@@ -115,6 +131,7 @@ async fn replica_process() {
         .mux_enabled(true)
         .local_direct_delivery(true, false)
         .store(store)
+        .streaming_liveness(fast_liveness())
         .replica_of(identity)
         .spawn()
         .await
@@ -373,10 +390,12 @@ async fn a_replica_in_another_process_delivers_and_can_die() {
         .mux_enabled(true)
         .local_direct_delivery(true, false)
         .store(store_a)
+        .streaming_liveness(fast_liveness())
         .spawn()
         .await
         .expect("instance A");
-    let (mut b, b_ws) = ReplicaProcess::start(&a.replica_identity()).await;
+    let identity = a.replica_identity();
+    let (mut b, b_ws) = ReplicaProcess::start(&identity).await;
     let a_ws: Uri = a.ws_endpoint().as_str().parse().unwrap();
 
     let env = TestEnvironment::new(a).await.expect("env");
@@ -457,4 +476,83 @@ async fn a_replica_in_another_process_delivers_and_can_die() {
     let (m, to) = pushed(&env, &mut ws).await;
     assert_eq!(m.body["content"], "via A, after B died");
     assert_eq!(to.as_deref(), Some(work.did.as_str()));
+
+    // 3. B comes back, and `work`'s own socket opens there. A direct socket
+    //    outranks the device's mux entry on A, which stands by: the device
+    //    is told the member is detached, `superseded`.
+    let (mut b, b_ws) = ReplicaProcess::start(&identity).await;
+    let tokens = env
+        .tdk
+        .authentication()
+        .authenticate(work.did.clone(), mediator_did.clone(), 3, None)
+        .await
+        .expect("authenticate work through A");
+    let request = ClientRequestBuilder::new(b_ws)
+        .with_sub_protocol("affinidi.test")
+        .with_sub_protocol(format!("bearer.{}", tokens.access_token));
+    let (_work_on_b, _) = connect_async(request)
+        .await
+        .expect("work's own socket on B");
+    member_event(&env, &mut ws, "detached", &work, |e| {
+        e["reason"] == "superseded"
+    })
+    .await;
+
+    // B dies with `work`'s socket on it. Its heartbeat expires, and A takes
+    // `work` over from the dead instance's entry without `work` doing
+    // anything.
+    b.kill();
+    let back = member_event(&env, &mut ws, "attached", &work, |e| {
+        e["reason"] == "reactivated"
+    })
+    .await;
+    assert_eq!(back["deliveryActive"], true);
+    // Taking the DID back redelivers `work`'s inbox: the two messages the
+    // device never acknowledged come first, then the new one.
+    send(&env, &sender, &work, "via A, after B died again").await;
+    let mut seen = Vec::new();
+    loop {
+        let (m, to) = pushed(&env, &mut ws).await;
+        assert_eq!(to.as_deref(), Some(work.did.as_str()));
+        let content = m.body["content"].as_str().unwrap_or_default().to_string();
+        if content == "via A, after B died again" {
+            break;
+        }
+        assert!(
+            ["via A, to B", "via A, after B died"].contains(&content.as_str()),
+            "only unacknowledged messages are redelivered: {content}"
+        );
+        seen.push(content);
+    }
+    assert!(seen.len() <= 2, "each redelivered once: {seen:?}");
+}
+
+/// Wait for an `event` for `member` whose entry `matches`.
+async fn member_event<S>(
+    env: &TestEnvironment,
+    ws: &mut S,
+    event: &str,
+    member: &TestUser,
+    matches: impl Fn(&Value) -> bool,
+) -> Value
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let within = Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match next_frame(env, ws, left).await {
+            Some(Frame::Event(e))
+                if e["event"] == event
+                    && e["dids"][0]["did"] == member.did.as_str()
+                    && matches(&e["dids"][0]) =>
+            {
+                return e["dids"][0].clone();
+            }
+            Some(Frame::Event(_) | Frame::Message(..)) => continue,
+            Some(Frame::Closed) => panic!("the socket closed"),
+            None => panic!("no matching {event} for {} within {within:?}", member.did),
+        }
+    }
 }

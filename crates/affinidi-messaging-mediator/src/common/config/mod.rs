@@ -181,6 +181,11 @@ pub struct Config {
     pub trust_xff_cidrs: Vec<affinidi_rate_limit::IpNet>,
     pub streaming_enabled: bool,
     pub streaming_uuid: String,
+    /// Heartbeat and ownership-recheck timing of the streaming task. Not in
+    /// the config file: the defaults suit production, and
+    /// `MediatorBuilder::streaming_liveness` sets others.
+    #[serde(skip)]
+    pub streaming_liveness: crate::tasks::websocket_streaming::StreamingLiveness,
     pub database: DatabaseConfig,
     pub security: SecurityConfig,
     #[serde(skip_serializing)]
@@ -243,6 +248,7 @@ impl fmt::Debug for Config {
             .field("database", &self.database)
             .field("streaming_enabled?", &self.streaming_enabled)
             .field("streaming_uuid", &self.streaming_uuid)
+            .field("streaming_liveness", &self.streaming_liveness)
             .field("DID Resolver config", &self.did_resolver_config)
             .field("api_prefix", &self.api_prefix)
             .field("security", &self.security)
@@ -289,6 +295,7 @@ impl Config {
             database: DatabaseConfig::default(),
             streaming_enabled: true,
             streaming_uuid: "".into(),
+            streaming_liveness: Default::default(),
             did_resolver_config,
             api_prefix: "/mediator/v1".into(),
             // The default config is only used inside the early-startup
