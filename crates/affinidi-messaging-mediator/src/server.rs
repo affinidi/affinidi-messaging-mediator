@@ -670,6 +670,7 @@ pub async fn serve_internal(
             &config.streaming_uuid,
             ws_send_budget.clone(),
             config.limits.delivered_expiry_seconds,
+            config.streaming_liveness,
         ))
     } else {
         None

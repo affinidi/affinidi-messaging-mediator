@@ -144,12 +144,32 @@ pub mod names {
     /// `drop` rate points at frames queued for members just revoked or
     /// narrowed; `nudge` tracks pickup-only traffic.
     pub const MUX_LIVE_FRAMES_WITHHELD_TOTAL: &str = "mux_live_frames_withheld_total";
-    /// counter: Live-streaming entries this instance found missing from the
-    /// store and claimed back (label `kind`: `direct` or `mux`), each followed
-    /// by an inbox redelivery. Normally 0. It counts while instances on a
-    /// release before 0.52 share the store (a rolling upgrade: they remove
-    /// entries without checking the owner), or after the store lost data.
+    /// counter: Live-streaming entries this instance claimed back for a
+    /// socket it carries, each followed by an inbox redelivery when the
+    /// socket wants live delivery. Labels: `kind` (`direct` or `mux`) and
+    /// `reason`:
+    /// - `missing`: the entry had gone from the store. This counts while
+    ///   instances on a release before 0.52 share the store (a rolling
+    ///   upgrade: they remove entries without checking the owner), or after
+    ///   the store lost data;
+    /// - `dead_owner`: the entry belonged to an instance whose heartbeat
+    ///   expired (it was killed, or lost the store for longer than the
+    ///   heartbeat lifetime);
+    /// - `outranks_mux`: a direct socket here found its DID held by a mux
+    ///   entry elsewhere, which a direct socket outranks. This follows an
+    ///   instance being taken for dead while it was still serving.
+    ///
+    /// Normally 0 outside upgrades and instance failures.
     pub const STREAMING_ENTRIES_RECLAIMED_TOTAL: &str = "streaming_entries_reclaimed_total";
+    /// counter: Streaming entries this instance removed from the store
+    /// because their owner's heartbeat had expired. Each is followed by a
+    /// claim for the socket this instance carries for that DID.
+    pub const STREAMING_ENTRIES_EVICTED_TOTAL: &str = "streaming_entries_evicted_total";
+    /// counter: Times this instance renewed its streaming heartbeat and found
+    /// it had lapsed, so other instances may have taken its entries over.
+    /// Its next ownership recheck runs at once to take back what it still
+    /// serves.
+    pub const STREAMING_HEARTBEAT_LAPSES_TOTAL: &str = "streaming_heartbeat_lapses_total";
     /// gauge: Bytes currently free in the global WebSocket send-buffer pool.
     pub const WS_SEND_BUFFER_AVAILABLE_BYTES: &str = "ws_send_buffer_available_bytes";
     /// counter: Old WebSocket sessions displaced by a newer duplicate for the same DID

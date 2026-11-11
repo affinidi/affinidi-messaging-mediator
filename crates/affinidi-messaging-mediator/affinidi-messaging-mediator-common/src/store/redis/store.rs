@@ -2131,6 +2131,41 @@ impl MediatorStore for RedisStore {
         crate::store::redis::database::Database::streaming_owners(self, did_hashes).await
     }
 
+    async fn streaming_heartbeat(
+        &self,
+        mediator_uuid: &str,
+        lifetime: std::time::Duration,
+        prune_after: std::time::Duration,
+    ) -> Result<bool, MediatorError> {
+        crate::store::redis::database::Database::streaming_heartbeat(
+            self,
+            mediator_uuid,
+            lifetime,
+            prune_after,
+        )
+        .await
+    }
+
+    async fn streaming_dead_instances(
+        &self,
+        mediator_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        crate::store::redis::database::Database::streaming_dead_instances(self, mediator_uuids)
+            .await
+    }
+
+    async fn streaming_evict(
+        &self,
+        did_hash: &str,
+        dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        crate::store::redis::database::Database::streaming_evict(self, did_hash, dead_uuid).await
+    }
+
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
+        crate::store::redis::database::Database::streaming_mux_owned(self, did_hashes).await
+    }
+
     async fn streaming_publish_message(
         &self,
         did_hash: &str,

@@ -441,6 +441,18 @@ impl MediatorBuilder {
         self
     }
 
+    /// Set how often the streaming task renews its heartbeat, how long the
+    /// heartbeat lasts, and how often it rechecks which instance streams each
+    /// DID it carries. The defaults suit production; shorter ones make a test
+    /// that kills an instance quick.
+    pub fn streaming_liveness(
+        mut self,
+        liveness: crate::tasks::websocket_streaming::StreamingLiveness,
+    ) -> Self {
+        self.config.streaming_liveness = liveness;
+        self
+    }
+
     /// Replace the security config wholesale. Use this to inject
     /// pre-built JWT keys from your secrets backend, configure CORS,
     /// adjust ACL defaults, etc.

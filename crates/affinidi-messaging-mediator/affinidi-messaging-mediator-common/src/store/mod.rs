@@ -1857,6 +1857,60 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(owners)
     }
 
+    /// Renew this instance's heartbeat for `lifetime`, so the other
+    /// instances sharing the store know it is alive; a listed instance whose
+    /// last beat is older than `prune_after` is forgotten. Returns whether
+    /// the heartbeat had lapsed, so other instances may have taken over this
+    /// instance's entries meanwhile.
+    ///
+    /// The default does nothing: a store used by one process has no other
+    /// instance to tell.
+    async fn streaming_heartbeat(
+        &self,
+        _mediator_uuid: &str,
+        _lifetime: std::time::Duration,
+        _prune_after: std::time::Duration,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    /// Whether each of `mediator_uuids` is a dead instance, in the order
+    /// asked: one that kept a heartbeat ([`streaming_heartbeat`](Self::streaming_heartbeat))
+    /// and let it expire. An instance that never kept one (an older release)
+    /// is never dead. A failed read is an error.
+    ///
+    /// The default (one process): nobody is dead.
+    async fn streaming_dead_instances(
+        &self,
+        mediator_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; mediator_uuids.len()])
+    }
+
+    /// Remove `did_hash`'s streaming entry if `dead_uuid` still owns it and
+    /// is still dead, both checked in the same step as the removal. Returns
+    /// whether it was removed; the caller then claims the DID as for a
+    /// missing entry.
+    ///
+    /// The default (one process): nothing to remove.
+    async fn streaming_evict(
+        &self,
+        _did_hash: &str,
+        _dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    /// Whether each of `did_hashes` is held by a mux entry rather than the
+    /// DID's own socket, in the order asked; `false` for a DID with no
+    /// entry. A failed read is an error.
+    ///
+    /// The default (one process): the streaming task orders its own entries,
+    /// so nothing needs it.
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; did_hashes.len()])
+    }
+
     /// Publish a delivery notification to the streaming channel for
     /// `mediator_uuid`. Subscribers (the WebSocket task on that mediator
     /// instance) deliver the message to the connected client.
