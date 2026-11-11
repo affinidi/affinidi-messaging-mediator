@@ -114,7 +114,7 @@ mediator-tui 0.11.0); they are no longer updated.
   reasons, which the event schema defines.
 - `revoke-all` ends session attaches. The `messaging/mux/revoke-all` 0.1
   specification said they were unaffected; it is amended to match
-  (dtgwg-trust-tasks-tf, see the PR). A principal relying on an attach
+  (dtgwg-trust-tasks-tf#1165). A principal relying on an attach
   surviving its member's `revoke-all` must attach again with a new statement.
 - An administrator demoted mid-lease stops receiving monitor batches at the
   next batch rather than at the end of the lease. A client that renews only
