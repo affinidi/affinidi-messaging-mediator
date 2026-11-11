@@ -333,8 +333,10 @@ return 1
 /// Streaming slot: drop one mediator instance's streaming sessions from the
 /// global registry, in batches of 500 as the library does.
 ///
-/// KEYS: the instance's sessions, the global registry. Returns the number
-/// removed.
+/// KEYS: the instance's sessions, the global registry, the owner kinds.
+/// ARGV: the
+/// instance's uuid: an entry another instance has taken since is kept.
+/// Returns the number of sessions cleaned.
 pub(crate) static CLEAN_START_STREAMING: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -344,7 +346,11 @@ while count < 500 do
     if #popped == 0 then
         break
     end
-    redis.call('HDEL', KEYS[2], popped[1])
+    local owner = redis.call('HGET', KEYS[2], popped[1])
+    if owner and string.sub(owner, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. ':' then
+        redis.call('HDEL', KEYS[2], popped[1])
+        redis.call('HDEL', KEYS[3], popped[1])
+    end
     count = count + 1
 end
 return count

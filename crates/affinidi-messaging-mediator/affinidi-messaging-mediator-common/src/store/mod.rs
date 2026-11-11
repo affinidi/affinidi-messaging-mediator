@@ -307,7 +307,8 @@ pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueEntry,
     InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RemovalReason,
     SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport, StatCounter,
-    StoreHealth, StoredMessageRef, StreamingClientState,
+    StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind,
+    StreamingWrite,
 };
 
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
@@ -1676,6 +1677,49 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         mediator_uuid: &str,
         state: StreamingClientState,
     ) -> Result<(), MediatorError>;
+
+    /// Register `did_hash` on this instance (`live`: with live delivery on),
+    /// as `kind`, and say whether this instance now holds it. Across
+    /// instances sharing a store, a direct socket outranks a mux entry and
+    /// otherwise the newest registration wins; `write` says whether this is a
+    /// new registration or a change to one (see [`StreamingWrite`]).
+    ///
+    /// The default is for a single-instance store, where the streaming task
+    /// already orders its own entries: it sets the state and holds the DID.
+    async fn streaming_claim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        live: bool,
+        _kind: StreamingKind,
+        _write: StreamingWrite,
+    ) -> Result<StreamingClaim, MediatorError> {
+        let state = if live {
+            StreamingClientState::Live
+        } else {
+            StreamingClientState::Registered
+        };
+        self.streaming_set_state(did_hash, mediator_uuid, state)
+            .await?;
+        Ok(StreamingClaim {
+            held_here: true,
+            displaced_mux: None,
+        })
+    }
+
+    /// Deregister `did_hash` from this instance, removing its entry only
+    /// while this instance owns it. Returns whether a mux entry on another
+    /// instance waits for the DID, so the caller tells it to take the DID
+    /// back. The default (single instance): deregister, nobody waits.
+    async fn streaming_release(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        self.streaming_set_state(did_hash, mediator_uuid, StreamingClientState::Deregistered)
+            .await?;
+        Ok(false)
+    }
 
     /// Whether `did_hash` has a streaming subscriber on any mediator
     /// instance, returning the mediator UUID hosting the subscriber.

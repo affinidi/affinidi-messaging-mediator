@@ -3431,10 +3431,24 @@ impl MediatorStore for FjallStore {
         // scan-then-remove and lose a registration made meanwhile.
         let _guard = self.write_lock.lock().await;
         match state {
+            // Only the owner's leaving removes the entry: another instance
+            // may hold the DID now.
             StreamingClientState::Deregistered => {
-                self.streaming_clients
-                    .remove(did_hash.as_bytes())
-                    .map_err(|e| Self::db_err("streaming_set_state:remove", e))?;
+                let owned = match self
+                    .streaming_clients
+                    .get(did_hash.as_bytes())
+                    .map_err(|e| Self::db_err("streaming_set_state:get", e))?
+                {
+                    Some(raw) => Self::decode::<StoredStreamingClient>(&raw)
+                        .map(|c| c.mediator_uuid == mediator_uuid)
+                        .unwrap_or(true),
+                    None => false,
+                };
+                if owned {
+                    self.streaming_clients
+                        .remove(did_hash.as_bytes())
+                        .map_err(|e| Self::db_err("streaming_set_state:remove", e))?;
+                }
             }
             other => {
                 let stored = StoredStreamingClient {

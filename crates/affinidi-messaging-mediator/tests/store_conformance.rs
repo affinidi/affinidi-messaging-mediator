@@ -1745,6 +1745,132 @@ async fn check_bulk_account_reads(store: Arc<dyn MediatorStore>) {
 /// Live delivery: a client registers and goes live (the WebSocket flow), a
 /// notification published for its mediator instance reaches that instance's
 /// subscriber, and a clean start or a disconnect drops the client.
+/// An instance leaving a DID it no longer owns keeps the current owner's
+/// entry. Two instances share one store: the client was on A, then
+/// registered on B (it reconnected there, or became a mux member of a
+/// connection there). A's socket closing afterwards used to delete the
+/// DID's global entry outright, and B's live delivery for it stopped.
+async fn check_streaming_deregister_keeps_another_owner(store: Arc<dyn MediatorStore>) {
+    let did = "did_hash_streaming_two_owners";
+    let (a, b) = ("conformance-instance-a", "conformance-instance-b");
+    for (uuid, state) in [
+        (a, StreamingClientState::Registered),
+        (a, StreamingClientState::Live),
+        (b, StreamingClientState::Registered),
+        (b, StreamingClientState::Live),
+    ] {
+        store
+            .streaming_set_state(did, uuid, state)
+            .await
+            .expect("streaming_set_state");
+    }
+    assert_eq!(
+        store.streaming_is_client_live(did, false).await.as_deref(),
+        Some(b),
+        "the newest registration owns the DID"
+    );
+    store
+        .streaming_set_state(did, a, StreamingClientState::Deregistered)
+        .await
+        .expect("A deregisters");
+    assert_eq!(
+        store.streaming_is_client_live(did, false).await.as_deref(),
+        Some(b),
+        "A leaving must not take B's live delivery with it"
+    );
+    store
+        .streaming_set_state(did, b, StreamingClientState::Deregistered)
+        .await
+        .expect("B deregisters");
+    assert_eq!(
+        store.streaming_is_client_live(did, true).await,
+        None,
+        "the owner leaving removes the entry"
+    );
+}
+
+/// Cross-instance precedence on a shared store (Redis): a direct socket
+/// outranks a mux entry on another instance, the newest registration wins
+/// otherwise, a stale instance never overwrites the owner, and a mux entry
+/// kept from or displaced from a DID learns when it may take it back.
+async fn check_streaming_cross_instance_precedence(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{StreamingKind, StreamingWrite};
+    let did = "did_hash_streaming_precedence";
+    let (a, b, c) = ("precedence-a", "precedence-b", "precedence-c");
+    let claim = |uuid: &'static str, live, kind, write| {
+        let store = store.clone();
+        async move {
+            store
+                .streaming_claim(did, uuid, live, kind, write)
+                .await
+                .expect("streaming_claim")
+        }
+    };
+    let live_on = || async { store.streaming_is_client_live(did, false).await };
+
+    // A's direct socket holds the DID.
+    assert!(
+        claim(a, true, StreamingKind::Direct, StreamingWrite::Claim)
+            .await
+            .held_here
+    );
+    // B's mux entry is refused, and recorded as waiting.
+    let refused = claim(b, true, StreamingKind::Mux, StreamingWrite::Claim).await;
+    assert!(
+        !refused.held_here,
+        "a mux entry never takes a DID from a direct socket"
+    );
+    assert_eq!(live_on().await.as_deref(), Some(a));
+    // A stale instance's update changes nothing.
+    assert!(
+        !claim(c, false, StreamingKind::Direct, StreamingWrite::Update)
+            .await
+            .held_here
+    );
+    assert_eq!(
+        live_on().await.as_deref(),
+        Some(a),
+        "an update is owner-checked"
+    );
+
+    // A leaves: the entry goes, and B is reported waiting.
+    assert!(
+        store.streaming_release(did, a).await.expect("release"),
+        "a mux entry waits for the DID"
+    );
+    assert_eq!(live_on().await, None);
+    // B takes it.
+    assert!(
+        claim(b, true, StreamingKind::Mux, StreamingWrite::Claim)
+            .await
+            .held_here
+    );
+    assert_eq!(
+        live_on().await.as_deref(),
+        Some(b),
+        "a mux owner is found like any other"
+    );
+
+    // C's direct socket takes it from B's mux entry, and says so.
+    let took = claim(c, true, StreamingKind::Direct, StreamingWrite::Claim).await;
+    assert!(took.held_here);
+    assert_eq!(took.displaced_mux.as_deref(), Some(b));
+    // B, no longer the owner, cannot remove C's entry.
+    assert!(!store.streaming_release(did, b).await.expect("release by B"));
+    assert_eq!(live_on().await.as_deref(), Some(c));
+
+    // B restarting cleans only its own entries.
+    store.streaming_clean_start(b).await.expect("clean start B");
+    assert_eq!(
+        live_on().await.as_deref(),
+        Some(c),
+        "clean start keeps another's entry"
+    );
+    // C leaves: the displaced B waits, so it is told.
+    assert!(store.streaming_release(did, c).await.expect("release by C"));
+    assert_eq!(live_on().await, None);
+}
+
 async fn check_streaming_pubsub(store: Arc<dyn MediatorStore>) {
     let did = "did_hash_streaming";
     let uuid = "conformance-mediator-uuid";
@@ -2273,6 +2399,7 @@ async fn check_mux_changes_single_process(store: Arc<dyn MediatorStore>) {
             principal_hash: "principal".into(),
             stored: true,
         }],
+        streaming: Vec::new(),
     };
     store.mux_changes_publish(&record).await.unwrap();
     assert!(store.mux_changes_subscribe().await.unwrap().is_none());
@@ -2308,6 +2435,7 @@ async fn redis_mux_changes_reach_every_instance() {
             principal_hash: "principal".into(),
             stored: false,
         }],
+        streaming: Vec::new(),
     };
     a.mux_changes_publish(&record).await.unwrap();
 
@@ -2372,6 +2500,8 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_login_session(store.clone()).await;
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
+    check_streaming_deregister_keeps_another_owner(store.clone()).await;
+    check_streaming_cross_instance_precedence(store.clone()).await;
     check_repeated_store(store.clone()).await;
     check_concurrent_delete(store.clone()).await;
     check_fetch_counts_sent(store.clone()).await;
@@ -2493,6 +2623,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn streaming_pubsub() {
                 check_streaming_pubsub(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn streaming_deregister_keeps_another_owner() {
+                check_streaming_deregister_keeps_another_owner(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn repeated_store() {

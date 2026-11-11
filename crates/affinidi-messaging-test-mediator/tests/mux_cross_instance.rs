@@ -218,6 +218,7 @@ async fn changes_on_another_instance_reach_this_ones_connections() {
                 .mux_changes_publish(&MuxChangeRecord {
                     origin: "instance-a".into(),
                     changes,
+                    streaming: Vec::new(),
                 })
                 .await
                 .expect("publish");

@@ -124,6 +124,28 @@ impl Keys {
         }
     }
 
+    /// DID hash → `mux` for a DID whose streaming owner is a mux entry, not
+    /// the DID's own socket. Kept beside GLOBAL_STREAMING rather than in its
+    /// values so an instance that predates it still reads every owner.
+    pub fn streaming_kind(self) -> &'static str {
+        if self.cluster {
+            "STREAMING_KIND:{streaming}"
+        } else {
+            "STREAMING_KIND"
+        }
+    }
+
+    /// DID hashes a mux entry on some instance waits for: a direct socket on
+    /// another instance holds the DID, or took it from that entry. When the
+    /// holder leaves, the waiters are told so they can take it back.
+    pub fn streaming_waiting(self) -> &'static str {
+        if self.cluster {
+            "STREAMING_WAITING:{streaming}"
+        } else {
+            "STREAMING_WAITING"
+        }
+    }
+
     /// One member DID's mux record: a hash `{ v: version, r: record JSON }`.
     pub fn mux_record(self, did_hash: &str) -> String {
         self.shared("MUX_DID:", "mux", did_hash)
@@ -165,6 +187,8 @@ mod tests {
             keys.msg_meta("m1"),
             keys.streaming_sessions("u1"),
             keys.global_streaming().to_string(),
+            keys.streaming_waiting().to_string(),
+            keys.streaming_kind().to_string(),
             keys.mux_record(H),
             keys.mux_principal("p1"),
         ]
@@ -188,6 +212,8 @@ mod tests {
                 "MSG:META:m1",
                 "STREAMING_SESSIONS:u1",
                 "GLOBAL_STREAMING",
+                "STREAMING_WAITING",
+                "STREAMING_KIND",
                 "MUX_DID:abc123",
                 "MUX_PRINCIPAL:p1",
             ]
@@ -212,6 +238,8 @@ mod tests {
                 "MSG:META:{m1}",
                 "STREAMING_SESSIONS:{streaming}:u1",
                 "GLOBAL_STREAMING:{streaming}",
+                "STREAMING_WAITING:{streaming}",
+                "STREAMING_KIND:{streaming}",
                 "MUX_DID:{mux}:abc123",
                 "MUX_PRINCIPAL:{mux}:p1",
             ]
@@ -243,6 +271,11 @@ mod tests {
             slot(&keys.streaming_sessions("u1")),
             slot(keys.global_streaming())
         );
+        assert_eq!(
+            slot(keys.streaming_waiting()),
+            slot(keys.global_streaming())
+        );
+        assert_eq!(slot(keys.streaming_kind()), slot(keys.global_streaming()));
         assert_eq!(slot(&keys.mux_record(H)), slot(&keys.mux_principal("p1")));
         assert_eq!(
             slot(&keys.mux_principal("p1")),

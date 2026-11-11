@@ -1956,17 +1956,58 @@ impl MediatorStore for RedisStore {
         mediator_uuid: &str,
         state: StreamingClientState,
     ) -> Result<(), MediatorError> {
+        // Through the same scripts as `streaming_claim`/`streaming_release`, so
+        // a write here keeps the owner's kind and the cross-instance rules: a
+        // direct registration that takes the DID.
+        use crate::store::redis::database::Database;
+        use crate::store::{StreamingKind, StreamingWrite};
         match state {
-            StreamingClientState::Registered => {
-                self.streaming_register_client(did_hash, mediator_uuid)
-                    .await
+            StreamingClientState::Registered | StreamingClientState::Live => {
+                Database::streaming_claim(
+                    self,
+                    did_hash,
+                    mediator_uuid,
+                    state == StreamingClientState::Live,
+                    StreamingKind::Direct,
+                    StreamingWrite::Claim,
+                )
+                .await
+                .map(|_| ())
             }
-            StreamingClientState::Live => self.streaming_start_live(did_hash, mediator_uuid).await,
             StreamingClientState::Deregistered => {
-                self.streaming_deregister_client(did_hash, mediator_uuid)
+                Database::streaming_release(self, did_hash, mediator_uuid)
                     .await
+                    .map(|_| ())
             }
         }
+    }
+
+    async fn streaming_claim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        live: bool,
+        kind: crate::store::StreamingKind,
+        write: crate::store::StreamingWrite,
+    ) -> Result<crate::store::StreamingClaim, MediatorError> {
+        crate::store::redis::database::Database::streaming_claim(
+            self,
+            did_hash,
+            mediator_uuid,
+            live,
+            kind,
+            write,
+        )
+        .await
+    }
+
+    async fn streaming_release(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        crate::store::redis::database::Database::streaming_release(self, did_hash, mediator_uuid)
+            .await
     }
 
     async fn streaming_is_client_live(
