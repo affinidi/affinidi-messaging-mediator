@@ -31,7 +31,8 @@
  Fjall's in-process broadcast, or the test MemoryStore.
 */
 use crate::common::metrics::names::{
-    MUX_QUEUE_FAIRNESS_SKIPS_TOTAL, WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
+    MUX_QUEUE_FAIRNESS_SKIPS_TOTAL, STREAMING_ENTRIES_RECLAIMED_TOTAL,
+    WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
     WEBSOCKET_DUPLICATE_REPLACEMENTS_TOTAL, WEBSOCKET_REDELIVERED_MESSAGES_TOTAL,
     WS_LIVE_DELIVERY_DROPPED,
 };
@@ -1344,16 +1345,23 @@ impl StreamingTask {
         true
     }
 
-    /// Bring this instance's mux entries in step with the store's owners,
-    /// for a handoff that never arrived ([`OWNERSHIP_RECHECK`]):
+    /// Bring this instance's entries in step with the store's owners
+    /// ([`OWNERSHIP_RECHECK`]), for a handoff that never arrived and for an
+    /// entry that went missing:
     ///
+    /// - an entry this instance holds whose DID nobody holds any more is
+    ///   claimed back, with an inbox redelivery: messages for it were stored
+    ///   but not pushed while its record was gone. The record goes when an
+    ///   instance that doesn't check owners removes it (one on the previous
+    ///   release, during a rolling upgrade), or when the store loses data;
     /// - a live mux entry whose DID another instance now streams stands by
     ///   (`superseded`), as on `RemoteTaken`;
     /// - a mux entry standing by for a DID nobody streams any more takes it
     ///   (`reactivated`), as on `RemoteReleased`.
     ///
-    /// Direct sockets are left alone: they take their DID on registration,
-    /// and a newer one elsewhere replaces them by the newest-wins rule.
+    /// A direct socket whose DID another instance holds is left alone: a
+    /// newer socket there replaced it by the newest-wins rule. The owners are
+    /// read in batches; a failed read changes nothing until the next pass.
     async fn recheck_ownership(
         &self,
         database: &Arc<dyn MediatorStore>,
@@ -1361,29 +1369,43 @@ impl StreamingTask {
         standby: &mut HashMap<String, Vec<ClientEntry>>,
         replay_in_progress: &Arc<DashSet<String>>,
     ) {
-        let live: Vec<String> = clients
-            .iter()
-            .filter(|(_, e)| e.kind == EntryKind::Mux)
-            .map(|(d, _)| d.clone())
-            .collect();
-        for did_hash in live {
-            if let Some(owner) = database.streaming_is_client_live(&did_hash, true).await
-                && owner != self.uuid
-                && stand_by_taken(clients, standby, &did_hash)
-            {
-                info!(did_hash = %did_hash, "a lost handoff: another instance streams this DID; mux entry stood by");
+        let held: Vec<String> = clients.keys().cloned().collect();
+        let owners = match database.streaming_owners(&held).await {
+            Ok(owners) => owners,
+            Err(err) => {
+                warn!("couldn't recheck which instance streams each DID: {err}");
+                return;
+            }
+        };
+        for (did_hash, owner) in held.into_iter().zip(owners) {
+            match owner {
+                Some(owner) if owner == self.uuid => {}
+                Some(_) => {
+                    if stand_by_taken(clients, standby, &did_hash) {
+                        info!(did_hash = %did_hash, "a lost handoff: another instance streams this DID; mux entry stood by");
+                    }
+                }
+                None => {
+                    self.reclaim(database, clients, standby, replay_in_progress, &did_hash)
+                        .await;
+                }
             }
         }
+
         let waiting: Vec<String> = standby
             .keys()
             .filter(|d| !clients.contains_key(*d))
             .cloned()
             .collect();
-        for did_hash in waiting {
-            if database
-                .streaming_is_client_live(&did_hash, true)
-                .await
-                .is_none()
+        let owners = match database.streaming_owners(&waiting).await {
+            Ok(owners) => owners,
+            Err(err) => {
+                warn!("couldn't recheck the DIDs mux entries wait for: {err}");
+                return;
+            }
+        };
+        for (did_hash, owner) in waiting.into_iter().zip(owners) {
+            if owner.is_none()
                 && self
                     .promote_standby(database, clients, standby, replay_in_progress, &did_hash)
                     .await
@@ -1391,6 +1413,53 @@ impl StreamingTask {
                 info!(did_hash = %did_hash, "a lost handoff: nobody streams this DID; mux entry took it back");
             }
         }
+    }
+
+    /// Claim `did_hash` back for its live entry here, whose store record has
+    /// gone, and redeliver the inbox to it when it wants live delivery. An
+    /// entry whose socket has closed is left to its deregistration, already on
+    /// its way.
+    async fn reclaim(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replay_in_progress: &Arc<DashSet<String>>,
+        did_hash: &str,
+    ) {
+        if clients.get(did_hash).is_none_or(|e| e.tx.is_closed()) {
+            return;
+        }
+        let Some(entry) = clients.remove(did_hash) else {
+            return;
+        };
+        let kind = entry.kind;
+        warn!(
+            did_hash = %did_hash,
+            kind = ?kind,
+            "this instance's streaming entry had gone from the store; claiming it back"
+        );
+        metrics::counter!(
+            STREAMING_ENTRIES_RECLAIMED_TOTAL,
+            "kind" => match kind {
+                EntryKind::Direct => "direct",
+                EntryKind::Mux => "mux",
+            }
+        )
+        .increment(1);
+        let replay = entry.active;
+        // Refused (a direct socket elsewhere registered the DID meanwhile), a
+        // mux entry stands by, as on any registration.
+        self.install(
+            database,
+            clients,
+            standby,
+            replay_in_progress,
+            did_hash,
+            entry,
+            replay,
+        )
+        .await;
     }
 
     /// Deregister `did_hash` from this instance's store entry, and when a mux
@@ -2498,6 +2567,93 @@ mod tests {
                 .as_deref(),
             Some(task.uuid.as_str())
         );
+    }
+
+    /// An entry whose store record went missing (removed by an instance that
+    /// doesn't check owners, as one on the previous release does during a
+    /// rolling upgrade) is claimed back by the recheck, and the inbox that
+    /// arrived meanwhile is redelivered. A direct socket whose DID another
+    /// instance holds, and an entry whose socket closed, are left alone.
+    #[tokio::test]
+    async fn the_ownership_recheck_claims_back_a_missing_entry() {
+        use affinidi_messaging_mediator_common::store::StreamingClientState;
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let task = streaming_task();
+        let replay: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let entry = |tx: mpsc::Sender<QueuedCommand>| ClientEntry {
+            tx,
+            session_id: "D".to_string(),
+            active: true,
+            registered_at: Instant::now(),
+            resync: Arc::new(AtomicBool::new(false)),
+            churn_streak: 0,
+            kind: EntryKind::Direct,
+            slots: None,
+        };
+        let (gone, elsewhere, closed) = (
+            digest("did:example:gone"),
+            digest("did:example:elsewhere"),
+            digest("did:example:closed"),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let (tx_elsewhere, mut rx_elsewhere) = mpsc::channel(8);
+        let (tx_closed, rx_closed) = mpsc::channel(8);
+        drop(rx_closed);
+        let mut clients = HashMap::from([
+            (gone.clone(), entry(tx)),
+            (elsewhere.clone(), entry(tx_elsewhere)),
+            (closed.clone(), entry(tx_closed)),
+        ]);
+        let mut standby = HashMap::new();
+        database
+            .streaming_set_state(&elsewhere, "another-instance", StreamingClientState::Live)
+            .await
+            .unwrap();
+        // Stored while `gone` had no record: not pushed.
+        let stored = "while-the-record-was-gone";
+        database
+            .store_message("sess-store", stored, &gone, None, 0, 1000)
+            .await
+            .expect("store message");
+
+        task.recheck_ownership(&database, &mut clients, &mut standby, &replay)
+            .await;
+
+        assert_eq!(
+            database
+                .streaming_is_client_live(&gone, false)
+                .await
+                .as_deref(),
+            Some(task.uuid.as_str()),
+            "the missing record is claimed back, live"
+        );
+        match timeout(StdDuration::from_secs(2), rx.recv())
+            .await
+            .expect("the inbox is redelivered")
+        {
+            Some(QueuedCommand {
+                cmd: WebSocketCommands::Message(msg),
+                ..
+            }) => assert_eq!(msg, stored),
+            _ => panic!("expected the stored message to be redelivered"),
+        }
+        assert_eq!(
+            database
+                .streaming_is_client_live(&elsewhere, false)
+                .await
+                .as_deref(),
+            Some("another-instance"),
+            "a newer socket elsewhere keeps the DID"
+        );
+        assert!(rx_elsewhere.try_recv().is_err());
+        assert!(
+            database
+                .streaming_is_client_live(&closed, true)
+                .await
+                .is_none(),
+            "a closed socket is left to its deregistration"
+        );
+        assert!(clients.contains_key(&gone) && clients.contains_key(&elsewhere));
     }
 
     /// A redelivery that cannot queue everything (here a send queue with room

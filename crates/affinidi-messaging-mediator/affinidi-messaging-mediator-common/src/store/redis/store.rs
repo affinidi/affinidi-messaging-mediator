@@ -2065,6 +2065,13 @@ impl MediatorStore for RedisStore {
             .await
     }
 
+    async fn streaming_owners(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<Option<String>>, MediatorError> {
+        crate::store::redis::database::Database::streaming_owners(self, did_hashes).await
+    }
+
     async fn streaming_publish_message(
         &self,
         did_hash: &str,
