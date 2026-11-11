@@ -3,7 +3,7 @@
  * both the mediator and the processors (message_expiry for example)
  */
 use super::DatabaseHandler;
-use crate::errors::MediatorError;
+use crate::errors::{MediatorError, StorageCap};
 use crate::store::types::{DeletionAuthority, OutboxReceipt};
 use crate::store::{OUTBOX_RECEIPT_TTL, ops};
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
@@ -146,6 +146,14 @@ impl DatabaseHandler {
                             message_hash, did_hash
                         );
                         Err(ops::delete_permission_denied(message_hash, request_msg_id))
+                    } else if let Some(cap) = StorageCap::of_redis(&err) {
+                        Err(MediatorError::storage_cap(
+                            cap,
+                            10,
+                            "NA",
+                            request_msg_id.map(|s| s.to_string()),
+                            format!("Couldn't delete message_hash ({message_hash}). Reason: {err}"),
+                        ))
                     } else {
                         // Generic database error
                         Err(MediatorError::problem_with_log(

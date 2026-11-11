@@ -357,7 +357,8 @@ jobs:
             --no-default-features \
             --features "didcomm,redis-backend" \
             --test store_conformance \
-            --test redis_reconnect
+            --test redis_reconnect \
+            --test redis_storage_full
       - name: cargo test mux_cross_instance and mux_two_instances against Redis
         # A grant change published by another instance reaches this one's
         # connections through Redis pub/sub. Needs the fixture's
@@ -416,7 +417,8 @@ jobs:
             --no-default-features \
             --features "didcomm,redis-backend" \
             --test store_conformance \
-            --test redis_reconnect
+            --test redis_reconnect \
+            --test redis_storage_full
           cargo test \
             -p affinidi-messaging-mediator-common \
             --features redis-backend \

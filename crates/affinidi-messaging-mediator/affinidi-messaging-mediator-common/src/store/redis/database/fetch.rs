@@ -43,9 +43,10 @@ impl Database {
                     "Couldn't fetch_messages() from database: {}",
                     err
                 );
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't fetch_messages() from database: {err}"),
                 )
             })?;

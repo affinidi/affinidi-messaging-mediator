@@ -55,9 +55,10 @@ impl Database {
                         did_hash,
                         err
                     );
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         did_hash.into(),
+                        &err,
                         format!(
                             "Couldn't get message_list({key}) from database for DID_hash {did_hash}: {err}"
                         ),

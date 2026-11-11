@@ -723,9 +723,17 @@ counts in the new `audit_write_failures_total` metric.
 - **A full or throttled database reaches clients as a named error** in both
   modes: 97 `storage.full` (507) or 98 `storage.busy` (503), also over a
   websocket, which got no reply before. This covers session writes and
-  deletes too, and 98 carries `Retry-After: 5`. A full database no longer
-  stops a restart or forwarding (with `cluster_mode` off, a restart goes
-  ahead when the loaded Lua library already matches this build).
+  deletes too, and 98 carries `Retry-After: 5`. The cause is read from the
+  Redis error where it is converted (the `OOM` code, also inside an aborted
+  transaction; a reply timeout; `STORE_IN_PROGRESS`/`DELETE_IN_PROGRESS`),
+  never from its wording, so a reworded server message can't change the
+  answer, and an unrelated error that mentions "timed out" isn't reported as
+  busy. Handlers that wrap a storage error in their own report (login,
+  token refresh, routing, pickup status, out-of-band invitations) pass 97
+  and 98 through in place of the generic `storage.error`. A full database
+  no longer stops a restart or forwarding (with `cluster_mode` off, a
+  restart goes ahead when the loaded Lua library already matches this
+  build).
 - The server version check accepts a two-part `redis_version`; ElastiCache
   Serverless reports `7.2`.
 

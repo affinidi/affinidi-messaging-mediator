@@ -112,6 +112,7 @@ pub async fn oob_invite_handler(
             )
             .into());
         }
+        Err(e) if e.is_storage_cap() => return Err(e.into()),
         Err(e) => {
             return Err(MediatorError::problem_with_log(
                 46,
@@ -183,6 +184,7 @@ pub async fn oobid_handler(
             format!("Database transaction error: {text}"),
         )
         .into()),
+        Err(e) if e.is_storage_cap() => Err(e.into()),
         Err(e) => Err(MediatorError::problem_with_log(
             87,
             "NA",
@@ -214,6 +216,9 @@ pub async fn delete_oobid_handler(
             .oob_discovery_get(&oobid._oobid)
             .await
             .map_err(|e| {
+                if e.is_storage_cap() {
+                    return e;
+                }
                 MediatorError::problem_with_log(
                     14,
                     session.session_id.clone(),

@@ -85,9 +85,10 @@ impl Database {
             };
             stored.map_err(|err| {
                 event!(Level::ERROR, "Couldn't store message in database: {}", err);
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     session_id.into(),
+                    &err,
                     format!("Couldn't store message in database: {err}"),
                 )
             })?;
@@ -333,9 +334,10 @@ impl Database {
                         "Couldn't get message metadata from database: {}",
                         err
                     );
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         session_id.into(),
+                        &err,
                         format!("Couldn't get message metadata from database: {err}"),
                     )
                 })?;

@@ -678,9 +678,10 @@ impl MediatorStore for RedisStore {
             .query_each(&mut conn, exists_pipe)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't check message metadata before marking delivery: {err}"),
                 )
             })?;
@@ -803,9 +804,10 @@ impl MediatorStore for RedisStore {
                 .arg(self.keys().outbox_receipt(sender_did_hash, id));
         }
         let replies: Vec<redis::Value> = self.query_each(&mut conn, pipe).await.map_err(|err| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "NA".into(),
+                &err,
                 format!("Couldn't read sent-message states: {err}"),
             )
         })?;
@@ -846,9 +848,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't read delivery state for ({msg_id}): {err}"),
                 )
             })?;
@@ -860,9 +863,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't check message metadata for ({msg_id}): {err}"),
                 )
             })?;
@@ -900,9 +904,10 @@ impl MediatorStore for RedisStore {
         }
         let rows: Vec<Vec<Option<String>>> =
             self.query_each(&mut conn, pipe).await.map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't batch-read delivery state: {err}"),
                 )
             })?;
@@ -1048,9 +1053,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     from_hash.into(),
+                    &err,
                     format!("peer_queue_count HGET failed: {err}"),
                 )
             })?;
@@ -1073,9 +1079,10 @@ impl MediatorStore for RedisStore {
             self.inbox_status_in_steps(&mut conn, did_hash)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         did_hash.into(),
+                        &err,
                         format!("inbox_status failed: {err}"),
                     )
                 })?
@@ -1087,9 +1094,10 @@ impl MediatorStore for RedisStore {
                 .query_async(&mut conn)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         did_hash.into(),
+                        &err,
                         format!("inbox_status Lua call failed: {err}"),
                     )
                 })?;
@@ -1158,9 +1166,10 @@ impl MediatorStore for RedisStore {
             .exec_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     session.session_id.clone(),
+                    &err,
                     format!("put_session failed: {err}"),
                 )
             })?;
@@ -1256,9 +1265,10 @@ impl MediatorStore for RedisStore {
             .exec_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::SessionError(
+                MediatorError::session_from_redis(
                     14,
                     session_id.into(),
+                    &err,
                     format!("delete_session failed: {err}"),
                 )
             })?;
@@ -1288,7 +1298,12 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("mux_record_get: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("mux_record_get: {e}"),
+                )
             })?;
         raw.map(|r| {
             serde_json::from_str(&r).map_err(|e| {
@@ -1347,7 +1362,7 @@ impl MediatorStore for RedisStore {
 
         let mut conn = self.get_connection().await?;
         let won: i64 = inv.invoke_async(&mut conn).await.map_err(|e| {
-            MediatorError::DatabaseError(14, "NA".into(), format!("mux_record_cas: {e}"))
+            MediatorError::database_from_redis(14, "NA".into(), &e, format!("mux_record_cas: {e}"))
         })?;
         Ok(won == 1)
     }
@@ -1373,7 +1388,12 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("mux_principal_dids: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("mux_principal_dids: {e}"),
+                )
             })
     }
 
@@ -1384,7 +1404,12 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("mux_principal_count: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("mux_principal_count: {e}"),
+                )
             })
     }
 
@@ -1402,7 +1427,12 @@ impl MediatorStore for RedisStore {
             .exec_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("mux_changes_publish: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("mux_changes_publish: {e}"),
+                )
             })
     }
 
@@ -1419,9 +1449,10 @@ impl MediatorStore for RedisStore {
         let (sender, receiver) = broadcast::channel(MUX_CHANGES_CAPACITY);
         let mut pubsub = self.handler.get_pubsub_connection().await?;
         pubsub.subscribe(MUX_CHANGES_CHANNEL).await.map_err(|err| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "NA".into(),
+                &err,
                 format!("mux_changes_subscribe SUBSCRIBE failed: {err}"),
             )
         })?;
@@ -1571,9 +1602,10 @@ impl MediatorStore for RedisStore {
             vec![role, listed]
         };
         self.exec_steps(&mut conn, steps).await.map_err(|err| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 did_hash.into(),
+                &err,
                 format!("account_set_role failed: {err}"),
             )
         })?;
@@ -1703,7 +1735,12 @@ impl MediatorStore for RedisStore {
         let redis_key = format!("TRUST_TASK_CLAIM:{key}");
         let mut conn = self.get_connection().await?;
         let db_err = |op: &str, err: redis::RedisError| {
-            MediatorError::DatabaseError(14, "NA".into(), format!("trust_task_claim {op}: {err}"))
+            MediatorError::database_from_redis(
+                14,
+                "NA".into(),
+                &err,
+                format!("trust_task_claim {op}: {err}"),
+            )
         };
 
         // SET NX is the atomic check-and-record: exactly one caller across all
@@ -1759,7 +1796,12 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("scid_source_put: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("scid_source_put: {e}"),
+                )
             })?;
         Ok(())
     }
@@ -1771,7 +1813,12 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("scid_source_list: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("scid_source_list: {e}"),
+                )
             })
     }
 
@@ -1812,9 +1859,10 @@ impl MediatorStore for RedisStore {
         self.exec_steps(&mut conn, vec![invite, counted])
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     did_hash.into(),
+                    &err,
                     format!("oob_discovery_store failed: {err}"),
                 )
             })?;
@@ -1835,9 +1883,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     oob_id.into(),
+                    &err,
                     format!("oob_discovery_get failed: {err}"),
                 )
             })?;
@@ -1863,9 +1912,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     oob_id.into(),
+                    &err,
                     format!("oob_discovery_delete failed: {err}"),
                 )
             })?;
@@ -1889,9 +1939,10 @@ impl MediatorStore for RedisStore {
             .exec_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "stats".into(),
+                    &err,
                     format!("stats_increment({field}) failed: {err}"),
                 )
             })?;
@@ -2091,9 +2142,10 @@ impl MediatorStore for RedisStore {
         let mut pubsub = self.handler.get_pubsub_connection().await?;
         let channel_name = format!("CHANNEL:{mediator_uuid}");
         pubsub.subscribe(&channel_name).await.map_err(|err| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 mediator_uuid.into(),
+                &err,
                 format!("streaming_subscribe SUBSCRIBE failed: {err}"),
             )
         })?;
@@ -2170,9 +2222,10 @@ impl MediatorStore for RedisStore {
         .await
         .map(|_| ())
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 did_hash.into(),
+                &e,
                 format!("recording account activity: {e}"),
             )
         })
@@ -2195,9 +2248,10 @@ impl MediatorStore for RedisStore {
         }
         let rows: Vec<(Option<u64>, Option<u64>)> =
             self.query_each(&mut conn, pipe).await.map_err(|e| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &e,
                     format!("reading account activity: {e}"),
                 )
             })?;
@@ -2240,9 +2294,10 @@ impl MediatorStore for RedisStore {
         .await
         .map(|_| ())
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 did_hash.into(),
+                &e,
                 format!("counting a message against the account: {e}"),
             )
         })
@@ -2262,7 +2317,12 @@ impl MediatorStore for RedisStore {
         }
         let rows: Vec<HashMap<String, i64>> =
             self.query_each(&mut conn, pipe).await.map_err(|e| {
-                MediatorError::DatabaseError(14, "NA".into(), format!("reading account stats: {e}"))
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("reading account stats: {e}"),
+                )
             })?;
         Ok(rows.into_iter().map(stats_from_hash).collect())
     }
@@ -2274,9 +2334,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &e,
                     format!("reading configuration overrides: {e}"),
                 )
             })
@@ -2290,9 +2351,10 @@ impl MediatorStore for RedisStore {
             .exec_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &e,
                     format!("storing configuration overrides: {e}"),
                 )
             })
@@ -2328,9 +2390,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "expiry".into(),
+                    &err,
                     format!("sweep_expired_messages timeslot_scan failed: {err}"),
                 )
             })?;
@@ -2361,9 +2424,10 @@ impl MediatorStore for RedisStore {
                     .query_async(&mut conn)
                     .await
                     .map_err(|err| {
-                        MediatorError::DatabaseError(
+                        MediatorError::database_from_redis(
                             14,
                             "expiry".into(),
+                            &err,
                             format!("sweep_expired_messages SSCAN failed: {err}"),
                         )
                     })?;
@@ -2445,9 +2509,10 @@ impl MediatorStore for RedisStore {
                     .exec_async(&mut conn)
                     .await
                     .map_err(|err| {
-                        MediatorError::DatabaseError(
+                        MediatorError::database_from_redis(
                             14,
                             "expiry".into(),
+                            &err,
                             format!("sweep_expired_messages ZREM failed: {err}"),
                         )
                     })?;

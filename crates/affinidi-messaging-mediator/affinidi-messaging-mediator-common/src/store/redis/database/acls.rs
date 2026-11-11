@@ -31,9 +31,10 @@ impl Database {
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("set_acl failed. Reason: {err}"),
                     )
                 })?;
@@ -61,9 +62,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("get_did_acls failed. Reason: {err}"),
                     )
                 })?;
@@ -110,9 +112,10 @@ impl Database {
             }
 
             let result: Vec<Value> = self.query_each(&mut con, query).await.map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("get_did_acls failed. Reason: {err}"),
                 )
             })?;
@@ -189,9 +192,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("delivery_decision failed. Reason: {err}"),
                     )
                 })?;
@@ -205,9 +209,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("delivery_decision failed. Reason: {err}"),
                     )
                 })?;
@@ -262,9 +267,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("access_list_list failed. Reason: {err}"),
                     )
                 })?;
@@ -294,9 +300,10 @@ impl Database {
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("access_list_count failed. Reason: {err}"),
                     )
                 })
@@ -345,9 +352,10 @@ impl Database {
             }
 
             query.exec_async(&mut con).await.map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("access_list_add failed. Reason: {err}"),
                 )
             })?;
@@ -390,9 +398,10 @@ impl Database {
             }
 
             query.query_async(&mut con).await.map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("access_list_remove failed. Reason: {err}"),
                 )
             })
@@ -417,9 +426,10 @@ impl Database {
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("access_list_clear failed. Reason: {err}"),
                     )
                 })
@@ -457,9 +467,10 @@ impl Database {
             }
 
             let results: Vec<u8> = query.query_async(&mut con).await.map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("access_list_get failed. Reason: {err}"),
                 )
             })?;

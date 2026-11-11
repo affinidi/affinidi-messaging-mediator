@@ -77,9 +77,10 @@ async fn get_applied_ids(db: &Database) -> Result<HashSet<u32>, MediatorError> {
         .query_async(&mut conn)
         .await
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "migrations".into(),
+                &e,
                 format!("Failed to read {MIGRATIONS_SET_KEY}: {e}"),
             )
         })?;
@@ -106,9 +107,10 @@ async fn record_migration(db: &Database, id: u32, name: &str) -> Result<(), Medi
         .await
         .map(|_| ())
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "migrations".into(),
+                &e,
                 format!("Failed to record migration {id}: {e}"),
             )
         })
@@ -131,9 +133,10 @@ async fn bootstrap_if_needed(
         .query_async(&mut conn)
         .await
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "migrations".into(),
+                &e,
                 format!("Failed to check {MIGRATIONS_SET_KEY}: {e}"),
             )
         })?;
@@ -150,9 +153,10 @@ async fn bootstrap_if_needed(
         .query_async(&mut conn)
         .await
         .map_err(|e| {
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "migrations".into(),
+                &e,
                 format!("Failed to read legacy SCHEMA_VERSION: {e}"),
             )
         })?;
@@ -195,9 +199,10 @@ async fn bootstrap_if_needed(
             .exec_async(&mut conn)
             .await
             .map_err(|e| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "migrations".into(),
+                    &e,
                     format!("Failed to remove legacy SCHEMA_VERSION: {e}"),
                 )
             })?;

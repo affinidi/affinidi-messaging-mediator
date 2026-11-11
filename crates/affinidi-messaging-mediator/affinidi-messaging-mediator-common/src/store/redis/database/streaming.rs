@@ -135,9 +135,10 @@ impl Database {
                 "redis function clean_start_streaming() failed. Reason: {}",
                 err
             );
-            MediatorError::DatabaseError(
+            MediatorError::database_from_redis(
                 14,
                 "NA".into(),
+                &err,
                 format!("redis function clean_start_streaming() failed. Reason: {err}"),
             )
         })?;
@@ -289,9 +290,10 @@ impl Database {
                     stream_uuid,
                     err
                 );
-                Err(MediatorError::DatabaseError(
+                Err(MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!(
                         "publish_live_message() for did_hash({did_hash}) channel(CHANNEL:{stream_uuid}) failed. Reason: {err}"
                     ),
@@ -319,9 +321,10 @@ impl Database {
             .await
             .map_err(|err| {
                 error!("streaming_release() for did_hash({did_hash}) from ({stream_uuid}) failed: {err}");
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("streaming_release() for did_hash({did_hash}) failed. Reason: {err}"),
                 )
             })?;
@@ -368,9 +371,10 @@ impl Database {
                 error!(
                     "streaming_claim() for did_hash({did_hash}) on ({stream_uuid}) failed: {err}"
                 );
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("streaming_claim() for did_hash({did_hash}) failed. Reason: {err}"),
                 )
             })?;

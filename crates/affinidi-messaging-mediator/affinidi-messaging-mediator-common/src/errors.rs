@@ -142,34 +142,40 @@ pub enum MediatorError {
     ),
 }
 
-/// Which database cap, if any, an error's text reports.
-enum StorageCap {
+/// A database limit that refused an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StorageCap {
+    /// Used memory is past its maximum: the database refuses writes, even
+    /// one that would change nothing, until space is freed.
     Full,
+    /// The database didn't answer within `database_timeout` (it is
+    /// throttled at its ECPU maximum, or unreachable), or in cluster mode
+    /// another store or delete still holds the message past the wait.
     Busy,
 }
 
-/// `timeout_is_storage` says whether a timeout in `text` can only be a
-/// storage timeout. It holds for database and session errors, which wrap a
-/// database reply. A generic problem report can carry any timeout (a forward,
-/// a DID resolution), so for it only the database's own replies count.
-fn storage_cap(text: &str, timeout_is_storage: bool) -> Option<StorageCap> {
-    if is_storage_full(text) {
-        Some(StorageCap::Full)
-    } else if (timeout_is_storage && text.contains("timed out"))
-        || text.contains("STORE_IN_PROGRESS")
-        || text.contains("DELETE_IN_PROGRESS")
-    {
-        Some(StorageCap::Busy)
-    } else {
-        None
+impl StorageCap {
+    /// The cap a Redis error reports, read from the error itself: a reply
+    /// timeout, or the server's error code (`OOM`, `STORE_IN_PROGRESS`,
+    /// `DELETE_IN_PROGRESS`). A pipeline or an aborted transaction reports
+    /// each command's error, and any of them counts.
+    #[cfg(feature = "redis-backend")]
+    pub fn of_redis(err: &redis::RedisError) -> Option<Self> {
+        if err.is_timeout() {
+            return Some(Self::Busy);
+        }
+        let errors = err.clone().into_server_errors()?;
+        let mut cap = None;
+        for (_, server) in errors.iter() {
+            match server.code() {
+                "OOM" => return Some(Self::Full),
+                "STORE_IN_PROGRESS" | "DELETE_IN_PROGRESS" => cap = Some(Self::Busy),
+                _ => {}
+            }
+        }
+        cap
     }
-}
-
-/// Whether a database error's text says the database is full: it refuses
-/// writes once used memory passes its maximum (`OOM command not allowed when
-/// used memory > 'maxmemory'`), even a write that would change nothing.
-pub fn is_storage_full(text: &str) -> bool {
-    text.contains("command not allowed when used memory")
 }
 
 impl MediatorError {
@@ -192,52 +198,23 @@ impl MediatorError {
         }
     }
 
-    /// An error caused by a database cap, as a problem report that names the
-    /// cause; any other error unchanged.
+    /// A refusal by a database cap, as a problem report that names it.
     ///
-    /// The cause is read from the error text, which carries the database's
-    /// own reply: `command not allowed when used memory` once the data
-    /// storage maximum is reached, `timed out` when a command outlasts
-    /// `database_timeout` (the database is throttled at its ECPU maximum, or
-    /// unreachable), and in cluster mode `STORE_IN_PROGRESS` /
-    /// `DELETE_IN_PROGRESS` when another store or delete still holds the
-    /// message past the wait. Left as they are, they reach an HTTP client as
-    /// a generic "Service temporarily unavailable" and a websocket client as
-    /// nothing.
-    ///
-    /// Covers [`DatabaseError`](Self::DatabaseError),
-    /// [`SessionError`](Self::SessionError) (login and session writes) and a
-    /// generic server-side problem report such as a failed delete; a problem
-    /// report that already names a specific cause is left alone.
-    pub fn named_storage_cap(self) -> Self {
-        let cap = match &self {
-            Self::DatabaseError(code, _, text) | Self::SessionError(code, _, text) => {
-                storage_cap(text, true).map(|cap| (cap, *code, text.clone()))
-            }
-            Self::MediatorError(code, _, _, report, status, log)
-                if *status >= 500 && !report.code.contains("storage.") =>
-            {
-                let from_database = report.code.contains(".database.");
-                storage_cap(log, from_database).map(|cap| (cap, *code, log.clone()))
-            }
-            _ => None,
-        };
-        let Some((cap, code, text)) = cap else {
-            return self;
-        };
-        // Keep the id of the message this error answers, so the report
-        // stays threaded (`pthid`) to the request.
-        let (session, msg_id) = match self {
-            Self::DatabaseError(_, session, _) | Self::SessionError(_, session, _) => {
-                (session, None)
-            }
-            Self::MediatorError(_, session, msg_id, ..) => (session, msg_id),
-            _ => unreachable!("only these variants are matched above"),
-        };
+    /// Left as a plain database error, a cap reaches an HTTP client as a
+    /// generic "Service temporarily unavailable" and a websocket client as
+    /// nothing. `msg_id` is the message the refusal answers (its `pthid`),
+    /// when known; `cause` is logged.
+    pub fn storage_cap(
+        cap: StorageCap,
+        code: ErrorCode,
+        session_id: impl Into<String>,
+        msg_id: Option<String>,
+        cause: impl std::fmt::Display,
+    ) -> Self {
         match cap {
             StorageCap::Full => Self::problem_with_log(
                 97,
-                session,
+                session_id,
                 msg_id,
                 ProblemReportSorter::Error,
                 ProblemReportScope::Message,
@@ -245,11 +222,11 @@ impl MediatorError {
                 "Mediator storage is full; nothing new can be stored until space is freed",
                 vec![],
                 StatusCode::INSUFFICIENT_STORAGE,
-                format!("Storage full (error {code}): {text}"),
+                format!("Storage full (error {code}): {cause}"),
             ),
             StorageCap::Busy => Self::problem_with_log(
                 98,
-                session,
+                session_id,
                 msg_id,
                 ProblemReportSorter::Warning,
                 ProblemReportScope::Message,
@@ -257,8 +234,49 @@ impl MediatorError {
                 "Mediator storage is busy; retry later",
                 vec![],
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Storage busy (error {code}): {text}"),
+                format!("Storage busy (error {code}): {cause}"),
             ),
+        }
+    }
+
+    /// Whether this is a [`storage_cap`](Self::storage_cap) refusal. A handler
+    /// that wraps a storage error in its own report passes these through, so
+    /// the client still learns that storage is full or busy.
+    pub fn is_storage_cap(&self) -> bool {
+        matches!(self, Self::MediatorError(_, _, _, report, _, _)
+            if report.code.ends_with(".me.res.storage.full")
+                || report.code.ends_with(".me.res.storage.busy"))
+    }
+
+    /// A failed Redis call as a [`DatabaseError`](Self::DatabaseError), or as
+    /// the [`storage_cap`](Self::storage_cap) refusal when `err` reports one.
+    /// `text` describes the failure and is what gets logged.
+    #[cfg(feature = "redis-backend")]
+    pub fn database_from_redis(
+        code: ErrorCode,
+        session_id: SessId,
+        err: &redis::RedisError,
+        text: String,
+    ) -> Self {
+        match StorageCap::of_redis(err) {
+            Some(cap) => Self::storage_cap(cap, code, session_id, None, text),
+            None => Self::DatabaseError(code, session_id, text),
+        }
+    }
+
+    /// [`database_from_redis`](Self::database_from_redis) for a login or
+    /// session write: a [`SessionError`](Self::SessionError) unless `err`
+    /// reports a cap.
+    #[cfg(feature = "redis-backend")]
+    pub fn session_from_redis(
+        code: ErrorCode,
+        session_id: SessId,
+        err: &redis::RedisError,
+        text: String,
+    ) -> Self {
+        match StorageCap::of_redis(err) {
+            Some(cap) => Self::storage_cap(cap, code, session_id, None, text),
+            None => Self::SessionError(code, session_id, text),
         }
     }
 
@@ -373,7 +391,7 @@ impl IntoResponse for AppError {
         // `Retry-After` header below.
         let mut retry_after_secs: Option<u64> = None;
 
-        let response = match self.error.named_storage_cap() {
+        let response = match self.error {
             MediatorError::ErrorHandlingError(error_code, session_id, msg) => {
                 event!(
                     Level::WARN,
@@ -848,62 +866,116 @@ mod tests {
     use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
     use axum::http::StatusCode;
 
-    /// `named_storage_cap` matches "timed out" in the error text. Fails if a
-    /// redis-rs upgrade rewords its timeout errors.
+    /// A Redis error as the client reads it from the server's reply.
+    #[cfg(feature = "redis-backend")]
+    fn server_error(reply: &str) -> redis::RedisError {
+        redis::parse_redis_value(format!("-{reply}\r\n").as_bytes())
+            .and_then(|value| value.extract_error())
+            .expect_err("an error reply")
+    }
+
     #[cfg(feature = "redis-backend")]
     #[test]
-    fn redis_timeout_text_is_recognised() {
-        let err = redis::RedisError::from(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        ));
-        assert!(err.is_timeout());
-        assert!(
-            err.to_string().contains("timed out"),
-            "redis timeout renders as: {err}"
+    fn the_cap_is_read_from_the_redis_error() {
+        let oom = server_error("OOM command not allowed when used memory > 'maxmemory'.");
+        assert_eq!(StorageCap::of_redis(&oom), Some(StorageCap::Full));
+        assert_eq!(
+            StorageCap::of_redis(&server_error("OOM reworded by a later server")),
+            Some(StorageCap::Full),
+            "the code counts, not the wording"
         );
+        let timeout = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(StorageCap::of_redis(&timeout), Some(StorageCap::Busy));
+        for held in [
+            "STORE_IN_PROGRESS message is still being stored",
+            "DELETE_IN_PROGRESS message is being deleted",
+        ] {
+            assert_eq!(
+                StorageCap::of_redis(&server_error(held)),
+                Some(StorageCap::Busy),
+                "{held}"
+            );
+        }
+        for other in [
+            "ERR operation timed out",
+            "ERR command not allowed when used memory > 'maxmemory'.",
+            "CROSSSLOT Keys in request don't hash to the same slot",
+        ] {
+            assert_eq!(StorageCap::of_redis(&server_error(other)), None, "{other}");
+        }
+    }
+
+    /// The problem code and HTTP status of a named refusal, or `None` when
+    /// the error is left as it was.
+    fn named(err: &MediatorError) -> Option<(String, StatusCode)> {
+        match err {
+            MediatorError::MediatorError(_, _, _, report, status, _) => Some((
+                report.code.clone(),
+                StatusCode::from_u16(*status).expect("valid status"),
+            )),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "redis-backend")]
+    #[test]
+    fn a_redis_error_is_named_where_it_is_converted() {
+        let full = Some((
+            "e.m.me.res.storage.full".to_string(),
+            StatusCode::INSUFFICIENT_STORAGE,
+        ));
+        let oom = server_error("OOM command not allowed when used memory > 'maxmemory'.");
+        assert_eq!(
+            named(&MediatorError::database_from_redis(
+                14,
+                "s".into(),
+                &oom,
+                format!("store: {oom}")
+            )),
+            full
+        );
+        assert_eq!(
+            named(&MediatorError::session_from_redis(
+                14,
+                "s".into(),
+                &oom,
+                format!("put_session: {oom}")
+            )),
+            full
+        );
+        let timeout = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            named(&MediatorError::database_from_redis(
+                14,
+                "s".into(),
+                &timeout,
+                "inbox_status failed".into()
+            )),
+            Some((
+                "w.m.me.res.storage.busy".to_string(),
+                StatusCode::SERVICE_UNAVAILABLE
+            ))
+        );
+        let other = server_error("ERR operation timed out");
+        assert!(matches!(
+            MediatorError::database_from_redis(14, "s".into(), &other, other.to_string()),
+            MediatorError::DatabaseError(14, _, _)
+        ));
+        assert!(matches!(
+            MediatorError::session_from_redis(14, "s".into(), &other, other.to_string()),
+            MediatorError::SessionError(14, _, _)
+        ));
     }
 
     #[test]
-    fn session_and_generic_errors_are_named_too() {
-        let oom = "OOM command not allowed when used memory > 'maxmemory'.";
-        let named_code = |err: MediatorError| match err.named_storage_cap() {
-            MediatorError::MediatorError(_, _, _, report, _, _) => Some(report.code.clone()),
-            _ => None,
-        };
-        assert!(
-            named_code(MediatorError::SessionError(14, "s".into(), oom.into()))
-                .is_some_and(|c| c.ends_with("storage.full"))
-        );
-        let delete = MediatorError::problem_with_log(
-            10,
-            "NA",
-            None,
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "database.message.delete.error",
-            "Couldn't delete message_hash ({1}). Reason: {2}",
-            vec!["h".into(), "Response timed out".into()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Couldn't delete message_hash (h). Reason: Response timed out".to_string(),
-        );
-        assert!(named_code(delete).is_some_and(|c| c.ends_with("storage.busy")));
-        let held = MediatorError::problem_with_log(
-            10,
-            "NA",
-            None,
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "database.message.delete.error",
-            "Couldn't delete message_hash ({1}). Reason: {2}",
-            vec!["h".into(), "STORE_IN_PROGRESS: message is still being stored".into()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Couldn't delete message_hash (h). Reason: STORE_IN_PROGRESS: message is still being stored".to_string(),
-        );
-        assert!(
-            named_code(held).is_some_and(|c| c.ends_with("storage.busy")),
-            "a delete that waited out its claim is retryable"
-        );
+    fn a_cap_keeps_the_request_it_answers() {
+        match MediatorError::storage_cap(StorageCap::Busy, 10, "NA", Some("req-1".into()), "held") {
+            MediatorError::MediatorError(_, _, msg_id, report, _, _) => {
+                assert!(report.code.ends_with("storage.busy"));
+                assert_eq!(msg_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         assert_eq!(
             storage_busy_retry_after_secs("e.p.me.res.storage.busy"),
             Some(STORAGE_BUSY_RETRY_AFTER_SECS)
@@ -911,111 +983,32 @@ mod tests {
     }
 
     #[test]
-    fn a_non_storage_timeout_is_not_named_storage_busy() {
-        let forward = MediatorError::problem_with_log(
-            50,
-            "NA",
-            Some("req-1".into()),
-            ProblemReportSorter::Error,
-            ProblemReportScope::Message,
-            "me.res.forwarding.error",
-            "Couldn't forward message: {1}",
-            vec!["operation timed out".into()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Couldn't forward message: operation timed out".to_string(),
-        );
-        match forward.named_storage_cap() {
-            MediatorError::MediatorError(_, _, _, report, _, _) => {
-                assert!(
-                    !report.code.contains("storage."),
-                    "renamed to {}",
-                    report.code
-                )
-            }
-            other => panic!("unexpected {other:?}"),
+    fn a_cap_refusal_is_recognised_for_passing_through() {
+        for cap in [StorageCap::Full, StorageCap::Busy] {
+            assert!(MediatorError::storage_cap(cap, 14, "s", None, "x").is_storage_cap());
         }
+        assert!(!refusal(None).is_storage_cap());
+        assert!(
+            !MediatorError::DatabaseError(14, "s".into(), "storage.full".into()).is_storage_cap()
+        );
     }
 
     #[test]
-    fn a_named_cap_keeps_the_request_it_answers() {
-        let delete = MediatorError::problem_with_log(
-            10,
-            "NA",
-            Some("req-1".into()),
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "database.message.delete.error",
-            "Couldn't delete message_hash ({1}). Reason: {2}",
-            vec!["h".into(), "Response timed out".into()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Couldn't delete message_hash (h). Reason: Response timed out".to_string(),
-        );
-        match delete.named_storage_cap() {
-            MediatorError::MediatorError(_, _, msg_id, report, _, _) => {
-                assert!(report.code.ends_with("storage.busy"));
-                assert_eq!(msg_id.as_deref(), Some("req-1"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    /// The problem code and HTTP status of `text` as a database error once
-    /// named, or `None` when it is left as a plain database error.
-    fn named(text: &str) -> Option<(String, StatusCode)> {
-        match MediatorError::DatabaseError(14, "s".into(), text.into()).named_storage_cap() {
-            MediatorError::MediatorError(_, _, _, report, status, _) => Some((
-                report.code.clone(),
-                StatusCode::from_u16(status).expect("valid status"),
-            )),
-            _ => None,
-        }
-    }
-
-    // The texts below are what redis-rs 1.8.1 reports from a real server.
-    #[test]
-    fn a_full_database_is_named_storage_full() {
-        let full = Some((
-            "e.m.me.res.storage.full".to_string(),
-            StatusCode::INSUFFICIENT_STORAGE,
-        ));
-        assert_eq!(
-            named(
-                "Couldn't store message: \"OOM\": command not allowed when used memory > 'maxmemory'."
-            ),
-            full
+    fn a_database_error_is_not_named_from_its_text() {
+        let error = MediatorError::DatabaseError(
+            14,
+            "s".into(),
+            "\"OOM\": command not allowed when used memory > 'maxmemory'. timed out".into(),
         );
         assert_eq!(
-            named(
-                "Failed to add account. Reason: Transaction aborted: [(Index 0, error: \"OOM\": command not allowed when used memory > 'maxmemory'.)]"
-            ),
-            full,
-            "an aborted transaction names its cause"
+            AppError::from(error).into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
-    }
-
-    #[test]
-    fn a_timed_out_database_is_named_storage_busy() {
-        assert_eq!(
-            named("inbox_status failed: timed out"),
-            Some((
-                "w.m.me.res.storage.busy".to_string(),
-                StatusCode::SERVICE_UNAVAILABLE
-            ))
-        );
-    }
-
-    #[test]
-    fn other_database_errors_stay_generic() {
-        assert_eq!(named("Failed to add account. Reason: CROSSSLOT"), None);
     }
 
     #[test]
     fn a_full_database_reaches_an_http_client_as_507() {
-        let error = MediatorError::DatabaseError(
-            14,
-            "s".into(),
-            "\"OOM\": command not allowed when used memory > 'maxmemory'.".into(),
-        );
+        let error = MediatorError::storage_cap(StorageCap::Full, 14, "s", None, "full");
         assert_eq!(
             AppError::from(error).into_response().status(),
             StatusCode::INSUFFICIENT_STORAGE

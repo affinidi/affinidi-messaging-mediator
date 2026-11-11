@@ -232,6 +232,7 @@ pub async fn authentication_response(
             .await
         {
             Ok(session) => session.into(),
+            Err(e) if e.is_storage_cap() => return Err(e.into()),
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
                     14,
@@ -380,6 +381,9 @@ pub async fn authentication_response(
             )
             .await
             .map_err(|e| {
+                if e.is_storage_cap() {
+                    return e;
+                }
                 MediatorError::problem_with_log(
                     14,
                     "",

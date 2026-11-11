@@ -1011,7 +1011,7 @@ async fn handle_socket(
 
                                             // Send a problem report to the sender
                                             #[cfg(feature = "didcomm")]
-                                            match e.named_storage_cap() {
+                                            match e {
                                                 MediatorError::MediatorError(_, _, msg_id, problem_report, _, log_message) => {
                                                     match  _package_problem_report(&state, &session, msg_id, *problem_report).await {
                                                         Ok(msg) => {
