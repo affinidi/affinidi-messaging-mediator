@@ -29,6 +29,34 @@ mediator-tui 0.11.0); they are no longer updated.
   then the members of the selected one, with their delivery state, and its
   title says when the view covers this instance only.
 - Needs affinidi-messaging-sdk 0.45.6 (`TrustTasksOps::mux_connections`).
+### Changed — a forward is delivered only to a next hop that has an account
+
+- A forward never creates an account. A local next hop with no account on
+  this mediator is refused with `73 delivery.refused`; it used to be
+  registered with `global_acl_default`, in either `mediator_acl_mode`. A
+  recipient gets its account by authenticating (or from an admin) before
+  forwards to it are accepted.
+- A forward from a DID with no account here is still checked against the
+  least-privilege relay ACL (`SEND_FORWARDED` only, if `global_acl_default`
+  grants it), but that DID is no longer registered. The message is stored
+  or relayed without a sender of record, as an anonymous forward is: it
+  does not count towards `limits.queue.sender` or `limits.queue.peer` for
+  that DID, and an abandoned relay has no inbox here to report to (logged
+  as `FORWARD_PROBLEM_REPORT_UNSENT`). Recipient-side checks, including
+  access lists, still see the sender's DID.
+- A next hop this mediator cannot route is refused instead of stored where
+  nothing would collect it. One whose DID document publishes a DIDComm
+  service with no usable endpoint, or names a mediator whose document has
+  no endpoint URL, gets `73 delivery.refused`. One whose DID, or whose
+  mediator's DID, cannot be resolved gets `74 did.resolve` with 503, so the
+  sender can retry. Previously each was stored locally, logged "Storing
+  locally — it will not be delivered", and answered as forwarded.
+
+**Behaviour change (R3.6):** a deployment that forwards to recipients
+before they have ever authenticated must now pre-register them with
+`messaging/account/add` (admin). Senders that relied on an unresolvable or
+unroutable next hop being accepted now get an error.
+
 ### Changed — `account/add` is admin-only and never replaces an existing account
 
 - `messaging/account/add` for a DID that already has an account is refused

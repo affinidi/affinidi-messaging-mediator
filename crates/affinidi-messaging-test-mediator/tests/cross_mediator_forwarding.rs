@@ -37,12 +37,12 @@ use uuid::Uuid;
 ///
 /// `global_acl_default = allow_all` makes this a *relay* deployment: when
 /// an inner forward arrives whose sender is homed on the *other* mediator
-/// (and therefore has no account here), the routing handler auto-registers
-/// that sender via `relay_sender_acls(global_default)`, which only seeds
-/// `SEND_FORWARDED` when the global default grants it. Without that, the
-/// inbound relayed forward is rejected with 403 and never reaches the
-/// recipient — so a mediator that accepts cross-mediator forwards must
-/// default-grant it. (Locally-registered users like Bob are added with an
+/// (and therefore has no account here), the routing handler checks that
+/// sender against `relay_sender_acls(global_default)`, which only grants
+/// `SEND_FORWARDED` when the global default grants it, and stores nothing for
+/// it. Without that, the inbound relayed forward is rejected with 403 and
+/// never reaches the recipient — so a mediator that accepts cross-mediator
+/// forwards must default-grant it. (Locally-registered users like Bob are added with an
 /// explicit `allow_all` ACL by `add_user`, independent of this default.)
 async fn spawn_relay_environment() -> TestEnvironment {
     let mediator = TestMediator::builder()
@@ -282,6 +282,15 @@ async fn cross_mediator_forward_delivers_over_memory_backend() {
         received.as_deref(),
         Some(text),
         "Bob should receive Alice's message after it routes A → B"
+    );
+    assert!(
+        !env_b
+            .mediator
+            .store()
+            .account_exists(&alice.did_hash())
+            .await
+            .expect("account_exists"),
+        "relaying Alice's forward must not give her an account on B"
     );
 
     env_a.shutdown().await.expect("shutdown mediator A");

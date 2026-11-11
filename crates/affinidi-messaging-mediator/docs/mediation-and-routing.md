@@ -76,7 +76,7 @@ and all of them can make a v2 recipient unreachable:
 | Gate | Effect |
 |------|--------|
 | `mediator_acl_mode = "explicit_allow"` | Unknown DIDs are refused at the authentication challenge, and v1 mediation is denied for DIDs with no account. Such a deployment registers DIDs ahead of time with the `messaging/account/add` Trust Task. |
-| Account existence, on **direct delivery** | A directly-delivered message to a DID with no account is refused with `delivery.refused` (error 73). Forwarding differs — it auto-creates the account. |
+| Account existence | A message to a DID with no account — directly delivered or forwarded — is refused with `delivery.refused` (error 73). A recipient's account comes from its first authentication (or an admin); no message creates one. |
 | `LOCAL` | Required to complete the WebSocket upgrade and to use inbox fetch/list/delete. |
 | `RECEIVE_MESSAGES` | Required to accept direct delivery. |
 | `RECEIVE_FORWARDED` | Required to accept a forwarded message. |

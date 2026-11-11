@@ -959,6 +959,18 @@ impl ForwardingProcessor {
     ) {
         let now = unix_timestamp_secs();
 
+        // An anonymous forward, or one from a sender with no account on this
+        // mediator, has no inbox here to hold a report.
+        if msg.from_did_hash.is_empty() || msg.from_did.is_empty() {
+            warn!(
+                "FORWARD_PROBLEM_REPORT_UNSENT: the abandoned forward to {} (endpoint {}) has no \
+                 sender with an account on this mediator to report to",
+                Self::destination_label(msg),
+                endpoint_url
+            );
+            return;
+        }
+
         let Some(packer) = self.packer.as_ref() else {
             error!(
                 "FORWARD_PROBLEM_REPORT_UNSENT: no system message packer configured, so the \

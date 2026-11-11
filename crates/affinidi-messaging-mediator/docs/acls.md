@@ -63,7 +63,8 @@ the same policy — an account deleted between the challenge and the response
 is treated as a revocation, not re-registered.
 
 **It does not affect message delivery.** No send, receive, forward, or
-pickup decision reads it.
+pickup decision reads it, and no delivery path creates an account, so it is
+the only place a DID's admission is decided.
 
 **`account_add` never changes an existing account.** Adding a DID that
 already has an account is refused with `messaging/account/add:alreadyExists`
@@ -135,20 +136,26 @@ from everyone.
 
 ## 4. How a DID gets an account
 
-Four paths, and they do **not** all grant the same ACLs:
+Two paths, and they do **not** grant the same ACLs:
 
 | Path | Trigger | ACLs granted |
 |------|---------|--------------|
 | Login | A DID answering its challenge (`/authenticate`, `/tsp/authenticate`) — `explicit_deny` mode only (`explicit_allow` rejects unknown DIDs instead). An existing account is used as it is. | `global_acl_default` |
 | `messaging/account/add` by an admin | Trust Task | The admin's ACL applied onto `global_acl_default`, else `global_acl_default` |
-| Forward next hop | An unseen DID is named as a forward's `next` (`resolve_next_account`) | `global_acl_default` — in either mode |
-| Forward sender | An unseen DID relays a forward through the mediator (`relay_sender_acls`) | **Least privilege**: `DENY_ALL` + `SEND_FORWARDED`, and only if `global_acl_default` grants `SEND_FORWARDED`. No `LOCAL`, `RECEIVE_*`, invites, or self-management. |
+
+DIDComm v1 mediation registers a client the same way as authentication,
+under the same `mediator_acl_mode` rule.
+
+Forwards do **not** create accounts. A forward whose `next` hop has no
+account here is refused with `delivery.refused`; a forward from a DID with no
+account here is checked against a least-privilege ACL (`DENY_ALL` +
+`SEND_FORWARDED`, and only if `global_acl_default` grants `SEND_FORWARDED` —
+`relay_sender_acls`) and nothing is stored for that DID.
 
 The first path is the one that surprises people: in `explicit_deny` mode,
 **registration is automatic and unconditional** — there is no approval
-step. `explicit_allow` turns off registration at authentication. It does not
-turn off the forward paths: a forward naming an unseen `next` DID still
-creates an account for it with `global_acl_default`.
+step. `explicit_allow` turns off registration at authentication, and with it
+every way a DID can register itself.
 
 ---
 
@@ -255,7 +262,10 @@ to admit or refuse.
 ├─ sender has SEND_FORWARDED?                   else 403 authorization.send_forwarded
 ├─ (queue, attachment, delay and forward-queue limits)
 ├─ next hop local or remote? (resolves its DID document)
+│  ├─ couldn't be resolved (it or its mediator)  503 did.resolve (retryable)
+│  └─ publishes no usable DIDComm endpoint       403 delivery.refused
 ├─ local next hop:
+│  ├─ has an account here?                      else 403 delivery.refused
 │  ├─ has RECEIVE_FORWARDED?                    else 403 delivery.refused
 │  ├─ access list admits the sender?            else 403 delivery.refused
 │  └─ anonymous envelope → has ANON_RECEIVE?    else 403 delivery.refused
