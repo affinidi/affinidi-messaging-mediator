@@ -299,6 +299,9 @@ pub async fn authentication_refresh(
             .get_session(&results.claims.session_id, &results.claims.sub)
             .await
             .map_err(|e| {
+                if e.is_storage_cap() {
+                    return e;
+                }
                 // The session ended with its account: tell the client to
                 // authenticate again rather than to retry.
                 if let MediatorError::Unauthorized(..) = e {
@@ -405,6 +408,9 @@ pub async fn authentication_refresh(
             )
             .await
             .map_err(|e| {
+                if e.is_storage_cap() {
+                    return e;
+                }
                 MediatorError::problem_with_log(
                     14,
                     "",

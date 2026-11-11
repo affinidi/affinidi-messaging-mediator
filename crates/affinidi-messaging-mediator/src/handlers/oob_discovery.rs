@@ -112,6 +112,7 @@ pub async fn oob_invite_handler(
             )
             .into());
         }
+        Err(e) if e.is_storage_cap() => return Err(e.into()),
         Err(e) => {
             return Err(MediatorError::problem_with_log(
                 46,
@@ -170,19 +171,14 @@ pub async fn oobid_handler(
                 data: None,
             }),
         )),
-        Err(MediatorError::DatabaseError(code, _, text)) => Err(MediatorError::problem_with_log(
-            code,
-            "NA",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.error",
-            "Database transaction error: {1}",
-            vec![text.to_string()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Database transaction error: {text}"),
-        )
-        .into()),
+        // Anyone may retrieve an invite, so a storage failure is reported
+        // without its cause (full, busy, or the database's own text).
+        Err(MediatorError::DatabaseError(code, _, text)) => {
+            Err(MediatorError::storage_error_opaque(code, "NA", text).into())
+        }
+        Err(e) if e.is_storage_cap() => {
+            Err(MediatorError::storage_error_opaque(87, "NA", e).into())
+        }
         Err(e) => Err(MediatorError::problem_with_log(
             87,
             "NA",
@@ -190,8 +186,8 @@ pub async fn oobid_handler(
             ProblemReportSorter::Error,
             ProblemReportScope::Protocol,
             "oob.retrieve",
-            "Couldn't retrieve OOB invite. Reason: {1}",
-            vec![e.to_string()],
+            "Couldn't retrieve OOB invite",
+            vec![],
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Couldn't retrieve OOB invite. Reason: {e}"),
         )
@@ -214,6 +210,9 @@ pub async fn delete_oobid_handler(
             .oob_discovery_get(&oobid._oobid)
             .await
             .map_err(|e| {
+                if e.is_storage_cap() {
+                    return e;
+                }
                 MediatorError::problem_with_log(
                     14,
                     session.session_id.clone(),

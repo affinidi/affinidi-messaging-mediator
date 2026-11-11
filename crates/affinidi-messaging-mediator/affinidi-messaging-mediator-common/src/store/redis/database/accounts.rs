@@ -56,9 +56,10 @@ impl Database {
             .query_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("Failed to check account existence. Reason: {err}"),
                 )
             })?;
@@ -88,9 +89,10 @@ impl Database {
             .query_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("Failed to get account details. Reason: {err}"),
                 )
             })?;
@@ -157,9 +159,10 @@ return 1
             .invoke_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".to_string(),
+                    &err,
                     format!("Failed to add account. Reason: {err}"),
                 )
             })?;
@@ -176,9 +179,10 @@ return 1
             self.exec_steps(&mut con, vec![listed])
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to list account. Reason: {err}"),
                     )
                 })?;
@@ -284,9 +288,10 @@ return 1
             self.exec_steps(&mut con, vec![unlisted, records])
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to remove DID ({did_hash}) records. Reason: {err}"),
                     )
                 })?;
@@ -322,9 +327,10 @@ return 1
                 .query_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to scan access list at cursor ({cursor}). Reason: {err}"),
                     )
                 })?;
@@ -341,9 +347,10 @@ return 1
 
             let did_results: Vec<HashMap<String, String>> =
                 self.query_each(&mut con, did_query).await.map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to get DID details. Reason: {err}"),
                     )
                 })?;
@@ -352,9 +359,10 @@ return 1
                 .query_each(&mut con, access_list_query)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to get DID access list count. Reason: {err}"),
                     )
                 })?;
@@ -409,9 +417,10 @@ return 1
                 .exec_async(&mut con)
                 .await
                 .map_err(|err| {
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".to_string(),
+                        &err,
                         format!("Failed to change account type. Reason: {err}"),
                     )
                 })?;
@@ -481,9 +490,10 @@ return 1
                     .exec_async(&mut con)
                     .await
                     .map_err(|err| {
-                        MediatorError::DatabaseError(
+                        MediatorError::database_from_redis(
                             14,
                             "NA".to_string(),
+                            &err,
                             format!("Failed to change queue limit ({queue_name}). Reason: {err}"),
                         )
                     })?;
@@ -496,9 +506,10 @@ return 1
                     .exec_async(&mut con)
                     .await
                     .map_err(|err| {
-                        MediatorError::DatabaseError(
+                        MediatorError::database_from_redis(
                             23,
                             "NA".to_string(),
+                            &err,
                             format!("Failed to change queue limit ({queue_name}). Reason: {err}"),
                         )
                     })?;

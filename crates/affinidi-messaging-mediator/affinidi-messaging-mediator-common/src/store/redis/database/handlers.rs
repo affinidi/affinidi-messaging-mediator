@@ -1,6 +1,6 @@
 use super::Database;
 use crate::database::RedisConnection;
-use crate::errors::{MediatorError, is_storage_full};
+use crate::errors::{MediatorError, StorageCap};
 use redis::Value;
 use std::fs::read_to_string;
 use tracing::{Level, event};
@@ -48,7 +48,7 @@ impl Database {
             // must not stop a restart when the library this build ships is
             // already loaded: nothing would change by loading it again.
             Err(err)
-                if is_storage_full(&err.to_string())
+                if StorageCap::of_redis(&err) == Some(StorageCap::Full)
                     && loaded_library_matches(&mut conn, &lua_scripts).await =>
             {
                 event!(
@@ -64,9 +64,10 @@ impl Database {
                     "database response for FUNCTION LOAD: ({})",
                     err
                 );
-                Err(MediatorError::DatabaseError(
+                Err(MediatorError::database_from_redis(
                     14,
                     "Initialization".into(),
+                    &err,
                     format!("Loading LUA scripts, received database error: {err}"),
                 ))
             }

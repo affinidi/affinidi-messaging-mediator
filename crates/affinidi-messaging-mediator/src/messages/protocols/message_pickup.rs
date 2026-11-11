@@ -130,6 +130,9 @@ async fn generate_status_reply(
         // tuple-walk; backends that don't speak Redis Lua produce the
         // same data via their own implementations.
         let inbox = state.database.inbox_status(did_hash).await.map_err(|e| {
+            if e.is_storage_cap() {
+                return e;
+            }
             MediatorError::problem_with_log(
                 14,
                 &session.session_id,

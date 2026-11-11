@@ -34,9 +34,10 @@ impl Database {
                         msg_id,
                         err
                     );
-                    MediatorError::DatabaseError(
+                    MediatorError::database_from_redis(
                         14,
                         "NA".into(),
+                        &err,
                         format!("Couldn't get message_id({msg_id}) from database: {err}"),
                     )
                 })?;

@@ -90,9 +90,10 @@ impl Database {
                     "Couldn't get shared METADATA from database: {}",
                     err
                 );
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't get shared METADATA from database: {err}"),
                 )
             })?;
@@ -144,9 +145,10 @@ impl Database {
             .exec_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "INTERNAL".into(),
+                    &err,
                     format!("Couldn't update GLOBAL SEND stats. Reason: {err}"),
                 )
             })?;
@@ -165,9 +167,10 @@ impl Database {
             .exec_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "INTERNAL".into(),
+                    &err,
                     format!("Couldn't update GLOBAL(WEBSOCKET_OPEN) stats. Reason: {err}"),
                 )
             })?;
@@ -186,9 +189,10 @@ impl Database {
             .exec_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "INTERNAL".into(),
+                    &err,
                     format!("Couldn't update GLOBAL(WEBSOCKET_CLOSE) stats. Reason: {err}"),
                 )
             })?;
@@ -205,9 +209,10 @@ impl Database {
             .query_async(&mut con)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "INTERNAL".into(),
+                    &err,
                     format!("Couldn't retrieve FORWARD_Q length. Reason: {err}"),
                 )
             })?;

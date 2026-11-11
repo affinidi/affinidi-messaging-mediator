@@ -11,19 +11,19 @@
 //! background blocking reads). This helper makes that bound **explicit,
 //! configurable, and backend-agnostic** for the request-validation path —
 //! it also covers in-process backends (Fjall/Memory) and any future
-//! backend without its own command timeout. On expiry it returns a clean
-//! `DatabaseError` (HTTP 503 / `me.res.storage.timeout`) instead of
+//! backend without its own command timeout. On expiry it returns the
+//! storage-busy refusal (HTTP 503 / `me.res.storage.busy`) instead of
 //! hanging.
 
 use std::future::Future;
 use std::time::Duration;
 
-use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::errors::{MediatorError, StorageCap};
 
 use crate::common::error_codes;
 
-/// Run a request-path storage future under `timeout`, returning a
-/// `DatabaseError` if it does not complete in time.
+/// Run a request-path storage future under `timeout`, returning the
+/// storage-busy refusal if it does not complete in time.
 ///
 /// `op` names the operation (for the log line); `session_id` threads the
 /// caller's session through to the error so it is traceable (`"NA"` where
@@ -39,9 +39,11 @@ where
 {
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
-        Err(_) => Err(MediatorError::DatabaseError(
+        Err(_) => Err(MediatorError::storage_cap(
+            StorageCap::Busy,
             error_codes::DB_OPERATION_ERROR,
-            session_id.to_string(),
+            session_id,
+            None,
             format!(
                 "storage operation '{op}' timed out after {}s",
                 timeout.as_secs()
@@ -63,7 +65,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn maps_a_hung_call_to_a_database_error() {
+    async fn maps_a_hung_call_to_storage_busy() {
         // A future that never resolves stands in for a wedged backend.
         let never = std::future::pending::<Result<(), MediatorError>>();
         let fut =
@@ -76,15 +78,17 @@ mod tests {
             "should not resolve before the timeout"
         );
 
-        // Advancing past the timeout yields a 503 DatabaseError, not a hang.
+        // Advancing past the timeout yields a 503 storage-busy refusal, not a hang.
         tokio::time::advance(Duration::from_secs(6)).await;
         match fut.await {
-            Err(MediatorError::DatabaseError(_, session, msg)) => {
+            Err(MediatorError::MediatorError(_, session, _, report, status, msg)) => {
                 assert_eq!(session, "sess-1");
+                assert_eq!(report.code, "w.m.me.res.storage.busy");
+                assert_eq!(status, 503);
                 assert!(msg.contains("forward_queue_len"), "msg was: {msg}");
                 assert!(msg.contains("timed out"), "msg was: {msg}");
             }
-            other => panic!("expected DatabaseError, got {other:?}"),
+            other => panic!("expected storage busy, got {other:?}"),
         }
     }
 

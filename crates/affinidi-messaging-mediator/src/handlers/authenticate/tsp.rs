@@ -70,7 +70,9 @@ pub async fn tsp_authentication_response(
         let mut session: Session = state
             .database
             .get_session(&body.session_id, &body.vid)
-            .await?
+            .await
+            // Unauthenticated: say nothing of storage capacity.
+            .map_err(MediatorError::opaque_storage)?
             .into();
         if session.state != SessionState::ChallengeSent {
             return Err(MediatorError::problem(
@@ -219,7 +221,9 @@ pub async fn tsp_authentication_response(
                 &session.did,
                 &refresh_token_hash,
             )
-            .await?;
+            .await
+            // Unauthenticated: say nothing of storage capacity.
+            .map_err(MediatorError::opaque_storage)?;
 
         debug!("TSP client authenticated: {}", session.did);
         crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;

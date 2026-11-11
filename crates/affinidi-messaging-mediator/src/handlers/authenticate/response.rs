@@ -232,21 +232,8 @@ pub async fn authentication_response(
             .await
         {
             Ok(session) => session.into(),
-            Err(e) => {
-                return Err(MediatorError::problem_with_log(
-                    14,
-                    "",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.error",
-                    "Database transaction error: {1}",
-                    vec![e.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Database transaction error: {e}"),
-                )
-                .into());
-            }
+            // The caller has no session yet: the cause stays in the log.
+            Err(e) => return Err(MediatorError::storage_error_opaque(14, "", e).into()),
         };
 
         // check that the DID matches from what was given for the initial challenge request to what was used for the message response
@@ -379,20 +366,8 @@ pub async fn authentication_response(
                 &refresh_token_hash,
             )
             .await
-            .map_err(|e| {
-                MediatorError::problem_with_log(
-                    14,
-                    "",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.error",
-                    "Database transaction error: {1}",
-                    vec![e.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Database transaction error: {e}"),
-                )
-            })?;
+            // Tokens are not issued yet: the cause stays in the log.
+            .map_err(|e| MediatorError::storage_error_opaque(14, "", e))?;
 
         // A did:scid account's version floor, persisted now its account exists.
         crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;
