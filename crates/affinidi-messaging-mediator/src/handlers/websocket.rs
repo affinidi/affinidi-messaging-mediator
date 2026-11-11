@@ -515,15 +515,20 @@ impl Drop for PerDidConnectionGuard {
 }
 
 /// One WebSocket's share of the mediator-wide connection state: its slot in
-/// the global count, its place on the `ACTIVE_WEBSOCKET_CONNECTIONS` gauge,
-/// its streaming registration and its close stat.
+/// the global count, its per-DID slot, its place on the
+/// `ACTIVE_WEBSOCKET_CONNECTIONS` gauge, its streaming registration and its
+/// close stat.
 ///
 /// Each part is taken on as the connection reaches it and given back by this
-/// one value, so no exit path from `handle_socket` can skip or repeat a
-/// release. [`ConnectionSlot::release`] gives everything back in order and
-/// awaits it; dropping the slot without it (an early return, a panic, the
+/// one value, so no exit path from `handle_socket` skips or repeats one of
+/// these releases. [`ConnectionSlot::release`] gives everything back in order
+/// and awaits it; dropping the slot without it (an early return, a panic, the
 /// task being cancelled) releases the same parts, sending what needs a task
 /// in the background.
+///
+/// A mux connection's members are not held here: they are closed by
+/// `mux::connection::close` on the handler's own exit paths, so a panic or a
+/// cancelled task leaves them to the registry's sweep.
 struct ConnectionSlot {
     count: Arc<AtomicUsize>,
     /// Counted on the gauge.
@@ -532,6 +537,8 @@ struct ConnectionSlot {
     close_stat: Option<Arc<dyn MediatorStore>>,
     /// Registered with the streaming task, so a deregistration is owed.
     registration: Option<(Sender<StreamingUpdate>, StreamingUpdate)>,
+    /// The DID's per-DID slot, released with the global one.
+    per_did: Option<PerDidConnectionGuard>,
 }
 
 impl ConnectionSlot {
@@ -544,6 +551,7 @@ impl ConnectionSlot {
             on_gauge: false,
             close_stat: None,
             registration: None,
+            per_did: None,
         };
         if current >= max {
             Err(current)
@@ -563,14 +571,29 @@ impl ConnectionSlot {
         self.close_stat = Some(database.clone());
     }
 
-    /// The streaming task holds a registration for this socket.
-    fn registered(&mut self, channel: Sender<StreamingUpdate>, did_hash: &str, session_id: &str) {
+    /// Hold the DID's per-DID slot until this slot is released.
+    fn hold_per_did(&mut self, guard: PerDidConnectionGuard) {
+        self.per_did = Some(guard);
+    }
+
+    /// The streaming task holds a registration for this socket, made with
+    /// the send queue `client`. The deregistration names that queue, so it
+    /// can only ever remove this socket's entry: another socket for the same
+    /// DID may share the session id.
+    fn registered(
+        &mut self,
+        channel: Sender<StreamingUpdate>,
+        did_hash: &str,
+        session_id: &str,
+        client: &Sender<QueuedCommand>,
+    ) {
         self.registration = Some((
             channel,
             StreamingUpdate {
                 did_hash: did_hash.to_string(),
                 state: StreamingUpdateState::Deregister {
                     session_id: session_id.to_string(),
+                    channel: client.downgrade(),
                 },
             },
         ));
@@ -593,7 +616,7 @@ impl ConnectionSlot {
                 .stats_increment(StatCounter::WebsocketClose, 1)
                 .await;
         }
-        // The count and the gauge go in `drop`.
+        // The count, the per-DID slot and the gauge go in `drop`.
     }
 }
 
@@ -840,8 +863,9 @@ async fn handle_socket(
         };
 
         // Enforce the per-DID connection cap (0 = unlimited). Reserve the slot
-        // immediately and bind a guard so it's released on every return path;
-        // then reject if this DID is over its cap.
+        // immediately and hand its guard to the connection slot, so it's
+        // released with the global one on every return path; then reject if
+        // this DID is over its cap.
         let per_did_count = {
             let mut entry = state
                 .ws_connections_per_did
@@ -856,16 +880,18 @@ async fn handle_socket(
         // peers*. That is the intended bound — it is the only thing limiting
         // anonymous sockets — and the empty string cannot collide with a real
         // DID's bucket, which is a sha256 hash.
-        let _per_did_guard = PerDidConnectionGuard {
+        slot.hold_per_did(PerDidConnectionGuard {
             registry: state.ws_connections_per_did.clone(),
             did_hash: session.did_hash.clone(),
-        };
+        });
         let per_did_cap = state.config.limits.max_websocket_connections_per_did;
         if per_did_cap != 0 && per_did_count as usize > per_did_cap {
             warn!(
                 "Per-DID WebSocket connection limit reached for {} ({}/{})",
                 session.did_hash, per_did_count, per_did_cap
             );
+            // Released before the close is written, which may take a while.
+            drop(slot);
             let _ = socket
                 .send(close_with(
                     close_code::POLICY,
@@ -938,6 +964,7 @@ async fn handle_socket(
                         streaming.channel.clone(),
                         &session.did_hash,
                         &session.session_id,
+                        &tx,
                     );
                 }
                 Err(e) => {
@@ -2653,9 +2680,11 @@ mod tests {
 #[cfg(all(test, feature = "memory-backend"))]
 mod connection_slot_tests {
     use super::ConnectionSlot;
+    use super::PerDidConnectionGuard;
     use crate::store::memory_store::MemoryStore;
-    use crate::tasks::websocket_streaming::{StreamingUpdate, StreamingUpdateState};
+    use crate::tasks::websocket_streaming::{QueuedCommand, StreamingUpdate, StreamingUpdateState};
     use affinidi_messaging_mediator_common::store::MediatorStore;
+    use dashmap::DashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
@@ -2687,7 +2716,8 @@ mod connection_slot_tests {
 
         let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
         slot.open(&database).await;
-        slot.registered(tx, "did-hash", "session-1");
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         // An early return: the slot is dropped, never released by hand.
@@ -2698,7 +2728,7 @@ mod connection_slot_tests {
         match rx.try_recv().expect("a deregistration is sent") {
             StreamingUpdate {
                 did_hash,
-                state: StreamingUpdateState::Deregister { session_id },
+                state: StreamingUpdateState::Deregister { session_id, .. },
             } => {
                 assert_eq!(did_hash, "did-hash");
                 assert_eq!(session_id, "session-1");
@@ -2717,7 +2747,8 @@ mod connection_slot_tests {
 
         let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
         slot.open(&database).await;
-        slot.registered(tx, "did-hash", "session-1");
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
         slot.release().await;
         settle().await;
 
@@ -2737,13 +2768,35 @@ mod connection_slot_tests {
 
         let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
         slot.open(&database).await;
-        slot.registered(tx, "did-hash", "session-1");
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
         slot.deregistered_by_streaming();
         slot.release().await;
 
         assert_eq!(count.load(Ordering::Relaxed), 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(closes(&database).await, (1, 1));
+    }
+
+    /// The per-DID slot goes back with the global one, when the connection
+    /// is released rather than when the handler finally returns.
+    #[tokio::test]
+    async fn a_released_slot_gives_back_the_per_did_slot() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let registry: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        registry.insert("did-hash".to_string(), 1);
+
+        let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
+        slot.hold_per_did(PerDidConnectionGuard {
+            registry: registry.clone(),
+            did_hash: "did-hash".to_string(),
+        });
+        slot.open(&database).await;
+        slot.release().await;
+
+        assert!(registry.get("did-hash").is_none());
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 
     /// A slot that was never admitted owes no close stat.
