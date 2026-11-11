@@ -22,8 +22,8 @@ pub use security::*;
 // every `ConfigRaw → Config` conversion stay in this module.
 pub use affinidi_messaging_mediator_config::{
     ConfigRaw, DIDResolverConfig, ForwardingConfigRaw, LimitsConfigRaw,
-    MessageExpiryCleanupConfigRaw, ProcessorsConfigRaw, SecretsConfigRaw, SecurityConfigRaw,
-    ServerConfig, SessionExpiryCleanupConfigRaw, StorageConfig, StreamingConfig,
+    MessageExpiryCleanupConfigRaw, ProcessorsConfigRaw, RedactedString, SecretsConfigRaw,
+    SecurityConfigRaw, ServerConfig, SessionExpiryCleanupConfigRaw, StorageConfig, StreamingConfig,
 };
 
 use affinidi_did_common::Document;

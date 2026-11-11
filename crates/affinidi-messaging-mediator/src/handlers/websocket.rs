@@ -848,7 +848,7 @@ fn relay_source_key(
 ) -> Option<String> {
     let Extension(ConnectInfo(peer)) = connect_info?;
     state
-        .client_ip
+        .relay_client_ip
         .client_key(peer.ip(), headers)
         .ok()
         .map(|ip| ip.to_string())

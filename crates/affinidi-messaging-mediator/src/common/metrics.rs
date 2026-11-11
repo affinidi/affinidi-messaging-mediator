@@ -561,11 +561,13 @@ impl MetricsAccess {
         }
         if let Some(expected) = &self.token {
             use subtle::ConstantTimeEq;
+            // The scheme name is case-insensitive (RFC 7235 §2.1).
             let presented = headers
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .unwrap_or("");
+                .and_then(|v| v.trim().split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map_or("", |(_, token)| token.trim());
             // Compare digests so the comparison takes the same time whatever
             // the presented length.
             let matches: bool = sha256::digest(presented.as_bytes())
@@ -734,6 +736,27 @@ mod tests {
             assert_eq!(
                 status(access.admit(ip("127.0.0.1"), &headers)),
                 StatusCode::OK
+            );
+            for scheme in ["bearer scrape-token", "BEARER scrape-token"] {
+                headers.insert(header::AUTHORIZATION, HeaderValue::from_static(scheme));
+                assert_eq!(
+                    status(access.admit(ip("127.0.0.1"), &headers)),
+                    StatusCode::OK,
+                    "{scheme}"
+                );
+            }
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic scrape-token"),
+            );
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &headers)),
+                StatusCode::UNAUTHORIZED,
+                "another scheme is not a bearer token"
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer scrape-token"),
             );
             // The token does not widen the address check.
             assert_eq!(

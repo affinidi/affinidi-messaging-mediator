@@ -663,7 +663,8 @@ oob_invite_ttl = "86400"
 ### once (only when security.enable_inter_mediator_relay is on). All relay
 ### sockets share the max_websocket_connections_per_did bucket; this keeps one
 ### source from holding every slot. The address is resolved as for
-### rate_limit_per_ip, so behind a load balancer set [server] trust_xff_cidrs.
+### rate_limit_per_ip (an IPv6 client is counted by its /64), so behind a load
+### balancer set [server] trust_xff_cidrs.
 ### Refusals: `relay_connections_refused_total`. Must be > 0. Default 10.
 # relay_connections_per_ip = "10"
 

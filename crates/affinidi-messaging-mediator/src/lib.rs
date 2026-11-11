@@ -111,9 +111,10 @@ pub struct SharedData {
     /// `limits.relay_connections_per_ip` inside the shared relay bucket.
     /// Entries are removed when an address's count returns to zero.
     pub relay_connections_per_ip: Arc<DashMap<String, u32>>,
-    /// Resolves a request's client address exactly as the per-IP rate limiter
-    /// does (honouring `server.trust_xff_cidrs`).
-    pub client_ip: affinidi_rate_limit::ClientIpExtractor,
+    /// Resolves the key a relay WebSocket is counted under: its client
+    /// address as the per-IP rate limiter resolves it (honouring
+    /// `server.trust_xff_cidrs`), with IPv6 masked to its /64.
+    pub relay_client_ip: affinidi_rate_limit::ClientIpExtractor,
     /// The cached backend half of `/readyz`.
     pub readiness: Arc<handlers::readiness::ReadinessCache>,
     /// Per-DID rate limiter for authenticated endpoints.

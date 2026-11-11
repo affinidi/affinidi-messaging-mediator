@@ -579,8 +579,12 @@ unauthenticated:
 The storage, forwarding-queue, secret-backend and VTA-cache checks are run at
 most once every 5 s and shared by every request in that window, so a burst of
 probes costs no more backend calls than one; each secret-backend read is
-bounded at 5 s. Shutdown, the storage circuit breaker and supervised-task
-health are read on every request.
+bounded at 5 s. The refresh completes and is stored even if the request that
+started it gives up. While one is running, requests get the previous result
+only while it is younger than two intervals plus the longest a refresh can
+take; after that `/readyz` reports `not_ready` with a failing
+`backend_checks` check. Shutdown, the storage circuit breaker and
+supervised-task health are read on every request.
 
 ### Rotation
 

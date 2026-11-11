@@ -353,6 +353,11 @@ pub struct TestMediatorBuilder {
     /// Override for the relay socket limits: `(relay_connections_per_ip,
     /// relay_frames_per_second, relay_frame_burst)`.
     relay_limits: Option<(usize, u32, u32)>,
+    /// `[server] trust_xff_cidrs`, as CIDR strings.
+    trust_xff_cidrs: Option<Vec<String>>,
+    /// `[server] metrics_allow_cidrs` (CIDR strings) and
+    /// `metrics_bearer_token`.
+    metrics_access: Option<(Vec<String>, Option<String>)>,
     /// Override for `LimitsConfig.did_rate_limit_per_second` /
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
@@ -417,6 +422,8 @@ impl Default for TestMediatorBuilder {
             jwt_refresh_expiry_secs: None,
             max_websocket_connections_per_did: None,
             relay_limits: None,
+            trust_xff_cidrs: None,
+            metrics_access: None,
             did_rate_limit: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
@@ -677,6 +684,34 @@ impl TestMediatorBuilder {
         frame_burst: u32,
     ) -> Self {
         self.relay_limits = Some((connections_per_ip, frames_per_second, frame_burst));
+        self
+    }
+
+    /// Set `[server] trust_xff_cidrs`: proxies whose `X-Forwarded-For` is
+    /// read. Panics on an entry that is not a CIDR range.
+    pub fn trust_xff_cidrs<I, S>(mut self, cidrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.trust_xff_cidrs = Some(cidrs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Set who may read `/metrics`: `[server] metrics_allow_cidrs` and
+    /// `metrics_bearer_token`. Panics on an entry that is not a CIDR range.
+    ///
+    /// The Prometheus recorder is process-wide, so only the first mediator
+    /// started in a test binary serves `/metrics`.
+    pub fn metrics_access<I, S>(mut self, allow: I, bearer_token: Option<&str>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.metrics_access = Some((
+            allow.into_iter().map(Into::into).collect(),
+            bearer_token.map(str::to_string),
+        ));
         self
     }
 
@@ -1107,6 +1142,25 @@ impl TestMediatorBuilder {
         }
         if let Some(liveness) = self.streaming_liveness {
             builder = builder.streaming_liveness(liveness);
+        }
+        if let Some(cidrs) = &self.trust_xff_cidrs {
+            builder.config_mut().trust_xff_cidrs = cidrs
+                .iter()
+                .map(|c| c.parse().expect("trust_xff_cidrs entry is a CIDR range"))
+                .collect();
+        }
+        if let Some((allow, bearer)) = &self.metrics_access {
+            let config = builder.config_mut();
+            config.metrics_allow_cidrs = allow
+                .iter()
+                .map(|c| {
+                    c.parse()
+                        .expect("metrics_allow_cidrs entry is a CIDR range")
+                })
+                .collect();
+            config.metrics_bearer_token = bearer
+                .clone()
+                .map(affinidi_messaging_mediator::common::config::RedactedString);
         }
         let inner = builder.start(token.clone()).await?;
 
