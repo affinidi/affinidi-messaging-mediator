@@ -4347,6 +4347,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let community = hash("community");
+        store
+            .account_add(&community, &MediatorACLSet::default(), None)
+            .await
+            .expect("sender account");
 
         for i in 0..250 {
             let member = hash(&format!("member-{i}"));
@@ -5463,6 +5467,12 @@ mod idempotent_store_tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let (to, from) = (hash("vta"), hash("control"));
+        for did in [&from, &to] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account");
+        }
 
         let a = store
             .store_message("s", "same-bytes", &to, Some(&from), 0, 0)

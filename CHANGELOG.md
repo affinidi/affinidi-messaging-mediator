@@ -29,6 +29,7 @@ mediator-tui 0.11.0); they are no longer updated.
   then the members of the selected one, with their delivery state, and its
   title says when the view covers this instance only.
 - Needs affinidi-messaging-sdk 0.45.6 (`TrustTasksOps::mux_connections`).
+
 ### Changed — a forward is delivered only to a next hop that has an account
 
 - A forward never creates an account. A local next hop with no account on
