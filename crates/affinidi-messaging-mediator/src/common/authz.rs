@@ -25,7 +25,7 @@
 use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_mediator_common::store::MediatorStore;
-use affinidi_messaging_sdk::protocols::mediator::{accounts::AccountType, acls::MediatorACLSet};
+use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 use subtle::ConstantTimeEq;
 use tracing::debug;
 
@@ -204,17 +204,13 @@ pub(crate) fn check_permissions(
     check_admin_signing: bool,
     sign_by: &Option<String>,
 ) -> bool {
+    let is_admin = crate::common::roles::can_administer(session.account_type);
     // If we need to check message signature for an admin request
-    if check_admin_signing
-        && (session.account_type == AccountType::Admin
-            || session.account_type == AccountType::RootAdmin)
-        && !check_admin_signature(session, sign_by)
-    {
+    if check_admin_signing && is_admin && !check_admin_signature(session, sign_by) {
         return false;
     }
 
-    session.account_type == AccountType::RootAdmin
-        || session.account_type == AccountType::Admin
+    is_admin
         || dids.len() == 1
             && dids[0]
                 .as_bytes()
@@ -223,9 +219,78 @@ pub(crate) fn check_permissions(
                 == 1
 }
 
+/// Refuse a request to the mediator itself unless it arrives on an
+/// authenticated session and was authenticated as that session's DID.
+///
+/// Requests the mediator *serves* — pickup, trust ping, discover features and
+/// every Trust Task — act for an account: its queue, its settings, its role.
+/// The account they act for is the session's, and handlers authorise against
+/// the session, so the message has to have been sent by that same DID.
+///
+/// This holds whatever `force_session_did_match` says: that switch governs
+/// what a session may *send* through the mediator (forwards and direct
+/// delivery), not who the mediator acts for. An unauthenticated session — the
+/// inter-mediator relay session — carries no account, so it may only relay.
+///
+/// `sender_did` is the DID that authenticated the message (signature or
+/// authcrypt), without a key fragment; `None` for an anonymous message. An
+/// anonymous message on an authenticated session names no other identity, so
+/// the session is the only one and it is accepted (whether anonymous outer
+/// envelopes reach this point at all is `block_anonymous_outer_envelope` and
+/// `force_session_did_match`). A message authenticated as any other DID is
+/// refused.
+pub(crate) fn require_session_sender(
+    session: &Session,
+    sender_did: Option<&str>,
+    msg_id: Option<&str>,
+) -> Result<(), MediatorError> {
+    use affinidi_messaging_sdk::messages::problem_report::{
+        ProblemReportScope, ProblemReportSorter,
+    };
+    use http::StatusCode;
+
+    if !session.authenticated {
+        return Err(MediatorError::problem(
+            44,
+            &session.session_id,
+            msg_id.map(str::to_string),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "authorization.authentication_required",
+            "Requests to the mediator need an authenticated session; this session may only relay",
+            vec![],
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match sender_did {
+        None => Ok(()),
+        Some(did)
+            if affinidi_messaging_mediator_common::did_identity::same_account(
+                did,
+                &session.did,
+            ) =>
+        {
+            Ok(())
+        }
+        Some(sender) => Err(MediatorError::problem_with_log(
+            52,
+            &session.session_id,
+            msg_id.map(str::to_string),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "authorization.did.session_mismatch",
+            "Sender DID ({1}) doesn't match session DID",
+            vec![sender.to_string()],
+            StatusCode::BAD_REQUEST,
+            format!("Sender DID ({sender}) doesn't match session DID"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use affinidi_messaging_sdk::protocols::mediator::accounts::AccountType;
     use sha256::digest;
 
     /// Build an ACL set granting everything (ALLOW_ALL), then we revoke
@@ -399,6 +464,101 @@ mod tests {
         assert!(!check_admin_signature(
             &session,
             &Some("did:example:alice".to_string())
+        ));
+    }
+
+    // --- require_session_sender tests ---
+
+    fn problem_code(err: &MediatorError) -> String {
+        match err {
+            MediatorError::MediatorError(_, _, _, report, _, _) => report.code.clone(),
+            other => panic!("expected a problem report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_request_from_the_session_did_is_accepted() {
+        let session = Session {
+            did: "did:example:alice".to_string(),
+            authenticated: true,
+            ..Default::default()
+        };
+        assert!(require_session_sender(&session, Some("did:example:alice"), None).is_ok());
+    }
+
+    #[test]
+    fn the_relay_session_may_not_make_requests() {
+        let session = Session {
+            session_id: "ANON-INBOUND".to_string(),
+            ..Default::default()
+        };
+        for sender in [Some("did:example:alice"), Some(""), None] {
+            let err = require_session_sender(&session, sender, None).expect_err("refused");
+            assert_eq!(
+                problem_code(&err),
+                "e.p.authorization.authentication_required",
+                "{sender:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_from_another_did_is_refused() {
+        let session = Session {
+            did: "did:example:alice".to_string(),
+            authenticated: true,
+            ..Default::default()
+        };
+        let err = require_session_sender(&session, Some("did:example:mallory"), None)
+            .expect_err("refused");
+        assert_eq!(problem_code(&err), "e.p.authorization.did.session_mismatch");
+    }
+
+    #[test]
+    fn an_anonymous_request_on_an_authenticated_session_is_the_sessions() {
+        let session = Session {
+            did: "did:example:alice".to_string(),
+            authenticated: true,
+            ..Default::default()
+        };
+        assert!(require_session_sender(&session, None, None).is_ok());
+    }
+
+    #[test]
+    fn the_mediator_account_does_not_pass_the_admin_permission_check() {
+        let session = Session {
+            did: "did:example:mediator".to_string(),
+            did_hash: digest("did:example:mediator"),
+            account_type: AccountType::Mediator,
+            ..Default::default()
+        };
+        assert!(!check_permissions(
+            &session,
+            &[digest("did:example:someone_else")],
+            false,
+            &None
+        ));
+    }
+
+    #[test]
+    fn an_unknown_role_acts_only_on_its_own_account() {
+        let session = Session {
+            did: "did:example:u".to_string(),
+            did_hash: digest("did:example:u"),
+            account_type: AccountType::Unknown,
+            ..Default::default()
+        };
+        assert!(!check_permissions(
+            &session,
+            &[digest("did:example:someone_else")],
+            false,
+            &None
+        ));
+        assert!(check_permissions(
+            &session,
+            &[digest("did:example:u")],
+            false,
+            &None
         ));
     }
 

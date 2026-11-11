@@ -1186,9 +1186,10 @@ async fn handle_inbound_didcomm(
 
                     // `from` must name the DID that authenticated the message;
                     // the routing and ACL checks below rely on it.
-                    if let Err(reason) = crate::messages::authenticated_sender(&msg, &metadata) {
-                        return Err(sender_mismatch(session, &msg.id, &reason));
-                    }
+                    let sender_did = match crate::messages::authenticated_sender(&msg, &metadata) {
+                        Ok(sender_did) => sender_did,
+                        Err(reason) => return Err(sender_mismatch(session, &msg.id, &reason)),
+                    };
 
                     // Does the sender identity match the session DID?
                     // The sender can be identified by JWS signing (sign_from) or
@@ -1225,6 +1226,15 @@ async fn handle_inbound_didcomm(
                     } else {
                         session
                     };
+
+                    // Anything other than a forward is a request the mediator
+                    // serves for an account (pickup, ping, discovery, Trust
+                    // Tasks), so it needs an authenticated session whose DID
+                    // sent it. Forwards are relayed and keep the rules above,
+                    // which is what lets the anonymous relay session work.
+                    if !is_forward(&msg) {
+                        authz::require_session_sender(session, sender_did.as_deref(), Some(&msg.id))?;
+                    }
 
                     // Process the message
                     let response = msg.process(state, session, &metadata).await?;

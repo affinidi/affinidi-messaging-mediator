@@ -57,6 +57,7 @@ use uuid::Uuid;
 
 use crate::SharedData;
 use crate::common::authz::check_permissions;
+use crate::common::roles;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::trust_task_versions::NewerVersion;
@@ -226,6 +227,15 @@ pub(crate) async fn consume(
     let sender_kid = sender_kid.to_string();
     let sender_did = vid_of(&sender_kid);
     let now = chrono::DateTime::from_timestamp(now_secs as i64, 0).unwrap_or_else(chrono::Utc::now);
+
+    // One identity for the whole request: the authenticated session, which
+    // must be the DID that sent the task. Handlers authorise on the session,
+    // the mux tasks on the sender and the audit log records the session, so
+    // the two have to be the same account before any of them runs.
+    crate::common::authz::require_session_sender(session, Some(&sender_did), None)?;
+    // The caller's role and ACLs as the store holds them now.
+    let principal = principal(state, session).await?;
+    let session = &principal;
 
     // Route by task type. The match is exhaustive over `ServedTask`, so a type
     // registered in `served_tasks!` without a handler here fails to compile.
@@ -512,6 +522,32 @@ pub(crate) async fn consume(
     Ok(Some(response_value))
 }
 
+/// The session a Trust Task is authorised as: `session` with its role and ACLs
+/// read from the store for this request.
+///
+/// Every handler then decides from the same, current answer. The role is the
+/// stored one, honoured as an administrator only when the store also lists the
+/// account as one (`check_admin_account`), and an `Unknown` role is read as
+/// `Standard` (see [`crate::common::roles::effective_role`]). An account the
+/// store no longer has is treated as `Standard` with the session's ACLs.
+async fn principal(state: &SharedData, session: &Session) -> Result<Session, MediatorError> {
+    let mut principal = session.clone();
+    match state.database.account_get(&session.did_hash).await? {
+        Some(account) => {
+            let listed_admin = crate::common::roles::can_administer(account._type)
+                && state
+                    .database
+                    .check_admin_account(&session.did_hash)
+                    .await?;
+            principal.account_type =
+                crate::common::roles::effective_role(account._type, listed_admin);
+            principal.acls = MediatorACLSet::from_u64(account.acls);
+        }
+        None => principal.account_type = AccountType::Standard,
+    }
+    Ok(principal)
+}
+
 /// Declares every Trust Task type this mediator serves — the **single list**.
 ///
 /// It generates [`ServedTask`], whose variants [`consume`] matches exhaustively,
@@ -730,17 +766,7 @@ async fn consume_account_list(
     })?;
 
     // Authz: admin-only (listing every account is an administrative action).
-    if !matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    ) {
-        return Err(tt_problem(
-            session,
-            "authorization.admin_required",
-            "account/list requires an admin account".to_string(),
-            StatusCode::FORBIDDEN,
-        ));
-    }
+    require_admin(session, "account/list")?;
 
     // The wire cursor is an opaque string over the store's numeric cursor.
     let cursor: u32 = typed
@@ -823,8 +849,11 @@ async fn consume_account_list(
 /// `change-type` / `change-queue-limits` / `acl/set` handlers, with their guards
 /// applied per member:
 ///
-/// - `accountType` — admin only; only a root admin may assign the root-admin
-///   role, and only a root admin may update an account that currently holds it.
+/// - `accountType` — admin only; only a root admin may grant a privileged role
+///   (admin, root admin, mediator) or change the role of an account holding one.
+///
+/// An account that holds a privileged role is changed only by itself or by a
+/// root admin, whichever members the update carries (see `common::roles`).
 /// - `acl` — self-or-admin; a non-admin may only change flags it self-manages.
 /// - `queueLimits` — self-or-admin; a standard account may only change limits it
 ///   self-manages, capped at the mediator's hard maximum.
@@ -844,10 +873,7 @@ async fn consume_account_update(
     validate_tt_basic(&typed, session, mediator_did, now)?;
 
     let target_hash = typed.payload.did.to_string();
-    let is_admin = matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    );
+    let is_admin = roles::can_administer(session.account_type);
     let denied = |reason: &str| {
         tt_problem(
             session,
@@ -873,10 +899,16 @@ async fn consume_account_update(
 
     // ---- Guards first, so a refused member refuses the whole update. ----
 
-    // Only a root admin may touch an account that currently holds root-admin.
-    if current._type == AccountType::RootAdmin && session.account_type != AccountType::RootAdmin {
+    // An account holding a privileged role (admin, root admin, the mediator's
+    // own) is changed only by itself or by a root admin.
+    if !roles::may_modify_account(
+        session.account_type,
+        &session.did_hash,
+        current._type,
+        &target_hash,
+    ) {
         return Err(denied(
-            "root-admin access is required to modify a root-admin account",
+            "root-admin access is required to modify a privileged account",
         ));
     }
 
@@ -891,19 +923,16 @@ async fn consume_account_update(
         WireType::RootAdmin => AccountType::RootAdmin,
         WireType::Mediator => AccountType::Mediator,
     });
-    if let Some(new_type) = &new_type {
+    if let Some(new_type) = new_type {
         // Must be an admin to change roles at all.
-        if !state
-            .database
-            .check_admin_account(&session.did_hash)
-            .await?
-        {
+        if !roles::can_administer(session.account_type) {
             return Err(denied("admin access is required to change account types"));
         }
-        // Only a root admin may assign the root-admin role.
-        if *new_type == AccountType::RootAdmin && session.account_type != AccountType::RootAdmin {
+        // Granting a privileged role, or changing the role of an account that
+        // holds one, is for a root admin.
+        if !roles::can_assign_role(session.account_type, Some(current._type), new_type) {
             return Err(denied(
-                "root-admin access is required to assign the root-admin role",
+                "root-admin access is required to grant or change a privileged role",
             ));
         }
     }
@@ -1210,6 +1239,22 @@ async fn consume_account_remove(
             StatusCode::FORBIDDEN,
         ));
     }
+    // Another privileged account is removed only by a root admin.
+    if let Some(target) = state.database.account_get(&target_hash).await?
+        && !roles::may_modify_account(
+            session.account_type,
+            &session.did_hash,
+            target._type,
+            &target_hash,
+        )
+    {
+        return Err(tt_problem(
+            session,
+            "authorization.permission",
+            "root-admin access is required to remove a privileged account".to_string(),
+            StatusCode::FORBIDDEN,
+        ));
+    }
 
     let removed = state
         .database
@@ -1291,7 +1336,8 @@ async fn consume_account_remove(
 /// created when the DID first authenticates), so the only accounts this task
 /// can create belong to other DIDs, which is account administration. The admin
 /// may supply the new account's ACL (applied onto the mediator default).
-/// Creating an admin / root-admin account requires admin / root-admin rights.
+/// Creating an account with a privileged role (admin, root admin, mediator)
+/// requires a root admin.
 ///
 /// An account that already exists is refused with `alreadyExists` and left
 /// exactly as it was; `messaging/account/update` changes an existing account.
@@ -1334,24 +1380,15 @@ async fn consume_account_add(
         )
     };
 
-    // Read from the store, not the session: a role removed since the session
-    // was issued no longer grants this.
-    if !state
-        .database
-        .check_admin_account(&session.did_hash)
-        .await?
-    {
+    // The role was read from the store for this request (see `principal`), so
+    // a role removed since the session was issued no longer grants this.
+    if !roles::can_administer(session.account_type) {
         return Err(denied("admin access is required to add accounts"));
     }
-    let caller_role = state
-        .database
-        .account_get(&session.did_hash)
-        .await?
-        .map(|a| a._type);
-    // Creating a privileged account requires the matching privilege.
-    if new_type == AccountType::RootAdmin && caller_role != Some(AccountType::RootAdmin) {
+    // Creating a privileged account is for a root admin.
+    if !roles::can_assign_role(session.account_type, None, new_type) {
         return Err(denied(
-            "root-admin access is required to create a root-admin account",
+            "root-admin access is required to create a privileged account",
         ));
     }
 
@@ -1485,9 +1522,7 @@ fn authorize_access_list(
             StatusCode::FORBIDDEN,
         ));
     }
-    if write
-        && session.account_type == AccountType::Standard
-        && !session.acls.get_self_manage_list()
+    if write && !roles::can_administer(session.account_type) && !session.acls.get_self_manage_list()
     {
         return Err(tt_problem(
             session,
@@ -1836,10 +1871,7 @@ async fn consume_mux_connections(
 }
 
 pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), MediatorError> {
-    if matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    ) {
+    if roles::can_administer(session.account_type) {
         Ok(())
     } else {
         Err(tt_problem(

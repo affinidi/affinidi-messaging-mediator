@@ -10,6 +10,7 @@ pub mod lua_integrity;
 pub mod metrics;
 pub mod request_id;
 pub mod request_metrics;
+pub(crate) mod roles;
 pub mod session;
 pub mod storage_timeout;
 pub mod time;

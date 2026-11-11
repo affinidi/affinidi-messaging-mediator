@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::SharedData;
 use crate::common::authz::check_permissions;
 use crate::common::authz::{self, Capability};
+use crate::common::roles;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::trust_tasks::{
@@ -599,7 +600,7 @@ pub(crate) async fn consume_message_get(
     let payload = &typed.payload;
     let requested = payload.did.as_ref().map(|d| d.to_string());
     let cross_account = requested.as_ref().is_some_and(|d| *d != session.did_hash);
-    if cross_account && session.account_type != AccountType::RootAdmin {
+    if cross_account && !roles::is_root(session.account_type) {
         return Err(tt_problem(
             session,
             "messaging/message/get:rootAdminRequired",
@@ -766,10 +767,7 @@ pub(crate) async fn consume_monitor_subscribe(
 
     validate_tt_basic(&typed, session, mediator_did, now)?;
     let payload = &typed.payload;
-    let is_admin = matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    );
+    let is_admin = roles::can_administer(session.account_type);
 
     let mut filter: Filter = match &payload.filter {
         Some(f) => serde_json::to_value(f)
@@ -907,7 +905,7 @@ pub(crate) async fn consume_monitor_unsubscribe(
         .unsubscribe(
             &subscription_id,
             &session.did_hash,
-            session.account_type == AccountType::RootAdmin,
+            roles::is_root(session.account_type),
         )
         .map_err(|_| {
             tt_problem(
@@ -917,10 +915,7 @@ pub(crate) async fn consume_monitor_unsubscribe(
                 StatusCode::NOT_FOUND,
             )
         })?;
-    if matches!(
-        session.account_type,
-        AccountType::Admin | AccountType::RootAdmin
-    ) {
+    if roles::can_administer(session.account_type) {
         record_audit(
             state,
             session,
@@ -945,11 +940,7 @@ fn guard_privileged_target(
     session: &Session,
     code: &str,
 ) -> Result<(), MediatorError> {
-    let privileged = matches!(
-        target_type,
-        AccountType::Admin | AccountType::RootAdmin | AccountType::Mediator
-    );
-    if privileged && target != session.did_hash && session.account_type != AccountType::RootAdmin {
+    if !roles::may_modify_account(session.account_type, &session.did_hash, target_type, target) {
         return Err(tt_problem(
             session,
             code,
@@ -1416,7 +1407,7 @@ pub(crate) async fn consume_config_patch(
     };
 
     validate_tt_basic(&typed, session, mediator_did, now)?;
-    if session.account_type != AccountType::RootAdmin {
+    if !roles::is_root(session.account_type) {
         return Err(tt_problem(
             session,
             "authorization.root_admin_required",
@@ -1559,7 +1550,7 @@ pub(crate) async fn consume_config_reload(
     use crate::common::config::overrides::{config_path, parse_stored, reload_plan};
 
     validate_tt_basic(&typed, session, mediator_did, now)?;
-    if session.account_type != AccountType::RootAdmin {
+    if !roles::is_root(session.account_type) {
         return Err(tt_problem(
             session,
             "authorization.root_admin_required",
