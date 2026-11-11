@@ -4469,6 +4469,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:test";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let did_hash = hash(did);
         let session = Session {
             session_id: "sid-1".into(),
@@ -4596,6 +4601,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:auth";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let old = Session {
             session_id: "challenge-sid".into(),
             challenge: "chal".into(),
@@ -4639,6 +4649,11 @@ mod tests {
         let store = FjallStore::open(dir.path()).expect("open");
 
         let did = "did:peer:refresh";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         let session = Session {
             session_id: "auth-sid".into(),
             state: SessionState::Authenticated,

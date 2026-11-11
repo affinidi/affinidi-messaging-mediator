@@ -2572,7 +2572,12 @@ mod tests {
             .await
             .expect("put challenge session");
 
-        // Step 2: promote to Authenticated under a new session_id.
+        // Step 2: the DID gets its account, then the session is promoted
+        // to Authenticated under a new session_id.
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
         store
             .update_session_authenticated(challenge_id, new_id, did, "refresh-hash-xyz")
             .await
@@ -2608,6 +2613,10 @@ mod tests {
         let store = MemoryStore::new();
         let did = "did:peer:refresh-test";
         let sid = "auth-sid-1";
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
 
         let session = Session {
             session_id: sid.into(),
