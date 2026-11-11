@@ -49,6 +49,11 @@ process-wide rustls provider.
   [mediator README](crates/affinidi-messaging-mediator/README.md).
 - Container: `ghcr.io/affinidi/messaging-mediator:<version>`; see
   [`docker/`](docker) and `docker-compose.test.yml` for a local stack.
+  Release images (`vX.Y.Z`, `vX.Y.Z-rc.N`) are built only from their release
+  tag, and each carries a signed build-provenance attestation. To be sure a
+  deployment runs the image you checked, pin it by digest
+  (`ghcr.io/affinidi/messaging-mediator@sha256:…`) and check it with
+  `gh attestation verify oci://ghcr.io/affinidi/messaging-mediator@sha256:… --owner affinidi`.
 - First-time configuration: `cargo run -p affinidi-messaging-mediator-setup`.
 
 ## Releases and support
