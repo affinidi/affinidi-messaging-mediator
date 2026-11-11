@@ -33,6 +33,7 @@ use crate::task_specs::{audit, config};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::redact::redact_url;
 use affinidi_messaging_mediator_common::types::accounts::{Account, AccountType};
 use affinidi_messaging_mediator_common::types::acls::{
     ACLError, AccessListModeType, MediatorACLSet,
@@ -2041,19 +2042,6 @@ fn redact_strings(value: &Value) -> Value {
                 .collect(),
         ),
         other => other.clone(),
-    }
-}
-
-/// `s` with the userinfo of a `scheme://user:password@host` URL replaced; any
-/// other string unchanged.
-fn redact_url(s: &str) -> String {
-    let Some((scheme, rest)) = s.split_once("://") else {
-        return s.to_string();
-    };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
-        None => s.to_string(),
     }
 }
 

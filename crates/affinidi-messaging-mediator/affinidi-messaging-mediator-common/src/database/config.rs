@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use std::fmt;
+
 use crate::errors::MediatorError;
+use crate::redact::redact_url;
 
 /// Database Struct contains database and storage of messages related configuration details
 ///
@@ -8,7 +11,7 @@ use crate::errors::MediatorError;
 /// connection; `#[serde(default, skip_serializing)]` on an ignored
 /// field silently drops pre-0.14 config files that still set it
 /// rather than hard-failing on an unknown key.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DatabaseConfigRaw {
     pub functions_file: String,
     pub database_url: String,
@@ -25,7 +28,9 @@ pub struct DatabaseConfigRaw {
     _ignored_pool_size: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `Debug` is written by hand so `database_url` prints with its credentials
+/// replaced (see [`redact_url`]): the startup log prints the whole config.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub functions_file: Option<String>,
     pub database_url: String,
@@ -40,6 +45,34 @@ pub struct DatabaseConfig {
     pub circuit_breaker_threshold: u32,
     /// Seconds to wait before probing Redis after circuit opens
     pub circuit_breaker_recovery_secs: u64,
+}
+
+impl fmt::Debug for DatabaseConfigRaw {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseConfigRaw")
+            .field("functions_file", &self.functions_file)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("database_timeout", &self.database_timeout)
+            .field("scripts_path", &self.scripts_path)
+            .field("cluster_mode", &self.cluster_mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("functions_file", &self.functions_file)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("database_timeout", &self.database_timeout)
+            .field("cluster_mode", &self.cluster_mode)
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field(
+                "circuit_breaker_recovery_secs",
+                &self.circuit_breaker_recovery_secs,
+            )
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -99,6 +132,35 @@ impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_recovery_secs: 10,
         })
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{DatabaseConfig, DatabaseConfigRaw};
+
+    #[test]
+    fn debug_hides_database_url_credentials() {
+        for url in ["redis://:pw@h/", "redis://user:pw@h/"] {
+            let config = DatabaseConfig {
+                database_url: url.into(),
+                ..Default::default()
+            };
+            for text in [format!("{config:?}"), format!("{config:#?}")] {
+                assert!(!text.contains("pw"), "{text}");
+                assert!(text.contains("redis://***@h/"), "{text}");
+            }
+
+            let raw: DatabaseConfigRaw = serde_json::from_value(serde_json::json!({
+                "functions_file": "f",
+                "database_url": url,
+                "database_timeout": "2",
+                "scripts_path": null,
+            }))
+            .unwrap();
+            let text = format!("{raw:#?}");
+            assert!(!text.contains("pw"), "{text}");
+        }
     }
 }
 
