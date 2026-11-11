@@ -109,11 +109,14 @@ impl Database {
 
         // A DID gets its account only once it has answered the challenge, so
         // a `ChallengeSent` session normally has no `DID:` record to join.
-        // Return it with default ACLs; the response handler applies the
-        // admission policy itself. Any later state still requires the
-        // account, so removing an account ends its sessions.
-        if session.state == SessionState::ChallengeSent && did_db.iter().all(Option::is_none) {
-            return Ok(session);
+        // Return it with default ACLs; the login handlers apply the
+        // admission policy themselves. Any later state requires the account,
+        // so removing an account ends its sessions.
+        if did_db.iter().all(Option::is_none) {
+            if session.state == SessionState::ChallengeSent {
+                return Ok(session);
+            }
+            return Err(crate::store::account_gone(session_id));
         }
 
         if let Some(Some(role_type)) = did_db.first() {

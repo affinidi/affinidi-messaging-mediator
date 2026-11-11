@@ -1990,6 +1990,10 @@ impl MediatorStore for FjallStore {
                 let acc: StoredAccount = Self::decode(&v)?;
                 session.acls = MediatorACLSet::from_u64(acc.acls);
                 session.account_type = acc.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
             }
         }
         Ok(session)

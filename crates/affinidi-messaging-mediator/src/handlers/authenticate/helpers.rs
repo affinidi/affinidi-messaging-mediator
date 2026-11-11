@@ -1,4 +1,5 @@
 use crate::SharedData;
+use crate::common::authz::{self, Capability};
 use crate::common::session::SessionClaims;
 // Production token creation now takes `now` from the injected clock; the only
 // remaining caller of this helper is the test module below.
@@ -12,7 +13,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
-use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
+use affinidi_messaging_sdk::protocols::mediator::acls::{AccessListModeType, MediatorACLSet};
 use http::StatusCode;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rand::{RngExt, distr::Alphanumeric};
@@ -187,52 +188,70 @@ pub(super) fn _create_refresh_token(
     Ok((refresh_token, refresh_claims.exp, token_hash))
 }
 
-/// Give a DID its account once it has proved control of its keys.
+/// Admit a DID that has just proved control of its keys, giving it an
+/// account if it has none. Every login path (`/authenticate`,
+/// `/tsp/authenticate`) calls this before issuing tokens.
 ///
 /// `/authenticate/challenge` is unauthenticated, so it only applies the
-/// admission checks and never writes an account: a DID is registered here,
-/// after the challenge is answered, and before any token is issued.
+/// admission checks and never writes an account; and the DID's standing can
+/// change between the challenge and the answer, so it is checked again here.
 ///
-/// - Already registered: nothing to do.
-/// - Unknown under `explicit_allow`: rejected with the same problem report
-///   the challenge step uses for a blocked DID. The challenge step already
+/// - Registered and blocked: rejected.
+/// - Registered: admitted.
+/// - Unknown under `explicit_allow`: rejected. The challenge step already
 ///   refuses unknown DIDs in this mode, so reaching here means an admin
 ///   removed the account after the challenge was issued, which is a
 ///   revocation, not a reason to recreate it.
 /// - Unknown under `explicit_deny`: registered with `global_acl_default`.
+///
+/// Every rejection is the `authentication.blocked` report the challenge step
+/// uses, so the two steps cannot be told apart.
 pub(super) async fn register_account_after_proof(
     state: &SharedData,
     did_hash: &str,
 ) -> Result<(), MediatorError> {
-    if state.database.account_exists(did_hash).await? {
-        debug!("DID({}) already registered", did_hash);
-        return Ok(());
+    let acls = match state.database.get_did_acl(did_hash).await? {
+        Some(acls) => acls,
+        None => {
+            if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+                info!(
+                    "DID({}) has no account and mediator_acl_mode is explicit_allow — rejecting",
+                    did_hash
+                );
+                return Err(blocked());
+            }
+            // An account that appeared since the read above (an admin adding
+            // it) is not an error: the ACLs `account_add` returns are the
+            // ones checked below.
+            let account = state
+                .database
+                .account_add(did_hash, &state.config.security.global_acl_default, None)
+                .await?;
+            MediatorACLSet::from_u64(account.acls)
+        }
+    };
+
+    if !authz::grants(&acls, Capability::NotBlocked) {
+        info!("DID({}) is blocked from connecting", did_hash);
+        return Err(blocked());
     }
-
-    if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
-        info!(
-            "DID({}) has no account and mediator_acl_mode is explicit_allow — rejecting",
-            did_hash
-        );
-        return Err(MediatorError::problem(
-            25,
-            "",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "authentication.blocked",
-            "DID is blocked",
-            vec![],
-            StatusCode::FORBIDDEN,
-        ));
-    }
-
-    state
-        .database
-        .account_add(did_hash, &state.config.security.global_acl_default, None)
-        .await?;
-
+    debug!("DID({}) admitted", did_hash);
     Ok(())
+}
+
+/// The `authentication.blocked` report, shared by every admission refusal.
+fn blocked() -> MediatorError {
+    MediatorError::problem(
+        25,
+        "",
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "authentication.blocked",
+        "DID is blocked",
+        vec![],
+        StatusCode::FORBIDDEN,
+    )
 }
 
 /// The login could not apply the mux unknown-key rule; the client retries.

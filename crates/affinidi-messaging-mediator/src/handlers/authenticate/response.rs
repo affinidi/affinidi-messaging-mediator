@@ -4,7 +4,6 @@ use super::helpers::{_create_access_token, _create_refresh_token, create_random_
 use crate::didcomm_compat::MetaEnvelope;
 use crate::{
     SharedData,
-    common::authz,
     common::session::{Session, SessionState},
 };
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
@@ -15,6 +14,7 @@ use affinidi_messaging_sdk::messages::{
 };
 use axum::{Json, extract::State};
 use http::StatusCode;
+use subtle::ConstantTimeEq;
 use tracing::{Instrument, Level, debug, info, span};
 
 /// POST /authenticate
@@ -88,65 +88,22 @@ pub async fn authentication_response(
             .into());
         }
 
-        let from_did = match &envelope.from_did {
-            Some(from_did) => {
-                // Check if DID is allowed to connect
-                match authz::authentication_check(
-                    &state,
-                    &affinidi_messaging_mediator_common::did_identity::did_hash(from_did),
-                    None,
-                )
-                .await
-                {
-                    Ok((allowed, _)) => {
-                        if allowed {
-                            from_did.to_string()
-                        } else {
-                            return Err(MediatorError::problem(
-                                25,
-                                "",
-                                None,
-                                ProblemReportSorter::Error,
-                                ProblemReportScope::Protocol,
-                                "authentication.blocked",
-                                "DID is blocked",
-                                vec![],
-                                StatusCode::FORBIDDEN,
-                            )
-                            .into());
-                        }
-                    }
-                    Err(e) => {
-                        return Err(MediatorError::problem_with_log(
-                            14,
-                            "",
-                            None,
-                            ProblemReportSorter::Error,
-                            ProblemReportScope::Protocol,
-                            "me.res.storage.error",
-                            "Database transaction error: {1}",
-                            vec![e.to_string()],
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("Database transaction error: {e}"),
-                        )
-                        .into());
-                    }
-                }
-            }
-            _ => {
-                return Err(MediatorError::problem(
-                    29,
-                    "",
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "authentication.response.from",
-                    "Authentication response message is missing the `from` header",
-                    vec![],
-                    StatusCode::BAD_REQUEST,
-                )
-                .into());
-            }
+        // Whether this DID may log in is decided once the challenge is
+        // answered (`helpers::register_account_after_proof`), on every login
+        // path.
+        let Some(from_did) = envelope.from_did.clone() else {
+            return Err(MediatorError::problem(
+                29,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.response.from",
+                "Authentication response message is missing the `from` header",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
         };
 
         // Unpack the message + enforce the signed/encrypted invariant.
@@ -313,6 +270,27 @@ pub async fn authentication_response(
                     "DID mismatch during authentication process: first_did({}) second_did({})",
                     session.did, from_did
                 ),
+            )
+            .into());
+        }
+
+        // The answer must carry the challenge this session issued.
+        if !bool::from(
+            challenge
+                .challenge
+                .as_bytes()
+                .ct_eq(session.challenge.as_bytes()),
+        ) {
+            return Err(MediatorError::problem(
+                34,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.invalid",
+                "Session is in an invalid state to complete authentication",
+                vec![],
+                StatusCode::BAD_REQUEST,
             )
             .into());
         }

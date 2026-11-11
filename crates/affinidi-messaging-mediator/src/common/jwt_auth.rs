@@ -5,7 +5,7 @@ use crate::{
     common::metrics::names::RATE_LIMITED_TOTAL,
     common::session::{Session, SessionClaims},
 };
-use affinidi_messaging_mediator_common::errors::ErrorResponse;
+use affinidi_messaging_mediator_common::errors::{ErrorResponse, MediatorError};
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 use axum::{
     Json, RequestPartsExt,
@@ -181,6 +181,12 @@ pub(crate) async fn authenticate_token(
         .get_session(&session_id, &did)
         .await
         .map_err(|e| {
+            // The account behind the session was removed: the token is no
+            // longer good, which is not a server fault.
+            if let MediatorError::Unauthorized(..) = e {
+                info!("{}: session's account no longer exists", session_id);
+                return AuthError::InvalidToken;
+            }
             error!(
                 "{}: Couldn't get session from database! Reason: {}",
                 session_id, e

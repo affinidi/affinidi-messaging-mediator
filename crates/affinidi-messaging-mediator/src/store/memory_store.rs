@@ -34,8 +34,8 @@ use affinidi_messaging_mediator_common::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
         OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        RefreshRotation, SentMessageState, Session, SessionSweepReport, StatCounter, StoreHealth,
-        StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
+        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -1083,6 +1083,10 @@ impl MediatorStore for MemoryStore {
             if let Some(account) = state.accounts.get(&did_hash) {
                 session.acls = account.acls.clone();
                 session.account_type = account.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
             }
         }
         Ok(session)

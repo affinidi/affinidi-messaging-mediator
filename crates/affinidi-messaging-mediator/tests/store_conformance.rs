@@ -42,6 +42,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState, StreamingClientState,
 };
@@ -1642,6 +1643,49 @@ async fn check_challenge_session_without_account(store: Arc<dyn MediatorStore>) 
         .expect("update_session_authenticated");
 }
 
+/// Removing an account ends its sessions: `get_session` for an
+/// authenticated session whose DID no longer has an account fails with
+/// `Unauthorized`, so callers send the client back to authenticate.
+async fn check_removed_account_ends_session(store: Arc<dyn MediatorStore>) {
+    let did = "did:example:conformance_removed_user";
+    let did_hash = sha256::digest(did);
+    let session_id = "conformance-removed-session";
+    store
+        .account_add(&did_hash, &allow_all(), None)
+        .await
+        .expect("account_add");
+    store
+        .put_session(
+            &Session {
+                session_id: session_id.to_string(),
+                challenge: "c".to_string(),
+                state: SessionState::Authenticated,
+                did: did.to_string(),
+                did_hash: did_hash.clone(),
+                refresh_token_hash: Some("hash".to_string()),
+                ..Default::default()
+            },
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("put_session");
+    store
+        .get_session(session_id, did)
+        .await
+        .expect("session readable while the account exists");
+
+    assert!(
+        store
+            .account_remove(&admin_session("admin_hash"), &did_hash)
+            .await
+            .expect("account_remove")
+    );
+    match store.get_session(session_id, did).await {
+        Err(MediatorError::Unauthorized(..)) => {}
+        other => panic!("a session without its account must be refused, got {other:?}"),
+    }
+}
+
 /// Refresh-token rotation is a compare-and-swap: only the current hash
 /// rotates, a stale or absent one changes nothing, and of many concurrent
 /// rotations with one hash exactly one wins.
@@ -2633,6 +2677,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_login_session(store.clone()).await;
     check_challenge_session_without_account(store.clone()).await;
     check_refresh_rotation(store.clone()).await;
+    check_removed_account_ends_session(store.clone()).await;
     check_bulk_account_reads(store.clone()).await;
     check_streaming_pubsub(store.clone()).await;
     check_streaming_deregister_keeps_another_owner(store.clone()).await;
@@ -2758,6 +2803,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn refresh_rotation() {
                 check_refresh_rotation(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn removed_account_ends_session() {
+                check_removed_account_ends_session(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn bulk_account_reads() {

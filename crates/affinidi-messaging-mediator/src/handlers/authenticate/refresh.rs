@@ -275,6 +275,22 @@ pub async fn authentication_refresh(
             .get_session(&results.claims.session_id, &results.claims.sub)
             .await
             .map_err(|e| {
+                // The session ended with its account: tell the client to
+                // authenticate again rather than to retry.
+                if let MediatorError::Unauthorized(..) = e {
+                    return MediatorError::problem_with_log(
+                        34,
+                        "",
+                        None,
+                        ProblemReportSorter::Error,
+                        ProblemReportScope::Protocol,
+                        "authentication.session.invalid",
+                        "Session is no longer valid; authenticate again",
+                        vec![],
+                        StatusCode::UNAUTHORIZED,
+                        format!("Refresh refused: {e}"),
+                    );
+                }
                 MediatorError::problem_with_log(
                     14,
                     "",

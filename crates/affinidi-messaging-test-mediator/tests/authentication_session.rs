@@ -19,7 +19,7 @@ use affinidi_messaging_mediator::store::MemoryStore;
 use affinidi_messaging_mediator_common::store::{MediatorStore, Session};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_test_mediator::{
-    AccessListModeType, TestEnvironment, TestMediator, TestMediatorHandle,
+    AccessListModeType, TestEnvironment, TestMediator, TestMediatorHandle, acl,
 };
 use affinidi_secrets_resolver::SecretsResolver;
 use affinidi_tdk::dids::{DID, KeyType, PeerKeyRole};
@@ -447,6 +447,139 @@ async fn refresh_without_a_recorded_token_is_refused() {
     env.shutdown().await.unwrap();
 }
 
+/// Answer a challenge for `did`, running `between` after the challenge is
+/// issued and before the answer is sent. `answer` overrides the challenge
+/// string sent back. Returns the `/authenticate` status and body.
+async fn answer_challenge<F, Fut>(
+    env: &TestEnvironment,
+    did: &str,
+    answer: Option<&str>,
+    between: F,
+) -> (u16, JsonValue)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (status, body) = challenge(&env.mediator, did).await;
+    assert_eq!(status, 200, "challenge for {did}: {body}");
+    let data = &body["data"];
+    let challenge_str = answer
+        .map(JsonValue::from)
+        .unwrap_or_else(|| data["challenge"].clone());
+    let response = packed(
+        env,
+        did,
+        "https://affinidi.com/atm/1.0/authenticate",
+        json!({ "challenge": challenge_str, "session_id": data["session_id"] }),
+    )
+    .await;
+    between().await;
+    post(&env.mediator, "authenticate", response).await
+}
+
+/// A DID blocked after it was issued a challenge is refused when it answers.
+#[tokio::test]
+async fn login_refused_when_blocked_after_the_challenge() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+
+    let (status, body) = answer_challenge(&env, &alice.did, None, || async {
+        let mut blocked = acl::allow_all();
+        blocked.set_blocked(true);
+        env.mediator.set_acl(&alice.did, blocked).await.unwrap();
+    })
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(25), "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// The answer must carry the challenge string the session issued.
+#[tokio::test]
+async fn login_refused_with_a_different_challenge_string() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+
+    let (status, body) =
+        answer_challenge(&env, &alice.did, Some("not-the-challenge"), || async {}).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(34), "{body}");
+
+    // The correct answer still works.
+    let _ = login(&env, &alice.did).await;
+
+    env.shutdown().await.unwrap();
+}
+
+/// Removing an account ends its sessions: the refresh token and the access
+/// token are both refused with 401, so the client authenticates again.
+async fn removed_account_ends_the_session(env: TestEnvironment) {
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    let admin = Session {
+        did_hash: "admin".into(),
+        account_type: AccountType::RootAdmin,
+        ..Default::default()
+    };
+    assert!(
+        env.mediator
+            .store()
+            .account_remove(&admin, &sha256::digest(&alice.did))
+            .await
+            .unwrap()
+    );
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 401, "{body}");
+
+    let whoami = http()
+        .get(format!("{}whoami", env.mediator.endpoint()))
+        .bearer_auth(&tokens.access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status().as_u16(), 401);
+
+    env.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removed_account_ends_the_session_memory() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    removed_account_ends_the_session(env).await;
+}
+
+#[cfg(feature = "fjall-backend")]
+#[tokio::test]
+async fn removed_account_ends_the_session_fjall() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .fjall_backend()
+        .expect("fjall backend")
+        .spawn()
+        .await
+        .expect("spawn fjall mediator");
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    removed_account_ends_the_session(env).await;
+}
+
 // ─── TSP ─────────────────────────────────────────────────────────────────────
 
 /// `/tsp/authenticate` creates the account once the challenge signature
@@ -496,6 +629,55 @@ async fn tsp_account_is_created_when_the_challenge_is_answered() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(store.account_exists(&did_hash).await.unwrap());
+
+    env.shutdown().await.unwrap();
+}
+
+/// `/tsp/authenticate` refuses a DID blocked after it was issued a challenge.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn tsp_login_refused_when_blocked_after_the_challenge() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let signing: [u8; 32] = alice
+        .secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .unwrap()
+        .get_private_bytes()
+        .try_into()
+        .unwrap();
+
+    let (status, body) = challenge(&env.mediator, &alice.did).await;
+    assert_eq!(status, 200, "{body}");
+
+    let mut blocked = acl::allow_all();
+    blocked.set_blocked(true);
+    env.mediator.set_acl(&alice.did, blocked).await.unwrap();
+
+    let signature = affinidi_tsp::crypto::signing::sign(
+        body["data"]["challenge"].as_str().unwrap().as_bytes(),
+        &signing,
+    )
+    .unwrap();
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        json!({
+            "vid": alice.did,
+            "session_id": body["data"]["session_id"],
+            "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(25), "{body}");
 
     env.shutdown().await.unwrap();
 }

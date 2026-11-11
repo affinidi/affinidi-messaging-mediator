@@ -311,6 +311,17 @@ pub use types::{
     StreamingKind, StreamingWrite,
 };
 
+/// The error every backend's `get_session` returns for a session past the
+/// challenge step whose DID no longer has an account: the account was
+/// removed, so its sessions are over and the client must authenticate again.
+pub fn account_gone(session_id: &str) -> MediatorError {
+    MediatorError::Unauthorized(
+        20,
+        session_id.into(),
+        "The session's account no longer exists; please re-authenticate".into(),
+    )
+}
+
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
 /// queue (`messaging/message/status/0.1` asks for at least 24 hours).
 ///
@@ -1015,6 +1026,11 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// record so the returned `Session` has populated `acls` and
     /// `account_type` fields. The handler uses these to authorise
     /// downstream requests without a separate account lookup.
+    ///
+    /// A `ChallengeSent` session may have no account yet (accounts are
+    /// created once the challenge is answered) and is returned with default
+    /// ACLs. Any other session whose DID has no account fails with
+    /// [`account_gone`]. An empty `did` skips the join (store-internal use).
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError>;
 
     /// Delete a session record. Used for logout and as the *first* step
