@@ -247,15 +247,19 @@ impl MuxConn {
     /// - a member holding `pickup` but not `receive`: do not push the frame,
     ///   but tell the principal mail waits for it (a resync: a pickup
     ///   `status` on DIDComm, a drain on raw TSP);
-    /// - anything else (a member that left, or that holds neither): drop it.
-    ///   The message stays in the member's inbox (§7.3, R1.1).
-    pub async fn live_frame(&self, did_hash: &str) -> LiveFrame {
+    /// - anything else (a member that left, whose admission has lapsed at
+    ///   `now`, or that holds neither): drop it. The message stays in the
+    ///   member's inbox (§7.3, R1.1).
+    ///
+    /// Expiry is checked here as [`MuxSession::allows`] checks it, rather
+    /// than left to the next sweep to remove the member.
+    pub async fn live_frame(&self, did_hash: &str, now: u64) -> LiveFrame {
         use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
         let s = self.session.lock().await;
         if did_hash == s.principal_hash {
             return LiveFrame::Write;
         }
-        match s.get(did_hash) {
+        match s.get(did_hash).filter(|m| m.expires_at > now) {
             Some(m) if m.scope.contains(Cap::Receive) => LiveFrame::Write,
             Some(m) if m.scope.contains(Cap::Pickup) => LiveFrame::Nudge,
             _ => LiveFrame::Drop,
@@ -691,5 +695,50 @@ mod tests {
         let m = s.get(&did_hash("did:example:work")).unwrap();
         assert_eq!(m.scope, narrow);
         assert_eq!(m.grant_iat, 2);
+    }
+
+    /// A member whose admission has lapsed gets no more live frames, even
+    /// before the sweep takes it off the connection; the principal's own
+    /// frames are unaffected.
+    #[tokio::test]
+    async fn a_lapsed_member_gets_no_live_frames_before_the_sweep() {
+        let registry = MuxRegistry::default();
+        let principal = "did:example:device";
+        let conn = connected(&registry, principal);
+        let member = |did: &str, scope: MuxScope| MuxMember {
+            did: did.into(),
+            did_hash: did_hash(did),
+            source: super::super::session::MuxSource::Attach,
+            scope,
+            kid: format!("{did}#key-1"),
+            key_fp: "fp".into(),
+            expires_at: 100,
+            grant_iat: 0,
+        };
+        {
+            let mut s = conn.session.lock().await;
+            s.admit(member(
+                "did:example:work",
+                MuxScope::new([MuxCapability::Receive]).unwrap(),
+            ))
+            .unwrap();
+            s.admit(member(
+                "did:example:home",
+                MuxScope::new([MuxCapability::Pickup]).unwrap(),
+            ))
+            .unwrap();
+        }
+        let work = did_hash("did:example:work");
+        let home = did_hash("did:example:home");
+        assert_eq!(conn.live_frame(&work, 99).await, LiveFrame::Write);
+        assert_eq!(conn.live_frame(&home, 99).await, LiveFrame::Nudge);
+        for now in [100, 101] {
+            assert_eq!(conn.live_frame(&work, now).await, LiveFrame::Drop);
+            assert_eq!(conn.live_frame(&home, now).await, LiveFrame::Drop);
+        }
+        assert_eq!(
+            conn.live_frame(&did_hash(principal), u64::MAX).await,
+            LiveFrame::Write
+        );
     }
 }

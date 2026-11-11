@@ -1420,7 +1420,7 @@ async fn handle_socket(
                         let mut write = true;
                         if let (Some(conn), Some(for_did)) = (&mux_conn, queued.did_hash.as_deref()) {
                             use crate::mux::registry::LiveFrame;
-                            match conn.live_frame(for_did).await {
+                            match conn.live_frame(for_did, state.clock.unix_secs()).await {
                                 LiveFrame::Write => {}
                                 LiveFrame::Nudge => {
                                     metrics::counter!(MUX_LIVE_FRAMES_WITHHELD_TOTAL, "outcome" => "nudge").increment(1);
@@ -1453,7 +1453,7 @@ async fn handle_socket(
                                     && let Some(for_did) = queued.did_hash.as_deref()
                                     && for_did != session.did_hash
                                 {
-                                    match send_tsp_member_live(conn, for_did, &mut socket, &msg, &mut member_inflight).await {
+                                    match send_tsp_member_live(conn, for_did, state.clock.unix_secs(), &mut socket, &msg, &mut member_inflight).await {
                                         ControlFlow::Break(()) => {
                                             close_reason = (close_code::GOING_AWAY, "client disconnected");
                                             break;
@@ -1830,16 +1830,26 @@ async fn drain_tsp_inbox(
     // Then each member with `pickup`, a page at a time, round-robin.
     if let Some((conn, member_inflight, only)) = members {
         let now = state.clock.unix_secs();
-        let mut order: Vec<String> = {
+        let candidates: Vec<crate::mux::session::MuxMember> = {
             let s = conn.session.lock().await;
             // A member no longer attached has nothing in flight here.
             member_inflight.retain(|did_hash, _| s.get(did_hash).is_some());
             s.members()
                 .filter(|m| only.is_none_or(|o| o.contains(&m.did_hash)))
                 .filter(|m| s.allows(&m.did_hash, MuxCapability::Pickup, now))
-                .map(|m| m.did_hash.clone())
+                .cloned()
                 .collect()
         };
+        // Each member's account must still stand before its inbox is walked;
+        // one whose standing has lapsed is detached, with its event.
+        let mut order: Vec<String> = Vec::with_capacity(candidates.len());
+        for m in candidates {
+            if crate::mux::connection::check_member(state, conn, &m).await
+                == crate::mux::connection::Standing::Good
+            {
+                order.push(m.did_hash);
+            }
+        }
         order.sort();
         let mut walks: std::collections::HashMap<
             String,
@@ -2105,13 +2115,14 @@ async fn drain_tsp_page(
 async fn send_tsp_member_live(
     conn: &crate::mux::registry::MuxConn,
     did_hash: &str,
+    now: u64,
     socket: &mut BoundedSocket,
     body: &str,
     inflight: &mut MemberInflight,
 ) -> ControlFlow<(), bool> {
     // Checked by the caller already; re-checked here because this write is
     // the one that must not happen for a member without `receive` (§7.3, R1.1).
-    if conn.live_frame(did_hash).await != crate::mux::registry::LiveFrame::Write {
+    if conn.live_frame(did_hash, now).await != crate::mux::registry::LiveFrame::Write {
         return ControlFlow::Continue(false);
     }
     let id = sha256::digest(body);

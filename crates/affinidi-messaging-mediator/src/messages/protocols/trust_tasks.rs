@@ -975,6 +975,9 @@ async fn consume_account_update(
             format!("acl -> {:#018x}", stored.to_u64()),
         )
         .await;
+        // A live mux connection carrying the account as a member drops it
+        // now if the new ACLs no longer cover its scope, before this answers.
+        crate::mux::connection::recheck_member(state, &target_hash).await;
     }
 
     if let Some((send_queue_limit, receive_queue_limit)) = queue_limits {
@@ -1255,6 +1258,12 @@ async fn consume_account_remove(
                 "account removed, but its DID multiplexing grants could not be: {e}"
             ),
         }
+    }
+    // Members admitted by a session attach hold no stored grant, so the
+    // detach above does not reach them; the account is gone, so its standing
+    // check detaches them (`accountRemoved`) on every connection here.
+    if removed {
+        crate::mux::connection::recheck_member(state, &target_hash).await;
     }
     record_audit(
         state,

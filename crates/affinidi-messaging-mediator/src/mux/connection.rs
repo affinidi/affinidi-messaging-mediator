@@ -581,9 +581,10 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) ->
     frames
 }
 
-/// Periodic sweep: expire lapsed members and, when `revalidate` is set,
-/// re-check each grant-admitted member's signing key (§5.1). Leavers are
-/// queued on the connection for [`drain_changes`].
+/// Periodic sweep: expire lapsed members, detach members whose account no
+/// longer stands ([`check_member`]) and, when `revalidate` is set, re-check
+/// each grant-admitted member's signing key (§5.1). Leavers are queued on the
+/// connection for [`drain_changes`].
 pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     let streaming = state.streaming_task.as_ref();
     let now = state.clock.unix_secs();
@@ -596,6 +597,17 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     };
     for h in expired {
         conn.detach(streaming, &h, LeaveReason::Expired).await;
+    }
+
+    // Every member, however admitted: does its account still stand (it
+    // exists, is not blocked, and its own ACLs still cover its scope)? An
+    // attach is checked as a grant is; an account change handled on this
+    // instance detached it already (`recheck_member`), and this is how a
+    // change made elsewhere, or by a path that does not call in, reaches the
+    // connection within one sweep interval.
+    let members: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
+    for m in &members {
+        check_member(state, conn, m).await;
     }
 
     // Grant-admitted members: is the stored grant still active? A revoke,
@@ -709,19 +721,88 @@ pub fn grant_leave_reason(
     }
 }
 
-/// Whether this connection may carry pickup / delete / send for `did_hash`.
+/// A member's account standing, read now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    Good,
+    /// The account was removed, blocked, or its ACLs no longer cover the
+    /// member's scope: the member leaves for this reason.
+    Lapsed(LeaveReason),
+    /// The store could not be read. Not a lapse, so the member stays; not a
+    /// pass, so nothing is done for it on the strength of this check.
+    Unknown,
+}
+
+/// `member`'s standing now (design §5.5, the check an attach or a grant met
+/// when it was admitted).
+pub async fn member_standing(state: &SharedData, member: &MuxMember) -> Standing {
+    match super::session::standing(
+        &*state.database,
+        &state.config.security.global_acl_default,
+        &member.did_hash,
+        &member.scope,
+    )
+    .await
+    {
+        Ok(()) => Standing::Good,
+        Err(e) => match super::session::standing_leave_reason(&e) {
+            Some(reason) => Standing::Lapsed(reason),
+            None => {
+                debug!(did = %member.did, "mux member standing re-check deferred: {e}");
+                Standing::Unknown
+            }
+        },
+    }
+}
+
+/// Re-check `member`'s standing and, when it has lapsed, take it off `conn`
+/// with a `detached` event naming why (R6.2).
+pub async fn check_member(state: &SharedData, conn: &MuxConn, member: &MuxMember) -> Standing {
+    let standing = member_standing(state, member).await;
+    if let Standing::Lapsed(reason) = standing {
+        debug!(did = %member.did, reason = reason.wire(), "mux member's account standing lapsed; detaching");
+        conn.detach(state.streaming_task.as_ref(), &member.did_hash, reason)
+            .await;
+    }
+    standing
+}
+
+/// After an account change on this instance (its ACLs set, the account
+/// removed): re-check `did_hash` as a member on every live mux connection
+/// here, and detach it wherever its standing has lapsed — attach-admitted
+/// members included — before the change is answered. Connections on other
+/// instances catch up at their next sweep.
+pub async fn recheck_member(state: &SharedData, did_hash: &str) {
+    for conn in state.mux.all() {
+        let member = conn.session.lock().await.get(did_hash).cloned();
+        if let Some(m) = member {
+            check_member(state, &conn, &m).await;
+        }
+    }
+}
+
+/// Whether this connection may carry pickup / delete for `did_hash` now: it
+/// carries the member with `cap`, unexpired, and the member's account still
+/// stands. A member whose standing has lapsed is detached; one whose standing
+/// cannot be read is refused this once.
 pub async fn allows(
     state: &SharedData,
     session_id: &str,
     did_hash: &str,
     cap: MuxCapability,
 ) -> bool {
-    match state.mux.get(session_id) {
-        Some(conn) => conn
-            .session
-            .lock()
-            .await
-            .allows(did_hash, cap, state.clock.unix_secs()),
+    let Some(conn) = state.mux.get(session_id) else {
+        return false;
+    };
+    let member = {
+        let s = conn.session.lock().await;
+        if !s.allows(did_hash, cap, state.clock.unix_secs()) {
+            return false;
+        }
+        s.get(did_hash).cloned()
+    };
+    match member {
+        Some(m) => check_member(state, &conn, &m).await == Standing::Good,
         None => false,
     }
 }
@@ -752,11 +833,28 @@ pub async fn sender_session(
     };
 
     let hash = did_hash(sender_did);
-    if hash == session.did_hash
-        || !allows(state, &session.session_id, &hash, MuxCapability::Send).await
+    if hash == session.did_hash {
+        return None;
+    }
+    // The member's standing is read below, from its account record, so this
+    // checks only that the connection carries it with `send` now.
+    let conn = state.mux.get(&session.session_id)?;
+    if !conn
+        .session
+        .lock()
+        .await
+        .allows(&hash, MuxCapability::Send, state.clock.unix_secs())
     {
         return None;
     }
+    let lapsed = |reason| {
+        let conn = conn.clone();
+        let hash = hash.clone();
+        async move {
+            conn.detach(state.streaming_task.as_ref(), &hash, reason)
+                .await;
+        }
+    };
     // A member must have an account: a grant or attach is refused without
     // one, so a member without one now has lost it, and is refused rather than
     // given the deployment's default ACLs.
@@ -764,6 +862,7 @@ pub async fn sender_session(
         Ok(Some(account)) => (MediatorACLSet::from_u64(account.acls), account._type),
         Ok(None) => {
             debug!(principal = %session.did_hash, session_id = %session.session_id, member = %hash, "mux send refused: member has no account");
+            lapsed(LeaveReason::AccountRemoved).await;
             return None;
         }
         Err(e) => {
@@ -774,6 +873,13 @@ pub async fn sender_session(
     let send = MuxScope::new([MuxCapability::Send]).ok()?;
     if let Err(e) = super::grants::check_scope(&acls, &send) {
         debug!(member = %hash, "mux send refused: {e}");
+        // Its account no longer stands for `send`; the member's full scope
+        // is re-checked, so one that merely lost `send` is not dropped for
+        // `receive`.
+        let member = conn.session.lock().await.get(&hash).cloned();
+        if let Some(m) = member {
+            check_member(state, &conn, &m).await;
+        }
         return None;
     }
     debug!(principal = %session.did_hash, member = %hash, "frame accepted as sent by mux member");
@@ -790,17 +896,27 @@ pub async fn sender_session(
     })
 }
 
-/// The members of `session_id`'s mux connection that may do `cap` now.
+/// The members of `session_id`'s mux connection that may do `cap` now,
+/// each with its account standing re-checked as [`allows`] does.
 pub async fn members_with(state: &SharedData, session_id: &str, cap: MuxCapability) -> Vec<String> {
     let Some(conn) = state.mux.get(session_id) else {
         return Vec::new();
     };
     let now = state.clock.unix_secs();
-    let s = conn.session.lock().await;
-    s.members()
-        .filter(|m| s.allows(&m.did_hash, cap, now))
-        .map(|m| m.did_hash.clone())
-        .collect()
+    let candidates: Vec<MuxMember> = {
+        let s = conn.session.lock().await;
+        s.members()
+            .filter(|m| s.allows(&m.did_hash, cap, now))
+            .cloned()
+            .collect()
+    };
+    let mut out = Vec::with_capacity(candidates.len());
+    for m in candidates {
+        if check_member(state, &conn, &m).await == Standing::Good {
+            out.push(m.did_hash);
+        }
+    }
+    out
 }
 
 /// Tear the connection down: every member out of the streaming task, the
