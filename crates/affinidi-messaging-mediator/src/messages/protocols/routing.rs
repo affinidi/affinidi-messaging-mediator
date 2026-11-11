@@ -1188,6 +1188,33 @@ fn didcomm_endpoints(doc: &Document) -> Vec<String> {
         .collect()
 }
 
+/// A relay is refused when its endpoint, the DID it is relayed to, or the
+/// next hop itself is on `processors.forwarding.blocked_forwarding`: this
+/// mediator's own DID and published endpoints (a forward that would come back
+/// here), plus the operator's `blocked_forwarding_dids` and their endpoints.
+fn refuse_blocked(state: &SharedData, next: &str, hop: RemoteHop) -> NextHop {
+    if blocked_relay(
+        &state.config.processors.forwarding.blocked_forwarding,
+        next,
+        &hop,
+    ) {
+        return NextHop::Unroutable {
+            reason: format!(
+                "next hop ({next}) relays via ({}) at ({}), which is on this mediator's                  forwarding block list",
+                hop.relay_to, hop.endpoint
+            ),
+            retryable: false,
+        };
+    }
+    NextHop::Remote(hop)
+}
+
+fn blocked_relay(blocked: &ahash::AHashSet<String>, next: &str, hop: &RemoteHop) -> bool {
+    blocked.contains(hop.endpoint.trim_matches('"'))
+        || blocked.contains(&hop.relay_to)
+        || blocked.contains(next)
+}
+
 /// Decide whether a forward's next hop is served by this mediator or a remote
 /// one, and — when remote — the URL to relay it to.
 ///
@@ -1228,10 +1255,14 @@ async fn service_endpoint_for_remote(
         match classify_endpoint(uri, &state.config.mediator_did, &state.self_authorities) {
             Some(EndpointHop::Local) => return NextHop::Local,
             Some(EndpointHop::Remote(url)) => {
-                return NextHop::Remote(RemoteHop {
-                    endpoint: url,
-                    relay_to: next.to_string(),
-                });
+                return refuse_blocked(
+                    state,
+                    next,
+                    RemoteHop {
+                        endpoint: url,
+                        relay_to: next.to_string(),
+                    },
+                );
             }
             // Remembered, but the scan continues: a later entry naming this
             // mediator directly still wins.
@@ -1271,10 +1302,14 @@ async fn service_endpoint_for_remote(
             // The peer mediator is this mediator under another name.
             Some(EndpointHop::Local) => return NextHop::Local,
             Some(EndpointHop::Remote(url)) => {
-                return NextHop::Remote(RemoteHop {
-                    endpoint: url,
-                    relay_to: peer_mediator,
-                });
+                return refuse_blocked(
+                    state,
+                    next,
+                    RemoteHop {
+                        endpoint: url,
+                        relay_to: peer_mediator,
+                    },
+                );
             }
             // A second hop of indirection is deliberately not chased.
             Some(EndpointHop::Indirect(_)) | None => {}
@@ -1293,8 +1328,8 @@ async fn service_endpoint_for_remote(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointHop, classify_endpoint, didcomm_endpoints, parse_next_did, relay_sender_acls,
-        rewrap_inner_attachment, uri_points_at_self,
+        EndpointHop, RemoteHop, blocked_relay, classify_endpoint, didcomm_endpoints,
+        parse_next_did, relay_sender_acls, rewrap_inner_attachment, uri_points_at_self,
     };
     use crate::common::session::Session;
     use crate::server::{compute_self_authorities_from, normalize_host};
@@ -1701,6 +1736,51 @@ mod tests {
             classify_endpoint(US, US, &no_authorities()),
             Some(EndpointHop::Local)
         );
+    }
+
+    #[test]
+    fn a_relay_on_the_forwarding_block_list_is_refused() {
+        let blocked: ahash::AHashSet<String> = [
+            "did:example:mediator".to_string(),
+            "https://mediator.example/api".to_string(),
+            "did:example:blocked".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let hop = |endpoint: &str, relay_to: &str| RemoteHop {
+            endpoint: endpoint.to_string(),
+            relay_to: relay_to.to_string(),
+        };
+
+        // Our own published endpoint, quoted or not.
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("https://mediator.example/api", "did:example:bob")
+        ));
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("\"https://mediator.example/api\"", "did:example:bob")
+        ));
+        // A blocked mediator named by the next hop's document.
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("https://other.example", "did:example:blocked")
+        ));
+        // A blocked next hop.
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:blocked",
+            &hop("https://other.example", "did:example:blocked")
+        ));
+        // Anything else relays.
+        assert!(!blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("https://other.example", "did:example:bob")
+        ));
     }
 
     #[test]

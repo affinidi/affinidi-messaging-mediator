@@ -354,8 +354,11 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
 - **Loop protection.** `hop_count` increments per relay and is rejected at
   `max_hops` (error 94). Independently, `blocked_forwarding` — the mediator's
   own DID plus every service endpoint URI in its document, loaded at boot by
-  `load_forwarding_protection_blocks` — prevents packing a forward that loops
-  back to itself.
+  `load_forwarding_protection_blocks` — plus any `blocked_forwarding_dids`
+  and their endpoints: a forward whose relay endpoint, relay DID or next hop
+  is on that list is refused (DIDComm `delivery_refused`, TSP error 94)
+  instead of queued. Declare this mediator's public aliases in
+  `local_endpoints` so forwards addressed to them are delivered locally.
 - **Observability.** `FORWARD_ENQUEUED` (with `endpoint=`),
   `MESSAGES_FORWARDED_TOTAL`, `FORWARD_LOOP_DETECTED_TOTAL`.
 
