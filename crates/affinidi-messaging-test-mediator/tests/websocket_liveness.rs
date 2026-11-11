@@ -65,11 +65,11 @@ async fn close_code(socket: &mut Socket) -> Option<u16> {
 async fn a_client_that_never_answers_pings_is_disconnected() {
     init_tracing();
 
-    // Ping every second; close after two seconds of silence. One socket per
+    // Ping every 2 s; 2 s of grace for an unanswered ping. One socket per
     // DID, so a second socket only opens once the first has given its slot
     // back.
     let mediator = TestMediator::builder()
-        .websocket_liveness(1, 2, 5)
+        .websocket_liveness(2, 4, 5)
         .max_websocket_connections_per_did(1)
         .spawn()
         .await
@@ -80,9 +80,9 @@ async fn a_client_that_never_answers_pings_is_disconnected() {
     // Open a socket and read nothing: its pings go unanswered, because a
     // client only answers a ping when it reads it.
     let mut silent = open_ws(&env, &alice).await;
-    // The first ping goes out about 1 s after the socket opens and has 1 s of
-    // grace; 6 s leaves room for a slow machine.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // The first ping goes out about 2 s after the socket opens and has 2 s of
+    // grace; 9 s leaves room for a slow machine.
+    tokio::time::sleep(Duration::from_secs(9)).await;
 
     // Reading now shows the pings that were never answered, then the close.
     assert_eq!(
@@ -94,7 +94,7 @@ async fn a_client_that_never_answers_pings_is_disconnected() {
     // The slot was given back: a new socket for the same DID opens, and one
     // that reads (and so answers each ping) stays open past the deadline.
     let mut reading = open_ws(&env, &alice).await;
-    let stayed_open = read_for(&mut reading, Duration::from_secs(5)).await;
+    let stayed_open = read_for(&mut reading, Duration::from_secs(10)).await;
     assert!(
         stayed_open.is_err(),
         "a socket that answers pings must stay open, got: {stayed_open:?}"
@@ -124,9 +124,9 @@ async fn read_for(socket: &mut Socket, for_how_long: Duration) -> Result<Option<
 async fn a_client_that_answers_pings_survives_a_busy_mediator_loop() {
     init_tracing();
 
-    // Ping every second; one second of grace for an unanswered ping.
+    // Ping every 2 s; 2 s of grace for an unanswered ping.
     let mediator = TestMediator::builder()
-        .websocket_liveness(1, 2, 5)
+        .websocket_liveness(2, 4, 5)
         .spawn()
         .await
         .expect("spawn mediator");
@@ -134,13 +134,13 @@ async fn a_client_that_answers_pings_survives_a_busy_mediator_loop() {
     let alice = env.add_user("Alice").await.expect("add user");
 
     // Right after each of its next three pings, the mediator's loop for this
-    // socket spends 2.5 s not reading, as a long flush or a slow message
+    // socket spends 4.5 s not reading, as a long flush or a slow message
     // would. The client answers every ping at once, but the mediator only
     // reads the answer after the ping's grace has run out.
-    stall_loop_after_ping(&alice.did_hash(), Duration::from_millis(2500), 3);
+    stall_loop_after_ping(&alice.did_hash(), Duration::from_millis(4500), 3);
     let mut socket = open_ws(&env, &alice).await;
 
-    let outcome = read_for(&mut socket, Duration::from_secs(10)).await;
+    let outcome = read_for(&mut socket, Duration::from_secs(25)).await;
     assert!(
         outcome.is_err(),
         "a client that answers pings must stay open while the mediator is busy, got: {outcome:?}"

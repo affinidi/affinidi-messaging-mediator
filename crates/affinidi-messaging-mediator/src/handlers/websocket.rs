@@ -711,34 +711,47 @@ impl Liveness {
 #[derive(Debug, Default)]
 struct PingWatch {
     deadline: Option<tokio::time::Instant>,
+    /// Fresh windows given to the ping now waiting; see
+    /// [`MAX_EXTENSIONS`](Self::MAX_EXTENSIONS).
+    extensions: u8,
 }
 
 impl PingWatch {
+    /// At most this many fresh windows for one unanswered ping. A loop kept
+    /// busy by other traffic must not keep a peer that has gone away open
+    /// window after window; a peer that is there answers within the first.
+    const MAX_EXTENSIONS: u8 = 2;
+
     /// A ping went out. Starts the clock unless an earlier ping is already
     /// waiting, which keeps its own (earlier) deadline.
     fn ping_sent(&mut self, grace: Duration) {
         if self.deadline.is_none() {
             self.deadline = Some(tokio::time::Instant::now() + grace);
+            self.extensions = 0;
         }
     }
 
     /// A frame arrived: the peer is there, nothing is waiting.
     fn answered(&mut self) {
         self.deadline = None;
+        self.extensions = 0;
     }
 
     /// Called before the loop waits again; `woke` is when the last wait
     /// ended. If the deadline passed after that, while the loop was busy
     /// elsewhere, the peer's answer may be sitting unread, so the ping gets
-    /// `window` more, in which the loop *is* reading. A deadline already due
+    /// `window` more, in which the loop *is* reading, up to
+    /// [`MAX_EXTENSIONS`](Self::MAX_EXTENSIONS) times. A deadline already due
     /// when the wait ended (another branch won the tie) is left as it is.
     fn after_pass(&mut self, woke: tokio::time::Instant, window: Duration) {
         let now = tokio::time::Instant::now();
         if let Some(deadline) = self.deadline
             && deadline > woke
             && deadline <= now
+            && self.extensions < Self::MAX_EXTENSIONS
         {
             self.deadline = Some(now + window);
+            self.extensions += 1;
         }
     }
 
@@ -2923,6 +2936,40 @@ mod tests {
             Some(tokio::time::Instant::now() + window),
             "missed while busy: a fresh window"
         );
+    }
+
+    /// One unanswered ping gets a bounded number of fresh windows, however
+    /// many busy passes it misses; an answer resets the allowance.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_ping_gets_a_bounded_number_of_windows() {
+        let grace = Duration::from_secs(60);
+        let window = Duration::from_secs(30);
+        let mut watch = PingWatch::default();
+        watch.ping_sent(grace);
+
+        // A busy pass that runs past the deadline.
+        async fn busy_pass(watch: &mut PingWatch, window: Duration) -> tokio::time::Instant {
+            let woke = tokio::time::Instant::now();
+            let deadline = watch.deadline().expect("a ping is waiting");
+            tokio::time::advance(deadline - woke + Duration::from_secs(1)).await;
+            watch.after_pass(woke, window);
+            watch.deadline().expect("still waiting")
+        }
+        for _ in 0..PingWatch::MAX_EXTENSIONS {
+            let deadline = busy_pass(&mut watch, window).await;
+            assert_eq!(deadline, tokio::time::Instant::now() + window, "extended");
+        }
+        let deadline = busy_pass(&mut watch, window).await;
+        assert!(
+            deadline <= tokio::time::Instant::now(),
+            "past the allowance the deadline stays due"
+        );
+
+        // An answer resets it: the next ping may be extended again.
+        watch.answered();
+        watch.ping_sent(grace);
+        let deadline = busy_pass(&mut watch, window).await;
+        assert_eq!(deadline, tokio::time::Instant::now() + window);
     }
 
     /// The deadline fell due together with another branch (a ping tick), and
