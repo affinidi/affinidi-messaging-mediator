@@ -5,7 +5,9 @@
 //! - an account is created when a DID answers its challenge, not when it asks
 //!   for one, and only DID-shaped, bounded input gets a challenge;
 //! - a refresh token is exchanged only by the DID it was issued to, only once,
-//!   and only against a session that records it.
+//!   and only against a session that records it;
+//! - an access token is the only bearer credential, and a refresh token the
+//!   only thing `/authenticate/refresh` exchanges.
 
 mod common;
 
@@ -443,6 +445,162 @@ async fn refresh_without_a_recorded_token_is_refused() {
 
     let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
     assert_eq!(status, 401, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+// ─── Token use ───────────────────────────────────────────────────────────────
+
+async fn whoami_status(env: &TestEnvironment, bearer: &str) -> u16 {
+    http()
+        .get(format!("{}whoami", env.mediator.endpoint()))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// Whether `/ws` upgrades for `bearer`, sent as an `Authorization` header
+/// and as a `bearer.<jwt>` subprotocol.
+async fn ws_upgrades(env: &TestEnvironment, bearer: &str) -> (bool, bool) {
+    use tokio_tungstenite::tungstenite::ClientRequestBuilder;
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        env.mediator.ws_endpoint().as_str().parse().unwrap();
+    let header = ClientRequestBuilder::new(uri.clone())
+        .with_header("Authorization", format!("Bearer {bearer}"));
+    let subprotocol = ClientRequestBuilder::new(uri)
+        .with_sub_protocol("affinidi.didcomm.v1")
+        .with_sub_protocol(format!("bearer.{bearer}"));
+    (
+        tokio_tungstenite::connect_async(header).await.is_ok(),
+        tokio_tungstenite::connect_async(subprotocol).await.is_ok(),
+    )
+}
+
+/// A session token as an earlier release minted it: no `token_use` claim
+/// and no `jti`, signed with the mediator's key.
+fn unmarked_token(env: &TestEnvironment, did: &str, session_id: &str, exp: u64) -> String {
+    let header = BASE64_URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"EdDSA"}"#);
+    let claims = BASE64_URL_SAFE_NO_PAD.encode(
+        json!({ "aud": "ATM", "sub": did, "session_id": session_id, "exp": exp }).to_string(),
+    );
+    let signing_input = format!("{header}.{claims}");
+    let key =
+        ring::signature::Ed25519KeyPair::from_pkcs8(&env.mediator.replica_identity().jwt_pkcs8)
+            .unwrap();
+    let signature = BASE64_URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()));
+    format!("{signing_input}.{signature}")
+}
+
+/// Login, use the access token, exchange the refresh token, and use the new
+/// access token.
+#[tokio::test]
+async fn login_access_refresh_flow_issues_working_tokens() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+    assert_eq!(whoami_status(&env, &tokens.access).await, 200);
+    assert_eq!(ws_upgrades(&env, &tokens.access).await, (true, true));
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+    let access = body["data"]["access_token"].as_str().unwrap();
+    assert_eq!(whoami_status(&env, access).await, 200);
+    let (status, body) = refresh(&env, &alice.did, &refreshed_token(&body)).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// A refresh token is not accepted as a bearer on REST routes or `/ws`,
+/// whether current or already exchanged.
+#[tokio::test]
+async fn refresh_token_is_not_a_bearer_credential() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    assert_eq!(whoami_status(&env, &tokens.refresh).await, 401);
+    assert_eq!(ws_upgrades(&env, &tokens.refresh).await, (false, false));
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(whoami_status(&env, &tokens.refresh).await, 401);
+    assert_eq!(whoami_status(&env, &refreshed_token(&body)).await, 401);
+
+    env.shutdown().await.unwrap();
+}
+
+/// An access token is not exchanged at `/authenticate/refresh`, and
+/// presenting one leaves the session and its refresh token intact.
+#[tokio::test]
+async fn access_token_is_not_exchanged_for_new_tokens() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+
+    let (status, body) = refresh(&env, &alice.did, &tokens.access).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(38), "{body}");
+
+    assert_eq!(whoami_status(&env, &tokens.access).await, 200);
+    let (status, body) = refresh(&env, &alice.did, &tokens.refresh).await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// Tokens minted before the `token_use` claim: an unmarked token that fits
+/// within an access-token lifetime is still a bearer credential; one that
+/// outlives it is not, but is still exchanged at refresh when it is the
+/// session's recorded refresh token.
+#[tokio::test]
+async fn unmarked_tokens_from_the_previous_release() {
+    init_tracing();
+    let store = Arc::new(MemoryStore::new());
+    let env = spawn_env(store.clone(), AccessListModeType::ExplicitDeny).await;
+    let alice = env.add_user("alice").await.unwrap();
+    let tokens = login(&env, &alice.did).await;
+    let session_id = session_id_of(&tokens.access);
+
+    // Default access lifetime is 900 s.
+    let access = unmarked_token(&env, &alice.did, &session_id, now() + 900);
+    assert_eq!(whoami_status(&env, &access).await, 200);
+    assert_eq!(ws_upgrades(&env, &access).await, (true, true));
+
+    let long_lived = unmarked_token(&env, &alice.did, &session_id, now() + 85_500);
+    assert_eq!(whoami_status(&env, &long_lived).await, 401);
+    assert_eq!(ws_upgrades(&env, &long_lived).await, (false, false));
+
+    // Make the long-lived token the session's recorded refresh token, as
+    // the previous release would have.
+    let mut session = store.get_session(&session_id, &alice.did).await.unwrap();
+    session.refresh_token_hash = Some(sha256::digest(&long_lived));
+    store
+        .put_session(&session, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let (status, body) = refresh(&env, &alice.did, &long_lived).await;
+    assert_eq!(status, 200, "{body}");
+    let access = body["data"]["access_token"].as_str().unwrap();
+    assert_eq!(whoami_status(&env, access).await, 200);
 
     env.shutdown().await.unwrap();
 }

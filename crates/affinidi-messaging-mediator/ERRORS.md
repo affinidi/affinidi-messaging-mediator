@@ -62,7 +62,7 @@ places with different statuses. Queue-limit refusals (61, 62, 95) include a
 |         35 |       500        | e.p.authentication.session.access_token            |     No     | Couldn't create JWT Access Token                                                                                            |
 |         36 |       500        | e.p.authentication.session.refresh_token           |     No     | Couldn't create JWT Refresh Token                                                                                           |
 |         37 |       400        | e.p.message.envelope.read                          |     No     | Couldn't read the message envelope. Also used for unsupported or malformed DIDComm v1/TSP messages, and `e.m.message.size.exceeded` (413) |
-|         38 |       400        | e.p.authentication.session.refresh_token.parse     |     No     | Couldn't parse the JWT refresh token (also `.expired`, and `.reuse` with 401) |
+|         38 |       400        | e.p.authentication.session.refresh_token.parse     |     No     | Couldn't parse the JWT refresh token, or it is not a refresh token (also `.expired`, and `.reuse` with 401) |
 |         39 |       400        | e.p.authentication.message.from.missing            |     No     | Refresh request is missing a `from` header |
 |         40 |       403        | e.p.authorization.local                            |     No     | DID is not local to the mediator, delivery rejected                                                                         |
 |         41 |       400        | e.p.api.inbox_fetch.limit                          |     No     | Invalid number of messages requested to retrieve (1 - 100)                                                                  |
