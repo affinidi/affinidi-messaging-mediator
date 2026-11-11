@@ -2982,8 +2982,9 @@ mod config_show_tests {
         assert_eq!(redact_url("redis://user:pw@host/"), "redis://***@host/");
         assert_eq!(redact_url("redis://127.0.0.1/"), "redis://127.0.0.1/");
         assert_eq!(redact_url("did:web:example.com"), "did:web:example.com");
-        // An `@` in the path is not userinfo.
-        assert_eq!(redact_url("https://h/a@b"), "https://h/a@b");
+        // Any `@` is treated as ending userinfo, so a malformed password
+        // (unencoded `/`) is still hidden.
+        assert_eq!(redact_url("redis://:pa/ss@host/"), "redis://***@host/");
     }
 
     #[test]

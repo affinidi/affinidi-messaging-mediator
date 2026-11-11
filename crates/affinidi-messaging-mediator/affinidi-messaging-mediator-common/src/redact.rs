@@ -10,8 +10,11 @@ pub fn redact_url(s: &str) -> String {
     let Some((scheme, rest)) = s.split_once("://") else {
         return s.to_string();
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
+    // Any `@` counts, not only one inside the authority: a password holding
+    // an unencoded `/`, `?` or `#` makes the URL unparseable, and that is
+    // exactly when it gets printed in an error. Hiding a path segment that
+    // happens to contain `@` is the cheaper mistake.
+    match rest.rfind('@') {
         Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
         None => s.to_string(),
     }
@@ -31,7 +34,8 @@ mod tests {
         assert_eq!(redact_url("rediss://user:pw@host"), "rediss://***@host");
         assert_eq!(redact_url("redis://127.0.0.1/"), "redis://127.0.0.1/");
         assert_eq!(redact_url("did:web:example.com"), "did:web:example.com");
-        // An `@` past the authority is part of the path, not userinfo.
-        assert_eq!(redact_url("https://h/a@b"), "https://h/a@b");
+        // A password with an unencoded `/` is still hidden.
+        assert_eq!(redact_url("redis://:pa/ss@host/"), "redis://***@host/");
+        assert_eq!(redact_url("redis://:p#w?d@host/"), "redis://***@host/");
     }
 }
