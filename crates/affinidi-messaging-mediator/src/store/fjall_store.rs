@@ -3434,6 +3434,47 @@ impl MediatorStore for FjallStore {
         Ok(out)
     }
 
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = now_ms_u64();
+        // Under the write lock, so a concurrent autoclaim cannot move a claim
+        // between the ownership check and the refresh.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut lost = Vec::new();
+        for id in stream_ids {
+            let Some(sid) = parse_stream_id_string(id) else {
+                lost.push(id.to_string());
+                continue;
+            };
+            let key = pending_key(group_name, sid);
+            let claim = self
+                .forward_pending
+                .get(&key)
+                .map_err(|e| Self::db_err("forward_queue_refresh_claims:get", e))?
+                .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+                .transpose()?;
+            match claim {
+                Some(claim) if claim.consumer == consumer_name => {
+                    let refreshed = StoredPendingClaim {
+                        claimed_at_ms: now,
+                        ..claim
+                    };
+                    batch.insert(&self.forward_pending, key, Self::encode(&refreshed)?);
+                }
+                _ => lost.push(id.to_string()),
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_refresh_claims:commit", e))?;
+        Ok(lost)
+    }
+
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
 
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {

@@ -462,6 +462,106 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
     store.forward_queue_ack("g", &ids).await.expect("ack");
 }
 
+/// Forward-queue claim refresh: the holder can keep an entry from going idle,
+/// so another consumer's autoclaim does not take it; a refresh by anyone else
+/// moves nothing and reports the entry as not theirs; an entry that is done
+/// is reported too.
+async fn check_forward_queue_refresh_claims(store: Arc<dyn MediatorStore>) {
+    let group = "refresh-g";
+    let mut ours = Vec::new();
+    for message in ["refresh-kept", "refresh-done"] {
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: message.to_string(),
+            to_did_hash: "next_hash".to_string(),
+            from_did_hash: "from_hash".to_string(),
+            from_did: "did:peer:from".to_string(),
+            to_did: "did:peer:next".to_string(),
+            endpoint_url: "https://peer.example.com/inbound".to_string(),
+            received_at_ms: 1,
+            delay_milli: 0,
+            expires_at: NEVER,
+            retry_count: 0,
+            hop_count: 1,
+            not_before_ms: 0,
+        };
+        ours.push(
+            store
+                .forward_queue_enqueue(&entry, 0)
+                .await
+                .expect("forward_queue_enqueue"),
+        );
+    }
+    // The group reads from the start of the queue, which on a shared Redis DB
+    // may hold other checks' entries; only ours are used below.
+    let claimed = store
+        .forward_queue_read(group, "holder", 1000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    for id in &ours {
+        assert!(
+            claimed.iter().any(|e| &e.stream_id == id),
+            "the holder claims {id}"
+        );
+    }
+    let kept = ours[0].as_str();
+    let done = ours[1].as_str();
+    store
+        .forward_queue_ack_and_delete(group, &[done])
+        .await
+        .expect("ack and delete");
+
+    // Another consumer's refresh moves nothing and owns nothing.
+    let lost = store
+        .forward_queue_refresh_claims(group, "bystander", &[kept])
+        .await
+        .expect("refresh by a bystander");
+    assert_eq!(lost, vec![kept.to_string()], "not the bystander's");
+
+    // The holder still holds the one it kept, and not the one it finished.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[kept, done])
+        .await
+        .expect("refresh by the holder");
+    assert_eq!(
+        lost,
+        vec![done.to_string()],
+        "the finished entry is not held"
+    );
+
+    // Just refreshed, so it is not idle long enough for another to take.
+    let taken = store
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000)
+        .await
+        .expect("autoclaim");
+    assert!(
+        taken.iter().all(|e| e.stream_id != kept),
+        "a refreshed claim is not reclaimed"
+    );
+
+    // Left alone, it goes idle and is reclaimable; then the holder has lost it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let taken = store
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000)
+        .await
+        .expect("autoclaim");
+    assert!(
+        taken.iter().any(|e| e.stream_id == kept),
+        "reclaimed once idle"
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[kept])
+        .await
+        .expect("refresh after losing it");
+    assert_eq!(lost, vec![kept.to_string()], "taken over by the bystander");
+
+    store
+        .forward_queue_ack_and_delete(group, &[kept])
+        .await
+        .expect("ack and delete");
+}
+
 /// Session-expiry: a session whose TTL has lapsed is reclaimed by
 /// `sweep_expired_sessions`, so `get_session` then errors. Both in-process
 /// backends must agree on this (the trait default is a no-op, so each
@@ -2694,6 +2794,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_outbox_receipts(store.clone()).await;
     check_purge_and_removal_receipts(store.clone()).await;
     check_mux_primitives(store.clone()).await;
+    check_forward_queue_refresh_claims(store.clone()).await;
     check_mux_grant_flows(store).await;
 }
 
@@ -2738,6 +2839,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn forward_queue_autoclaim() {
                 check_forward_queue_autoclaim(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_refresh_claims() {
+                check_forward_queue_refresh_claims(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn session_expiry_sweep() {

@@ -1961,6 +1961,16 @@ impl MediatorStore for RedisStore {
         Ok(inner.into_iter().map(fwd_entry_into_new).collect())
     }
 
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        self.forward_queue_refresh_claims(group_name, consumer_name, stream_ids)
+            .await
+    }
+
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
 
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {

@@ -296,6 +296,66 @@ impl Database {
     }
 }
 
+/// Reset the idle time of the entries in ARGV[3..] that consumer ARGV[2] of
+/// group ARGV[1] still holds, and return the ids it does not. Ownership is
+/// checked and the claim refreshed in one script, so a claim another
+/// consumer has taken over is never moved back.
+///
+/// KEYS: [1] the stream.
+static REFRESH_CLAIMS: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local lost = {}
+for i = 3, #ARGV do
+  local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1)
+  if p[1] and p[1][2] == ARGV[2] then
+    redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[i], 'JUSTID')
+  else
+    lost[#lost + 1] = ARGV[i]
+  end
+end
+return lost
+"#,
+    )
+});
+
+/// Ids per refresh script call, so one call does not hold Redis for long.
+const REFRESH_CHUNK: usize = 256;
+
+impl Database {
+    /// See [`MediatorStore::forward_queue_refresh_claims`](crate::store::MediatorStore::forward_queue_refresh_claims).
+    pub async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let mut lost = Vec::new();
+        if stream_ids.is_empty() {
+            return Ok(lost);
+        }
+        let mut conn = self.get_connection().await?;
+        for chunk in stream_ids.chunks(REFRESH_CHUNK) {
+            let mut invocation = REFRESH_CLAIMS.key("FORWARD_Q");
+            invocation.arg(group_name).arg(consumer_name);
+            for id in chunk {
+                invocation.arg(*id);
+            }
+            let chunk_lost: Vec<String> =
+                invocation.invoke_async(&mut conn).await.map_err(|err| {
+                    event!(Level::ERROR, "forward claim refresh error: {}", err);
+                    MediatorError::DatabaseError(
+                        96,
+                        "forwarding".into(),
+                        format!("forward claim refresh error: {err}"),
+                    )
+                })?;
+            lost.extend(chunk_lost);
+        }
+        Ok(lost)
+    }
+}
+
 fn parse_forward_entry(
     stream_id: String,
     fields: HashMap<String, String>,

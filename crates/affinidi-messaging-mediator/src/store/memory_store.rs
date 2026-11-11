@@ -1962,6 +1962,28 @@ impl MediatorStore for MemoryStore {
         Ok(out)
     }
 
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let group = state.forward_groups.get_mut(group_name);
+        let mut lost = Vec::new();
+        let Some(group) = group else {
+            return Ok(stream_ids.iter().map(|id| id.to_string()).collect());
+        };
+        for id in stream_ids {
+            match parse_stream_id(id).and_then(|parsed| group.pending.get_mut(&parsed)) {
+                Some(claim) if claim.consumer == consumer_name => claim.claimed_at = now,
+                _ => lost.push(id.to_string()),
+            }
+        }
+        Ok(lost)
+    }
+
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
 
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {

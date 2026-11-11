@@ -1680,6 +1680,22 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         count: usize,
     ) -> Result<Vec<ForwardQueueEntry>, MediatorError>;
 
+    /// Reset the idle time of each of `stream_ids` that `consumer_name` still
+    /// has claimed, so another consumer's
+    /// [`forward_queue_autoclaim`](Self::forward_queue_autoclaim) does not take
+    /// an entry this one is still working on. An entry claimed by another
+    /// consumer is left alone: the refresh never moves a claim.
+    ///
+    /// Returns the ids `consumer_name` no longer holds — claimed by another
+    /// consumer, acked, or gone from the queue. The caller must not deliver
+    /// those.
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError>;
+
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
 
     /// Reset the streaming session set for this mediator instance.
