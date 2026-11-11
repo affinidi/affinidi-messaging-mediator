@@ -57,6 +57,44 @@ mediator-tui 0.11.0); they are no longer updated.
   sender-side code. Every recipient-side refusal (no account, no
   `RECEIVE_MESSAGES`, access list) is still the single `73
   delivery.refused`. The TSP path already ran its checks in this order.
+### Changed — live mux members and monitor subscriptions follow account changes
+
+- A mux member stays on a connection only while its own account stands: it
+  exists, is not blocked, and its ACLs still cover the member's scope. That
+  was checked only when the member was admitted. It is now checked again:
+  - at once, on this instance, when `account/update` changes the member's
+    ACLs or `account/remove` removes it;
+  - before each pickup or delete made for the member on the connection, and
+    before a `tsp-mux` drain walks its inbox;
+  - by the connection's 30-second sweep, which catches a change made on
+    another instance or directly in the store.
+
+  A member whose standing has lapsed is detached, with a `detached` event
+  naming `accountBlocked` or `accountRemoved`. Members admitted by a session
+  attach are covered as well as grant-admitted ones; until now an attach
+  outlived its member's removal. A store failure during a re-check keeps the
+  member, but the request it was made for is refused.
+- A live frame for a member whose admission has expired is no longer
+  written in the moments before the sweep removes the member.
+- A `messaging/monitor/subscribe` subscription whose filter reaches beyond
+  its owner's own account (one only an administrator may open) now needs its
+  owner to still be an administrator (the store's admin check) each time a
+  batch is sent. Any subscription also ends when its owner's account is
+  removed or blocked. When that happens, pending events are discarded and
+  counted as dropped. A last batch with no events and `expiresAt` set to now
+  tells the subscriber the subscription has ended, and a renewal then gets
+  `unknownSubscription`. If the subscription had administrator reach, its
+  end is written to the audit log as `monitorUnsubscribe`. A batch whose
+  standing check cannot read the store is withheld and counted as dropped.
+
+**Behaviour change (R3.6):** a principal can lose a member before the grant
+or attach expires, when an administrator blocks or removes the member's
+account or narrows its ACLs. Clients already handle `detached` with these
+reasons, which the event schema defines. An administrator demoted
+mid-lease stops receiving monitor batches at the next batch rather than at
+the end of the lease. A client that renews only shortly before `expiresAt`
+should treat a batch whose `expiresAt` has already passed as the end of
+the subscription.
 
 ### Added — `messaging/mux/connections` and the console's Mux tab
 

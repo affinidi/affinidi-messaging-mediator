@@ -924,6 +924,124 @@ async fn a_standard_account_monitors_only_itself() {
     assert!(stolen.is_err());
 }
 
+/// A subscription with an administrator's reach keeps it only while its
+/// owner is an administrator: demoted mid-lease, the next batch is not sent.
+/// Its last batch carries no events and an `expiresAt` cut to now, a renewal
+/// finds no subscription, and the end is on the audit log.
+#[tokio::test]
+async fn a_demoted_administrators_monitor_ends_at_its_next_batch() {
+    use affinidi_messaging_sdk::protocols::trust_tasks::decode_monitor_event;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
+
+    let env = direct_env().await;
+    let alice = env.add_user("alice").await.expect("alice");
+    let bob = env.add_user("bob").await.expect("bob");
+    let admin = promoted(&env, "admin", AccountType::Admin).await;
+    let auditor = promoted(&env, "auditor", AccountType::Admin).await;
+    let tt = env.atm.trust_tasks();
+
+    let filter: MonitorFilter =
+        serde_json::from_value(json!({ "dids": [bob.did_hash()] })).unwrap();
+    let sub = tt
+        .monitor_subscribe(&admin.profile, Some(filter), Some(600), None, None)
+        .await
+        .expect("admin subscribes");
+    let sub_id = sub.subscription_id.to_string();
+
+    // Served while an administrator.
+    send_direct(&env, &alice, &bob).await;
+    let bob_hash = bob.did_hash();
+    await_monitor_event(
+        &env,
+        &admin,
+        |e| e["stage"] == "stored" && e["to"] == bob_hash.as_str(),
+        common::EVENT_WAIT,
+    )
+    .await
+    .expect("seen while an administrator");
+
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Standard)
+        .await
+        .expect("demote");
+    send_direct(&env, &alice, &bob).await;
+
+    // The batch that would carry it is the subscription's last: no events,
+    // and its lease ends now.
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let last = loop {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "no final batch after the demotion"
+        );
+        let Some((message, _)) = env
+            .atm
+            .message_pickup()
+            .live_stream_next(&admin.profile, Some(Duration::from_millis(500)), false)
+            .await
+            .expect("live stream")
+        else {
+            continue;
+        };
+        let Some(batch) = decode_monitor_event(&message) else {
+            continue;
+        };
+        let p = serde_json::to_value(&batch.payload).unwrap();
+        if p["subscriptionId"] != sub_id.as_str() {
+            continue;
+        }
+        let expires = chrono::DateTime::parse_from_rfc3339(p["expiresAt"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        if expires <= chrono::Utc::now() {
+            break p;
+        }
+        // A batch sent before the demotion was seen: it may only hold what
+        // was observed then.
+    };
+    assert_eq!(
+        last["events"],
+        json!([]),
+        "nothing after the lapse: {last:#}"
+    );
+    assert!(
+        await_monitor_event(
+            &env,
+            &admin,
+            |e| e["to"] == bob_hash.as_str(),
+            Duration::from_millis(1500)
+        )
+        .await
+        .is_none(),
+        "no batch follows the last"
+    );
+
+    // Gone: a renewal finds nothing to renew.
+    let mut renewed = Ok(());
+    for _ in 0..20 {
+        renewed = tt
+            .monitor_subscribe(&admin.profile, None, Some(60), None, Some(sub_id.clone()))
+            .await
+            .map(|_| ());
+        if renewed.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(renewed.is_err(), "the ended subscription cannot be renewed");
+
+    let audit = tt
+        .audit_list(&auditor.profile, None, None)
+        .await
+        .expect("audit");
+    let text = format!("{audit:?}");
+    assert!(
+        text.contains("monitorUnsubscribe") && text.contains("no longer an administrator"),
+        "the end is audited: {text}"
+    );
+}
+
 /// A monitor subscription made over TSP is served, like every other
 /// management task. It used to be refused: monitor batches are live-only and
 /// a raw-TSP socket discards an ordinary push, so a subscription made over TSP
