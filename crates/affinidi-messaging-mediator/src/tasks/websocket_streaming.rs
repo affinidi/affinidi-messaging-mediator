@@ -396,6 +396,21 @@ fn try_queue(
     true
 }
 
+/// Tell the socket that `did_hash` has stored mail it was not pushed, so the
+/// client is prompted to collect it (a pickup `status` on DIDComm, a drain on
+/// raw TSP).
+///
+/// On a mux connection the resync is owed to this DID, not the socket:
+/// recorded before the shared flag goes up, so the socket finds it. Repeated
+/// raises collapse into one signal, which is the right shape: the client's
+/// answer to any number of them is the same single collection.
+fn raise_resync(slots: Option<&Arc<MuxSlots>>, resync: &AtomicBool, did_hash: &str) {
+    if let Some(slots) = slots {
+        slots.raise_resync(did_hash);
+    }
+    resync.store(true, Ordering::Relaxed);
+}
+
 /// Push one live notification to a registered client, raising its resync flag
 /// if the push could not be queued.
 ///
@@ -426,14 +441,7 @@ fn deliver_live(
         debug!("Sent message to client ({did_hash})");
         return true;
     }
-    // On a mux connection the resync is owed to this DID, not the socket:
-    // recorded before the shared flag goes up, so the socket finds it.
-    if let Some(slots) = &entry.slots {
-        slots.raise_resync(did_hash);
-    }
-    // Repeated drops collapse into one signal, which is the right shape: the
-    // client's answer to any number of them is the same single drain.
-    entry.resync.store(true, Ordering::Relaxed);
+    raise_resync(entry.slots.as_ref(), &entry.resync, did_hash);
     debug!(
         did_hash = %did_hash,
         "live notification dropped; resync raised for the socket handler"
@@ -797,10 +805,10 @@ impl StreamingTask {
         active: bool,
     ) {
         // The socket to flush to, captured while the entry is borrowed.
-        let (client_tx, client_slots) = match clients.get_mut(did_hash) {
+        let (client_tx, client_slots, client_resync) = match clients.get_mut(did_hash) {
             Some(entry) if entry.session_id == session_id => {
                 entry.active = active;
-                (entry.tx.clone(), entry.slots.clone())
+                (entry.tx.clone(), entry.slots.clone(), entry.resync.clone())
             }
             Some(entry) => {
                 // A standby entry keeps its wish, so that it is honoured if
@@ -872,6 +880,7 @@ impl StreamingTask {
                     Arc::clone(database),
                     client_tx,
                     client_slots,
+                    client_resync,
                     self.send_budget.clone(),
                     did_hash.to_string(),
                     session_id.to_string(),
@@ -1139,6 +1148,7 @@ impl StreamingTask {
         );
         let client_tx = entry.tx.clone();
         let client_slots = entry.slots.clone();
+        let client_resync = entry.resync.clone();
         let session_id = entry.session_id.clone();
         let state = if entry.active {
             StreamingClientState::Live
@@ -1162,6 +1172,7 @@ impl StreamingTask {
                     Arc::clone(database),
                     client_tx,
                     client_slots,
+                    client_resync,
                     self.send_budget.clone(),
                     did_hash.to_string(),
                     session_id,
@@ -1257,11 +1268,17 @@ fn remove_standby(
 /// re-cover, not an ack. The client deletes what it has processed via the
 /// normal message-pickup path, so this is at-least-once and idempotent by
 /// message id.
+///
+/// A drain that stops before the end of the inbox (the socket's queue or the
+/// byte budget is full, the safety cap is reached, or a fetch fails) raises
+/// the client's resync, as a dropped live push does: what is left is still
+/// stored, and a client that only listens would otherwise never learn of it.
 #[allow(clippy::too_many_arguments)]
 fn spawn_inbox_redelivery(
     database: Arc<dyn MediatorStore>,
     client_tx: mpsc::Sender<QueuedCommand>,
     client_slots: Option<Arc<MuxSlots>>,
+    client_resync: Arc<AtomicBool>,
     budget: WsSendBudget,
     did_hash: String,
     session_id: String,
@@ -1272,6 +1289,8 @@ fn spawn_inbox_redelivery(
     tokio::spawn(async move {
         let mut start_id: Option<String> = None;
         let mut total: usize = 0;
+        // Set when the drain stops with messages possibly left behind.
+        let mut cut_short = false;
 
         'drain: loop {
             let options = FetchOptions {
@@ -1299,6 +1318,7 @@ fn spawn_inbox_redelivery(
                         did_hash = %did_hash,
                         "Inbox redelivery fetch failed, aborting drain: {err}"
                     );
+                    cut_short = true;
                     break 'drain;
                 }
             };
@@ -1323,9 +1343,9 @@ fn spawn_inbox_redelivery(
                 };
 
                 // Fetched with `DoNotDelete`, so anything not queued here stays
-                // in the inbox. Stopping the drain early is therefore lossless —
-                // the client picks the remainder up via normal message-pickup,
-                // exactly as it does when REDELIVERY_MAX is hit.
+                // in the inbox. Stopping the drain early is therefore lossless,
+                // and the resync raised below tells the client to collect the
+                // remainder through message-pickup.
                 if !try_queue_message(
                     &client_tx,
                     client_slots.as_ref(),
@@ -1339,6 +1359,7 @@ fn spawn_inbox_redelivery(
                         "Send queue or byte budget unavailable mid-redelivery; \
                          stopping drain, remainder left for message-pickup"
                     );
+                    cut_short = true;
                     break 'drain;
                 }
                 metrics::counter!(WEBSOCKET_REDELIVERED_MESSAGES_TOTAL).increment(1);
@@ -1351,6 +1372,7 @@ fn spawn_inbox_redelivery(
                         "Inbox redelivery hit its safety cap; remaining messages \
                          left for normal message-pickup"
                     );
+                    cut_short = true;
                     break 'drain;
                 }
             }
@@ -1361,7 +1383,10 @@ fn spawn_inbox_redelivery(
             }
         }
 
-        if total > 0 {
+        if cut_short {
+            raise_resync(client_slots.as_ref(), &client_resync, &did_hash);
+            debug!(did_hash = %did_hash, total, "Inbox redelivery stopped early; resync raised");
+        } else if total > 0 {
             debug!(did_hash = %did_hash, total, "Inbox redelivery complete");
         }
         replay_in_progress.remove(&did_hash);
@@ -1984,6 +2009,71 @@ mod tests {
                 ..
             }) => assert_eq!(msg, stored),
             _ => panic!("expected the queued message to be redelivered on activation"),
+        }
+    }
+
+    /// A redelivery that cannot queue everything (here a send queue with room
+    /// for one) stops, and raises the client's resync so the rest is
+    /// collected through message-pickup. Before, it stopped silently, and a
+    /// client that only listens never learned the rest was there. A drain
+    /// that reaches the end raises nothing.
+    #[tokio::test]
+    async fn a_redelivery_cut_short_raises_the_resync() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:dave");
+        for i in 0..3 {
+            database
+                .store_message("sess-store", &format!("m{i}"), &did_hash, None, 0, 1000)
+                .await
+                .expect("store message");
+        }
+        let task = streaming_task();
+        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+
+        for (room, cut_short) in [(1, true), (5, false)] {
+            let (tx, mut rx) = mpsc::channel(room);
+            let resync = Arc::new(AtomicBool::new(false));
+            let mut clients = HashMap::from([(
+                did_hash.clone(),
+                ClientEntry {
+                    tx,
+                    session_id: "A".to_string(),
+                    active: false,
+                    registered_at: Instant::now(),
+                    resync: resync.clone(),
+                    churn_streak: 0,
+                    kind: EntryKind::Direct,
+                    slots: None,
+                },
+            )]);
+            task._handle_activation(
+                &database,
+                &mut clients,
+                &mut HashMap::new(),
+                &replay_in_progress,
+                &did_hash,
+                "A",
+                true,
+            )
+            .await;
+            // The drain runs detached; it is done once its guard is released.
+            timeout(StdDuration::from_secs(2), async {
+                while replay_in_progress.contains(&did_hash) {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the redelivery finishes");
+            let mut queued = 0;
+            while rx.try_recv().is_ok() {
+                queued += 1;
+            }
+            assert_eq!(queued, room.min(3), "room for {room}");
+            assert_eq!(
+                resync.load(Ordering::Relaxed),
+                cut_short,
+                "room for {room}: resync raised only when messages were left behind"
+            );
         }
     }
 
