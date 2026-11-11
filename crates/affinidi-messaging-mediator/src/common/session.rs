@@ -17,6 +17,18 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 use tracing::warn;
 
+/// What a session token may be used for. Access and refresh tokens share
+/// the signing key, header and audience, so this claim is what tells them
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenUse {
+    /// Bearer credential for the REST routes and `/ws`.
+    Access,
+    /// Exchanged once at `/authenticate/refresh` for a new token pair.
+    Refresh,
+}
+
 /// JWT claims embedded in session tokens issued after authentication.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionClaims {
@@ -28,6 +40,15 @@ pub struct SessionClaims {
     pub session_id: String,
     /// Expiration time as a Unix timestamp.
     pub exp: u64,
+    /// What the token is for. `None` only on tokens minted by a release
+    /// that did not set it — see `jwt_auth::unmarked_token_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_use: Option<TokenUse>,
+    /// Random token id, set on refresh tokens. EdDSA signatures are
+    /// deterministic, so without it two refresh tokens issued for one
+    /// session in the same second would be the same string (and hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 /// Lifecycle state of an authentication session.
