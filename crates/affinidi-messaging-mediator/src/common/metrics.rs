@@ -123,6 +123,10 @@ pub mod names {
     /// apart from "never generated", which is the distinction an alert on
     /// [`WS_LIVE_RESYNC_SENT`] alone cannot make.
     pub const WS_LIVE_RESYNC_SUPPRESSED: &str = "ws_live_resync_suppressed_total";
+    /// counter: WebSocket writes that did not complete within the write
+    /// timeout. Each one closes its connection: the peer has stopped reading,
+    /// and nothing queued for it is reported delivered.
+    pub const WS_WRITE_TIMEOUTS_TOTAL: &str = "ws_write_timeouts_total";
     /// counter: Live pushes for a DID on a mux connection refused because that
     /// DID already held its own share (8) of the connection's send queue.
     ///

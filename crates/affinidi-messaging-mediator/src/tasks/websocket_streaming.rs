@@ -165,6 +165,21 @@ struct ClientEntry {
     slots: Option<Arc<MuxSlots>>,
 }
 
+impl ClientEntry {
+    /// Whether this entry is the one the connection with `session_id` and
+    /// send queue `channel` registered.
+    fn is_registered_by(
+        &self,
+        session_id: &str,
+        channel: &mpsc::WeakSender<QueuedCommand>,
+    ) -> bool {
+        self.session_id == session_id
+            && channel
+                .upgrade()
+                .is_some_and(|tx| tx.same_channel(&self.tx))
+    }
+}
+
 /// Used when updating the streaming state.
 /// Register: Creates the hash map entry for the DID hash and TX Channel
 /// Start: Start streaming messages to clients.
@@ -196,11 +211,19 @@ pub enum StreamingUpdateState {
     /// Disable live delivery for the socket owned by `session_id`.
     Stop { session_id: String },
     /// Remove the map entry for this DID — but only if it is still *this*
-    /// session's entry. `clients` is keyed by DID hash, not by connection, so a
-    /// deregistration must name the session it belongs to: a socket that has
-    /// already been replaced (one DID, one slot) would otherwise evict its
-    /// successor on the way out. See the session-id check in the handler.
-    Deregister { session_id: String },
+    /// connection's entry. `clients` is keyed by DID hash, not by connection,
+    /// so a deregistration must name the connection it belongs to: a socket
+    /// that has already been replaced (one DID, one slot) would otherwise
+    /// evict its successor on the way out.
+    ///
+    /// The session id alone does not name a connection: every socket opened
+    /// with the same access token shares it. `channel` is the send queue the
+    /// connection registered, held weakly so it does not keep that queue
+    /// open; an entry is this connection's only if it holds that queue.
+    Deregister {
+        session_id: String,
+        channel: mpsc::WeakSender<QueuedCommand>,
+    },
     /// A registration on another instance took this DID from this
     /// instance's mux entry: a direct socket there outranks it, or a newer
     /// mux connection there carries it. The entry stands by, and its
@@ -425,6 +448,29 @@ fn try_queue(
     true
 }
 
+/// Tell a client's socket to close, without waiting on its send queue.
+///
+/// This runs in the single loop that serves every DID, so it must not await a
+/// queue a slow client may never drain. A `Close` goes behind the frames
+/// already queued, so when the queue is full it is handed to a task of its
+/// own, which holds the sender until the socket takes the `Close` or goes
+/// away. That task is bounded by the socket: once the handler exits (at the
+/// latest when a write times out) the send fails and the task ends.
+fn send_close(tx: &mpsc::Sender<QueuedCommand>, why: CloseReason) {
+    match tx.try_send(QueuedCommand::control(WebSocketCommands::Close(why))) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(close)) => {
+            debug!(reason = ?why, "Send queue full; queuing close in the background");
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(close).await;
+            });
+        }
+        // The socket has already gone; there is nothing to close.
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 /// Tell the socket that `did_hash` has stored mail it was not pushed, so the
 /// client is prompted to collect it (a pickup `status` on DIDComm, a drain on
 /// raw TSP).
@@ -635,47 +681,8 @@ impl StreamingTask {
                                 StreamingUpdateState::Stop { session_id } => {
                                     self._handle_activation(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, false).await;
                                 },
-                                StreamingUpdateState::Deregister { session_id } => {
-                                    // A standby entry leaving takes nothing live with it.
-                                    if remove_standby(&mut standby, &value.did_hash, session_id) {
-                                        debug!(did_hash = %value.did_hash, leaving_session = %session_id, "Deregistered a standby entry");
-                                        continue;
-                                    }
-                                    // Only the session that currently owns the slot may
-                                    // vacate it. One DID has one entry, so a socket that
-                                    // was already replaced still runs its own teardown —
-                                    // and an unconditional remove here would take the
-                                    // *successor's* channel out with it. Dropping that
-                                    // `tx` closes the live socket's command channel, so
-                                    // its handler exits with "streaming task unavailable"
-                                    // and the client sees the connection closed for no
-                                    // reason it can act on. Common whenever one DID hands
-                                    // off between transports (a DIDComm session closing
-                                    // as a raw-TSP socket opens).
-                                    match clients.get(value.did_hash.as_str()) {
-                                        Some(entry) if entry.session_id != *session_id => {
-                                            debug!(
-                                                did_hash = %value.did_hash,
-                                                leaving_session = %session_id,
-                                                current_session = %entry.session_id,
-                                                "Ignoring deregistration from a replaced session; the slot belongs to a newer connection",
-                                            );
-                                        }
-                                        Some(_) => {
-                                            clients.remove(value.did_hash.as_str());
-                                            info!("Deregistered streaming for DID: ({}) registered_clients({})", value.did_hash, clients.len());
-                                            if !self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await {
-                                                self.release(&database, &value.did_hash).await;
-                                            }
-                                        }
-                                        None => {
-                                            debug!(
-                                                did_hash = %value.did_hash,
-                                                leaving_session = %session_id,
-                                                "Deregistration for a DID with no registered client",
-                                            );
-                                        }
-                                    }
+                                StreamingUpdateState::Deregister { session_id, channel } => {
+                                    self._handle_deregistration(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, channel).await;
                                 }
                                 StreamingUpdateState::RemoteTaken => {
                                     stand_by_taken(&mut clients, &mut standby, &value.did_hash);
@@ -951,6 +958,68 @@ impl StreamingTask {
         }
     }
 
+    /// Remove the entry `channel` registered for `did_hash`, if it still has
+    /// one: from standby, or from the live slot, promoting a standby entry in
+    /// its place.
+    #[allow(clippy::too_many_arguments)]
+    async fn _handle_deregistration(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replay_in_progress: &Arc<DashSet<String>>,
+        did_hash: &str,
+        session_id: &str,
+        channel: &mpsc::WeakSender<QueuedCommand>,
+    ) {
+        // A standby entry leaving takes nothing live with it.
+        if remove_standby(standby, did_hash, session_id, channel) {
+            debug!(did_hash = %did_hash, leaving_session = %session_id, "Deregistered a standby entry");
+            return;
+        }
+        // Only the connection that currently owns the slot may vacate it. One
+        // DID has one entry, so a socket that was already replaced still runs
+        // its own teardown — and an unconditional remove here would take the
+        // *successor's* channel out with it. Dropping that `tx` closes the
+        // live socket's command channel, so its handler exits with "streaming
+        // task unavailable" and the client sees the connection closed for no
+        // reason it can act on. Common whenever one DID hands off between
+        // transports (a DIDComm session closing as a raw-TSP socket opens),
+        // and when a client reconnects with the token it already holds while
+        // its previous socket is still winding down.
+        match clients.get(did_hash) {
+            Some(entry) if !entry.is_registered_by(session_id, channel) => {
+                debug!(
+                    did_hash = %did_hash,
+                    leaving_session = %session_id,
+                    current_session = %entry.session_id,
+                    "Ignoring deregistration from a replaced connection; the slot belongs to a newer one",
+                );
+            }
+            Some(_) => {
+                clients.remove(did_hash);
+                info!(
+                    "Deregistered streaming for DID: ({}) registered_clients({})",
+                    did_hash,
+                    clients.len()
+                );
+                if !self
+                    .promote_standby(database, clients, standby, replay_in_progress, did_hash)
+                    .await
+                {
+                    self.release(database, did_hash).await;
+                }
+            }
+            None => {
+                debug!(
+                    did_hash = %did_hash,
+                    leaving_session = %session_id,
+                    "Deregistration for a DID with no registered client",
+                );
+            }
+        }
+    }
+
     /// Helper function to handle the registration of a new client.
     /// Handles if this is a duplicate channel for a DID
     async fn _handle_registration(
@@ -990,11 +1059,7 @@ impl StreamingTask {
                  the upstream session is missing its authenticated DID. \
                  Closing the channel."
             );
-            let _ = client_tx
-                .send(QueuedCommand::control(WebSocketCommands::Close(
-                    CloseReason::Unauthenticated,
-                )))
-                .await;
+            send_close(client_tx, CloseReason::Unauthenticated);
             return;
         }
 
@@ -1109,11 +1174,7 @@ impl StreamingTask {
                         "Refusing duplicate WebSocket registration (duel damper)",
                     );
                 }
-                let _ = client_tx
-                    .send(QueuedCommand::control(WebSocketCommands::Close(
-                        CloseReason::Refused,
-                    )))
-                    .await;
+                send_close(client_tx, CloseReason::Refused);
                 return;
             }
 
@@ -1153,12 +1214,7 @@ impl StreamingTask {
                 metrics::counter!(WEBSOCKET_DUPLICATE_CHURN_TOTAL).increment(1);
             }
             // Channel already exists, close the old one.
-            let _ = old
-                .tx
-                .send(QueuedCommand::control(WebSocketCommands::Close(
-                    CloseReason::Replaced,
-                )))
-                .await;
+            send_close(&old.tx, CloseReason::Replaced);
             true
         } else {
             false
@@ -1459,12 +1515,13 @@ fn remove_standby(
     standby: &mut HashMap<String, Vec<ClientEntry>>,
     did_hash: &str,
     session_id: &str,
+    channel: &mpsc::WeakSender<QueuedCommand>,
 ) -> bool {
     let Some(waiting) = standby.get_mut(did_hash) else {
         return false;
     };
     let before = waiting.len();
-    waiting.retain(|e| e.session_id != session_id);
+    waiting.retain(|e| !e.is_registered_by(session_id, channel));
     let removed = waiting.len() != before;
     if waiting.is_empty() {
         standby.remove(did_hash);
@@ -2162,6 +2219,138 @@ mod tests {
         );
     }
 
+    /// Replacing a socket whose send queue is full returns at once: the
+    /// registration path runs in the loop that serves every DID, so it must
+    /// not wait for the old socket to drain. The old socket still gets its
+    /// `Close(Replaced)`, behind the frames already queued, once it reads.
+    #[tokio::test]
+    async fn replacing_a_socket_with_a_full_queue_does_not_wait_for_it() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:full-queue";
+        let did_hash = digest(did);
+        let task = streaming_task();
+        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+
+        let (a_tx, mut a_rx) = mpsc::channel(1);
+        a_tx.try_send(QueuedCommand::for_test(Some(&did_hash)))
+            .expect("fill A's queue");
+        clients.insert(
+            did_hash.clone(),
+            ClientEntry {
+                tx: a_tx,
+                session_id: "A".to_string(),
+                active: true,
+                registered_at: Instant::now() - CHURN_WINDOW,
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+                kind: EntryKind::Direct,
+                slots: None,
+            },
+        );
+
+        let (b_tx, _b_rx) = mpsc::channel(5);
+        timeout(
+            StdDuration::from_secs(1),
+            task._handle_registration(
+                &database,
+                &mut clients,
+                &mut HashMap::new(),
+                &replay_in_progress,
+                &reg(did, "B", b_tx, EntryKind::Direct),
+            ),
+        )
+        .await
+        .expect("registration must not wait on the old socket's full queue");
+
+        assert_eq!(
+            clients.get(&did_hash).map(|e| e.session_id.as_str()),
+            Some("B")
+        );
+
+        // A drains: first the frame it already had, then the close.
+        assert!(matches!(
+            next_cmd(&mut a_rx).await.cmd,
+            WebSocketCommands::Message(_)
+        ));
+        assert!(matches!(
+            next_cmd(&mut a_rx).await.cmd,
+            WebSocketCommands::Close(CloseReason::Replaced)
+        ));
+    }
+
+    /// Two sockets opened with one access token share its session id. The
+    /// replaced one's teardown must not take the slot from the socket that
+    /// replaced it, even when its `Close` never reached it (its queue was
+    /// full, and it went away before reading).
+    #[tokio::test]
+    async fn a_replaced_socket_sharing_the_session_id_does_not_deregister_its_successor() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:shared-session";
+        let did_hash = digest(did);
+        let task = streaming_task();
+        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+        let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
+
+        let (a_tx, a_rx) = mpsc::channel(1);
+        let a_channel = a_tx.downgrade();
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay_in_progress,
+            &reg(did, "S", a_tx.clone(), EntryKind::Direct),
+        )
+        .await;
+        a_tx.try_send(QueuedCommand::for_test(Some(&did_hash)))
+            .expect("fill A's queue");
+        clients
+            .get_mut(&did_hash)
+            .expect("A registered")
+            .registered_at = Instant::now() - CHURN_WINDOW;
+
+        let (b_tx, _b_rx) = mpsc::channel(5);
+        let b_channel = b_tx.downgrade();
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay_in_progress,
+            &reg(did, "S", b_tx, EntryKind::Direct),
+        )
+        .await;
+
+        // A goes away without reading its queue, then tears down.
+        drop(a_rx);
+        drop(a_tx);
+        task._handle_deregistration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay_in_progress,
+            &did_hash,
+            "S",
+            &a_channel,
+        )
+        .await;
+        let b = clients.get(&did_hash).expect("B keeps the slot");
+        assert!(b.is_registered_by("S", &b_channel));
+
+        // B's own teardown does remove it.
+        task._handle_deregistration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replay_in_progress,
+            &did_hash,
+            "S",
+            &b_channel,
+        )
+        .await;
+        assert!(clients.get(&did_hash).is_none());
+    }
+
     /// Enabling live delivery must deliver what is **already queued**.
     ///
     /// The gap this closes: `_store_message` streams a message only if the
@@ -2812,6 +3001,8 @@ mod tests {
     async fn a_standby_entry_leaving_does_not_touch_the_live_one() {
         let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
         let (tx, _rx) = mpsc::channel(1);
+        let channel = tx.downgrade();
+        let (other_tx, _other_rx) = mpsc::channel::<QueuedCommand>(1);
         standby.insert(
             "h".into(),
             vec![ClientEntry {
@@ -2825,8 +3016,15 @@ mod tests {
                 slots: None,
             }],
         );
-        assert!(!remove_standby(&mut standby, "h", "someone-else"));
-        assert!(remove_standby(&mut standby, "h", "mux"));
+        assert!(!remove_standby(&mut standby, "h", "someone-else", &channel));
+        // Same session, another connection's queue.
+        assert!(!remove_standby(
+            &mut standby,
+            "h",
+            "mux",
+            &other_tx.downgrade()
+        ));
+        assert!(remove_standby(&mut standby, "h", "mux", &channel));
         assert!(standby.is_empty());
     }
 
