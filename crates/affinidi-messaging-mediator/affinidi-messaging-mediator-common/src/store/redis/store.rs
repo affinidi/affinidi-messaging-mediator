@@ -562,6 +562,10 @@ fn stat_counter_redis_field(counter: StatCounter) -> &'static str {
 
 #[async_trait]
 impl MediatorStore for RedisStore {
+    fn spans_processes(&self) -> bool {
+        true
+    }
+
     // ─── Bootstrap & health ─────────────────────────────────────────────────
 
     async fn initialize(&self) -> Result<(), MediatorError> {

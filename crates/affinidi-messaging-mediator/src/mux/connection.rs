@@ -369,7 +369,11 @@ pub async fn open(
     super::notice::expiring(state, &session.did_hash).await;
     let pending_notices = super::notice::pending(state, &session.did_hash).await;
     let nonce = mux.nonce.clone();
-    let conn = Arc::new(MuxConn::new(mux, tx, resync).with_slots(slots));
+    let conn = Arc::new(
+        MuxConn::new(mux, tx, resync)
+            .with_slots(slots)
+            .with_origin(wire, state.clock.unix_secs()),
+    );
     if let Some(streaming) = &state.streaming_task {
         for m in &admitted {
             conn.register_member(streaming, m).await;

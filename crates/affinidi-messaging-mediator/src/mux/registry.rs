@@ -61,6 +61,10 @@ pub struct MuxConn {
     pub inactive: Mutex<std::collections::HashSet<String>>,
     /// Wakes the socket loop to report `left` / `joined`.
     pub notify: tokio::sync::Notify,
+    /// The wire this connection speaks, for `messaging/mux/connections`.
+    pub wire: super::connection::MuxWire,
+    /// When the connection opened (unix seconds), for the same.
+    pub opened_at: u64,
 }
 
 impl MuxConn {
@@ -78,7 +82,16 @@ impl MuxConn {
             joined: Mutex::new(Vec::new()),
             inactive: Mutex::new(std::collections::HashSet::new()),
             notify: tokio::sync::Notify::new(),
+            wire: super::connection::MuxWire::DidComm,
+            opened_at: 0,
         }
+    }
+
+    /// Record the wire the connection speaks and when it opened.
+    pub fn with_origin(mut self, wire: super::connection::MuxWire, opened_at: u64) -> Self {
+        self.wire = wire;
+        self.opened_at = opened_at;
+        self
     }
 
     /// Queue this connection's frames through `slots`, so each member gets a

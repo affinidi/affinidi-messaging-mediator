@@ -565,3 +565,196 @@ async fn stats_show_counts_mux_connections_and_members() {
     assert_eq!(mux["membersByAttach"], 1);
     assert_eq!(mux["membersInactive"], 0);
 }
+
+/// `messaging/mux/connections`: an administrator lists the live mux
+/// connections, with each member's source, scope and delivery state; filters
+/// by member; pages under a member budget; and a non-administrator is
+/// refused.
+#[tokio::test]
+async fn an_administrator_lists_live_mux_connections() {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+    use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let temp = env.add_user("temp").await.unwrap();
+    let admin = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Admin)
+        .await
+        .expect("promote");
+    env.atm
+        .profile_add(&admin.profile, true)
+        .await
+        .expect("admin websocket");
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut ready_rx = device.profile.mux_ready().await.unwrap();
+    let ready = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(r) = ready_rx.borrow().clone() {
+                return r;
+            }
+            ready_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("ready");
+    let (g, grant_id) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[MuxCapability::Receive, MuxCapability::Delete],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g])
+        .await
+        .expect("grant");
+    let a = sign_attach(
+        &env.atm,
+        &temp.did,
+        &device.did,
+        &mediator_did,
+        &ready.session_id,
+        &ready.mux_nonce,
+        &[MuxCapability::Receive],
+        600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_attach(&device.profile, vec![a])
+        .await
+        .expect("attach");
+    let mut members_rx = device.profile.mux_members().await.unwrap();
+    members_until(&mut members_rx, "two members", |m| m.len() == 2).await;
+
+    let tasks = env.atm.trust_tasks();
+    let list = |q: MuxConnectionsQuery| {
+        let tasks = &tasks;
+        let admin = &admin;
+        async move {
+            serde_json::to_value(
+                tasks
+                    .mux_connections(&admin.profile, &q)
+                    .await
+                    .expect("mux_connections"),
+            )
+            .unwrap()
+        }
+    };
+
+    // Everything: one connection, both members, in DID order.
+    let page = list(MuxConnectionsQuery::all()).await;
+    assert_eq!(
+        page["coverage"], "allInstances",
+        "an in-process store: {page:#}"
+    );
+    let conns = page["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1, "{page:#}");
+    let c = &conns[0];
+    assert_eq!(c["principal"], device.did.as_str());
+    assert_eq!(c["sessionId"], ready.session_id.as_str());
+    assert_eq!(c["wire"], "didcomm");
+    assert_eq!(c["memberCount"], 2);
+    let mut want = [work.did.clone(), temp.did.clone()];
+    want.sort();
+    let dids: Vec<&str> = c["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["did"].as_str().unwrap())
+        .collect();
+    assert_eq!(dids, want.iter().map(String::as_str).collect::<Vec<_>>());
+    let by_did = |did: &str| {
+        c["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["did"] == did)
+            .cloned()
+            .unwrap()
+    };
+    let w = by_did(&work.did);
+    assert_eq!(w["source"], "grant");
+    assert_eq!(w["grantId"], grant_id.as_str());
+    assert_eq!(w["scope"], serde_json::json!(["receive", "delete"]));
+    assert_eq!(w["deliveryActive"], true);
+    let t = by_did(&temp.did);
+    assert_eq!(t["source"], "attach");
+    assert!(t.get("grantId").is_none());
+
+    // Filtered by member: that member alone, the count still exact.
+    let page = list(MuxConnectionsQuery::all().member(&work.did)).await;
+    let c = &page["connections"][0];
+    assert_eq!(c["members"].as_array().unwrap().len(), 1);
+    assert_eq!(c["members"][0]["did"], work.did.as_str());
+    assert_eq!(c["memberCount"], 2);
+    let none = list(MuxConnectionsQuery::all().principal(&work.did)).await;
+    assert_eq!(none["connections"], serde_json::json!([]));
+
+    // A member budget of one splits the connection across two pages.
+    let p1 = list(MuxConnectionsQuery::all().member_limit(1)).await;
+    assert_eq!(p1["connections"][0]["members"].as_array().unwrap().len(), 1);
+    let cursor = p1["nextCursor"].as_str().expect("more to come").to_string();
+    let p2 = list(
+        MuxConnectionsQuery::all()
+            .member_limit(1)
+            .cursor(cursor.clone()),
+    )
+    .await;
+    assert_eq!(p2["connections"][0]["sessionId"], ready.session_id.as_str());
+    assert_ne!(
+        p2["connections"][0]["members"][0]["did"],
+        p1["connections"][0]["members"][0]["did"]
+    );
+    assert!(p2.get("nextCursor").is_none());
+    // The cursor belongs to that request: other filters refuse it.
+    let refused = tasks
+        .mux_connections(
+            &admin.profile,
+            &MuxConnectionsQuery::all()
+                .member_limit(1)
+                .member(&work.did)
+                .cursor(cursor),
+        )
+        .await;
+    assert!(refused.is_err(), "a cursor for other filters: {refused:?}");
+
+    // A summary without members.
+    let summary = list(MuxConnectionsQuery::all().member_limit(0)).await;
+    assert_eq!(summary["connections"][0]["members"], serde_json::json!([]));
+    assert_eq!(summary["connections"][0]["memberCount"], 2);
+
+    // Not an administrator: refused.
+    env.atm
+        .profile_add(&work.profile, true)
+        .await
+        .expect("work websocket");
+    let refused = tasks
+        .mux_connections(&work.profile, &MuxConnectionsQuery::all())
+        .await;
+    assert!(
+        refused.is_err(),
+        "a standard account is refused: {refused:?}"
+    );
+}
