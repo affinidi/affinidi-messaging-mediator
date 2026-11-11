@@ -1142,15 +1142,20 @@ impl MediatorStore for MemoryStore {
         ))
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
         let mut state = self.state.lock().await;
         if !state.known_dids.iter().any(|d| d == did_hash) {
             state.known_dids.push(did_hash.to_string());
+        }
+        // Checked under the same lock as the insert, so an existing account is
+        // never replaced.
+        if state.accounts.contains_key(did_hash) {
+            return Ok(None);
         }
         let mut record = AccountRecord {
             acls: acls.clone(),
@@ -1164,7 +1169,7 @@ impl MediatorStore for MemoryStore {
         // A fresh account starts with no activity and no counters.
         state.activity.remove(did_hash);
         state.stats.remove(did_hash);
-        Ok(record.into_account(did_hash.to_string(), 0))
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
     }
 
     async fn account_remove(

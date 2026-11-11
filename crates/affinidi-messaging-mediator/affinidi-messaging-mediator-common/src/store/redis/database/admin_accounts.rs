@@ -19,7 +19,7 @@ impl Database {
         // Check if the admin account already exists
         if !self.account_exists(admin_did_hash).await? {
             debug!("Admin account doesn't exist, creating: {}", admin_did_hash);
-            self.account_add(admin_did_hash, acls, None).await?;
+            self.account_create(admin_did_hash, acls, None).await?;
         }
         let mut con = self.get_connection().await?;
 

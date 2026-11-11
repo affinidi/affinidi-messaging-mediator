@@ -29,6 +29,31 @@ mediator-tui 0.11.0); they are no longer updated.
   then the members of the selected one, with their delivery state, and its
   title says when the view covers this instance only.
 - Needs affinidi-messaging-sdk 0.45.6 (`TrustTasksOps::mux_connections`).
+### Changed — `account/add` is admin-only and never replaces an existing account
+
+- `messaging/account/add` for a DID that already has an account is refused
+  with `messaging/account/add:alreadyExists` (409), and the account is left
+  as it was. It used to be written afresh: role back to `standard`, ACLs
+  back to `global_acl_default`, queue limits, counters, activity and stats
+  cleared. Use `messaging/account/update` to change an existing account.
+- `messaging/account/add` now requires an `Admin` or `RootAdmin` account in
+  both `mediator_acl_mode`s. In `explicit_deny` any authenticated account
+  could call it; its own account always exists by then (authentication
+  creates it), so the only accounts it could add were other DIDs'.
+- `MediatorStore` gains `account_create`, which creates an account only if
+  none exists and returns `None` otherwise, with the check and the write in
+  one atomic step (a Lua script on Redis; under the store lock on memory and
+  Fjall). `account_add` is now a provided method built on it: it creates
+  the account or returns the existing one unchanged, so two first-contact
+  requests racing can no longer reset an account's counters. A third-party
+  `MediatorStore` implements `account_create` in place of `account_add`.
+- On Redis, a `DID:<hash>` record that holds only queue counters (written
+  when a message is stored for a party with no account) is completed by
+  `account_create` rather than refused, and its counters are kept.
+
+**Behaviour change (R3.6):** a non-admin client calling
+`messaging/account/add`, or any caller re-adding an existing account to
+reset it, now gets an error.
 
 ### Fixed — live delivery across mediator instances (Redis)
 

@@ -20,7 +20,7 @@ meaning entirely different things.
 
 | # | Layer | Scope | Set by | What it decides |
 |---|-------|-------|--------|-----------------|
-| 1 | `mediator_acl_mode` | mediator-wide | `mediator.toml` | Whether **unknown DIDs may authenticate**, and who may pre-register other DIDs via `account_add`. |
+| 1 | `mediator_acl_mode` | mediator-wide | `mediator.toml` | Whether **unknown DIDs may authenticate** (and so register themselves). |
 | 2 | `global_acl_default` | mediator-wide | `mediator.toml` | The ACL set handed to every new or unknown DID. |
 | 3 | `MediatorACLSet` | per DID | admin, or the DID itself where delegated | What that DID may do (19 permission bits). |
 | 4 | Access list | per DID | the DID (if delegated) or an admin | Which **senders** that DID accepts messages from. |
@@ -28,9 +28,8 @@ meaning entirely different things.
 Layers 1 and 4 both use `AccessListModeType`. They are unrelated:
 
 - **Layer 1** (`mediator_acl_mode`): `ExplicitAllow` = closed mediator —
-  only pre-registered DIDs may authenticate, only admins may add accounts.
-  `ExplicitDeny` = open mediator — any DID may authenticate and any
-  authenticated DID may add accounts.
+  only pre-registered DIDs may authenticate. `ExplicitDeny` = open mediator —
+  any DID may authenticate. In both, only admins add accounts for other DIDs.
 - **Layer 4** (a DID's own `access_list_mode` bit): `ExplicitAllow` = the
   access list is an **allowlist** (empty list ⇒ nobody may send to me).
   `ExplicitDeny` = it is a **denylist** (empty list ⇒ anybody may).
@@ -47,12 +46,14 @@ it is also `MediatorACLSet::default()`.
 mediator_acl_mode = "explicit_deny"   # or "explicit_allow"
 ```
 
-It has two effects: who may authenticate, and who may add accounts.
+It decides who may authenticate.
 
-| Mode | Authentication | `messaging/account/add` |
-|------|----------------|-------------------------|
-| `explicit_allow` | **Closed.** Only DIDs that already hold an account record may authenticate. An unknown DID is rejected at `/authenticate/challenge` with `403 authentication.blocked` and no account is created for it. | Only `Admin` / `RootAdmin` accounts may add accounts. |
-| `explicit_deny` | **Open.** Any DID may authenticate; an unknown DID is registered with `global_acl_default` once it answers the challenge (`/authenticate` or `/tsp/authenticate`). Requesting a challenge creates no account. | Any authenticated DID may add accounts. |
+| Mode | Authentication |
+|------|----------------|
+| `explicit_allow` | **Closed.** Only DIDs that already hold an account record may authenticate. An unknown DID is rejected at `/authenticate/challenge` with `403 authentication.blocked` and no account is created for it. |
+| `explicit_deny` | **Open.** Any DID may authenticate; an unknown DID is registered with `global_acl_default` once it answers the challenge (`/authenticate` or `/tsp/authenticate`). Requesting a challenge creates no account. |
+
+`messaging/account/add` is admin-only (`Admin` / `RootAdmin`) in both modes.
 
 In `explicit_allow`, the unknown-DID rejection is deliberately identical to
 the blocked-DID rejection (same status, error code, and problem report):
@@ -64,12 +65,12 @@ is treated as a revocation, not re-registered.
 **It does not affect message delivery.** No send, receive, forward, or
 pickup decision reads it.
 
-**It does not let a non-admin grant privileges.** A non-admin using
-`account_add` in `explicit_deny` mode always creates the account with
-`global_acl_default`; any ACLs it supplies are ignored. Only admins may
-specify custom ACLs. So in `explicit_deny` the worst a non-admin can do is
-create account records that would have been created anyway on first
-authentication.
+**`account_add` never changes an existing account.** Adding a DID that
+already has an account is refused with `messaging/account/add:alreadyExists`
+(409) and the account — role, ACLs, queue limits, counters, activity — is
+left exactly as it was. Change an existing account with
+`messaging/account/update`. The existence check and the write are one atomic
+step in every storage backend.
 
 > **Historical note.** Before mediator 0.18.0, `explicit_allow` did not gate
 > authentication (see the CHANGELOG). If you relied on unknown DIDs
@@ -90,7 +91,7 @@ and the fallback whenever a permission check runs against a DID with no
 stored record. On an open mediator (`explicit_deny`) it therefore decides
 what an arbitrary DID off the internet can do; on a closed mediator
 (`explicit_allow`) unknown DIDs never authenticate, and this setting only
-matters as the account_add default and the no-record fallback.
+matters as the `account_add` default and the no-record fallback.
 
 It is consumed in four places:
 
@@ -134,14 +135,12 @@ from everyone.
 
 ## 4. How a DID gets an account
 
-Six paths, and they do **not** all grant the same ACLs:
+Four paths, and they do **not** all grant the same ACLs:
 
 | Path | Trigger | ACLs granted |
 |------|---------|--------------|
-| Authentication challenge | Any DID requesting `/authenticate/challenge` — `explicit_deny` mode only (`explicit_allow` rejects unknown DIDs instead) | `global_acl_default` |
-| Authentication response | Backstop if the record vanished mid-flow — `explicit_deny` mode only (`explicit_allow` rejects instead) | `global_acl_default` |
+| Login | A DID answering its challenge (`/authenticate`, `/tsp/authenticate`) — `explicit_deny` mode only (`explicit_allow` rejects unknown DIDs instead). An existing account is used as it is. | `global_acl_default` |
 | `messaging/account/add` by an admin | Trust Task | The admin's ACL applied onto `global_acl_default`, else `global_acl_default` |
-| `messaging/account/add` by a non-admin | Trust Task, `explicit_deny` mode only | Always `global_acl_default` |
 | Forward next hop | An unseen DID is named as a forward's `next` (`resolve_next_account`) | `global_acl_default` — in either mode |
 | Forward sender | An unseen DID relays a forward through the mediator (`relay_sender_acls`) | **Least privilege**: `DENY_ALL` + `SEND_FORWARDED`, and only if `global_acl_default` grants `SEND_FORWARDED`. No `LOCAL`, `RECEIVE_*`, invites, or self-management. |
 

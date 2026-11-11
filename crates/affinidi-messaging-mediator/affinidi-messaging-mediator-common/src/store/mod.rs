@@ -1046,14 +1046,40 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// doesn't exist.
     async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError>;
 
-    /// Create a new account with the given ACLs and optional queue limit.
-    /// Returns the created account.
+    /// Create an account with the given ACLs and optional queue limit, but
+    /// only when the DID has none. Returns the created account, or `None` —
+    /// having written nothing — when an account already exists.
+    ///
+    /// The existence check and the write are one atomic step, so an existing
+    /// account's role, ACLs, limits, counters and activity are never reset,
+    /// however callers interleave.
+    async fn account_create(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+        queue_limit: Option<u32>,
+    ) -> Result<Option<Account>, MediatorError>;
+
+    /// Make sure the DID has an account: create it as
+    /// [`account_create`](Self::account_create) does, or return the existing
+    /// account unchanged (the given ACLs and limit then do not apply).
     async fn account_add(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError>;
+    ) -> Result<Account, MediatorError> {
+        if let Some(created) = self.account_create(did_hash, acls, queue_limit).await? {
+            return Ok(created);
+        }
+        self.account_get(did_hash).await?.ok_or_else(|| {
+            MediatorError::InternalError(
+                14,
+                "NA".to_string(),
+                format!("account {did_hash} was removed while it was being added"),
+            )
+        })
+    }
 
     /// Remove an account from the mediator.
     ///

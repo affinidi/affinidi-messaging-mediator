@@ -1274,11 +1274,16 @@ async fn consume_account_remove(
     serde_json::to_value(&response_doc).map_err(serialize_err)
 }
 
-/// Handle `messaging/account/add`. In `ExplicitAllow` mode only an admin may add
-/// accounts; in `ExplicitDeny` mode any authenticated account may. An admin may
-/// supply the new account's ACL (applied onto the mediator default); a non-admin
-/// gets the default. Creating an admin / root-admin account requires admin /
-/// root-admin rights. Returns the created account's realized view.
+/// Handle `messaging/account/add`. Only an admin may add accounts, in either
+/// `mediator_acl_mode`: an account for the caller itself already exists (it is
+/// created when the DID first authenticates), so the only accounts this task
+/// can create belong to other DIDs, which is account administration. The admin
+/// may supply the new account's ACL (applied onto the mediator default).
+/// Creating an admin / root-admin account requires admin / root-admin rights.
+///
+/// An account that already exists is refused with `alreadyExists` and left
+/// exactly as it was; `messaging/account/update` changes an existing account.
+/// Returns the created account's realized view.
 async fn consume_account_add(
     typed: TrustTask<account::add::v0_1::Payload>,
     state: &SharedData,
@@ -1322,8 +1327,7 @@ async fn consume_account_add(
         )
     };
 
-    // In allowlist mode only admins may add accounts.
-    if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow && !is_admin {
+    if !is_admin {
         return Err(denied("admin access is required to add accounts"));
     }
     // Creating a privileged account requires the matching privilege.
@@ -1332,26 +1336,28 @@ async fn consume_account_add(
             "root-admin access is required to create a root-admin account",
         ));
     }
-    if new_type.is_admin() && !is_admin {
-        return Err(denied(
-            "admin access is required to create an admin account",
-        ));
-    }
 
-    // ACLs: an admin may supply them (applied onto the mediator default); a non-admin
-    // always gets the default.
-    let acls = match (is_admin, &typed.payload.acl) {
-        (true, Some(acl)) => merge_wire_acl(
+    // ACLs: the admin may supply them (applied onto the mediator default).
+    let acls = match &typed.payload.acl {
+        Some(acl) => merge_wire_acl(
             serde_json::to_value(acl).map_err(serialize_err)?,
             state.config.security.global_acl_default.clone(),
         )?,
-        _ => state.config.security.global_acl_default.clone(),
+        None => state.config.security.global_acl_default.clone(),
     };
 
     let account = state
         .database
-        .account_add(&target_hash, &acls, None)
-        .await?;
+        .account_create(&target_hash, &acls, None)
+        .await?
+        .ok_or_else(|| {
+            tt_problem(
+                session,
+                "messaging/account/add:alreadyExists",
+                format!("account {target_hash} already exists"),
+                StatusCode::CONFLICT,
+            )
+        })?;
     // Apply a non-standard role if requested (the guards above already authorized it).
     let account = if new_type != AccountType::Standard {
         state

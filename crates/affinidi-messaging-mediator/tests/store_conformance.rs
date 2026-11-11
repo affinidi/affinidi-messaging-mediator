@@ -167,6 +167,127 @@ async fn check_account_lifecycle(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// `account_add` on an existing account does not change its role, ACLs,
+/// limits, counters, activity or stats; `account_create` reports it as
+/// existing and writes nothing; and of two concurrent creates exactly one
+/// wins.
+async fn check_account_add_keeps_existing_account(store: Arc<dyn MediatorStore>) {
+    let did = "did_hash_existing_account";
+    let sender = "did_hash_existing_account_sender";
+    let original = acls_with_mode(AccessListModeType::ExplicitAllow);
+
+    store
+        .account_create(did, &original, None)
+        .await
+        .expect("account_create")
+        .expect("a new account is created");
+    store
+        .account_add(sender, &allow_all(), None)
+        .await
+        .expect("account_add sender");
+    store
+        .account_set_role(did, &AccountType::Admin)
+        .await
+        .expect("account_set_role");
+    store
+        .account_change_queue_limits(did, Some(7), Some(9))
+        .await
+        .expect("account_change_queue_limits");
+    store
+        .store_message(
+            "session-id",
+            "{\"protected\":\"keep\"}",
+            did,
+            Some(sender),
+            NEVER,
+            1000,
+        )
+        .await
+        .expect("store_message");
+    store
+        .account_activity_record(did, ActivityKind::Received, 111)
+        .await
+        .expect("account_activity_record");
+    store
+        .account_stats_bump(
+            did,
+            AccountStatsDelta::new(StatsDirection::Received, StatsWire::DidComm, 10),
+        )
+        .await
+        .expect("account_stats_bump");
+
+    let before = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account present");
+    let ids = [did.to_string()];
+    let activity_before = store.account_activity(&ids).await.expect("activity");
+    let stats_before = store.account_stats(&ids).await.expect("stats");
+
+    let other = MediatorACLSet::from_string_ruleset("DENY_ALL").expect("DENY_ALL");
+    assert!(
+        store
+            .account_create(did, &other, Some(1))
+            .await
+            .expect("account_create on an existing account")
+            .is_none(),
+        "account_create reports an existing account and creates nothing"
+    );
+    let returned = store
+        .account_add(did, &other, Some(1))
+        .await
+        .expect("account_add on an existing account");
+    assert_eq!(
+        returned.acls, before.acls,
+        "account_add returns the existing account"
+    );
+
+    let after = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account still present");
+    assert_eq!(after._type, AccountType::Admin, "role unchanged");
+    assert_eq!(after.acls, original.to_u64(), "ACLs unchanged");
+    assert_eq!(
+        after.queue_send_limit, before.queue_send_limit,
+        "send limit unchanged"
+    );
+    assert_eq!(
+        after.queue_receive_limit, before.queue_receive_limit,
+        "receive limit unchanged"
+    );
+    assert_eq!(after.receive_queue_count, 1, "queued message still counted");
+    assert_eq!(after.receive_queue_count, before.receive_queue_count);
+    assert_eq!(after.receive_queue_bytes, before.receive_queue_bytes);
+    assert_eq!(after.send_queue_count, before.send_queue_count);
+    assert_eq!(after.send_queue_bytes, before.send_queue_bytes);
+    assert_eq!(
+        store.account_activity(&ids).await.expect("activity")[0].last_received,
+        activity_before[0].last_received,
+        "activity unchanged"
+    );
+    assert_eq!(
+        store.account_stats(&ids).await.expect("stats")[0].messages_received,
+        stats_before[0].messages_received,
+        "stats unchanged"
+    );
+
+    // Two first-contact creates racing: one creates, the other sees it.
+    let racing = "did_hash_racing_account";
+    let acls = allow_all();
+    let (a, b) = tokio::join!(
+        store.account_create(racing, &acls, None),
+        store.account_create(racing, &acls, None),
+    );
+    let created = [a.expect("create a"), b.expect("create b")]
+        .iter()
+        .filter(|r| r.is_some())
+        .count();
+    assert_eq!(created, 1, "exactly one concurrent create wins");
+}
+
 /// Setting a DID's ACL is read back verbatim.
 async fn check_acl_set_get_roundtrip(store: Arc<dyn MediatorStore>) {
     let did = "did_hash_acl_roundtrip";
@@ -2674,6 +2795,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     // Store-only checks first, so a failure in the message path (Lua) can't
     // hide them.
     check_admin_roles(store.clone()).await;
+    check_account_add_keeps_existing_account(store.clone()).await;
     check_login_session(store.clone()).await;
     check_challenge_session_without_account(store.clone()).await;
     check_refresh_rotation(store.clone()).await;
@@ -2711,6 +2833,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn acl_set_get_roundtrip() {
                 check_acl_set_get_roundtrip(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn account_add_keeps_existing_account() {
+                check_account_add_keeps_existing_account(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn message_store_and_counters() {

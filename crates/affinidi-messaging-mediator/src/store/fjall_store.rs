@@ -2183,12 +2183,12 @@ impl MediatorStore for FjallStore {
         Ok(Some(acc.into_account(did_hash.to_string(), count as u32)))
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
         let mut record = StoredAccount {
             acls: acls.to_u64(),
             ..Default::default()
@@ -2198,6 +2198,16 @@ impl MediatorStore for FjallStore {
             record.queue_receive_limit = Some(limit as i32);
         }
         let _guard = self.write_lock.lock().await;
+        // Checked under the write lock, so an existing account is never
+        // replaced.
+        if self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_create:get", e))?
+            .is_some()
+        {
+            return Ok(None);
+        }
         let mut batch = self.db.batch();
         batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
         // A fresh account starts with no activity and no counters, whatever
@@ -2211,7 +2221,7 @@ impl MediatorStore for FjallStore {
         batch
             .commit()
             .map_err(|e| Self::db_err("account_add:insert", e))?;
-        Ok(record.into_account(did_hash.to_string(), 0))
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
     }
 
     async fn account_remove(

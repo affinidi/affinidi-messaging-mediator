@@ -421,11 +421,30 @@ async fn account_update_acl_denies_a_non_admin() {
     assert!(denied.is_err(), "a non-admin must not set ACLs");
 }
 
+/// A standard account connected with a live stream, promoted to `Admin` in
+/// the store before it authenticates (as `mediator_ops.rs` does).
+async fn with_admin(env: &TestEnvironment) -> affinidi_messaging_test_mediator::TestUser {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+
+    let admin = env.add_user("operator").await.expect("add operator");
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Admin)
+        .await
+        .expect("promote operator to admin");
+    env.atm
+        .profile_add(&admin.profile, true)
+        .await
+        .expect("enable websocket for the admin");
+    admin
+}
+
 #[tokio::test]
-async fn account_add_self_register_creates_a_standard_account() {
+async fn account_add_is_refused_for_a_non_admin() {
     use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
 
-    // The fixture defaults to `ExplicitDeny`, so a standard account may add accounts.
+    // The fixture defaults to `ExplicitDeny`; adding accounts is still an
+    // admin task there.
     let env = TestEnvironment::spawn()
         .await
         .expect("spawn test environment");
@@ -436,8 +455,8 @@ async fn account_add_self_register_creates_a_standard_account() {
         .await
         .expect("enable websocket for alice");
 
-    let new_hash = "tt-add-standard-account".to_string();
-    let account = env
+    let new_hash = "tt-add-by-non-admin".to_string();
+    let denied = env
         .atm
         .trust_tasks()
         .account_add(
@@ -446,11 +465,83 @@ async fn account_add_self_register_creates_a_standard_account() {
             AccountType::Standard,
             None,
         )
+        .await;
+    assert!(denied.is_err(), "a non-admin must not add accounts");
+    assert!(
+        !env.mediator
+            .store()
+            .account_exists(&new_hash)
+            .await
+            .expect("account_exists"),
+        "no account is created"
+    );
+}
+
+#[tokio::test]
+async fn account_add_by_an_admin_creates_a_standard_account() {
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
+
+    let env = TestEnvironment::spawn()
         .await
-        .expect("alice adds a new standard account");
+        .expect("spawn test environment");
+    let admin = with_admin(&env).await;
+
+    let new_hash = "tt-add-standard-account".to_string();
+    let account = env
+        .atm
+        .trust_tasks()
+        .account_add(
+            &admin.profile,
+            new_hash.clone(),
+            AccountType::Standard,
+            None,
+        )
+        .await
+        .expect("the admin adds a new standard account");
 
     assert_eq!(account.did.as_str(), new_hash);
     assert_eq!(account.account_type.to_string(), "standard");
+}
+
+#[tokio::test]
+async fn account_add_leaves_an_existing_account_unchanged() {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType as StoreType;
+    use affinidi_messaging_sdk::tasks::messaging::account::add::v0_2::AccountType;
+
+    let env = TestEnvironment::spawn()
+        .await
+        .expect("spawn test environment");
+    let admin = with_admin(&env).await;
+    let bob = env.add_user("bob").await.expect("add bob");
+    let store = env.mediator.store();
+    store
+        .account_set_role(&bob.did_hash(), &StoreType::Admin)
+        .await
+        .expect("make bob an admin");
+    let before = store
+        .account_get(&bob.did_hash())
+        .await
+        .expect("account_get")
+        .expect("bob has an account");
+
+    let refused = env
+        .atm
+        .trust_tasks()
+        .account_add(&admin.profile, bob.did_hash(), AccountType::Standard, None)
+        .await
+        .expect_err("adding an existing account is refused");
+    assert!(
+        format!("{refused:?}").contains("alreadyExists"),
+        "refused as already existing: {refused:?}"
+    );
+
+    let after = store
+        .account_get(&bob.did_hash())
+        .await
+        .expect("account_get")
+        .expect("bob still has an account");
+    assert_eq!(after._type, StoreType::Admin, "role unchanged");
+    assert_eq!(after.acls, before.acls, "ACLs unchanged");
 }
 
 #[tokio::test]
