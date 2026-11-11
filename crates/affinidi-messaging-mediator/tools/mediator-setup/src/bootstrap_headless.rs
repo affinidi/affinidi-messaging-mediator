@@ -88,6 +88,19 @@ pub struct BootstrapArtifacts {
     pub request_path: Option<PathBuf>,
 }
 
+/// Operator choices that steer [`dispatch`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchOptions<'a> {
+    /// Phase 2: the out-of-band bundle digest (`--digest`).
+    pub digest: Option<&'a str>,
+    /// Phase 2: open the bundle without a digest
+    /// (`--allow-bundle-without-digest`).
+    pub allow_without_digest: bool,
+    /// Phase 1: discard an in-flight bootstrap's seeds instead of
+    /// refusing to start a new one (`--force-reprovision`).
+    pub force_reprovision: bool,
+}
+
 /// Dispatch into phase 1 (request emission) or phase 2 (bundle apply)
 /// based on whether `--bundle` was supplied.
 ///
@@ -95,12 +108,12 @@ pub struct BootstrapArtifacts {
 /// configured backend's sweep index has any entries and the caller
 /// is attempting phase 1 (no `--bundle`), we error rather than
 /// overwrite — the operator must either finalise with `--bundle` or
-/// re-run with `--force-reprovision` (which wipes the existing
-/// setup).
+/// re-run with `--force-reprovision`, which deletes the in-flight
+/// seeds first.
 pub async fn dispatch(
     config: &crate::app::WizardConfig,
     bundle_path: Option<&Path>,
-    digest: Option<&str>,
+    options: DispatchOptions<'_>,
 ) -> anyhow::Result<HeadlessOutcome> {
     // Sweep any stranded phase-1 seeds before branching. This
     // piggybacks on the backend handle the phase-1/phase-2 code
@@ -113,8 +126,8 @@ pub async fn dispatch(
     sweep_stale_bootstrap_seeds(config).await;
 
     match bundle_path {
-        Some(path) => phase2_apply(config, path, digest).await,
-        None => phase1_emit_request(config).await,
+        Some(path) => phase2_apply(config, path, options).await,
+        None => phase1_emit_request(config, options.force_reprovision).await,
     }
 }
 
@@ -188,7 +201,10 @@ async fn sweep_stale_bootstrap_seeds(config: &crate::app::WizardConfig) {
 /// depends on `config.vta_mode`), persist the HPKE recipient seed
 /// into the configured secret backend, and return the operator's
 /// next-step command for the caller to print.
-async fn phase1_emit_request(config: &crate::app::WizardConfig) -> anyhow::Result<HeadlessOutcome> {
+async fn phase1_emit_request(
+    config: &crate::app::WizardConfig,
+    force_reprovision: bool,
+) -> anyhow::Result<HeadlessOutcome> {
     // Open the backend first so we fail fast on a misconfigured
     // secret store — no point minting a request, writing it to disk,
     // and then discovering `aws_secrets://...` can't talk to AWS.
@@ -214,7 +230,27 @@ async fn phase1_emit_request(config: &crate::app::WizardConfig) -> anyhow::Resul
         .bootstrap_seed_index()
         .await
         .map_err(|e| anyhow::anyhow!("read bootstrap seed index: {e}"))?;
-    if !in_flight.entries.is_empty() {
+    if !in_flight.entries.is_empty() && force_reprovision {
+        // `--force-reprovision`: the operator asked to start over, so the
+        // pending request's seed goes. A bundle made for it can no
+        // longer be opened.
+        for entry in &in_flight.entries {
+            store
+                .delete_bootstrap_seed(&entry.bundle_id_hex)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not discard in-flight bootstrap {} in '{backend_url}': {e}",
+                        entry.bundle_id_hex
+                    )
+                })?;
+            warn!(
+                bundle_id = %entry.bundle_id_hex,
+                backend = %backend_url,
+                "--force-reprovision: discarded the in-flight bootstrap request's seed",
+            );
+        }
+    } else if !in_flight.entries.is_empty() {
         let ids: Vec<_> = in_flight
             .entries
             .iter()
@@ -225,7 +261,7 @@ async fn phase1_emit_request(config: &crate::app::WizardConfig) -> anyhow::Resul
              In-flight bundle id(s): {}\n\n\
              To finalise: re-run `mediator-setup --from <recipe> --bundle bundle.armor`\n\
              To restart:  wait {BOOTSTRAP_SEED_TTL_HINT} for auto-cleanup, \
-             or re-run with `--force-reprovision` to wipe.",
+             or re-run with `--force-reprovision` to discard the in-flight request.",
             ids.join(", "),
         );
     }
@@ -307,8 +343,16 @@ const BOOTSTRAP_SEED_TTL_HINT: &str = "24h";
 async fn phase2_apply(
     config: &crate::app::WizardConfig,
     bundle_path: &Path,
-    digest: Option<&str>,
+    options: DispatchOptions<'_>,
 ) -> anyhow::Result<HeadlessOutcome> {
+    if options.digest.is_none_or(|d| d.trim().is_empty()) && !options.allow_without_digest {
+        anyhow::bail!(
+            "--digest is required with --bundle: pass the SHA-256 digest the VTA admin \
+             printed, received over a separate channel. The bundle's encryption does not \
+             identify its sender, so the digest is what ties it to the VTA admin. For a \
+             throwaway dev setup only, --allow-bundle-without-digest skips the check."
+        );
+    }
     let intent = intent_for_mode(&config.vta_mode)?;
 
     let armored = std::fs::read_to_string(bundle_path)
@@ -359,14 +403,17 @@ async fn phase2_apply(
             )
         })?;
     state.recipient_secret = *vta_sdk::sealed_transfer::ed25519_seed_to_x25519_secret(&seed_bytes);
+    state.allow_without_digest = options.allow_without_digest;
 
-    crate::sealed_handoff::open_with_digest(&mut state, digest.unwrap_or("")).map_err(|e| {
-        anyhow::anyhow!(
-            "could not open sealed bundle: {e}. \
+    crate::sealed_handoff::open_with_digest(&mut state, options.digest.unwrap_or("")).map_err(
+        |e| {
+            anyhow::anyhow!(
+                "could not open sealed bundle: {e}. \
              Verify the digest matches what the VTA admin printed, and \
              that the bundle belongs to this setup's request (bundle id: {bundle_id_hex})."
-        )
-    })?;
+            )
+        },
+    )?;
 
     let session = state.session.take().ok_or_else(|| {
         anyhow::anyhow!("open_with_digest reported success but produced no session")
@@ -606,7 +653,7 @@ mod tests {
         let cwd = CwdGuard::new();
         let dir = cwd.dir().to_path_buf();
         let config = sealed_export_config("prod-mediator", &dir);
-        let outcome = dispatch(&config, None, None)
+        let outcome = dispatch(&config, None, DispatchOptions::default())
             .await
             .expect("phase 1 dispatch");
         let HeadlessOutcome::RequestEmitted {
@@ -667,13 +714,13 @@ mod tests {
         let cwd = CwdGuard::new();
         let dir = cwd.dir().to_path_buf();
         let config = sealed_export_config("prod-mediator", &dir);
-        let first = dispatch(&config, None, None).await;
+        let first = dispatch(&config, None, DispatchOptions::default()).await;
         assert!(first.is_ok(), "first phase-1 run must succeed");
 
         // Second run without --bundle must refuse rather than clobber
         // the in-flight seed — the VTA may still respond with a
         // bundle tied to the first request.
-        let second = dispatch(&config, None, None).await;
+        let second = dispatch(&config, None, DispatchOptions::default()).await;
         let err = match second {
             Err(e) => e.to_string(),
             Ok(_) => panic!("second phase-1 run must refuse while a seed is in flight"),
@@ -690,6 +737,82 @@ mod tests {
             err.contains("--force-reprovision"),
             "error must name the restart path: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn phase1_with_force_reprovision_replaces_the_in_flight_request() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let config = sealed_export_config("prod-mediator", &dir);
+        let HeadlessOutcome::RequestEmitted {
+            bundle_id_hex: first_id,
+            ..
+        } = dispatch(&config, None, DispatchOptions::default())
+            .await
+            .expect("first phase-1 run")
+        else {
+            panic!("phase 1 must emit a request");
+        };
+
+        let forced = DispatchOptions {
+            force_reprovision: true,
+            ..Default::default()
+        };
+        let HeadlessOutcome::RequestEmitted {
+            bundle_id_hex: second_id,
+            ..
+        } = dispatch(&config, None, forced)
+            .await
+            .expect("--force-reprovision restarts phase 1")
+        else {
+            panic!("phase 1 must emit a request");
+        };
+        assert_ne!(first_id, second_id);
+
+        let backend_url = crate::config_writer::build_backend_url(&config);
+        let store =
+            affinidi_messaging_mediator_common::MediatorSecrets::from_url(&backend_url).unwrap();
+        assert!(
+            store
+                .load_bootstrap_seed(&first_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the discarded request's seed is gone"
+        );
+        let index = store.bootstrap_seed_index().await.unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].bundle_id_hex, second_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn phase2_requires_a_digest() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let bundle_path = dir.join("bundle.armor");
+        std::fs::write(&bundle_path, "unused").unwrap();
+        let config = sealed_export_config("prod-mediator", &dir);
+        for digest in [None, Some(""), Some("  ")] {
+            let err = match dispatch(
+                &config,
+                Some(&bundle_path),
+                DispatchOptions {
+                    digest,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("phase 2 must refuse without a digest"),
+            };
+            assert!(
+                err.contains("--digest is required"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
@@ -780,7 +903,7 @@ mod tests {
         // Dispatch: phase-1 (no --bundle). The sweeper should clean
         // the aged entry, leaving the index empty before the
         // "don't clobber" check runs — so phase-1 succeeds.
-        let outcome = dispatch(&config, None, None)
+        let outcome = dispatch(&config, None, DispatchOptions::default())
             .await
             .expect("dispatch must succeed once sweeper clears the aged entry");
         assert!(matches!(outcome, HeadlessOutcome::RequestEmitted { .. }));
@@ -889,9 +1012,16 @@ mod tests {
 
         // Phase 2 — passes the OOB digest so the PinnedOnly bundle
         // unseals cleanly.
-        let outcome = dispatch(&config, Some(&bundle_path), Some(&digest))
-            .await
-            .expect("phase 2 must succeed when seed + bundle align");
+        let outcome = dispatch(
+            &config,
+            Some(&bundle_path),
+            DispatchOptions {
+                digest: Some(&digest),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("phase 2 must succeed when seed + bundle align");
 
         match outcome {
             HeadlessOutcome::Applied { session, .. } => {
@@ -962,7 +1092,16 @@ mod tests {
         std::fs::write(&bundle_path, armored).unwrap();
 
         let config = sealed_export_config("prod-mediator", &dir);
-        let err = match dispatch(&config, Some(&bundle_path), None).await {
+        let err = match dispatch(
+            &config,
+            Some(&bundle_path),
+            DispatchOptions {
+                digest: Some("00"),
+                ..Default::default()
+            },
+        )
+        .await
+        {
             Err(e) => e.to_string(),
             Ok(_) => panic!("phase 2 must fail when no seed is present"),
         };

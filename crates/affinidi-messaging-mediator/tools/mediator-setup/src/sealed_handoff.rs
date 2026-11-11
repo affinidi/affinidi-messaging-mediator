@@ -111,10 +111,11 @@ pub enum SealedPhase {
     /// file. Anything that decodes cleanly advances; anything that
     /// doesn't keeps the operator on this phase with `last_error` set.
     AwaitingBundle,
-    /// Bundle is parsed; optional out-of-band digest verification.
-    /// Empty input means "skip the digest check" — that decision is
-    /// surfaced explicitly in the prompt so the operator can't skip it
-    /// by accident.
+    /// Bundle is parsed; waiting for the out-of-band digest. The
+    /// digest is the only check that the bundle came from the VTA
+    /// admin (the producer's signature is not verified yet), so an
+    /// empty input is refused unless
+    /// [`SealedHandoffState::allow_without_digest`] is set.
     DigestVerify,
     /// Bundle opened, payload extracted, [`VtaSession`] ready. The
     /// wizard transitions out of the sub-flow on Enter.
@@ -239,6 +240,12 @@ pub struct SealedHandoffState {
     /// (intro screen renders without the banner). Populated by
     /// [`crate::app::WizardApp::transition_to_sealed_handoff`].
     pub offline_transition_banner: Option<String>,
+    /// Open a bundle without an out-of-band digest. Off by default:
+    /// the request file (recipient key and nonce) is public, so
+    /// without the digest anyone who has seen it can seal a bundle the
+    /// wizard would accept. Set only by the headless
+    /// `--allow-bundle-without-digest` flag.
+    pub allow_without_digest: bool,
 }
 
 impl SealedHandoffState {
@@ -276,6 +283,7 @@ impl SealedHandoffState {
             assertion_warning: None,
             request_scroll: 0,
             offline_transition_banner: None,
+            allow_without_digest: false,
         }
     }
 
@@ -794,6 +802,13 @@ pub enum SealedHandoffError {
         expected: String,
         got: String,
     },
+    /// No out-of-band digest was given.
+    DigestRequired,
+    /// The bundle answers a different request than this run's.
+    BundleIdMismatch {
+        expected: String,
+        got: String,
+    },
     WrongPayload,
     Open(String),
     FileRead {
@@ -816,6 +831,17 @@ impl std::fmt::Display for SealedHandoffError {
             Self::DigestMismatch { expected, got } => write!(
                 f,
                 "provided digest did not match the bundle: expected {expected}, got {got}"
+            ),
+            Self::DigestRequired => write!(
+                f,
+                "the bundle digest is required: enter the SHA-256 digest the VTA admin \
+                 shared on a separate channel (the producer's signature is not verified, \
+                 so the digest is what ties the bundle to the VTA admin)"
+            ),
+            Self::BundleIdMismatch { expected, got } => write!(
+                f,
+                "the bundle answers a different request: expected bundle id {expected}, \
+                 got {got}. Ask the VTA admin to run the command for this run's request"
             ),
             Self::WrongPayload => write!(f, "bundle did not contain a mediator admin credential"),
             Self::Open(e) => write!(f, "could not open the sealed bundle: {e}"),
@@ -852,7 +878,21 @@ impl std::error::Error for SealedHandoffError {
 /// Logged via `tracing::warn` so even non-TUI runs leave an audit
 /// trail. Renderer reads `SealedHandoffState::assertion_warning` for
 /// the on-screen line.
-fn classify_producer_assertion(assertion: &ProducerAssertion) -> Option<String> {
+fn classify_producer_assertion(
+    assertion: &ProducerAssertion,
+    digest_checked: bool,
+) -> Option<String> {
+    if !digest_checked {
+        warn!(
+            producer_did = %assertion.producer_did,
+            "Sealed handoff: bundle opened without a digest; the producer claim is unverified"
+        );
+        return Some(format!(
+            "Trust anchor: none. No digest was checked and the producer claim ({}) is \
+             not verified.",
+            assertion.producer_did
+        ));
+    }
     match &assertion.proof {
         AssertionProof::PinnedOnly => {
             warn!(
@@ -877,7 +917,7 @@ fn classify_producer_assertion(assertion: &ProducerAssertion) -> Option<String> 
                 proof = "did_signed",
                 "Sealed handoff: producer claims DidSigned proof — \
                  cryptographic verification is not yet implemented; \
-                 trust still anchored by your supplied digest"
+                 trust anchored by your supplied digest"
             );
             Some(format!(
                 "Trust anchor: DidSigned by {} ({}). Signature is recorded but not \
@@ -892,11 +932,12 @@ fn classify_producer_assertion(assertion: &ProducerAssertion) -> Option<String> 
                 format = %quote.format,
                 proof = "attested",
                 "Sealed handoff: producer claims Attested proof — \
-                 attestation verification is not yet implemented"
+                 attestation verification is not yet implemented; \
+                 trust anchored by your supplied digest"
             );
             Some(format!(
                 "Trust anchor: Attested ({}) by {}. Attestation is recorded but \
-                 not yet verified.",
+                 not yet verified — relying on your supplied digest.",
                 quote.format, assertion.producer_did
             ))
         }
@@ -945,14 +986,20 @@ pub fn ingest_armored_file(
     ingest_armored(state, &armored)
 }
 
-/// Verify the (optional) operator-supplied digest matches the bundle's
-/// canonical digest, then `open_bundle` the payload, project to a
-/// [`VtaSession`], and advance to [`SealedPhase::Complete`].
+/// Verify the operator-supplied digest matches the bundle's canonical
+/// digest, then `open_bundle` the payload, project to a [`VtaSession`],
+/// and advance to [`SealedPhase::Complete`].
 ///
-/// `expected_digest` is the operator's input verbatim. Empty / whitespace
-/// means "skip the OOB check" — the AEAD inside the bundle still
-/// authenticates the payload, but the operator forgoes the producer-
-/// declared digest binding.
+/// `expected_digest` is the operator's input verbatim. The bundle is
+/// sealed in HPKE base mode, which does not identify the sender, and
+/// the producer's `DidSigned` / `Attested` proof is not verified yet,
+/// so the out-of-band digest is the only link between the bundle and
+/// the VTA admin. Empty / whitespace input is therefore refused with
+/// [`SealedHandoffError::DigestRequired`] unless
+/// [`SealedHandoffState::allow_without_digest`] is set.
+///
+/// The bundle must also answer this run's request: its `bundle_id`
+/// must equal [`SealedHandoffState::nonce`].
 pub fn open_with_digest(
     state: &mut SealedHandoffState,
     expected_digest: &str,
@@ -961,8 +1008,22 @@ pub fn open_with_digest(
     let bundle = state.bundle.as_ref().ok_or_else(|| {
         SealedHandoffError::Internal("open_with_digest called before ingest_armored".into())
     })?;
+    if bundle.bundle_id != state.nonce {
+        return Err(SealedHandoffError::BundleIdMismatch {
+            expected: B64URL.encode(state.nonce),
+            got: B64URL.encode(bundle.bundle_id),
+        });
+    }
     let trimmed = expected_digest.trim();
     let expect = if trimmed.is_empty() {
+        if !state.allow_without_digest {
+            return Err(SealedHandoffError::DigestRequired);
+        }
+        warn!(
+            bundle_id = %state.nonce_display(),
+            "Sealed handoff: opening the bundle without an out-of-band digest; \
+             nothing ties it to the VTA admin"
+        );
         None
     } else {
         Some(trimmed.to_lowercase())
@@ -976,12 +1037,10 @@ pub fn open_with_digest(
         })?;
 
     // Capture the producer assertion for the renderer + audit log
-    // before we move the payload. Trust-policy classification follows
-    // (`PinnedOnly` → operator-supplied digest is the only anchor;
-    // `DidSigned` / `Attested` → cryptographic verification is the
-    // *intended* anchor but is currently a TODO — see
-    // `classify_producer_assertion`).
-    state.assertion_warning = classify_producer_assertion(&opened.producer);
+    // before we move the payload. The operator-supplied digest is the
+    // anchor for every proof type today; `DidSigned` / `Attested` are
+    // recorded but not verified — see `classify_producer_assertion`.
+    state.assertion_warning = classify_producer_assertion(&opened.producer, expect.is_some());
     state.producer_assertion = Some(opened.producer);
 
     match (state.intent, opened.payload) {
@@ -1685,7 +1744,87 @@ mod tests {
         ingest_armored(&mut state, &armor::encode(&bundle)).unwrap();
         let err = open_with_digest(&mut state, "deadbeef").unwrap_err();
         assert!(matches!(err, SealedHandoffError::DigestMismatch { .. }));
-        // Still on DigestVerify so the operator can correct or skip.
+        // Still on DigestVerify so the operator can correct it.
         assert_eq!(state.phase, SealedPhase::DigestVerify);
+    }
+
+    /// Seal `payload` to this run's request with the given proof and
+    /// bundle id, and ingest it.
+    async fn ingest_sealed(
+        state: &mut SealedHandoffState,
+        proof: AssertionProof,
+        bundle_id: [u8; 16],
+    ) {
+        let parsed_request: BootstrapRequest = serde_json::from_str(&state.request_json).unwrap();
+        let recipient_pk = parsed_request.decode_client_x25519_pub().unwrap();
+        let (_prod_seed, prod_ed_pub) = generate_ed25519_keypair();
+        let payload = SealedPayloadV1::AdminCredential(Box::new(CredentialBundle::new(
+            "did:key:z6MkOther",
+            "zOTHER",
+            "did:webvh:other.example.com",
+        )));
+        let assertion = ProducerAssertion {
+            producer_did: affinidi_crypto::did_key::ed25519_pub_to_did_key(&prod_ed_pub),
+            proof,
+        };
+        let store = InMemoryNonceStore::new();
+        let bundle = seal_payload(&recipient_pk, bundle_id, assertion, &payload, &store)
+            .await
+            .unwrap();
+        ingest_armored(state, &armor::encode(&bundle)).unwrap();
+    }
+
+    fn did_signed() -> AssertionProof {
+        AssertionProof::DidSigned(vta_sdk::sealed_transfer::bundle::DidSignedAssertion {
+            did: "did:key:z6MkOther".into(),
+            signature_b64: "AAAA".into(),
+            verification_method: "did:key:z6MkOther#z6MkOther".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn an_empty_digest_is_refused_whatever_the_bundle_claims() {
+        for proof in [AssertionProof::PinnedOnly, did_signed()] {
+            let mut state = SealedHandoffState::new(VtaIntent::AdminOnly, None);
+            finalize_in_temp_cwd(&mut state).unwrap();
+            let nonce = state.nonce;
+            ingest_sealed(&mut state, proof, nonce).await;
+            for input in ["", "   "] {
+                let err = open_with_digest(&mut state, input).unwrap_err();
+                assert!(
+                    matches!(err, SealedHandoffError::DigestRequired),
+                    "unexpected {err}"
+                );
+                assert_eq!(state.phase, SealedPhase::DigestVerify);
+                assert!(state.session.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_digest_opens_a_did_signed_bundle_only_when_allowed() {
+        let mut state = SealedHandoffState::new(VtaIntent::AdminOnly, None);
+        finalize_in_temp_cwd(&mut state).unwrap();
+        let nonce = state.nonce;
+        ingest_sealed(&mut state, did_signed(), nonce).await;
+        state.allow_without_digest = true;
+        open_with_digest(&mut state, "").unwrap();
+        assert_eq!(state.phase, SealedPhase::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_for_another_request_is_refused() {
+        let mut state = SealedHandoffState::new(VtaIntent::AdminOnly, None);
+        finalize_in_temp_cwd(&mut state).unwrap();
+        let mut other = state.nonce;
+        other[0] ^= 0xFF;
+        ingest_sealed(&mut state, AssertionProof::PinnedOnly, other).await;
+        let digest = state.computed_digest.clone().unwrap();
+        let err = open_with_digest(&mut state, &digest).unwrap_err();
+        assert!(
+            matches!(err, SealedHandoffError::BundleIdMismatch { .. }),
+            "unexpected {err}"
+        );
+        assert!(state.session.is_none());
     }
 }

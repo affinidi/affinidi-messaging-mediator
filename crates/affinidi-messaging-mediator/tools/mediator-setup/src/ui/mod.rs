@@ -453,9 +453,9 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
             SealedPhase::DigestVerify => {
                 let computed = state.computed_digest.as_deref().unwrap_or("(missing)");
                 let title = "Sealed handoff — verify digest";
-                let desc = "Type the SHA-256 digest your VTA admin showed you. Leave blank to \
-                            skip the OOB check.";
-                let placeholder = "sha256 hex (or blank to skip)";
+                let desc = "Type the SHA-256 digest your VTA admin showed you on a separate \
+                            channel. It is required.";
+                let placeholder = "sha256 hex";
                 let mut hint_default = format!(
                     "Computed digest of the parsed bundle:\n  {computed}\n\nIf the producer \
                      told you a different digest, do NOT continue — abort and re-request the \
@@ -480,9 +480,11 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                     frame,
                     chunks[1],
                     "Info",
-                    "Skipping the digest is acceptable for low-stakes dev work — the bundle's \
-                     internal AEAD still binds the payload — but for production rollouts, \
-                     paste the digest the VTA admin shared on a separate channel.",
+                    "The digest is what ties this bundle to your VTA admin. The bundle's \
+                     encryption only proves it was sealed to this run's request key, which \
+                     anyone holding the request file can do, and the producer's signature \
+                     is not verified yet. Get the digest over a channel other than the one \
+                     that carried the bundle.",
                 );
                 return;
             }
