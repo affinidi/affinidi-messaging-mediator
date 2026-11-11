@@ -74,6 +74,7 @@ pub async fn publish(state: &SharedData, changes: &[MuxChange]) {
     let record = MuxChangeRecord {
         origin: state.config.streaming_uuid.clone(),
         changes: dedupe(changes),
+        streaming: Vec::new(),
     };
     if let Err(e) = state.database.mux_changes_publish(&record).await {
         warn!(
@@ -269,7 +270,12 @@ pub async fn run(state: SharedData) -> Result<(), String> {
         match rx.recv().await {
             // Applied before it was published.
             Ok(record) if record.origin == me => {}
-            Ok(record) => apply(&state, &record.changes).await,
+            Ok(record) => {
+                if !record.changes.is_empty() {
+                    apply(&state, &record.changes).await;
+                }
+                forward_handoffs(&state, &me, &record.streaming).await;
+            }
             Err(RecvError::Lagged(missed)) => {
                 warn!(
                     missed,
@@ -284,6 +290,39 @@ pub async fn run(state: SharedData) -> Result<(), String> {
                 resync(&state).await;
             }
         }
+    }
+}
+
+/// Hand the streaming task the handoffs meant for this instance: a mux
+/// entry here that another instance's registration displaced, or a DID whose
+/// owner elsewhere left while a mux entry here waited for it.
+async fn forward_handoffs(
+    state: &SharedData,
+    me: &str,
+    handoffs: &[affinidi_messaging_mediator_common::store::mux::StreamingHandoff],
+) {
+    use crate::tasks::websocket_streaming::{StreamingUpdate, StreamingUpdateState};
+    use affinidi_messaging_mediator_common::store::mux::StreamingHandoff;
+    let Some(streaming) = state.streaming_task.as_ref() else {
+        return;
+    };
+    for handoff in handoffs {
+        let (did_hash, update) = match handoff {
+            StreamingHandoff::Taken { did_hash, instance } if instance == me => {
+                (did_hash, StreamingUpdateState::RemoteTaken)
+            }
+            StreamingHandoff::Taken { .. } => continue,
+            StreamingHandoff::Released { did_hash } => {
+                (did_hash, StreamingUpdateState::RemoteReleased)
+            }
+        };
+        let _ = streaming
+            .channel
+            .send(StreamingUpdate {
+                did_hash: did_hash.clone(),
+                state: update,
+            })
+            .await;
     }
 }
 
@@ -555,6 +594,7 @@ mod tests {
         let record = MuxChangeRecord {
             origin: "instance-a".into(),
             changes: vec![MuxChange::of(&g, false)],
+            streaming: Vec::new(),
         };
         let wire = serde_json::to_value(&record).unwrap();
         assert_eq!(

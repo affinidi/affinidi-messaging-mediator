@@ -360,6 +360,8 @@ pub struct TestMediatorBuilder {
     /// historical opaque `did:key:z6Mk{uuid}` shape with no usable
     /// secrets — suitable for tests that don't authenticate as admin.
     admin_identity: Option<AdminIdentity>,
+    /// See [`TestMediatorBuilder::replica_of`].
+    replica: Option<ReplicaIdentity>,
     /// Temp directory backing a Fjall store, kept alive for the lifetime
     /// of the resulting handle so the partition files don't get cleaned
     /// up while the mediator is still using them.
@@ -409,6 +411,7 @@ impl Default for TestMediatorBuilder {
             message_size: None,
             clock: None,
             admin_identity: None,
+            replica: None,
             #[cfg(feature = "fjall-backend")]
             fjall_dir: None,
         }
@@ -828,6 +831,21 @@ impl TestMediatorBuilder {
         self
     }
 
+    /// Run as another instance of the mediator `identity` came from
+    /// ([`TestMediatorHandle::replica_identity`]): the same DID, keys and
+    /// session-token signing key, on its own port, with its own streaming
+    /// task. Pair it with the same shared [`store`](Self::store) (Redis) to
+    /// get two instances of one horizontally-scaled mediator, as behind a
+    /// load balancer: a token issued by one is accepted by the other.
+    ///
+    /// The DID's service endpoints still name the first instance; reach
+    /// this one by its own [`endpoint`](TestMediatorHandle::endpoint) and
+    /// [`ws_endpoint`](TestMediatorHandle::ws_endpoint).
+    pub fn replica_of(mut self, identity: ReplicaIdentity) -> Self {
+        self.replica = Some(identity);
+        self
+    }
+
     /// Run this test mediator against an on-disk Fjall backend instead
     /// of the default in-memory store. The data lives in a temporary
     /// directory tied to the resulting handle — when the handle drops,
@@ -877,8 +895,14 @@ impl TestMediatorBuilder {
             None => format!("http://{bound_addr}{api_prefix}"),
         };
 
-        let (mediator_did, mediator_secrets, secrets_resolver) =
-            generate_mediator_identity(&service_uri).await?;
+        let (mediator_did, mediator_secrets, secrets_resolver) = match &self.replica {
+            Some(r) => {
+                let (resolver, _task) = ThreadedSecretsResolver::new(None).await;
+                resolver.insert_vec(&r.secrets).await;
+                (r.did.clone(), r.secrets.clone(), Arc::new(resolver))
+            }
+            None => generate_mediator_identity(&service_uri).await?,
+        };
         // Honor an operator-supplied admin identity if present —
         // otherwise fall back to the historical opaque shape so tests
         // that don't authenticate as admin keep working unchanged.
@@ -889,7 +913,10 @@ impl TestMediatorBuilder {
 
         // JWT signing key — Ed25519 PKCS8, same shape as the production
         // path's `JWT_SECRET` well-known.
-        let jwt_pkcs8 = generate_jwt_pkcs8()?;
+        let jwt_pkcs8: Vec<u8> = match &self.replica {
+            Some(r) => r.jwt_pkcs8.clone(),
+            None => generate_jwt_pkcs8()?.as_ref().to_vec(),
+        };
 
         let secrets_backend =
             MediatorSecrets::new(Arc::new(SecretsMemoryStore::new("test-mediator-memory")));
@@ -898,7 +925,7 @@ impl TestMediatorBuilder {
             secrets_resolver.clone(),
         );
         security
-            .set_jwt_keys_from_pkcs8(jwt_pkcs8.as_ref())
+            .set_jwt_keys_from_pkcs8(&jwt_pkcs8)
             .map_err(|e| TestMediatorError::JwtKey(format!("install jwt keys: {e}")))?;
         security.use_ssl = false;
         // Apply Option-typed overrides — `None` keeps the headless
@@ -1027,10 +1054,32 @@ impl TestMediatorBuilder {
             inner,
             secrets_resolver,
             mediator_secrets,
+            jwt_pkcs8,
             store: store_for_local_accounts,
             #[cfg(feature = "fjall-backend")]
             _fjall_dir: self.fjall_dir,
         })
+    }
+}
+
+/// The identity one instance of a test mediator shares with another
+/// instance of the same mediator ([`TestMediatorBuilder::replica_of`]): its
+/// DID and keys, and the key that signs its session tokens.
+#[derive(Clone)]
+pub struct ReplicaIdentity {
+    /// The mediator's DID.
+    pub did: String,
+    /// The DID's private keys.
+    pub secrets: Vec<Secret>,
+    /// Ed25519 PKCS#8 bytes of the session-token signing key.
+    pub jwt_pkcs8: Vec<u8>,
+}
+
+impl std::fmt::Debug for ReplicaIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicaIdentity")
+            .field("did", &self.did)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1040,6 +1089,8 @@ pub struct TestMediatorHandle {
     inner: MediatorHandle,
     secrets_resolver: Arc<ThreadedSecretsResolver>,
     mediator_secrets: Vec<Secret>,
+    /// The session-token signing key, for [`Self::replica_identity`].
+    jwt_pkcs8: Vec<u8>,
     /// Live reference to the account/message store, kept so callers
     /// can register additional local DIDs after spawn (see
     /// [`Self::register_local_did`]). Cloned from the same `Arc` the
@@ -1064,6 +1115,16 @@ impl TestMediatorHandle {
     /// `ws://127.0.0.1:54321/mediator/v1/ws`.
     pub fn ws_endpoint(&self) -> &Url {
         &self.inner.ws_endpoint
+    }
+
+    /// What a second instance of this mediator needs to be the same
+    /// mediator: see [`TestMediatorBuilder::replica_of`].
+    pub fn replica_identity(&self) -> ReplicaIdentity {
+        ReplicaIdentity {
+            did: self.did().to_string(),
+            secrets: self.mediator_secrets.clone(),
+            jwt_pkcs8: self.jwt_pkcs8.clone(),
+        }
     }
 
     /// Bound socket address.

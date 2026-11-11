@@ -279,8 +279,13 @@ local function clean_start_streaming(keys, args)
             counter = counter + 1
         end
 
-        -- remove from global session list
-        redis.call('HDEL', 'GLOBAL_STREAMING', session)
+        -- remove from global session list, unless another instance has
+        -- taken the DID since: its entry is not ours to clean
+        local owner = redis.call('HGET', 'GLOBAL_STREAMING', session)
+        if owner and string.match(owner, '^([^:]*):') == keys[1] then
+            redis.call('HDEL', 'GLOBAL_STREAMING', session)
+            redis.call('HDEL', 'STREAMING_KIND', session)
+        end
     end
 
     return counter

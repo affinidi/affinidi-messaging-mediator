@@ -1953,8 +1953,15 @@ impl MediatorStore for MemoryStore {
     ) -> Result<(), MediatorError> {
         let mut s = self.state.lock().await;
         match state {
+            // Only the owner's leaving removes the entry: another instance
+            // may hold the DID now.
             StreamingClientState::Deregistered => {
-                s.streaming_clients.remove(did_hash);
+                if s.streaming_clients
+                    .get(did_hash)
+                    .is_some_and(|(owner, _)| owner == mediator_uuid)
+                {
+                    s.streaming_clients.remove(did_hash);
+                }
             }
             other => {
                 s.streaming_clients

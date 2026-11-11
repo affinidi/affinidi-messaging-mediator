@@ -355,6 +355,31 @@ pub struct MuxChangeRecord {
     /// ignore its own records: it applied the change before publishing.
     pub origin: String,
     pub changes: Vec<MuxChange>,
+    /// Changes of which instance streams a DID, for the instances holding a
+    /// mux entry for it. Absent from records that carry none; an instance
+    /// that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming: Vec<StreamingHandoff>,
+}
+
+/// A change of which instance streams a DID's live traffic, for the mux
+/// entries the store's ordering cannot reach on its own: a direct socket on
+/// one instance outranks a mux entry on another, and the newest registration
+/// otherwise wins (design §7.2). Hashes and instance ids only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "event",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum StreamingHandoff {
+    /// `instance`'s mux entry for `did_hash` lost the DID to a newer
+    /// registration elsewhere. That instance stands its entry by and tells
+    /// its connection the member is inactive (`superseded`).
+    Taken { did_hash: String, instance: String },
+    /// The DID's owner left, and a mux entry waits for it. An instance
+    /// holding one on standby takes the DID back (`reactivated`).
+    Released { did_hash: String },
 }
 
 /// One changed (member DID, principal) pair in a [`MuxChangeRecord`].

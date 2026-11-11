@@ -40,7 +40,11 @@ use crate::mux::fair_queue::{MuxSlots, SlotCredit, SlotRefusal};
 use crate::tasks::supervisor::TaskSupervisor;
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
-    store::{MediatorStore, StreamingClientState, types::PubSubRecord},
+    store::{
+        MediatorStore, StreamingClaim, StreamingKind, StreamingWrite,
+        mux::{MuxChangeRecord, StreamingHandoff},
+        types::PubSubRecord,
+    },
     types::messages::FetchOptions,
 };
 use ahash::AHashMap as HashMap;
@@ -75,6 +79,13 @@ const REDELIVERY_PAGE: usize = 50;
 /// remainder is left for the client to pick up via normal message-pickup.
 const REDELIVERY_MAX: usize = 1000;
 
+/// How often the task re-reads, for each of its mux entries, which instance
+/// the store says streams the DID. The `Taken`/`Released` handoffs normally
+/// keep the two in step; this catches one that was lost (an instance dying
+/// between its store write and its publish, or a dropped pub/sub message), so
+/// a member is never reported in the wrong state for longer than this.
+const OWNERSHIP_RECHECK: Duration = Duration::from_secs(60);
+
 /// Slots in a single connection's send queue.
 ///
 /// This is the per-connection *depth* cap; the aggregate *byte* cap is the
@@ -93,6 +104,15 @@ pub enum EntryKind {
     #[default]
     Direct,
     Mux,
+}
+
+impl From<EntryKind> for StreamingKind {
+    fn from(kind: EntryKind) -> Self {
+        match kind {
+            EntryKind::Direct => StreamingKind::Direct,
+            EntryKind::Mux => StreamingKind::Mux,
+        }
+    }
 }
 
 /// What happened to one member DID on a mux connection, told to that
@@ -181,6 +201,14 @@ pub enum StreamingUpdateState {
     /// already been replaced (one DID, one slot) would otherwise evict its
     /// successor on the way out. See the session-id check in the handler.
     Deregister { session_id: String },
+    /// A registration on another instance took this DID from this
+    /// instance's mux entry: a direct socket there outranks it, or a newer
+    /// mux connection there carries it. The entry stands by, and its
+    /// connection is told the member is inactive (`superseded`).
+    RemoteTaken,
+    /// The DID's owner on another instance left. A mux entry standing by
+    /// here takes the DID back (`reactivated`).
+    RemoteReleased,
 }
 
 /// Used to send commands from the streaming task to the websocket handler
@@ -554,9 +582,17 @@ impl StreamingTask {
             // in-process broadcast, etc.) — the task just consumes
             // already-decoded `PubSubRecord`s.
             let mut rx = database.streaming_subscribe(&self.uuid).await?;
+            let mut ownership = tokio::time::interval_at(
+                tokio::time::Instant::now() + OWNERSHIP_RECHECK,
+                OWNERSHIP_RECHECK,
+            );
+            ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 select! {
+                    _ = ownership.tick() => {
+                        self.recheck_ownership(&database, &mut clients, &mut standby, &replay_in_progress).await;
+                    }
                     value = rx.recv() => {
                         match value {
                             Ok(payload) => {
@@ -628,10 +664,8 @@ impl StreamingTask {
                                         Some(_) => {
                                             clients.remove(value.did_hash.as_str());
                                             info!("Deregistered streaming for DID: ({}) registered_clients({})", value.did_hash, clients.len());
-                                            if !self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await
-                                                && let Err(err) = database.streaming_set_state(&value.did_hash, &self.uuid, StreamingClientState::Deregistered).await
-                                            {
-                                                error!("Error stopping streaming for client ({}): {}",value.did_hash, err);
+                                            if !self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await {
+                                                self.release(&database, &value.did_hash).await;
                                             }
                                         }
                                         None => {
@@ -641,6 +675,16 @@ impl StreamingTask {
                                                 "Deregistration for a DID with no registered client",
                                             );
                                         }
+                                    }
+                                }
+                                StreamingUpdateState::RemoteTaken => {
+                                    stand_by_taken(&mut clients, &mut standby, &value.did_hash);
+                                }
+                                StreamingUpdateState::RemoteReleased => {
+                                    if !clients.contains_key(&value.did_hash)
+                                        && self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await
+                                    {
+                                        debug!(did_hash = %value.did_hash, "the DID's owner elsewhere left; its mux entry here took it back");
                                     }
                                 }
                             }
@@ -697,16 +741,7 @@ impl StreamingTask {
                         {
                             return;
                         }
-                        if let Err(e) = database
-                            .streaming_set_state(
-                                &did_hash,
-                                &self.uuid,
-                                StreamingClientState::Deregistered,
-                            )
-                            .await
-                        {
-                            error!("Error deregistering dead client ({did_hash}): {e}");
-                        }
+                        self.release(database, &did_hash).await;
                     } else {
                         // A stored message's delivery rides with the frame;
                         // the socket loop reports it once it is written
@@ -731,11 +766,14 @@ impl StreamingTask {
                     }
                 } else {
                     debug!("pub/sub msg received for did_hash({did_hash}) but it is not active");
+                    let kind = entry.kind;
                     if let Err(err) = database
-                        .streaming_set_state(
+                        .streaming_claim(
                             &did_hash,
                             &self.uuid,
-                            StreamingClientState::Registered,
+                            false,
+                            kind.into(),
+                            StreamingWrite::Update,
                         )
                         .await
                     {
@@ -782,10 +820,15 @@ impl StreamingTask {
         active: bool,
     ) {
         // The socket to flush to, captured while the entry is borrowed.
-        let (client_tx, client_slots, client_resync) = match clients.get_mut(did_hash) {
+        let (client_tx, client_slots, client_resync, kind) = match clients.get_mut(did_hash) {
             Some(entry) if entry.session_id == session_id => {
                 entry.active = active;
-                (entry.tx.clone(), entry.slots.clone(), entry.resync.clone())
+                (
+                    entry.tx.clone(),
+                    entry.slots.clone(),
+                    entry.resync.clone(),
+                    entry.kind,
+                )
             }
             Some(entry) => {
                 // A standby entry keeps its wish, so that it is honoured if
@@ -807,6 +850,16 @@ impl StreamingTask {
                 return;
             }
             None => {
+                // A mux entry standing by while a direct socket on another
+                // instance holds the DID keeps its wish too, for when the
+                // DID is released to it.
+                if let Some(waiting) = standby
+                    .get_mut(did_hash)
+                    .and_then(|v| v.iter_mut().find(|e| e.session_id == session_id))
+                {
+                    waiting.active = active;
+                    return;
+                }
                 debug!(
                     did_hash = %did_hash,
                     requesting_session = %session_id,
@@ -817,17 +870,42 @@ impl StreamingTask {
             }
         };
 
-        let (state, verb) = if active {
-            (StreamingClientState::Live, "Starting")
-        } else {
-            (StreamingClientState::Registered, "Stopping")
-        };
+        let verb = if active { "Starting" } else { "Stopping" };
         info!("{verb} streaming for DID: ({did_hash})");
-        if let Err(err) = database
-            .streaming_set_state(did_hash, &self.uuid, state)
+        match database
+            .streaming_claim(
+                did_hash,
+                &self.uuid,
+                active,
+                kind.into(),
+                StreamingWrite::Update,
+            )
             .await
         {
-            error!("Error changing streaming state for client ({did_hash}): {err}");
+            Err(err) => {
+                error!("Error changing streaming state for client ({did_hash}): {err}");
+            }
+            // Another instance took the DID between this entry's registration
+            // and this change. A mux entry stands by, as it would have had
+            // the store refused its registration; a direct socket keeps its
+            // entry (the newest connection elsewhere has the DID's traffic).
+            Ok(claim) if !claim.held_here => {
+                if kind == EntryKind::Mux
+                    && let Some(entry) = clients.remove(did_hash)
+                {
+                    let _ =
+                        entry
+                            .tx
+                            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+                                MemberChange::Inactive {
+                                    did_hash: did_hash.to_string(),
+                                },
+                            )));
+                    standby.entry(did_hash.to_string()).or_default().push(entry);
+                }
+                return;
+            }
+            Ok(_) => {}
         }
 
         // Turning live delivery *on* must also deliver what is already queued.
@@ -969,6 +1047,7 @@ impl StreamingTask {
                     self.install(
                         database,
                         clients,
+                        standby,
                         replay_in_progress,
                         &value.did_hash,
                         new_entry(0),
@@ -1088,6 +1167,7 @@ impl StreamingTask {
         self.install(
             database,
             clients,
+            standby,
             replay_in_progress,
             &value.did_hash,
             new_entry(churn_streak),
@@ -1099,15 +1179,70 @@ impl StreamingTask {
     /// Make `entry` the DID's live entry, record it, and — when it took the
     /// slot from another socket — redeliver the inbox to it, since a message in
     /// flight to the displaced socket would otherwise be stranded (#374).
+    #[allow(clippy::too_many_arguments)]
     async fn install(
         &self,
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
         replay_in_progress: &Arc<DashSet<String>>,
         did_hash: &str,
         entry: ClientEntry,
         replacing: bool,
-    ) {
+    ) -> bool {
+        // Across instances the store orders the DID's owners as this task
+        // orders its own entries: a mux entry never takes the DID from a
+        // direct socket on another instance. Refused, it stands by, and its
+        // connection is told the member is inactive; the direct socket
+        // leaving tells this instance to take it back (`RemoteReleased`).
+        let claim = match database
+            .streaming_claim(
+                did_hash,
+                &self.uuid,
+                entry.active,
+                entry.kind.into(),
+                StreamingWrite::Claim,
+            )
+            .await
+        {
+            Ok(claim) => claim,
+            Err(err) => {
+                // As before this check existed: the entry is installed, and
+                // the store will catch up on its next state change.
+                error!("Error starting streaming to client ({did_hash}) streaming: {err}");
+                StreamingClaim {
+                    held_here: true,
+                    displaced_mux: None,
+                }
+            }
+        };
+        if !claim.held_here {
+            let _ = entry
+                .tx
+                .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+                    MemberChange::Inactive {
+                        did_hash: did_hash.to_string(),
+                    },
+                )));
+            debug!(
+                did_hash = %did_hash,
+                session = %entry.session_id,
+                "a direct socket on another instance holds this DID; the mux entry stands by"
+            );
+            standby.entry(did_hash.to_string()).or_default().push(entry);
+            return false;
+        }
+        if let Some(instance) = claim.displaced_mux {
+            self.handoff(
+                database,
+                StreamingHandoff::Taken {
+                    did_hash: did_hash.to_string(),
+                    instance,
+                },
+            )
+            .await;
+        }
+
         // Count after this registration lands. A replacement swaps a map entry
         // rather than adding one, so `len() + 1` would over-report. `clients`
         // is keyed by DID hash, so this is the number of DIDs with a live
@@ -1126,19 +1261,7 @@ impl StreamingTask {
         let client_slots = entry.slots.clone();
         let client_resync = entry.resync.clone();
         let session_id = entry.session_id.clone();
-        let state = if entry.active {
-            StreamingClientState::Live
-        } else {
-            StreamingClientState::Registered
-        };
         clients.insert(did_hash.to_string(), entry);
-
-        if let Err(err) = database
-            .streaming_set_state(did_hash, &self.uuid, state)
-            .await
-        {
-            error!("Error starting streaming to client ({did_hash}) streaming: {err}");
-        }
 
         // Skip if a redelivery for this DID is already running, so a
         // flip-flop duel can't amplify into a repeated whole-inbox dump.
@@ -1161,6 +1284,88 @@ impl StreamingTask {
                     "Inbox redelivery already in progress for DID; skipping duplicate drain"
                 );
             }
+        }
+        true
+    }
+
+    /// Bring this instance's mux entries in step with the store's owners,
+    /// for a handoff that never arrived ([`OWNERSHIP_RECHECK`]):
+    ///
+    /// - a live mux entry whose DID another instance now streams stands by
+    ///   (`superseded`), as on `RemoteTaken`;
+    /// - a mux entry standing by for a DID nobody streams any more takes it
+    ///   (`reactivated`), as on `RemoteReleased`.
+    ///
+    /// Direct sockets are left alone: they take their DID on registration,
+    /// and a newer one elsewhere replaces them by the newest-wins rule.
+    async fn recheck_ownership(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replay_in_progress: &Arc<DashSet<String>>,
+    ) {
+        let live: Vec<String> = clients
+            .iter()
+            .filter(|(_, e)| e.kind == EntryKind::Mux)
+            .map(|(d, _)| d.clone())
+            .collect();
+        for did_hash in live {
+            if let Some(owner) = database.streaming_is_client_live(&did_hash, true).await
+                && owner != self.uuid
+                && stand_by_taken(clients, standby, &did_hash)
+            {
+                info!(did_hash = %did_hash, "a lost handoff: another instance streams this DID; mux entry stood by");
+            }
+        }
+        let waiting: Vec<String> = standby
+            .keys()
+            .filter(|d| !clients.contains_key(*d))
+            .cloned()
+            .collect();
+        for did_hash in waiting {
+            if database
+                .streaming_is_client_live(&did_hash, true)
+                .await
+                .is_none()
+                && self
+                    .promote_standby(database, clients, standby, replay_in_progress, &did_hash)
+                    .await
+            {
+                info!(did_hash = %did_hash, "a lost handoff: nobody streams this DID; mux entry took it back");
+            }
+        }
+    }
+
+    /// Deregister `did_hash` from this instance's store entry, and when a mux
+    /// entry elsewhere waits for the DID, tell it to take the DID back.
+    async fn release(&self, database: &Arc<dyn MediatorStore>, did_hash: &str) {
+        match database.streaming_release(did_hash, &self.uuid).await {
+            Ok(true) => {
+                self.handoff(
+                    database,
+                    StreamingHandoff::Released {
+                        did_hash: did_hash.to_string(),
+                    },
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(err) => error!("Error stopping streaming for client ({did_hash}): {err}"),
+        }
+    }
+
+    /// Tell the other instances sharing the store of a change in which of
+    /// them streams a DID. Lost on a store without cross-instance pub/sub,
+    /// which has no other instance to tell.
+    async fn handoff(&self, database: &Arc<dyn MediatorStore>, handoff: StreamingHandoff) {
+        let record = MuxChangeRecord {
+            origin: self.uuid.clone(),
+            changes: Vec::new(),
+            streaming: vec![handoff],
+        };
+        if let Err(err) = database.mux_changes_publish(&record).await {
+            warn!("couldn't tell the other instances of a streaming handoff: {err}");
         }
     }
 
@@ -1191,28 +1396,62 @@ impl StreamingTask {
         let Some(mut entry) = promoted else {
             return false;
         };
-        let _ = entry
-            .tx
-            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
-                MemberChange::Reactivated {
-                    did_hash: did_hash.to_string(),
-                },
-            )));
         entry.registered_at = Instant::now();
         // Redeliver only to an entry that wants live delivery; an inactive
         // one collects by pickup, as it would have on its own.
         let replay = entry.active;
-        self.install(
-            database,
-            clients,
-            replay_in_progress,
-            did_hash,
-            entry,
-            replay,
-        )
-        .await;
+        let tx = entry.tx.clone();
+        // A direct socket on another instance may hold the DID: then the
+        // entry goes back on standby, still inactive.
+        if !self
+            .install(
+                database,
+                clients,
+                standby,
+                replay_in_progress,
+                did_hash,
+                entry,
+                replay,
+            )
+            .await
+        {
+            return false;
+        }
+        let _ = tx.try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+            MemberChange::Reactivated {
+                did_hash: did_hash.to_string(),
+            },
+        )));
         true
     }
+}
+
+/// Another instance took `did_hash` from this instance's live mux entry: the
+/// entry stands by, and its connection is told the member is inactive. Only
+/// a mux entry yields to another instance; the store never displaces a
+/// direct socket on a mux registration's behalf. Returns whether one did.
+fn stand_by_taken(
+    clients: &mut HashMap<String, ClientEntry>,
+    standby: &mut HashMap<String, Vec<ClientEntry>>,
+    did_hash: &str,
+) -> bool {
+    if !clients
+        .get(did_hash)
+        .is_some_and(|e| e.kind == EntryKind::Mux)
+    {
+        return false;
+    }
+    let entry = clients.remove(did_hash).expect("present above");
+    let _ = entry
+        .tx
+        .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+            MemberChange::Superseded {
+                did_hash: did_hash.to_string(),
+            },
+        )));
+    standby.entry(did_hash.to_string()).or_default().push(entry);
+    debug!(did_hash = %did_hash, "another instance took this DID; its mux entry stands by");
+    true
 }
 
 /// Remove `session_id`'s standby entry for `did_hash`, if it has one.
@@ -1671,7 +1910,11 @@ mod tests {
         // Session B currently owns the slot and is live.
         let mut clients = clients_with(&did_hash, "B", true);
         database
-            .streaming_set_state(&did_hash, &task.uuid, StreamingClientState::Live)
+            .streaming_set_state(
+                &did_hash,
+                &task.uuid,
+                affinidi_messaging_mediator_common::store::StreamingClientState::Live,
+            )
             .await
             .expect("mark live");
 
@@ -1986,6 +2229,86 @@ mod tests {
             }) => assert_eq!(msg, stored),
             _ => panic!("expected the queued message to be redelivered on activation"),
         }
+    }
+
+    /// A handoff that never arrives is caught by the periodic recheck: a mux
+    /// entry whose DID the store now gives to another instance stands by
+    /// (`superseded`), and one standing by for a DID nobody holds takes it
+    /// back (`reactivated`).
+    #[tokio::test]
+    async fn the_ownership_recheck_catches_a_lost_handoff() {
+        use affinidi_messaging_mediator_common::store::StreamingClientState;
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let task = streaming_task();
+        let replay: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let did = "did_hash_member";
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut clients = HashMap::from([(
+            did.to_string(),
+            ClientEntry {
+                tx,
+                session_id: "M".to_string(),
+                active: true,
+                registered_at: Instant::now(),
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+                kind: EntryKind::Mux,
+                slots: None,
+            },
+        )]);
+        let mut standby = HashMap::new();
+        let change = |rx: &mut mpsc::Receiver<QueuedCommand>| match rx.try_recv() {
+            Ok(QueuedCommand {
+                cmd: WebSocketCommands::MemberChange(c),
+                ..
+            }) => Some(c),
+            _ => None,
+        };
+
+        // Ours in the store: nothing changes.
+        database
+            .streaming_set_state(did, &task.uuid, StreamingClientState::Live)
+            .await
+            .unwrap();
+        task.recheck_ownership(&database, &mut clients, &mut standby, &replay)
+            .await;
+        assert!(clients.contains_key(did));
+        assert!(change(&mut rx).is_none());
+
+        // Another instance took it, and its `Taken` was lost.
+        database
+            .streaming_set_state(did, "another-instance", StreamingClientState::Live)
+            .await
+            .unwrap();
+        task.recheck_ownership(&database, &mut clients, &mut standby, &replay)
+            .await;
+        assert!(!clients.contains_key(did), "the mux entry stood by");
+        assert_eq!(standby.get(did).map(Vec::len), Some(1));
+        assert!(matches!(
+            change(&mut rx),
+            Some(MemberChange::Superseded { .. })
+        ));
+
+        // That instance left, and its `Released` was lost.
+        database
+            .streaming_set_state(did, "another-instance", StreamingClientState::Deregistered)
+            .await
+            .unwrap();
+        task.recheck_ownership(&database, &mut clients, &mut standby, &replay)
+            .await;
+        assert!(clients.contains_key(did), "the mux entry took the DID back");
+        assert!(standby.get(did).is_none());
+        assert!(matches!(
+            change(&mut rx),
+            Some(MemberChange::Reactivated { .. })
+        ));
+        assert_eq!(
+            database
+                .streaming_is_client_live(did, false)
+                .await
+                .as_deref(),
+            Some(task.uuid.as_str())
+        );
     }
 
     /// A redelivery that cannot queue everything (here a send queue with room

@@ -570,6 +570,41 @@ pub struct DeliveryDecision {
 
 // ─── Live streaming state ───────────────────────────────────────────────────
 
+/// What holds a DID's live stream on an instance: the DID's own socket, or
+/// a mux connection carrying it as a member. A direct socket outranks a mux
+/// entry across instances as it does within one (design §7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamingKind {
+    Direct,
+    Mux,
+}
+
+/// How [`MediatorStore::streaming_claim`](super::MediatorStore::streaming_claim)
+/// treats an entry another instance owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamingWrite {
+    /// A new registration: take the DID, the newest connection winning,
+    /// except that a mux entry never takes it from a direct socket.
+    Claim,
+    /// A live-delivery change on an existing registration: change the entry
+    /// only while this instance owns it, so a stale instance never overwrites
+    /// the current owner.
+    Update,
+}
+
+/// [`MediatorStore::streaming_claim`](super::MediatorStore::streaming_claim)'s
+/// answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamingClaim {
+    /// Whether this instance now holds the DID's entry. `false` when a direct
+    /// socket on another instance holds it (a mux claim), or another instance
+    /// owns it (an update).
+    pub held_here: bool,
+    /// A mux entry on another instance (its streaming uuid) that this claim
+    /// took the DID from. That instance must stand its entry by.
+    pub displaced_mux: Option<String>,
+}
+
 /// State of a live-streaming subscriber, set by the WebSocket task as
 /// clients connect, transition to live delivery, and disconnect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
