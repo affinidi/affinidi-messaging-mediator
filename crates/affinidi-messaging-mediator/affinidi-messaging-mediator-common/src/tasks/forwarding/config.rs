@@ -68,8 +68,8 @@ pub struct ForwardingConfig {
     /// Upper bound, in seconds, on one delivery attempt (connect, send and
     /// the peer's answer, including a WebSocket attempt and its REST
     /// fallback). An attempt that runs over is a retryable failure. Keep it
-    /// above 60: a WebSocket attempt can wait 30 s for the peer's ack before
-    /// the REST fallback, which has 30 s of its own.
+    /// above 60: a WebSocket attempt (connect, send and the peer's ack) takes
+    /// at most 30 s before the REST fallback, which has 30 s of its own.
     #[serde(default = "default_delivery_timeout_seconds")]
     pub delivery_timeout_seconds: u64,
     /// Seconds a claimed queue entry may sit untouched before any processor

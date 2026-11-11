@@ -759,8 +759,8 @@ max_concurrent_endpoints = "32"
 ### Seconds (not milliseconds) one delivery attempt may take — connect, send
 ### and the peer's answer, including a WebSocket attempt and its REST
 ### fallback — before it counts as a failed attempt. Keep it above 60: a
-### WebSocket attempt may wait 30 s for the peer's ack before falling back to
-### REST, which has 30 s of its own. Must be at least 1.
+### WebSocket attempt (connect, send and the peer's ack) takes at most 30 s
+### before falling back to REST, which has 30 s of its own. Must be at least 1.
 delivery_timeout_seconds = "90"
 
 ### Env: PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS
