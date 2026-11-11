@@ -410,6 +410,10 @@ impl From<ProcessorError> for MediatorError {
     }
 }
 
+/// What an HTTP client is told for any [`MediatorError::SessionError`]; the
+/// error's own text is logged only.
+pub const SESSION_ERROR_MESSAGE: &str = "Session could not be established or found";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let ctx = &self.context;
@@ -667,16 +671,25 @@ impl IntoResponse for AppError {
                 response
             }
             MediatorError::SessionError(error_code, session_id, message) => {
-                let response = ErrorResponse {
+                // The text can come from the store (a backend's own error
+                // message) and the caller may have no session yet, so it is
+                // logged and the client gets a fixed message.
+                event!(
+                    Level::WARN,
+                    "{}: SessionError({}): {}{}",
+                    session_id,
+                    error_code,
+                    message,
+                    ctx_log
+                );
+                ErrorResponse {
                     http_code: StatusCode::NOT_ACCEPTABLE.as_u16(),
-                    session_id: session_id.to_string(),
+                    session_id,
                     request_id,
                     error_code,
                     error_code_str: "SessionError".to_string(),
-                    message,
-                };
-                event!(Level::WARN, "{}{}", response.to_string(), ctx_log);
-                response
+                    message: SESSION_ERROR_MESSAGE.to_string(),
+                }
             }
             MediatorError::AnonymousMessageError(error_code, session_id, message) => {
                 let response = ErrorResponse {
@@ -1128,6 +1141,22 @@ mod tests {
         assert!(
             !MediatorError::DatabaseError(14, "s".into(), "storage.full".into()).is_storage_cap()
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_error_reaches_an_http_client_without_its_text() {
+        let detail = "Failed to retrieve session (abc). Reason: ERR backend detail 10.0.0.7:6379";
+        let response = AppError::from(MediatorError::SessionError(14, "abc".into(), detail.into()))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["message"], SESSION_ERROR_MESSAGE);
+        assert_eq!(body["errorCodeStr"], "SessionError");
+        assert_eq!(body["errorCode"], 14);
+        assert!(!body.to_string().contains("backend detail"));
     }
 
     #[test]
