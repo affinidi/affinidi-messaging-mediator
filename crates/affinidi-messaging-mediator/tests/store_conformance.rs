@@ -1498,6 +1498,44 @@ async fn check_v1_routing_keys(store: Arc<dyn MediatorStore>) {
         "the failed claim must not have changed the owner"
     );
 
+    // A conditional unbind removes the binding only for its owner.
+    assert!(
+        !store
+            .v1_routing_key_unbind_if_owner(verkey, bob)
+            .await
+            .expect("conditional unbind"),
+        "a conditional unbind by another account must report false"
+    );
+    assert_eq!(
+        store.v1_routing_key_lookup(verkey).await.expect("lookup"),
+        Some(alice.to_string()),
+        "a conditional unbind by another account must leave the binding"
+    );
+    let third = "6QHqHQvwwh8xbgzNnUCsYaNbfAMSqUGkGkSFHqDu9dXq";
+    store
+        .v1_routing_key_bind(third, alice)
+        .await
+        .expect("bind third");
+    assert!(
+        store
+            .v1_routing_key_unbind_if_owner(third, alice)
+            .await
+            .expect("conditional unbind"),
+        "a conditional unbind by the owner removes the binding"
+    );
+    assert_eq!(
+        store.v1_routing_key_lookup(third).await.expect("lookup"),
+        None
+    );
+    assert!(
+        !store
+            .v1_routing_keys_for(&alice_hash)
+            .await
+            .expect("keys_for")
+            .contains(&third.to_string()),
+        "a conditionally unbound key leaves the owner's index"
+    );
+
     // Reverse index.
     store
         .v1_routing_key_bind(other, alice)

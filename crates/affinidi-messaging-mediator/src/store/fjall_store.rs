@@ -2505,6 +2505,27 @@ impl MediatorStore for FjallStore {
         Ok(existed)
     }
 
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        // Under the write lock, like bind, so the owner cannot change between
+        // the check and the remove.
+        let _guard = self.write_lock.lock().await;
+        let owned = self
+            .v1_routing_keys
+            .get(verkey.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_unbind_if_owner:get", e))?
+            .is_some_and(|owner| owner.as_ref() == did.as_bytes());
+        if owned {
+            self.v1_routing_keys
+                .remove(verkey.as_bytes())
+                .map_err(|e| Self::db_err("v1_routing_key_unbind_if_owner:remove", e))?;
+        }
+        Ok(owned)
+    }
+
     async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
         // The index is keyed by verkey and stores the DID, so matching by hash
         // means hashing each stored DID. Acceptable on a cold keyspace touched
@@ -2708,6 +2729,10 @@ impl MediatorStore for FjallStore {
         to_hash: &str,
         from_hash: Option<&str>,
     ) -> Result<Option<DeliveryDecision>, MediatorError> {
+        // Probe the access list before reading the account, so a recipient
+        // with no account costs the same reads as one that has one.
+        let on_access_list =
+            from_hash.map(|from| self.access_list_contains(to_hash, from).unwrap_or(false));
         let Ok(Some(raw)) = self.accounts.get(to_hash.as_bytes()) else {
             return Ok(None);
         };
@@ -2716,10 +2741,8 @@ impl MediatorStore for FjallStore {
             _ => return Ok(None),
         };
         let acls = MediatorACLSet::from_u64(acc.acls);
-        let sender = match from_hash {
-            Some(from) => ops::Sender::Known {
-                on_access_list: self.access_list_contains(to_hash, from).unwrap_or(false),
-            },
+        let sender = match on_access_list {
+            Some(on_access_list) => ops::Sender::Known { on_access_list },
             None => ops::Sender::Anonymous,
         };
         let access_list_allows = ops::access_list_allowed(&acls, sender);

@@ -1506,6 +1506,14 @@ impl MediatorStore for RedisStore {
         self.v1_routing_key_unbind(verkey).await
     }
 
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        self.v1_routing_key_unbind_if_owner(verkey, did).await
+    }
+
     async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
         self.v1_routing_keys_for(did_hash).await
     }

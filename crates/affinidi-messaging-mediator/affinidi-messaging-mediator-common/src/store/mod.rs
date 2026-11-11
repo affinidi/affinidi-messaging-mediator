@@ -1175,6 +1175,24 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(false)
     }
 
+    /// Drop the binding for `verkey` only if it is bound to `did`, in one
+    /// atomic step. Returns whether it was removed.
+    ///
+    /// Unlike [`Self::v1_routing_key_unbind`] this never removes a binding
+    /// that another account holds, even one made between the caller's last
+    /// read and this call.
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        _verkey: &str,
+        _did: &str,
+    ) -> Result<bool, MediatorError> {
+        Err(MediatorError::ConfigError(
+            12,
+            "NA".into(),
+            "this storage backend does not implement DIDComm v1 routing keys".into(),
+        ))
+    }
+
     /// Every routing verkey bound to the account with this DID **hash**.
     ///
     /// Used by account removal (so a deleted account's keys stop resolving)

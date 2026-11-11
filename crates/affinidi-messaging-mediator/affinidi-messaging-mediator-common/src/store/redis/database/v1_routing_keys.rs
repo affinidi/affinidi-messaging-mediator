@@ -167,6 +167,72 @@ impl RedisStore {
         Ok(true)
     }
 
+    /// Drop the binding for `verkey` only if `did` holds it.
+    ///
+    /// The owner check and the delete run in one script on the single
+    /// `V1_KEY:` key, so they work unchanged in cluster mode and no other
+    /// account's binding can be removed between them. The reverse-index
+    /// entry is removed first, as [`Self::v1_routing_key_unbind`] does: if the
+    /// script then finds another owner, `did`'s index never held the key.
+    pub(crate) async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        let owner: Option<String> = redis::cmd("GET")
+            .arg(key_owner(verkey))
+            .query_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".to_string(),
+                    &err,
+                    format!("Failed to read v1 routing key owner. Reason: {err}"),
+                )
+            })?;
+        if owner.as_deref() != Some(did) {
+            return Ok(false);
+        }
+
+        redis::cmd("SREM")
+            .arg(self.keys().v1_keys(&crate::did_identity::did_hash(did)))
+            .arg(verkey)
+            .exec_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".to_string(),
+                    &err,
+                    format!("Failed to unindex v1 routing key. Reason: {err}"),
+                )
+            })?;
+
+        let removed: i64 = redis::Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+               return redis.call('DEL', KEYS[1]) \
+             end \
+             return 0",
+        )
+        .key(key_owner(verkey))
+        .arg(did)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::database_from_redis(
+                14,
+                "NA".to_string(),
+                &err,
+                format!("Failed to unbind v1 routing key. Reason: {err}"),
+            )
+        })?;
+
+        Ok(removed == 1)
+    }
+
     /// Every routing verkey bound to `did_hash`.
     pub(crate) async fn v1_routing_keys_for(
         &self,
