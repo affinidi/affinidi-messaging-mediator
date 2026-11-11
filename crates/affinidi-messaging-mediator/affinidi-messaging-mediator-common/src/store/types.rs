@@ -209,6 +209,15 @@ pub struct ForwardQueueEntry {
     /// Hop counter for loop detection. The mediator increments on each
     /// forward and rejects messages exceeding `max_hops`.
     pub hop_count: u32,
+    /// Unix milliseconds before which no processor attempts this entry; `0`
+    /// means "as soon as it is read". Set on a retry, so the retry waits out
+    /// its backoff wherever it is picked up, not only on the processor that
+    /// saw the failure.
+    ///
+    /// Defaulted on decode so entries written before this field existed still
+    /// read; a processor that predates it ignores it and retries at once.
+    #[serde(default)]
+    pub not_before_ms: u128,
 }
 
 // ─── Live streaming pub/sub ─────────────────────────────────────────────────

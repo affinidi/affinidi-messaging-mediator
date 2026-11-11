@@ -737,8 +737,25 @@ max_retries = "5"
 initial_backoff_ms = "1000"
 
 ### Env: PROCESSOR_FORWARDING_MAX_BACKOFF_MS
-### Maximum backoff delay in milliseconds
+### Maximum backoff delay in milliseconds. After a failed attempt the endpoint
+### backs off (initial_backoff_ms doubling per consecutive failure, capped
+### here); the message is queued again with a not-before at the end of the
+### backoff, which every processor sharing the queue honours.
 max_backoff_ms = "60000"
+
+### Env: PROCESSOR_FORWARDING_MAX_CONCURRENT_ENDPOINTS
+### How many next-hop endpoints are delivered to at once. Messages for one
+### endpoint go out in order, one at a time; different endpoints proceed in
+### parallel up to this limit, so a slow endpoint holds one slot instead of
+### the whole processor. Must be at least 1.
+### Scale: raise for relay/hub mediators forwarding to many peers.
+max_concurrent_endpoints = "32"
+
+### Env: PROCESSOR_FORWARDING_DELIVERY_TIMEOUT
+### Seconds one delivery attempt may take (connect, send and the peer's
+### answer, including a WebSocket attempt and its REST fallback) before it
+### counts as a failed attempt. Must be at least 1.
+delivery_timeout_seconds = "60"
 
 ### Env: PROCESSOR_FORWARDING_CONSUMER_GROUP
 ### Consumer group name for the forwarding queue. On Redis this is the

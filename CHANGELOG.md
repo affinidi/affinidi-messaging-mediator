@@ -217,6 +217,38 @@ once on Fjall and Memory, as they already did on Redis.
 
 **Behaviour change (R3.6):** a client that stops reading its socket long
 enough for a mediator write to wait 30 s is disconnected.
+### Changed — forwarding delivers to endpoints concurrently, with per-endpoint backoff
+
+- The forwarding processor delivers to up to `max_concurrent_endpoints`
+  next-hop endpoints at once (default 32). Messages for one endpoint still go
+  out in order, one at a time. Before, endpoints were served one after
+  another, so a slow peer delayed every other peer's forwards.
+- Each delivery attempt is bounded by `delivery_timeout_seconds` (default
+  60), covering a WebSocket attempt and its REST fallback together.
+- Backoff now applies to the failing endpoint only. The processor used to
+  pause all forwarding for up to `max_backoff_ms` after a failed batch. Now
+  the failed message is queued again with a not-before at the end of that
+  endpoint's backoff, and the endpoint's other messages are deferred to the
+  same time instead of being sent into the failure. Every processor sharing
+  the queue honours the not-before, so retries are spaced out on multi-
+  processor deployments too.
+- A next hop whose URL does not parse, or that the egress policy does not
+  admit, is final: the forward is dropped on the first attempt and the
+  sender gets a problem report with the new code
+  `e.p.me.res.forwarding.endpoint-not-permitted`. It used to be retried
+  `max_retries` times and reported as abandoned.
+- A forward with a requested delay (`delay_milli`) up to `max_backoff_ms`
+  is held and delivered when due.
+- `ForwardQueueEntry` has a new `not_before_ms` field (unix ms, `0` = none),
+  stored as `NOT_BEFORE_MS` on Redis. Entries written before it read as `0`;
+  a processor from an earlier release ignores it and retries at once.
+  `ForwardOutcome` has a new `NotPermitted` variant.
+
+**Behaviour change (R3.6):** retries of a failed forward are spaced by the
+endpoint's backoff across all processors; forwards to a non-permitted next hop
+produce `e.p.me.res.forwarding.endpoint-not-permitted` instead of
+`e.p.me.res.forwarding.abandoned`; and messages to different endpoints may be
+relayed in a different order than they were queued.
 
 ### Changed — mux frame decisions are counted; delivery reports hold no body
 

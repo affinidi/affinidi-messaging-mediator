@@ -501,6 +501,7 @@ fn fwd_entry_into_new(inner: InnerForwardEntry) -> ForwardQueueEntry {
         expires_at: inner.expires_at,
         retry_count: inner.retry_count,
         hop_count: inner.hop_count,
+        not_before_ms: inner.not_before_ms,
     }
 }
 
@@ -518,6 +519,7 @@ fn fwd_entry_into_old(new: &ForwardQueueEntry) -> InnerForwardEntry {
         expires_at: new.expires_at,
         retry_count: new.retry_count,
         hop_count: new.hop_count,
+        not_before_ms: new.not_before_ms,
     }
 }
 

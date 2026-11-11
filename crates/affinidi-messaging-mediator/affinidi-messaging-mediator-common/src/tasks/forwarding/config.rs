@@ -59,6 +59,17 @@ pub struct ForwardingConfig {
     pub initial_backoff_ms: u64,
     /// Maximum backoff delay in milliseconds for retry
     pub max_backoff_ms: u64,
+    /// How many next-hop endpoints are delivered to at once. Messages for one
+    /// endpoint go out in order, one at a time; different endpoints proceed in
+    /// parallel up to this limit, so a slow endpoint holds one slot rather
+    /// than the whole processor.
+    #[serde(default = "default_max_concurrent_endpoints")]
+    pub max_concurrent_endpoints: usize,
+    /// Upper bound, in seconds, on one delivery attempt (connect, send and
+    /// the peer's answer, including a WebSocket attempt and its REST
+    /// fallback). An attempt that runs over is a retryable failure.
+    #[serde(default = "default_delivery_timeout_seconds")]
+    pub delivery_timeout_seconds: u64,
     /// Redis consumer group name for forwarding processors
     pub consumer_group: String,
     /// Whether to accept invalid TLS certificates when forwarding to remote mediators.
@@ -93,6 +104,14 @@ pub struct ForwardingConfig {
     pub relay_trusted_mediators: HashSet<String>,
 }
 
+fn default_max_concurrent_endpoints() -> usize {
+    32
+}
+
+fn default_delivery_timeout_seconds() -> u64 {
+    60
+}
+
 impl Default for ForwardingConfig {
     fn default() -> Self {
         ForwardingConfig {
@@ -108,6 +127,8 @@ impl Default for ForwardingConfig {
             max_retries: 5,
             initial_backoff_ms: 1000,
             max_backoff_ms: 60000,
+            max_concurrent_endpoints: default_max_concurrent_endpoints(),
+            delivery_timeout_seconds: default_delivery_timeout_seconds(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: false,
             max_hops: 10,

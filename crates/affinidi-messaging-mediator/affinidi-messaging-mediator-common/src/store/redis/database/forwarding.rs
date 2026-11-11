@@ -57,6 +57,8 @@ impl Database {
             .arg(entry.retry_count.to_string())
             .arg("HOP_COUNT")
             .arg(entry.hop_count.to_string())
+            .arg("NOT_BEFORE_MS")
+            .arg(entry.not_before_ms.to_string())
             .query_async(&mut conn)
             .await
             .map_err(|err| {
@@ -340,6 +342,11 @@ fn parse_forward_entry(
             .unwrap_or(&"0".to_string())
             .parse()
             .unwrap_or(0),
+        // Absent on entries written before retries carried a not-before.
+        not_before_ms: fields
+            .get("NOT_BEFORE_MS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -362,6 +369,7 @@ mod tests {
             expires_at: 2000000,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         assert_eq!(entry.retry_count, 0);
         assert_eq!(entry.delay_milli, 0);
@@ -384,6 +392,7 @@ mod tests {
             expires_at: 9999,
             retry_count: 3,
             hop_count: 2,
+            not_before_ms: 0,
         };
         let cloned = entry.clone();
         assert_eq!(cloned.stream_id, entry.stream_id);
@@ -527,6 +536,7 @@ mod tests {
             expires_at: 9999999999,
             retry_count: 2,
             hop_count: 1,
+            not_before_ms: 0,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: ForwardQueueEntry = serde_json::from_str(&json).unwrap();

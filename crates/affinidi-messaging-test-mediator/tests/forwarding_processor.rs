@@ -19,7 +19,10 @@
 use affinidi_messaging_mediator::store::MemoryStore;
 use affinidi_messaging_mediator_common::{
     store::{MediatorStore, types::ForwardQueueEntry},
-    tasks::forwarding::{ForwardingConfig, ForwardingProcessor, SystemMessagePacker},
+    tasks::forwarding::{
+        ForwardOutcome, ForwardingConfig, ForwardingObserver, ForwardingProcessor,
+        SystemMessagePacker,
+    },
     types::messages::{Folder, MessageListElement},
 };
 use axum::{Router, extract::State, http::StatusCode, routing::post};
@@ -102,6 +105,7 @@ fn forward_entry(endpoint_url: &str, message: &str) -> ForwardQueueEntry {
         expires_at: (now_ms / 1000) as u64 + 300,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     }
 }
 
@@ -378,4 +382,182 @@ async fn abandonment_without_a_packer_stores_nothing() {
         sender_inbox(&store).await.is_none(),
         "with no packer configured there is nothing readable to store"
     );
+}
+
+// ─── Scheduling across endpoints ────────────────────────────────────────────
+
+/// Accepts connections and never answers, so a request to it runs until the
+/// client gives up.
+async fn spawn_unresponsive_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unresponsive endpoint");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Records every outcome the processor reports.
+#[derive(Default)]
+struct RecordingObserver {
+    outcomes: std::sync::Mutex<Vec<(String, ForwardOutcome)>>,
+}
+
+impl ForwardingObserver for RecordingObserver {
+    fn observe(&self, entry: &ForwardQueueEntry, outcome: ForwardOutcome) {
+        self.outcomes
+            .lock()
+            .expect("observer log")
+            .push((entry.message.clone(), outcome));
+    }
+}
+
+/// Endpoints that never answer each hold up their own deliveries only: a
+/// forward to a responsive endpoint, read in the same batch, goes out at once
+/// rather than after the others time out.
+#[tokio::test]
+async fn an_unresponsive_endpoint_does_not_delay_another() {
+    let mut healthy = spawn_stub_mediator(0).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+
+    for i in 0..3 {
+        let stalled = spawn_unresponsive_endpoint().await;
+        store
+            .forward_queue_enqueue(&forward_entry(&stalled, &format!("stalled-{i}")), 0)
+            .await
+            .expect("enqueue");
+    }
+    store
+        .forward_queue_enqueue(&forward_entry(&healthy.endpoint_url, "prompt-forward"), 0)
+        .await
+        .expect("enqueue");
+
+    spawn_processor(
+        ForwardingConfig {
+            delivery_timeout_seconds: 30,
+            ..test_config()
+        },
+        store.clone(),
+    );
+
+    let body = tokio::time::timeout(Duration::from_secs(5), healthy.received.recv())
+        .await
+        .expect("the responsive endpoint waited on the unresponsive ones")
+        .expect("stub channel closed");
+    assert_eq!(body, "prompt-forward");
+}
+
+/// A next hop the egress policy does not admit, or whose URL does not parse,
+/// is dropped on the first attempt — no retries — and the sender is told
+/// with a report of its own.
+#[tokio::test]
+async fn an_endpoint_that_is_not_permitted_is_dropped_without_retrying() {
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    let packed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observer = Arc::new(RecordingObserver::default());
+
+    store
+        .forward_queue_enqueue(
+            &forward_entry("https://169.254.169.254", "link-local-forward"),
+            0,
+        )
+        .await
+        .expect("enqueue");
+    store
+        .forward_queue_enqueue(&forward_entry("not a url", "unparsable-forward"), 0)
+        .await
+        .expect("enqueue");
+
+    // The default retry budget: a final answer must not spend it.
+    let processor = ForwardingProcessor::new(
+        ForwardingConfig {
+            max_retries: 5,
+            ..test_config()
+        },
+        store.clone(),
+    )
+    .expect("create processor")
+    .with_system_packer(Arc::new(RecordingPacker {
+        mediator_did: "did:example:mediator".into(),
+        packed: packed_log.clone(),
+        fail: false,
+    }))
+    .with_observer(observer.clone());
+    tokio::spawn(async move {
+        let _ = processor.start().await;
+    });
+
+    assert_queue_drains(&store).await;
+    // Both reports are stored by the time the queue is empty; allow the
+    // second a moment in case its write is still in flight.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while packed_log.lock().expect("packer log").len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both senders get a report");
+
+    let outcomes = observer.outcomes.lock().expect("observer log").clone();
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "one outcome each, no retries: {outcomes:?}"
+    );
+    for (message, outcome) in &outcomes {
+        assert_eq!(*outcome, ForwardOutcome::NotPermitted, "{message}");
+    }
+
+    for (plaintext, _) in packed_log.lock().expect("packer log").iter() {
+        assert_eq!(
+            plaintext["body"]["code"],
+            "e.p.me.res.forwarding.endpoint-not-permitted"
+        );
+    }
+}
+
+/// A failed attempt is retried only after the endpoint's backoff, even by a
+/// second processor sharing the queue, which has seen no failure itself.
+#[tokio::test]
+async fn a_retry_waits_out_the_backoff_on_every_processor() {
+    let mut stub = spawn_stub_mediator(1).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+
+    store
+        .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, "retried-forward"), 0)
+        .await
+        .expect("enqueue");
+
+    // One failure backs off `initial_backoff_ms * 2`.
+    let config = ForwardingConfig {
+        initial_backoff_ms: 400,
+        max_backoff_ms: 5_000,
+        ..test_config()
+    };
+    spawn_processor(config.clone(), store.clone());
+    spawn_processor(config, store.clone());
+
+    let first = tokio::time::timeout(Duration::from_secs(10), stub.received.recv())
+        .await
+        .expect("timed out waiting for the first attempt")
+        .expect("stub channel closed");
+    let failed_at = std::time::Instant::now();
+    let second = tokio::time::timeout(Duration::from_secs(10), stub.received.recv())
+        .await
+        .expect("timed out waiting for the retry")
+        .expect("stub channel closed");
+    let waited = failed_at.elapsed();
+
+    assert_eq!(first, "retried-forward");
+    assert_eq!(second, "retried-forward");
+    assert!(
+        waited >= Duration::from_millis(700),
+        "the retry went out {waited:?} after the failure, inside the 800ms backoff"
+    );
+    assert_queue_drains(&store).await;
 }

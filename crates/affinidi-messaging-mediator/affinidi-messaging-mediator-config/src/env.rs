@@ -291,6 +291,14 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         "PROCESSOR_FORWARDING_MAX_BACKOFF_MS"
     );
     env_override!(
+        config.processors.forwarding.max_concurrent_endpoints,
+        "PROCESSOR_FORWARDING_MAX_CONCURRENT_ENDPOINTS"
+    );
+    env_override!(
+        config.processors.forwarding.delivery_timeout_seconds,
+        "PROCESSOR_FORWARDING_DELIVERY_TIMEOUT"
+    );
+    env_override!(
         config.processors.forwarding.consumer_group,
         "PROCESSOR_FORWARDING_CONSUMER_GROUP"
     );

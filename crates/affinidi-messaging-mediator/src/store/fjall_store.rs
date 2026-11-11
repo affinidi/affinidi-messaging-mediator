@@ -4882,6 +4882,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         let id = store
             .forward_queue_enqueue(&entry, 0)
@@ -4925,6 +4926,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
 
         let id = {
@@ -5000,6 +5002,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         store
             .forward_queue_enqueue(&entry, 0)
@@ -5100,6 +5103,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         let id = store
             .forward_queue_enqueue(&entry, 0)
@@ -5138,6 +5142,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         }
     }
 

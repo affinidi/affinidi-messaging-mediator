@@ -11,10 +11,18 @@
 //! - If rate exceeds threshold: use WebSocket (kept alive with idle timeout)
 //! - Otherwise: use REST POST
 //!
+//! Scheduling:
+//! - Endpoints are delivered to concurrently, up to `max_concurrent_endpoints`;
+//!   messages for one endpoint go out in order, one at a time
+//! - Each attempt is bounded by `delivery_timeout_seconds`
+//!
 //! Error handling:
-//! - Connection failures: retry with exponential backoff
+//! - Connection failures: the endpoint backs off exponentially, and the
+//!   message is queued again with a not-before at the end of the backoff
 //! - Refusal from remote mediator (a 4xx other than 408/425/429): drop the
 //!   message at once and send the sender a problem report; it is not retried
+//! - An endpoint URL that does not parse, or that the egress policy does not
+//!   admit: likewise dropped at once with a problem report of its own
 
 use crate::store::{MediatorStore, types::ForwardQueueEntry};
 use crate::tasks::forwarding::config::ForwardingConfig;
@@ -24,11 +32,12 @@ use crate::time::{unix_timestamp_millis, unix_timestamp_secs};
 use affinidi_net_guard::{EgressPolicy, guarded_dns_resolver};
 use futures_util::{SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -161,6 +170,10 @@ struct EndpointState {
     last_activity: Instant,
     /// Consecutive failure count for backoff calculation
     consecutive_failures: u32,
+    /// Unix ms until which this endpoint is backing off after a failed
+    /// attempt; `0` when it is not. While it is, its messages are queued
+    /// again for after the window instead of being sent.
+    retry_after_ms: u128,
     /// Set when a WebSocket attempt to this endpoint failed; until it elapses,
     /// delivery goes straight to REST.
     ///
@@ -174,6 +187,16 @@ struct EndpointState {
 }
 
 impl EndpointState {
+    fn new(rate_window_seconds: u64) -> Self {
+        EndpointState {
+            rate_tracker: EndpointRateTracker::new(rate_window_seconds),
+            last_activity: Instant::now(),
+            consecutive_failures: 0,
+            retry_after_ms: 0,
+            ws_suppressed_until: None,
+        }
+    }
+
     /// Whether a WebSocket attempt is currently suppressed for this endpoint.
     fn ws_suppressed(&self, now: Instant) -> bool {
         self.ws_suppressed_until.is_some_and(|until| now < until)
@@ -296,6 +319,9 @@ enum RelayFailure {
     Refused { status: u16, reason: String },
     /// The peer was unreachable, overloaded or failed: worth another try.
     Retryable(String),
+    /// The endpoint URL does not parse, or the egress policy does not admit
+    /// it. No request was made, and none ever will be, so it is final.
+    NotPermitted(String),
 }
 
 impl RelayFailure {
@@ -313,9 +339,9 @@ impl RelayFailure {
 impl std::fmt::Display for RelayFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RelayFailure::Refused { reason, .. } | RelayFailure::Retryable(reason) => {
-                f.write_str(reason)
-            }
+            RelayFailure::Refused { reason, .. }
+            | RelayFailure::Retryable(reason)
+            | RelayFailure::NotPermitted(reason) => f.write_str(reason),
         }
     }
 }
@@ -325,7 +351,168 @@ impl std::fmt::Display for RelayFailure {
 const METRIC_FORWARD_REPORT_LIVE_PUBLISH_FAILED_TOTAL: &str =
     "forward_problem_report_live_publish_failed_total";
 
+/// Why a forward was dropped undelivered, which picks the sender's report.
+#[derive(Clone, Copy, Debug)]
+enum ReportReason {
+    /// Its retries ran out.
+    Abandoned,
+    /// The peer refused it with this HTTP status.
+    Refused(u16),
+    /// The next-hop endpoint is not one this mediator sends to.
+    NotPermitted,
+}
+
+/// When an entry may first be attempted (unix ms): after the delay its sender
+/// asked for, and after the not-before of a retry.
+fn due_at_ms(entry: &ForwardQueueEntry) -> u128 {
+    let requested = if entry.delay_milli > 0 {
+        entry.received_at_ms + entry.delay_milli as u128
+    } else {
+        0
+    };
+    requested.max(entry.not_before_ms)
+}
+
+/// The processor's claimed-but-unfinished entries, and which endpoint is
+/// delivered to next.
+///
+/// Each held entry is in exactly one of `parked`, `queued`, or a running
+/// delivery task (its endpoint is then in `busy`), and its stream id is in
+/// `held` until that task finishes. An endpoint is in `waiting` exactly when
+/// it has queued entries and no running task.
+struct Scheduler {
+    max_concurrent: usize,
+    batch_size: usize,
+    /// Stop reading once this many entries are held.
+    max_held: usize,
+    /// The longest an entry is parked for. Retries never ask for more than
+    /// `max_backoff_ms`; a sender-requested delay beyond it is left claimed
+    /// in the store, as before.
+    park_horizon_ms: u128,
+    held: HashSet<String>,
+    /// Entries not yet due, by (due unix ms, arrival order).
+    parked: BTreeMap<(u128, u64), ForwardQueueEntry>,
+    arrivals: u64,
+    queued: HashMap<String, VecDeque<ForwardQueueEntry>>,
+    waiting: VecDeque<String>,
+    busy: HashSet<String>,
+}
+
+impl Scheduler {
+    fn new(config: &ForwardingConfig) -> Self {
+        let max_concurrent = config.max_concurrent_endpoints.max(1);
+        let batch_size = config.batch_size.max(1);
+        Scheduler {
+            max_concurrent,
+            batch_size,
+            max_held: batch_size.saturating_mul(max_concurrent),
+            park_horizon_ms: config.max_backoff_ms.max(config.initial_backoff_ms) as u128,
+            held: HashSet::new(),
+            parked: BTreeMap::new(),
+            arrivals: 0,
+            queued: HashMap::new(),
+            waiting: VecDeque::new(),
+            busy: HashSet::new(),
+        }
+    }
+
+    fn has_room(&self) -> bool {
+        self.held.len() < self.max_held
+    }
+
+    /// Take newly read entries: due ones are queued for their endpoint, the
+    /// rest parked until due.
+    fn accept(&mut self, entries: Vec<ForwardQueueEntry>, now_ms: u128) {
+        for entry in entries {
+            if !self.held.insert(entry.stream_id.clone()) {
+                debug!(
+                    "FORWARD_Q entry {} is already held; ignoring the repeat",
+                    entry.stream_id
+                );
+                continue;
+            }
+            let due = due_at_ms(&entry);
+            if due <= now_ms {
+                self.enqueue(entry);
+            } else if entry.not_before_ms == 0 && due - now_ms > self.park_horizon_ms {
+                debug!(
+                    "Forward {} is delayed {}ms, beyond the {}ms park horizon; leaving it claimed",
+                    entry.stream_id,
+                    due - now_ms,
+                    self.park_horizon_ms
+                );
+                self.held.remove(&entry.stream_id);
+            } else {
+                // A retry's not-before is at most `max_backoff_ms` ahead when
+                // written; the clamp only bites on clock skew between
+                // processors, where an early attempt beats holding it forever.
+                let until = due.min(now_ms + self.park_horizon_ms);
+                self.arrivals += 1;
+                self.parked.insert((until, self.arrivals), entry);
+            }
+        }
+    }
+
+    /// Move parked entries that are now due onto their endpoint's queue.
+    fn release_due(&mut self, now_ms: u128) {
+        while let Some(first) = self.parked.first_entry() {
+            if first.key().0 > now_ms {
+                break;
+            }
+            let entry = first.remove();
+            self.enqueue(entry);
+        }
+    }
+
+    fn enqueue(&mut self, entry: ForwardQueueEntry) {
+        let endpoint_url = entry.endpoint_url.clone();
+        let queue = self.queued.entry(endpoint_url.clone()).or_default();
+        let was_empty = queue.is_empty();
+        queue.push_back(entry);
+        if was_empty && !self.busy.contains(&endpoint_url) {
+            self.waiting.push_back(endpoint_url);
+        }
+    }
+
+    /// The next endpoint to deliver to and up to `batch_size` of its entries,
+    /// marking it busy. Endpoints take turns in the order they became ready.
+    fn next_batch(&mut self) -> Option<(String, Vec<ForwardQueueEntry>)> {
+        while let Some(endpoint_url) = self.waiting.pop_front() {
+            let Some(queue) = self.queued.get_mut(&endpoint_url) else {
+                continue;
+            };
+            let take = queue.len().min(self.batch_size);
+            let batch: Vec<_> = queue.drain(..take).collect();
+            if queue.is_empty() {
+                self.queued.remove(&endpoint_url);
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            self.busy.insert(endpoint_url.clone());
+            return Some((endpoint_url, batch));
+        }
+        None
+    }
+
+    /// A delivery task for `endpoint_url` has finished with `stream_ids`.
+    fn finished(&mut self, endpoint_url: &str, stream_ids: &[String]) {
+        for id in stream_ids {
+            self.held.remove(id);
+        }
+        self.busy.remove(endpoint_url);
+        if self.queued.get(endpoint_url).is_some_and(|q| !q.is_empty()) {
+            self.waiting.push_back(endpoint_url.to_string());
+        }
+    }
+
+    fn next_due_ms(&self) -> Option<u128> {
+        self.parked.keys().next().map(|(due, _)| *due)
+    }
+}
+
 /// The forwarding processor that reads from FORWARD_Q and delivers to remote mediators
+#[derive(Clone)]
 pub struct ForwardingProcessor {
     config: ForwardingConfig,
     database: Arc<dyn MediatorStore>,
@@ -399,14 +586,29 @@ impl ForwardingProcessor {
     }
 
     /// Start the forwarding processor. This runs indefinitely.
+    ///
+    /// Reading and delivering are decoupled. A reader task claims batches from
+    /// the queue; this loop sorts each entry into "ready now" or "parked until
+    /// its not-before", and hands ready entries to one delivery task per
+    /// endpoint, at most `max_concurrent_endpoints` at a time. A slow or
+    /// failing endpoint therefore occupies one slot, and its backoff is a
+    /// not-before on its own entries rather than a pause of the whole loop.
+    ///
+    /// Every claimed entry is held in exactly one place — parked, queued for
+    /// its endpoint, or inside that endpoint's delivery task — and only the
+    /// delivery task acks or deletes it, once. An endpoint never has two
+    /// delivery tasks at a time, which keeps its messages in order and its
+    /// pooled WebSocket single-user.
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // The consumer group is created lazily on the first
         // `forward_queue_read` call; no explicit ensure step needed.
         info!(
-            "ForwardingProcessor started: consumer={}, group={}, batch_size={}, ws_threshold={} msgs/10s, ws_idle_timeout={}s",
+            "ForwardingProcessor started: consumer={}, group={}, batch_size={}, max_concurrent_endpoints={}, delivery_timeout={}s, ws_threshold={} msgs/10s, ws_idle_timeout={}s",
             self.consumer_name,
             self.config.consumer_group,
             self.config.batch_size,
+            self.config.max_concurrent_endpoints,
+            self.config.delivery_timeout_seconds,
             self.config.ws_threshold_msgs_per_10s,
             self.config.ws_idle_timeout_seconds
         );
@@ -422,7 +624,12 @@ impl ForwardingProcessor {
             );
         }
 
-        // Spawn a background task to periodically reclaim stale messages
+        // Spawn a background task to periodically reclaim stale messages.
+        //
+        // The reclaimed entries are not delivered from here. If that changes,
+        // it must skip entries this processor already holds (see `held` in
+        // the loop below): a parked retry sits claimed but idle for up to
+        // `max_backoff_ms`, which can exceed the 60 s idle threshold.
         let db_clone = self.database.clone();
         let group = self.config.consumer_group.clone();
         let consumer = self.consumer_name.clone();
@@ -501,50 +708,105 @@ impl ForwardingProcessor {
             }
         });
 
-        // Main processing loop
-        loop {
-            let entries = match self
-                .database
-                .forward_queue_read(
-                    &self.config.consumer_group,
-                    &self.consumer_name,
-                    self.config.batch_size,
-                    // 5 second block timeout, then loop to check for stale messages
-                    Duration::from_secs(5),
-                )
-                .await
-            {
-                Ok(entries) => entries,
-                Err(e) => {
-                    error!("Error reading from FORWARD_Q: {}. Retrying in 1s...", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+        // The read runs in its own task because it is not cancel-safe: a
+        // Redis XREADGROUP abandoned mid-flight still claims what it read.
+        // The channel holds one batch, so the reader stays at most one batch
+        // ahead of what this loop has accepted.
+        let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<ForwardQueueEntry>>(1);
+        let mut reader = JoinSet::new();
+        {
+            let database = self.database.clone();
+            let group = self.config.consumer_group.clone();
+            let consumer = self.consumer_name.clone();
+            let batch_size = self.config.batch_size;
+            reader.spawn(async move {
+                loop {
+                    match database
+                        .forward_queue_read(&group, &consumer, batch_size, Duration::from_secs(5))
+                        .await
+                    {
+                        Ok(entries) if entries.is_empty() => {}
+                        Ok(entries) => {
+                            if batch_tx.send(entries).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading from FORWARD_Q: {}. Retrying in 1s...", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
-            };
+            });
+        }
 
-            if entries.is_empty() {
-                continue;
+        let this = Arc::new(self.clone());
+        let mut scheduler = Scheduler::new(&self.config);
+        let mut deliveries: JoinSet<()> = JoinSet::new();
+        // Which endpoint, and which entries, each delivery task holds.
+        let mut running: HashMap<tokio::task::Id, (String, Vec<String>)> = HashMap::new();
+
+        loop {
+            let now_ms = unix_timestamp_millis();
+            scheduler.release_due(now_ms);
+
+            while deliveries.len() < scheduler.max_concurrent {
+                let Some((endpoint_url, batch)) = scheduler.next_batch() else {
+                    break;
+                };
+                let ids = batch.iter().map(|m| m.stream_id.clone()).collect();
+                let processor = this.clone();
+                let task_endpoint = endpoint_url.clone();
+                let handle = deliveries.spawn(async move {
+                    processor
+                        .process_endpoint_batch(&task_endpoint, batch)
+                        .await;
+                });
+                running.insert(handle.id(), (endpoint_url, ids));
             }
 
-            debug!("Read {} entries from FORWARD_Q", entries.len());
+            let wake_in = scheduler
+                .next_due_ms()
+                .map(|due| Duration::from_millis(due.saturating_sub(now_ms) as u64))
+                .unwrap_or(Duration::from_secs(3600));
+            let can_read = scheduler.has_room();
 
-            // Group by endpoint URL for batch delivery
-            let mut by_endpoint: HashMap<String, Vec<ForwardQueueEntry>> = HashMap::new();
-            for entry in entries {
-                by_endpoint
-                    .entry(entry.endpoint_url.clone())
-                    .or_default()
-                    .push(entry);
-            }
-
-            // Process each endpoint group
-            for (endpoint_url, messages) in by_endpoint {
-                self.process_endpoint_batch(&endpoint_url, messages).await;
+            tokio::select! {
+                Some(done) = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
+                    let id = match done {
+                        Ok((id, ())) => id,
+                        Err(e) => {
+                            // The entries stay claimed in the store, as they
+                            // would after a crash; nothing here acks them.
+                            error!("Forwarding delivery task failed: {e}");
+                            e.id()
+                        }
+                    };
+                    if let Some((endpoint_url, ids)) = running.remove(&id) {
+                        scheduler.finished(&endpoint_url, &ids);
+                    }
+                }
+                batch = batch_rx.recv(), if can_read => {
+                    let Some(entries) = batch else {
+                        return Err("forwarding queue reader stopped".into());
+                    };
+                    debug!("Read {} entries from FORWARD_Q", entries.len());
+                    scheduler.accept(entries, unix_timestamp_millis());
+                }
+                _ = tokio::time::sleep(wake_in) => {}
             }
         }
     }
 
-    /// Process a batch of messages all destined for the same endpoint
+    /// Deliver a batch of entries, all due now, for one endpoint.
+    ///
+    /// Messages go out one at a time, in order. Each ends in exactly one
+    /// queue update: acked and deleted (delivered, refused, not permitted,
+    /// expired or abandoned), or replaced by a retry entry carrying a
+    /// not-before and then deleted. Once one attempt fails, the endpoint backs
+    /// off and the rest of the batch are retried after the backoff without
+    /// being sent now; so a failing endpoint costs one attempt per backoff
+    /// window, not one per message.
     async fn process_endpoint_batch(&self, endpoint_url: &str, messages: Vec<ForwardQueueEntry>) {
         let msg_count = messages.len();
         debug!(
@@ -555,7 +817,7 @@ impl ForwardingProcessor {
         // Check if any messages have expired
         let now_secs = unix_timestamp_secs();
 
-        let (active, expired): (Vec<_>, Vec<_>) =
+        let (ready, expired): (Vec<_>, Vec<_>) =
             messages.into_iter().partition(|m| m.expires_at > now_secs);
 
         // ACK and delete expired messages
@@ -586,38 +848,6 @@ impl ForwardingProcessor {
             }
         }
 
-        if active.is_empty() {
-            return;
-        }
-
-        // Check if delay_milli requires us to wait
-        let mut ready = Vec::new();
-        let mut delayed = Vec::new();
-        let now_ms = unix_timestamp_millis();
-
-        for msg in active {
-            let deliver_at_ms = if msg.delay_milli > 0 {
-                msg.received_at_ms + msg.delay_milli as u128
-            } else {
-                msg.received_at_ms
-            };
-
-            if deliver_at_ms <= now_ms {
-                ready.push(msg);
-            } else {
-                delayed.push(msg);
-            }
-        }
-
-        if !delayed.is_empty() {
-            debug!(
-                "{} messages delayed for endpoint {}",
-                delayed.len(),
-                endpoint_url
-            );
-            // Don't ACK — they stay in pending and will be autoclaimed/re-read
-        }
-
         if ready.is_empty() {
             return;
         }
@@ -627,12 +857,7 @@ impl ForwardingProcessor {
             let mut endpoints = self.endpoints.write().await;
             let state = endpoints
                 .entry(endpoint_url.to_string())
-                .or_insert_with(|| EndpointState {
-                    rate_tracker: EndpointRateTracker::new(self.config.rate_window_seconds),
-                    last_activity: Instant::now(),
-                    consecutive_failures: 0,
-                    ws_suppressed_until: None,
-                });
+                .or_insert_with(|| EndpointState::new(self.config.rate_window_seconds));
 
             let now = Instant::now();
             state.rate_tracker.record_and_rate(ready.len() as u32);
@@ -663,14 +888,38 @@ impl ForwardingProcessor {
             transport
         );
 
+        let delivery_timeout = Duration::from_secs(self.config.delivery_timeout_seconds.max(1));
         let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        let mut refused = Vec::new();
 
         for msg in &ready {
-            match self.deliver_message(endpoint_url, msg, use_websocket).await {
+            // Checked per message, not once per batch: the attempt before this
+            // one may just have failed and opened the backoff window.
+            if let Some(retry_after_ms) = self.endpoint_backing_off(endpoint_url).await {
+                debug!(
+                    "Endpoint {} is backing off; deferring message (retry_count={})",
+                    endpoint_url, msg.retry_count
+                );
+                self.retry_or_abandon(msg, endpoint_url, retry_after_ms)
+                    .await;
+                continue;
+            }
+
+            let attempt = tokio::time::timeout(
+                delivery_timeout,
+                self.deliver_message(endpoint_url, msg, use_websocket),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(RelayFailure::Retryable(format!(
+                    "no answer from {endpoint_url} within {}s",
+                    delivery_timeout.as_secs()
+                )))
+            });
+
+            match attempt {
                 Ok(()) => {
-                    let forward_time_ms = now_ms.saturating_sub(msg.received_at_ms);
+                    let forward_time_ms =
+                        unix_timestamp_millis().saturating_sub(msg.received_at_ms);
                     let delay_info = if msg.delay_milli > 0 {
                         format!(", delay_requested={}ms", msg.delay_milli)
                     } else {
@@ -688,40 +937,47 @@ impl ForwardingProcessor {
                     );
                     self.observe(msg, relayed);
                     succeeded.push(msg.stream_id.as_str());
+                    self.record_endpoint_success(endpoint_url).await;
                 }
+                // A refusal is final: drop it now and tell the sender. The peer
+                // answered, so it says nothing about the endpoint's health and
+                // does not count towards backoff.
                 Err(RelayFailure::Refused { status, reason }) => {
                     warn!(
                         "FORWARD_REFUSED: to_did_hash={} from_did_hash={} endpoint={} status={} error={}",
                         msg.to_did_hash, msg.from_did_hash, endpoint_url, status, reason
                     );
-                    refused.push((msg, status));
+                    self.drop_final(msg, endpoint_url, ForwardOutcome::Refused { status })
+                        .await;
                 }
-                Err(e) => {
+                // So is an endpoint we will not send to: no retry changes the
+                // URL or the policy, and nothing was sent.
+                Err(RelayFailure::NotPermitted(reason)) => {
+                    warn!(
+                        "FORWARD_NOT_PERMITTED: to_did_hash={} from_did_hash={} endpoint={} error={}",
+                        msg.to_did_hash, msg.from_did_hash, endpoint_url, reason
+                    );
+                    self.drop_final(msg, endpoint_url, ForwardOutcome::NotPermitted)
+                        .await;
+                }
+                Err(e @ RelayFailure::Retryable(_)) => {
                     warn!(
                         "FORWARD_FAILED: to_did_hash={} from_did_hash={} endpoint={} error={} retry_count={}",
                         msg.to_did_hash, msg.from_did_hash, endpoint_url, e, msg.retry_count
                     );
-                    failed.push(msg);
-                }
-            }
-        }
+                    let retry_after_ms = self.record_endpoint_failure(endpoint_url).await;
 
-        // A refusal is final: drop it now and tell the sender. The peer
-        // answered, so it says nothing about the endpoint's health and does
-        // not count towards backoff.
-        for (msg, status) in refused {
-            let ids = [msg.stream_id.as_str()];
-            if let Err(e) = self
-                .database
-                .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                .await
-            {
-                warn!("Failed to ACK and delete refused entry: {e}");
-            }
-            self.observe(msg, ForwardOutcome::Refused { status });
-            if self.config.report_errors && !msg.from_did.is_empty() {
-                self.send_forwarding_failure_report(msg, endpoint_url, Some(status))
-                    .await;
+                    // Remove broken WebSocket connection on failure
+                    if use_websocket {
+                        let mut pool = self.ws_pool.lock().await;
+                        if pool.remove(endpoint_url).is_some() {
+                            debug!("Removed failed WebSocket connection for {}", endpoint_url);
+                        }
+                    }
+
+                    self.retry_or_abandon(msg, endpoint_url, retry_after_ms)
+                        .await;
+                }
             }
         }
 
@@ -739,111 +995,144 @@ impl ForwardingProcessor {
                 );
             }
             debug!("ACKed {} forwarded messages for {}", count, endpoint_url);
+        }
+    }
 
-            // Reset failure counter on success
-            let mut endpoints = self.endpoints.write().await;
-            if let Some(state) = endpoints.get_mut(endpoint_url) {
-                state.consecutive_failures = 0;
+    /// When the endpoint's backoff ends (unix ms), if it is backing off now.
+    async fn endpoint_backing_off(&self, endpoint_url: &str) -> Option<u128> {
+        let endpoints = self.endpoints.read().await;
+        let retry_after_ms = endpoints.get(endpoint_url)?.retry_after_ms;
+        (retry_after_ms > unix_timestamp_millis()).then_some(retry_after_ms)
+    }
+
+    async fn record_endpoint_success(&self, endpoint_url: &str) {
+        let mut endpoints = self.endpoints.write().await;
+        if let Some(state) = endpoints.get_mut(endpoint_url) {
+            state.consecutive_failures = 0;
+            state.retry_after_ms = 0;
+        }
+    }
+
+    /// Count a failed attempt against the endpoint and open its backoff
+    /// window. Returns when the window ends (unix ms).
+    async fn record_endpoint_failure(&self, endpoint_url: &str) -> u128 {
+        let mut endpoints = self.endpoints.write().await;
+        let state = endpoints
+            .entry(endpoint_url.to_string())
+            .or_insert_with(|| EndpointState::new(self.config.rate_window_seconds));
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let backoff = self.calculate_backoff(state.consecutive_failures);
+        state.retry_after_ms = unix_timestamp_millis() + backoff.as_millis();
+        debug!(
+            "Endpoint {} backing off {}ms (failures: {})",
+            endpoint_url,
+            backoff.as_millis(),
+            state.consecutive_failures
+        );
+        state.retry_after_ms
+    }
+
+    /// Drop an entry that no retry can deliver, and tell its sender.
+    async fn drop_final(
+        &self,
+        msg: &ForwardQueueEntry,
+        endpoint_url: &str,
+        outcome: ForwardOutcome,
+    ) {
+        let ids = [msg.stream_id.as_str()];
+        if let Err(e) = self
+            .database
+            .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
+            .await
+        {
+            warn!("Failed to ACK and delete undeliverable entry: {e}");
+        }
+        self.observe(msg, outcome);
+        if self.config.report_errors && !msg.from_did.is_empty() {
+            let reason = match outcome {
+                ForwardOutcome::Refused { status } => ReportReason::Refused(status),
+                ForwardOutcome::NotPermitted => ReportReason::NotPermitted,
+                _ => ReportReason::Abandoned,
+            };
+            self.send_forwarding_failure_report(msg, endpoint_url, reason)
+                .await;
+        }
+    }
+
+    /// Queue `msg` again for an attempt no earlier than `not_before_ms`, or
+    /// abandon it if its retries are spent.
+    async fn retry_or_abandon(
+        &self,
+        msg: &ForwardQueueEntry,
+        endpoint_url: &str,
+        not_before_ms: u128,
+    ) {
+        if msg.retry_count >= self.config.max_retries {
+            // Max retries exceeded — ACK and drop, send problem report to sender
+            warn!(
+                "FORWARD_ABANDONED: to_did_hash={} from_did_hash={} endpoint={} retries={}",
+                msg.to_did_hash, msg.from_did_hash, endpoint_url, msg.retry_count
+            );
+            let ids = [msg.stream_id.as_str()];
+            if let Err(e) = self
+                .database
+                .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
+                .await
+            {
+                warn!("Failed to ACK and delete abandoned entry: {e}");
             }
+            self.observe(
+                msg,
+                ForwardOutcome::Abandoned {
+                    attempts: msg.retry_count + 1,
+                },
+            );
+
+            // Send problem report to the original sender if we know their DID
+            if self.config.report_errors && !msg.from_did.is_empty() {
+                self.send_forwarding_failure_report(msg, endpoint_url, ReportReason::Abandoned)
+                    .await;
+            }
+            return;
         }
 
-        // Handle failures
-        if !failed.is_empty() {
-            let mut endpoints = self.endpoints.write().await;
-            let consecutive_failures = if let Some(state) = endpoints.get_mut(endpoint_url) {
-                state.consecutive_failures += 1;
-                state.consecutive_failures
-            } else {
-                1
-            };
-            drop(endpoints);
+        // Re-enqueue with incremented retry count. The not-before travels with
+        // the entry, so whichever processor reads it next waits out the
+        // backoff too.
+        let mut retry_entry = msg.clone();
+        retry_entry.retry_count += 1;
+        retry_entry.not_before_ms = not_before_ms;
 
-            // Remove broken WebSocket connection on failure
-            if use_websocket {
-                let mut pool = self.ws_pool.lock().await;
-                if pool.remove(endpoint_url).is_some() {
-                    debug!("Removed failed WebSocket connection for {}", endpoint_url);
+        // Enqueue the retry before releasing the old entry. In the other
+        // order a crash between the two loses the message; in this one it
+        // leaves the old entry claimed, so autoclaim redelivers it (at least
+        // once, never zero).
+        //
+        // `max_len = 0` keeps the legacy unbounded behaviour for retries; the
+        // inbound enqueue path applies the queue limit instead.
+        match self.database.forward_queue_enqueue(&retry_entry, 0).await {
+            Ok(_) => {
+                self.observe(
+                    msg,
+                    ForwardOutcome::Retrying {
+                        attempt: msg.retry_count + 1,
+                        max_retries: self.config.max_retries,
+                    },
+                );
+                let ids = [msg.stream_id.as_str()];
+                if let Err(e) = self
+                    .database
+                    .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
+                    .await
+                {
+                    warn!("Failed to ACK and delete retried entry: {e}");
                 }
             }
-
-            for msg in failed {
-                if msg.retry_count >= self.config.max_retries {
-                    // Max retries exceeded — ACK and drop, send problem report to sender
-                    warn!(
-                        "FORWARD_ABANDONED: to_did_hash={} from_did_hash={} endpoint={} retries={}",
-                        msg.to_did_hash, msg.from_did_hash, endpoint_url, msg.retry_count
-                    );
-                    let ids = [msg.stream_id.as_str()];
-                    if let Err(e) = self
-                        .database
-                        .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                        .await
-                    {
-                        warn!("Failed to ACK and delete abandoned entry: {e}");
-                    }
-                    self.observe(
-                        msg,
-                        ForwardOutcome::Abandoned {
-                            attempts: msg.retry_count + 1,
-                        },
-                    );
-
-                    // Send problem report to the original sender if we know their DID
-                    if self.config.report_errors && !msg.from_did.is_empty() {
-                        self.send_forwarding_failure_report(msg, endpoint_url, None)
-                            .await;
-                    }
-                } else {
-                    // Re-enqueue with incremented retry count
-                    let mut retry_entry = msg.clone();
-                    retry_entry.retry_count += 1;
-
-                    // Enqueue the retry before releasing the old entry. In the
-                    // other order a crash between the two loses the message;
-                    // in this one it leaves the old entry claimed, so
-                    // autoclaim redelivers it (at least once, never zero).
-                    //
-                    // `max_len = 0` keeps the legacy unbounded behaviour
-                    // for retries; the inbound enqueue path applies the
-                    // queue limit instead.
-                    match self.database.forward_queue_enqueue(&retry_entry, 0).await {
-                        Ok(_) => {
-                            self.observe(
-                                msg,
-                                ForwardOutcome::Retrying {
-                                    attempt: msg.retry_count + 1,
-                                    max_retries: self.config.max_retries,
-                                },
-                            );
-                            let ids = [msg.stream_id.as_str()];
-                            if let Err(e) = self
-                                .database
-                                .forward_queue_ack_and_delete(&self.config.consumer_group, &ids)
-                                .await
-                            {
-                                warn!("Failed to ACK and delete retried entry: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            // The old entry stays claimed, so autoclaim picks
-                            // it up again once it has been idle long enough.
-                            error!(
-                                "Failed to re-enqueue retry entry; leaving it claimed for autoclaim: {e}"
-                            );
-                        }
-                    }
-                }
+            Err(e) => {
+                // The old entry stays claimed, so autoclaim picks it up again
+                // once it has been idle long enough.
+                error!("Failed to re-enqueue retry entry; leaving it claimed for autoclaim: {e}");
             }
-
-            // Apply backoff before next attempt to this endpoint
-            let backoff = self.calculate_backoff(consecutive_failures);
-            debug!(
-                "Backing off {}ms for endpoint {} (failures: {})",
-                backoff.as_millis(),
-                endpoint_url,
-                consecutive_failures
-            );
-            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -914,6 +1203,27 @@ impl ForwardingProcessor {
         Self::problem_report_envelope(msg, problem_body, from, now)
     }
 
+    /// The DIDComm plaintext of the report sent when the next hop is not an
+    /// endpoint this mediator forwards to (see [`RelayFailure::NotPermitted`]).
+    /// Which policy rule matched stays in the log.
+    fn build_not_permitted_report(
+        msg: &ForwardQueueEntry,
+        endpoint_url: &str,
+        from: &str,
+        now: u64,
+    ) -> serde_json::Value {
+        let destination = Self::destination_label(msg);
+        let problem_body = serde_json::json!({
+            "code": "e.p.me.res.forwarding.endpoint-not-permitted",
+            "comment": format!(
+                "The forwarded message for {} was not sent: this mediator does not forward to the destination endpoint {}",
+                destination, endpoint_url
+            ),
+            "args": [destination, endpoint_url],
+        });
+        Self::problem_report_envelope(msg, problem_body, from, now)
+    }
+
     fn problem_report_envelope(
         msg: &ForwardQueueEntry,
         problem_body: serde_json::Value,
@@ -949,13 +1259,13 @@ impl ForwardingProcessor {
     /// default accepted set too. So the abandonment surfaces as an operator-side
     /// `ERROR` naming the sender, the destination and the reason.
     ///
-    /// `refused` carries the peer's HTTP status when it refused the relay
-    /// outright rather than the retries running out.
+    /// `reason` says whether the retries ran out, the peer refused the relay
+    /// outright, or the endpoint was not one this mediator sends to.
     async fn send_forwarding_failure_report(
         &self,
         msg: &ForwardQueueEntry,
         endpoint_url: &str,
-        refused: Option<u16>,
+        reason: ReportReason,
     ) {
         let now = unix_timestamp_secs();
 
@@ -970,11 +1280,16 @@ impl ForwardingProcessor {
             return;
         };
 
-        let report = match refused {
-            Some(status) => {
+        let report = match reason {
+            ReportReason::Refused(status) => {
                 Self::build_refusal_report(msg, endpoint_url, status, packer.mediator_did(), now)
             }
-            None => Self::build_problem_report(msg, endpoint_url, packer.mediator_did(), now),
+            ReportReason::NotPermitted => {
+                Self::build_not_permitted_report(msg, endpoint_url, packer.mediator_did(), now)
+            }
+            ReportReason::Abandoned => {
+                Self::build_problem_report(msg, endpoint_url, packer.mediator_did(), now)
+            }
         };
 
         let packed = match packer.pack(&report, &msg.from_did).await {
@@ -1124,8 +1439,12 @@ impl ForwardingProcessor {
         // is not a public, globally-routable https target before issuing the
         // request. This is the check that sees IP literals (metadata/RFC1918/
         // loopback/link-local), which the client's DNS resolver never sees.
+        //
+        // Every vet error is final: a refusal by address class or scheme, or a
+        // URL that does not parse. Retrying would only spend the retry budget
+        // and the backoff on an answer that cannot change.
         self.http_pool.policy.vet(&inbound_url).map_err(|e| {
-            RelayFailure::Retryable(format!(
+            RelayFailure::NotPermitted(format!(
                 "Refusing to forward to {inbound_url}: blocked by egress policy: {e}"
             ))
         })?;
@@ -1207,13 +1526,21 @@ impl ForwardingProcessor {
         let frame = msg.message.clone();
         let id = frame_id(frame.as_bytes());
 
-        let mut pool = self.ws_pool.lock().await;
+        // Take the pooled connection out for the duration of the exchange, so
+        // the pool lock is never held across network I/O: deliveries to other
+        // endpoints run concurrently and need the pool too. Only one delivery
+        // task runs per endpoint, so nothing else wants this connection.
+        let pooled = self.ws_pool.lock().await.remove(endpoint_url);
 
         // Try the pooled connection first.
-        if let Some(ws) = pool.get_mut(endpoint_url) {
+        if let Some(mut ws) = pooled {
             match Self::send_and_await_ack(&mut ws.stream, &frame, &id).await {
                 Ok(()) => {
                     ws.last_used = Instant::now();
+                    self.ws_pool
+                        .lock()
+                        .await
+                        .insert(endpoint_url.to_string(), ws);
                     debug!("Relayed via pooled WebSocket to {} (acked)", endpoint_url);
                     return Ok(());
                 }
@@ -1222,6 +1549,10 @@ impl ForwardingProcessor {
                     // the message is not. Keep the socket, fail the message —
                     // retry/abandonment is the caller's job, as on REST.
                     ws.last_used = Instant::now();
+                    self.ws_pool
+                        .lock()
+                        .await
+                        .insert(endpoint_url.to_string(), ws);
                     return Err(reason);
                 }
                 Err(AckFailure::Transport(e)) => {
@@ -1229,13 +1560,11 @@ impl ForwardingProcessor {
                         "Pooled WebSocket relay to {} failed: {}. Reconnecting...",
                         endpoint_url, e
                     );
-                    pool.remove(endpoint_url);
                 }
             }
         }
 
         // No usable connection — establish one, negotiating `relay-ack`.
-        drop(pool); // Release the lock while connecting
 
         // DNS-rebinding guard for the WS path: the URL vet above blocks
         // IP-literal internal targets, but `tokio_tungstenite` resolves the
@@ -1507,6 +1836,7 @@ mod tests {
             expires_at: 0,
             retry_count: 5,
             hop_count: 1,
+            not_before_ms: 0,
         }
     }
 
@@ -1603,6 +1933,154 @@ mod tests {
         );
         assert_eq!(report["from"], "did:example:mediator");
         assert_eq!(report["to"], serde_json::json!(["did:example:sender"]));
+    }
+
+    /// The report for an endpoint this mediator will not send to has its own
+    /// code, distinct from a peer's refusal and from running out of retries.
+    #[test]
+    fn not_permitted_report_carries_its_own_code() {
+        let entry = abandoned_entry();
+        let report = ForwardingProcessor::build_not_permitted_report(
+            &entry,
+            "https://169.254.169.254",
+            "did:example:mediator",
+            1_000,
+        );
+
+        assert_eq!(
+            report["body"]["code"],
+            "e.p.me.res.forwarding.endpoint-not-permitted"
+        );
+        assert_eq!(
+            report["body"]["args"],
+            serde_json::json!(["did:example:recipient", "https://169.254.169.254"])
+        );
+        assert_eq!(report["from"], "did:example:mediator");
+        assert_eq!(report["to"], serde_json::json!(["did:example:sender"]));
+    }
+
+    // --- Scheduler tests ---
+
+    fn scheduler(batch_size: usize, max_concurrent_endpoints: usize) -> Scheduler {
+        Scheduler::new(&ForwardingConfig {
+            batch_size,
+            max_concurrent_endpoints,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 60_000,
+            ..Default::default()
+        })
+    }
+
+    fn queued(id: &str, endpoint_url: &str) -> ForwardQueueEntry {
+        ForwardQueueEntry {
+            stream_id: id.into(),
+            endpoint_url: endpoint_url.into(),
+            received_at_ms: 1_000,
+            retry_count: 0,
+            ..abandoned_entry()
+        }
+    }
+
+    /// While one endpoint's delivery is still running, another endpoint's
+    /// entries are handed out regardless.
+    #[test]
+    fn a_busy_endpoint_does_not_hold_up_another() {
+        let mut s = scheduler(10, 4);
+        s.accept(
+            vec![queued("1-0", "https://slow"), queued("2-0", "https://fast")],
+            5_000,
+        );
+
+        let (first, _) = s.next_batch().expect("a batch for the first endpoint");
+        assert_eq!(first, "https://slow");
+        // More for the busy endpoint arrives; it waits for that task to end.
+        s.accept(vec![queued("3-0", "https://slow")], 5_000);
+
+        let (second, batch) = s.next_batch().expect("a batch for the other endpoint");
+        assert_eq!(second, "https://fast");
+        assert_eq!(batch.len(), 1);
+        assert!(
+            s.next_batch().is_none(),
+            "the busy endpoint gets no second task"
+        );
+
+        s.finished("https://slow", &["1-0".to_string()]);
+        let (again, batch) = s.next_batch().expect("its queued entry, once it is free");
+        assert_eq!(again, "https://slow");
+        assert_eq!(batch[0].stream_id, "3-0");
+    }
+
+    /// A retry is held back until its not-before, then released.
+    #[test]
+    fn a_retry_waits_for_its_not_before() {
+        let mut s = scheduler(10, 4);
+        let mut retry = queued("1-0", "https://peer");
+        retry.not_before_ms = 9_000;
+        s.accept(vec![retry], 5_000);
+
+        assert!(s.next_batch().is_none(), "not due yet");
+        assert_eq!(s.next_due_ms(), Some(9_000));
+
+        s.release_due(8_999);
+        assert!(s.next_batch().is_none(), "still not due");
+
+        s.release_due(9_000);
+        let (_, batch) = s.next_batch().expect("due now");
+        assert_eq!(batch[0].stream_id, "1-0");
+    }
+
+    /// An entry read twice is held once, so it cannot be delivered (or
+    /// deleted) twice by this processor.
+    #[test]
+    fn a_repeated_read_is_held_once() {
+        let mut s = scheduler(10, 4);
+        s.accept(vec![queued("1-0", "https://peer")], 5_000);
+        s.accept(vec![queued("1-0", "https://peer")], 5_000);
+
+        let (_, batch) = s.next_batch().expect("a batch");
+        assert_eq!(batch.len(), 1);
+        assert!(s.next_batch().is_none());
+    }
+
+    /// Reading stops once the held entries reach the limit, and resumes as
+    /// deliveries finish.
+    #[test]
+    fn reading_pauses_while_the_hold_is_full() {
+        let mut s = scheduler(1, 2);
+        s.accept(
+            vec![queued("1-0", "https://a"), queued("2-0", "https://b")],
+            5_000,
+        );
+        assert!(!s.has_room());
+
+        let (endpoint, batch) = s.next_batch().expect("a batch");
+        let ids: Vec<String> = batch.iter().map(|m| m.stream_id.clone()).collect();
+        s.finished(&endpoint, &ids);
+        assert!(s.has_room());
+    }
+
+    /// A delay the sender asked for that is beyond what the processor parks
+    /// is left claimed in the store, as before; it is not held in memory.
+    #[test]
+    fn a_long_requested_delay_is_not_parked() {
+        let mut s = scheduler(10, 4);
+        let mut delayed = queued("1-0", "https://peer");
+        delayed.delay_milli = 3_600_000;
+        s.accept(vec![delayed], 5_000);
+
+        assert!(s.next_due_ms().is_none());
+        assert!(s.next_batch().is_none());
+        assert!(s.held.is_empty());
+    }
+
+    #[test]
+    fn due_time_honours_both_requested_delay_and_retry_not_before() {
+        let mut entry = queued("1-0", "https://peer");
+        assert_eq!(due_at_ms(&entry), 0);
+        entry.delay_milli = 500;
+        assert_eq!(due_at_ms(&entry), 1_500);
+        entry.not_before_ms = 2_000;
+        assert_eq!(due_at_ms(&entry), 2_000);
     }
 
     // --- decode_tsp_forward tests ---
@@ -1789,6 +2267,7 @@ mod tests {
             rate_tracker: EndpointRateTracker::new(300),
             last_activity: Instant::now(),
             consecutive_failures: 0,
+            retry_after_ms: 0,
             ws_suppressed_until,
         }
     }

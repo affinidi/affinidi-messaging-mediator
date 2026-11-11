@@ -304,8 +304,19 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
 - **REST shape.** `POST {endpoint}/inbound`, `Content-Type:
   application/didcomm-encrypted+json` for DIDComm, `application/tsp` (raw qb2)
   for TSP. TSP always goes over REST regardless of rate.
+- **Concurrency.** Up to `max_concurrent_endpoints` (32) next-hop endpoints
+  are delivered to at once; messages for one endpoint go out in order, one at
+  a time. Each attempt is bounded by `delivery_timeout_seconds` (60).
 - **Retry.** `max_retries` (5) with exponential backoff from
-  `initial_backoff_ms` to `max_backoff_ms`, in batches of `batch_size`.
+  `initial_backoff_ms` to `max_backoff_ms`, per endpoint. A failed message is
+  queued again with a not-before at the end of the endpoint's backoff, which
+  every processor sharing the queue honours; the rest of that endpoint's
+  messages are deferred to the same time rather than sent into the failure.
+- **Refusal.** A peer's 4xx (other than 408/425/429) is final
+  (`e.p.me.res.forwarding.refused`), as is a next hop whose URL does not parse
+  or that the egress policy does not admit
+  (`e.p.me.res.forwarding.endpoint-not-permitted`): no retry, and the sender
+  gets a problem report.
 - **Abandonment.** On exhaustion the entry is ACKed and dropped, logged as
   `FORWARD_ABANDONED`, and — when `report_errors` is set — a problem report is
   packed by the mediator and stored in the *sender's* inbox

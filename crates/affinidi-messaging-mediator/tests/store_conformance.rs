@@ -261,6 +261,7 @@ async fn check_forward_queue_claim_ack(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     let stream_id = store
         .forward_queue_enqueue(&entry, 1000)
@@ -397,6 +398,7 @@ async fn check_forward_queue_delete(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     let stream_id = store
         .forward_queue_enqueue(&entry, 1000)
@@ -431,6 +433,7 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     store
         .forward_queue_enqueue(&entry, 1000)
