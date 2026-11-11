@@ -37,12 +37,12 @@ use uuid::Uuid;
 ///
 /// `global_acl_default = allow_all` makes this a *relay* deployment: when
 /// an inner forward arrives whose sender is homed on the *other* mediator
-/// (and therefore has no account here), the routing handler auto-registers
-/// that sender via `relay_sender_acls(global_default)`, which only seeds
-/// `SEND_FORWARDED` when the global default grants it. Without that, the
-/// inbound relayed forward is rejected with 403 and never reaches the
-/// recipient — so a mediator that accepts cross-mediator forwards must
-/// default-grant it. (Locally-registered users like Bob are added with an
+/// (and therefore has no account here), the routing handler checks that
+/// sender against `relay_sender_acls(global_default)`, which only grants
+/// `SEND_FORWARDED` when the global default grants it, and stores nothing for
+/// it. Without that, the inbound relayed forward is rejected with 403 and
+/// never reaches the recipient — so a mediator that accepts cross-mediator
+/// forwards must default-grant it. (Locally-registered users like Bob are added with an
 /// explicit `allow_all` ACL by `add_user`, independent of this default.)
 async fn spawn_relay_environment() -> TestEnvironment {
     let mediator = TestMediator::builder()
@@ -282,6 +282,15 @@ async fn cross_mediator_forward_delivers_over_memory_backend() {
         received.as_deref(),
         Some(text),
         "Bob should receive Alice's message after it routes A → B"
+    );
+    assert!(
+        !env_b
+            .mediator
+            .store()
+            .account_exists(&alice.did_hash())
+            .await
+            .expect("account_exists"),
+        "relaying Alice's forward must not give her an account on B"
     );
 
     env_a.shutdown().await.expect("shutdown mediator A");
@@ -1176,4 +1185,88 @@ async fn consent_based_mediator_guards_local_forward() {
     );
 
     env.shutdown().await.expect("shutdown mediator");
+}
+
+/// A relayed sender with no account on the recipient's mediator is still held
+/// to that mediator's per-relationship limit: it is counted per peer without
+/// being given an account.
+#[tokio::test]
+async fn relayed_sender_without_an_account_is_held_to_the_per_peer_limit() {
+    init_tracing();
+
+    let env_a = spawn_relay_environment().await;
+    let mediator_b = TestMediator::builder()
+        .enable_forwarding(true)
+        .enable_external_forwarding(true)
+        .global_acl_default(acl::allow_all())
+        // A queue at the limit refuses, so a limit of 3 holds two.
+        .queue_send_limit_per_peer(3)
+        .spawn()
+        .await
+        .expect("spawn mediator B");
+    let env_b = TestEnvironment::new(mediator_b)
+        .await
+        .expect("wire SDK environment to mediator B");
+
+    let mediator_a_did = env_a.mediator.did().to_string();
+    let mediator_b_did = env_b.mediator.did().to_string();
+    let alice = add_live_user(&env_a, "Alice").await;
+    // Bob does not collect, so everything relayed to him stays queued on B.
+    let bob = env_b.add_user("Bob").await.expect("add Bob");
+
+    for i in 0..4 {
+        send_double_forward(
+            &env_a,
+            &alice,
+            &mediator_a_did,
+            &bob,
+            &mediator_b_did,
+            &format!("message {i}"),
+        )
+        .await;
+    }
+
+    let store_b = env_b.mediator.store();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let queued = store_b
+            .inbox_status(&bob.did_hash())
+            .await
+            .expect("inbox_status")
+            .message_count;
+        if queued >= 2 || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Give the refused relays time to land if the limit were not applied.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        store_b
+            .inbox_status(&bob.did_hash())
+            .await
+            .expect("inbox_status")
+            .message_count,
+        2,
+        "B stops Alice at its per-peer limit"
+    );
+    assert_eq!(
+        store_b
+            .peer_queue_count(&alice.did_hash(), &bob.did_hash())
+            .await
+            .expect("peer_queue_count"),
+        2,
+        "B counts Alice's queued messages for Bob"
+    );
+    assert!(
+        !store_b
+            .account_exists(&alice.did_hash())
+            .await
+            .expect("account_exists"),
+        "counting Alice does not give her an account on B"
+    );
+
+    env_a.shutdown().await.expect("shutdown mediator A");
+    env_b.shutdown().await.expect("shutdown mediator B");
 }

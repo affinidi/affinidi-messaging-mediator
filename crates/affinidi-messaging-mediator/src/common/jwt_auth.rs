@@ -3,7 +3,7 @@ use crate::{
     common::authz::{self, Capability},
     common::did_rate_limiter,
     common::metrics::names::RATE_LIMITED_TOTAL,
-    common::session::{Session, SessionClaims},
+    common::session::{Session, SessionClaims, TokenUse},
 };
 use affinidi_messaging_mediator_common::errors::{ErrorResponse, MediatorError};
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
@@ -133,6 +133,51 @@ pub(crate) fn jwt_exp_is_expired(exp: u64, now: u64) -> bool {
     exp + JWT_EXP_LEEWAY_SECS < now
 }
 
+/// Whether a decoded session token may be used as `expected`.
+///
+/// A token carrying `token_use` is accepted only for that use. A token
+/// without it was minted by an earlier release and is judged by
+/// [`unmarked_token_accepted`].
+pub(crate) fn token_use_accepted(
+    claims: &SessionClaims,
+    expected: TokenUse,
+    now: u64,
+    access_lifetime_secs: u64,
+) -> bool {
+    match claims.token_use {
+        Some(token_use) => token_use == expected,
+        None => unmarked_token_accepted(claims, expected, now, access_lifetime_secs),
+    }
+}
+
+/// Transition rule for tokens minted before `token_use` existed. Every such
+/// token has expired one refresh-token lifetime (`jwt_refresh_expiry`) after
+/// the upgrade, at which point this function and its call can be removed and
+/// an unmarked token refused outright.
+///
+/// - As an **access** token: accepted only if it has no `jti` (refresh tokens
+///   have carried one since the previous release) and its `exp` is no further
+///   away than one access-token lifetime plus the expiry leeway. Older
+///   refresh tokens had neither `jti` nor marker; one with more than an
+///   access lifetime left cannot be an access token, so it is refused.
+/// - As a **refresh** token: accepted. `/authenticate/refresh` still requires
+///   the token's hash to be the session's current refresh-token hash, which
+///   an access token never is.
+fn unmarked_token_accepted(
+    claims: &SessionClaims,
+    expected: TokenUse,
+    now: u64,
+    access_lifetime_secs: u64,
+) -> bool {
+    match expected {
+        TokenUse::Access => {
+            claims.jti.is_none()
+                && claims.exp <= now.saturating_add(access_lifetime_secs + JWT_EXP_LEEWAY_SECS)
+        }
+        TokenUse::Refresh => true,
+    }
+}
+
 /// Validate a raw JWT bearer token and resolve it to an authenticated
 /// [`Session`].
 ///
@@ -169,6 +214,22 @@ pub(crate) async fn authenticate_token(
     if jwt_exp_is_expired(token_data.claims.exp, state.clock.unix_secs()) {
         event!(Level::WARN, "JWT access token expired");
         return Err(AuthError::ExpiredToken);
+    }
+
+    // Only an access token is a bearer credential; a refresh token is
+    // exchanged at `/authenticate/refresh` and nowhere else.
+    if !token_use_accepted(
+        &token_data.claims,
+        TokenUse::Access,
+        state.clock.unix_secs(),
+        state.config.security.jwt_access_expiry,
+    ) {
+        warn!(
+            session_id = %token_data.claims.session_id,
+            token_use = ?token_data.claims.token_use,
+            "Token presented as a bearer is not an access token"
+        );
+        return Err(AuthError::InvalidToken);
     }
 
     let session_id = token_data.claims.session_id.clone();
@@ -489,6 +550,106 @@ mod tests {
         // ...but `exp` is still a required claim, so a token without it is
         // rejected at decode time exactly as before.
         assert!(validation.required_spec_claims.contains("exp"));
+    }
+
+    fn claims(token_use: Option<TokenUse>, jti: Option<&str>, exp: u64) -> SessionClaims {
+        SessionClaims {
+            aud: "ATM".into(),
+            sub: "did:example:alice".into(),
+            session_id: "session".into(),
+            exp,
+            token_use,
+            jti: jti.map(str::to_string),
+        }
+    }
+
+    const NOW: u64 = 1_000_000;
+    const ACCESS: u64 = 900;
+
+    #[test]
+    fn marked_tokens_are_accepted_only_for_their_own_use() {
+        let access = claims(Some(TokenUse::Access), None, NOW + ACCESS);
+        let refresh = claims(Some(TokenUse::Refresh), Some("id"), NOW + 85_500);
+        assert!(token_use_accepted(&access, TokenUse::Access, NOW, ACCESS));
+        assert!(!token_use_accepted(&access, TokenUse::Refresh, NOW, ACCESS));
+        assert!(token_use_accepted(&refresh, TokenUse::Refresh, NOW, ACCESS));
+        assert!(!token_use_accepted(&refresh, TokenUse::Access, NOW, ACCESS));
+        // The marker decides even for a refresh token close to its expiry.
+        let late_refresh = claims(Some(TokenUse::Refresh), Some("id"), NOW + 10);
+        assert!(!token_use_accepted(
+            &late_refresh,
+            TokenUse::Access,
+            NOW,
+            ACCESS
+        ));
+    }
+
+    #[test]
+    fn unmarked_token_without_jti_within_access_lifetime_is_an_access_token() {
+        let legacy = claims(None, None, NOW + ACCESS);
+        assert!(token_use_accepted(&legacy, TokenUse::Access, NOW, ACCESS));
+        // Up to the expiry leeway beyond the access lifetime.
+        let edge = claims(None, None, NOW + ACCESS + JWT_EXP_LEEWAY_SECS);
+        assert!(token_use_accepted(&edge, TokenUse::Access, NOW, ACCESS));
+    }
+
+    #[test]
+    fn unmarked_token_outliving_the_access_lifetime_is_not_an_access_token() {
+        let legacy_refresh = claims(None, None, NOW + ACCESS + JWT_EXP_LEEWAY_SECS + 1);
+        assert!(!token_use_accepted(
+            &legacy_refresh,
+            TokenUse::Access,
+            NOW,
+            ACCESS
+        ));
+        // It is still exchangeable at refresh during the transition.
+        assert!(token_use_accepted(
+            &legacy_refresh,
+            TokenUse::Refresh,
+            NOW,
+            ACCESS
+        ));
+    }
+
+    #[test]
+    fn unmarked_token_with_jti_is_not_an_access_token() {
+        let previous_refresh = claims(None, Some("id"), NOW + 60);
+        assert!(!token_use_accepted(
+            &previous_refresh,
+            TokenUse::Access,
+            NOW,
+            ACCESS
+        ));
+        assert!(token_use_accepted(
+            &previous_refresh,
+            TokenUse::Refresh,
+            NOW,
+            ACCESS
+        ));
+    }
+
+    #[test]
+    fn token_use_claim_round_trips_and_absence_decodes_as_none() {
+        let marked = claims(Some(TokenUse::Access), None, NOW);
+        let json = serde_json::to_value(&marked).unwrap();
+        assert_eq!(json["token_use"], "access");
+        assert!(json.get("jti").is_none());
+
+        let unmarked: SessionClaims = serde_json::from_value(serde_json::json!({
+            "aud": "ATM", "sub": "did:example:a", "session_id": "s", "exp": NOW
+        }))
+        .unwrap();
+        assert_eq!(unmarked.token_use, None);
+        assert_eq!(unmarked.jti, None);
+
+        // An unknown use is not silently read as unmarked.
+        assert!(
+            serde_json::from_value::<SessionClaims>(serde_json::json!({
+                "aud": "ATM", "sub": "did:example:a", "session_id": "s", "exp": NOW,
+                "token_use": "id"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

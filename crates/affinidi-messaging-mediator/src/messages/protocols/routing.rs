@@ -39,17 +39,13 @@ struct ForwardRequest {
     next: Option<String>, // Defaults to true
 }
 
-/// Build the minimal ACL used to auto-register a previously-unseen forwarding
-/// sender (the `from_account` below) on first contact.
+/// The ACL a forward sender with no account on this mediator is checked
+/// against. Nothing is stored for such a sender: the ACL applies to this one
+/// forward.
 ///
-/// PR #383 registered such senders with the full `global_acl_default` —
-/// `ALLOW_ALL` in a relay deployment — persisting `LOCAL`, `RECEIVE_MESSAGES`,
-/// invite creation, and the `self_manage_*` capabilities for a DID that has only
-/// ever *relayed a forward* through us. Least privilege: grant `SEND_FORWARDED`
-/// (the single capability the forward gate below consumes) and nothing else —
-/// and only when `global_acl_default` itself grants it, so a non-relay mediator
-/// still refuses the forward exactly as before rather than silently gaining
-/// relay capability.
+/// Least privilege: `SEND_FORWARDED` (the single capability the forward gate
+/// consumes) and nothing else — and only when `global_acl_default` itself
+/// grants it, so a non-relay mediator refuses the forward.
 fn relay_sender_acls(global_acl_default: &MediatorACLSet) -> MediatorACLSet {
     let mut acls = MediatorACLSet::from_string_ruleset("DENY_ALL").unwrap_or_default();
     if authz::grants(global_acl_default, Capability::SendForwarded) {
@@ -316,7 +312,8 @@ async fn deliver_forward(
     next: &str,
     next_did_hash: &str,
     next_acls: Option<&MediatorACLSet>,
-    from_account: &Account,
+    sender_of_record: &str,
+    sender_has_account: bool,
     data: &str,
     delay_milli: i64,
     expires_at: u64,
@@ -365,19 +362,38 @@ async fn deliver_forward(
     );
 
     if ephemeral {
-        // Live stream the message?
-        if let Some(stream_uuid) = state
+        // Live stream only: an ephemeral message is never stored, so it is
+        // accepted only when it is actually handed to a live stream.
+        let Some(stream_uuid) = state
             .database
             .streaming_is_client_live(next_did_hash, false)
             .await
-            && state
-                .database
-                .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
-                .await
-                .is_ok()
+        else {
+            return Err(crate::messages::delivery_refused(
+                session,
+                Some(msg.id.to_string()),
+                "ephemeral message for a recipient with no live stream",
+            ));
+        };
+        if let Err(e) = state
+            .database
+            .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
+            .await
         {
-            debug!("Live streaming message to UUID: {}", stream_uuid);
+            return Err(MediatorError::problem_with_log(
+                14,
+                &session.session_id,
+                Some(msg.id.to_string()),
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "me.res.storage.error",
+                "Database transaction error: {1}",
+                vec![e.to_string()],
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Couldn't publish an ephemeral message to its live stream: {e}"),
+            ));
         }
+        debug!("Live streaming message to UUID: {}", stream_uuid);
     } else {
         if let Some(RemoteHop {
             endpoint: endpoint_url,
@@ -415,8 +431,13 @@ async fn deliver_forward(
 
             let now_ms = state.clock.unix_millis();
 
-            // Get the sender's full DID for problem reports
-            let from_did = msg.from.as_deref().unwrap_or("").to_string();
+            // The sender's full DID, for problem reports. Only a sender with an
+            // account here has an inbox to receive one.
+            let from_did = if sender_has_account && !sender_of_record.is_empty() {
+                msg.from.as_deref().unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
 
             // Blind relay forwards the inner envelope verbatim; rewrap relay
             // re-encrypts it from this mediator to the peer (see
@@ -432,7 +453,7 @@ async fn deliver_forward(
                 stream_id: String::new(), // Set by Redis on XADD
                 message: relay_message,
                 to_did_hash: next_did_hash.to_string(),
-                from_did_hash: from_account.did_hash.clone(),
+                from_did_hash: sender_of_record.to_string(),
                 from_did,
                 to_did: next.to_string(),
                 endpoint_url: endpoint_url.clone(),
@@ -441,6 +462,7 @@ async fn deliver_forward(
                 expires_at,
                 retry_count: 0,
                 hop_count: hop_count + 1,
+                not_before_ms: 0,
             };
 
             state
@@ -471,7 +493,7 @@ async fn deliver_forward(
             );
             info!(
                 "FORWARD_ENQUEUED: to_did_hash={} from_did_hash={} endpoint={}",
-                next_did_hash, from_account.did_hash, endpoint_url
+                next_did_hash, sender_of_record, endpoint_url
             );
         } else {
             // Local destination — store as before
@@ -479,7 +501,7 @@ async fn deliver_forward(
                 state,
                 session,
                 data,
-                Some(&from_account.did_hash),
+                Some(sender_of_record),
                 next,
                 Some(expires_at),
             )
@@ -502,44 +524,84 @@ struct RemoteHop {
     relay_to: String,
 }
 
-/// The hop to relay to when `next` is hosted by another mediator, or
-/// `None` when it is local (or external forwarding is off). Resolves `next`'s
-/// DID document; a DID that can't be resolved is treated as local.
-async fn remote_endpoint_for(state: &SharedData, next: &str) -> Option<RemoteHop> {
+/// Where a forward's next hop is delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NextHop {
+    /// This mediator holds the next hop's inbox (or external forwarding is
+    /// off). Delivered only if the next hop has an account here.
+    Local,
+    /// Another mediator holds it; relay there.
+    Remote(RemoteHop),
+    /// No route this mediator can use. Storing the message here would never
+    /// reach the recipient, so the forward is refused. `retryable` when the
+    /// cause is a failure to resolve the mediator the next hop names, which
+    /// may clear.
+    Unroutable { reason: String, retryable: bool },
+}
+
+/// Classify a forward's next hop by resolving its DID document (and, one hop
+/// further, a mediator it names). Only when external forwarding is enabled;
+/// otherwise every next hop is local. A next hop whose own DID cannot be
+/// resolved is local too.
+async fn classify_next_hop(state: &SharedData, next: &str) -> NextHop {
     if !state.config.processors.forwarding.external_forwarding {
-        return None;
+        return NextHop::Local;
     }
     match state.did_resolver.resolve(next).await {
         Ok(resolve_response) => {
-            match service_endpoint_for_remote(state, next, &resolve_response.doc).await {
-                Some(hop) => {
-                    debug!(
-                        "Next hop ({}) is remote, endpoint: {} (via {})",
-                        next, hop.endpoint, hop.relay_to
-                    );
-                    Some(hop)
-                }
-                None => {
-                    debug!("Next hop ({}) is local to this mediator", next);
-                    None
-                }
+            let hop = service_endpoint_for_remote(state, next, &resolve_response.doc).await;
+            match &hop {
+                NextHop::Remote(remote) => debug!(
+                    "Next hop ({}) is remote, endpoint: {} (via {})",
+                    next, remote.endpoint, remote.relay_to
+                ),
+                NextHop::Local => debug!("Next hop ({}) is local to this mediator", next),
+                NextHop::Unroutable { .. } => {}
             }
+            hop
         }
+        // Classed as local, so it is delivered only to an account here: a
+        // resolver outage does not stop local delivery, and a next hop with no
+        // account gets the same `delivery_refused` either way.
         Err(e) => {
-            // Can't resolve the DID — treat as local (store normally)
             warn!(
-                "Couldn't resolve DID document for {}: {}. Treating as local.",
-                next, e
+                "Next hop ({next}) couldn't be resolved ({e}); delivering only to a local account"
             );
-            None
+            NextHop::Local
         }
     }
 }
 
-/// The recipient checks for a next hop whose inbox is on this mediator:
-/// `RECEIVE_FORWARDED`, its access list and its receive-queue limit. Registers
-/// the account on first contact and returns its ACLs, which `deliver_forward`
-/// still needs for the `ANON_RECEIVE` check.
+/// The refusal for a [`NextHop::Unroutable`] next hop. A resolution failure
+/// may clear, so it is reported as retryable; anything else gets the uniform
+/// `delivery_refused`.
+fn unroutable(session: &Session, msg: &Message, reason: &str, retryable: bool) -> MediatorError {
+    if retryable {
+        warn!(
+            session = %session.session_id,
+            reason = %reason,
+            "forward refused: the next hop's mediator could not be resolved"
+        );
+        MediatorError::problem(
+            74,
+            &session.session_id,
+            Some(msg.id.to_string()),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "did.resolve",
+            "The forward's next hop couldn't be routed; try again later",
+            vec![],
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    } else {
+        crate::messages::delivery_refused(session, Some(msg.id.to_string()), reason)
+    }
+}
+
+/// The recipient checks for a next hop whose inbox is on this mediator: an
+/// account, `RECEIVE_FORWARDED`, its access list and its receive-queue limit.
+/// Returns its ACLs, which `deliver_forward` still needs for the
+/// `ANON_RECEIVE` check.
 #[allow(clippy::too_many_arguments)]
 async fn check_local_next_hop(
     state: &SharedData,
@@ -646,8 +708,10 @@ async fn check_remote_next_hop(
     Ok(())
 }
 
-/// Fetch the next-hop account, registering it with the global default ACL on
-/// first contact. Returns a storage problem report on backend failure.
+/// Fetch the next-hop account. A next hop with no account is refused: a
+/// forward never creates one, since only authentication (or an admin) admits
+/// a DID to this mediator. Returns a storage problem report on backend
+/// failure.
 async fn resolve_next_account(
     state: &SharedData,
     session: &Session,
@@ -656,34 +720,11 @@ async fn resolve_next_account(
 ) -> Result<Account, MediatorError> {
     match state.database.account_get(next_did_hash).await {
         Ok(Some(next_account)) => Ok(next_account),
-        Ok(None) => {
-            debug!("Next account not found, creating a new one");
-            state
-                .database
-                .account_add(
-                    next_did_hash,
-                    &state.config.security.global_acl_default,
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    if e.is_storage_cap() {
-                        return e;
-                    }
-                    MediatorError::problem_with_log(
-                        14,
-                        &session.session_id,
-                        Some(msg.id.to_string()),
-                        ProblemReportSorter::Error,
-                        ProblemReportScope::Protocol,
-                        "me.res.storage.error",
-                        "Database transaction error: {1}",
-                        vec![e.to_string()],
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Database transaction error: {e}"),
-                    )
-                })
-        }
+        Ok(None) => Err(crate::messages::delivery_refused(
+            session,
+            Some(msg.id.to_string()),
+            "next hop has no account on this mediator",
+        )),
         Err(e) => Err(MediatorError::problem_with_log(
             14,
             &session.session_id,
@@ -699,10 +740,23 @@ async fn resolve_next_account(
     }
 }
 
+/// Who a forward is from.
+struct ForwardSender {
+    /// What the sender checks run against: `SEND_FORWARDED`, the recipient's
+    /// access list and the queue limits.
+    account: Account,
+    /// Whether the sender holds an account here. A sender without one is
+    /// still counted per relationship (`limits.queue.peer`) — counters alone
+    /// do not make an account in any store — but it has no inbox here for a
+    /// relay failure report.
+    registered: bool,
+}
+
 /// Resolve the account a forward is *from*: the DID that signed or authcrypted
-/// it (auto-registering it with a minimal relay ACL on first contact), or — for
-/// an anonymous forward — a synthetic account carrying the global default ACL.
-/// Enforces the `SEND_FORWARDED` capability on the resolved sender.
+/// it, or — for an anonymous forward — a synthetic account carrying the
+/// global default ACL. A signing sender with no account here is checked
+/// against [`relay_sender_acls`] and no account is created for it. Enforces the
+/// `SEND_FORWARDED` capability on the resolved sender.
 ///
 /// The plaintext `from` is never used on its own: it is accepted only when it
 /// names that same authenticated DID.
@@ -711,7 +765,7 @@ async fn resolve_forward_sender(
     session: &Session,
     msg: &Message,
     metadata: &UnpackMetadata,
-) -> Result<Account, MediatorError> {
+) -> Result<ForwardSender, MediatorError> {
     let sender = crate::messages::authenticated_sender(msg, metadata).map_err(|reason| {
         MediatorError::problem_with_log(
             96,
@@ -727,58 +781,20 @@ async fn resolve_forward_sender(
         )
     })?;
     if let Some(from) = &sender {
-        let from_account = match state
-            .database
-            .account_get(&affinidi_messaging_mediator_common::did_identity::did_hash(
-                from.as_str(),
-            ))
-            .await
-        {
-            Ok(Some(from_account)) => from_account,
-            Ok(None) => {
-                // First time we've seen this forwarding sender. Persist it
-                // as a registered account (mirrors the `next_account` branch
-                // above). Without this, `store_message` later creates a bare
-                // `DID:<hash>` record holding only queue counters (no `ACLS`
-                // field). On every subsequent forward `account_get` then
-                // returns that phantom record with `acls = 0` (DENY_ALL), so
-                // the `send_forwarded` gate below rejects the relay with 403;
-                // registering here keeps cross-mediator forwarding
-                // reproducible.
-                //
-                // Seed with a minimal relay ACL (`SEND_FORWARDED` only, and
-                // only if `global_acl_default` grants it) rather than the
-                // full default — see `relay_sender_acls`. A DID that merely
-                // relays a forward should not also be persisted with LOCAL /
-                // RECEIVE / invite / self-manage capabilities.
-                debug!("Forwarding sender account not found, creating a new one");
-                let from_acl_seed = relay_sender_acls(&state.config.security.global_acl_default);
-                state
-                    .database
-                    .account_add(
-                        &affinidi_messaging_mediator_common::did_identity::did_hash(from.as_str()),
-                        &from_acl_seed,
-                        None,
-                    )
-                    .await
-                    .map_err(|e| {
-                        if e.is_storage_cap() {
-                            return e;
-                        }
-                        MediatorError::problem_with_log(
-                            14,
-                            &session.session_id,
-                            Some(msg.id.to_string()),
-                            ProblemReportSorter::Error,
-                            ProblemReportScope::Protocol,
-                            "me.res.storage.error",
-                            "Database transaction error: {1}",
-                            vec![e.to_string()],
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("Database transaction error: {e}"),
-                        )
-                    })?
-            }
+        let from_hash = affinidi_messaging_mediator_common::did_identity::did_hash(from.as_str());
+        let (from_account, registered) = match state.database.account_get(&from_hash).await {
+            Ok(Some(from_account)) => (from_account, true),
+            // A sender this mediator has not admitted. It is not registered
+            // here: an account is created only by authentication (subject to
+            // `mediator_acl_mode`) or by an admin.
+            Ok(None) => (
+                Account {
+                    did_hash: from_hash,
+                    acls: relay_sender_acls(&state.config.security.global_acl_default).to_u64(),
+                    ..Default::default()
+                },
+                false,
+            ),
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
                     14,
@@ -810,7 +826,10 @@ async fn resolve_forward_sender(
             ));
         }
 
-        Ok(from_account)
+        Ok(ForwardSender {
+            account: from_account,
+            registered,
+        })
     } else if authz::require_capability(&session.acls, Capability::SendForwarded).is_err() {
         Err(MediatorError::problem(
             60,
@@ -824,9 +843,13 @@ async fn resolve_forward_sender(
             StatusCode::FORBIDDEN,
         ))
     } else {
-        Ok(Account {
-            acls: state.config.security.global_acl_default.to_u64(),
-            ..Default::default()
+        Ok(ForwardSender {
+            account: Account {
+                acls: state.config.security.global_acl_default.to_u64(),
+                ..Default::default()
+            },
+            // Anonymous: stored under no sender, exactly as before.
+            registered: true,
         })
     }
 }
@@ -898,7 +921,9 @@ pub(crate) async fn process(
         // Determine who the from did is
         // If message is anonymous, then use the session DID
 
-        let from_account = resolve_forward_sender(state, session, msg, metadata).await?;
+        let sender = resolve_forward_sender(state, session, msg, metadata).await?;
+        let from_account = sender.account;
+        let sender_has_account = sender.registered;
 
         // Check queue + attachment + forward-task-queue limits before accepting.
         // Per-relationship first: when a sender is genuinely flooding one peer,
@@ -1007,10 +1032,17 @@ pub(crate) async fn process(
         // Local or remote next hop? This resolves `next` (and possibly its
         // mediator) over the network, so it runs only once every cheap check
         // above has passed.
-        let remote_endpoint = if ephemeral {
-            None
+        let next_hop = if ephemeral {
+            NextHop::Local
         } else {
-            remote_endpoint_for(state, &next).await
+            classify_next_hop(state, &next).await
+        };
+        let remote_endpoint = match next_hop {
+            NextHop::Local => None,
+            NextHop::Remote(hop) => Some(hop),
+            NextHop::Unroutable { reason, retryable } => {
+                return Err(unroutable(session, msg, &reason, retryable));
+            }
         };
 
         // ****************************************************
@@ -1063,7 +1095,8 @@ pub(crate) async fn process(
             &next,
             &next_did_hash,
             next_acls.as_ref(),
-            &from_account,
+            &from_account.did_hash,
+            sender_has_account,
             &data,
             delay_milli,
             expires_at,
@@ -1158,8 +1191,9 @@ fn didcomm_endpoints(doc: &Document) -> Vec<String> {
 /// Decide whether a forward's next hop is served by this mediator or a remote
 /// one, and — when remote — the URL to relay it to.
 ///
-/// Returns the [`RemoteHop`] if the next hop should be forwarded to a remote
-/// mediator, or `None` if the next hop is local to this mediator.
+/// Returns [`NextHop::Remote`] if the next hop should be forwarded to a remote
+/// mediator, [`NextHop::Local`] if it is local to this mediator, and
+/// [`NextHop::Unroutable`] if it names a mediator this one cannot reach.
 ///
 /// A `DIDCommMessaging` endpoint names its mediator one of two ways:
 ///
@@ -1173,28 +1207,28 @@ fn didcomm_endpoints(doc: &Document) -> Vec<String> {
 /// expected to publish a URL, and chasing further would let a chain of
 /// documents steer this mediator's relay.
 ///
-/// Anything left over is still treated as local — the original conservative
-/// default — but no longer silently. A next hop that publishes a DIDComm
-/// service we could not turn into a URL is almost certainly not ours, and
-/// storing it locally means it is never delivered to anyone.
+/// Anything left over is refused rather than stored: a next hop that
+/// publishes a DIDComm service we could not turn into a URL is almost
+/// certainly not ours, and storing it locally means it is never delivered to
+/// anyone.
 async fn service_endpoint_for_remote(
     state: &SharedData,
     next: &str,
     next_doc: &Document,
-) -> Option<RemoteHop> {
+) -> NextHop {
     let endpoints = didcomm_endpoints(next_doc);
     if endpoints.is_empty() {
-        // No DIDComm service published at all — local, and not worth a warning.
-        // A local account is under no obligation to publish one.
-        return None;
+        // No DIDComm service published at all — local. A local account is
+        // under no obligation to publish one.
+        return NextHop::Local;
     }
 
     let mut peer_mediator: Option<String> = None;
     for uri in &endpoints {
         match classify_endpoint(uri, &state.config.mediator_did, &state.self_authorities) {
-            Some(EndpointHop::Local) => return None,
+            Some(EndpointHop::Local) => return NextHop::Local,
             Some(EndpointHop::Remote(url)) => {
-                return Some(RemoteHop {
+                return NextHop::Remote(RemoteHop {
                     endpoint: url,
                     relay_to: next.to_string(),
                 });
@@ -1209,33 +1243,35 @@ async fn service_endpoint_for_remote(
     }
 
     let Some(peer_mediator) = peer_mediator else {
-        warn!(
-            "Next hop ({}) publishes a DIDCommMessaging service this mediator can't turn into \
-             an endpoint ({:?}). Storing locally — it will not be delivered.",
-            next, endpoints
-        );
-        return None;
+        return NextHop::Unroutable {
+            reason: format!(
+                "next hop ({next}) publishes a DIDCommMessaging service this mediator can't \
+                 turn into an endpoint ({endpoints:?})"
+            ),
+            retryable: false,
+        };
     };
 
     // One hop: the peer mediator's own document carries the transport URL.
     let peer_doc = match state.did_resolver.resolve(&peer_mediator).await {
         Ok(response) => response.doc,
         Err(e) => {
-            warn!(
-                "Next hop ({}) is mediated by ({}), which couldn't be resolved: {}. Storing \
-                 locally — it will not be delivered.",
-                next, peer_mediator, e
-            );
-            return None;
+            return NextHop::Unroutable {
+                reason: format!(
+                    "next hop ({next}) is mediated by ({peer_mediator}), which couldn't be \
+                     resolved: {e}"
+                ),
+                retryable: true,
+            };
         }
     };
 
     for uri in didcomm_endpoints(&peer_doc) {
         match classify_endpoint(&uri, &state.config.mediator_did, &state.self_authorities) {
             // The peer mediator is this mediator under another name.
-            Some(EndpointHop::Local) => return None,
+            Some(EndpointHop::Local) => return NextHop::Local,
             Some(EndpointHop::Remote(url)) => {
-                return Some(RemoteHop {
+                return NextHop::Remote(RemoteHop {
                     endpoint: url,
                     relay_to: peer_mediator,
                 });
@@ -1245,12 +1281,13 @@ async fn service_endpoint_for_remote(
         }
     }
 
-    warn!(
-        "Next hop ({}) is mediated by ({}), whose document publishes no DIDComm endpoint URL. \
-         Storing locally — it will not be delivered.",
-        next, peer_mediator
-    );
-    None
+    NextHop::Unroutable {
+        reason: format!(
+            "next hop ({next}) is mediated by ({peer_mediator}), whose document publishes no \
+             DIDComm endpoint URL"
+        ),
+        retryable: false,
+    }
 }
 
 #[cfg(test)]
@@ -1336,7 +1373,7 @@ mod tests {
     #[test]
     fn relay_sender_acls_grant_only_send_forwarded_on_a_relay() {
         // Relay deployment (global default grants SEND_FORWARDED, e.g. ALLOW_ALL):
-        // the auto-registered sender gets SEND_FORWARDED and nothing else — not
+        // a sender with no account is checked against SEND_FORWARDED and nothing else — not
         // the LOCAL / RECEIVE / invite / self-manage bits ALLOW_ALL would carry.
         let global = MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap();
         let acls = relay_sender_acls(&global);
@@ -1356,7 +1393,7 @@ mod tests {
     #[test]
     fn relay_sender_acls_deny_send_forwarded_on_a_non_relay() {
         // Non-relay mediator (shipped secure default lacks SEND_FORWARDED): the
-        // auto-registered sender must NOT gain relay capability, so the forward
+        // sender with no account must NOT gain relay capability, so the forward
         // gate keeps rejecting it exactly as before this change.
         let global =
             MediatorACLSet::from_string_ruleset("DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES")

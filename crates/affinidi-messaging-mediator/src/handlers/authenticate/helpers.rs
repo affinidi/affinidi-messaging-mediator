@@ -1,6 +1,6 @@
 use crate::SharedData;
 use crate::common::authz::{self, Capability};
-use crate::common::session::SessionClaims;
+use crate::common::session::{SessionClaims, TokenUse};
 // Production token creation now takes `now` from the injected clock; the only
 // remaining caller of this helper is the test module below.
 #[cfg(test)]
@@ -107,6 +107,8 @@ pub(super) fn _create_access_token(
         sub: did.to_owned(),
         session_id: session_id.to_owned(),
         exp: (now + expiry),
+        token_use: Some(TokenUse::Access),
+        jti: None,
     };
 
     let access_token = encode(
@@ -146,26 +148,18 @@ pub(super) fn _create_refresh_token(
         sub: did.to_owned(),
         session_id: session_id.to_owned(),
         exp: (now + expiry),
+        token_use: Some(TokenUse::Refresh),
+        // EdDSA signatures are deterministic, so without a unique claim two
+        // refresh tokens issued for one session in the same second are the
+        // same string, and rotating from one to the other would change
+        // nothing. The `jti` makes every issued token, and so its stored
+        // hash, distinct.
+        jti: Some(create_random_string(22)),
     };
-
-    // EdDSA signatures are deterministic, so without a unique claim two
-    // refresh tokens issued for one session in the same second are the same
-    // string, and rotating from one to the other would change nothing. The
-    // `jti` makes every issued token, and so its stored hash, distinct.
-    // Decoders read `SessionClaims` and ignore it.
-    #[derive(serde::Serialize)]
-    struct RefreshClaims<'a> {
-        #[serde(flatten)]
-        claims: &'a SessionClaims,
-        jti: String,
-    }
 
     let refresh_token = encode(
         &Header::new(jsonwebtoken::Algorithm::EdDSA),
-        &RefreshClaims {
-            claims: &refresh_claims,
-            jti: create_random_string(22),
-        },
+        &refresh_claims,
         encoding_key,
     )
     .map_err(|err| {
@@ -210,25 +204,26 @@ pub(super) async fn register_account_after_proof(
     state: &SharedData,
     did_hash: &str,
 ) -> Result<(), MediatorError> {
-    let acls = match state.database.get_did_acl(did_hash).await? {
-        Some(acls) => acls,
-        None => {
-            if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+    let acls = if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+        match state.database.get_did_acl(did_hash).await? {
+            Some(acls) => acls,
+            None => {
                 info!(
                     "DID({}) has no account and mediator_acl_mode is explicit_allow — rejecting",
                     did_hash
                 );
                 return Err(blocked());
             }
-            // An account that appeared since the read above (an admin adding
-            // it) is not an error: the ACLs `account_add` returns are the
-            // ones checked below.
-            let account = state
-                .database
-                .account_add(did_hash, &state.config.security.global_acl_default, None)
-                .await?;
-            MediatorACLSet::from_u64(account.acls)
         }
+    } else {
+        // Create-if-absent in one atomic store step: an existing account —
+        // including one an admin added or changed since the challenge — is
+        // returned unchanged, and its ACLs are the ones checked below.
+        let account = state
+            .database
+            .account_add(did_hash, &state.config.security.global_acl_default, None)
+            .await?;
+        MediatorACLSet::from_u64(account.acls)
     };
 
     if !authz::grants(&acls, Capability::NotBlocked) {
@@ -330,6 +325,8 @@ mod tests {
         assert_eq!(token_data.claims.aud, "ATM");
         assert_eq!(token_data.claims.sub, "did:example:123");
         assert_eq!(token_data.claims.session_id, "session-1");
+        assert_eq!(token_data.claims.token_use, Some(TokenUse::Access));
+        assert_eq!(token_data.claims.jti, None);
     }
 
     #[test]
@@ -399,6 +396,8 @@ mod tests {
             .claims;
         assert_eq!(claims.session_id, "session-5");
         assert_eq!(claims.sub, "did:example:abc");
+        assert_eq!(claims.token_use, Some(TokenUse::Refresh));
+        assert!(claims.jti.is_some());
     }
 
     #[test]

@@ -68,8 +68,8 @@ use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
-        ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
-        OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
         StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
@@ -391,6 +391,10 @@ fn decode_stream_id(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((ms, seq))
 }
 
+/// Pending entries one autoclaim call examines per entry it may return, as
+/// on Redis.
+const AUTOCLAIM_SCAN_FACTOR: usize = 10;
+
 fn format_stream_id(ms: u64, seq: u64) -> String {
     format!("{ms}-{seq}")
 }
@@ -510,6 +514,16 @@ struct StoredAccount {
     receive_queue_bytes: u64,
     queue_send_limit: Option<i32>,
     queue_receive_limit: Option<i32>,
+    /// Whether this record is an account. Storing a message for a party with
+    /// no account keeps its queue counters here too (as Redis keeps them in a
+    /// `DID:<hash>` hash with no `ACLS`), but that alone does not make it an
+    /// account. Records written before the field existed read as accounts.
+    #[serde(default = "stored_account_default_is_account")]
+    is_account: bool,
+}
+
+fn stored_account_default_is_account() -> bool {
+    true
 }
 
 impl StoredAccount {
@@ -885,6 +899,20 @@ impl FjallStore {
 
     /// Helper: encode any serde value as JSON bytes, mapping errors to
     /// `MediatorError::InternalError`.
+    /// The stored record for `did_hash`, if it is an account (see
+    /// [`StoredAccount::is_account`]).
+    fn account_record(&self, did_hash: &str) -> Result<Option<StoredAccount>, MediatorError> {
+        let Some(raw) = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("accounts.get", e))?
+        else {
+            return Ok(None);
+        };
+        let acc: StoredAccount = Self::decode(&raw)?;
+        Ok(acc.is_account.then_some(acc))
+    }
+
     fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MediatorError> {
         serde_json::to_vec(value).map_err(|e| {
             MediatorError::InternalError(500, "fjall".into(), format!("encode failed: {e}"))
@@ -1982,12 +2010,8 @@ impl MediatorStore for FjallStore {
         // Redis path's "session HMGET + DID HMGET" pipeline).
         if !did.is_empty() {
             let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
-            if let Some(v) = self
-                .accounts
-                .get(did_hash.as_bytes())
-                .map_err(|e| Self::db_err("get_session:accounts.get", e))?
-            {
-                let acc: StoredAccount = Self::decode(&v)?;
+            // A record holding only queue counters is not an account.
+            if let Some(acc) = self.account_record(&did_hash)? {
                 session.acls = MediatorACLSet::from_u64(acc.acls);
                 session.account_type = acc.role;
             } else if session.state != SessionState::ChallengeSent {
@@ -2165,39 +2189,53 @@ impl MediatorStore for FjallStore {
     // ─── Accounts ───────────────────────────────────────────────────────────
 
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
-        self.accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_exists:contains_key", e))
+        Ok(self.account_record(did_hash)?.is_some())
     }
 
     async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
-        let Some(raw) = self
-            .accounts
-            .get(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_get:get", e))?
-        else {
+        let Some(acc) = self.account_record(did_hash)? else {
             return Ok(None);
         };
-        let acc: StoredAccount = Self::decode(&raw)?;
         let count = self.access_list_count_inner(did_hash)?;
         Ok(Some(acc.into_account(did_hash.to_string(), count as u32)))
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        // Checked under the write lock, so an existing account is never
+        // replaced. A record holding only queue counters is completed, and
+        // its counters kept: they describe messages that are really queued.
+        let counters = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_create:get", e))?
+        {
+            Some(raw) => {
+                let existing: StoredAccount = Self::decode(&raw)?;
+                if existing.is_account {
+                    return Ok(None);
+                }
+                existing
+            }
+            None => StoredAccount::default(),
+        };
         let mut record = StoredAccount {
+            role: AccountType::Standard,
             acls: acls.to_u64(),
-            ..Default::default()
+            queue_send_limit: None,
+            queue_receive_limit: None,
+            is_account: true,
+            ..counters
         };
         if let Some(limit) = queue_limit {
             record.queue_send_limit = Some(limit as i32);
             record.queue_receive_limit = Some(limit as i32);
         }
-        let _guard = self.write_lock.lock().await;
         let mut batch = self.db.batch();
         batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
         // A fresh account starts with no activity and no counters, whatever
@@ -2211,7 +2249,7 @@ impl MediatorStore for FjallStore {
         batch
             .commit()
             .map_err(|e| Self::db_err("account_add:insert", e))?;
-        Ok(record.into_account(did_hash.to_string(), 0))
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
     }
 
     async fn account_remove(
@@ -2511,6 +2549,12 @@ impl MediatorStore for FjallStore {
             }
             let did_hash = String::from_utf8(key.as_ref().to_vec()).unwrap_or_default();
             let acc: StoredAccount = Self::decode(&value)?;
+            // A record holding only queue counters is not an account; it is
+            // counted towards the cursor so paging stays stable.
+            if !acc.is_account {
+                total_seen += 1;
+                continue;
+            }
             let count = self.access_list_count_inner(&did_hash)? as u32;
             accounts.push(acc.into_account(did_hash, count));
             total_seen += 1;
@@ -2539,6 +2583,8 @@ impl MediatorStore for FjallStore {
             None => StoredAccount::default(),
         };
         record.role = *account_type;
+        // A role makes the record an account, as `ROLE_TYPE` does on Redis.
+        record.is_account = true;
 
         let mut batch = self.db.batch();
         batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
@@ -2601,6 +2647,8 @@ impl MediatorStore for FjallStore {
             None => StoredAccount::default(),
         };
         record.acls = acls.to_u64();
+        // ACLs make the record an account, as `ACLS` does on Redis.
+        record.is_account = true;
         self.accounts
             .insert(did_hash.as_bytes(), Self::encode(&record)?)
             .map_err(|e| Self::db_err("set_did_acl:insert", e))?;
@@ -2608,14 +2656,9 @@ impl MediatorStore for FjallStore {
     }
 
     async fn get_did_acl(&self, did_hash: &str) -> Result<Option<MediatorACLSet>, MediatorError> {
-        let Some(raw) = self
-            .accounts
-            .get(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("get_did_acl:get", e))?
-        else {
+        let Some(acc) = self.account_record(did_hash)? else {
             return Ok(None);
         };
-        let acc: StoredAccount = Self::decode(&raw)?;
         Ok(Some(MediatorACLSet::from_u64(acc.acls)))
     }
 
@@ -2636,12 +2679,7 @@ impl MediatorStore for FjallStore {
             mediator_acl_mode,
         };
         for did in dids {
-            if let Some(raw) = self
-                .accounts
-                .get(did.as_bytes())
-                .map_err(|e| Self::db_err("get_did_acls:get", e))?
-            {
-                let acc: StoredAccount = Self::decode(&raw)?;
+            if let Some(acc) = self.account_record(did)? {
                 let acls = MediatorACLSet::from_u64(acc.acls);
                 response.acl_response.push(
                     affinidi_messaging_sdk::protocols::mediator::acls_handler::MediatorACLExpanded {
@@ -2673,9 +2711,9 @@ impl MediatorStore for FjallStore {
         let Ok(Some(raw)) = self.accounts.get(to_hash.as_bytes()) else {
             return Ok(None);
         };
-        let acc: StoredAccount = match Self::decode(&raw) {
-            Ok(a) => a,
-            Err(_) => return Ok(None),
+        let acc = match Self::decode::<StoredAccount>(&raw) {
+            Ok(a) if a.is_account => a,
+            _ => return Ok(None),
         };
         let acls = MediatorACLSet::from_u64(acc.acls);
         let sender = match from_hash {
@@ -2829,10 +2867,10 @@ impl MediatorStore for FjallStore {
         admin_type: AccountType,
         acls: &MediatorACLSet,
     ) -> Result<(), MediatorError> {
-        let exists = self.account_exists(admin_did_hash).await?;
-        if !exists {
-            self.account_add(admin_did_hash, acls, None).await?;
-        }
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
         let _guard = self.write_lock.lock().await;
         let mut record: StoredAccount = self
             .accounts
@@ -3219,6 +3257,7 @@ impl MediatorStore for FjallStore {
                 None => std::ops::Bound::Unbounded,
             };
             let mut entries = Vec::new();
+            let mut malformed: Vec<(u64, u64)> = Vec::new();
             let mut new_last: Option<(u64, u64)> = last;
             for guard in store
                 .forward_queue
@@ -3231,9 +3270,19 @@ impl MediatorStore for FjallStore {
                 let Some(sid) = decode_stream_id(key.as_ref()) else {
                     continue;
                 };
-                let entry: ForwardQueueEntry = Self::decode(&value)?;
-                entries.push((sid, entry));
                 new_last = Some(sid);
+                match Self::decode::<ForwardQueueEntry>(&value) {
+                    Ok(entry) => entries.push((sid, entry)),
+                    // Dropped below, rather than failing every read from here.
+                    Err(e) => {
+                        tracing::warn!(
+                            "Dropping malformed forward queue entry {}-{}: {e}",
+                            sid.0,
+                            sid.1
+                        );
+                        malformed.push(sid);
+                    }
+                }
             }
 
             // Persist the claims and the new cursor in one batch.
@@ -3258,9 +3307,20 @@ impl MediatorStore for FjallStore {
                     encode_stream_id(sid.0, sid.1).to_vec(),
                 );
             }
+            for sid in &malformed {
+                batch.remove(
+                    &store.forward_queue,
+                    encode_stream_id(sid.0, sid.1).to_vec(),
+                );
+            }
             batch
                 .commit()
                 .map_err(|e| Self::db_err("forward_queue_read:commit", e))?;
+            if !malformed.is_empty() {
+                store
+                    .forward_queue_len
+                    .fetch_sub(malformed.len(), Ordering::AcqRel);
+            }
 
             Ok(entries.into_iter().map(|(_, e)| e).collect())
         };
@@ -3364,34 +3424,45 @@ impl MediatorStore for FjallStore {
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
         let now = now_ms_u64();
         let min_idle_ms = min_idle.as_millis() as u64;
+        let start = parse_stream_id_string(cursor).unwrap_or((0, 0));
 
         let _guard = self.write_lock.lock().await;
         let group_prefix_len = group_name.len() + 1; // +1 for the null byte
+        // Examine a bounded stretch of the pending list per call, as Redis
+        // does, and say where to continue.
+        let scan_limit = count.max(1).saturating_mul(AUTOCLAIM_SCAN_FACTOR);
 
-        // Snapshot pending entries for this group whose claim is older
-        // than `min_idle`.
+        // Snapshot pending entries for this group, from the cursor, whose
+        // claim is older than `min_idle`.
         let mut stale: Vec<((u64, u64), StoredPendingClaim)> = Vec::new();
-        for guard in self.forward_pending.prefix(group_name.as_bytes()) {
-            if stale.len() >= count {
-                break;
-            }
+        let mut next_cursor = None;
+        let mut examined = 0usize;
+        for guard in self
+            .forward_pending
+            .range::<Vec<u8>, _>(pending_key(group_name, start)..)
+        {
             let (key, value) = guard
                 .into_inner()
-                .map_err(|e| Self::db_err("forward_queue_autoclaim:prefix", e))?;
-            // Defensive: only consider keys that are actually for our
-            // group (the prefix iter is conservative).
+                .map_err(|e| Self::db_err("forward_queue_autoclaim:range", e))?;
+            // Past this group's keys: the scan is complete.
             if key.len() < group_prefix_len + 16
                 || &key[..group_name.len()] != group_name.as_bytes()
                 || key[group_name.len()] != 0x00
             {
-                continue;
+                break;
             }
             let Some(sid) = decode_stream_id(&key[group_prefix_len..]) else {
                 continue;
             };
+            if examined >= scan_limit || stale.len() >= count {
+                next_cursor = Some(format_stream_id(sid.0, sid.1));
+                break;
+            }
+            examined += 1;
             let claim: StoredPendingClaim = Self::decode(&value)?;
             if now.saturating_sub(claim.claimed_at_ms) >= min_idle_ms {
                 stale.push((sid, claim));
@@ -3402,7 +3473,8 @@ impl MediatorStore for FjallStore {
         // delivery count. Persist updated claims + collect the
         // associated queue entries to return.
         let mut batch = self.db.batch();
-        let mut out = Vec::with_capacity(stale.len());
+        let mut entries = Vec::with_capacity(stale.len());
+        let mut dropped = 0usize;
         for (sid, claim) in stale {
             let Some(raw) = self
                 .forward_queue
@@ -3416,6 +3488,21 @@ impl MediatorStore for FjallStore {
                 batch.remove(&self.forward_pending, pending_key(group_name, sid));
                 continue;
             };
+            let entry = match Self::decode::<ForwardQueueEntry>(&raw) {
+                Ok(entry) => entry,
+                // Dropped, claim and all, rather than reclaimed on every sweep.
+                Err(e) => {
+                    tracing::warn!(
+                        "Dropping malformed forward queue entry {}-{}: {e}",
+                        sid.0,
+                        sid.1
+                    );
+                    batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                    batch.remove(&self.forward_queue, encode_stream_id(sid.0, sid.1).to_vec());
+                    dropped += 1;
+                    continue;
+                }
+            };
             let new_claim = StoredPendingClaim {
                 consumer: consumer_name.to_string(),
                 claimed_at_ms: now,
@@ -3426,12 +3513,120 @@ impl MediatorStore for FjallStore {
                 pending_key(group_name, sid),
                 Self::encode(&new_claim)?,
             );
-            out.push(Self::decode(&raw)?);
+            entries.push(entry);
         }
         batch
             .commit()
             .map_err(|e| Self::db_err("forward_queue_autoclaim:commit", e))?;
-        Ok(out)
+        if dropped > 0 {
+            self.forward_queue_len.fetch_sub(dropped, Ordering::AcqRel);
+        }
+        Ok(ForwardQueueClaimPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let Some(sid) = parse_stream_id_string(stream_id) else {
+            return Ok(false);
+        };
+        // Under the write lock, so the ownership check and the write cannot
+        // be split by an autoclaim moving the claim.
+        let guard = self.write_lock.lock().await;
+        let claim_key = pending_key(group_name, sid);
+        let held = self
+            .forward_pending
+            .get(&claim_key)
+            .map_err(|e| Self::db_err("forward_queue_finish:get", e))?
+            .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+            .transpose()?
+            .is_some_and(|claim| claim.consumer == consumer_name);
+        if !held {
+            return Ok(false);
+        }
+
+        let mut batch = self.db.batch();
+        let mut len = self.forward_queue_count_inner();
+        if let Some(entry) = requeue {
+            let id = self.alloc_stream_id();
+            let mut entry = entry.clone();
+            entry.stream_id = format_stream_id(id.0, id.1);
+            batch.insert(
+                &self.forward_queue,
+                encode_stream_id(id.0, id.1).to_vec(),
+                Self::encode(&entry)?,
+            );
+            len += 1;
+        }
+        batch.remove(&self.forward_pending, claim_key);
+        let key = encode_stream_id(sid.0, sid.1).to_vec();
+        if self
+            .forward_queue
+            .contains_key(&key)
+            .map_err(|e| Self::db_err("forward_queue_finish:contains", e))?
+        {
+            len -= 1;
+            batch.remove(&self.forward_queue, key);
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_finish:commit", e))?;
+        // Only after the batch is durable. Still under `write_lock`.
+        self.forward_queue_len.store(len, Ordering::Release);
+        drop(guard);
+        self.sync_if_durable("forward_queue_finish:persist")?;
+        if requeue.is_some() {
+            self.forward_notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = now_ms_u64();
+        // Under the write lock, so a concurrent autoclaim cannot move a claim
+        // between the ownership check and the refresh.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut lost = Vec::new();
+        for id in stream_ids {
+            let Some(sid) = parse_stream_id_string(id) else {
+                lost.push(id.to_string());
+                continue;
+            };
+            let key = pending_key(group_name, sid);
+            let claim = self
+                .forward_pending
+                .get(&key)
+                .map_err(|e| Self::db_err("forward_queue_refresh_claims:get", e))?
+                .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+                .transpose()?;
+            match claim {
+                Some(claim) if claim.consumer == consumer_name => {
+                    let refreshed = StoredPendingClaim {
+                        claimed_at_ms: now,
+                        ..claim
+                    };
+                    batch.insert(&self.forward_pending, key, Self::encode(&refreshed)?);
+                }
+                _ => lost.push(id.to_string()),
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_refresh_claims:commit", e))?;
+        Ok(lost)
     }
 
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
@@ -3598,10 +3793,7 @@ impl MediatorStore for FjallStore {
         // Under the write lock, so it cannot interleave with `account_remove`
         // and leave a removed account's record behind.
         let _guard = self.write_lock.lock().await;
-        let exists = self
-            .accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_activity_record:accounts.get", e))?;
+        let exists = self.account_record(did_hash)?.is_some();
         if !exists {
             return Ok(());
         }
@@ -3641,11 +3833,7 @@ impl MediatorStore for FjallStore {
         delta: AccountStatsDelta,
     ) -> Result<(), MediatorError> {
         let _guard = self.write_lock.lock().await;
-        if !self
-            .accounts
-            .contains_key(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("account_stats_bump:accounts.get", e))?
-        {
+        if self.account_record(did_hash)?.is_none() {
             return Ok(());
         }
         let key = stats_key(did_hash);
@@ -4320,6 +4508,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let community = hash("community");
+        store
+            .account_add(&community, &MediatorACLSet::default(), None)
+            .await
+            .expect("sender account");
 
         for i in 0..250 {
             let member = hash(&format!("member-{i}"));
@@ -4882,6 +5074,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         let id = store
             .forward_queue_enqueue(&entry, 0)
@@ -4925,6 +5118,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
 
         let id = {
@@ -4953,9 +5147,10 @@ mod tests {
         assert!(read.is_empty());
         // ...but autoclaim recovers it for the new consumer.
         let claimed = store
-            .forward_queue_autoclaim("forwarding", "c2", Duration::from_millis(0), 10)
+            .forward_queue_autoclaim("forwarding", "c2", Duration::from_millis(0), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].stream_id, id);
         assert_eq!(claimed[0].message, "encrypted");
@@ -5000,6 +5195,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         store
             .forward_queue_enqueue(&entry, 0)
@@ -5083,6 +5279,56 @@ mod tests {
         );
     }
 
+    /// A forward-queue row that does not decode is dropped, by a read or by
+    /// the reclaim sweep, rather than failing every read or being reclaimed
+    /// on every sweep.
+    #[tokio::test]
+    async fn malformed_forward_queue_rows_are_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // One bad row read fresh, and one already claimed when it went bad.
+        store
+            .forward_queue
+            .insert(encode_stream_id(1, 0).to_vec(), b"not json".to_vec())
+            .expect("insert bad row");
+        store.forward_queue_len.fetch_add(1, Ordering::AcqRel);
+        let good = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        let read = store
+            .forward_queue_read("g", "c1", 10, Duration::ZERO)
+            .await
+            .expect("a bad row does not fail the read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].stream_id, good);
+        assert!(
+            store
+                .forward_queue
+                .get(encode_stream_id(1, 0))
+                .expect("get")
+                .is_none(),
+            "the bad row is gone"
+        );
+
+        let sid = parse_stream_id_string(&good).expect("stream id");
+        store
+            .forward_queue
+            .insert(
+                encode_stream_id(sid.0, sid.1).to_vec(),
+                b"gone bad".to_vec(),
+            )
+            .expect("corrupt the claimed row");
+        let page = store
+            .forward_queue_autoclaim("g", "c2", Duration::ZERO, 10, "0-0")
+            .await
+            .expect("a bad row does not fail the sweep");
+        assert!(page.entries.is_empty());
+        assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
+        assert_eq!(store.forward_queue_len().await.expect("len"), 0);
+    }
+
     #[tokio::test]
     async fn forward_queue_autoclaim_recovers_idle_entries() {
         let dir = TempDir::new().expect("tempdir");
@@ -5100,6 +5346,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         let id = store
             .forward_queue_enqueue(&entry, 0)
@@ -5117,9 +5364,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let reclaimed = store
-            .forward_queue_autoclaim("g", "consumer-b", Duration::from_millis(10), 10)
+            .forward_queue_autoclaim("g", "consumer-b", Duration::from_millis(10), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].stream_id, id);
     }
@@ -5138,6 +5386,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         }
     }
 
@@ -5189,9 +5438,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         let reclaimed = store
-            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10)
+            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10, "0-0")
             .await
-            .expect("autoclaim");
+            .expect("autoclaim")
+            .entries;
         assert!(reclaimed.is_empty());
         assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
     }
@@ -5436,6 +5686,12 @@ mod idempotent_store_tests {
         let dir = TempDir::new().expect("tempdir");
         let store = FjallStore::open(dir.path()).expect("open");
         let (to, from) = (hash("vta"), hash("control"));
+        for did in [&from, &to] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account");
+        }
 
         let a = store
             .store_message("s", "same-bytes", &to, Some(&from), 0, 0)

@@ -38,9 +38,10 @@ use crate::{
     database::{DatabaseHandler, RedisConnection},
     errors::MediatorError,
     store::{
-        DeletionAuthority, ExpiryReport, ForwardQueueEntry, InboxStatusReply, MediatorStore,
-        MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session, SessionState,
-        StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
+        DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
+        InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats, PubSubRecord,
+        RefreshRotation, Session, SessionState, StatCounter, StoreHealth, StreamingClientState,
+        TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -501,6 +502,7 @@ fn fwd_entry_into_new(inner: InnerForwardEntry) -> ForwardQueueEntry {
         expires_at: inner.expires_at,
         retry_count: inner.retry_count,
         hop_count: inner.hop_count,
+        not_before_ms: inner.not_before_ms,
     }
 }
 
@@ -518,6 +520,7 @@ fn fwd_entry_into_old(new: &ForwardQueueEntry) -> InnerForwardEntry {
         expires_at: new.expires_at,
         retry_count: new.retry_count,
         hop_count: new.hop_count,
+        not_before_ms: new.not_before_ms,
     }
 }
 
@@ -1511,13 +1514,15 @@ impl MediatorStore for RedisStore {
         self.account_get(did_hash).await
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
-        let account = self.account_add(did_hash, acls, queue_limit).await?;
+    ) -> Result<Option<Account>, MediatorError> {
+        let Some(account) = self.account_create(did_hash, acls, queue_limit).await? else {
+            return Ok(None);
+        };
         // A fresh account starts with no activity. This also collects a record
         // that a message in flight wrote between a removal's existence check
         // and its `DEL` below.
@@ -1530,7 +1535,7 @@ impl MediatorStore for RedisStore {
         {
             warn!("account {did_hash} added, but its old activity or counters remain: {e}");
         }
-        Ok(account)
+        Ok(Some(account))
     }
 
     async fn account_remove(
@@ -1998,16 +2003,42 @@ impl MediatorStore for RedisStore {
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
-        let inner = self
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
+        let (next, entries) = self
             .forward_queue_autoclaim(
                 group_name,
                 consumer_name,
                 min_idle.as_millis() as u64,
                 count,
+                cursor,
             )
             .await?;
-        Ok(inner.into_iter().map(fwd_entry_into_new).collect())
+        Ok(ForwardQueueClaimPage {
+            entries: entries.into_iter().map(fwd_entry_into_new).collect(),
+            next_cursor: (next != "0-0").then_some(next),
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        self.forward_queue_finish(group_name, consumer_name, stream_id, requeue)
+            .await
+    }
+
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        self.forward_queue_refresh_claims(group_name, consumer_name, stream_ids)
+            .await
     }
 
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────

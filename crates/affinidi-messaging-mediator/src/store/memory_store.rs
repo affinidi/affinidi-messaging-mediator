@@ -32,8 +32,8 @@ use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
-        ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
-        OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
         RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
         StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
@@ -69,6 +69,10 @@ const PUBSUB_BROADCAST_CAPACITY: usize = 32;
 // ─── Internal types ─────────────────────────────────────────────────────────
 
 type StreamId = (u64, u64); // (timestamp_ms, sequence)
+
+/// Pending entries one autoclaim call examines per entry it may return, as
+/// on Redis.
+const AUTOCLAIM_SCAN_FACTOR: usize = 10;
 
 fn format_stream_id(id: StreamId) -> String {
     format!("{}-{}", id.0, id.1)
@@ -126,6 +130,11 @@ struct AccountRecord {
     receive_queue_bytes: u64,
     queue_send_limit: Option<i32>,
     queue_receive_limit: Option<i32>,
+    /// Whether this record is an account. Storing a message for a party with
+    /// no account keeps its queue counters here too (as Redis keeps them in a
+    /// `DID:<hash>` hash with no `ACLS`), but that alone does not make it an
+    /// account: it is not admitted, listed, or given ACLs from this record.
+    is_account: bool,
 }
 
 impl Default for AccountRecord {
@@ -139,7 +148,16 @@ impl Default for AccountRecord {
             receive_queue_bytes: 0,
             queue_send_limit: None,
             queue_receive_limit: None,
+            is_account: false,
         }
+    }
+}
+
+impl MemoryState {
+    /// The account record for `did_hash`, if it is an account (see
+    /// [`AccountRecord::is_account`]).
+    fn account(&self, did_hash: &str) -> Option<&AccountRecord> {
+        self.accounts.get(did_hash).filter(|r| r.is_account)
     }
 }
 
@@ -1080,7 +1098,7 @@ impl MediatorStore for MemoryStore {
         // Join with account for ACLs/role (matches Redis path).
         if !did.is_empty() {
             let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
-            if let Some(account) = state.accounts.get(&did_hash) {
+            if let Some(account) = state.account(&did_hash) {
                 session.acls = account.acls.clone();
                 session.account_type = account.role;
             } else if session.state != SessionState::ChallengeSent {
@@ -1124,12 +1142,12 @@ impl MediatorStore for MemoryStore {
     // ─── Accounts ───────────────────────────────────────────────────────────
 
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
-        Ok(self.state.lock().await.accounts.contains_key(did_hash))
+        Ok(self.state.lock().await.account(did_hash).is_some())
     }
 
     async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
         let state = self.state.lock().await;
-        let Some(record) = state.accounts.get(did_hash).cloned() else {
+        let Some(record) = state.account(did_hash).cloned() else {
             return Ok(None);
         };
         let access_list_count = state
@@ -1142,20 +1160,32 @@ impl MediatorStore for MemoryStore {
         ))
     }
 
-    async fn account_add(
+    async fn account_create(
         &self,
         did_hash: &str,
         acls: &MediatorACLSet,
         queue_limit: Option<u32>,
-    ) -> Result<Account, MediatorError> {
+    ) -> Result<Option<Account>, MediatorError> {
         let mut state = self.state.lock().await;
         if !state.known_dids.iter().any(|d| d == did_hash) {
             state.known_dids.push(did_hash.to_string());
         }
+        // Checked under the same lock as the insert, so an existing account is
+        // never replaced.
+        if state.account(did_hash).is_some() {
+            return Ok(None);
+        }
+        // A record holding only queue counters is completed, and its counters
+        // kept: they describe messages that are really queued.
+        let counters = state.accounts.get(did_hash).cloned().unwrap_or_default();
         let mut record = AccountRecord {
             acls: acls.clone(),
-            ..AccountRecord::default()
+            is_account: true,
+            ..counters
         };
+        record.role = AccountType::Standard;
+        record.queue_send_limit = None;
+        record.queue_receive_limit = None;
         if let Some(limit) = queue_limit {
             record.queue_send_limit = Some(limit as i32);
             record.queue_receive_limit = Some(limit as i32);
@@ -1164,7 +1194,7 @@ impl MediatorStore for MemoryStore {
         // A fresh account starts with no activity and no counters.
         state.activity.remove(did_hash);
         state.stats.remove(did_hash);
-        Ok(record.into_account(did_hash.to_string(), 0))
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
     }
 
     async fn account_remove(
@@ -1388,7 +1418,7 @@ impl MediatorStore for MemoryStore {
         };
         let mut accounts = Vec::with_capacity(dids.len());
         for did in &dids {
-            if let Some(record) = state.accounts.get(did) {
+            if let Some(record) = state.account(did) {
                 let count = state
                     .access_lists
                     .get(did)
@@ -1411,6 +1441,8 @@ impl MediatorStore for MemoryStore {
         let mut state = self.state.lock().await;
         let record = state.accounts.entry(did_hash.to_string()).or_default();
         record.role = *account_type;
+        // A role makes the record an account, as `ROLE_TYPE` does on Redis.
+        record.is_account = true;
         if account_type.is_admin() {
             state.admins.insert(did_hash.to_string());
         } else {
@@ -1450,12 +1482,14 @@ impl MediatorStore for MemoryStore {
         let mut state = self.state.lock().await;
         let record = state.accounts.entry(did_hash.to_string()).or_default();
         record.acls = acls.clone();
+        // ACLs make the record an account, as `ACLS` does on Redis.
+        record.is_account = true;
         Ok(acls.clone())
     }
 
     async fn get_did_acl(&self, did_hash: &str) -> Result<Option<MediatorACLSet>, MediatorError> {
         let state = self.state.lock().await;
-        Ok(state.accounts.get(did_hash).map(|r| r.acls.clone()))
+        Ok(state.account(did_hash).map(|r| r.acls.clone()))
     }
 
     async fn get_did_acls(
@@ -1476,7 +1510,7 @@ impl MediatorStore for MemoryStore {
             mediator_acl_mode,
         };
         for did in dids {
-            if let Some(record) = state.accounts.get(did) {
+            if let Some(record) = state.account(did) {
                 response.acl_response.push(MediatorACLExpanded {
                     did_hash: did.clone(),
                     acl_value: record.acls.to_hex_string(),
@@ -1501,7 +1535,7 @@ impl MediatorStore for MemoryStore {
         from_hash: Option<&str>,
     ) -> Result<Option<DeliveryDecision>, MediatorError> {
         let state = self.state.lock().await;
-        let Some(account) = state.accounts.get(to_hash) else {
+        let Some(account) = state.account(to_hash) else {
             return Ok(None);
         };
         let sender = match from_hash {
@@ -1619,10 +1653,10 @@ impl MediatorStore for MemoryStore {
         admin_type: AccountType,
         acls: &MediatorACLSet,
     ) -> Result<(), MediatorError> {
-        let exists = self.account_exists(admin_did_hash).await?;
-        if !exists {
-            self.account_add(admin_did_hash, acls, None).await?;
-        }
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
         let mut state = self.state.lock().await;
         if let Some(record) = state.accounts.get_mut(admin_did_hash) {
             record.role = admin_type;
@@ -1930,24 +1964,36 @@ impl MediatorStore for MemoryStore {
         consumer_name: &str,
         min_idle: Duration,
         count: usize,
-    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
         let now = Instant::now();
+        let start = parse_stream_id(cursor).unwrap_or((0, 0));
         let mut state = self.state.lock().await;
-        // Snapshot stale entries first to avoid borrow conflicts.
-        let stale_ids: Vec<StreamId> = state
-            .forward_groups
-            .get(group_name)
-            .map(|g| {
-                g.pending
-                    .iter()
-                    .filter(|(_, claim)| now.duration_since(claim.claimed_at) >= min_idle)
-                    .map(|(id, _)| *id)
-                    .take(count)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut out = Vec::with_capacity(stale_ids.len());
+        // Examine a bounded stretch of the pending list per call, as Redis
+        // does, and say where to continue.
+        let scan_limit = count.max(1).saturating_mul(AUTOCLAIM_SCAN_FACTOR);
+        let mut stale_ids: Vec<StreamId> = Vec::new();
+        let mut next_cursor = None;
+        if let Some(group) = state.forward_groups.get(group_name) {
+            for (examined, (id, claim)) in group.pending.range(start..).enumerate() {
+                if examined >= scan_limit || stale_ids.len() >= count {
+                    next_cursor = Some(format_stream_id(*id));
+                    break;
+                }
+                if now.duration_since(claim.claimed_at) >= min_idle {
+                    stale_ids.push(*id);
+                }
+            }
+        }
+        let mut entries = Vec::with_capacity(stale_ids.len());
         for id in stale_ids {
+            if !state.forward_queue.contains_key(&id) {
+                // Gone from the queue: drop the claim, as XAUTOCLAIM does.
+                if let Some(group) = state.forward_groups.get_mut(group_name) {
+                    group.pending.remove(&id);
+                }
+                continue;
+            }
             if let Some(group) = state.forward_groups.get_mut(group_name)
                 && let Some(claim) = group.pending.get_mut(&id)
             {
@@ -1956,10 +2002,71 @@ impl MediatorStore for MemoryStore {
                 claim.delivery_count += 1;
             }
             if let Some(entry) = state.forward_queue.get(&id) {
-                out.push(entry.clone());
+                entries.push(entry.clone());
             }
         }
-        Ok(out)
+        Ok(ForwardQueueClaimPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let Some(id) = parse_stream_id(stream_id) else {
+            return Ok(false);
+        };
+        let mut state = self.state.lock().await;
+        let held = state
+            .forward_groups
+            .get(group_name)
+            .and_then(|group| group.pending.get(&id))
+            .is_some_and(|claim| claim.consumer == consumer_name);
+        if !held {
+            return Ok(false);
+        }
+        if let Some(entry) = requeue {
+            let new_id = state.alloc_stream_id();
+            let mut entry = entry.clone();
+            entry.stream_id = format_stream_id(new_id);
+            state.forward_queue.insert(new_id, entry);
+        }
+        if let Some(group) = state.forward_groups.get_mut(group_name) {
+            group.pending.remove(&id);
+        }
+        state.forward_queue.remove(&id);
+        drop(state);
+        if requeue.is_some() {
+            self.forward_notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let group = state.forward_groups.get_mut(group_name);
+        let mut lost = Vec::new();
+        let Some(group) = group else {
+            return Ok(stream_ids.iter().map(|id| id.to_string()).collect());
+        };
+        for id in stream_ids {
+            match parse_stream_id(id).and_then(|parsed| group.pending.get_mut(&parsed)) {
+                Some(claim) if claim.consumer == consumer_name => claim.claimed_at = now,
+                _ => lost.push(id.to_string()),
+            }
+        }
+        Ok(lost)
     }
 
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
@@ -2081,7 +2188,7 @@ impl MediatorStore for MemoryStore {
         at: u64,
     ) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
-        if !state.accounts.contains_key(did_hash) {
+        if state.account(did_hash).is_none() {
             return Ok(());
         }
         let activity = state.activity.entry(did_hash.to_string()).or_default();
@@ -2110,7 +2217,7 @@ impl MediatorStore for MemoryStore {
         delta: AccountStatsDelta,
     ) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
-        if !state.accounts.contains_key(did_hash) {
+        if state.account(did_hash).is_none() {
             return Ok(());
         }
         state
@@ -2761,6 +2868,7 @@ mod tests {
             expires_at: 0,
             retry_count: 0,
             hop_count: 0,
+            not_before_ms: 0,
         };
         let id = store
             .forward_queue_enqueue(&entry, 0)

@@ -1,6 +1,6 @@
 use crate::common::metrics::names::{
     ACTIVE_WEBSOCKET_CONNECTIONS, MUX_LIVE_FRAMES_WITHHELD_TOTAL, WS_LIVE_RESYNC_SENT,
-    WS_LIVE_RESYNC_SUPPRESSED,
+    WS_LIVE_RESYNC_SUPPRESSED, WS_WRITE_TIMEOUTS_TOTAL,
 };
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
@@ -24,7 +24,7 @@ use affinidi_messaging_didcomm::message::Message as DidcommMessage;
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError};
 #[cfg(feature = "tsp")]
 use affinidi_messaging_mediator_common::store::DeletionAuthority;
-use affinidi_messaging_mediator_common::store::StatCounter;
+use affinidi_messaging_mediator_common::store::{MediatorStore, StatCounter};
 use affinidi_messaging_mediator_common::tasks::forwarding::relay_ack::{
     RELAY_ACK_SUBPROTOCOL, RelayAck, frame_id,
 };
@@ -53,7 +53,7 @@ use serde_json::json;
 #[cfg(feature = "tsp")]
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::{
     select,
@@ -514,6 +514,222 @@ impl Drop for PerDidConnectionGuard {
     }
 }
 
+/// One WebSocket's share of the mediator-wide connection state: its slot in
+/// the global count, its per-DID slot, its place on the
+/// `ACTIVE_WEBSOCKET_CONNECTIONS` gauge, its streaming registration and its
+/// close stat.
+///
+/// Each part is taken on as the connection reaches it and given back by this
+/// one value, so no exit path from `handle_socket` skips or repeats one of
+/// these releases. [`ConnectionSlot::release`] gives everything back in order
+/// and awaits it; dropping the slot without it (an early return, a panic, the
+/// task being cancelled) releases the same parts, sending what needs a task
+/// in the background.
+///
+/// A mux connection's members are not held here: they are closed by
+/// `mux::connection::close` on the handler's own exit paths, so a panic or a
+/// cancelled task leaves them to the registry's sweep.
+struct ConnectionSlot {
+    count: Arc<AtomicUsize>,
+    /// Counted on the gauge.
+    on_gauge: bool,
+    /// Counted as opened, so a close stat is owed.
+    close_stat: Option<Arc<dyn MediatorStore>>,
+    /// Registered with the streaming task, so a deregistration is owed.
+    registration: Option<(Sender<StreamingUpdate>, StreamingUpdate)>,
+    /// The DID's per-DID slot, released with the global one.
+    per_did: Option<PerDidConnectionGuard>,
+}
+
+impl ConnectionSlot {
+    /// Reserve a place in the global count. `Err` carries the count already
+    /// in use when it is at `max`; the reservation is backed out by then.
+    fn acquire(count: &Arc<AtomicUsize>, max: usize) -> Result<Self, usize> {
+        let current = count.fetch_add(1, Ordering::Relaxed);
+        let slot = Self {
+            count: count.clone(),
+            on_gauge: false,
+            close_stat: None,
+            registration: None,
+            per_did: None,
+        };
+        if current >= max {
+            Err(current)
+        } else {
+            Ok(slot)
+        }
+    }
+
+    /// The connection is admitted: count it on the gauge and in the open
+    /// stat, which this slot then owes a matching close for.
+    async fn open(&mut self, database: &Arc<dyn MediatorStore>) {
+        metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).increment(1.0);
+        self.on_gauge = true;
+        let _ = database
+            .stats_increment(StatCounter::WebsocketOpen, 1)
+            .await;
+        self.close_stat = Some(database.clone());
+    }
+
+    /// Hold the DID's per-DID slot until this slot is released.
+    fn hold_per_did(&mut self, guard: PerDidConnectionGuard) {
+        self.per_did = Some(guard);
+    }
+
+    /// The streaming task holds a registration for this socket, made with
+    /// the send queue `client`. The deregistration names that queue, so it
+    /// can only ever remove this socket's entry: another socket for the same
+    /// DID may share the session id.
+    fn registered(
+        &mut self,
+        channel: Sender<StreamingUpdate>,
+        did_hash: &str,
+        session_id: &str,
+        client: &Sender<QueuedCommand>,
+    ) {
+        self.registration = Some((
+            channel,
+            StreamingUpdate {
+                did_hash: did_hash.to_string(),
+                state: StreamingUpdateState::Deregister {
+                    session_id: session_id.to_string(),
+                    channel: client.downgrade(),
+                },
+            },
+        ));
+    }
+
+    /// The streaming task closed this socket and has already let its
+    /// registration go. Deregistering now could remove the newer socket
+    /// that took the slot.
+    fn deregistered_by_streaming(&mut self) {
+        self.registration = None;
+    }
+
+    /// Give everything back now, awaiting the parts that go to other tasks.
+    async fn release(mut self) {
+        if let Some((channel, stop)) = self.registration.take() {
+            let _ = channel.send(stop).await;
+        }
+        if let Some(database) = self.close_stat.take() {
+            let _ = database
+                .stats_increment(StatCounter::WebsocketClose, 1)
+                .await;
+        }
+        // The count, the per-DID slot and the gauge go in `drop`.
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        if self.on_gauge {
+            metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).decrement(1.0);
+        }
+        let registration = self.registration.take();
+        let close_stat = self.close_stat.take();
+        if registration.is_none() && close_stat.is_none() {
+            return;
+        }
+        // Dropped without `release`. The deregistration is tried without
+        // waiting first; only a full control channel needs a task.
+        let registration = registration.and_then(|(channel, stop)| match channel.try_send(stop) {
+            Err(mpsc::error::TrySendError::Full(stop)) => Some((channel, stop)),
+            _ => None,
+        });
+        if registration.is_none() && close_stat.is_none() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Some((channel, stop)) = registration {
+                        let _ = channel.send(stop).await;
+                    }
+                    if let Some(database) = close_stat {
+                        let _ = database
+                            .stats_increment(StatCounter::WebsocketClose, 1)
+                            .await;
+                    }
+                });
+            }
+            Err(_) => warn!(
+                "WebSocket connection released outside a runtime; streaming deregistration and close stat not sent"
+            ),
+        }
+    }
+}
+
+/// How long one write to a WebSocket may take before the peer is treated as
+/// gone. A peer that stops reading leaves a write parked once its TCP window
+/// closes; without a bound the connection never notices, and holds its
+/// slots and queued frames until the kernel gives up on it.
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A [`WebSocket`] whose writes are bounded by [`WS_WRITE_TIMEOUT`].
+///
+/// A write that runs out of time may have left part of a frame on the wire,
+/// so the socket is unusable after it: every later write fails at once, and
+/// the connection loop closes on [`BoundedSocket::stalled`].
+struct BoundedSocket {
+    inner: WebSocket,
+    write_timeout: Duration,
+    stalled: bool,
+}
+
+impl BoundedSocket {
+    fn new(inner: WebSocket) -> Self {
+        Self {
+            inner,
+            write_timeout: WS_WRITE_TIMEOUT,
+            stalled: false,
+        }
+    }
+
+    async fn send(&mut self, msg: Message) -> Result<(), axum::Error> {
+        let write = self.inner.send(msg);
+        bounded_write(&mut self.stalled, self.write_timeout, write).await
+    }
+
+    async fn recv(&mut self) -> Option<Result<Message, axum::Error>> {
+        self.inner.recv().await
+    }
+
+    /// A write timed out; the connection should close.
+    fn stalled(&self) -> bool {
+        self.stalled
+    }
+}
+
+/// Run `write` within `limit`. A timeout marks the socket `stalled`, and a
+/// stalled socket's writes fail without being attempted. Either way the
+/// caller sees an error, so nothing is reported as written that wasn't.
+async fn bounded_write<F>(stalled: &mut bool, limit: Duration, write: F) -> Result<(), axum::Error>
+where
+    F: std::future::Future<Output = Result<(), axum::Error>>,
+{
+    if *stalled {
+        return Err(axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "an earlier WebSocket write timed out",
+        )));
+    }
+    match tokio::time::timeout(limit, write).await {
+        Ok(result) => result,
+        Err(_) => {
+            *stalled = true;
+            metrics::counter!(WS_WRITE_TIMEOUTS_TOTAL).increment(1);
+            Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "WebSocket write did not complete within {}s",
+                    limit.as_secs()
+                ),
+            )))
+        }
+    }
+}
+
 /// RFC 6455 close codes the mediator uses, so clients learn *why* a socket was
 /// closed instead of seeing a bare close.
 mod close_code {
@@ -592,7 +808,7 @@ fn close_with(code: u16, reason: &'static str) -> Message {
 
 /// WebSocket state machine. This is spawned per connection.
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: SharedData,
     mut session: Session,
     // An anonymous inter-mediator relay socket: it may push frames and
@@ -609,24 +825,47 @@ async fn handle_socket(
         session = session.session_id
     );
     async move {
-        // Enforce the global connection limit.
-        let current = state.active_websocket_count.fetch_add(1, Ordering::Relaxed);
-        if current >= state.config.limits.max_websocket_connections {
-            state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
-            warn!("WebSocket connection limit reached ({}/{})", current, state.config.limits.max_websocket_connections);
+        let mut socket = BoundedSocket::new(socket);
+
+        // A token past its `exp` is still accepted by the upgrade within the
+        // JWT leeway, but the socket lives only until `exp`. Refuse it here,
+        // before anything is reserved or registered, rather than reserving a
+        // connection that would have no lifetime left.
+        let epoch = state.clock.unix_secs();
+        if session.expires_at <= epoch {
+            warn!("JWT access token has expired. Closing Session");
             let _ = socket
                 .send(close_with(
-                    close_code::TRY_AGAIN_LATER,
-                    "server connection limit reached",
+                    close_code::POLICY,
+                    "authentication token expired",
                 ))
                 .await;
             return;
         }
 
+        // Enforce the global connection limit. From here the slot gives back
+        // everything it holds on every return path.
+        let mut slot = match ConnectionSlot::acquire(
+            &state.active_websocket_count,
+            state.config.limits.max_websocket_connections,
+        ) {
+            Ok(slot) => slot,
+            Err(current) => {
+                warn!("WebSocket connection limit reached ({}/{})", current, state.config.limits.max_websocket_connections);
+                let _ = socket
+                    .send(close_with(
+                        close_code::TRY_AGAIN_LATER,
+                        "server connection limit reached",
+                    ))
+                    .await;
+                return;
+            }
+        };
+
         // Enforce the per-DID connection cap (0 = unlimited). Reserve the slot
-        // immediately and bind a guard so it's released on every return path;
-        // then reject if this DID is over its cap (the global slot reserved
-        // above is backed out explicitly, the per-DID slot by the guard).
+        // immediately and hand its guard to the connection slot, so it's
+        // released with the global one on every return path; then reject if
+        // this DID is over its cap.
         let per_did_count = {
             let mut entry = state
                 .ws_connections_per_did
@@ -641,17 +880,18 @@ async fn handle_socket(
         // peers*. That is the intended bound — it is the only thing limiting
         // anonymous sockets — and the empty string cannot collide with a real
         // DID's bucket, which is a sha256 hash.
-        let _per_did_guard = PerDidConnectionGuard {
+        slot.hold_per_did(PerDidConnectionGuard {
             registry: state.ws_connections_per_did.clone(),
             did_hash: session.did_hash.clone(),
-        };
+        });
         let per_did_cap = state.config.limits.max_websocket_connections_per_did;
         if per_did_cap != 0 && per_did_count as usize > per_did_cap {
-            state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
             warn!(
                 "Per-DID WebSocket connection limit reached for {} ({}/{})",
                 session.did_hash, per_did_count, per_did_cap
             );
+            // Released before the close is written, which may take a while.
+            drop(slot);
             let _ = socket
                 .send(close_with(
                     close_code::POLICY,
@@ -661,7 +901,7 @@ async fn handle_socket(
             return;
         }
 
-        metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).increment(1.0);
+        slot.open(&state.database).await;
 
         // A mux connection shares its queue among many DIDs, so each gets a
         // fair share of it (design §7.2): per-DID slots on the way in, and a
@@ -720,6 +960,12 @@ async fn handle_socket(
             match streaming.channel.send(start).await {
                 Ok(_) => {
                     debug!("Sent start message to streaming task");
+                    slot.registered(
+                        streaming.channel.clone(),
+                        &session.did_hash,
+                        &session.session_id,
+                        &tx,
+                    );
                 }
                 Err(e) => {
                     warn!("Error sending start message to streaming task: {:?}", e);
@@ -765,10 +1011,6 @@ async fn handle_socket(
             }
         }
 
-        let _ = state
-            .database
-            .stats_increment(StatCounter::WebsocketOpen, 1)
-            .await;
         info!("Websocket connection established");
 
         // A mux connection admits its stored grants and tells the client its
@@ -803,26 +1045,12 @@ async fn handle_socket(
             if no_ready {
                 warn!("tsp-mux connection not opened: its `ready` event could not be sealed");
                 crate::mux::connection::close(&state, &session, &conn).await;
-                if let Some(streaming) = &state.streaming_task {
-                    let stop = StreamingUpdate {
-                        did_hash: session.did_hash.clone(),
-                        state: StreamingUpdateState::Deregister {
-                            session_id: session.session_id.clone(),
-                        },
-                    };
-                    let _ = streaming.channel.send(stop).await;
-                }
-                state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
-                metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).decrement(1.0);
+                slot.release().await;
                 let _ = socket
                     .send(close_with(
                         close_code::SERVER_ERROR,
                         "mux connection could not be established",
                     ))
-                    .await;
-                let _ = state
-                    .database
-                    .stats_increment(StatCounter::WebsocketClose, 1)
                     .await;
                 return;
             }
@@ -842,24 +1070,13 @@ async fn handle_socket(
         ));
         mux_revalidate.reset();
 
-        // Set a timeout for the websocket connection for when the JWT Auth token expires
+        // The socket lives until the JWT Auth token expires. `expires_at` was
+        // checked to be in the future on entry; the setup since may have
+        // taken that time, which leaves a zero-length lifetime.
         let epoch = state.clock.unix_secs();
-        if session.expires_at <= epoch {
-            warn!("JWT access token has expired. Closing Session");
-            if let Some(conn) = &mux_conn {
-                crate::mux::connection::close(&state, &session, conn).await;
-            }
-            let _ = socket
-                .send(close_with(
-                    close_code::POLICY,
-                    "authentication token expired",
-                ))
-                .await;
-            return;
-        }
-        let auth_timeout = tokio::time::sleep(Duration::from_secs(session.expires_at - epoch));
+        let auth_timeout = tokio::time::sleep(Duration::from_secs(session.expires_at.saturating_sub(epoch)));
         tokio::pin!(auth_timeout);
-        debug!(expires_in_secs = session.expires_at - epoch, "WebSocket auth timeout set");
+        debug!(expires_in_secs = session.expires_at.saturating_sub(epoch), "WebSocket auth timeout set");
 
         // Periodic ping to detect dead connections
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
@@ -898,33 +1115,21 @@ async fn handle_socket(
             if let Some(conn) = &mux_conn {
                 crate::mux::connection::close(&state, &session, conn).await;
             }
-            if let Some(streaming) = &state.streaming_task {
-                let stop = StreamingUpdate {
-                    did_hash: session.did_hash.clone(),
-                    state: StreamingUpdateState::Deregister {
-                        session_id: session.session_id.clone(),
-                    },
-                };
-                let _ = streaming.channel.send(stop).await;
-            }
-            state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
-            metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).decrement(1.0);
-            let _ = state
-                .database
-                .stats_increment(StatCounter::WebsocketClose, 1)
-                .await;
+            slot.release().await;
             info!("Websocket connection closed during TSP flush-on-connect");
             return;
         }
 
-        // Flag to prevent double deregistration
-        // This can occur because in some situations the streaming-task will send a close message
-        // due to duplicate channels. If we were to deregister on close in this scenario, we would
-        // also deregister the new channel that is still in use.
-        let mut already_deregistered_flag = false;
         // Why this socket ends up closing — surfaced in the final close frame.
         let mut close_reason: (u16, &'static str) = (close_code::NORMAL, "normal closure");
         loop {
+            // Checked at the top so it holds however the last pass ended,
+            // including the arms that `continue`.
+            if socket.stalled() {
+                warn!("WebSocket write timed out; closing");
+                close_reason = (close_code::GOING_AWAY, "connection unresponsive");
+                break;
+            }
             select! {
                 _ = &mut auth_timeout => {
                     debug!("Socket lifetime reached");
@@ -1342,7 +1547,10 @@ async fn handle_socket(
                                     warn!("Failed to send message to WebSocket client: {e}");
                                 }
                                 debug!(reason = ?why, "Streaming task requested close");
-                                already_deregistered_flag = true;
+                                // The streaming task has dropped this socket's
+                                // registration (e.g. a newer socket replaced it);
+                                // deregistering now would remove the successor.
+                                slot.deregistered_by_streaming();
                                 close_reason = _close_frame_reason(why);
                                 break;
                             }
@@ -1463,24 +1671,10 @@ async fn handle_socket(
             crate::mux::connection::close(&state, &session, conn).await;
         }
 
-        // Remove this websocket and associated info from the streaming task.
-        // A relay socket was never registered (see above), so there is nothing
-        // to deregister — and doing so under the empty did_hash would be a
-        // deregistration for an account that isn't this session's.
-        if !already_deregistered_flag && !is_relay { // Skip if close initiated by the streaming task
-            if let Some(streaming) = &state.streaming_task  {
-                let stop = StreamingUpdate {
-                    did_hash: session.did_hash.clone(),
-                    state: StreamingUpdateState::Deregister {
-                        session_id: session.session_id.clone(),
-                    },
-                };
-                let _ = streaming.channel.send(stop).await;
-            }
-        }
-
-        state.active_websocket_count.fetch_sub(1, Ordering::Relaxed);
-        metrics::gauge!(ACTIVE_WEBSOCKET_CONNECTIONS).decrement(1.0);
+        // Deregister from the streaming task (unless it closed this socket
+        // itself; a relay socket was never registered), release the
+        // connection count and gauge, and record the close.
+        slot.release().await;
 
         // We're done, close the connection with the reason that ended the loop.
         if let Err(e) = socket
@@ -1489,10 +1683,6 @@ async fn handle_socket(
         {
             debug!("Failed to send WebSocket close frame: {e}");
         }
-        let _ = state
-            .database
-            .stats_increment(StatCounter::WebsocketClose, 1)
-            .await;
 
         info!("Websocket connection closed");
     }
@@ -1584,7 +1774,7 @@ const TSP_DRAIN_MAX: usize = 1000;
 async fn drain_tsp_inbox(
     state: &SharedData,
     session: &Session,
-    socket: &mut WebSocket,
+    socket: &mut BoundedSocket,
     ack_mode: bool,
     inflight: &mut std::collections::HashSet<String>,
     members: Option<(
@@ -1753,7 +1943,7 @@ async fn drain_tsp_page(
     state: &SharedData,
     session: &Session,
     did_hash: &str,
-    socket: &mut WebSocket,
+    socket: &mut BoundedSocket,
     ack_mode: bool,
     inflight: &mut std::collections::HashSet<String>,
     seen: &mut std::collections::HashSet<String>,
@@ -1915,7 +2105,7 @@ async fn drain_tsp_page(
 async fn send_tsp_member_live(
     conn: &crate::mux::registry::MuxConn,
     did_hash: &str,
-    socket: &mut WebSocket,
+    socket: &mut BoundedSocket,
     body: &str,
     inflight: &mut MemberInflight,
 ) -> ControlFlow<(), bool> {
@@ -2256,11 +2446,52 @@ mod close_report_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CorsOriginPolicy, MIN_RESYNC_INTERVAL, app_subprotocols, extract_bearer_subprotocol,
-        resync_due, ws_origin_allowed,
+        CorsOriginPolicy, MIN_RESYNC_INTERVAL, app_subprotocols, bounded_write,
+        extract_bearer_subprotocol, resync_due, ws_origin_allowed,
     };
     use crate::common::config::OriginMatcher;
     use http::HeaderValue;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_past_its_deadline_fails_and_marks_the_socket_stalled() {
+        let mut stalled = false;
+        let never = std::future::pending::<Result<(), axum::Error>>();
+        assert!(
+            bounded_write(&mut stalled, Duration::from_secs(30), never)
+                .await
+                .is_err()
+        );
+        assert!(stalled);
+
+        // Later writes fail without being attempted.
+        let attempted = std::cell::Cell::new(false);
+        let write = async {
+            attempted.set(true);
+            Ok(())
+        };
+        assert!(
+            bounded_write(&mut stalled, Duration::from_secs(30), write)
+                .await
+                .is_err()
+        );
+        assert!(!attempted.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_within_its_deadline_succeeds() {
+        let mut stalled = false;
+        let write = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        };
+        assert!(
+            bounded_write(&mut stalled, Duration::from_secs(30), write)
+                .await
+                .is_ok()
+        );
+        assert!(!stalled);
+    }
 
     fn hv(s: &str) -> HeaderValue {
         HeaderValue::from_str(s).expect("valid header value")
@@ -2443,5 +2674,139 @@ mod tests {
             &policy,
             Some(&hv("https://evilaffinidi.com"))
         ));
+    }
+}
+
+#[cfg(all(test, feature = "memory-backend"))]
+mod connection_slot_tests {
+    use super::ConnectionSlot;
+    use super::PerDidConnectionGuard;
+    use crate::store::memory_store::MemoryStore;
+    use crate::tasks::websocket_streaming::{QueuedCommand, StreamingUpdate, StreamingUpdateState};
+    use affinidi_messaging_mediator_common::store::MediatorStore;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+
+    async fn closes(database: &Arc<dyn MediatorStore>) -> (i64, i64) {
+        let stats = database.get_global_stats().await.expect("stats");
+        (stats.websocket_open, stats.websocket_close)
+    }
+
+    /// Wait for the background release a dropped slot spawns.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slot_over_the_limit_gives_its_count_back() {
+        let count = Arc::new(AtomicUsize::new(2));
+        assert_eq!(ConnectionSlot::acquire(&count, 2).err(), Some(2));
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_slot_releases_everything_it_took() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::channel::<StreamingUpdate>(4);
+
+        let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
+        slot.open(&database).await;
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        // An early return: the slot is dropped, never released by hand.
+        drop(slot);
+        settle().await;
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        match rx.try_recv().expect("a deregistration is sent") {
+            StreamingUpdate {
+                did_hash,
+                state: StreamingUpdateState::Deregister { session_id, .. },
+            } => {
+                assert_eq!(did_hash, "did-hash");
+                assert_eq!(session_id, "session-1");
+            }
+            _ => panic!("expected a Deregister"),
+        }
+        assert!(rx.try_recv().is_err(), "deregistered exactly once");
+        assert_eq!(closes(&database).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_released_slot_releases_once() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::channel::<StreamingUpdate>(4);
+
+        let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
+        slot.open(&database).await;
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
+        slot.release().await;
+        settle().await;
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "deregistered exactly once");
+        assert_eq!(closes(&database).await, (1, 1));
+    }
+
+    /// A socket the streaming task closed has no registration of its own left;
+    /// deregistering it could remove the socket that replaced it.
+    #[tokio::test]
+    async fn a_slot_closed_by_the_streaming_task_does_not_deregister() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::channel::<StreamingUpdate>(4);
+
+        let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
+        slot.open(&database).await;
+        let (client, _client_rx) = mpsc::channel::<QueuedCommand>(1);
+        slot.registered(tx, "did-hash", "session-1", &client);
+        slot.deregistered_by_streaming();
+        slot.release().await;
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(closes(&database).await, (1, 1));
+    }
+
+    /// The per-DID slot goes back with the global one, when the connection
+    /// is released rather than when the handler finally returns.
+    #[tokio::test]
+    async fn a_released_slot_gives_back_the_per_did_slot() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let registry: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        registry.insert("did-hash".to_string(), 1);
+
+        let mut slot = ConnectionSlot::acquire(&count, 10).expect("under the limit");
+        slot.hold_per_did(PerDidConnectionGuard {
+            registry: registry.clone(),
+            did_hash: "did-hash".to_string(),
+        });
+        slot.open(&database).await;
+        slot.release().await;
+
+        assert!(registry.get("did-hash").is_none());
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    /// A slot that was never admitted owes no close stat.
+    #[tokio::test]
+    async fn an_unopened_slot_records_no_close() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        drop(ConnectionSlot::acquire(&count, 10).expect("under the limit"));
+        settle().await;
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(closes(&database).await, (0, 0));
     }
 }

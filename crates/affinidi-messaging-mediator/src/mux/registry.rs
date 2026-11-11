@@ -181,6 +181,7 @@ impl MuxConn {
                     did_hash: did_hash.to_string(),
                     state: StreamingUpdateState::Deregister {
                         session_id: session_id.to_string(),
+                        channel: self.tx.downgrade(),
                     },
                 })
                 .await;

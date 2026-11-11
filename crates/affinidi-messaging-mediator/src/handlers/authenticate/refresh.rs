@@ -1,12 +1,12 @@
 use super::super::message_inbound::InboundMessage;
 use super::AuthRefreshResponse;
 use super::helpers::{_create_access_token, _create_refresh_token};
-use crate::common::jwt_auth::{clock_aware_validation, jwt_exp_is_expired};
+use crate::common::jwt_auth::{clock_aware_validation, jwt_exp_is_expired, token_use_accepted};
 use crate::didcomm_compat::MetaEnvelope;
 use crate::{
     SharedData,
     common::authz::{self, Capability},
-    common::session::{Session, SessionClaims, SessionState},
+    common::session::{Session, SessionClaims, SessionState, TokenUse},
 };
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
 use affinidi_messaging_mediator_common::store::RefreshRotation;
@@ -252,6 +252,30 @@ pub async fn authentication_refresh(
                 vec![],
                 StatusCode::BAD_REQUEST,
                 "Refresh token has expired",
+            )
+            .into());
+        }
+
+        // Only a refresh token is exchanged here. Refused before the stored
+        // hash is consulted, so presenting an access token does not end the
+        // session the way a reused refresh token does.
+        if !token_use_accepted(
+            &results.claims,
+            TokenUse::Refresh,
+            now,
+            state.config.security.jwt_access_expiry,
+        ) {
+            return Err(MediatorError::problem_with_log(
+                38,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.refresh_token.parse",
+                "Token is not a refresh token",
+                vec![],
+                StatusCode::BAD_REQUEST,
+                "Token presented for refresh is not a refresh token",
             )
             .into());
         }

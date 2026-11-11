@@ -30,6 +30,81 @@ mediator-tui 0.11.0); they are no longer updated.
   title says when the view covers this instance only.
 - Needs affinidi-messaging-sdk 0.45.6 (`TrustTasksOps::mux_connections`).
 
+### Changed — a forward is delivered only to a next hop that has an account
+
+- A forward never creates an account. A local next hop with no account on
+  this mediator is refused with `73 delivery.refused`; it used to be
+  registered with `global_acl_default`, in either `mediator_acl_mode`. A
+  recipient gets its account by authenticating (or from an admin) before
+  forwards to it are accepted.
+- A forward from a DID with no account here is still checked against the
+  least-privilege relay ACL (`SEND_FORWARDED` only, if `global_acl_default`
+  grants it), but that DID is no longer registered. Its queued messages
+  are still counted per recipient, so `limits.queue.peer` holds it as it
+  holds any sender; `limits.queue.sender` (a per-account total) does not
+  apply to it. An abandoned relay has no inbox here to report to (logged as
+  `FORWARD_PROBLEM_REPORT_UNSENT`). Recipient-side checks, including access
+  lists, see the sender's DID.
+- A next hop this mediator cannot route is refused instead of stored where
+  nothing would collect it. One whose DID document publishes a DIDComm
+  service with no usable endpoint, or names a mediator whose document has
+  no endpoint URL, gets `73 delivery.refused`. One that names a mediator
+  whose DID cannot be resolved gets `74 did.resolve` with 503, so the sender
+  can retry. Previously each was stored locally, logged "Storing locally —
+  it will not be delivered", and answered as forwarded.
+- A next hop whose own DID cannot be resolved is treated as local: it is
+  delivered if it holds an account here, so a resolver outage does not stop
+  local delivery, and refused with `73` otherwise.
+- A forward is answered as forwarded only once it is stored: a storage
+  failure while storing it locally is now returned to the sender instead of
+  being logged and answered with success. An `ephemeral` forward is accepted
+  only when it is handed to the recipient's live stream; a recipient with no
+  live stream gets `73 delivery.refused`, and a failed publish a 503.
+
+**Behaviour change (R3.6):** a deployment that forwards to recipients
+before they have ever authenticated must now pre-register them with
+`messaging/account/add` (admin). Senders that relied on an unresolvable or
+unroutable next hop being accepted, or on `ephemeral` forwards to an
+offline recipient succeeding, now get an error.
+
+### Changed — `account/add` is admin-only and never replaces an existing account
+
+- `messaging/account/add` for a DID that already has an account is refused
+  with `messaging/account/add:alreadyExists` (409), and the account is left
+  as it was. It used to be written afresh: role back to `standard`, ACLs
+  back to `global_acl_default`, queue limits, counters, activity and stats
+  cleared. Use `messaging/account/update` to change an existing account.
+- `messaging/account/add` now requires an `Admin` or `RootAdmin` account in
+  both `mediator_acl_mode`s. In `explicit_deny` any authenticated account
+  could call it; its own account always exists by then (authentication
+  creates it), so the only accounts it could add were other DIDs'.
+- `MediatorStore` gains `account_create`, which creates an account only if
+  none exists and returns `None` otherwise, with the check and the write in
+  one atomic step (a Lua script on Redis; under the store lock on memory and
+  Fjall). `account_add` is now a provided method built on it: it creates
+  the account or returns the existing one unchanged, so two first-contact
+  requests racing can no longer reset an account's counters. Login
+  registration (`/authenticate`, `/tsp/authenticate`) creates the account
+  through it in one step, so an account an admin adds or changes while a
+  login is in flight is used as it is. A third-party
+  `MediatorStore` implements `account_create` in place of `account_add`.
+- Storing a message for a party with no account keeps queue counters for
+  it, and every backend now agrees that those counters alone are not an
+  account: it is not found by `account_exists` / `account_get`, not listed,
+  not given ACLs (and so not admitted in `explicit_allow`), and
+  `account_create` completes the record, keeping its counters. Memory and
+  Fjall used to treat such a record as a deny-all account; Redis's
+  `account_exists` counted it too. Fjall marks records with a new
+  `is_account` field; records written before it read as accounts.
+- Admin set-up at start completes such a record before setting the role,
+  so the mediator and root-admin accounts never end up without ACLs.
+- `account/add` checks the caller's role in the store, not the role cached
+  in its session.
+
+**Behaviour change (R3.6):** a non-admin client calling
+`messaging/account/add`, or any caller re-adding an existing account to
+reset it, now gets an error.
+
 ### Fixed — live delivery across mediator instances (Redis)
 
 Two instances of one mediator share Redis, and each DID's live-streaming
@@ -91,6 +166,34 @@ members whose own socket is online elsewhere as inactive, and later
   `redis://***@host/`, as `config/show` already did, and so does the
   "Database URL is invalid" error. The helper is shared as
   `affinidi_messaging_mediator_common::redact::redact_url`.
+
+### Changed — access and refresh tokens are each accepted only where they belong (R3.6)
+
+Auth-semantics change: clients that send the access token as the bearer and
+the refresh token to `/authenticate/refresh` (as the SDK does) are
+unaffected.
+
+- Session tokens now carry a `token_use` claim, `"access"` or `"refresh"`.
+  `aud`, the header and the signing key are unchanged.
+- REST routes and `/ws` (both the `Authorization` header and the
+  `bearer.<jwt>` subprotocol) accept only access tokens; a refresh token is
+  refused with `401`.
+- `/authenticate/refresh` exchanges only refresh tokens. An access token is
+  refused with `400` (error code 38) before the stored refresh-token hash is
+  consulted, so it no longer ends the session.
+- Transition for tokens issued by the previous release, which have no
+  `token_use`:
+  - as a bearer, an unmarked token is accepted only if it has no `jti` and
+    expires within one access-token lifetime (`jwt_access_expiry`) plus the
+    60 s expiry leeway. Anything longer-lived is a refresh token and is
+    refused;
+  - at `/authenticate/refresh`, an unmarked token is still accepted; the
+    one-time stored-hash check applies as before.
+  - All such tokens have expired one `jwt_refresh_expiry` after the upgrade;
+    a later release will refuse unmarked tokens outright.
+  - An operator who lowered `jwt_access_expiry` in the same upgrade will see
+    previously issued access tokens refused early; clients refresh or
+    re-authenticate as on expiry.
 
 ### Changed — token refresh is bound to the session's DID and is single-use
 
@@ -154,6 +257,111 @@ first successful authentication. Challenge requests with non-DID-shaped or
 oversized `did` values, and refresh requests sent from a DID other than the
 session's, are now refused. Sessions of a removed account stop working at
 once on Fjall and Memory, as they already did on Redis.
+
+### Fixed — WebSocket connections release their resources on every exit
+
+- A socket's global and per-DID connection counts,
+  `active_websocket_connections` gauge, streaming registration and
+  `WEBSOCKET_CLOSE` stat are now held by one guard and released together on
+  every return path, before the final close frame is written. Previously a
+  few early exits skipped part of the cleanup, so the count and gauge could
+  drift from the sockets actually open.
+- A socket's streaming deregistration now names the connection it belongs
+  to, not only its session. Two sockets opened with the same access token
+  share a session id, so a replaced socket winding down could remove the
+  live entry of the socket that replaced it, which then closed with
+  "streaming task unavailable".
+- An expired token is now refused before anything is reserved or
+  registered. A token accepted inside the JWT leeway after its `exp` still
+  closes at once with 1008 "authentication token expired", as before.
+- `WEBSOCKET_OPEN` is now counted when the connection is admitted (past
+  the global and per-DID limits), before it registers for live delivery,
+  rather than after registration. It and `WEBSOCKET_CLOSE` always come in
+  pairs.
+
+### Fixed — a slow client no longer holds up live delivery for others
+
+- Replacing a socket whose send queue was full waited for that socket to
+  drain before the streaming task could serve anyone else. The `Close` is
+  now queued without waiting; when the queue is full it follows the queued
+  frames from a task of its own.
+- Every WebSocket write is bounded at 30 s. A peer that stops reading is
+  closed with 1001 "connection unresponsive" instead of holding its
+  connection, and nothing queued for it is reported delivered. Timeouts
+  count in the new `ws_write_timeouts_total`.
+
+**Behaviour change (R3.6):** a client that stops reading its socket long
+enough for a mediator write to wait 30 s is disconnected.
+
+### Changed — forwarding delivers to endpoints concurrently, with per-endpoint backoff
+
+- The forwarding processor delivers to up to `max_concurrent_endpoints`
+  next-hop endpoints at once (default 32). Messages for one endpoint still go
+  out one at a time, usually in queue order; a retried message can now go
+  after later ones. Before, endpoints were served one after another, so a
+  slow peer delayed every other peer's forwards.
+- Each delivery attempt is bounded by `delivery_timeout_seconds` (default
+  90, env `PROCESSOR_FORWARDING_DELIVERY_TIMEOUT_SECONDS`), covering a
+  WebSocket attempt and its REST fallback together.
+- Backoff now applies to the failing endpoint only. The processor used to
+  pause all forwarding for up to `max_backoff_ms` after a failed batch. Now
+  the failed message is queued again with a not-before at the end of that
+  endpoint's backoff, and the endpoint's other messages are held until the
+  same time instead of being sent into the failure. Those were not sent, so
+  they keep their retry budget. Every processor sharing the queue honours
+  the not-before, so retries are spaced out on multi-processor deployments
+  too.
+- A processor holds at most `batch_size` × `max_concurrent_endpoints`
+  claimed entries, one endpoint at most half of them, and an endpoint that
+  is backing off at most `batch_size`, so backlogs for peers that are slow
+  or down do not stop other peers' forwards being read. The rest stay
+  claimed in the queue and are picked up again by the reclaim sweep.
+- Claimed entries are no longer stranded when a processor stops or
+  restarts. A processor refreshes the claims on what it holds, and any
+  processor takes over an entry whose claim has been idle for
+  `reclaim_idle_seconds` (new, default 180, env
+  `PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS`). Previously such entries were
+  reclaimed but never delivered. The sweep follows its cursor over the whole
+  pending list, so idle entries behind a long run of busy ones are reached.
+  The same sweep delivers a forward with a requested delay (`delay_milli`)
+  once it is due; a delay of up to `max_backoff_ms` is held in memory and
+  sent on time.
+- A processor only finishes an entry it still holds. Acking a delivered,
+  refused, expired or abandoned entry, and replacing a failed one with its
+  retry, are each one owner-checked write; an entry another processor has
+  taken over is left to it. A processor that cannot confirm its claims for
+  half of `reclaim_idle_seconds` (its store calls are failing) stops
+  sending — including a REST fallback after a WebSocket attempt — reading
+  and reclaiming until it can. A send already under way at that point
+  completes, so its message can arrive twice; none is lost. Keep
+  `reclaim_idle_seconds` at least twice `delivery_timeout_seconds` so such a
+  send ends before another processor can take the entry over; the processor
+  warns at start when it is not. A processor holding all it may skips the
+  reclaim sweep. Reclaimed entries that cannot be parsed are dropped with a
+  warning instead of being reclaimed again and again.
+- Each delivered entry is acked as soon as the peer accepts it, rather than
+  with the rest of its batch.
+- A next hop whose URL does not parse, or that the egress policy does not
+  admit, is final: the forward is dropped on the first attempt and the
+  sender gets a problem report with the new code
+  `e.p.me.res.forwarding.endpoint-not-permitted`. It used to be retried
+  `max_retries` times and reported as abandoned.
+- `ForwardQueueEntry` has a new `not_before_ms` field (unix ms, `0` = none),
+  stored as `NOT_BEFORE_MS` on Redis. Entries written before it read as `0`;
+  a processor from an earlier release ignores it and retries at once.
+  `ForwardOutcome` has a new `NotPermitted` variant. `MediatorStore` has
+  new required methods `forward_queue_refresh_claims` and
+  `forward_queue_finish`, and `forward_queue_autoclaim` now takes a cursor
+  and returns a `ForwardQueueClaimPage` with the cursor to continue from.
+
+**Behaviour change (R3.6):** retries of a failed forward are spaced by the
+endpoint's backoff across all processors; forwards to a non-permitted next hop
+produce `e.p.me.res.forwarding.endpoint-not-permitted` instead of
+`e.p.me.res.forwarding.abandoned`; messages may be relayed in a different
+order than they were queued, across endpoints and, after a retry, within one;
+and an entry a stopped processor held is delivered by another after
+`reclaim_idle_seconds`, which can repeat a delivery the stopped processor made
+but had not yet acked.
 
 ### Changed — mux frame decisions are counted; delivery reports hold no body
 

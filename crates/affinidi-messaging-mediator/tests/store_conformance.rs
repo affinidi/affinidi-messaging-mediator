@@ -167,6 +167,228 @@ async fn check_account_lifecycle(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// `account_add` on an existing account does not change its role, ACLs,
+/// limits, counters, activity or stats; `account_create` reports it as
+/// existing and writes nothing; and of two concurrent creates exactly one
+/// wins.
+async fn check_account_add_keeps_existing_account(store: Arc<dyn MediatorStore>) {
+    let did = "did_hash_existing_account";
+    let sender = "did_hash_existing_account_sender";
+    let original = acls_with_mode(AccessListModeType::ExplicitAllow);
+
+    store
+        .account_create(did, &original, None)
+        .await
+        .expect("account_create")
+        .expect("a new account is created");
+    store
+        .account_add(sender, &allow_all(), None)
+        .await
+        .expect("account_add sender");
+    store
+        .account_set_role(did, &AccountType::Admin)
+        .await
+        .expect("account_set_role");
+    store
+        .account_change_queue_limits(did, Some(7), Some(9))
+        .await
+        .expect("account_change_queue_limits");
+    store
+        .store_message(
+            "session-id",
+            "{\"protected\":\"keep\"}",
+            did,
+            Some(sender),
+            NEVER,
+            1000,
+        )
+        .await
+        .expect("store_message");
+    store
+        .account_activity_record(did, ActivityKind::Received, 111)
+        .await
+        .expect("account_activity_record");
+    store
+        .account_stats_bump(
+            did,
+            AccountStatsDelta::new(StatsDirection::Received, StatsWire::DidComm, 10),
+        )
+        .await
+        .expect("account_stats_bump");
+
+    let before = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account present");
+    let ids = [did.to_string()];
+    let activity_before = store.account_activity(&ids).await.expect("activity");
+    let stats_before = store.account_stats(&ids).await.expect("stats");
+
+    let other = MediatorACLSet::from_string_ruleset("DENY_ALL").expect("DENY_ALL");
+    assert!(
+        store
+            .account_create(did, &other, Some(1))
+            .await
+            .expect("account_create on an existing account")
+            .is_none(),
+        "account_create reports an existing account and creates nothing"
+    );
+    let returned = store
+        .account_add(did, &other, Some(1))
+        .await
+        .expect("account_add on an existing account");
+    assert_eq!(
+        returned.acls, before.acls,
+        "account_add returns the existing account"
+    );
+
+    let after = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account still present");
+    assert_eq!(after._type, AccountType::Admin, "role unchanged");
+    assert_eq!(after.acls, original.to_u64(), "ACLs unchanged");
+    assert_eq!(
+        after.queue_send_limit, before.queue_send_limit,
+        "send limit unchanged"
+    );
+    assert_eq!(
+        after.queue_receive_limit, before.queue_receive_limit,
+        "receive limit unchanged"
+    );
+    assert_eq!(after.receive_queue_count, 1, "queued message still counted");
+    assert_eq!(after.receive_queue_count, before.receive_queue_count);
+    assert_eq!(after.receive_queue_bytes, before.receive_queue_bytes);
+    assert_eq!(after.send_queue_count, before.send_queue_count);
+    assert_eq!(after.send_queue_bytes, before.send_queue_bytes);
+    assert_eq!(
+        store.account_activity(&ids).await.expect("activity")[0].last_received,
+        activity_before[0].last_received,
+        "activity unchanged"
+    );
+    assert_eq!(
+        store.account_stats(&ids).await.expect("stats")[0].messages_received,
+        stats_before[0].messages_received,
+        "stats unchanged"
+    );
+
+    // Two first-contact creates racing: one creates, the other sees it.
+    let racing = "did_hash_racing_account";
+    let acls = allow_all();
+    let (a, b) = tokio::join!(
+        store.account_create(racing, &acls, None),
+        store.account_create(racing, &acls, None),
+    );
+    let created = [a.expect("create a"), b.expect("create b")]
+        .iter()
+        .filter(|r| r.is_some())
+        .count();
+    assert_eq!(created, 1, "exactly one concurrent create wins");
+}
+
+/// Storing a message for a sender with no account keeps its queue counters
+/// but does not make it an account, in every backend: it is not found, listed
+/// or given ACLs, `account_create` completes the record (keeping the
+/// counters), and admin set-up on such a record leaves an account with ACLs.
+async fn check_counters_only_record_is_not_an_account(store: Arc<dyn MediatorStore>) {
+    let to = "did_hash_counters_only_recipient";
+    let sender = "did_hash_counters_only_sender";
+    let admin = "did_hash_counters_only_admin";
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add recipient");
+    for from in [sender, admin] {
+        store
+            .store_message(
+                "session-id",
+                &format!("{{\"protected\":\"{from}\"}}"),
+                to,
+                Some(from),
+                NEVER,
+                1000,
+            )
+            .await
+            .expect("store_message");
+    }
+
+    assert!(
+        !store.account_exists(sender).await.expect("account_exists"),
+        "a counters-only record is not an account"
+    );
+    assert!(
+        store
+            .account_get(sender)
+            .await
+            .expect("account_get")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_did_acl(sender)
+            .await
+            .expect("get_did_acl")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_did_acls(&[sender.to_string()], AccessListModeType::ExplicitDeny)
+            .await
+            .expect("get_did_acls")
+            .acl_response
+            .is_empty(),
+        "a counters-only record has no ACL"
+    );
+    let listed = store.account_list(0, 100).await.expect("account_list");
+    assert!(
+        !listed.accounts.iter().any(|a| a.did_hash == sender),
+        "a counters-only record is not listed"
+    );
+    assert_eq!(
+        store
+            .peer_queue_count(sender, to)
+            .await
+            .expect("peer_queue_count"),
+        1,
+        "the sender is still counted per relationship"
+    );
+
+    assert!(
+        store
+            .account_create(sender, &allow_all(), None)
+            .await
+            .expect("account_create")
+            .is_some(),
+        "account_create completes a counters-only record"
+    );
+    let created = store
+        .account_get(sender)
+        .await
+        .expect("account_get")
+        .expect("an account now");
+    assert_eq!(created.acls, allow_all().to_u64(), "given ACLs applied");
+    assert_eq!(created._type, AccountType::Standard);
+    assert_eq!(created.send_queue_count, 1, "queued message still counted");
+
+    store
+        .setup_admin_account(admin, AccountType::Admin, &allow_all())
+        .await
+        .expect("setup_admin_account");
+    let admin_account = store
+        .account_get(admin)
+        .await
+        .expect("account_get")
+        .expect("admin account present");
+    assert_eq!(admin_account._type, AccountType::Admin);
+    assert_eq!(
+        admin_account.acls,
+        allow_all().to_u64(),
+        "an admin set up over a counters-only record has its ACLs"
+    );
+}
+
 /// Setting a DID's ACL is read back verbatim.
 async fn check_acl_set_get_roundtrip(store: Arc<dyn MediatorStore>) {
     let did = "did_hash_acl_roundtrip";
@@ -261,6 +483,7 @@ async fn check_forward_queue_claim_ack(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     let stream_id = store
         .forward_queue_enqueue(&entry, 1000)
@@ -397,6 +620,7 @@ async fn check_forward_queue_delete(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     let stream_id = store
         .forward_queue_enqueue(&entry, 1000)
@@ -431,6 +655,7 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
         expires_at: NEVER,
         retry_count: 0,
         hop_count: 1,
+        not_before_ms: 0,
     };
     store
         .forward_queue_enqueue(&entry, 1000)
@@ -446,9 +671,10 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
 
     // Consumer 2 reclaims anything idle beyond zero — i.e. the pending entry.
     let reclaimed = store
-        .forward_queue_autoclaim("g", "consumer-2", Duration::ZERO, 10)
+        .forward_queue_autoclaim("g", "consumer-2", Duration::ZERO, 10, "0-0")
         .await
-        .expect("forward_queue_autoclaim");
+        .expect("forward_queue_autoclaim")
+        .entries;
     assert_eq!(
         reclaimed.len(),
         1,
@@ -457,6 +683,300 @@ async fn check_forward_queue_autoclaim(store: Arc<dyn MediatorStore>) {
 
     let ids: Vec<&str> = reclaimed.iter().map(|e| e.stream_id.as_str()).collect();
     store.forward_queue_ack("g", &ids).await.expect("ack");
+}
+
+/// Forward-queue claim refresh: the holder can keep an entry from going idle,
+/// so another consumer's autoclaim does not take it; a refresh by anyone else
+/// moves nothing and reports the entry as not theirs; an entry that is done
+/// is reported too.
+async fn check_forward_queue_refresh_claims(store: Arc<dyn MediatorStore>) {
+    let group = "refresh-g";
+    let mut ours = Vec::new();
+    for message in ["refresh-kept", "refresh-done"] {
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: message.to_string(),
+            to_did_hash: "next_hash".to_string(),
+            from_did_hash: "from_hash".to_string(),
+            from_did: "did:peer:from".to_string(),
+            to_did: "did:peer:next".to_string(),
+            endpoint_url: "https://peer.example.com/inbound".to_string(),
+            received_at_ms: 1,
+            delay_milli: 0,
+            expires_at: NEVER,
+            retry_count: 0,
+            hop_count: 1,
+            not_before_ms: 0,
+        };
+        ours.push(
+            store
+                .forward_queue_enqueue(&entry, 0)
+                .await
+                .expect("forward_queue_enqueue"),
+        );
+    }
+    // The group reads from the start of the queue, which on a shared Redis DB
+    // may hold other checks' entries; only ours are used below.
+    let claimed = store
+        .forward_queue_read(group, "holder", 1000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    for id in &ours {
+        assert!(
+            claimed.iter().any(|e| &e.stream_id == id),
+            "the holder claims {id}"
+        );
+    }
+    let kept = ours[0].as_str();
+    let done = ours[1].as_str();
+    store
+        .forward_queue_ack_and_delete(group, &[done])
+        .await
+        .expect("ack and delete");
+
+    // Another consumer's refresh moves nothing and owns nothing.
+    let lost = store
+        .forward_queue_refresh_claims(group, "bystander", &[kept])
+        .await
+        .expect("refresh by a bystander");
+    assert_eq!(lost, vec![kept.to_string()], "not the bystander's");
+
+    // The holder still holds the one it kept, and not the one it finished.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[kept, done])
+        .await
+        .expect("refresh by the holder");
+    assert_eq!(
+        lost,
+        vec![done.to_string()],
+        "the finished entry is not held"
+    );
+
+    // Just refreshed, so it is not idle long enough for another to take.
+    let taken = store
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000, "0-0")
+        .await
+        .expect("autoclaim")
+        .entries;
+    assert!(
+        taken.iter().all(|e| e.stream_id != kept),
+        "a refreshed claim is not reclaimed"
+    );
+
+    // Left alone, it goes idle and is reclaimable; then the holder has lost it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let taken = store
+        .forward_queue_autoclaim(group, "bystander", Duration::from_millis(200), 1000, "0-0")
+        .await
+        .expect("autoclaim")
+        .entries;
+    assert!(
+        taken.iter().any(|e| e.stream_id == kept),
+        "reclaimed once idle"
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[kept])
+        .await
+        .expect("refresh after losing it");
+    assert_eq!(lost, vec![kept.to_string()], "taken over by the bystander");
+
+    store
+        .forward_queue_ack_and_delete(group, &[kept])
+        .await
+        .expect("ack and delete");
+}
+
+fn forward_entry_for_check(message: &str) -> ForwardQueueEntry {
+    ForwardQueueEntry {
+        stream_id: String::new(),
+        message: message.to_string(),
+        to_did_hash: "next_hash".to_string(),
+        from_did_hash: "from_hash".to_string(),
+        from_did: "did:peer:from".to_string(),
+        to_did: "did:peer:next".to_string(),
+        endpoint_url: "https://peer.example.com/inbound".to_string(),
+        received_at_ms: 1,
+        delay_milli: 0,
+        expires_at: NEVER,
+        retry_count: 0,
+        hop_count: 1,
+        not_before_ms: 0,
+    }
+}
+
+/// Forward-queue autoclaim pages: idle entries behind a long run of held,
+/// refreshed ones are still reached by following the cursor. One call
+/// examines only a bounded stretch of the pending list (on Redis, ten times
+/// the count), so a sweep that stopped at the first empty page would never
+/// get past the held head.
+async fn check_forward_queue_autoclaim_pages_past_held_entries(store: Arc<dyn MediatorStore>) {
+    let group = "paging-g";
+    let mut ours = Vec::new();
+    for i in 0..300 {
+        ours.push(
+            store
+                .forward_queue_enqueue(&forward_entry_for_check(&format!("paging-{i}")), 0)
+                .await
+                .expect("forward_queue_enqueue"),
+        );
+    }
+    let claimed = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    assert!(
+        ours.iter()
+            .all(|id| claimed.iter().any(|e| &e.stream_id == id))
+    );
+
+    // The head stays busy; the last few go idle.
+    let (head, tail) = ours.split_at(ours.len() - 5);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let head_ids: Vec<&str> = head.iter().map(String::as_str).collect();
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &head_ids)
+        .await
+        .expect("refresh the head");
+    assert!(lost.is_empty());
+
+    let mut cursor = "0-0".to_string();
+    let mut reclaimed = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = store
+            .forward_queue_autoclaim(group, "sweeper", Duration::from_millis(200), 5, &cursor)
+            .await
+            .expect("forward_queue_autoclaim");
+        pages += 1;
+        if pages == 1 {
+            assert!(
+                page.entries.iter().all(|e| !tail.contains(&e.stream_id)),
+                "the first page cannot reach past the held head"
+            );
+        }
+        reclaimed.extend(page.entries.into_iter().map(|e| e.stream_id));
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 1_000, "the scan must end");
+    }
+    let mut reclaimed_ours: Vec<&String> =
+        reclaimed.iter().filter(|id| ours.contains(id)).collect();
+    reclaimed_ours.sort();
+    let mut expected: Vec<&String> = tail.iter().collect();
+    expected.sort();
+    assert_eq!(
+        reclaimed_ours, expected,
+        "exactly the idle tail is reclaimed"
+    );
+
+    let ids: Vec<&str> = ours.iter().map(String::as_str).collect();
+    store
+        .forward_queue_ack_and_delete(group, &ids)
+        .await
+        .expect("ack and delete");
+}
+
+/// Forward-queue finish: only the consumer holding an entry can finish it,
+/// and a finish with a replacement writes the replacement only then.
+async fn check_forward_queue_finish_is_owner_conditional(store: Arc<dyn MediatorStore>) {
+    let group = "finish-g";
+    let first = store
+        .forward_queue_enqueue(&forward_entry_for_check("finish-first"), 0)
+        .await
+        .expect("forward_queue_enqueue");
+    let second = store
+        .forward_queue_enqueue(&forward_entry_for_check("finish-second"), 0)
+        .await
+        .expect("forward_queue_enqueue");
+    let claimed = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    let first_entry = claimed
+        .iter()
+        .find(|e| e.stream_id == first)
+        .expect("holder claims the first")
+        .clone();
+
+    // A bystander cannot finish what the holder holds.
+    assert!(
+        !store
+            .forward_queue_finish(group, "bystander", &first, None)
+            .await
+            .expect("finish by a bystander")
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[&first])
+        .await
+        .expect("refresh");
+    assert!(lost.is_empty(), "the holder still holds it");
+
+    // The holder replaces it with a retry, in one step.
+    let mut retry = first_entry.clone();
+    retry.retry_count = 1;
+    assert!(
+        store
+            .forward_queue_finish(group, "holder", &first, Some(&retry))
+            .await
+            .expect("finish with a retry")
+    );
+    let lost = store
+        .forward_queue_refresh_claims(group, "holder", &[&first])
+        .await
+        .expect("refresh");
+    assert_eq!(lost, vec![first.clone()], "the original is gone");
+    let next = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    let replacement = next
+        .iter()
+        .find(|e| e.message == "finish-first")
+        .expect("the retry is queued");
+    assert_eq!(replacement.retry_count, 1);
+
+    // Once another consumer has taken an entry over, the old holder's finish
+    // changes nothing, retry or not; the new holder's does.
+    let mut cursor = "0-0".to_string();
+    loop {
+        let page = store
+            .forward_queue_autoclaim(group, "bystander", Duration::ZERO, 1_000, &cursor)
+            .await
+            .expect("forward_queue_autoclaim");
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assert!(
+        !store
+            .forward_queue_finish(group, "holder", &second, Some(&retry))
+            .await
+            .expect("finish after a takeover")
+    );
+    assert!(
+        store
+            .forward_queue_finish(group, "bystander", &second, None)
+            .await
+            .expect("finish by the new holder")
+    );
+    assert!(
+        store
+            .forward_queue_finish(group, "bystander", &replacement.stream_id, None)
+            .await
+            .expect("finish the retry")
+    );
+    let after = store
+        .forward_queue_read(group, "holder", 10_000, Duration::from_millis(50))
+        .await
+        .expect("forward_queue_read");
+    assert!(
+        after.iter().all(|e| !e.message.starts_with("finish-")),
+        "the refused finish queued no second retry"
+    );
 }
 
 /// Session-expiry: a session whose TTL has lapsed is reclaimed by
@@ -2674,6 +3194,8 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     // Store-only checks first, so a failure in the message path (Lua) can't
     // hide them.
     check_admin_roles(store.clone()).await;
+    check_account_add_keeps_existing_account(store.clone()).await;
+    check_counters_only_record_is_not_an_account(store.clone()).await;
     check_login_session(store.clone()).await;
     check_challenge_session_without_account(store.clone()).await;
     check_refresh_rotation(store.clone()).await;
@@ -2691,6 +3213,9 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_outbox_receipts(store.clone()).await;
     check_purge_and_removal_receipts(store.clone()).await;
     check_mux_primitives(store.clone()).await;
+    check_forward_queue_refresh_claims(store.clone()).await;
+    check_forward_queue_autoclaim_pages_past_held_entries(store.clone()).await;
+    check_forward_queue_finish_is_owner_conditional(store.clone()).await;
     check_mux_grant_flows(store).await;
 }
 
@@ -2711,6 +3236,14 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn acl_set_get_roundtrip() {
                 check_acl_set_get_roundtrip(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn account_add_keeps_existing_account() {
+                check_account_add_keeps_existing_account(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn counters_only_record_is_not_an_account() {
+                check_counters_only_record_is_not_an_account(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn message_store_and_counters() {
@@ -2735,6 +3268,18 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn forward_queue_autoclaim() {
                 check_forward_queue_autoclaim(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_refresh_claims() {
+                check_forward_queue_refresh_claims(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_autoclaim_pages_past_held_entries() {
+                check_forward_queue_autoclaim_pages_past_held_entries(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_finish_is_owner_conditional() {
+                check_forward_queue_finish_is_owner_conditional(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn session_expiry_sweep() {
@@ -2890,6 +3435,88 @@ conformance_for_redis!(redis,
     trust_task_claim         => check_trust_task_claim         @ 15,
 );
 
+/// A FORWARD_Q entry that does not parse is dropped by the consumer that
+/// claims it — by a read, or by the reclaim sweep — instead of staying
+/// pending to be reclaimed, and skipped, on every sweep. Uses a group of its
+/// own and touches only the entries it adds; part of the DB 0 sequence.
+#[cfg(feature = "redis-backend")]
+async fn check_redis_malformed_forward_entries_are_dropped(
+    store: &affinidi_messaging_mediator::store::RedisStore,
+) {
+    let group = format!("malformed-{}", uuid::Uuid::new_v4());
+    let mut conn = store.get_connection().await.expect("redis connection");
+    use affinidi_messaging_mediator_common::database::RedisConnection;
+    async fn xadd(conn: &mut RedisConnection) -> String {
+        ::redis::cmd("XADD")
+            .arg("FORWARD_Q")
+            .arg("*")
+            .arg("NOT_A_FORWARD")
+            .arg("1")
+            .query_async::<String>(conn)
+            .await
+            .expect("XADD")
+    }
+    async fn exists(conn: &mut RedisConnection, id: String) -> bool {
+        let rows: Vec<::redis::Value> = ::redis::cmd("XRANGE")
+            .arg("FORWARD_Q")
+            .arg(&id)
+            .arg(&id)
+            .query_async(conn)
+            .await
+            .expect("XRANGE");
+        !rows.is_empty()
+    }
+
+    // The group starts at the end of the stream, so it sees only ours.
+    ::redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg("FORWARD_Q")
+        .arg(&group)
+        .arg("$")
+        .arg("MKSTREAM")
+        .query_async::<()>(&mut conn)
+        .await
+        .expect("XGROUP CREATE");
+
+    // Read: dropped at once.
+    let read_bad = xadd(&mut conn).await;
+    let read =
+        MediatorStore::forward_queue_read(store, &group, "reader", 10, Duration::from_millis(50))
+            .await
+            .expect("forward_queue_read");
+    assert!(read.is_empty());
+    assert!(!exists(&mut conn, read_bad).await, "dropped by the read");
+
+    // Already pending (claimed before it could be parsed): dropped by the
+    // sweep that reclaims it.
+    let swept_bad = xadd(&mut conn).await;
+    ::redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(&group)
+        .arg("raw")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg("FORWARD_Q")
+        .arg(">")
+        .query_async::<::redis::Value>(&mut conn)
+        .await
+        .expect("XREADGROUP");
+    let page =
+        MediatorStore::forward_queue_autoclaim(store, &group, "sweeper", Duration::ZERO, 10, "0-0")
+            .await
+            .expect("forward_queue_autoclaim");
+    assert!(page.entries.is_empty());
+    assert!(!exists(&mut conn, swept_bad).await, "dropped by the sweep");
+
+    let _ = ::redis::cmd("XGROUP")
+        .arg("DESTROY")
+        .arg("FORWARD_Q")
+        .arg(&group)
+        .query_async::<i64>(&mut conn)
+        .await;
+}
+
 /// DB 0: every numbered index a default Redis offers (0..=15) is in use, so
 /// the checks added since share it, one after another in a single test. The
 /// start-up check needs the concrete `RedisStore`, so this test is written out
@@ -2903,5 +3530,6 @@ async fn redis_db0_checks() {
     store.initialize().await.expect("store initialize");
     check_redis_startup(&store).await;
     flush_db(&store).await;
+    check_redis_malformed_forward_entries_are_dropped(&store).await;
     check_db0_in_sequence(Arc::new(store)).await;
 }

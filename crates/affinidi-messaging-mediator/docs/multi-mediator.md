@@ -83,7 +83,16 @@ endpoint URI it publishes:
 | `http(s)://` / `ws(s)://` whose `(host, port)` is one of ours | `Local` | store locally |
 | `http(s)://` / `ws(s)://` anywhere else | `Remote(url)` | enqueue on `FORWARD_Q` |
 | Another `did:...` | `Indirect(did)` | resolve **one** hop, classify that document's endpoints the same way |
-| Anything else | — | treated as local, with a warning |
+| Anything else | — | refused, `73 delivery.refused` |
+
+A next hop that publishes no `DIDCommMessaging` service at all is local. A
+local next hop is stored only if it holds an account on this mediator;
+otherwise the forward is refused with `73 delivery.refused`. A forward never
+creates an account. A next hop whose own DID cannot be resolved is treated
+as local: delivered if it holds an account here (so a resolver outage does
+not stop local delivery), refused with `73` otherwise. If the next hop names
+a mediator whose DID cannot be resolved, the forward is refused with
+`74 did.resolve` (503, retryable).
 
 Rules that matter in production:
 
@@ -100,20 +109,16 @@ Rules that matter in production:
   hostname never literally matches, so a hostname-fronted deployment (load
   balancer, public DNS, ingress) **must** declare `server.local_endpoints`, or
   a message addressed to one of its own users is relayed to itself.
-- **The "storing locally" warnings are delivery failures.** Three log lines
-  say a message was accepted and will never arrive:
-
-  ```text
-  Next hop (…) publishes a DIDCommMessaging service this mediator can't turn into an endpoint (…). Storing locally — it will not be delivered.
-  Next hop (…) is mediated by (…), which couldn't be resolved: …. Storing locally — it will not be delivered.
-  Next hop (…) is mediated by (…), whose document publishes no DIDComm endpoint URL. Storing locally — it will not be delivered.
-  ```
-
-  Alert on them. The sender got a `200`.
+- **A next hop this mediator cannot route is refused, not stored.** Earlier
+  versions stored such a forward locally, answered `200`, and logged
+  "Storing locally — it will not be delivered". The sender now gets the
+  refusal, and the mediator logs the reason (`delivery refused` or
+  `forward refused: the next hop's mediator could not be resolved`).
 
 Setting `processors.forwarding.external_forwarding = "false"` skips this
-classification entirely and makes every forward local — useful for isolating
-the forward handler in tests, never for a federated deployment.
+classification entirely and makes every forward local (still only to a next
+hop with an account here) — useful for isolating the forward handler in
+tests, never for a federated deployment.
 
 ---
 
@@ -262,11 +267,13 @@ connection errors are still retried until `max_retries`, then abandoned with
 | Bob, if the inner envelope is anon-packed | `ANON_RECEIVE` | `deliver_forward` | 73 `delivery.refused` |
 
 On a double forward Alice is an account-less forward sender on B, so B
-auto-registers her via
-`relay_sender_acls` — which seeds `SEND_FORWARDED` **only if B's
+checks her against `relay_sender_acls` — `SEND_FORWARDED` **only if B's
 `global_acl_default` grants it**, and nothing else (no `LOCAL`, no
-`RECEIVE_*`, no invites, no self-management). A DID that has only ever relayed
-a forward through B does not gain an inbox there.
+`RECEIVE_*`, no invites, no self-management). B creates no account for her.
+Her queued messages are still counted against her per recipient, so
+`limits.queue.peer` holds her as it holds any sender; those counters alone
+are not an account in any storage backend. A DID that has only ever relayed
+a forward through B gains nothing there.
 
 Consequence worth stating plainly: **the shipped default
 `global_acl_default = "DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES"` is not
@@ -304,8 +311,39 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
 - **REST shape.** `POST {endpoint}/inbound`, `Content-Type:
   application/didcomm-encrypted+json` for DIDComm, `application/tsp` (raw qb2)
   for TSP. TSP always goes over REST regardless of rate.
+- **Concurrency.** Up to `max_concurrent_endpoints` (32) next-hop endpoints
+  are delivered to at once. Messages for one endpoint go out one at a time,
+  usually in queue order; a retried message can go after later ones. Each
+  attempt is bounded by `delivery_timeout_seconds` (90). A processor holds at
+  most `batch_size` × `max_concurrent_endpoints` claimed entries, one
+  endpoint at most half of them, and an endpoint backing off at most
+  `batch_size`, so backlogs for slow or failing peers do not stop the others'
+  forwards being read.
 - **Retry.** `max_retries` (5) with exponential backoff from
-  `initial_backoff_ms` to `max_backoff_ms`, in batches of `batch_size`.
+  `initial_backoff_ms` to `max_backoff_ms`, per endpoint. A failed message is
+  queued again with a not-before at the end of the endpoint's backoff, which
+  every processor sharing the queue honours. The rest of that endpoint's
+  messages are held until the same time rather than sent into the failure;
+  they were not sent, so they keep their retry budget.
+- **Claims and recovery.** A processor refreshes the claims on everything it
+  holds four times per `reclaim_idle_seconds` (180; keep it at least twice
+  `delivery_timeout_seconds`, which the processor warns about at start). An entry whose claim goes
+  idle that long — its processor stopped, or it was left for later (a long
+  requested delay, an endpoint's share exceeded) — is taken over by the next
+  reclaim sweep of any processor in the group; the sweep follows its cursor
+  over the whole pending list. A refresh never moves a claim another
+  processor has taken, and every ack — and every retry, which replaces its
+  entry in the same write — is made only if the entry is still held, so each
+  entry is settled by whichever processor holds it. Delivered entries are
+  acked one at a time, as soon as the peer accepts them. A processor that
+  cannot confirm its claims for half of `reclaim_idle_seconds` stops sending,
+  reading and reclaiming until it can; a send already under way then
+  completes, so that one message can arrive twice (at-least-once).
+- **Refusal.** A peer's 4xx (other than 408/425/429) is final
+  (`e.p.me.res.forwarding.refused`), as is a next hop whose URL does not parse
+  or that the egress policy does not admit
+  (`e.p.me.res.forwarding.endpoint-not-permitted`): no retry, and the sender
+  gets a problem report.
 - **Abandonment.** On exhaustion the entry is ACKed and dropped, logged as
   `FORWARD_ABANDONED`, and — when `report_errors` is set — a problem report is
   packed by the mediator and stored in the *sender's* inbox
@@ -416,10 +454,11 @@ mediator **DIDs**, not URLs).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Sender gets `200`, recipient never receives, no relay in A's logs | A classified the next hop as local | check A's logs for a "Storing locally — it will not be delivered" warning (§2); publish the mediator's DID in the user's service entry |
+| Error 73 `delivery.refused` at A for a recipient homed elsewhere | A classified the next hop as local (it has no account on A), or its DID document publishes no usable DIDComm endpoint (§2) | A's log names the reason; publish the mediator's DID in the user's service entry |
+| Error 74 `did.resolve` (503) at A | the mediator the next hop names couldn't be resolved | retry; check that DID and A's resolver |
 | Message loops back to A | A's public hostname doesn't match its bind address | set `server.local_endpoints` to every public URL in A's DID document |
 | B returns `401` on `/inbound` | B isn't configured as a relay | `security.enable_inter_mediator_relay = "true"` on B |
-| Error 60 `authorization.send_forwarded` at B | B's `global_acl_default` doesn't grant `SEND_FORWARDED`, so the auto-registered sender got nothing | widen B's default (§6) |
+| Error 60 `authorization.send_forwarded` at B | B's `global_acl_default` doesn't grant `SEND_FORWARDED`, so a sender with no account on B gets nothing | widen B's default (§6) |
 | Error 73 `delivery.refused` at A for a remote recipient | the recipient holds an account on A with an access list that doesn't admit the sender (§6) | remove that account or list on A, or check whether A wrongly classes a local user as remote (`server.local_endpoints`) |
 | `FORWARD_REFUSED` in A's logs; sender gets `e.p.me.res.forwarding.refused` | B refused the relay with a 4xx, typically a recipient-side check on Bob | B's log names the reason; the message is not retried |
 | Error 73 `delivery.refused` at B | a recipient-side check on Bob failed (§6) | B's log names the reason |
