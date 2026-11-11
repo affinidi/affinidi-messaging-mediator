@@ -425,6 +425,29 @@ fn try_queue(
     true
 }
 
+/// Tell a client's socket to close, without waiting on its send queue.
+///
+/// This runs in the single loop that serves every DID, so it must not await a
+/// queue a slow client may never drain. A `Close` goes behind the frames
+/// already queued, so when the queue is full it is handed to a task of its
+/// own, which holds the sender until the socket takes the `Close` or goes
+/// away. That task is bounded by the socket: once the handler exits (at the
+/// latest when a write times out) the send fails and the task ends.
+fn send_close(tx: &mpsc::Sender<QueuedCommand>, why: CloseReason) {
+    match tx.try_send(QueuedCommand::control(WebSocketCommands::Close(why))) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(close)) => {
+            debug!(reason = ?why, "Send queue full; queuing close in the background");
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(close).await;
+            });
+        }
+        // The socket has already gone; there is nothing to close.
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 /// Tell the socket that `did_hash` has stored mail it was not pushed, so the
 /// client is prompted to collect it (a pickup `status` on DIDComm, a drain on
 /// raw TSP).
@@ -990,11 +1013,7 @@ impl StreamingTask {
                  the upstream session is missing its authenticated DID. \
                  Closing the channel."
             );
-            let _ = client_tx
-                .send(QueuedCommand::control(WebSocketCommands::Close(
-                    CloseReason::Unauthenticated,
-                )))
-                .await;
+            send_close(client_tx, CloseReason::Unauthenticated);
             return;
         }
 
@@ -1109,11 +1128,7 @@ impl StreamingTask {
                         "Refusing duplicate WebSocket registration (duel damper)",
                     );
                 }
-                let _ = client_tx
-                    .send(QueuedCommand::control(WebSocketCommands::Close(
-                        CloseReason::Refused,
-                    )))
-                    .await;
+                send_close(client_tx, CloseReason::Refused);
                 return;
             }
 
@@ -1153,12 +1168,7 @@ impl StreamingTask {
                 metrics::counter!(WEBSOCKET_DUPLICATE_CHURN_TOTAL).increment(1);
             }
             // Channel already exists, close the old one.
-            let _ = old
-                .tx
-                .send(QueuedCommand::control(WebSocketCommands::Close(
-                    CloseReason::Replaced,
-                )))
-                .await;
+            send_close(&old.tx, CloseReason::Replaced);
             true
         } else {
             false
@@ -2160,6 +2170,66 @@ mod tests {
             clients.get(&did_hash).map(|e| e.session_id.as_str()),
             Some("B")
         );
+    }
+
+    /// Replacing a socket whose send queue is full returns at once: the
+    /// registration path runs in the loop that serves every DID, so it must
+    /// not wait for the old socket to drain. The old socket still gets its
+    /// `Close(Replaced)`, behind the frames already queued, once it reads.
+    #[tokio::test]
+    async fn replacing_a_socket_with_a_full_queue_does_not_wait_for_it() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:full-queue";
+        let did_hash = digest(did);
+        let task = streaming_task();
+        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+
+        let (a_tx, mut a_rx) = mpsc::channel(1);
+        a_tx.try_send(QueuedCommand::for_test(Some(&did_hash)))
+            .expect("fill A's queue");
+        clients.insert(
+            did_hash.clone(),
+            ClientEntry {
+                tx: a_tx,
+                session_id: "A".to_string(),
+                active: true,
+                registered_at: Instant::now() - CHURN_WINDOW,
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+                kind: EntryKind::Direct,
+                slots: None,
+            },
+        );
+
+        let (b_tx, _b_rx) = mpsc::channel(5);
+        timeout(
+            StdDuration::from_secs(1),
+            task._handle_registration(
+                &database,
+                &mut clients,
+                &mut HashMap::new(),
+                &replay_in_progress,
+                &reg(did, "B", b_tx, EntryKind::Direct),
+            ),
+        )
+        .await
+        .expect("registration must not wait on the old socket's full queue");
+
+        assert_eq!(
+            clients.get(&did_hash).map(|e| e.session_id.as_str()),
+            Some("B")
+        );
+
+        // A drains: first the frame it already had, then the close.
+        assert!(matches!(
+            next_cmd(&mut a_rx).await.cmd,
+            WebSocketCommands::Message(_)
+        ));
+        assert!(matches!(
+            next_cmd(&mut a_rx).await.cmd,
+            WebSocketCommands::Close(CloseReason::Replaced)
+        ));
     }
 
     /// Enabling live delivery must deliver what is **already queued**.
