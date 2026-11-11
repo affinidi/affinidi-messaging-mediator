@@ -284,34 +284,6 @@ impl Database {
         .await
     }
 
-    /// Retrieves count of Access List members for given DID
-    /// - `did_hash` - DID Hash to retrieve the Access List for
-    ///
-    /// - Returns number of members in the Access List
-    pub(crate) async fn access_list_count(&self, did_hash: &str) -> Result<usize, MediatorError> {
-        let _span = span!(Level::DEBUG, "access_list_count", did_hash = did_hash,);
-
-        async move {
-            debug!("Requesting Access List Count");
-
-            let mut con = self.get_connection().await?;
-            redis::cmd("SCARD")
-                .arg(self.keys().access_list(did_hash))
-                .query_async(&mut con)
-                .await
-                .map_err(|err| {
-                    MediatorError::database_from_redis(
-                        14,
-                        "NA".to_string(),
-                        &err,
-                        format!("access_list_count failed. Reason: {err}"),
-                    )
-                })
-        }
-        .instrument(_span)
-        .await
-    }
-
     /// Adds a number of DID hashes to the Access List, up to
     /// `access_list_limit` entries in total. When the request does not fit,
     /// the first `limit - current` hashes are added and `truncated` is set,

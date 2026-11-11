@@ -307,17 +307,38 @@ impl Database {
 
         let sid = format!("SESSION:{session_id}");
 
-        redis::Cmd::hset(&sid, "refresh_token_hash", refresh_token_hash)
-            .exec_async(&mut con)
-            .await
-            .map_err(|err| {
-                MediatorError::session_from_redis(
-                    14,
-                    session_id.into(),
-                    &err,
-                    format!("Failed to update refresh token hash for session ({session_id}). Reason: {err}"),
-                )
-            })?;
+        // Only an existing session is updated: a bare HSET would recreate a
+        // session that expired or ended meanwhile, as a hash with no TTL.
+        let updated: i64 = redis::Script::new(
+            r#"
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], 'refresh_token_hash', ARGV[1])
+  return 1
+end
+return 0
+"#,
+        )
+        .key(&sid)
+        .arg(refresh_token_hash)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::session_from_redis(
+                14,
+                session_id.into(),
+                &err,
+                format!(
+                    "Failed to update refresh token hash for session ({session_id}). Reason: {err}"
+                ),
+            )
+        })?;
+        if updated == 0 {
+            return Err(MediatorError::SessionError(
+                14,
+                session_id.into(),
+                format!("Session not found: {session_id}"),
+            ));
+        }
 
         Ok(())
     }
