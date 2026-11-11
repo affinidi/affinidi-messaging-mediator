@@ -122,7 +122,9 @@ pub async fn authentication_challenge(
         state
             .database
             .create_session(&session.to_store_session())
-            .await?;
+            .await
+            // Unauthenticated: say nothing of storage capacity.
+            .map_err(MediatorError::opaque_storage)?;
 
         metrics::counter!(crate::common::metrics::names::AUTH_CHALLENGES_TOTAL).increment(1);
         debug!("Challenge sent to {}", session.did);

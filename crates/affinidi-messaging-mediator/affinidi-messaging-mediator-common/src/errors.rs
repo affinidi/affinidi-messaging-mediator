@@ -142,6 +142,11 @@ pub enum MediatorError {
     ),
 }
 
+/// The problem-report code of a [`StorageCap::Full`] refusal.
+pub const STORAGE_FULL_CODE: &str = "e.m.me.res.storage.full";
+/// The problem-report code of a [`StorageCap::Busy`] refusal.
+pub const STORAGE_BUSY_CODE: &str = "w.m.me.res.storage.busy";
+
 /// A database limit that refused an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -242,10 +247,54 @@ impl MediatorError {
     /// Whether this is a [`storage_cap`](Self::storage_cap) refusal. A handler
     /// that wraps a storage error in its own report passes these through, so
     /// the client still learns that storage is full or busy.
+    ///
+    /// Matched exactly on the error number and problem code that
+    /// [`storage_cap`](Self::storage_cap) sets, never on a part of either.
     pub fn is_storage_cap(&self) -> bool {
-        matches!(self, Self::MediatorError(_, _, _, report, _, _)
-            if report.code.ends_with(".me.res.storage.full")
-                || report.code.ends_with(".me.res.storage.busy"))
+        matches!(self, Self::MediatorError(97, _, _, report, _, _) if report.code == STORAGE_FULL_CODE)
+            || matches!(self, Self::MediatorError(98, _, _, report, _, _) if report.code == STORAGE_BUSY_CODE)
+    }
+
+    /// A storage failure as a generic `503` (`me.res.storage.error`) that
+    /// says nothing of its cause, for a caller with no session yet: telling
+    /// an unauthenticated caller that storage is full or busy would let
+    /// anyone probe the mediator's capacity. `cause` is logged only.
+    pub fn storage_error_opaque(
+        code: ErrorCode,
+        session_id: impl Into<String>,
+        cause: impl std::fmt::Display,
+    ) -> Self {
+        Self::problem_with_log(
+            code,
+            session_id,
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "me.res.storage.error",
+            "Database transaction error",
+            vec![],
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Database transaction error: {cause}"),
+        )
+    }
+
+    /// For a caller with no session yet: a storage cap refusal or a plain
+    /// database error becomes [`storage_error_opaque`](Self::storage_error_opaque);
+    /// anything else is left as it is.
+    pub fn opaque_storage(self) -> Self {
+        match self {
+            Self::DatabaseError(code, session, text) => {
+                Self::storage_error_opaque(code, session, text)
+            }
+            cap if cap.is_storage_cap() => {
+                let (code, session) = match &cap {
+                    Self::MediatorError(code, session, ..) => (*code, session.clone()),
+                    _ => unreachable!("a cap refusal is a problem report"),
+                };
+                Self::storage_error_opaque(code, session, cap)
+            }
+            other => other,
+        }
     }
 
     /// A failed Redis call as a [`DatabaseError`](Self::DatabaseError), or as
@@ -772,14 +821,20 @@ fn queue_full_retry_after_secs(code: &str) -> Option<u64> {
         .then_some(QUEUE_FULL_RETRY_AFTER_SECS)
 }
 
-/// Seconds a client should wait before retrying when storage is busy
+/// The least a client is told to wait before retrying when storage is busy
 /// (throttled or slow). Short: a throttle clears within seconds, but without
 /// any hint a client retries in a hot loop and deepens it.
 pub const STORAGE_BUSY_RETRY_AFTER_SECS: u64 = 5;
 
+/// Up to this many seconds are added to [`STORAGE_BUSY_RETRY_AFTER_SECS`] at
+/// random, so the clients refused in one throttle don't all come back at the
+/// same moment and throttle it again.
+pub const STORAGE_BUSY_RETRY_JITTER_SECS: u64 = 5;
+
 fn storage_busy_retry_after_secs(code: &str) -> Option<u64> {
-    code.ends_with("storage.busy")
-        .then_some(STORAGE_BUSY_RETRY_AFTER_SECS)
+    (code == STORAGE_BUSY_CODE).then(|| {
+        STORAGE_BUSY_RETRY_AFTER_SECS + rand::rng().random_range(0..=STORAGE_BUSY_RETRY_JITTER_SECS)
+    })
 }
 
 /// JSON error response body returned by the mediator's HTTP API.
@@ -976,10 +1031,80 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert_eq!(
-            storage_busy_retry_after_secs("e.p.me.res.storage.busy"),
-            Some(STORAGE_BUSY_RETRY_AFTER_SECS)
+        let waits: std::collections::HashSet<u64> = (0..200)
+            .filter_map(|_| storage_busy_retry_after_secs(STORAGE_BUSY_CODE))
+            .collect();
+        assert!(
+            waits.iter().all(|w| (STORAGE_BUSY_RETRY_AFTER_SECS
+                ..=STORAGE_BUSY_RETRY_AFTER_SECS + STORAGE_BUSY_RETRY_JITTER_SECS)
+                .contains(w)),
+            "{waits:?}"
         );
+        assert!(waits.len() > 1, "the wait is spread out: {waits:?}");
+        assert_eq!(storage_busy_retry_after_secs("x.me.res.storage.busy"), None);
+    }
+
+    #[test]
+    fn the_cap_codes_are_what_the_builder_sets() {
+        let code = |cap| match MediatorError::storage_cap(cap, 14, "s", None, "x") {
+            MediatorError::MediatorError(_, _, _, report, _, _) => report.code,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(code(StorageCap::Full), STORAGE_FULL_CODE);
+        assert_eq!(code(StorageCap::Busy), STORAGE_BUSY_CODE);
+    }
+
+    #[test]
+    fn an_opaque_storage_error_says_nothing_of_its_cause() {
+        let e = MediatorError::storage_error_opaque(14, "", "OOM command not allowed");
+        match &e {
+            MediatorError::MediatorError(_, _, _, report, status, log) => {
+                assert!(report.code.ends_with("me.res.storage.error"));
+                assert!(report.args.is_empty());
+                assert!(!report.comment.contains("OOM"));
+                assert_eq!(*status, 503);
+                assert!(log.contains("OOM"), "the cause is logged");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!e.is_storage_cap());
+    }
+
+    #[test]
+    fn only_storage_failures_are_made_opaque() {
+        let opaque = |e: MediatorError| match e.opaque_storage() {
+            MediatorError::MediatorError(_, _, _, report, 503, _) => {
+                report.code.ends_with("me.res.storage.error") && report.args.is_empty()
+            }
+            _ => false,
+        };
+        assert!(opaque(MediatorError::storage_cap(
+            StorageCap::Full,
+            14,
+            "s",
+            None,
+            "x"
+        )));
+        assert!(opaque(MediatorError::storage_cap(
+            StorageCap::Busy,
+            14,
+            "s",
+            None,
+            "x"
+        )));
+        assert!(opaque(MediatorError::DatabaseError(
+            14,
+            "s".into(),
+            "OOM".into()
+        )));
+        assert!(matches!(
+            MediatorError::SessionError(14, "s".into(), "no such session".into()).opaque_storage(),
+            MediatorError::SessionError(..)
+        ));
+        assert!(matches!(
+            refusal(None).opaque_storage(),
+            MediatorError::MediatorError(44, ..)
+        ));
     }
 
     #[test]
@@ -988,6 +1113,18 @@ mod tests {
             assert!(MediatorError::storage_cap(cap, 14, "s", None, "x").is_storage_cap());
         }
         assert!(!refusal(None).is_storage_cap());
+        let lookalike = MediatorError::problem(
+            97,
+            "s",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "other.me.res.storage.full",
+            "x",
+            vec![],
+            StatusCode::INSUFFICIENT_STORAGE,
+        );
+        assert!(!lookalike.is_storage_cap());
         assert!(
             !MediatorError::DatabaseError(14, "s".into(), "storage.full".into()).is_storage_cap()
         );
