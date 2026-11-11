@@ -107,6 +107,15 @@ pub struct SharedData {
     /// exhaust the global connection budget. Entries are removed when a DID's
     /// count returns to zero.
     pub ws_connections_per_did: Arc<DashMap<String, u32>>,
+    /// Live anonymous relay WebSocket count per client address, enforcing
+    /// `limits.relay_connections_per_ip` inside the shared relay bucket.
+    /// Entries are removed when an address's count returns to zero.
+    pub relay_connections_per_ip: Arc<DashMap<String, u32>>,
+    /// Resolves a request's client address exactly as the per-IP rate limiter
+    /// does (honouring `server.trust_xff_cidrs`).
+    pub client_ip: affinidi_rate_limit::ClientIpExtractor,
+    /// The cached backend half of `/readyz`.
+    pub readiness: Arc<handlers::readiness::ReadinessCache>,
     /// Per-DID rate limiter for authenticated endpoints.
     pub did_rate_limiter: DidRateLimiter,
     /// Cancellation token for coordinated graceful shutdown of all background tasks.

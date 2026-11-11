@@ -1,6 +1,7 @@
 use crate::common::metrics::names::{
-    ACTIVE_WEBSOCKET_CONNECTIONS, MUX_LIVE_FRAMES_WITHHELD_TOTAL, WS_LIVE_RESYNC_SENT,
-    WS_LIVE_RESYNC_SUPPRESSED, WS_WRITE_TIMEOUTS_TOTAL,
+    ACTIVE_WEBSOCKET_CONNECTIONS, MUX_LIVE_FRAMES_WITHHELD_TOTAL, RELAY_CONNECTIONS_REFUSED_TOTAL,
+    RELAY_FRAMES_THROTTLED_TOTAL, WS_LIVE_RESYNC_SENT, WS_LIVE_RESYNC_SUPPRESSED,
+    WS_WRITE_TIMEOUTS_TOTAL,
 };
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
@@ -34,8 +35,9 @@ use affinidi_messaging_mediator_common::types::messages::FetchOptions;
 use affinidi_messaging_sdk::messages::problem_report::ProblemReport;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use axum::{
+    Extension,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     response::{IntoResponse, Response},
@@ -203,6 +205,7 @@ fn ws_origin_allowed(policy: &CorsOriginPolicy, origin: Option<&HeaderValue>) ->
 /// yields a valid token the upgrade is rejected, exactly as before.
 pub async fn websocket_handler(
     State(state): State<SharedData>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     auth_header: Option<TypedHeader<Authorization<Bearer>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -250,11 +253,11 @@ pub async fn websocket_handler(
     let offered = app_subprotocols(headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter());
     let wants_relay = offered.iter().any(|p| p == RELAY_ACK_SUBPROTOCOL);
 
-    let (session, is_relay) = match token {
+    let (session, relay_source) = match token {
         Some(token) => {
             // 2. Validate the token → Session (identical checks for both paths).
             match authenticate_token(&state, &token).await {
-                Ok(session) => (session, false),
+                Ok(session) => (session, None),
                 Err(e) => return e.into_response(),
             }
         }
@@ -265,12 +268,27 @@ pub async fn websocket_handler(
                 &security.global_acl_default,
             ) {
                 Some(mut session) => {
+                    // Relay sockets are counted per client address, so the
+                    // address has to be known; one that cannot be attributed
+                    // is refused rather than counted against nobody.
+                    let Some(source) = relay_source_key(&state, connect_info, &headers) else {
+                        metrics::counter!(RELAY_CONNECTIONS_REFUSED_TOTAL, "reason" => "no_client_ip")
+                            .increment(1);
+                        warn!(
+                            "Relay WebSocket upgrade refused: client address could not be determined"
+                        );
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "client address could not be determined",
+                        )
+                            .into_response();
+                    };
                     // No JWT means no expiry to inherit, and an anonymous
                     // socket that never ends is a resource a peer can hold
                     // open indefinitely. Give it a bounded lifetime instead;
                     // the relaying peer's pool reconnects transparently.
                     session.expires_at = state.clock.unix_secs() + RELAY_SOCKET_LIFETIME_SECS;
-                    (session, true)
+                    (session, Some(source))
                 }
                 None => {
                     warn!(
@@ -289,6 +307,8 @@ pub async fn websocket_handler(
             return AuthError::MissingCredentials.into_response();
         }
     };
+
+    let is_relay = relay_source.is_some();
 
     let _span = span!(
         tracing::Level::INFO,
@@ -475,7 +495,7 @@ pub async fn websocket_handler(
                     socket,
                     state,
                     session,
-                    is_relay,
+                    relay_source,
                     mux_mode,
                     tsp_mode,
                     tsp_ack_mode,
@@ -488,7 +508,9 @@ pub async fn websocket_handler(
     #[cfg(not(feature = "tsp"))]
     {
         async move {
-            ws.on_upgrade(move |socket| handle_socket(socket, state, session, is_relay, mux_mode))
+            ws.on_upgrade(move |socket| {
+                handle_socket(socket, state, session, relay_source, mux_mode)
+            })
         }
         .instrument(_span)
         .await
@@ -539,6 +561,8 @@ struct ConnectionSlot {
     registration: Option<(Sender<StreamingUpdate>, StreamingUpdate)>,
     /// The DID's per-DID slot, released with the global one.
     per_did: Option<PerDidConnectionGuard>,
+    /// A relay socket's per-address slot, released with the global one.
+    per_source: Option<PerDidConnectionGuard>,
 }
 
 impl ConnectionSlot {
@@ -552,6 +576,7 @@ impl ConnectionSlot {
             close_stat: None,
             registration: None,
             per_did: None,
+            per_source: None,
         };
         if current >= max {
             Err(current)
@@ -574,6 +599,11 @@ impl ConnectionSlot {
     /// Hold the DID's per-DID slot until this slot is released.
     fn hold_per_did(&mut self, guard: PerDidConnectionGuard) {
         self.per_did = Some(guard);
+    }
+
+    /// Hold a relay socket's per-address slot until this slot is released.
+    fn hold_per_source(&mut self, guard: PerDidConnectionGuard) {
+        self.per_source = Some(guard);
     }
 
     /// The streaming task holds a registration for this socket, made with
@@ -798,6 +828,91 @@ fn relay_refusal(error: &MediatorError) -> (u16, String) {
     }
 }
 
+/// Take one place in `registry` under `key`, returning the count including it.
+/// The caller hands a [`PerDidConnectionGuard`] for the same key to its
+/// [`ConnectionSlot`], which gives the place back.
+fn reserve(registry: &DashMap<String, u32>, key: &str) -> u32 {
+    let mut entry = registry.entry(key.to_string()).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
+/// The key a relay socket is counted under: its client address, resolved as
+/// the per-IP rate limiter resolves it (through `server.trust_xff_cidrs`).
+/// `None` when there is no peer address or a trusted proxy sent an unreadable
+/// `X-Forwarded-For` chain.
+fn relay_source_key(
+    state: &SharedData,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let Extension(ConnectInfo(peer)) = connect_info?;
+    state
+        .client_ip
+        .client_key(peer.ip(), headers)
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+/// Inbound budget for one anonymous relay socket: frames per second and bytes
+/// per second, each a token bucket.
+///
+/// An authenticated socket is bounded by its DID's queue limits; a relay
+/// socket has no DID, and each frame costs an unpack and DID resolutions, so
+/// without this one socket could push frames as fast as it can write them.
+struct RelayMeter {
+    frames: governor::DefaultDirectRateLimiter,
+    bytes: governor::DefaultDirectRateLimiter,
+    refused: u64,
+}
+
+impl RelayMeter {
+    fn new(limits: &crate::common::config::limits::LimitsConfig) -> Self {
+        use governor::{Quota, RateLimiter};
+        use std::num::NonZeroU32;
+        let nz = |n: u32| NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN);
+        let bytes_per_second = nz(limits.relay_bytes_per_second);
+        // Deep enough for the largest frame the socket admits at all.
+        let byte_burst = nz(limits
+            .relay_bytes_per_second
+            .max(u32::try_from(limits.ws_size).unwrap_or(u32::MAX)));
+        Self {
+            frames: RateLimiter::direct(
+                Quota::per_second(nz(limits.relay_frames_per_second))
+                    .allow_burst(nz(limits.relay_frame_burst)),
+            ),
+            bytes: RateLimiter::direct(Quota::per_second(bytes_per_second).allow_burst(byte_burst)),
+            refused: 0,
+        }
+    }
+
+    /// Charge one frame of `len` bytes. `Err` names the budget it exceeded.
+    fn admit(&mut self, len: usize) -> Result<(), &'static str> {
+        let refused = if self.frames.check().is_err() {
+            Some("frames")
+        } else {
+            let n = std::num::NonZeroU32::new(u32::try_from(len.max(1)).unwrap_or(u32::MAX))
+                .unwrap_or(std::num::NonZeroU32::MIN);
+            match self.bytes.check_n(n) {
+                Ok(Ok(())) => None,
+                _ => Some("bytes"),
+            }
+        };
+        match refused {
+            Some(limit) => {
+                self.refused += 1;
+                Err(limit)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the refusal just counted was this socket's first.
+    fn first_refusal(&self) -> bool {
+        self.refused == 1
+    }
+}
+
 /// Build a close message carrying an RFC 6455 code + human-readable reason.
 fn close_with(code: u16, reason: &'static str) -> Message {
     Message::Close(Some(CloseFrame {
@@ -811,9 +926,9 @@ async fn handle_socket(
     socket: WebSocket,
     state: SharedData,
     mut session: Session,
-    // An anonymous inter-mediator relay socket: it may push frames and
-    // receives nothing but the `RelayAck` answers to them.
-    is_relay: bool,
+    // `Some(client address)` for an anonymous inter-mediator relay socket: it
+    // may push frames and receives nothing but the `RelayAck` answers to them.
+    relay_source: Option<String>,
     // A DID-multiplexing connection (design §7): carries member DIDs too.
     mux_mode: bool,
     #[cfg(feature = "tsp")] tsp_mode: bool,
@@ -824,6 +939,7 @@ async fn handle_socket(
         "handle_socket",
         session = session.session_id
     );
+    let is_relay = relay_source.is_some();
     async move {
         let mut socket = BoundedSocket::new(socket);
 
@@ -862,24 +978,41 @@ async fn handle_socket(
             }
         };
 
+        // Relay sockets share one bucket (below), so each client address may
+        // hold only `relay_connections_per_ip` of them: one source cannot take
+        // every relay slot from the other peers.
+        if let Some(source) = &relay_source {
+            let held = reserve(&state.relay_connections_per_ip, source);
+            slot.hold_per_source(PerDidConnectionGuard {
+                registry: state.relay_connections_per_ip.clone(),
+                did_hash: source.clone(),
+            });
+            let cap = state.config.limits.relay_connections_per_ip;
+            if held as usize > cap {
+                metrics::counter!(RELAY_CONNECTIONS_REFUSED_TOTAL, "reason" => "per_ip").increment(1);
+                warn!(source = %source, held, cap, "Relay WebSocket refused: per-address relay connection limit reached");
+                drop(slot);
+                let _ = socket
+                    .send(close_with(
+                        close_code::TRY_AGAIN_LATER,
+                        "relay connection limit reached for this address",
+                    ))
+                    .await;
+                return;
+            }
+        }
+
         // Enforce the per-DID connection cap (0 = unlimited). Reserve the slot
         // immediately and hand its guard to the connection slot, so it's
         // released with the global one on every return path; then reject if
         // this DID is over its cap.
-        let per_did_count = {
-            let mut entry = state
-                .ws_connections_per_did
-                .entry(session.did_hash.clone())
-                .or_insert(0);
-            *entry += 1;
-            *entry
-        };
+        let per_did_count = reserve(&state.ws_connections_per_did, &session.did_hash);
         // Note for relay sockets: they carry no DID, so they all share the
         // empty-hash bucket and `max_websocket_connections_per_did` (default
         // 100) becomes the ceiling on *concurrent relay sockets across all
-        // peers*. That is the intended bound — it is the only thing limiting
-        // anonymous sockets — and the empty string cannot collide with a real
-        // DID's bucket, which is a sha256 hash.
+        // peers*, with `relay_connections_per_ip` above bounding each source's
+        // share of it. The empty string cannot collide with a real DID's
+        // bucket, which is a sha256 hash.
         slot.hold_per_did(PerDidConnectionGuard {
             registry: state.ws_connections_per_did.clone(),
             did_hash: session.did_hash.clone(),
@@ -1136,6 +1269,9 @@ async fn handle_socket(
             return;
         }
 
+        // Inbound frame budget for a relay socket (see `RelayMeter`).
+        let mut relay_meter = is_relay.then(|| RelayMeter::new(&state.config.limits));
+
         // Why this socket ends up closing — surfaced in the final close frame.
         let mut close_reason: (u16, &'static str) = (close_code::NORMAL, "normal closure");
         loop {
@@ -1176,6 +1312,41 @@ async fn handle_socket(
                                     }
                                     if msg.len() > state.config.limits.ws_size {
                                         warn!("Error processing message, the size is too big. limit is {}, message size is {}", state.config.limits.ws_size, msg.len());
+                                        continue;
+                                    }
+
+                                    // A relay frame over the socket's budget is
+                                    // refused with a negative ack, which sends the
+                                    // relaying mediator to its REST fallback (where
+                                    // the per-IP limiter applies) for that message.
+                                    if let Some(meter) = relay_meter.as_mut()
+                                        && let Err(limit) = meter.admit(msg.len())
+                                    {
+                                        metrics::counter!(RELAY_FRAMES_THROTTLED_TOTAL, "limit" => limit).increment(1);
+                                        if meter.first_refusal() {
+                                            warn!(limit, "Relay frame refused: socket over its frame budget; further refusals on this socket are logged at debug");
+                                        } else {
+                                            debug!(limit, "Relay frame refused: socket over its frame budget");
+                                        }
+                                        let ack = RelayAck::rejected(
+                                            frame_id(msg.as_bytes()),
+                                            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                                            "relay frame rate exceeded; send again later",
+                                        );
+                                        match serde_json::to_string(&ack) {
+                                            Ok(body) => {
+                                                if let Err(e) = socket.send(Message::Text(body.into())).await {
+                                                    warn!("Failed to send relay-ack: {e}");
+                                                    close_reason = (close_code::GOING_AWAY, "peer disconnected");
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Couldn't serialise relay-ack: {e}");
+                                                close_reason = (close_code::SERVER_ERROR, "could not acknowledge");
+                                                break;
+                                            }
+                                        }
                                         continue;
                                     }
 
@@ -2563,12 +2734,48 @@ mod close_report_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CorsOriginPolicy, MIN_RESYNC_INTERVAL, app_subprotocols, bounded_write,
+        CorsOriginPolicy, MIN_RESYNC_INTERVAL, RelayMeter, app_subprotocols, bounded_write,
         extract_bearer_subprotocol, resync_due, ws_origin_allowed,
     };
     use crate::common::config::OriginMatcher;
     use http::HeaderValue;
     use std::time::Duration;
+
+    #[test]
+    fn a_relay_meter_refuses_frames_past_its_burst() {
+        let limits = crate::common::config::limits::LimitsConfig {
+            relay_frames_per_second: 1,
+            relay_frame_burst: 3,
+            ..Default::default()
+        };
+        let mut meter = RelayMeter::new(&limits);
+        for _ in 0..3 {
+            assert_eq!(meter.admit(10), Ok(()));
+        }
+        assert_eq!(meter.admit(10), Err("frames"));
+        assert!(meter.first_refusal());
+        assert_eq!(meter.admit(10), Err("frames"));
+        assert!(
+            !meter.first_refusal(),
+            "only the first refusal is the first"
+        );
+    }
+
+    #[test]
+    fn a_relay_meter_refuses_bytes_past_its_budget() {
+        let limits = crate::common::config::limits::LimitsConfig {
+            relay_bytes_per_second: 1_000,
+            ws_size: 1_000,
+            ..Default::default()
+        };
+        let mut meter = RelayMeter::new(&limits);
+        assert_eq!(meter.admit(600), Ok(()));
+        assert_eq!(meter.admit(600), Err("bytes"));
+        // A frame of the full admitted size passes on a fresh budget: the
+        // bucket is never shallower than `ws_size`.
+        let mut fresh = RelayMeter::new(&limits);
+        assert_eq!(fresh.admit(1_000), Ok(()));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_write_past_its_deadline_fails_and_marks_the_socket_stalled() {

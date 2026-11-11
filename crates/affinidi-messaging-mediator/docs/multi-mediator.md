@@ -308,6 +308,18 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   peer refused. A peer that does not echo `relay-ack` is never relayed to over
   the socket; the connection is dropped and the endpoint falls back to REST
   (and stays there for `WS_SUPPRESSION_WINDOW`, five minutes).
+- **Relay socket limits on the receiving mediator.** All anonymous relay
+  sockets share one connection bucket (`limits.max_websocket_connections_per_did`,
+  default 100); within it one client address may hold at most
+  `limits.relay_connections_per_ip` (default 10). The address is resolved as
+  for per-IP rate limiting, so behind a load balancer set
+  `server.trust_xff_cidrs`. Each relay socket is also metered:
+  `relay_frames_per_second` / `relay_frame_burst` (50 / 100) and
+  `relay_bytes_per_second` (4 MiB/s; the byte bucket is never shallower than
+  `ws_size`). A frame over budget is answered with a negative ack (code 429),
+  so the relaying mediator sends that message over REST instead. Refusals are
+  counted in `relay_connections_refused_total{reason}` and
+  `relay_frames_throttled_total{limit}`.
 - **REST shape.** `POST {endpoint}/inbound`, `Content-Type:
   application/didcomm-encrypted+json` for DIDComm, `application/tsp` (raw qb2)
   for TSP. TSP always goes over REST regardless of rate.

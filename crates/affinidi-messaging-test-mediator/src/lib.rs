@@ -350,6 +350,9 @@ pub struct TestMediatorBuilder {
     jwt_refresh_expiry_secs: Option<u64>,
     /// Override for `LimitsConfig.max_websocket_connections_per_did`.
     max_websocket_connections_per_did: Option<usize>,
+    /// Override for the relay socket limits: `(relay_connections_per_ip,
+    /// relay_frames_per_second, relay_frame_burst)`.
+    relay_limits: Option<(usize, u32, u32)>,
     /// Override for `LimitsConfig.did_rate_limit_per_second` /
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
@@ -413,6 +416,7 @@ impl Default for TestMediatorBuilder {
             jwt_access_expiry_secs: None,
             jwt_refresh_expiry_secs: None,
             max_websocket_connections_per_did: None,
+            relay_limits: None,
             did_rate_limit: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
@@ -659,6 +663,20 @@ impl TestMediatorBuilder {
     /// production default (100). Set small to exercise the cap in tests.
     pub fn max_websocket_connections_per_did(mut self, max: usize) -> Self {
         self.max_websocket_connections_per_did = Some(max);
+        self
+    }
+
+    /// Override the anonymous relay socket limits:
+    /// `limits.relay_connections_per_ip`, `relay_frames_per_second` and
+    /// `relay_frame_burst`. Defaults to the production defaults (10, 50, 100).
+    /// Set small to exercise the refusals in tests.
+    pub fn relay_limits(
+        mut self,
+        connections_per_ip: usize,
+        frames_per_second: u32,
+        frame_burst: u32,
+    ) -> Self {
+        self.relay_limits = Some((connections_per_ip, frames_per_second, frame_burst));
         self
     }
 
@@ -1010,6 +1028,11 @@ impl TestMediatorBuilder {
         let mut limits = affinidi_messaging_mediator::common::config::LimitsConfig::default();
         if let Some(max) = self.max_websocket_connections_per_did {
             limits.max_websocket_connections_per_did = max;
+        }
+        if let Some((connections, frames, burst)) = self.relay_limits {
+            limits.relay_connections_per_ip = connections;
+            limits.relay_frames_per_second = frames;
+            limits.relay_frame_burst = burst;
         }
         if let Some(limit) = self.queue_send_limit_per_peer {
             limits.queued_send_messages_per_peer = limit;

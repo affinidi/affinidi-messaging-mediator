@@ -22,7 +22,9 @@
 //!   v1 anonymous-forward session. They carry no DID, so there is nothing to key
 //!   on, and keying them all on one shared bucket would let one busy peer
 //!   mediator throttle every other peer's forwards. They never reach
-//!   `authenticate_token`; the per-IP limiter still applies to them.
+//!   `authenticate_token`; the per-IP limiter still applies to them. Relay
+//!   WebSockets are bounded per client address and their frames per socket
+//!   instead (`limits.relay_*`, see `handlers::websocket`).
 //! - **The mediator's own DID and the configured admin DID**
 //!   ([`DidRateLimiter::with_exempt_did_hashes`]). Throttling the operator's own
 //!   management plane is how an incident response locks itself out.

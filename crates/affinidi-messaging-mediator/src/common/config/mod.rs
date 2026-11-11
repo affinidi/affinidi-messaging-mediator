@@ -179,6 +179,13 @@ pub struct Config {
     pub local_endpoints: Vec<String>,
     /// Trusted reverse-proxy CIDRs used for `X-Forwarded-For` rate-limit attribution.
     pub trust_xff_cidrs: Vec<affinidi_rate_limit::IpNet>,
+    /// Client ranges allowed to read `/metrics` (see
+    /// [`ServerConfig::metrics_allow_cidrs`]). Defaults to
+    /// [`default_metrics_allow_cidrs`].
+    pub metrics_allow_cidrs: Vec<affinidi_rate_limit::IpNet>,
+    /// When set, `/metrics` also requires this bearer token.
+    #[serde(skip_serializing)]
+    pub metrics_bearer_token: Option<affinidi_messaging_mediator_config::RedactedString>,
     pub streaming_enabled: bool,
     pub streaming_uuid: String,
     /// Heartbeat and ownership-recheck timing of the streaming task. Not in
@@ -233,6 +240,28 @@ pub struct Config {
     #[cfg(feature = "vta")]
     #[serde(skip)]
     pub vta_refresher: Option<crate::tasks::vta_refresh::VtaRefresher>,
+}
+
+/// Who may read `/metrics` when `[server] metrics_allow_cidrs` is absent:
+/// loopback plus the private (RFC 1918), shared (RFC 6598, used by some
+/// cluster networks), link-local and IPv6 unique-local ranges. A scraper in the
+/// same cluster, VPC or host keeps working; a client on the public internet is
+/// refused.
+pub fn default_metrics_allow_cidrs() -> Vec<affinidi_rate_limit::IpNet> {
+    [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .iter()
+    .map(|cidr| cidr.parse().expect("built-in CIDR parses"))
+    .collect()
 }
 
 impl fmt::Debug for Config {
@@ -292,6 +321,8 @@ impl Config {
             admin_did: "".into(),
             local_endpoints: Vec::new(),
             trust_xff_cidrs: Vec::new(),
+            metrics_allow_cidrs: default_metrics_allow_cidrs(),
+            metrics_bearer_token: None,
             database: DatabaseConfig::default(),
             streaming_enabled: true,
             streaming_uuid: "".into(),
@@ -777,6 +808,14 @@ impl TryFrom<ConfigRaw> for Config {
             admin_did: read_did_config(&raw.server.admin_did, &aws_config, "admin_did").await?,
             local_endpoints: raw.server.local_endpoints,
             trust_xff_cidrs: raw.server.trust_xff_cidrs,
+            metrics_allow_cidrs: raw
+                .server
+                .metrics_allow_cidrs
+                .unwrap_or_else(default_metrics_allow_cidrs),
+            metrics_bearer_token: raw
+                .server
+                .metrics_bearer_token
+                .filter(|token| !token.0.is_empty()),
             database: database_config_from_raw(raw.database),
             streaming_enabled: raw.streaming.enabled.parse().unwrap_or_else(|_| {
                 warn!(
