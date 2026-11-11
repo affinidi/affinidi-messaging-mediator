@@ -3203,6 +3203,88 @@ conformance_for_redis!(redis,
     trust_task_claim         => check_trust_task_claim         @ 15,
 );
 
+/// A FORWARD_Q entry that does not parse is dropped by the consumer that
+/// claims it — by a read, or by the reclaim sweep — instead of staying
+/// pending to be reclaimed, and skipped, on every sweep. Uses a group of its
+/// own and touches only the entries it adds; part of the DB 0 sequence.
+#[cfg(feature = "redis-backend")]
+async fn check_redis_malformed_forward_entries_are_dropped(
+    store: &affinidi_messaging_mediator::store::RedisStore,
+) {
+    let group = format!("malformed-{}", uuid::Uuid::new_v4());
+    let mut conn = store.get_connection().await.expect("redis connection");
+    use affinidi_messaging_mediator_common::database::RedisConnection;
+    async fn xadd(conn: &mut RedisConnection) -> String {
+        ::redis::cmd("XADD")
+            .arg("FORWARD_Q")
+            .arg("*")
+            .arg("NOT_A_FORWARD")
+            .arg("1")
+            .query_async::<String>(conn)
+            .await
+            .expect("XADD")
+    }
+    async fn exists(conn: &mut RedisConnection, id: String) -> bool {
+        let rows: Vec<::redis::Value> = ::redis::cmd("XRANGE")
+            .arg("FORWARD_Q")
+            .arg(&id)
+            .arg(&id)
+            .query_async(conn)
+            .await
+            .expect("XRANGE");
+        !rows.is_empty()
+    }
+
+    // The group starts at the end of the stream, so it sees only ours.
+    ::redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg("FORWARD_Q")
+        .arg(&group)
+        .arg("$")
+        .arg("MKSTREAM")
+        .query_async::<()>(&mut conn)
+        .await
+        .expect("XGROUP CREATE");
+
+    // Read: dropped at once.
+    let read_bad = xadd(&mut conn).await;
+    let read =
+        MediatorStore::forward_queue_read(store, &group, "reader", 10, Duration::from_millis(50))
+            .await
+            .expect("forward_queue_read");
+    assert!(read.is_empty());
+    assert!(!exists(&mut conn, read_bad).await, "dropped by the read");
+
+    // Already pending (claimed before it could be parsed): dropped by the
+    // sweep that reclaims it.
+    let swept_bad = xadd(&mut conn).await;
+    ::redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(&group)
+        .arg("raw")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg("FORWARD_Q")
+        .arg(">")
+        .query_async::<::redis::Value>(&mut conn)
+        .await
+        .expect("XREADGROUP");
+    let page =
+        MediatorStore::forward_queue_autoclaim(store, &group, "sweeper", Duration::ZERO, 10, "0-0")
+            .await
+            .expect("forward_queue_autoclaim");
+    assert!(page.entries.is_empty());
+    assert!(!exists(&mut conn, swept_bad).await, "dropped by the sweep");
+
+    let _ = ::redis::cmd("XGROUP")
+        .arg("DESTROY")
+        .arg("FORWARD_Q")
+        .arg(&group)
+        .query_async::<i64>(&mut conn)
+        .await;
+}
+
 /// DB 0: every numbered index a default Redis offers (0..=15) is in use, so
 /// the checks added since share it, one after another in a single test. The
 /// start-up check needs the concrete `RedisStore`, so this test is written out
@@ -3216,5 +3298,6 @@ async fn redis_db0_checks() {
     store.initialize().await.expect("store initialize");
     check_redis_startup(&store).await;
     flush_db(&store).await;
+    check_redis_malformed_forward_entries_are_dropped(&store).await;
     check_db0_in_sequence(Arc::new(store)).await;
 }

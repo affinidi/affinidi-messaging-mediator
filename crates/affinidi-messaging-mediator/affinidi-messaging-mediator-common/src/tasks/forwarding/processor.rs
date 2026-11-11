@@ -329,6 +329,10 @@ enum RelayFailure {
     /// The endpoint URL does not parse, or the egress policy does not admit
     /// it. No request was made, and none ever will be, so it is final.
     NotPermitted(String),
+    /// Not sent, because this processor could no longer confirm it holds
+    /// the entry. Not a failure of the endpoint: the entry waits, keeping its
+    /// retries, and no backoff opens.
+    Deferred(String),
 }
 
 impl RelayFailure {
@@ -348,7 +352,8 @@ impl std::fmt::Display for RelayFailure {
         match self {
             RelayFailure::Refused { reason, .. }
             | RelayFailure::Retryable(reason)
-            | RelayFailure::NotPermitted(reason) => f.write_str(reason),
+            | RelayFailure::NotPermitted(reason)
+            | RelayFailure::Deferred(reason) => f.write_str(reason),
         }
     }
 }
@@ -838,6 +843,16 @@ impl ForwardingProcessor {
         self.claims_confirmed_at_ms
             .store(unix_timestamp_millis() as u64, AtomicOrdering::Release);
 
+        if self.config.delivery_timeout_seconds.saturating_mul(2) > self.config.reclaim_idle_seconds
+        {
+            warn!(
+                "reclaim_idle_seconds ({}) is less than twice delivery_timeout_seconds ({}): a send \
+                 under way when this processor's claims stop being confirmed can outlast its \
+                 claim, so another processor may take the entry over and send it again",
+                self.config.reclaim_idle_seconds, self.config.delivery_timeout_seconds
+            );
+        }
+
         let reclaim_idle = Duration::from_secs(self.config.reclaim_idle_seconds.max(1));
         let refresh_every = reclaim_idle / 4;
         let sweep_every = reclaim_idle / 2;
@@ -906,6 +921,9 @@ impl ForwardingProcessor {
         // claims what it read. The channel holds one batch, so the reader
         // stays at most one batch ahead of what this loop has accepted.
         let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<ForwardQueueEntry>>(1);
+        // Set while this processor holds all it may; the reader then skips
+        // reclaim sweeps.
+        let saturated = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let database = self.database.clone();
             let group = self.config.consumer_group.clone();
@@ -914,6 +932,11 @@ impl ForwardingProcessor {
             let block = sweep_every.min(Duration::from_secs(5));
             let claims_confirmed_at_ms = self.claims_confirmed_at_ms.clone();
             let unconfirmed_after_ms = reclaim_idle.as_millis() / 2;
+            let claims_unconfirmed = move || {
+                let confirmed = claims_confirmed_at_ms.load(AtomicOrdering::Acquire) as u128;
+                unix_timestamp_millis().saturating_sub(confirmed) > unconfirmed_after_ms
+            };
+            let saturated = saturated.clone();
             background.spawn(async move {
                 let mut next_sweep = Instant::now() + sweep_every;
                 loop {
@@ -921,12 +944,14 @@ impl ForwardingProcessor {
                     // on nothing new. Its sweep in particular would re-claim
                     // the very entries it cannot use, resetting their idle
                     // time and keeping every other processor off them.
-                    let confirmed = claims_confirmed_at_ms.load(AtomicOrdering::Acquire) as u128;
-                    if unix_timestamp_millis().saturating_sub(confirmed) > unconfirmed_after_ms {
+                    if claims_unconfirmed() {
                         tokio::time::sleep(refresh_every).await;
                         continue;
                     }
-                    if Instant::now() >= next_sweep {
+                    // A processor holding all it may hold skips the sweep:
+                    // what it reclaimed it could not hold, and reclaiming
+                    // resets the entries' idle time, keeping others off them.
+                    if Instant::now() >= next_sweep && !saturated.load(AtomicOrdering::Acquire) {
                         next_sweep = Instant::now() + sweep_every;
                         // Follow the cursor over the whole pending list. A page
                         // can come back empty because it covered only entries
@@ -934,6 +959,11 @@ impl ForwardingProcessor {
                         // beyond it.
                         let mut cursor = "0-0".to_string();
                         loop {
+                            // Checked before every page, since sending one
+                            // can wait on this loop.
+                            if claims_unconfirmed() || saturated.load(AtomicOrdering::Acquire) {
+                                break;
+                            }
                             match database
                                 .forward_queue_autoclaim(
                                     &group,
@@ -1017,6 +1047,7 @@ impl ForwardingProcessor {
                 .map(|due| Duration::from_millis(due.saturating_sub(now_ms) as u64))
                 .unwrap_or(Duration::from_secs(3600));
             let can_read = scheduler.has_room();
+            saturated.store(!can_read, AtomicOrdering::Release);
 
             tokio::select! {
                 Some(done) = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
@@ -1138,6 +1169,12 @@ impl ForwardingProcessor {
         let confirmed = self.claims_confirmed_at_ms.load(AtomicOrdering::Acquire) as u128;
         let limit = (self.config.reclaim_idle_seconds.max(1) as u128) * 1000 / 2;
         unix_timestamp_millis().saturating_sub(confirmed) <= limit
+    }
+
+    /// How long an entry held back for unconfirmed claims waits before it is
+    /// looked at again: one refresh interval.
+    fn unconfirmed_retry_ms(&self) -> u128 {
+        (self.config.reclaim_idle_seconds.max(1) as u128) * 1000 / 4
     }
 
     /// Finish with `msg` if this processor still holds it (see
@@ -1271,19 +1308,6 @@ impl ForwardingProcessor {
                 );
                 continue;
             }
-            // Claims not confirmed lately: another processor may be taking
-            // these over, so send nothing until a refresh succeeds.
-            if !self.claims_current() {
-                debug!(
-                    "Claims not confirmed recently; holding message {} for endpoint {}",
-                    msg.stream_id, endpoint_url
-                );
-                let retry_ms = (self.config.reclaim_idle_seconds.max(1) as u128) * 1000 / 4;
-                outcome
-                    .deferred
-                    .push((unix_timestamp_millis() + retry_ms, msg));
-                continue;
-            }
             // Checked per message, not once per batch: the attempt before this
             // one may just have failed and opened the backoff window.
             if let Some(retry_after_ms) = self.endpoint_backing_off(endpoint_url).await {
@@ -1292,6 +1316,19 @@ impl ForwardingProcessor {
                     endpoint_url, msg.stream_id
                 );
                 outcome.deferred.push((retry_after_ms, msg));
+                continue;
+            }
+            // Claims not confirmed lately: another processor may be taking
+            // these over, so send nothing until a refresh succeeds. Checked
+            // last, just before the send.
+            if !self.claims_current() {
+                debug!(
+                    "Claims not confirmed recently; holding message {} for endpoint {}",
+                    msg.stream_id, endpoint_url
+                );
+                outcome
+                    .deferred
+                    .push((unix_timestamp_millis() + self.unconfirmed_retry_ms(), msg));
                 continue;
             }
 
@@ -1361,6 +1398,17 @@ impl ForwardingProcessor {
                     );
                     self.drop_final(&msg, endpoint_url, ForwardOutcome::NotPermitted)
                         .await;
+                }
+                // Not sent; not the endpoint's fault. Held, unless another
+                // processor has it now.
+                Err(RelayFailure::Deferred(reason)) => {
+                    attempted -= 1;
+                    debug!("{reason}");
+                    if !self.is_revoked(&msg.stream_id) {
+                        outcome
+                            .deferred
+                            .push((unix_timestamp_millis() + self.unconfirmed_retry_ms(), msg));
+                    }
                 }
                 Err(e @ RelayFailure::Retryable(_)) => {
                     warn!(
@@ -1788,6 +1836,15 @@ impl ForwardingProcessor {
                             "WebSocket delivery failed for {}, falling back to REST: {}",
                             endpoint_url, ws_err
                         );
+                    }
+                    // The WebSocket attempt can take as long as the relay-ack
+                    // timeout; the fallback is a new send, so it is held to
+                    // the same check as the first.
+                    if self.is_revoked(&msg.stream_id) || !self.claims_current() {
+                        return Err(RelayFailure::Deferred(format!(
+                            "not falling back to REST for {}: its claim is not confirmed",
+                            msg.stream_id
+                        )));
                     }
                     self.deliver_via_rest(endpoint_url, msg).await
                 }

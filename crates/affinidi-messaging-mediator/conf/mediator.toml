@@ -772,8 +772,13 @@ delivery_timeout_seconds = "90"
 ### still working on; if it cannot confirm them for half the window it stops
 ### sending until it can. The same sweep picks up a requested forward delay
 ### longer than max_backoff_ms when due, and an endpoint's entries beyond what
-### it may hold. Must be at least 1; a few seconds or more in production.
-reclaim_idle_seconds = "60"
+### it may hold. Keep it at least twice delivery_timeout_seconds: a send
+### already under way when claims stop being confirmed runs on for up to the
+### delivery timeout, and a shorter window lets another processor take the
+### entry over and send it too (the processor logs a warning at start).
+### Lower values recover a stopped processor's entries sooner.
+### Must be at least 1.
+reclaim_idle_seconds = "180"
 
 ### Env: PROCESSOR_FORWARDING_CONSUMER_GROUP
 ### Consumer group name for the forwarding queue. On Redis this is the

@@ -1146,3 +1146,132 @@ async fn a_processor_that_cannot_confirm_its_claims_stops_sending() {
         "the rest went through the other processor"
     );
 }
+
+/// Stub remote mediator whose WebSocket route refuses the upgrade — the
+/// first time only after `first_ws_delay` — so every WebSocket attempt falls
+/// back to REST, where every request is accepted and tallied.
+async fn spawn_mediator_refusing_websocket(first_ws_delay: Duration) -> CountingMediator {
+    #[derive(Clone)]
+    struct StubState {
+        ws_seen: Arc<AtomicU32>,
+        first_ws_delay: Duration,
+        first_arrived: Arc<tokio::sync::Notify>,
+        accepted: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    }
+
+    async fn ws(State(state): State<StubState>) -> StatusCode {
+        if state.ws_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            state.first_arrived.notify_one();
+            tokio::time::sleep(state.first_ws_delay).await;
+        }
+        StatusCode::FORBIDDEN
+    }
+
+    async fn inbound(State(state): State<StubState>, body: String) -> StatusCode {
+        *state
+            .accepted
+            .lock()
+            .expect("accepted log")
+            .entry(body)
+            .or_default() += 1;
+        StatusCode::OK
+    }
+
+    let first_arrived = Arc::new(tokio::sync::Notify::new());
+    let accepted = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let app = Router::new()
+        .route("/ws", axum::routing::get(ws))
+        .route("/inbound", post(inbound))
+        .with_state(StubState {
+            ws_seen: Arc::new(AtomicU32::new(0)),
+            first_ws_delay,
+            first_arrived: first_arrived.clone(),
+            accepted: accepted.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub mediator");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub mediator serve");
+    });
+    CountingMediator {
+        endpoint_url: format!("http://{addr}"),
+        first_arrived,
+        accepted,
+    }
+}
+
+/// The REST fallback after a failed WebSocket attempt is a new send, held to
+/// the same check as the first: if the processor's claims went unconfirmed
+/// while the WebSocket attempt ran, it does not fall back. The entry keeps
+/// its retries, and another processor takes it over and delivers it once.
+#[tokio::test]
+async fn no_rest_fallback_once_claims_are_unconfirmed() {
+    let stub = spawn_mediator_refusing_websocket(Duration::from_millis(1_500)).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    store
+        .forward_queue_enqueue(&forward_entry(&stub.endpoint_url, "after-websocket"), 0)
+        .await
+        .expect("enqueue");
+    // WebSocket first; refreshes every 500 ms; unconfirmed after 1 s;
+    // reclaimable after 2 s.
+    let config = ForwardingConfig {
+        ws_threshold_msgs_per_10s: 0,
+        reclaim_idle_seconds: 2,
+        ..test_config()
+    };
+
+    let fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stalled_side = Arc::new(RecordingObserver::default());
+    let first = ForwardingProcessor::new(config.clone(), store.clone())
+        .expect("create processor")
+        .with_observer(stalled_side.clone())
+        .with_claim_refresh_fault(fault.clone());
+    tokio::spawn(async move {
+        let _ = first.start().await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), stub.first_arrived.notified())
+        .await
+        .expect("the first processor never tried the WebSocket");
+    fault.store(true, Ordering::SeqCst);
+
+    let other_side = Arc::new(RecordingObserver::default());
+    let second = ForwardingProcessor::new(config, store.clone())
+        .expect("create processor")
+        .with_observer(other_side.clone());
+    tokio::spawn(async move {
+        let _ = second.start().await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if store.forward_queue_len().await.expect("queue len") == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the other processor did not take the entry over");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let accepted = stub.accepted.lock().expect("accepted log").clone();
+    assert_eq!(
+        accepted.get("after-websocket").copied(),
+        Some(1),
+        "{accepted:?}"
+    );
+    let stalled = stalled_side.outcomes.lock().expect("observer log").clone();
+    assert!(
+        stalled.is_empty(),
+        "no fallback, no retry, no backoff on the unconfirmed side: {stalled:?}"
+    );
+    let other = other_side.outcomes.lock().expect("observer log").clone();
+    assert!(
+        matches!(other.as_slice(), [(_, ForwardOutcome::Relayed { .. })]),
+        "{other:?}"
+    );
+}

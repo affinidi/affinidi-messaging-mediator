@@ -164,14 +164,26 @@ impl Database {
         };
 
         let mut entries = Vec::new();
+        let mut malformed = Vec::new();
         for (_stream_name, messages) in streams {
             for (stream_id, fields) in messages {
-                match parse_forward_entry(stream_id, fields) {
+                match parse_forward_entry(stream_id.clone(), fields) {
                     Ok(entry) => entries.push(entry),
                     Err(e) => {
-                        warn!("Skipping malformed FORWARD_Q entry: {}", e);
+                        warn!("Dropping malformed FORWARD_Q entry {stream_id}: {e}");
+                        malformed.push(stream_id);
                     }
                 }
+            }
+        }
+        // Claimed by this read, so this consumer drops it; left claimed it
+        // would come back through every reclaim sweep.
+        for stream_id in malformed {
+            if let Err(e) = self
+                .forward_queue_finish(group_name, consumer_name, &stream_id, None)
+                .await
+            {
+                warn!("Could not drop malformed FORWARD_Q entry {stream_id}: {e}");
             }
         }
 
@@ -265,12 +277,24 @@ impl Database {
                 })?;
 
         let mut entries = Vec::new();
+        let mut malformed = Vec::new();
         for (stream_id, fields) in result.1 {
-            match parse_forward_entry(stream_id, fields) {
+            match parse_forward_entry(stream_id.clone(), fields) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
-                    warn!("Skipping malformed autoclaimed entry: {}", e);
+                    warn!("Dropping malformed FORWARD_Q entry {stream_id}: {e}");
+                    malformed.push(stream_id);
                 }
+            }
+        }
+        // Just claimed by this consumer, so it is this consumer's to drop;
+        // left alone it would be reclaimed, and skipped, on every sweep.
+        for stream_id in malformed {
+            if let Err(e) = self
+                .forward_queue_finish(group_name, consumer_name, &stream_id, None)
+                .await
+            {
+                warn!("Could not drop malformed FORWARD_Q entry {stream_id}: {e}");
             }
         }
 

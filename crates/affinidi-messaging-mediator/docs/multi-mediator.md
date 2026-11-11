@@ -319,7 +319,8 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   messages are held until the same time rather than sent into the failure;
   they were not sent, so they keep their retry budget.
 - **Claims and recovery.** A processor refreshes the claims on everything it
-  holds four times per `reclaim_idle_seconds` (60). An entry whose claim goes
+  holds four times per `reclaim_idle_seconds` (180; keep it at least twice
+  `delivery_timeout_seconds`, which the processor warns about at start). An entry whose claim goes
   idle that long — its processor stopped, or it was left for later (a long
   requested delay, an endpoint's share exceeded) — is taken over by the next
   reclaim sweep of any processor in the group; the sweep follows its cursor

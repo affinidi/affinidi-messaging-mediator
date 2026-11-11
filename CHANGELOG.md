@@ -217,6 +217,7 @@ once on Fjall and Memory, as they already did on Redis.
 
 **Behaviour change (R3.6):** a client that stops reading its socket long
 enough for a mediator write to wait 30 s is disconnected.
+
 ### Changed — forwarding delivers to endpoints concurrently, with per-endpoint backoff
 
 - The forwarding processor delivers to up to `max_concurrent_endpoints`
@@ -243,7 +244,7 @@ enough for a mediator write to wait 30 s is disconnected.
 - Claimed entries are no longer stranded when a processor stops or
   restarts. A processor refreshes the claims on what it holds, and any
   processor takes over an entry whose claim has been idle for
-  `reclaim_idle_seconds` (new, default 60, env
+  `reclaim_idle_seconds` (new, default 180, env
   `PROCESSOR_FORWARDING_RECLAIM_IDLE_SECONDS`). Previously such entries were
   reclaimed but never delivered. The sweep follows its cursor over the whole
   pending list, so idle entries behind a long run of busy ones are reached.
@@ -255,8 +256,14 @@ enough for a mediator write to wait 30 s is disconnected.
   retry, are each one owner-checked write; an entry another processor has
   taken over is left to it. A processor that cannot confirm its claims for
   half of `reclaim_idle_seconds` (its store calls are failing) stops
-  sending, reading and reclaiming until it can. A send already under way at
-  that point completes, so its message can arrive twice; none is lost.
+  sending — including a REST fallback after a WebSocket attempt — reading
+  and reclaiming until it can. A send already under way at that point
+  completes, so its message can arrive twice; none is lost. Keep
+  `reclaim_idle_seconds` at least twice `delivery_timeout_seconds` so such a
+  send ends before another processor can take the entry over; the processor
+  warns at start when it is not. A processor holding all it may skips the
+  reclaim sweep. Reclaimed entries that cannot be parsed are dropped with a
+  warning instead of being reclaimed again and again.
 - Each delivered entry is acked as soon as the peer accepts it, rather than
   with the rest of its batch.
 - A next hop whose URL does not parse, or that the egress policy does not

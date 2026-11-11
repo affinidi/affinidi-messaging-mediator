@@ -78,6 +78,12 @@ pub struct ForwardingConfig {
     /// refreshes its claims four times in this window, so it never loses one
     /// it is still working on. The same sweep picks up a requested delay
     /// longer than `max_backoff_ms` once it is due.
+    ///
+    /// Keep it at least twice `delivery_timeout_seconds`. A processor stops
+    /// starting sends once its claims have gone unconfirmed for half this
+    /// window, but a send already under way runs on for up to the delivery
+    /// timeout; a shorter window lets another processor take the entry over
+    /// and send it too.
     #[serde(default = "default_reclaim_idle_seconds")]
     pub reclaim_idle_seconds: u64,
     /// Redis consumer group name for forwarding processors
@@ -123,7 +129,7 @@ fn default_delivery_timeout_seconds() -> u64 {
 }
 
 fn default_reclaim_idle_seconds() -> u64 {
-    60
+    180
 }
 
 impl Default for ForwardingConfig {

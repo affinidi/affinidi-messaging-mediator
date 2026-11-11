@@ -143,8 +143,8 @@ pub(crate) fn forwarding_config_from_raw(
         reclaim_idle_seconds: match raw.reclaim_idle_seconds.parse() {
             Ok(n) if n > 0 => n,
             _ => {
-                warn_default("reclaim_idle_seconds", "60");
-                60
+                warn_default("reclaim_idle_seconds", "180");
+                180
             }
         },
         consumer_group: raw.consumer_group,
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(config.max_backoff_ms, 60000);
         assert_eq!(config.max_concurrent_endpoints, 32);
         assert_eq!(config.delivery_timeout_seconds, 90);
-        assert_eq!(config.reclaim_idle_seconds, 60);
+        assert_eq!(config.reclaim_idle_seconds, 180);
         assert_eq!(config.consumer_group, "forwarding");
         assert!(!config.accept_invalid_certs);
         assert_eq!(config.max_hops, 10);
@@ -219,7 +219,7 @@ mod tests {
 
             max_concurrent_endpoints: "32".to_string(),
             delivery_timeout_seconds: "90".to_string(),
-            reclaim_idle_seconds: "60".to_string(),
+            reclaim_idle_seconds: "180".to_string(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: "false".to_string(),
             max_hops: "10".to_string(),
@@ -323,7 +323,7 @@ mod tests {
 
             max_concurrent_endpoints: "32".to_string(),
             delivery_timeout_seconds: "90".to_string(),
-            reclaim_idle_seconds: "60".to_string(),
+            reclaim_idle_seconds: "180".to_string(),
             consumer_group: "forwarding".to_string(),
             accept_invalid_certs: "false".to_string(),
             max_hops: "10".to_string(),
@@ -376,7 +376,7 @@ mod tests {
         // Zero would stall or disable delivery, so it is refused like garbage.
         assert_eq!(config.max_concurrent_endpoints, 32);
         assert_eq!(config.delivery_timeout_seconds, 90);
-        assert_eq!(config.reclaim_idle_seconds, 60);
+        assert_eq!(config.reclaim_idle_seconds, 180);
         assert!(!config.accept_invalid_certs); // default false
         assert_eq!(config.max_hops, 10); // default 10
     }

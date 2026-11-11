@@ -3223,6 +3223,7 @@ impl MediatorStore for FjallStore {
                 None => std::ops::Bound::Unbounded,
             };
             let mut entries = Vec::new();
+            let mut malformed: Vec<(u64, u64)> = Vec::new();
             let mut new_last: Option<(u64, u64)> = last;
             for guard in store
                 .forward_queue
@@ -3235,9 +3236,19 @@ impl MediatorStore for FjallStore {
                 let Some(sid) = decode_stream_id(key.as_ref()) else {
                     continue;
                 };
-                let entry: ForwardQueueEntry = Self::decode(&value)?;
-                entries.push((sid, entry));
                 new_last = Some(sid);
+                match Self::decode::<ForwardQueueEntry>(&value) {
+                    Ok(entry) => entries.push((sid, entry)),
+                    // Dropped below, rather than failing every read from here.
+                    Err(e) => {
+                        tracing::warn!(
+                            "Dropping malformed forward queue entry {}-{}: {e}",
+                            sid.0,
+                            sid.1
+                        );
+                        malformed.push(sid);
+                    }
+                }
             }
 
             // Persist the claims and the new cursor in one batch.
@@ -3262,9 +3273,20 @@ impl MediatorStore for FjallStore {
                     encode_stream_id(sid.0, sid.1).to_vec(),
                 );
             }
+            for sid in &malformed {
+                batch.remove(
+                    &store.forward_queue,
+                    encode_stream_id(sid.0, sid.1).to_vec(),
+                );
+            }
             batch
                 .commit()
                 .map_err(|e| Self::db_err("forward_queue_read:commit", e))?;
+            if !malformed.is_empty() {
+                store
+                    .forward_queue_len
+                    .fetch_sub(malformed.len(), Ordering::AcqRel);
+            }
 
             Ok(entries.into_iter().map(|(_, e)| e).collect())
         };
@@ -3418,6 +3440,7 @@ impl MediatorStore for FjallStore {
         // associated queue entries to return.
         let mut batch = self.db.batch();
         let mut entries = Vec::with_capacity(stale.len());
+        let mut dropped = 0usize;
         for (sid, claim) in stale {
             let Some(raw) = self
                 .forward_queue
@@ -3431,6 +3454,21 @@ impl MediatorStore for FjallStore {
                 batch.remove(&self.forward_pending, pending_key(group_name, sid));
                 continue;
             };
+            let entry = match Self::decode::<ForwardQueueEntry>(&raw) {
+                Ok(entry) => entry,
+                // Dropped, claim and all, rather than reclaimed on every sweep.
+                Err(e) => {
+                    tracing::warn!(
+                        "Dropping malformed forward queue entry {}-{}: {e}",
+                        sid.0,
+                        sid.1
+                    );
+                    batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                    batch.remove(&self.forward_queue, encode_stream_id(sid.0, sid.1).to_vec());
+                    dropped += 1;
+                    continue;
+                }
+            };
             let new_claim = StoredPendingClaim {
                 consumer: consumer_name.to_string(),
                 claimed_at_ms: now,
@@ -3441,11 +3479,14 @@ impl MediatorStore for FjallStore {
                 pending_key(group_name, sid),
                 Self::encode(&new_claim)?,
             );
-            entries.push(Self::decode(&raw)?);
+            entries.push(entry);
         }
         batch
             .commit()
             .map_err(|e| Self::db_err("forward_queue_autoclaim:commit", e))?;
+        if dropped > 0 {
+            self.forward_queue_len.fetch_sub(dropped, Ordering::AcqRel);
+        }
         Ok(ForwardQueueClaimPage {
             entries,
             next_cursor,
@@ -5205,6 +5246,56 @@ mod tests {
             store.streaming_is_client_live(&hash("bob"), false).await,
             Some("uuid-2".to_string())
         );
+    }
+
+    /// A forward-queue row that does not decode is dropped, by a read or by
+    /// the reclaim sweep, rather than failing every read or being reclaimed
+    /// on every sweep.
+    #[tokio::test]
+    async fn malformed_forward_queue_rows_are_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // One bad row read fresh, and one already claimed when it went bad.
+        store
+            .forward_queue
+            .insert(encode_stream_id(1, 0).to_vec(), b"not json".to_vec())
+            .expect("insert bad row");
+        store.forward_queue_len.fetch_add(1, Ordering::AcqRel);
+        let good = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        let read = store
+            .forward_queue_read("g", "c1", 10, Duration::ZERO)
+            .await
+            .expect("a bad row does not fail the read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].stream_id, good);
+        assert!(
+            store
+                .forward_queue
+                .get(encode_stream_id(1, 0))
+                .expect("get")
+                .is_none(),
+            "the bad row is gone"
+        );
+
+        let sid = parse_stream_id_string(&good).expect("stream id");
+        store
+            .forward_queue
+            .insert(
+                encode_stream_id(sid.0, sid.1).to_vec(),
+                b"gone bad".to_vec(),
+            )
+            .expect("corrupt the claimed row");
+        let page = store
+            .forward_queue_autoclaim("g", "c2", Duration::ZERO, 10, "0-0")
+            .await
+            .expect("a bad row does not fail the sweep");
+        assert!(page.entries.is_empty());
+        assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
+        assert_eq!(store.forward_queue_len().await.expect("len"), 0);
     }
 
     #[tokio::test]
