@@ -347,7 +347,7 @@ while count < 500 do
         break
     end
     local owner = redis.call('HGET', KEYS[2], popped[1])
-    if owner and string.sub(owner, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. ':' then
+    if owner and string.match(owner, '^([^:]*):') == ARGV[1] then
         redis.call('HDEL', KEYS[2], popped[1])
         redis.call('HDEL', KEYS[3], popped[1])
     end

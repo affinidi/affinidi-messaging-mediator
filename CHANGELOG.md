@@ -35,7 +35,11 @@ owner is one entry there. Two bugs:
     over the mux pub/sub channel and takes the DID back (`reactivated`, with
     an inbox redelivery);
   - a direct socket taking a DID from a mux entry on another instance tells
-    that instance, which reports the member `superseded`.
+    that instance, which reports the member `superseded`;
+  - every 60 s each instance re-reads the owner of each DID it carries as a
+    mux member, so a handoff that was lost (an instance dying between its
+    store write and its publish, or a dropped pub/sub message) leaves a
+    member in the wrong state for a minute at most.
 
   Which kind of owner holds a DID is kept in a new hash beside the owner
   entry (`STREAMING_KIND`), with `STREAMING_WAITING` for the mux entries

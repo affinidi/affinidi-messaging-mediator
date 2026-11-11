@@ -83,7 +83,7 @@ static RELEASE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(||
         r#"
 redis.call('SREM', KEYS[1], ARGV[1])
 local cur = redis.call('HGET', KEYS[2], ARGV[1])
-if cur and string.sub(cur, 1, string.len(ARGV[2]) + 1) == ARGV[2] .. ':' then
+if cur and string.match(cur, '^([^:]*):') == ARGV[2] then
   redis.call('HDEL', KEYS[2], ARGV[1])
   redis.call('HDEL', KEYS[4], ARGV[1])
   if redis.call('SREM', KEYS[3], ARGV[1]) == 1 then
