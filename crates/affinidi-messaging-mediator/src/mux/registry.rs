@@ -258,6 +258,17 @@ impl MuxConn {
     }
 }
 
+/// [`MuxRegistry::summary`]: this instance's mux connections and members.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MuxSummary {
+    pub connections: u64,
+    pub members: u64,
+    pub by_grant: u64,
+    pub by_attach: u64,
+    /// Members whose live traffic another connection holds.
+    pub inactive: u64,
+}
+
 /// All live mux connections, by session id and by principal.
 #[derive(Default)]
 pub struct MuxRegistry {
@@ -290,6 +301,29 @@ impl MuxRegistry {
     /// Every live mux connection on this instance.
     pub fn all(&self) -> Vec<Arc<MuxConn>> {
         self.conns.iter().map(|c| c.value().clone()).collect()
+    }
+
+    /// Counts across every live mux connection on this instance, for
+    /// `messaging/stats/show`. Each connection's session is locked in turn,
+    /// never two at once.
+    pub async fn summary(&self) -> MuxSummary {
+        let mut out = MuxSummary::default();
+        for conn in self.all() {
+            out.connections += 1;
+            let inactive = conn.inactive.lock().await.clone();
+            let s = conn.session.lock().await;
+            for m in s.members() {
+                out.members += 1;
+                match m.source {
+                    super::session::MuxSource::Grant { .. } => out.by_grant += 1,
+                    super::session::MuxSource::Attach => out.by_attach += 1,
+                }
+                if inactive.contains(&m.did_hash) {
+                    out.inactive += 1;
+                }
+            }
+        }
+        out
     }
 
     /// The live mux connections of `principal_hash` on this instance.

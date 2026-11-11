@@ -1529,7 +1529,7 @@ impl App {
             Some("halfOpen") => Color::Yellow,
             _ => Color::Green,
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(format!(
                 "version {}   up {}",
                 get("/version").as_str().unwrap_or("–"),
@@ -1563,6 +1563,12 @@ impl App {
                 ),
             ]),
         ];
+        // DID multiplexing, when the mediator reports it (an extension member
+        // of `stats/show`; counts are for the instance answering).
+        let mux = get("/ext/com.affinidi.mux");
+        if mux.is_object() {
+            lines.push(Line::from(mux_summary_line(&mux)));
+        }
         f.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Mediator ")),
             top[0],
@@ -2031,13 +2037,23 @@ impl App {
                         })
                         .unwrap_or_default()
                 };
+                let action = pick(&["action"]);
+                // DID-multiplexing decisions (grants suspended under the
+                // unknown-key rule, revoked, an epoch advanced) stand out:
+                // each one cut a device off from a DID.
+                let style = if is_mux_action(&action) {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default()
+                };
                 Row::new(vec![
                     pick(&["at", "timestamp", "recordedAt"]),
                     label(&self.book, &pick(&["actor"])),
-                    pick(&["action"]),
+                    action,
                     label(&self.book, &pick(&["target", "subject"])),
                     pick(&["summary", "detail", "description"]),
                 ])
+                .style(style)
             })
             .collect();
         f.render_widget(
@@ -2741,8 +2757,55 @@ fn human_bytes(b: Option<u64>) -> String {
     }
 }
 
+/// Whether an audit `action` is a DID-multiplexing one (`mux_grant_suspend`,
+/// `mux_grant_revoke`, `mux_revoke_all`, and any later `mux_` action).
+fn is_mux_action(action: &str) -> bool {
+    action.starts_with("mux_")
+}
+
+/// The dashboard line for `stats/show`'s `com.affinidi.mux` extension.
+fn mux_summary_line(mux: &Value) -> String {
+    let n = |k: &str| mux[k].as_u64().unwrap_or(0);
+    let mut line = format!(
+        "mux {} connections, {} members ({} grant, {} attach)",
+        n("connections"),
+        n("members"),
+        n("membersByGrant"),
+        n("membersByAttach")
+    );
+    if n("membersInactive") > 0 {
+        line.push_str(&format!(", {} inactive", n("membersInactive")));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mux_audit_actions_are_recognised() {
+        for a in ["mux_grant_suspend", "mux_grant_revoke", "mux_revoke_all"] {
+            assert!(super::is_mux_action(a), "{a}");
+        }
+        assert!(!super::is_mux_action("account_remove"));
+    }
+
+    #[test]
+    fn the_mux_summary_line_reads_the_extension() {
+        let mux = serde_json::json!({
+            "scope": "instance", "connections": 2, "members": 5,
+            "membersByGrant": 4, "membersByAttach": 1, "membersInactive": 1
+        });
+        assert_eq!(
+            super::mux_summary_line(&mux),
+            "mux 2 connections, 5 members (4 grant, 1 attach), 1 inactive"
+        );
+        let quiet = serde_json::json!({ "connections": 0, "members": 0 });
+        assert_eq!(
+            super::mux_summary_line(&quiet),
+            "mux 0 connections, 0 members (0 grant, 0 attach)"
+        );
+    }
+
     use super::*;
 
     #[test]
