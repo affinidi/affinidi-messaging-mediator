@@ -54,6 +54,11 @@ pub mod s3_target;
 /// rule governs every path any of them reads.
 pub mod config_path;
 
+/// Hiding the credentials in a URL before it is printed. Pure (`std` only),
+/// always built: shared by the config structs' `Debug`, the storage startup
+/// errors and the `config/show` Trust Task, so they all hide the same part.
+pub mod redact;
+
 #[cfg(feature = "server")]
 pub mod circuit_breaker;
 /// Database wiring: the lean `DatabaseConfig` serde struct is always

@@ -12,6 +12,8 @@ pub mod keys;
 #[cfg(feature = "redis-backend")]
 use crate::errors::MediatorError;
 #[cfg(feature = "redis-backend")]
+use crate::redact::redact_url;
+#[cfg(feature = "redis-backend")]
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
 #[cfg(feature = "redis-backend")]
 use axum::http::StatusCode;
@@ -127,11 +129,12 @@ impl DatabaseHandler {
                 ProblemReportScope::Protocol,
                 "me.res.storage.url",
                 "Database URL ({1}) is invalid. Reason: {2}",
-                vec![config.database_url.clone(), err.to_string()],
+                vec![redact_url(&config.database_url), err.to_string()],
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
                     "Database URL ({}) is invalid. Reason: {}",
-                    config.database_url, err
+                    redact_url(&config.database_url),
+                    err
                 ),
             )
         })?;
@@ -292,11 +295,12 @@ impl DatabaseHandler {
                     ProblemReportScope::Protocol,
                     "me.res.storage.url",
                     "Database URL ({1}) is invalid. Reason: {2}",
-                    vec![config.database_url.clone(), err.to_string()],
+                    vec![redact_url(&config.database_url), err.to_string()],
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!(
                         "Database URL ({}) is invalid. Reason: {}",
-                        config.database_url, err
+                        redact_url(&config.database_url),
+                        err
                     ),
                 )
             })?;

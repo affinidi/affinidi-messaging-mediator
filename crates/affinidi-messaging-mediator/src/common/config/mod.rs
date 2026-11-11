@@ -1608,4 +1608,22 @@ mod database_config_tests {
     fn cluster_mode_typo_falls_back_to_off() {
         assert!(!database_config_from_raw(raw("ture")).cluster_mode);
     }
+
+    /// The startup log prints the whole `Config` with `{:#?}`.
+    #[tokio::test]
+    async fn config_debug_hides_database_url_credentials() {
+        for url in ["redis://:pw@h/", "redis://user:pw@h/"] {
+            let (secrets, _h) = ThreadedSecretsResolver::new(None).await;
+            let mut config = Config::headless(Arc::new(secrets));
+            config.database.database_url = url.into();
+            let text = format!("{config:#?}");
+            assert!(!text.contains("pw"), "{text}");
+            assert!(text.contains("redis://***@h/"), "{text}");
+
+            let mut raw = raw("");
+            raw.database_url = url.into();
+            let text = format!("{raw:#?}");
+            assert!(!text.contains("pw"), "{text}");
+        }
+    }
 }

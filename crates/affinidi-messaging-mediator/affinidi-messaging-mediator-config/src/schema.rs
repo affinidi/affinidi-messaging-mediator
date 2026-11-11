@@ -1,6 +1,7 @@
 //! Top-level raw config schema (`[server]`, `[streaming]`, `[did_resolver]`,
 //! `[secrets]`, `[storage]`, and the `ConfigRaw` root).
 
+use affinidi_messaging_mediator_common::redact::redact_url;
 use serde::{Deserialize, Serialize};
 
 use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw};
@@ -15,7 +16,10 @@ use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw};
 /// schema, so it lives here; the resolved `DatabaseConfig` (with circuit-breaker
 /// tuning, used by the runtime `DatabaseHandler`) stays in mediator-common, and
 /// the mediator converts between them.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand so `database_url` prints with its credentials
+/// replaced.
+#[derive(Serialize, Deserialize)]
 pub struct DatabaseConfigRaw {
     pub functions_file: String,
     pub database_url: String,
@@ -24,6 +28,18 @@ pub struct DatabaseConfigRaw {
     /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
     #[serde(default)]
     pub cluster_mode: String,
+}
+
+impl std::fmt::Debug for DatabaseConfigRaw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfigRaw")
+            .field("functions_file", &self.functions_file)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("database_timeout", &self.database_timeout)
+            .field("scripts_path", &self.scripts_path)
+            .field("cluster_mode", &self.cluster_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

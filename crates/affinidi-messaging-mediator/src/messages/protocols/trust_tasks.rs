@@ -33,6 +33,7 @@ use crate::task_specs::{audit, config};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::redact::redact_url;
 use affinidi_messaging_mediator_common::types::accounts::{Account, AccountType};
 use affinidi_messaging_mediator_common::types::acls::{
     ACLError, AccessListModeType, MediatorACLSet,
@@ -2099,19 +2100,6 @@ fn redact_strings(value: &Value) -> Value {
     }
 }
 
-/// `s` with the userinfo of a `scheme://user:password@host` URL replaced; any
-/// other string unchanged.
-fn redact_url(s: &str) -> String {
-    let Some((scheme, rest)) = s.split_once("://") else {
-        return s.to_string();
-    };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
-        None => s.to_string(),
-    }
-}
-
 /// Map the mediator's internal [`Account`] to the wire `account/get` shape.
 ///
 /// The DID is carried as the mediator's account hash — a valid `Vid` per the
@@ -3049,8 +3037,9 @@ mod config_show_tests {
         assert_eq!(redact_url("redis://user:pw@host/"), "redis://***@host/");
         assert_eq!(redact_url("redis://127.0.0.1/"), "redis://127.0.0.1/");
         assert_eq!(redact_url("did:web:example.com"), "did:web:example.com");
-        // An `@` in the path is not userinfo.
-        assert_eq!(redact_url("https://h/a@b"), "https://h/a@b");
+        // Any `@` is treated as ending userinfo, so a malformed password
+        // (unencoded `/`) is still hidden.
+        assert_eq!(redact_url("redis://:pa/ss@host/"), "redis://***@host/");
     }
 
     #[test]
