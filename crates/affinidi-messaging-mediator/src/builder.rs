@@ -468,10 +468,22 @@ impl MediatorBuilder {
     /// docs for what that widens and what it deliberately does not.
     #[cfg(feature = "didcomm-v1")]
     pub fn didcomm_v1(mut self, enabled: bool, allow_unauthenticated_forwards: bool) -> Self {
-        self.config.didcomm_v1 = crate::common::config::DidCommV1Config {
-            enabled,
-            allow_unauthenticated_forwards,
-        };
+        self.config.didcomm_v1.enabled = enabled;
+        self.config.didcomm_v1.allow_unauthenticated_forwards = allow_unauthenticated_forwards;
+        self
+    }
+
+    /// DIDComm v1 `keylist-update` policy: whether a client may register a
+    /// routing key other than the one it authenticated with, and how many
+    /// routing keys one account may hold. See the `[didcomm_v1]` config docs.
+    #[cfg(feature = "didcomm-v1")]
+    pub fn didcomm_v1_routing_keys(
+        mut self,
+        allow_unproven_routing_keys: bool,
+        max_routing_keys_per_account: u32,
+    ) -> Self {
+        self.config.didcomm_v1.allow_unproven_routing_keys = allow_unproven_routing_keys;
+        self.config.didcomm_v1.max_routing_keys_per_account = max_routing_keys_per_account;
         self
     }
 

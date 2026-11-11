@@ -321,6 +321,10 @@ pub struct TestMediatorBuilder {
     /// it off, matching a production mediator that has not opted in.
     #[cfg(feature = "didcomm-v1")]
     didcomm_v1: Option<(bool, bool)>,
+    /// DIDComm v1 keylist policy: `(allow_unproven_routing_keys,
+    /// max_routing_keys_per_account)`. `None` keeps the production defaults.
+    #[cfg(feature = "didcomm-v1")]
+    didcomm_v1_routing_keys: Option<(bool, u32)>,
     /// Override for `SecurityConfig.global_acl_default`. `None` keeps the
     /// production default (`MediatorACLSet::default()`).
     global_acl_default: Option<MediatorACLSet>,
@@ -392,6 +396,8 @@ impl Default for TestMediatorBuilder {
             acl_mode: None,
             #[cfg(feature = "didcomm-v1")]
             didcomm_v1: None,
+            #[cfg(feature = "didcomm-v1")]
+            didcomm_v1_routing_keys: None,
             global_acl_default: None,
             local_direct_delivery_allowed: None,
             local_direct_delivery_allow_anon: None,
@@ -598,6 +604,21 @@ impl TestMediatorBuilder {
     #[cfg(feature = "didcomm-v1")]
     pub fn didcomm_v1(mut self, enabled: bool, allow_unauthenticated_forwards: bool) -> Self {
         self.didcomm_v1 = Some((enabled, allow_unauthenticated_forwards));
+        self
+    }
+
+    /// DIDComm v1 `keylist-update` policy. `allow_unproven_routing_keys`
+    /// lets a client register keys other than the one it authenticates with,
+    /// as Aries wallets do; `max_routing_keys_per_account` caps how many one
+    /// account holds. Unset, the production defaults apply.
+    #[cfg(feature = "didcomm-v1")]
+    pub fn didcomm_v1_routing_keys(
+        mut self,
+        allow_unproven_routing_keys: bool,
+        max_routing_keys_per_account: u32,
+    ) -> Self {
+        self.didcomm_v1_routing_keys =
+            Some((allow_unproven_routing_keys, max_routing_keys_per_account));
         self
     }
 
@@ -1038,6 +1059,10 @@ impl TestMediatorBuilder {
         #[cfg(feature = "didcomm-v1")]
         if let Some((enabled, allow_anon)) = self.didcomm_v1 {
             builder = builder.didcomm_v1(enabled, allow_anon);
+        }
+        #[cfg(feature = "didcomm-v1")]
+        if let Some((allow_unproven, max_keys)) = self.didcomm_v1_routing_keys {
+            builder = builder.didcomm_v1_routing_keys(allow_unproven, max_keys);
         }
         if let Some(clock) = self.clock.clone() {
             builder = builder.clock(clock);

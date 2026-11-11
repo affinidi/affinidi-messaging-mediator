@@ -111,10 +111,21 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 30 * 86_400; // 30 days
 /// Typed `[didcomm_v1]` settings. See
 /// [`DidCommV1ConfigRaw`](affinidi_messaging_mediator_config::DidCommV1ConfigRaw)
 /// for what each knob means and why `allow_unauthenticated_forwards` exists.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DidCommV1Config {
     pub enabled: bool,
     pub allow_unauthenticated_forwards: bool,
+    /// `keylist-update` may register a key other than the request's own
+    /// authenticated verkey.
+    pub allow_unproven_routing_keys: bool,
+    /// Most routing keys one account may hold.
+    pub max_routing_keys_per_account: u32,
+}
+
+impl Default for DidCommV1Config {
+    fn default() -> Self {
+        affinidi_messaging_mediator_config::DidCommV1ConfigRaw::default().into()
+    }
 }
 
 impl From<affinidi_messaging_mediator_config::DidCommV1ConfigRaw> for DidCommV1Config {
@@ -122,6 +133,8 @@ impl From<affinidi_messaging_mediator_config::DidCommV1ConfigRaw> for DidCommV1C
         Self {
             enabled: raw.enabled,
             allow_unauthenticated_forwards: raw.allow_unauthenticated_forwards,
+            allow_unproven_routing_keys: raw.allow_unproven_routing_keys,
+            max_routing_keys_per_account: raw.max_routing_keys_per_account,
         }
     }
 }

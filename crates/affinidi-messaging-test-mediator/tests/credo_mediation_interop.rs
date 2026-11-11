@@ -115,6 +115,9 @@ impl Client {
 async fn mediator_answers_credos_own_requests() {
     let mediator = TestMediator::builder()
         .didcomm_v1(true, true)
+        // Credo registers a fresh key per connection, not the key it
+        // authenticates with; accepting that is opt-in.
+        .didcomm_v1_routing_keys(true, 256)
         .global_acl_default(MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap())
         .spawn()
         .await

@@ -56,6 +56,13 @@ const MAX_DELIVERY_LIMIT: u32 = 100;
 /// Cap on `message_id_list` in one `messages-received`.
 const MAX_ACK_IDS: usize = 100;
 
+/// Cap on `updates` in one `keylist-update`.
+///
+/// Each entry costs store round trips, so one request must not be able to
+/// queue an unbounded amount of work. The per-account total is a separate,
+/// configured limit (`[didcomm_v1] max_routing_keys_per_account`).
+const MAX_KEYLIST_UPDATES: usize = 100;
+
 /// A v1 request the mediator answers directly, rather than routing.
 pub(crate) enum V1Request {
     CoordinateMediation(cm::CoordinateMediation),
@@ -99,6 +106,9 @@ pub(crate) async fn handle(
 struct ClientAccount {
     did: String,
     did_hash: String,
+    /// The verkey that authenticated this request: the one key the client has
+    /// shown the mediator it holds.
+    verkey: Verkey,
 }
 
 async fn client_account(
@@ -133,7 +143,11 @@ async fn client_account(
             .await?;
     }
 
-    Ok(ClientAccount { did, did_hash })
+    Ok(ClientAccount {
+        did,
+        did_hash,
+        verkey: *sender,
+    })
 }
 
 async fn coordinate_mediation(
@@ -154,15 +168,7 @@ async fn coordinate_mediation(
             // Reached when `global_acl_default` does not grant receive; the
             // operator either intends that (and v1 clients are not welcome) or
             // has misconfigured it, and both are better surfaced than hidden.
-            let can_receive = state
-                .database
-                .get_did_acl(&account.did_hash)
-                .await?
-                .is_some_and(|acls| {
-                    authz::require_capability(&acls, Capability::ReceiveMessages).is_ok()
-                });
-
-            if !can_receive {
+            if !account_can_receive(state, account).await? {
                 warn!(
                     did = %account.did,
                     "denying v1 mediation: the account is not permitted to receive messages, so \
@@ -195,9 +201,36 @@ async fn coordinate_mediation(
                 )
             })?;
 
+            if updates.len() > MAX_KEYLIST_UPDATES {
+                return Err(v1_problem(
+                    session,
+                    37,
+                    "message.didcomm_v1.keylist",
+                    format!(
+                        "keylist-update lists {} updates, exceeding the maximum of \
+                         {MAX_KEYLIST_UPDATES}",
+                        updates.len()
+                    ),
+                    StatusCode::BAD_REQUEST,
+                ));
+            }
+
+            // Adding a key is only meaningful for an account mediation would
+            // be granted to, the same precondition `mediate-request` applies.
+            // Read once for the batch; removes do not need it, so a client can
+            // always clean up after itself.
+            let can_receive = if updates
+                .iter()
+                .any(|u| matches!(u.action, cm::KeylistAction::Add))
+            {
+                account_can_receive(state, account).await?
+            } else {
+                false
+            };
+
             let mut results = Vec::with_capacity(updates.len());
             for update in updates {
-                let result = apply_keylist_update(state, account, &update).await;
+                let result = apply_keylist_update(state, account, can_receive, &update).await;
                 results.push(cm::KeylistUpdated {
                     recipient_key: update.recipient_key,
                     action: update.action,
@@ -249,42 +282,31 @@ async fn coordinate_mediation(
     }
 }
 
+/// Whether the account holds `RECEIVE_MESSAGES` — the condition for granting
+/// mediation, and so for registering routing keys that would route to it.
+async fn account_can_receive(
+    state: &SharedData,
+    account: &ClientAccount,
+) -> Result<bool, MediatorError> {
+    Ok(state
+        .database
+        .get_did_acl(&account.did_hash)
+        .await?
+        .is_some_and(|acls| authz::require_capability(&acls, Capability::ReceiveMessages).is_ok()))
+}
+
 /// Apply one keylist change, reporting the per-key outcome rather than failing
 /// the whole batch — RFC 0211 expects a result for every entry.
 async fn apply_keylist_update(
     state: &SharedData,
     account: &ClientAccount,
+    can_receive: bool,
     update: &cm::KeylistUpdate,
 ) -> cm::KeylistResult {
     let verkey = update.recipient_key.to_base58();
 
     match update.action {
-        cm::KeylistAction::Add => {
-            match state.database.v1_routing_key_lookup(&verkey).await {
-                // Already ours: nothing to do, and say so rather than claiming
-                // to have made a change.
-                Ok(Some(owner)) if owner == account.did => cm::KeylistResult::NoChange,
-                // Someone else's key. Refusing is the whole point of the
-                // exclusive binding — granting it would hand this client
-                // another account's inbound traffic.
-                Ok(Some(_)) => cm::KeylistResult::ClientError,
-                Ok(None) => match state
-                    .database
-                    .v1_routing_key_bind(&verkey, &account.did)
-                    .await
-                {
-                    Ok(()) => cm::KeylistResult::Success,
-                    Err(e) => {
-                        warn!(%verkey, error = %e, "v1 keylist add failed");
-                        cm::KeylistResult::ServerError
-                    }
-                },
-                Err(e) => {
-                    warn!(%verkey, error = %e, "v1 keylist lookup failed");
-                    cm::KeylistResult::ServerError
-                }
-            }
-        }
+        cm::KeylistAction::Add => add_routing_key(state, account, can_receive, update).await,
 
         cm::KeylistAction::Remove => {
             match state.database.v1_routing_key_lookup(&verkey).await {
@@ -314,6 +336,131 @@ async fn apply_keylist_update(
         // `KeylistAction` is `#[non_exhaustive]`.
         _ => cm::KeylistResult::ClientError,
     }
+}
+
+/// Register one routing key for `account`. Every refusal is `client_error`,
+/// so the reply does not say which rule applied; the reason is logged.
+async fn add_routing_key(
+    state: &SharedData,
+    account: &ClientAccount,
+    can_receive: bool,
+    update: &cm::KeylistUpdate,
+) -> cm::KeylistResult {
+    let verkey = update.recipient_key.to_base58();
+    let policy = &state.config.didcomm_v1;
+
+    if !can_receive {
+        warn!(
+            did = %account.did,
+            %verkey,
+            "v1 keylist add refused: the account is not permitted to receive messages"
+        );
+        return cm::KeylistResult::ClientError;
+    }
+
+    // Coordinate-mediation 1.0 lets a client list any key, with nothing to
+    // show it holds one. The key that authenticated this request is the only
+    // one it has demonstrably used, so by default it is the only one it may
+    // register. Deployments serving Aries wallets, which register a new key
+    // per connection, opt in to accepting the others.
+    if update.recipient_key != account.verkey && !policy.allow_unproven_routing_keys {
+        warn!(
+            did = %account.did,
+            %verkey,
+            "v1 keylist add refused: the key is not the one that authenticated the request \
+             and [didcomm_v1] allow_unproven_routing_keys is off"
+        );
+        return cm::KeylistResult::ClientError;
+    }
+
+    match state.database.v1_routing_key_lookup(&verkey).await {
+        // Already ours: nothing to do, and say so rather than claiming to have
+        // made a change.
+        Ok(Some(owner)) if owner == account.did => return cm::KeylistResult::NoChange,
+        // Someone else's key. It stays where it is: moving it would hand this
+        // client another account's inbound traffic.
+        Ok(Some(_)) => {
+            warn!(
+                did = %account.did,
+                %verkey,
+                "v1 keylist add refused: the key is registered to another account"
+            );
+            return cm::KeylistResult::ClientError;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(%verkey, error = %e, "v1 keylist lookup failed");
+            return cm::KeylistResult::ServerError;
+        }
+    }
+
+    let max = policy.max_routing_keys_per_account as usize;
+    match held_routing_keys(state, account).await {
+        Ok(held) if held >= max => {
+            warn!(
+                did = %account.did,
+                %verkey,
+                held,
+                max,
+                "v1 keylist add refused: the account holds the maximum number of routing keys"
+            );
+            return cm::KeylistResult::ClientError;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(%verkey, error = %e, "v1 keylist count failed");
+            return cm::KeylistResult::ServerError;
+        }
+    }
+
+    if let Err(e) = state
+        .database
+        .v1_routing_key_bind(&verkey, &account.did)
+        .await
+    {
+        warn!(%verkey, error = %e, "v1 keylist add failed");
+        return cm::KeylistResult::ServerError;
+    }
+
+    // Concurrent adds for one account can each pass the count above. Count
+    // again now that this key is in, and take it back out if the account went
+    // over: two racing requests may then both be refused, never both kept.
+    let refused = match held_routing_keys(state, account).await {
+        Ok(held) if held <= max => return cm::KeylistResult::Success,
+        Ok(held) => {
+            warn!(
+                did = %account.did,
+                %verkey,
+                held,
+                max,
+                "v1 keylist add withdrawn: a concurrent add took the account over its limit"
+            );
+            cm::KeylistResult::ClientError
+        }
+        Err(e) => {
+            warn!(%verkey, error = %e, "v1 keylist recount failed; withdrawing the add");
+            cm::KeylistResult::ServerError
+        }
+    };
+    match state.database.v1_routing_key_unbind(&verkey).await {
+        Ok(_) => refused,
+        Err(e) => {
+            warn!(%verkey, error = %e, "v1 keylist add could not be withdrawn");
+            cm::KeylistResult::ServerError
+        }
+    }
+}
+
+/// How many routing keys the account holds now.
+async fn held_routing_keys(
+    state: &SharedData,
+    account: &ClientAccount,
+) -> Result<usize, MediatorError> {
+    Ok(state
+        .database
+        .v1_routing_keys_for(&account.did_hash)
+        .await?
+        .len())
 }
 
 async fn message_pickup(

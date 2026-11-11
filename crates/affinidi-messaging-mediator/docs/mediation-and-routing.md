@@ -64,6 +64,21 @@ does not have one. A v2 `did:key` client already holds what the keylist would
 have produced — which is the underlying reason it needs no keylist, and why
 that is unlikely to change.
 
+The rules for registering keys:
+
+- By default a client can register only the verkey that authenticated its
+  `keylist-update`. Coordinate-mediation 1.0 carries no proof that a client
+  holds any other key it lists. Aries wallets register a new key per
+  connection, so they need `[didcomm_v1] allow_unproven_routing_keys = true`.
+- A key belongs to one account. Another account's add for it is refused, and
+  the key is never moved.
+- An account holds at most `[didcomm_v1] max_routing_keys_per_account` keys
+  (default 256).
+- One request carries at most 100 updates.
+- An add needs `RECEIVE_MESSAGES`, the same condition `mediate-request`
+  applies.
+- Every refused add is answered `client_error`, and the reason is logged.
+
 v1 support is compile-gated (`--features didcomm-v1`) and additive.
 
 ---

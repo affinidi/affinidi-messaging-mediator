@@ -144,7 +144,7 @@ pub struct ConfigRaw {
 /// Requires the mediator to be built with the `didcomm-v1` feature; the binary
 /// warns and ignores the section otherwise, rather than pretending v1 traffic
 /// will be handled.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DidCommV1ConfigRaw {
     /// Accept inbound DIDComm v1 forwards. Default `false`.
     #[serde(default)]
@@ -164,6 +164,45 @@ pub struct DidCommV1ConfigRaw {
     /// per-IP rate limiter.
     #[serde(default)]
     pub allow_unauthenticated_forwards: bool,
+    /// Let `keylist-update` register a routing key other than the one that
+    /// authenticated the request.
+    ///
+    /// Default `false`: a client may register only the verkey it authcrypted
+    /// the request with, which is the one key the mediator has seen it hold.
+    /// Coordinate-mediation 1.0 carries no proof that a client holds any
+    /// *other* key it lists, and Aries wallets register a fresh key per
+    /// connection, so `true` is required for stock Aries interop. With it on,
+    /// a key is registered to whichever account claims it first; it is never
+    /// moved to another account, the account must be able to receive, and
+    /// `max_routing_keys_per_account` still applies.
+    #[serde(default)]
+    pub allow_unproven_routing_keys: bool,
+    /// Most routing keys one account may hold. Default
+    /// [`DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT`]. An add that would exceed it
+    /// is refused for that key; `0` refuses every add.
+    #[serde(default = "default_max_v1_routing_keys_per_account")]
+    pub max_routing_keys_per_account: u32,
+}
+
+/// Default for `[didcomm_v1] max_routing_keys_per_account`.
+///
+/// Room for a wallet with a few hundred connections; `keylist-query` returns
+/// the whole list in one reply, so this also bounds that reply.
+pub const DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT: u32 = 256;
+
+fn default_max_v1_routing_keys_per_account() -> u32 {
+    DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT
+}
+
+impl Default for DidCommV1ConfigRaw {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_unauthenticated_forwards: false,
+            allow_unproven_routing_keys: false,
+            max_routing_keys_per_account: DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT,
+        }
+    }
 }
 
 /// `[storage]` section — selects the mediator's storage backend.
