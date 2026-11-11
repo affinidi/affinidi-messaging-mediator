@@ -449,7 +449,7 @@ async fn member_standing(
     standing(ctx.store, ctx.default_acl, member_hash, scope).await
 }
 
-/// [`member_standing`] against the store alone, for re-checking a member
+/// `member_standing` against the store alone, for re-checking a member
 /// already on a connection: at admission and again while it stays (the
 /// periodic sweep, and each pickup or delete made for it).
 pub async fn standing(

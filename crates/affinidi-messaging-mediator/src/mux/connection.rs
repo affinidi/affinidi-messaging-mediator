@@ -843,7 +843,7 @@ async fn apply_standing(
 }
 
 /// Re-check `member`'s standing from the store and act on it
-/// ([`apply_standing`]).
+/// (`apply_standing`).
 pub async fn check_member(state: &SharedData, conn: &MuxConn, member: &MuxMember) -> Standing {
     let standing = member_standing(state, member).await;
     apply_standing(state, conn, member, standing).await
