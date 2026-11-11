@@ -64,10 +64,6 @@ async fn authenticating_and_receiving_are_recorded() {
         .expect("read activity");
     let after = unix_secs();
     let within = |t: Option<u64>| t.is_some_and(|t| (before..=after).contains(&t));
-    // Over the wire (0.2) the same times are RFC 3339 timestamps.
-    let within_at = |t: Option<chrono::DateTime<chrono::Utc>>| {
-        within(t.and_then(|t| u64::try_from(t.timestamp()).ok()))
-    };
 
     assert!(
         within(got[0].last_authenticated),
@@ -104,6 +100,15 @@ async fn authenticating_and_receiving_are_recorded() {
         .account_get_with_activity(&bob.profile, None, true)
         .await
         .expect("bob reads his own account, asking for activity");
+    // Bob authenticated when his websocket opened, after `after` was taken
+    // above: a second boundary in between used to fail this test. The wire
+    // times are checked against a window that ends now.
+    let after_wire = unix_secs();
+    // Over the wire (0.2) the times are RFC 3339 timestamps.
+    let within_at = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.and_then(|t| u64::try_from(t.timestamp()).ok())
+            .is_some_and(|t| (before..=after_wire).contains(&t))
+    };
     assert!(
         within_at(asked.last_received_at),
         "the message alice sent: {:?}",
