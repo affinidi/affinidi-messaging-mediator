@@ -1,4 +1,3 @@
-#[cfg(feature = "didcomm")]
 use crate::SharedData;
 use crate::common::session::SessionClaims;
 // Production token creation now takes `now` from the injected clock; the only
@@ -13,12 +12,12 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
+use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
 use http::StatusCode;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rand::{RngExt, distr::Alphanumeric};
 use sha256::digest;
-#[cfg(feature = "didcomm")]
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Unpack an authentication envelope and enforce the signed-AND-encrypted
 /// invariant in a single place, shared by the `authenticate` response and
@@ -148,9 +147,24 @@ pub(super) fn _create_refresh_token(
         exp: (now + expiry),
     };
 
+    // EdDSA signatures are deterministic, so without a unique claim two
+    // refresh tokens issued for one session in the same second are the same
+    // string, and rotating from one to the other would change nothing. The
+    // `jti` makes every issued token, and so its stored hash, distinct.
+    // Decoders read `SessionClaims` and ignore it.
+    #[derive(serde::Serialize)]
+    struct RefreshClaims<'a> {
+        #[serde(flatten)]
+        claims: &'a SessionClaims,
+        jti: String,
+    }
+
     let refresh_token = encode(
         &Header::new(jsonwebtoken::Algorithm::EdDSA),
-        &refresh_claims,
+        &RefreshClaims {
+            claims: &refresh_claims,
+            jti: create_random_string(22),
+        },
         encoding_key,
     )
     .map_err(|err| {
@@ -171,6 +185,54 @@ pub(super) fn _create_refresh_token(
     let token_hash = digest(&refresh_token);
 
     Ok((refresh_token, refresh_claims.exp, token_hash))
+}
+
+/// Give a DID its account once it has proved control of its keys.
+///
+/// `/authenticate/challenge` is unauthenticated, so it only applies the
+/// admission checks and never writes an account: a DID is registered here,
+/// after the challenge is answered, and before any token is issued.
+///
+/// - Already registered: nothing to do.
+/// - Unknown under `explicit_allow`: rejected with the same problem report
+///   the challenge step uses for a blocked DID. The challenge step already
+///   refuses unknown DIDs in this mode, so reaching here means an admin
+///   removed the account after the challenge was issued, which is a
+///   revocation, not a reason to recreate it.
+/// - Unknown under `explicit_deny`: registered with `global_acl_default`.
+pub(super) async fn register_account_after_proof(
+    state: &SharedData,
+    did_hash: &str,
+) -> Result<(), MediatorError> {
+    if state.database.account_exists(did_hash).await? {
+        debug!("DID({}) already registered", did_hash);
+        return Ok(());
+    }
+
+    if state.config.security.mediator_acl_mode == AccessListModeType::ExplicitAllow {
+        info!(
+            "DID({}) has no account and mediator_acl_mode is explicit_allow — rejecting",
+            did_hash
+        );
+        return Err(MediatorError::problem(
+            25,
+            "",
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "authentication.blocked",
+            "DID is blocked",
+            vec![],
+            StatusCode::FORBIDDEN,
+        ));
+    }
+
+    state
+        .database
+        .account_add(did_hash, &state.config.security.global_acl_default, None)
+        .await?;
+
+    Ok(())
 }
 
 /// The login could not apply the mux unknown-key rule; the client retries.
@@ -295,6 +357,29 @@ mod tests {
         assert!(!token.is_empty(), "token should not be empty");
         assert!(exp > 0, "expiry should be positive");
         assert!(!hash.is_empty(), "hash should not be empty");
+    }
+
+    #[test]
+    fn refresh_tokens_issued_in_one_second_differ() {
+        let (encoding_key, decoding_key) = test_ed25519_keys();
+        let now = unix_timestamp_secs();
+        let (a, _, hash_a) =
+            _create_refresh_token("did:example:abc", "session-5", 3600, now, &encoding_key)
+                .unwrap();
+        let (b, _, hash_b) =
+            _create_refresh_token("did:example:abc", "session-5", 3600, now, &encoding_key)
+                .unwrap();
+        assert_ne!(a, b);
+        assert_ne!(hash_a, hash_b);
+
+        // Still decodes as the session claims every reader expects.
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_audience(&["ATM"]);
+        let claims = decode::<SessionClaims>(&a, &decoding_key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.session_id, "session-5");
+        assert_eq!(claims.sub, "did:example:abc");
     }
 
     #[test]

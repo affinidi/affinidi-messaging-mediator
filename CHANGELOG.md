@@ -70,6 +70,50 @@ members whose own socket is online elsewhere as inactive, and later
   "Database URL is invalid" error. The helper is shared as
   `affinidi_messaging_mediator_common::redact::redact_url`.
 
+### Changed — token refresh is bound to the session's DID and is single-use
+
+- `/authenticate/refresh` now requires the authcrypt sender, the inner
+  message's `from` and the refresh token's subject to name the DID that owns
+  the session. A refresh sent from any other DID is refused with
+  `authentication.session.mismatch` (error code 33). The blocked check on
+  refresh now reads the session owner's ACLs.
+- A session with no recorded refresh-token hash can no longer be refreshed.
+- The compare and the rotation of the refresh-token hash are one atomic
+  store operation on every backend (a Lua script on Redis, under the
+  backend's lock on Fjall and Memory). Of two requests presenting the same
+  refresh token, at most one succeeds.
+- Presenting a refresh token that was already exchanged, or one the session
+  has no record of, ends that session: the request gets `401` and the DID
+  must authenticate again from the challenge.
+- `MediatorStore` gains `rotate_refresh_token_hash` and the
+  `RefreshRotation` outcome. The trait default is not atomic; out-of-tree
+  backends should override it.
+
+### Changed — accounts are registered after the challenge is answered
+
+- In `explicit_deny` mode, `/authenticate/challenge` no longer creates an
+  account for an unknown DID. The account is created with
+  `global_acl_default` once the DID answers the challenge on `/authenticate`
+  or `/tsp/authenticate`, before any token is issued. The blocked and
+  `explicit_allow` checks at the challenge step are unchanged.
+- `/authenticate/challenge` accepts only a `did:<method>:<id>` string of at
+  most 2048 bytes with a lowercase-alphanumeric method and DID URL
+  characters; anything else gets `400 authentication.challenge.invalid_did`.
+- The authentication routes carry their own body limits: 16 KiB for
+  `/authenticate/challenge` and `/tsp/authenticate`, 64 KiB for
+  `/authenticate` and `/authenticate/refresh` (previously axum's 2 MiB
+  default). A larger body gets `413`.
+- On Redis, a `ChallengeSent` session is readable before its DID has an
+  account; any later state still requires the account.
+
+**Behaviour change (R3.6):** a client that retries a refresh with a token it
+already exchanged (for example after losing the response) has its session
+ended and must re-authenticate. Tooling that relied on a DID's account
+existing as soon as it requested a challenge will see it only after the
+first successful authentication. Challenge requests with non-DID-shaped or
+oversized `did` values, and refresh requests sent from a DID other than the
+session's, are now refused.
+
 ### Changed — mux frame decisions are counted; delivery reports hold no body
 
 - A live frame the socket withholds from a mux member, decided against the

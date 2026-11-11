@@ -11,7 +11,7 @@
 //! pass against a mediator that rejects everyone, so
 //! [`preregistered_did_authenticates_in_explicit_allow_mode`] is the control
 //! proving the gate admits known DIDs through the *full* auth flow, and
-//! [`unknown_did_registered_and_authenticated_in_explicit_deny_mode`] pins
+//! [`unknown_did_gets_a_challenge_in_explicit_deny_mode`] pins
 //! the open behaviour of `explicit_deny` so the gate cannot silently widen
 //! to both modes.
 //!
@@ -181,10 +181,11 @@ async fn unknown_did_rejection_indistinguishable_from_blocked() {
     let _ = mediator.join().await;
 }
 
-/// `explicit_deny` keeps the historical open behaviour: an unknown DID gets
-/// a challenge and is auto-registered with `global_acl_default`.
+/// `explicit_deny` keeps the open behaviour: an unknown DID gets a
+/// challenge. Its account is created only once it answers (see
+/// `authentication_session.rs`), so the challenge alone leaves none.
 #[tokio::test]
-async fn unknown_did_registered_and_authenticated_in_explicit_deny_mode() {
+async fn unknown_did_gets_a_challenge_in_explicit_deny_mode() {
     init_tracing();
 
     let store = Arc::new(MemoryStore::new());
@@ -209,11 +210,11 @@ async fn unknown_did_registered_and_authenticated_in_explicit_deny_mode() {
     );
 
     assert!(
-        store
+        !store
             .account_exists(&sha256::digest(&did))
             .await
             .expect("account_exists"),
-        "explicit_deny must auto-register the DID at the challenge step"
+        "the challenge step must not register the DID"
     );
 
     mediator.shutdown();

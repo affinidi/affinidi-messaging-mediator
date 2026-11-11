@@ -94,11 +94,25 @@ pub struct Session {
     /// extend or shorten a session.
     pub expires_at: u64,
     /// Hash of the most recently issued refresh token. Used to enforce
-    /// one-time-use semantics on refresh — the handler reads the session,
-    /// compares the presented refresh token to this hash, and on match
-    /// rotates by writing back a new hash. `None` until the first refresh
-    /// token is issued (i.e., for `ChallengeSent` sessions pre-auth).
+    /// one-time-use semantics on refresh: the handler hands the presented
+    /// token's hash and its replacement to
+    /// `MediatorStore::rotate_refresh_token_hash`, which swaps them only if
+    /// the presented one is current. `None` until the first refresh token is
+    /// issued (i.e., for `ChallengeSent` sessions pre-auth).
     pub refresh_token_hash: Option<String>,
+}
+
+/// Outcome of `MediatorStore::rotate_refresh_token_hash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// The presented hash was the current one and has been replaced.
+    Rotated,
+    /// The session holds a different hash: the presented refresh token was
+    /// already exchanged. Nothing was written.
+    Mismatch,
+    /// No session, or a session with no refresh-token hash recorded. Nothing
+    /// was written.
+    Missing,
 }
 
 impl Session {

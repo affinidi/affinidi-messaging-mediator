@@ -70,8 +70,8 @@ use affinidi_messaging_mediator_common::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats,
         OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        SentMessageState, Session, SessionState, SessionSweepReport, StatCounter, StoreHealth,
-        StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
+        RefreshRotation, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, ops,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -2117,6 +2117,45 @@ impl MediatorStore for FjallStore {
             .insert(session_id.as_bytes(), Self::encode(&stored)?)
             .map_err(|e| Self::db_err("update_refresh_token_hash:insert", e))?;
         Ok(())
+    }
+
+    /// Compare-and-swap under `write_lock`. Every session write in this
+    /// backend takes that lock, so nothing can change the record between the
+    /// read and the insert.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        use subtle::ConstantTimeEq;
+        let _guard = self.write_lock.lock().await;
+        let Some(raw) = self
+            .sessions
+            .get(session_id.as_bytes())
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:get", e))?
+        else {
+            return Ok(RefreshRotation::Missing);
+        };
+        let mut stored: StoredSession = Self::decode(&raw)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
+            return Ok(RefreshRotation::Missing);
+        }
+        let Some(current) = stored.session.refresh_token_hash.as_deref() else {
+            return Ok(RefreshRotation::Missing);
+        };
+        if !bool::from(current.as_bytes().ct_eq(presented_hash.as_bytes())) {
+            return Ok(RefreshRotation::Mismatch);
+        }
+        stored.session.refresh_token_hash = Some(new_hash.to_string());
+        self.sessions
+            .insert(session_id.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:insert", e))?;
+        Ok(RefreshRotation::Rotated)
     }
 
     // ─── Accounts ───────────────────────────────────────────────────────────

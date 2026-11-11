@@ -305,10 +305,10 @@ pub mod redis;
 
 pub use types::{
     DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueEntry,
-    InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RemovalReason,
-    SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport, StatCounter,
-    StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind,
-    StreamingWrite,
+    InboxStatusReply, MessageMetaData, MetadataStats, OutboxReceipt, PubSubRecord, RefreshRotation,
+    RemovalReason, SentMessageState, Session, SessionClaims, SessionState, SessionSweepReport,
+    StatCounter, StoreHealth, StoredMessageRef, StreamingClaim, StreamingClientState,
+    StreamingKind, StreamingWrite,
 };
 
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
@@ -2017,6 +2017,32 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         session.refresh_token_hash = Some(refresh_token_hash.to_string());
         self.put_session(&session, std::time::Duration::from_secs(86_400))
             .await
+    }
+
+    /// Exchange a refresh token: if the session's stored refresh-token hash
+    /// equals `presented_hash`, replace it with `new_hash`; otherwise write
+    /// nothing. The compare and the write must be one atomic step, so two
+    /// requests presenting the same token can never both see
+    /// [`RefreshRotation::Rotated`].
+    ///
+    /// The default is NOT atomic (read, compare, write) and exists only so
+    /// out-of-tree backends keep compiling; every in-tree backend overrides
+    /// it. A missing session or a missing stored hash is
+    /// [`RefreshRotation::Missing`], never a match.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        match self.get_refresh_token_hash(session_id).await? {
+            None => Ok(RefreshRotation::Missing),
+            Some(stored) if stored != presented_hash => Ok(RefreshRotation::Mismatch),
+            Some(_) => {
+                self.update_refresh_token_hash(session_id, new_hash).await?;
+                Ok(RefreshRotation::Rotated)
+            }
+        }
     }
 
     /// Legacy: read just the refresh-token hash for a session. Default
