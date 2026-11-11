@@ -481,6 +481,20 @@ pub(crate) async fn messages_received(
                         continue;
                     }
                 };
+                // A mux member's message is deleted only while the member's
+                // own account still stands; checked for the member this id
+                // belongs to, not for every member the connection carries.
+                if *owner_hash != session.did_hash
+                    && !crate::mux::connection::allows(
+                        state,
+                        &session.session_id,
+                        owner_hash,
+                        affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
+                    )
+                    .await
+                {
+                    continue;
+                }
                 debug!("Deleting message: {}", msg_id);
                 match state
                     .database

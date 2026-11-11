@@ -1488,6 +1488,7 @@ impl StreamingTask {
             origin: self.uuid.clone(),
             changes: Vec::new(),
             streaming: vec![handoff],
+            members: Vec::new(),
         };
         if let Err(err) = database.mux_changes_publish(&record).await {
             warn!("couldn't tell the other instances of a streaming handoff: {err}");

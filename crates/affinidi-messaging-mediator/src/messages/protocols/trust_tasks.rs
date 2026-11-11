@@ -975,6 +975,10 @@ async fn consume_account_update(
             format!("acl -> {:#018x}", stored.to_u64()),
         )
         .await;
+        // A live mux connection carrying the account as a member drops it
+        // now if the new ACLs no longer cover its scope, before this answers;
+        // other instances are told to do the same.
+        crate::mux::connection::account_changed(state, &target_hash).await;
     }
 
     if let Some((send_queue_limit, receive_queue_limit)) = queue_limits {
@@ -1255,6 +1259,12 @@ async fn consume_account_remove(
                 "account removed, but its DID multiplexing grants could not be: {e}"
             ),
         }
+    }
+    // Members admitted by a session attach hold no stored grant, so the
+    // detach above does not reach them; the account is gone, so its standing
+    // check detaches them (`accountRemoved`) on every connection here.
+    if removed {
+        crate::mux::connection::account_changed(state, &target_hash).await;
     }
     record_audit(
         state,
@@ -2444,6 +2454,14 @@ async fn consume_mux(
     if !changed.narrowed.is_empty() {
         state.mux.narrow(&changed.narrowed).await;
     }
+    // `revoke-all` ends the member's session attaches as well as its grants,
+    // on every connection here, before answering (design §5.2).
+    if let Some(member) = &changed.attaches_ended {
+        state
+            .mux
+            .detach_attaches(streaming, member, ctx.now, LeaveReason::EpochBumped)
+            .await;
+    }
     if !changed.stored.is_empty() {
         let carried = state
             .mux
@@ -2464,6 +2482,18 @@ async fn consume_mux(
     // The same principals' connections on other instances sharing the store
     // follow within one pub/sub hop (§7.4); this answer does not wait for them.
     crate::mux::sync::publish(state, &crate::mux::sync::changes_of(&changed)).await;
+    if let Some(member) = &changed.attaches_ended {
+        crate::mux::sync::publish_members(
+            state,
+            &[
+                affinidi_messaging_mediator_common::store::mux::MemberHint::AttachesEnded {
+                    did_hash: member.clone(),
+                    at: ctx.now,
+                },
+            ],
+        )
+        .await;
+    }
     // Durable notices for what this task suspended or revoked: only now,
     // once the change is committed and its members detached (spec rule 2).
     crate::mux::notice::after_change(state, &changed).await;

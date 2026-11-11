@@ -12,7 +12,11 @@ use std::collections::HashMap;
 
 use affinidi_messaging_mediator_common::{
     did_identity::did_hash,
-    store::mux::{self, MuxCapability, MuxGrant, MuxScope},
+    store::{
+        MediatorStore,
+        mux::{self, MuxCapability, MuxGrant, MuxScope},
+    },
+    types::acls::MediatorACLSet,
 };
 use serde_json::Value;
 
@@ -51,6 +55,10 @@ pub struct MuxMember {
     /// principal's newest grant on a DID, so a live admission never replaces
     /// a member carried by a newer grant, whatever order they finish in.
     pub grant_iat: u64,
+    /// When a session attach admitted it (0 for one carried by a grant). A
+    /// member's `revoke-all` ends the attaches admitted before it, and only
+    /// those: one admitted afterwards rests on a statement made since.
+    pub attached_at: u64,
 }
 
 /// A stored grant a connection did not carry, for its `detached` event.
@@ -274,6 +282,7 @@ impl MuxSession {
                     key_fp: grant.key_fp.clone(),
                     expires_at: grant.effective_exp(),
                     grant_iat: grant.iat,
+                    attached_at: 0,
                 };
                 let member = match self.members.remove(&grant.did_hash) {
                     Some(existing) => merge(existing, member),
@@ -424,6 +433,7 @@ pub async fn verify_attach(
             key_fp: verified.key.key_fp,
             expires_at: verified.exp,
             grant_iat: 0,
+            attached_at: ctx.now,
         },
         suspended,
     ))
@@ -436,21 +446,42 @@ async fn member_standing(
     member_hash: &str,
     scope: &MuxScope,
 ) -> Result<(), MuxError> {
-    if !ctx
-        .store
+    standing(ctx.store, ctx.default_acl, member_hash, scope).await
+}
+
+/// `member_standing` against the store alone, for re-checking a member
+/// already on a connection: at admission and again while it stays (the
+/// periodic sweep, and each pickup or delete made for it).
+pub async fn standing(
+    store: &dyn MediatorStore,
+    default_acl: &MediatorACLSet,
+    member_hash: &str,
+    scope: &MuxScope,
+) -> Result<(), MuxError> {
+    if !store
         .account_exists(member_hash)
         .await
         .map_err(|e| MuxError::Store(e.into()))?
     {
         return Err(MuxError::UnknownMember);
     }
-    let acls = ctx
-        .store
+    let acls = store
         .get_did_acl(member_hash)
         .await
         .map_err(|e| MuxError::Store(e.into()))?
-        .unwrap_or_else(|| ctx.default_acl.clone());
+        .unwrap_or_else(|| default_acl.clone());
     check_scope(&acls, scope)
+}
+
+/// Why a member whose standing check failed with `e` must leave, or `None`
+/// when the check could not be made (a store failure): that is neither a
+/// lapse nor a pass.
+pub fn standing_leave_reason(e: &MuxError) -> Option<LeaveReason> {
+    match e {
+        MuxError::UnknownMember => Some(LeaveReason::AccountRemoved),
+        MuxError::MemberBlocked | MuxError::ScopeExceedsAcl(_) => Some(LeaveReason::AccountBlocked),
+        MuxError::Statement(_) | MuxError::Store(_) | MuxError::MemberQuota { .. } => None,
+    }
 }
 
 /// One DID admitted twice (attach and grant): the union of scope, the later
@@ -464,6 +495,7 @@ fn merge(a: MuxMember, b: MuxMember) -> MuxMember {
     MuxMember {
         scope,
         expires_at: a.expires_at.max(b.expires_at),
+        attached_at: a.attached_at.max(b.attached_at),
         ..keep
     }
 }
@@ -603,6 +635,54 @@ mod tests {
                 .unwrap();
         assert_eq!(session.detach_grants(&revoked).len(), 1);
         assert!(session.is_empty());
+    }
+
+    /// The standing a member met at admission is checked again while it
+    /// stays: a removed account, a blocked one, or ACLs that no longer cover
+    /// the scope each give the reason it leaves; a store failure gives none.
+    #[tokio::test]
+    async fn a_members_standing_is_rechecked_against_the_store() {
+        let store = MemoryStore::new();
+        let allow = MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap();
+        let (member, _) = did_key(61);
+        let h = did_hash(&member);
+        let scope = MuxScope::new([MuxCapability::Receive]).unwrap();
+        let reason = |r: Result<(), MuxError>| r.err().and_then(|e| standing_leave_reason(&e));
+
+        // No account.
+        assert_eq!(
+            reason(standing(&store, &allow, &h, &scope).await),
+            Some(LeaveReason::AccountRemoved)
+        );
+        store.account_add(&h, &allow, None).await.unwrap();
+        assert!(standing(&store, &allow, &h, &scope).await.is_ok());
+
+        // Blocked.
+        let mut blocked = allow.clone();
+        blocked.set_blocked(true);
+        store.set_did_acl(&h, &blocked).await.unwrap();
+        assert_eq!(
+            reason(standing(&store, &allow, &h, &scope).await),
+            Some(LeaveReason::AccountBlocked)
+        );
+
+        // Not blocked, but its ACLs no longer allow what the scope asks.
+        let deny = MediatorACLSet::from_string_ruleset("DENY_ALL").unwrap();
+        let mut narrowed = deny.clone();
+        narrowed.set_blocked(false);
+        store.set_did_acl(&h, &narrowed).await.unwrap();
+        assert_eq!(
+            reason(standing(&store, &allow, &h, &scope).await),
+            Some(LeaveReason::AccountBlocked)
+        );
+
+        // Neither a lapse nor a pass.
+        assert_eq!(
+            standing_leave_reason(&MuxError::Store(
+                affinidi_messaging_mediator_common::store::mux::MuxStoreError::Contended
+            )),
+            None
+        );
     }
 
     #[tokio::test]

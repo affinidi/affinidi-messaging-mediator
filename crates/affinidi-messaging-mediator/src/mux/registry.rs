@@ -65,6 +65,22 @@ pub struct MuxConn {
     pub wire: super::connection::MuxWire,
     /// When the connection opened (unix seconds), for the same.
     pub opened_at: u64,
+    /// Members whose account was last found in good standing, and when, so a
+    /// burst of requests made for one member reads its account once
+    /// (`connection::check_member`). Keyed by DID hash; an entry counts only
+    /// for the admission (source and scope) it was read for.
+    pub standing_seen: Mutex<std::collections::HashMap<String, StandingSeen>>,
+    /// Set while a standing pass over every member is running, so a slow
+    /// store never stacks one pass on another.
+    pub standing_pass: AtomicBool,
+}
+
+/// [`MuxConn::standing_seen`]: one member's last good standing check.
+#[derive(Clone, Debug)]
+pub struct StandingSeen {
+    pub at: u64,
+    pub source: super::session::MuxSource,
+    pub scope: affinidi_messaging_mediator_common::store::mux::MuxScope,
 }
 
 impl MuxConn {
@@ -84,6 +100,8 @@ impl MuxConn {
             notify: tokio::sync::Notify::new(),
             wire: super::connection::MuxWire::DidComm,
             opened_at: 0,
+            standing_seen: Mutex::new(std::collections::HashMap::new()),
+            standing_pass: AtomicBool::new(false),
         }
     }
 
@@ -167,12 +185,36 @@ impl MuxConn {
         }
     }
 
+    /// Take `did_hash` off the connection only if `still` holds for the
+    /// member as it is now: a decision made on a snapshot must not remove a
+    /// member that was re-admitted, widened or replaced in the meantime.
+    pub async fn detach_if(
+        &self,
+        streaming: Option<&StreamingTask>,
+        did_hash: &str,
+        reason: LeaveReason,
+        still: impl FnOnce(&MuxMember) -> bool,
+    ) -> Option<MuxMember> {
+        let (member, session_id) = {
+            let mut s = self.session.lock().await;
+            if !s.get(did_hash).is_some_and(still) {
+                return None;
+            }
+            (s.detach(did_hash)?, s.session_id.clone())
+        };
+        self.deregister(streaming, did_hash, &session_id).await;
+        self.left.lock().await.push((member.clone(), reason));
+        self.notify.notify_one();
+        Some(member)
+    }
+
     async fn deregister(
         &self,
         streaming: Option<&StreamingTask>,
         did_hash: &str,
         session_id: &str,
     ) {
+        self.standing_seen.lock().await.remove(did_hash);
         self.inactive.lock().await.remove(did_hash);
         if let Some(streaming) = streaming {
             let _ = streaming
@@ -247,15 +289,19 @@ impl MuxConn {
     /// - a member holding `pickup` but not `receive`: do not push the frame,
     ///   but tell the principal mail waits for it (a resync: a pickup
     ///   `status` on DIDComm, a drain on raw TSP);
-    /// - anything else (a member that left, or that holds neither): drop it.
-    ///   The message stays in the member's inbox (§7.3, R1.1).
-    pub async fn live_frame(&self, did_hash: &str) -> LiveFrame {
+    /// - anything else (a member that left, whose admission has lapsed at
+    ///   `now`, or that holds neither): drop it. The message stays in the
+    ///   member's inbox (§7.3, R1.1).
+    ///
+    /// Expiry is checked here as [`MuxSession::allows`] checks it, rather
+    /// than left to the next sweep to remove the member.
+    pub async fn live_frame(&self, did_hash: &str, now: u64) -> LiveFrame {
         use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
         let s = self.session.lock().await;
         if did_hash == s.principal_hash {
             return LiveFrame::Write;
         }
-        match s.get(did_hash) {
+        match s.get(did_hash).filter(|m| m.expires_at > now) {
             Some(m) if m.scope.contains(Cap::Receive) => LiveFrame::Write,
             Some(m) if m.scope.contains(Cap::Pickup) => LiveFrame::Nudge,
             _ => LiveFrame::Drop,
@@ -373,6 +419,31 @@ impl MuxRegistry {
         }
     }
 
+    /// End, on every live connection here, the session attach of `did_hash`
+    /// admitted at or before `at` — the member DID's `revoke-all` at `at`
+    /// ends the attaches as well as the grants (design §5.2). A member carried
+    /// by a grant is left to the grant's own detach, and an attach admitted
+    /// after `at` rests on a statement made since, so it stays. Returns once
+    /// each is out of its member set, so the caller may then answer.
+    pub async fn detach_attaches(
+        &self,
+        streaming: Option<&StreamingTask>,
+        did_hash: &str,
+        at: u64,
+        reason: LeaveReason,
+    ) {
+        for conn in self.all() {
+            let gone = conn
+                .detach_if(streaming, did_hash, reason, |m| {
+                    m.source == super::session::MuxSource::Attach && m.attached_at <= at
+                })
+                .await;
+            if gone.is_some() {
+                debug!(member = did_hash, ?reason, "ended a mux session attach");
+            }
+        }
+    }
+
     /// Carry the members of newly stored grants on every live connection of
     /// their principal, at once (design §4.4). Returns the ids of the grants
     /// some connection on this instance now carries (`attachedNow`).
@@ -427,6 +498,7 @@ impl MuxRegistry {
                 key_fp: current.key_fp.clone(),
                 expires_at: current.effective_exp(),
                 grant_iat: current.iat,
+                attached_at: 0,
             };
             for conn in self.for_principal(&g.principal_hash) {
                 let admitted = conn.session.lock().await.admit_grant(member.clone());
@@ -673,6 +745,7 @@ mod tests {
             key_fp: "fp".into(),
             expires_at: u64::MAX / 2,
             grant_iat: iat,
+            attached_at: 0,
         };
         let narrow = MuxScope::new([MuxCapability::Receive]).unwrap();
         let wide = MuxScope::new([MuxCapability::Receive, MuxCapability::Delete]).unwrap();
@@ -691,5 +764,159 @@ mod tests {
         let m = s.get(&did_hash("did:example:work")).unwrap();
         assert_eq!(m.scope, narrow);
         assert_eq!(m.grant_iat, 2);
+    }
+
+    /// A member whose admission has lapsed gets no more live frames, even
+    /// before the sweep takes it off the connection; the principal's own
+    /// frames are unaffected.
+    #[tokio::test]
+    async fn a_lapsed_member_gets_no_live_frames_before_the_sweep() {
+        let registry = MuxRegistry::default();
+        let principal = "did:example:device";
+        let conn = connected(&registry, principal);
+        let member = |did: &str, scope: MuxScope| MuxMember {
+            did: did.into(),
+            did_hash: did_hash(did),
+            source: super::super::session::MuxSource::Attach,
+            scope,
+            kid: format!("{did}#key-1"),
+            key_fp: "fp".into(),
+            expires_at: 100,
+            grant_iat: 0,
+            attached_at: 0,
+        };
+        {
+            let mut s = conn.session.lock().await;
+            s.admit(member(
+                "did:example:work",
+                MuxScope::new([MuxCapability::Receive]).unwrap(),
+            ))
+            .unwrap();
+            s.admit(member(
+                "did:example:home",
+                MuxScope::new([MuxCapability::Pickup]).unwrap(),
+            ))
+            .unwrap();
+        }
+        let work = did_hash("did:example:work");
+        let home = did_hash("did:example:home");
+        assert_eq!(conn.live_frame(&work, 99).await, LiveFrame::Write);
+        assert_eq!(conn.live_frame(&home, 99).await, LiveFrame::Nudge);
+        for now in [100, 101] {
+            assert_eq!(conn.live_frame(&work, now).await, LiveFrame::Drop);
+            assert_eq!(conn.live_frame(&home, now).await, LiveFrame::Drop);
+        }
+        assert_eq!(
+            conn.live_frame(&did_hash(principal), u64::MAX).await,
+            LiveFrame::Write
+        );
+    }
+
+    fn attach_member(did: &str, attached_at: u64) -> MuxMember {
+        MuxMember {
+            did: did.into(),
+            did_hash: did_hash(did),
+            source: super::super::session::MuxSource::Attach,
+            scope: MuxScope::new([MuxCapability::Receive]).unwrap(),
+            kid: format!("{did}#key-1"),
+            key_fp: "fp".into(),
+            expires_at: u64::MAX / 2,
+            grant_iat: 0,
+            attached_at,
+        }
+    }
+
+    /// A decision taken on a snapshot of a member removes it only while the
+    /// member is still on the connection as it was seen.
+    #[tokio::test]
+    async fn a_conditional_detach_leaves_a_member_that_changed() {
+        let registry = MuxRegistry::default();
+        let conn = connected(&registry, "did:example:device");
+        let snap = attach_member("did:example:work", 10);
+        conn.session.lock().await.admit(snap.clone()).unwrap();
+        // Widened meanwhile (a grant merged in): the stale decision misses.
+        let mut wider = snap.clone();
+        wider.scope = MuxScope::new([MuxCapability::Receive, MuxCapability::Delete]).unwrap();
+        conn.session.lock().await.admit(wider).unwrap();
+        let same = |m: &MuxMember| m.source == snap.source && m.scope == snap.scope;
+        assert!(
+            conn.detach_if(None, &snap.did_hash, LeaveReason::AccountBlocked, same)
+                .await
+                .is_none()
+        );
+        assert!(conn.session.lock().await.get(&snap.did_hash).is_some());
+        assert!(conn.left.lock().await.is_empty(), "no event for a miss");
+        // As seen: removed, with its event.
+        assert!(
+            conn.detach_if(None, &snap.did_hash, LeaveReason::AccountBlocked, |_| true)
+                .await
+                .is_some()
+        );
+        assert_eq!(conn.left.lock().await.len(), 1);
+    }
+
+    /// A member's `revoke-all` at `at` ends its session attaches admitted by
+    /// then, on every connection, and nothing else: not an attach admitted
+    /// later, not a member carried by a grant, not another DID.
+    #[tokio::test]
+    async fn revoke_all_ends_the_attaches_admitted_before_it() {
+        let registry = MuxRegistry::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let conn_for = |session: &str, principal: &str| {
+            let conn = Arc::new(MuxConn::new(
+                MuxSession::new(principal, session, 10),
+                tx.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ));
+            registry.insert(session, &did_hash(principal), conn.clone());
+            conn
+        };
+        let a = conn_for("s-a", "did:example:device-a");
+        let b = conn_for("s-b", "did:example:device-b");
+        let c = conn_for("s-c", "did:example:device-c");
+        let d = conn_for("s-d", "did:example:device-d");
+        let work = "did:example:work";
+        a.session
+            .lock()
+            .await
+            .admit(attach_member(work, 50))
+            .unwrap();
+        b.session
+            .lock()
+            .await
+            .admit(attach_member(work, 100))
+            .unwrap();
+        // Attached after the revoke-all: stays.
+        c.session
+            .lock()
+            .await
+            .admit(attach_member(work, 101))
+            .unwrap();
+        // Carried by a grant: the grant's own detach handles it.
+        let mut by_grant = attach_member(work, 0);
+        by_grant.source = super::super::session::MuxSource::Grant {
+            grant_id: "g".into(),
+        };
+        d.session.lock().await.admit(by_grant).unwrap();
+        a.session
+            .lock()
+            .await
+            .admit(attach_member("did:example:home", 50))
+            .unwrap();
+
+        registry
+            .detach_attaches(None, &did_hash(work), 100, LeaveReason::EpochBumped)
+            .await;
+        let has = async |conn: &Arc<MuxConn>, did: &str| {
+            conn.session.lock().await.get(&did_hash(did)).is_some()
+        };
+        assert!(!has(&a, work).await);
+        assert!(!has(&b, work).await);
+        assert!(has(&c, work).await);
+        assert!(has(&d, work).await);
+        assert!(has(&a, "did:example:home").await);
+        let left = a.left.lock().await.clone();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1, LeaveReason::EpochBumped);
     }
 }

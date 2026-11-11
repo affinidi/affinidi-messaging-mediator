@@ -39,7 +39,10 @@
 //! account is a party, so it learns only its own correspondents — which it
 //! already knows from its own traffic. An administrator can watch every
 //! account; that reach is the feature, and it is why every administrator
-//! subscribe, renew and unsubscribe is written to the audit log. Refusals
+//! subscribe, renew and unsubscribe is written to the audit log. That reach
+//! lasts only while its owner is an administrator: it is re-checked before
+//! each batch, and a subscription whose owner has lost it ends there (see
+//! `DeliveryTask::deliver_if_standing`). Refusals
 //! carry the problem-report code and comment the sender was already sent; an
 //! internal failure is reported as `internalError` with no detail.
 
@@ -597,6 +600,10 @@ struct Settings {
     filter: Filter,
     expires_at: DateTime<Utc>,
     max_eps: u64,
+    /// Set, under this lock, when the subscription ends because its owner's
+    /// standing lapsed: a renewal that already holds this subscription is
+    /// then refused as unknown rather than reviving it.
+    ended: bool,
 }
 
 /// How a subscriber's batches are sealed and pushed.
@@ -796,6 +803,9 @@ impl TrafficMonitor {
             let settings = sub.settings.clone();
             drop(sub);
             let mut guard = settings.lock().await;
+            if guard.ended {
+                return Err(MonitorError::UnknownSubscription);
+            }
             guard.filter = filter.clone();
             guard.expires_at = expires_at;
             guard.max_eps = max_eps;
@@ -821,6 +831,7 @@ impl TrafficMonitor {
             filter: filter.clone(),
             expires_at,
             max_eps,
+            ended: false,
         }));
         let cancel = CancellationToken::new();
         let sent = Arc::new(AtomicU64::new(0));
@@ -889,6 +900,44 @@ impl TrafficMonitor {
     }
 }
 
+/// Test-only switches, compiled only with the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static STANDING_UNREADABLE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+    /// Make every standing read for subscriptions owned by `did_hash` fail as
+    /// an unreadable store would (`unreadable`), or read normally again.
+    pub fn set_standing_unreadable(did_hash: &str, unreadable: bool) {
+        let mut set = STANDING_UNREADABLE.lock().expect("hook set");
+        if unreadable {
+            set.insert(did_hash.to_string());
+        } else {
+            set.remove(did_hash);
+        }
+    }
+
+    pub(super) fn standing_unreadable(did_hash: &str) -> bool {
+        STANDING_UNREADABLE
+            .lock()
+            .expect("hook set")
+            .contains(did_hash)
+    }
+}
+
+/// [`DeliveryTask::standing`]'s answer.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriberStanding {
+    Good,
+    /// What the subscription was granted on no longer holds; why.
+    Lapsed(&'static str),
+    /// The store could not be read.
+    Unknown,
+}
+
 /// One subscription's filter-rate-batch-deliver loop.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 struct DeliveryTask {
@@ -941,7 +990,9 @@ impl DeliveryTask {
                         in_window += 1;
                         batch.push(event.to_json());
                         if batch.len() >= MAX_BATCH {
-                            self.deliver(&mut batch, &mut dropped_since_batch, &mut seq).await;
+                            if !self.deliver_if_standing(&mut batch, &mut dropped_since_batch, &mut seq).await {
+                                break;
+                            }
                             last_sent = tokio::time::Instant::now();
                         }
                     }
@@ -954,13 +1005,153 @@ impl DeliveryTask {
                         break;
                     }
                     if !batch.is_empty() || dropped_since_batch > 0 || last_sent.elapsed() >= HEARTBEAT {
-                        self.deliver(&mut batch, &mut dropped_since_batch, &mut seq).await;
+                        if !self.deliver_if_standing(&mut batch, &mut dropped_since_batch, &mut seq).await {
+                            break;
+                        }
                         last_sent = tokio::time::Instant::now();
                     }
                 }
             }
         }
         self.subscriptions.remove(&self.subscription_id);
+    }
+
+    /// The subscriber's standing now, re-read from the store. A subscription
+    /// keeps the reach it was granted for its whole lease (up to
+    /// [`MAX_LEASE_SECONDS`]), so what it was granted on is checked again
+    /// before each batch leaves:
+    ///
+    /// - the subscriber's account still exists and is not blocked;
+    /// - a subscription whose filter reaches beyond the subscriber's own
+    ///   account (which only an administrator may open) still belongs to an
+    ///   administrator, by the store's own check (`check_admin_account`).
+    ///
+    /// Returns the standing and whether the filter it was judged against
+    /// reaches beyond the owner's own account.
+    async fn standing(&self) -> (SubscriberStanding, bool) {
+        let reaches = self.reaches_other_accounts().await;
+        (self.standing_for(reaches).await, reaches)
+    }
+
+    async fn standing_for(&self, reaches: bool) -> SubscriberStanding {
+        use affinidi_messaging_mediator_common::types::{
+            accounts::AccountType, acls::MediatorACLSet,
+        };
+        #[cfg(feature = "test-hooks")]
+        if test_hooks::standing_unreadable(&self.owner_did_hash) {
+            return SubscriberStanding::Unknown;
+        }
+        let db = &self.state.database;
+        let account = match db.account_get(&self.owner_did_hash).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return SubscriberStanding::Lapsed("the subscriber's account was removed"),
+            Err(e) => {
+                tracing::debug!(subscription = %self.subscription_id, "monitor standing re-check deferred: {e}");
+                return SubscriberStanding::Unknown;
+            }
+        };
+        if MediatorACLSet::from_u64(account.acls).get_blocked() {
+            return SubscriberStanding::Lapsed("the subscriber's account is blocked");
+        }
+        if reaches {
+            // The same rule a Trust Task caller's role is read by. Once
+            // `common::roles` lands (#218), this is
+            // `roles::can_administer(roles::effective_role(account._type, listed))`.
+            let admin = matches!(account._type, AccountType::Admin | AccountType::RootAdmin)
+                && match db.check_admin_account(&self.owner_did_hash).await {
+                    Ok(listed) => listed,
+                    Err(e) => {
+                        tracing::debug!(subscription = %self.subscription_id, "monitor standing re-check deferred: {e}");
+                        return SubscriberStanding::Unknown;
+                    }
+                };
+            if !admin {
+                return SubscriberStanding::Lapsed("the subscriber is no longer an administrator");
+            }
+        }
+        SubscriberStanding::Good
+    }
+
+    /// Whether the filter in force reaches beyond the subscriber's own
+    /// account: a non-administrator's is narrowed to it at subscribe.
+    async fn reaches_other_accounts(&self) -> bool {
+        let s = self.settings.lock().await;
+        !s.filter
+            .dids
+            .as_ref()
+            .is_some_and(|d| d.iter().all(|x| *x == self.owner_did_hash))
+    }
+
+    /// [`Self::deliver`] the batch if the subscriber still stands. Returns
+    /// `false` when the subscription must end:
+    ///
+    /// - standing lapsed: the pending events are discarded (counted as
+    ///   dropped), the subscription is ended and removed so a renewal finds
+    ///   none, and one last batch with `expiresAt` cut to now tells the
+    ///   subscriber it has ended (R6.2). An administrator's reach is on the
+    ///   audit log when it opens, so its end is too.
+    /// - standing unreadable (store failure): this batch is withheld and
+    ///   counted as dropped; the next one checks again.
+    async fn deliver_if_standing(
+        &self,
+        batch: &mut Vec<Value>,
+        dropped: &mut u64,
+        seq: &mut u64,
+    ) -> bool {
+        let (standing, reached) = self.standing().await;
+        match standing {
+            SubscriberStanding::Good => {
+                self.deliver(batch, dropped, seq).await;
+                true
+            }
+            SubscriberStanding::Unknown => {
+                let n = std::mem::take(batch).len() as u64;
+                *dropped += n;
+                self.dropped.fetch_add(n, Ordering::Relaxed);
+                true
+            }
+            SubscriberStanding::Lapsed(why) => {
+                let n = std::mem::take(batch).len() as u64;
+                *dropped += n;
+                self.dropped.fetch_add(n, Ordering::Relaxed);
+                // Ended first, under the settings lock a renewal takes, and
+                // out of the map: no renewal succeeds from here on. Only then
+                // is the subscriber told.
+                {
+                    let mut s = self.settings.lock().await;
+                    s.ended = true;
+                    s.expires_at = Utc::now();
+                }
+                self.subscriptions.remove(&self.subscription_id);
+                self.deliver(batch, dropped, seq).await;
+                tracing::info!(subscription = %self.subscription_id, owner = %self.owner_did_hash, "monitor subscription ended: {why}");
+                if reached {
+                    use affinidi_messaging_mediator_common::types::audit::{
+                        AuditAction, AuditLogEntry,
+                    };
+                    let entry = AuditLogEntry {
+                        timestamp: self.state.clock.unix_secs(),
+                        actor_did_hash: self.mediator_did_hash.clone(),
+                        target_did_hash: self.owner_did_hash.clone(),
+                        action: AuditAction::MonitorUnsubscribe,
+                        detail: format!(
+                            "ended monitor {} ({} events sent, {} dropped): {why}",
+                            self.subscription_id,
+                            self.sent.load(Ordering::Relaxed),
+                            self.dropped.load(Ordering::Relaxed),
+                        ),
+                    };
+                    if let Err(e) = self.state.database.audit_log_record(&entry).await {
+                        metrics::counter!(
+                            crate::common::metrics::names::AUDIT_WRITE_FAILURES_TOTAL
+                        )
+                        .increment(1);
+                        tracing::warn!(subscription = %self.subscription_id, "Failed to record audit-log entry: {e}");
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// The subscriber's own management traffic with the mediator — its
