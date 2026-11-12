@@ -72,6 +72,17 @@ pub enum MuxWire {
     Tsp,
 }
 
+impl MuxWire {
+    /// The `wire` label on
+    /// [`MUX_CONNECTIONS`](crate::common::metrics::names::MUX_CONNECTIONS).
+    pub fn label(self) -> &'static str {
+        match self {
+            MuxWire::DidComm => "didcomm",
+            MuxWire::Tsp => "tsp",
+        }
+    }
+}
+
 /// One event, ready to write to the socket.
 #[derive(Debug)]
 pub enum EventFrame {
@@ -441,6 +452,9 @@ pub async fn open(
     // in one `detached` event (spec event rule 4).
     if !refused.is_empty() {
         debug!(principal = %session.did_hash, refused = refused.len(), "stored grants not carried on connect");
+        for r in &refused {
+            r.reason.count(1);
+        }
         let dids: Vec<Value> = refused
             .iter()
             .map(|r| detached(&r.did, Some(&r.grant_id), r.reason))
@@ -574,10 +588,13 @@ pub async fn on_member_change(
         }
     }
     let payload = match change_ {
-        MemberChange::Superseded { .. } => json!({
-            "event": "detached",
-            "dids": [detached(&member.did, grant_id(&member), LeaveReason::Superseded)],
-        }),
+        MemberChange::Superseded { .. } => {
+            LeaveReason::Superseded.count(1);
+            json!({
+                "event": "detached",
+                "dids": [detached(&member.did, grant_id(&member), LeaveReason::Superseded)],
+            })
+        }
         // Restates a member just admitted while the DID's own direct socket
         // keeps its live traffic. The reason must be an AttachReason, and
         // `superseded` is not one: name how the member joined.
@@ -713,7 +730,7 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     let to_check: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
     let verifier = StatementVerifier::new(state.did_resolver.clone());
     for m in to_check {
-        match verifier.key_is_current(&m.kid, &m.key_fp).await {
+        match super::grants::key_is_current(&verifier, &m.kid, &m.key_fp).await {
             Ok(true) => {}
             Ok(false) => {
                 if let MuxSource::Grant { .. } = m.source {
@@ -1101,24 +1118,11 @@ pub async fn members_reading(state: &SharedData, session_id: &str) -> Vec<String
 }
 
 /// Tear the connection down: every member out of the streaming task, the
-/// connection out of the registry.
+/// connection out of the registry. The members are not reported or counted
+/// as detached: nobody is left to read the event, and the connection ending
+/// is not a detach.
 pub async fn close(state: &SharedData, session: &Session, conn: &MuxConn) {
-    let members: Vec<String> = conn
-        .session
-        .lock()
-        .await
-        .members()
-        .map(|m| m.did_hash.clone())
-        .collect();
-    for h in members {
-        // `detach` also queues a `detached` event nobody will read; harmless.
-        conn.detach(
-            state.streaming_task.as_ref(),
-            &h,
-            LeaveReason::DetachRequested,
-        )
-        .await;
-    }
+    conn.close_members(state.streaming_task.as_ref()).await;
     state.mux.remove(&session.session_id, &session.did_hash);
 }
 

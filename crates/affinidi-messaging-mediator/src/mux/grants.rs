@@ -312,7 +312,7 @@ pub async fn revoke_all(ctx: &Ctx<'_>, member_did: &str) -> Result<(u64, Vec<Mux
 /// not be resolved — "unknown" is neither stale nor fine, so the caller keeps
 /// its previous decision and retries later.
 pub async fn revalidate(ctx: &Ctx<'_>, grant: &MuxGrant) -> Result<Option<MuxGrant>, String> {
-    match ctx.verifier.key_is_current(&grant.kid, &grant.key_fp).await {
+    match key_is_current(ctx.verifier, &grant.kid, &grant.key_fp).await {
         Ok(true) => Ok(None),
         Ok(false) => mux::modify(
             ctx.store,
@@ -323,9 +323,36 @@ pub async fn revalidate(ctx: &Ctx<'_>, grant: &MuxGrant) -> Result<Option<MuxGra
             |rec, _| Ok(mux::mark_stale_key(rec, &grant.grant_id, ctx.now)),
         )
         .await
-        .map_err(|e| e.to_string()),
+        .map_err(|e| {
+            revalidate_failed("store");
+            e.to_string()
+        }),
         Err(unknown) => Err(unknown),
     }
+}
+
+/// Whether a mux member's signing key `kid` still has fingerprint `key_fp`
+/// (§5.1). Every re-validation of a member's key goes through here, so a
+/// check that cannot be made (the DID did not resolve) is counted on
+/// [`MUX_GRANT_REVALIDATE_FAILURES_TOTAL`](crate::common::metrics::names::MUX_GRANT_REVALIDATE_FAILURES_TOTAL).
+pub async fn key_is_current(
+    verifier: &StatementVerifier,
+    kid: &str,
+    key_fp: &str,
+) -> Result<bool, String> {
+    let r = verifier.key_is_current(kid, key_fp).await;
+    if r.is_err() {
+        revalidate_failed("resolution");
+    }
+    r
+}
+
+fn revalidate_failed(cause: &'static str) {
+    metrics::counter!(
+        crate::common::metrics::names::MUX_GRANT_REVALIDATE_FAILURES_TOTAL,
+        "cause" => cause
+    )
+    .increment(1);
 }
 
 #[cfg(test)]

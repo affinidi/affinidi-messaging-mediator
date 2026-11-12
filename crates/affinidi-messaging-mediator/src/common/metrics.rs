@@ -147,6 +147,38 @@ pub mod names {
     /// `drop` rate points at frames queued for members just revoked or
     /// narrowed; `nudge` tracks pickup-only traffic.
     pub const MUX_LIVE_FRAMES_WITHHELD_TOTAL: &str = "mux_live_frames_withheld_total";
+    /// gauge: Live mux connections on this instance (label `wire`:
+    /// `didcomm` for `didcomm-mux`, `tsp` for `tsp-mux`). Moves with the mux
+    /// registry, so it matches `messaging/stats/show`'s connection count:
+    /// up when a connection is published, down when it is taken out, however
+    /// the socket ended.
+    pub const MUX_CONNECTIONS: &str = "mux_connections";
+    /// gauge: Member DIDs carried by mux connections on this instance (label
+    /// `source`: `grant` for a member a stored grant admitted, `attach` for a
+    /// session attach). Moves with each connection's member set, on every way
+    /// a member joins or leaves (attach, grant, detach, revoke, expiry, a
+    /// change from another instance, the connection closing). A member
+    /// admitted both ways counts once, as `grant`. A member another
+    /// connection has superseded stays on its connection, inactive, and is
+    /// still counted.
+    pub const MUX_MEMBERS: &str = "mux_members";
+    /// counter: Members a mux connection reported `detached`, or refused to
+    /// carry, by `reason` (the spec's `DetachReason` values: `expired`,
+    /// `detachRequested`, `revokedByMember`, `revokedByPrincipal`,
+    /// `epochBumped`, `suspendedUnknownKey`, `keyRotated`, `accountBlocked`,
+    /// `accountRemoved`, `resolutionFailed`, `superseded`, `connectionFull`).
+    /// Counted when the leave is decided, whether or not the event reaches
+    /// the client. Members dropped because their connection closed are not
+    /// counted: that is the connection ending, not a detach.
+    pub const MUX_DETACH_TOTAL: &str = "mux_detach_total";
+    /// counter: Re-validations of a mux member's signing key (§5.1: stored
+    /// grants on connect, every member in the periodic sweep) that could not
+    /// reach a decision (label `cause`): `resolution` when the member's DID
+    /// could not be resolved, so the member is kept (or, on connect, not
+    /// carried) until a later check; `store` when a key found stale could not
+    /// be marked so in the store. A key found stale is not a failure: it is
+    /// counted in [`MUX_DETACH_TOTAL`] as `keyRotated`.
+    pub const MUX_GRANT_REVALIDATE_FAILURES_TOTAL: &str = "mux_grant_revalidate_failures_total";
     /// counter: Live-streaming entries this instance claimed back for a
     /// socket it carries, each followed by an inbox redelivery when the
     /// socket wants live delivery. Labels: `kind` (`direct` or `mux`) and
@@ -604,6 +636,29 @@ pub async fn metrics_access(
     match access.admit(peer, request.headers()) {
         None => next.run(request).await,
         Some(response) => response,
+    }
+}
+
+/// A recorder for one test, and the value of one series in it, so a unit
+/// test can check what code under it records without the process-wide
+/// recorder (`metrics::set_default_local_recorder`).
+#[cfg(test)]
+pub(crate) mod testing {
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
+
+    pub fn recorder() -> PrometheusRecorder {
+        PrometheusBuilder::new().build_recorder()
+    }
+
+    /// The value of `series` (a name with its labels as rendered, e.g.
+    /// `mux_members{source="grant"}`), or 0 when it was never recorded.
+    pub fn value(recorder: &PrometheusRecorder, series: &str) -> f64 {
+        recorder
+            .handle()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or(0.0)
     }
 }
 
