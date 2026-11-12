@@ -1,7 +1,8 @@
 //! The SDK's `tsp-mux` client against this mediator, for what goes *on* the
 //! socket: mux Trust Tasks answered on it, acks with `messaging/mux/ack`,
 //! sending from another task while one reads, and the connection state
-//! (R6.2). `tsp_mux.rs` covers the wire itself.
+//! (R6.2), and the managed socket that reconnects by itself. `tsp_mux.rs`
+//! covers the wire itself.
 #![cfg(feature = "tsp")]
 
 mod common;
@@ -17,7 +18,7 @@ use affinidi_messaging_mediator_common::{store::mux::MuxLimits, types::acls::Med
 use affinidi_messaging_sdk::protocols::{
     mux::{MuxCapability, sign_attach},
     tsp::RelationshipState,
-    tsp_mux::{TspMuxFrame, TspMuxState, TspMuxWebSocket},
+    tsp_mux::{TspMuxFrame, TspMuxReconnect, TspMuxState, TspMuxWebSocket},
 };
 use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator, TestUser};
 use common::init_tracing;
@@ -564,5 +565,179 @@ async fn an_administrator_sees_a_tsp_mux_connection_as_wire_tsp() {
         gone.is_ok(),
         "a closed tsp-mux connection is no longer listed"
     );
+    env.shutdown().await.expect("shutdown");
+}
+
+/// Restart the mediator in place: stop it, then start it again on the same
+/// address with the same identity and store, as a deploy does. The managed
+/// socket sees the drop and the gap in between.
+async fn restart(env: &mut TestEnvironment) {
+    let addr = env.mediator.bound_addr();
+    let identity = env.mediator.replica_identity();
+    let store = env.mediator.store();
+    env.mediator.shutdown();
+    let next = timeout(Duration::from_secs(30), async {
+        loop {
+            match TestMediator::builder()
+                .mux_enabled(true)
+                .local_direct_delivery(true, false)
+                .store(store.clone())
+                .replica_of(identity.clone())
+                .listen_addr(addr)
+                .spawn()
+                .await
+            {
+                Ok(m) => break m,
+                // The old one still holds the port.
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("the mediator restarts on its address");
+    let old = std::mem::replace(&mut env.mediator, next);
+    let _ = timeout(Duration::from_secs(30), old.join()).await;
+}
+
+/// A managed socket rides out a mediator restart: the state says it is
+/// down, it reconnects by itself, `recv` announces the new connection, the
+/// stored grant comes back with it, and mail for the member arrives and is
+/// acked on the new connection (R6.2, R1.1).
+#[tokio::test]
+async fn a_managed_socket_comes_back_after_a_mediator_restart() {
+    init_tracing();
+    let mut env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let peer = env.add_user("peer").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    env.relate_directly(&peer, &work).await.unwrap();
+    grant(&env, &work, &principal, &["receive", "delete"]).await;
+    let mediator = env.mediator.did().to_string();
+
+    let policy = TspMuxReconnect::default()
+        .with_delays(Duration::from_millis(100), Duration::from_millis(500));
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux_managed(&principal.profile, policy)
+        .await
+        .expect("managed tsp-mux");
+    let first_nonce = sock.ready().mux_nonce.clone();
+    event(&mut sock, &principal.did, &mediator, "attached").await;
+    assert!(sock.members().is_reachable(&work.did));
+    // Every state the socket passes through, recorded as it changes: the
+    // reconnect may be over before the restart returns.
+    let mut state = sock.state();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            while state.changed().await.is_ok() {
+                seen.lock().unwrap().push(state.borrow_and_update().clone());
+            }
+        })
+    };
+
+    restart(&mut env).await;
+    let ready = loop {
+        if let TspMuxFrame::Reconnected { ready } = timeout(Duration::from_secs(30), sock.recv())
+            .await
+            .expect("reconnected within 30s")
+            .expect("socket readable")
+            .expect("socket open")
+        {
+            break ready;
+        }
+    };
+    assert_ne!(
+        ready.mux_nonce, first_nonce,
+        "a new connection, with a new nonce"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|s| matches!(s, TspMuxState::Reconnecting { .. })),
+        "the state said it was down: {:?}",
+        seen.lock().unwrap()
+    );
+    assert_eq!(*sock.state().borrow(), TspMuxState::Open);
+    assert_eq!(sock.ready().mux_nonce, ready.mux_nonce);
+    event(&mut sock, &principal.did, &mediator, "attached").await;
+    assert!(
+        sock.members().is_reachable(&work.did),
+        "the grant came back"
+    );
+
+    env.atm
+        .tsp()
+        .send(&peer.profile, &work.did, b"after the restart")
+        .await
+        .unwrap();
+    let frame = loop {
+        if let TspMuxFrame::Data {
+            frame, receiver, ..
+        } = next(&mut sock).await
+            && receiver == work.did
+        {
+            break frame;
+        }
+    };
+    let acked = sock
+        .acker()
+        .ack(&[frame.as_slice()])
+        .await
+        .expect("ack on the new connection");
+    assert_eq!(acked.acked.len(), 1, "{acked:?}");
+    sock.close().await.expect("close");
+    recorder.abort();
+    env.shutdown().await.expect("shutdown");
+}
+
+/// A managed socket that a newer connection for the same DID replaces stops
+/// for good rather than take the connection back, and the newer one stays
+/// up.
+#[tokio::test]
+async fn a_replaced_managed_socket_leaves_the_newer_one_alone() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    let policy = TspMuxReconnect::default()
+        .with_delays(Duration::from_millis(50), Duration::from_millis(200));
+    let first = env
+        .atm
+        .tsp()
+        .connect_websocket_mux_managed(&principal.profile, policy)
+        .await
+        .expect("managed tsp-mux");
+    let mut state = first.state();
+    let second = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("the newer socket");
+    timeout(
+        Duration::from_secs(10),
+        state.wait_for(|s| matches!(s, TspMuxState::Closed { .. })),
+    )
+    .await
+    .expect("closed within 10s")
+    .expect("state");
+    // Well past the backoff: still closed, and the newer one still up.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    match &*first.state().borrow() {
+        TspMuxState::Closed { reason } => {
+            assert!(
+                reason.contains("replaced by a newer connection"),
+                "{reason}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*second.state().borrow(), TspMuxState::Open);
+    second.close().await.expect("close");
     env.shutdown().await.expect("shutdown");
 }
