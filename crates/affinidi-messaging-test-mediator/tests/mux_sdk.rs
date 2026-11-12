@@ -1097,3 +1097,130 @@ async fn after_a_reconnect_stored_grants_reattach_and_missed_mail_arrives() {
     send(&env, &sender, &work, "after").await;
     assert_eq!(next_basic().await, (work.did.clone(), "after".to_string()));
 }
+
+/// With sdk 0.45.13 a member message taken with `auto_delete` on a
+/// `didcomm-mux` connection is deleted by `messaging/mux/ack` on the socket,
+/// not a REST `DELETE` (which another instance could refuse): the monitor
+/// reports the delete on the websocket channel. The ack answers do not pile
+/// up in the device's inbox.
+#[tokio::test]
+async fn auto_delete_on_a_mux_connection_acks_on_the_socket() {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+    use affinidi_messaging_sdk::messages::fetch::FetchOptions;
+    use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    let admin = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Admin)
+        .await
+        .unwrap();
+    env.atm.profile_add(&admin.profile, true).await.unwrap();
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut members_rx = device.profile.mux_members().await.expect("members");
+    let (g_work, _) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[MuxCapability::Receive, MuxCapability::Delete],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g_work])
+        .await
+        .expect("mux_grant");
+    members_until(&mut members_rx, "work attached", |m| {
+        m.is_reachable(&work.did)
+    })
+    .await;
+
+    let filter: MonitorFilter =
+        serde_json::from_value(json!({ "dids": [work.did_hash()] })).unwrap();
+    env.atm
+        .trust_tasks()
+        .monitor_subscribe(&admin.profile, Some(filter), Some(60), None, None)
+        .await
+        .expect("admin subscribes");
+
+    for i in 0..3 {
+        send(&env, &sender, &work, &format!("for work {i}")).await;
+    }
+    let mut got = 0;
+    while got < 3 {
+        let (msg, _) = env
+            .atm
+            .message_pickup()
+            .live_stream_next(&device.profile, Some(Duration::from_secs(5)), true)
+            .await
+            .unwrap()
+            .expect("a message");
+        if msg.typ == "https://didcomm.org/basicmessage/2.0/message" {
+            got += 1;
+        }
+    }
+    // The three deletes may share one monitor batch: count them as they go by.
+    let work_hash = work.did_hash();
+    let channels = std::cell::RefCell::new(Vec::new());
+    common::await_monitor_event(
+        &env,
+        &admin,
+        |e| {
+            if e["stage"] == "deleted" && e["to"] == work_hash.as_str() {
+                channels.borrow_mut().push(e["channel"].clone());
+            }
+            channels.borrow().len() == 3
+        },
+        common::EVENT_WAIT,
+    )
+    .await
+    .expect("the member's three messages are deleted");
+    assert_eq!(
+        channels.into_inner(),
+        vec![json!("websocket"); 3],
+        "deleted by the ack on the socket, not over REST"
+    );
+    let store = env.mediator.store();
+    assert_eq!(
+        store
+            .inbox_status(&work.did_hash())
+            .await
+            .unwrap()
+            .message_count,
+        0
+    );
+    // Give a stray stored answer time to land, then look for one.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let inbox = store
+        .fetch_messages("test", &device.did_hash(), &FetchOptions::default())
+        .await
+        .unwrap();
+    for m in &inbox.success {
+        let Some(body) = &m.msg else { continue };
+        let (unpacked, _) = env.atm.unpack(body).await.unwrap();
+        assert_ne!(
+            unpacked.body["type"], "https://trusttasks.org/spec/messaging/mux/ack/0.1#response",
+            "an ack answer was stored"
+        );
+    }
+    env.shutdown().await.unwrap();
+}
