@@ -11,23 +11,30 @@ release: `release-tag.yml` tags `v<RELEASE>` (and builds the image), and
 
   rc     0.42.0-rc.N -> 0.42.0-rc.N+1   RELEASE only.
   ga     0.42.0-rc.N -> 0.42.0          RELEASE; CHANGELOG `## Unreleased`
-                                        becomes `## 0.42.0 (date)`.
+                                        and the `changelog.d/` fragments
+                                        become `## 0.42.0 (date)`.
   patch  0.42.N      -> 0.42.N+1        the workspace version (lockstep: every
                                         crate and internal requirement);
                                         RELEASE; a CHANGELOG section listing
                                         the commits since the last tag.
 
+The changelog entries are `changelog.d/` fragments until GA, when
+changelog_fragments.assemble() writes them into the version's section (in the
+same layout `## Unreleased` had, so release-tag.yml's extraction is unchanged)
+and deletes them. An rc touches neither.
+
 A patch's entries come from the commit subjects since the previous tag, not
-from cherry-picked CHANGELOG hunks: a backport's hunk lands in main's
-`## Unreleased`, which does not exist on a GA'd branch, so resolve such a
-conflict by dropping the hunk. Commit subjects are conventional, so they read
-as entries.
+from cherry-picked notes: backport.yml drops a backport's `changelog.d/`
+fragments and CHANGELOG.md changes. Commit subjects are conventional, so they
+read as entries. A fragment that reached the branch anyway (a
+`release-direct` PR) is assembled above the commits.
 """
 
 import argparse
 import datetime
 import sys
 
+from changelog_fragments import assemble, fragment_paths
 from release_lib import ROOT, git, parse_release, set_version, unreleased_split, workspace_version
 
 
@@ -71,11 +78,9 @@ def main():
         if rc is None:
             sys.exit(f"{current} is already GA. Use `patch`.")
         target = f"{major}.{minor}.{patch}"
-        parts = unreleased_split(text)
-        if not parts:
+        if not unreleased_split(text):
             sys.exit("CHANGELOG.md has no `## Unreleased` section to release")
-        before, body, after = parts
-        changelog.write_text(f"{before}## {target} ({today})\n{body}{after}")
+        assemble(f"{target} ({today})", ROOT)
     else:
         if rc is not None:
             sys.exit(f"{current} is a release candidate; use `rc` or `ga` first.")
@@ -86,11 +91,10 @@ def main():
         target = f"{major}.{minor}.{patch + 1}"
         set_version(ROOT, target)
         entries = "".join(f"- {s}\n" for s in since)
-        parts = unreleased_split(text)
-        if parts:
-            # A backport brought its own `## Unreleased` notes: they are this patch's.
-            before, body, after = parts
-            text = f"{before}## {target} ({today})\n{body.rstrip()}\n\n### Commits\n\n{entries}\n{after}"
+        if unreleased_split(text) or fragment_paths(ROOT):
+            # Notes that reached the branch (a `## Unreleased` section, or a
+            # fragment from a `release-direct` PR) are this patch's.
+            assemble(f"{target} ({today})", ROOT, extra=f"### Commits\n\n{entries}")
         else:
             head, sep, rest = text.partition("\n## ")
             text = (
@@ -98,7 +102,7 @@ def main():
                 if sep
                 else f"{text}\n## {target} ({today})\n\n{entries}"
             )
-        changelog.write_text(text)
+            changelog.write_text(text)
 
     release_file.write_text(f"{target}\n")
     print(f"{current} -> {target}")

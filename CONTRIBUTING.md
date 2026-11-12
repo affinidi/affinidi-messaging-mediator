@@ -47,11 +47,16 @@ production image and boot-probes it.
 
 All work lands on `main` by PR. Releases are `major.minor` (`0.42`) branches
 cut from `nightly` — the last fully green `main` — and patched only there.
-Two rules follow (details in [RELEASES.md](RELEASES.md)):
+Three rules follow (details in [RELEASES.md](RELEASES.md)):
 
 - **Never edit a version.** The workspace is versioned in lockstep and only the
   release tooling moves it; the `branch rules` check fails a PR that changes it.
-  Note user-facing changes under `## Unreleased` in `CHANGELOG.md`.
+- **Record user-facing changes as a `changelog.d/` fragment**, never in
+  `CHANGELOG.md`: add a new file `changelog.d/<short-kebab-name>.md` holding a
+  `### <Kind> — <title>` entry (format in
+  [changelog.d/README.md](changelog.d/README.md)). The release tooling assembles
+  the fragments into `CHANGELOG.md`, and the `branch rules` check fails any
+  other PR that edits it.
 - **Need a fix in a supported release?** Merge it to `main`, then label the PR
   `backport release/<major.minor>`; a bot opens the cherry-pick on that branch.
 
@@ -99,7 +104,7 @@ git rebase --signoff origin/main
    stored data). `unwrap` on internal invariants is fine.
 8. **Transport semantics are API.** Changes to send / ack / reconnect / delivery
    behaviour are breaking for consumers even when signatures do not change:
-   call them out in `CHANGELOG.md`.
+   call them out in a `changelog.d/` fragment.
 
 ## Code of Conduct
 

@@ -35,7 +35,13 @@ publish.
 
 Semver caution: services pin these crates loosely; behavioural changes to
 delivery/ack/auth semantics are breaking even when signatures don't change —
-call them out in CHANGELOG and coordinate with the consuming repos (R3.6).
+call them out in a `changelog.d/` fragment and coordinate with the consuming
+repos (R3.6).
+
+Changelog: a PR adds `changelog.d/<short-kebab-name>.md` (one or more
+`### <Kind> — <title>` entries; see `changelog.d/README.md`) and never edits
+`CHANGELOG.md` — the `branch rules` check fails it. The release tooling
+assembles the fragments (`scripts/changelog_fragments.py`).
 
 ## TDK dependencies
 

@@ -145,11 +145,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
-      # Toolchain sync, lockstep versions, CHANGELOG / RELEASE consistency.
+      # Toolchain sync, lockstep versions, CHANGELOG / changelog.d / RELEASE consistency.
       - name: Release guards
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 scripts/check-release-guards.py ${BASE_SHA:+--base-sha "$BASE_SHA"}
+      # The changelog.d/ assembler the release scripts call: its ordering,
+      # cut/GA/patch layouts and fragment validation, in a throwaway repo.
+      - name: Changelog fragments self-test
+        run: python3 scripts/changelog_fragments.py --self-test
       # A workspace member also resolved from crates.io (through a TDK or VTI
       # crate depending on it) builds two copies of its types; see the script.
       - name: Workspace duplicate guard

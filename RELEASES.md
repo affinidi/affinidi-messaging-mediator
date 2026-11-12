@@ -90,9 +90,10 @@ released. Features never are.
 **Fix on `main` first, then backport.** Label the merged PR
 `backport release/<major.minor>` (one label per target branch); `backport.yml`
 opens the cherry-pick as a PR on that branch, as a draft carrying the conflict
-if it does not apply cleanly. A conflict in `CHANGELOG.md` is expected — main's
-`## Unreleased` is not on a GA'd branch — drop that hunk: a patch's changelog is
-generated from the commit subjects it ships.
+if it does not apply cleanly. A backport carries no changelog notes: a patch's
+changelog is generated from the commit subjects it ships, so `backport.yml`
+removes the `changelog.d/` fragments the cherry-pick adds (and reverts any
+`CHANGELOG.md` change or conflict) in a follow-up commit on the backport PR.
 
 Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its
@@ -100,7 +101,39 @@ description says why.
 
 The `branch rules` check (`scripts/check-branch-rules.py`) holds all of this: a
 PR into `release/**` is a bot backport, a prep PR or labelled `release-direct`;
-only the release tooling changes the version or `RELEASE`, on any branch.
+only the release tooling changes the version, `RELEASE` or `CHANGELOG.md`, on
+any branch.
+
+## Changelog
+
+A PR records a user-facing change as a new file,
+`changelog.d/<short-kebab-name>.md`, holding one or more entries in the
+changelog's own format (`### <Kind> — <title>`, then bullets or paragraphs);
+[changelog.d/README.md](changelog.d/README.md) has the details. It never edits
+`CHANGELOG.md`: on `main` that file's `## Unreleased` holds only a line
+pointing at `changelog.d/`, which the `release guards` check enforces, and the
+`branch rules` check fails a PR that changes `CHANGELOG.md` unless it comes from
+a release-tooling branch in this repository. Every PR adds its own file, so
+open PRs never conflict over the changelog.
+
+`scripts/changelog_fragments.py` turns the fragments into a release's section
+and deletes them. Entries are ordered by kind (Breaking, Changed, Fixed, Added,
+Removed, Deprecated, Security, then any other), and within a kind by when the
+fragment was added on the branch, oldest first. The section is laid out as
+`## Unreleased` always was, so `release-tag.yml` reads it unchanged.
+
+| Step | What happens to the fragments |
+|---|---|
+| **Cut** | main's `release-cut/<name>` PR assembles the fragments the cut's source commit has into `## <name>.0 (release/<name>)`; ones added after it stay for the next release. The release branch keeps its copies. |
+| **rc** | Untouched. |
+| **GA** | The prep assembles the release branch's fragments into `## <name>.0 (date)`. |
+| **Patch** | Notes are the commit subjects since the last tag. A fragment that reached the branch (a `release-direct` PR) is assembled above them. |
+| **Backport** | `backport.yml` drops the fragments the cherry-pick adds. |
+
+```sh
+python3 scripts/changelog_fragments.py --dry-run   # the next section, as it would be written
+python3 scripts/changelog_fragments.py --check     # validate the fragments
+```
 
 ## Procedures
 
@@ -115,9 +148,9 @@ From a clean checkout with push access, Python ≥ 3.11, cargo, and `gh`
 authenticated. It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` =
 `0.42.0-rc.0`, which `release-tag.yml` tags and builds an image for), creates
 the `backport release/0.42` label, and opens the `release-cut/0.42` PR that
-moves `main` to `0.43.0` and closes `main`'s `## Unreleased` changelog section
-under `## 0.42.0 (release/0.42)` (the release branch's copy gets its date at
-GA). Merge it, then update the schedule table above.
+moves `main` to `0.43.0` and assembles the `changelog.d/` fragments that shipped
+into `## 0.42.0 (release/0.42)` (the release branch's copy is assembled, with
+its date, at GA). Merge it, then update the schedule table above.
 
 `--from <rev>` cuts from something other than `origin/nightly` — the first cut,
 before `nightly` exists, is `--from origin/main`.
@@ -126,8 +159,9 @@ before `nightly` exists, is `--from origin/main`.
 
 Actions → **Prepare a release** → choose the release branch as the ref and
 `rc`, `ga` or `patch`. It moves `RELEASE`, writes the changelog (GA: the
-`## Unreleased` section becomes `## 0.42.0 (date)`; patch: a new section listing
-the commits since the last tag), moves the whole workspace for a patch, and
+`changelog.d/` fragments become `## 0.42.0 (date)`, replacing `## Unreleased`;
+patch: a new section listing the commits since the last tag), moves the whole
+workspace for a patch, and
 opens a `chore(release): v…` PR from `release-prep/<major.minor>/<version>`.
 
 **Merging it is the release.** On that push to the release branch:
@@ -190,7 +224,7 @@ Settings, not files:
   bypass actor).
 - **`branch rules`** honours the release-tooling branch names (`backport-…`,
   `release-prep/…`, `release-cut/…`) only on branches in this repository, not
-  on a fork's.
+  on a fork's. That covers who may edit `CHANGELOG.md` too.
 - **Ruleset `tags_managed`** (all tags): blocks creation, update and
   deletion; admins and the `affinidi-semantic-release` app bypass it. That
   app is the identity `release-tag.yml` tags with — `GITHUB_TOKEN` (the
