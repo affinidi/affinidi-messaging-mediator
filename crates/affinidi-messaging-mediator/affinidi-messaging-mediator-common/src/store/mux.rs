@@ -458,9 +458,19 @@ pub enum MemberHint {
     /// The member's account was blocked, removed or had its ACLs changed:
     /// re-check its standing wherever it is carried.
     StandingChanged { did_hash: String },
-    /// The member DID ran `revoke-all` at `at` (unix seconds): end its
+    /// The member DID's epoch advanced at `at` (unix seconds), by its own
+    /// `revoke-all` or an administrator's `admin-revoke-all`: end its
     /// session attaches admitted at or before then.
-    AttachesEnded { did_hash: String, at: u64 },
+    AttachesEnded {
+        did_hash: String,
+        at: u64,
+        /// The `messaging/mux` detach reason the originating instance used
+        /// (`admin` for an administrator's advance). Absent means
+        /// `epochBumped`, which is all an instance that predates the field
+        /// sends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// A change of which instance streams a DID's live traffic, for the mux
@@ -497,6 +507,14 @@ pub struct MuxChange {
     /// checkable, member blocked), and only a reconnect re-runs those checks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stored: bool,
+    /// The `messaging/mux` detach reason the originating instance used for a
+    /// grant it removed or voided on this pair (`revokedByPrincipal`,
+    /// `admin`, …). The store still decides whether a receiver detaches; this
+    /// only labels the detach it reports, which the store alone cannot tell
+    /// (a deleted grant looks the same whoever revoked it). Absent from
+    /// records that carry none, and from an instance that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl MuxChange {
@@ -505,7 +523,15 @@ impl MuxChange {
             did_hash: grant.did_hash.clone(),
             principal_hash: grant.principal_hash.clone(),
             stored,
+            reason: None,
         }
+    }
+
+    /// This change, labelled with the detach reason the originating
+    /// instance used.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 }
 

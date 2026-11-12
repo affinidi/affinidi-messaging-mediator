@@ -458,6 +458,7 @@ pub async fn after_change(state: &SharedData, changed: &Changed) {
             Some(LeaveReason::RevokedByMember) => "revokedByMember",
             Some(LeaveReason::EpochBumped) => "epochBumped",
             Some(LeaveReason::AccountRemoved) => "accountRemoved",
+            Some(LeaveReason::Admin) => "admin",
             // A principal that revoked its own grants is not sent one.
             _ => return,
         };
@@ -466,9 +467,17 @@ pub async fn after_change(state: &SharedData, changed: &Changed) {
             per_principal(&changed.removed, ListKind::Revoked, reason, now),
         )
         .await;
-        // Only epoch-revoked grants stay on the record to be marked.
-        if changed.reason == Some(LeaveReason::EpochBumped) {
-            mark_noticed(state, &changed.removed, &stored).await;
+        // Only epoch-revoked grants stay on the record to be marked: a
+        // member's `revoke-all` or an administrator's `admin-revoke-all`.
+        // Deleted grants have nothing left to mark.
+        let voided: Vec<MuxGrant> = changed
+            .removed
+            .iter()
+            .filter(|g| g.state == MuxGrantState::EpochRevoked)
+            .cloned()
+            .collect();
+        if !voided.is_empty() {
+            mark_noticed(state, &voided, &stored).await;
         }
     }
 }

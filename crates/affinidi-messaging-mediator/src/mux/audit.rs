@@ -126,3 +126,51 @@ pub async fn revoked_all(state: &SharedData, sender_hash: &str, response: &Value
     )
     .await;
 }
+
+/// One entry per grant a `messaging/mux/admin-revoke` removed (spec
+/// consumer rule 9). The actor is the administrator; the target is the
+/// member DID, and the detail names the grant, its principal and the
+/// selection the administrator made — as hashes, like every other entry.
+pub async fn admin_revoked(
+    state: &SharedData,
+    admin_hash: &str,
+    selection: &str,
+    removed: &[MuxGrant],
+) {
+    for g in removed {
+        record(
+            state,
+            admin_hash,
+            &g.did_hash,
+            AuditAction::MuxGrantRevoke,
+            format!(
+                "grant {} (principal {}) revoked by an administrator; selection: {selection}",
+                g.grant_id, g.principal_hash
+            ),
+        )
+        .await;
+    }
+}
+
+/// One entry for a `messaging/mux/admin-revoke-all` that advanced the member
+/// DID's epoch (spec consumer rule 7): the administrator, the member DID and
+/// the epochs before and after. One that changed nothing is not recorded.
+pub async fn admin_revoked_all(
+    state: &SharedData,
+    admin_hash: &str,
+    member_hash: &str,
+    before: u64,
+    after: u64,
+    voided: usize,
+) {
+    record(
+        state,
+        admin_hash,
+        member_hash,
+        AuditAction::MuxRevokeAll,
+        format!(
+            "epoch advanced from {before} to {after} by an administrator; {voided} grants voided"
+        ),
+    )
+    .await;
+}
