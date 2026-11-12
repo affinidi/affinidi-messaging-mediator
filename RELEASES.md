@@ -8,7 +8,11 @@ only ever happen on the release branch.
 
 This follows the branching model of the DID hosting service
 (`affinidi-webvh-service`) and verifiable-trust-infrastructure. Every crate in
-the workspace carries the release's version (lockstep).
+the workspace carries the release's version (lockstep). Tagging, publishing,
+`nightly` and the `branch rules` check run the `release-*` actions of
+[affinidi/pipeline-rust](https://github.com/affinidi/pipeline-rust) (README,
+"Release branches"). The cut, prep, backport and `release guards` stay local
+while only they handle `changelog.d/`.
 
 ## Branches
 
@@ -99,10 +103,15 @@ Only fix on the release branch directly when the code there no longer exists on
 `main`: a maintainer adds the `release-direct` label to that PR, and its
 description says why.
 
-The `branch rules` check (`scripts/check-branch-rules.py`) holds all of this: a
-PR into `release/**` is a bot backport, a prep PR or labelled `release-direct`;
-only the release tooling changes the version, `RELEASE` or `CHANGELOG.md`, on
-any branch.
+The `branch rules` check holds all of this: a PR into `release/**` is a
+backport or prep PR, or labelled `release-direct`; only the release tooling
+changes the version, `RELEASE` or `CHANGELOG.md`, on any branch. A cut, prep or
+backport PR counts as one only when the release-bot app
+(`affinidi-semantic-release[bot]`) opened it from a branch of this repository:
+a branch name alone proves nothing. A cut or prep PR also counts when a person
+with the admin or maintain role opened it, since cuts are still run by hand.
+The check runs pipeline-rust's rules, then `scripts/check-branch-rules.py` for
+the `CHANGELOG.md` rule.
 
 ## Changelog
 
@@ -179,16 +188,14 @@ Automatic, by `publish.yml`, on every push to `release/**`. It publishes only
 when `RELEASE` is a GA/patch version equal to the workspace version, and only
 the crates whose version is not on crates.io yet — so it is a no-op on every
 other push, and re-running it after a failure resumes from the first missing
-crate. Order is dependency order from `cargo metadata`:
-
-```sh
-python3 .github/scripts/publish-crates.py plan
-```
+crate. Order is dependency order from `cargo metadata`; the run's log prints
+the plan.
 
 It authenticates with **crates.io Trusted Publishing only** — no registry token
 is stored anywhere. Each crate is verify-built first (`cargo package`), then a
-fresh 30-minute token is minted for its upload alone, so a long release never
-outlives its token; a failed upload is retried with a new token.
+fresh 30-minute token is minted for its upload alone and revoked after it, so
+a long release never outlives its token; a failed upload is retried with a new
+token.
 
 **A new crate** cannot be published this way: Trusted Publishing can only
 publish to a crate that already exists and names this workflow as a trusted
@@ -219,9 +226,8 @@ Settings, not files:
   rules`, `DCO sign-off`, `cargo test (workspace)`, `cargo clippy` and `cargo
   fmt`. `Default_branch_managed` adds the PR, review and signature rules.
 - **Ruleset `nightly`:** block force pushes and deletion. `nightly.yml` only
-  fast-forwards it. Restricting who may move it at all needs `RELEASE_TOKEN`
-  set to an identity a ruleset can name (the GitHub Actions app cannot be a
-  bypass actor).
+  fast-forwards it, as the release-bot app, so a ruleset can also limit who
+  creates or moves it to that app, maintainers and admins.
 - **`branch rules`** honours the release-tooling branch names (`backport-…`,
   `release-prep/…`, `release-cut/…`) only on branches in this repository, not
   on a fork's. That covers who may edit `CHANGELOG.md` too.
@@ -231,17 +237,16 @@ Settings, not files:
   GitHub Actions app) is not on the bypass list.
 - **Environment `release`** — `publish.yml` (crates.io), the ECR mirror in
   `publish-images.yaml`, and the release-bot steps of `release-tag.yml`,
-  `release-prep.yml` and `backport.yml` run in it. Restrict it to `main`
+  `release-prep.yml`, `backport.yml` and `nightly.yml` run in it. Restrict it to `main`
   (backports run there), `release/*` branches and `v*` tags. Each crate's
   Trusted Publisher on crates.io names this repository, `publish.yml` and
   this environment.
 - **`RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`** (environment `release`
   secrets) — the `affinidi-semantic-release` app, installed org-wide with
   contents write, as in affinidi-trust-registry-rs. Its token creates the
-  tags and GitHub Releases, and opens the prep and backport PRs: the
-  enterprise does not allow `GITHUB_TOKEN` to open pull requests, and a PR it
-  opened would trigger no CI anyway. `nightly.yml` and `publish.yml` need no
-  secret.
+  tags and GitHub Releases, moves `nightly`, and opens the prep and backport
+  PRs: the enterprise does not allow `GITHUB_TOKEN` to open pull requests, and
+  a PR it opened would trigger no CI anyway. `publish.yml` needs no secret.
 - **`CI_RUNNER_LARGE`** (variable, optional) — a larger runner label for the
   heavy CI jobs and `publish.yml`; `ubuntu-24.04` otherwise.
 - **`AWS_ROLE_ARN`** (variable, optional) — enables the ECR Public mirror in
