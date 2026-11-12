@@ -59,7 +59,12 @@ impl Database {
 
         if let Some(state) = session_db.get("state") {
             match SessionState::try_from(state) {
-                Ok(parsed) => session.state = parsed,
+                Ok(parsed) => {
+                    // The record holds the state only; `authenticated` is
+                    // derived from it, as the other backends store it.
+                    session.authenticated = parsed == SessionState::Authenticated;
+                    session.state = parsed;
+                }
                 Err(_) => {
                     // Corrupt session record — typically left over
                     // from a pre-0.14.x mediator that wrote `Unknown`
