@@ -775,6 +775,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            super::validate::refuse_sample_operating_keys(&converted)?;
             config.mediator_secrets.insert_vec(&converted).await;
         } else {
             // Self-hosted mode: operating keys come from the well-known
@@ -791,6 +792,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                         "Loading {} operating secret(s) from unified secret backend",
                         secrets_vec.len()
                     );
+                    super::validate::refuse_sample_operating_keys(&secrets_vec)?;
                     config.mediator_secrets.insert_vec(&secrets_vec).await;
                 }
                 Ok(None) => {
@@ -838,6 +840,13 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         };
 
         config.set_jwt_keys_from_pkcs8(&jwt_bytes)?;
+        if let Ok(pair) = Ed25519KeyPair::from_pkcs8(&jwt_bytes) {
+            super::validate::sample_identity_guard(
+                affinidi_messaging_mediator_config::validate::check_not_sample_jwt_key(
+                    pair.public_key().as_ref(),
+                ),
+            )?;
+        }
 
         Ok(config)
     }

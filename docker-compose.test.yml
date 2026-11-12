@@ -42,6 +42,9 @@ services:
     environment:
       # Mediator's view of Redis on the compose network (overrides the config).
       DATABASE_URL: redis://redis:6379/
+      # The test identity's keys are committed; a release build refuses them
+      # unless told this is a test deployment.
+      MEDIATOR_ALLOW_TEST_IDENTITY: "true"
     ports:
       - "7037:7037"
     # No container healthcheck: the production image ships without curl.

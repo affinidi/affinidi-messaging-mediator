@@ -50,7 +50,9 @@ mod golden {
 
         // Spot-check a field from a few different sections so an accidental
         // rename or moved field is caught, not just "it deserialized".
-        assert!(raw.mediator_did.starts_with("did"));
+        // The template names no identity: an operator supplies their own.
+        assert!(raw.mediator_did.is_empty());
+        assert!(raw.server.admin_did.is_empty());
         assert!(!raw.server.listen_address.is_empty());
         assert!(!raw.security.global_acl_default.is_empty());
         assert!(!raw.limits.message_size.is_empty());

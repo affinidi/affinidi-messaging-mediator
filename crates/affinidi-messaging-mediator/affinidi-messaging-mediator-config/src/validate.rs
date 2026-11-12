@@ -40,23 +40,116 @@ pub fn warn_implicit_relay(
     None
 }
 
-/// Warn when `admin_did` equals `mediator_did`: sharing one identity lets
-/// the mediator's operating key authenticate as admin (privilege confusion)
-/// and conflates two distinct trust roles.
+/// The account a configured DID names, for comparing two of them: the
+/// `did://` loader prefix, any query (including a did:scid `src` locator)
+/// and any fragment removed, and the `did` scheme and method lowercased. The
+/// method-specific id keeps its case, which its method defines.
+fn did_account_form(did: &str) -> String {
+    let did = did.trim();
+    let did = did.strip_prefix("did://").unwrap_or(did);
+    let did = affinidi_messaging_mediator_common::did_identity::account_did(did);
+    let end = did.find(['?', '#']).unwrap_or(did.len());
+    let did = &did[..end];
+    let mut parts = did.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(scheme), Some(method), Some(id)) => format!(
+            "{}:{}:{id}",
+            scheme.to_ascii_lowercase(),
+            method.to_ascii_lowercase()
+        ),
+        _ => did.to_string(),
+    }
+}
+
+/// Refuse an `admin_did` that names the mediator's own DID. The admin is the
+/// root administrator; the mediator's DID is its operating identity, whose
+/// keys sit on the server. One account would hold both roles, so whoever
+/// holds the mediator's operating keys could administer every account.
 ///
-/// This is a *warning*, not a hard error: the shipped example config (and
-/// possibly real deployments) use a single DID for both, so rejecting it at
-/// boot would break a currently-valid deployment — which the validation
-/// contract forbids. The footgun is still surfaced loudly.
-pub fn warn_admin_is_mediator(admin_did: &str, mediator_did: &str) -> Option<String> {
-    if admin_did == mediator_did {
-        return Some(format!(
-            "admin_did equals mediator_did ('{admin_did}') — the admin role shares the mediator's \
-             operating DID/key (privilege confusion). Use a separate DID for admin unless this is \
-             intentional."
+/// Compared as accounts (see `did_account_form`), so a fragment, a did:scid
+/// `src` locator or the case of `did:` and the method do not hide a match.
+/// Refused in every build.
+pub fn check_admin_not_mediator(admin_did: &str, mediator_did: &str) -> Result<(), String> {
+    if admin_did.trim().is_empty() || mediator_did.trim().is_empty() {
+        return Ok(());
+    }
+    if did_account_form(admin_did) == did_account_form(mediator_did) {
+        return Err(format!(
+            "admin_did names the mediator's own DID ('{}'). The admin must be a separate \
+             identity: set [server] admin_did (env ADMIN_DID) to a DID of its own. \
+             `mediator-setup` creates one (Admin step: \"Generate did:key\"); see \"Run the \
+             setup wizard\" in the mediator README.",
+            admin_did.trim()
         ));
     }
-    None
+    Ok(())
+}
+
+/// Environment variable that lets a release build start with one of the
+/// identities in [`SAMPLE_DID_KEYS`] or [`SAMPLE_JWT_PUBLIC_KEYS`]. Set it to
+/// `true` only for a test deployment such as `docker-compose.test.yml`.
+pub const ALLOW_SAMPLE_IDENTITY_ENV: &str = "MEDIATOR_ALLOW_TEST_IDENTITY";
+
+/// Public keys (multibase) of the sample and test DIDs committed to this
+/// repository: the example in `conf/mediator.toml` and the fixed identity in
+/// `docker/test/conf`. Their private keys are public, so a deployment that
+/// names one of them as its mediator or admin DID, or loads one as an
+/// operating key, hands that role to anyone.
+pub const SAMPLE_DID_KEYS: &[&str] = &[
+    // Example DID formerly in conf/mediator.toml (mediator_did and admin_did).
+    "z6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ",
+    "zQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3",
+    // docker/test/conf mediator DID (signing and key-agreement keys).
+    "z6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5pr6",
+    "z6LShyV6x81XmxvpyDpgwaXo27783iBBJPTeUtDgcvyKLDXP",
+    // docker/test/conf admin DID.
+    "z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed",
+];
+
+/// Ed25519 public keys (hex) of the JWT signing keys committed to this
+/// repository (`docker/test/conf/secrets.json`). Tokens signed with one of
+/// them can be minted by anyone.
+pub const SAMPLE_JWT_PUBLIC_KEYS: &[&str] =
+    &["8813a35c3f5b86539604dc5937c6fac5b8331c0964b8f1f6fbd05fb406ec6b65"];
+
+/// `did` must not be one of the sample or test DIDs committed to this
+/// repository (matched on the key it carries, so a re-encoded `did:peer`
+/// with other services is still caught).
+pub fn check_not_sample_did(field: &str, did: &str) -> Result<(), String> {
+    match SAMPLE_DID_KEYS.iter().find(|key| did.contains(*key)) {
+        Some(key) => Err(format!(
+            "{field} uses a sample/test identity whose private key is published in this \
+             repository (key {key}). Generate your own identity with mediator-setup."
+        )),
+        None => Ok(()),
+    }
+}
+
+/// An operating key (its public key as multibase) must not be one of
+/// [`SAMPLE_DID_KEYS`]. Catches a deployment that publishes its own
+/// `did:web` / `did:webvh` document but loads the committed test keys.
+pub fn check_not_sample_operating_key(key_id: &str, public_multibase: &str) -> Result<(), String> {
+    if SAMPLE_DID_KEYS.contains(&public_multibase) {
+        return Err(format!(
+            "operating key '{key_id}' is a sample/test key whose private key is published in \
+             this repository ({public_multibase}). Generate your own keys with mediator-setup."
+        ));
+    }
+    Ok(())
+}
+
+/// The JWT signing key must not be one committed to this repository.
+/// `public_key` is the raw 32-byte Ed25519 public key.
+pub fn check_not_sample_jwt_key(public_key: &[u8]) -> Result<(), String> {
+    let hex: String = public_key.iter().map(|b| format!("{b:02x}")).collect();
+    if SAMPLE_JWT_PUBLIC_KEYS.contains(&hex.as_str()) {
+        return Err(
+            "the JWT signing key is a sample/test key published in this repository; anyone \
+             can sign session tokens with it. Generate a new one with mediator-setup."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Minimal DID syntax check: `did:<method>:<method-specific-id>`, with a
@@ -239,11 +332,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warns_only_when_admin_equals_mediator() {
-        assert!(warn_admin_is_mediator("did:key:zAdmin", "did:peer:2.zMediator").is_none());
-        let msg = warn_admin_is_mediator("did:peer:2.same", "did:peer:2.same")
-            .expect("identical DIDs should warn");
-        assert!(msg.contains("privilege confusion"), "msg was: {msg}");
+    fn an_admin_did_naming_the_mediator_is_refused() {
+        let mediator = "did:peer:2.Ez6LSmediator.Vz6Mkmediator";
+        assert!(check_admin_not_mediator("did:key:z6MkAdmin", mediator).is_ok());
+        for admin in [
+            mediator.to_string(),
+            format!("did://{mediator}"),
+            format!("{mediator}#key-1"),
+            format!("  {mediator} "),
+            "DID:PEER:2.Ez6LSmediator.Vz6Mkmediator".to_string(),
+        ] {
+            let err = check_admin_not_mediator(&admin, mediator).expect_err(&admin);
+            assert!(
+                err.contains("admin_did names the mediator's own DID"),
+                "{err}"
+            );
+            assert!(err.contains("mediator-setup"), "says how to fix it: {err}");
+        }
+        // A did:scid `src` locator does not change the account.
+        assert!(
+            check_admin_not_mediator(
+                "did:scid:vh:1:QmScid?src=example.com",
+                "did:scid:vh:1:QmScid"
+            )
+            .is_err()
+        );
+        // The method-specific id keeps its case.
+        assert!(check_admin_not_mediator("did:example:ABC", "did:example:abc").is_ok());
+        // Unset on either side is checked elsewhere.
+        assert!(check_admin_not_mediator("", "").is_ok());
+        assert!(check_admin_not_mediator("", mediator).is_ok());
     }
 
     #[test]
@@ -389,6 +507,52 @@ mod tests {
     fn warns_only_when_remote_admin_unblocked() {
         assert!(warn_remote_admin_allowed(false).is_some());
         assert!(warn_remote_admin_allowed(true).is_none());
+    }
+
+    #[test]
+    fn sample_dids_are_recognised_by_their_key() {
+        let template = "did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.EzQ3shVZJV9gKezYsvy5tC1LCwjjWSms2zCfZhvnRK48BNoHH3";
+        let err = check_not_sample_did("admin_did", template).unwrap_err();
+        assert!(err.contains("admin_did"));
+        // Same key, different service section.
+        assert!(
+            check_not_sample_did(
+                "mediator_did",
+                "did:peer:2.Vz6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5pr6.SeyJ0IjoiZG0ifQ"
+            )
+            .is_err()
+        );
+        assert!(
+            check_not_sample_did(
+                "admin_did",
+                "did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
+            )
+            .is_err()
+        );
+        assert!(check_not_sample_did("admin_did", "did:key:z6MkOther").is_ok());
+        assert!(check_not_sample_did("mediator_did", "did:web:example.com").is_ok());
+    }
+
+    #[test]
+    fn sample_operating_keys_are_recognised() {
+        assert!(
+            check_not_sample_operating_key(
+                "did:web:example.com#key-2",
+                "z6LShyV6x81XmxvpyDpgwaXo27783iBBJPTeUtDgcvyKLDXP"
+            )
+            .is_err()
+        );
+        assert!(check_not_sample_operating_key("k", "z6MkOther").is_ok());
+    }
+
+    #[test]
+    fn sample_jwt_keys_are_recognised() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&SAMPLE_JWT_PUBLIC_KEYS[0][i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert!(check_not_sample_jwt_key(&key).is_err());
+        assert!(check_not_sample_jwt_key(&[7u8; 32]).is_ok());
     }
 
     #[test]

@@ -656,6 +656,11 @@ fn validate(config: &Config, has_store: bool) -> Result<(), MediatorError> {
             "admin_did is required (call MediatorBuilder::admin_did)".into(),
         ));
     }
+    affinidi_messaging_mediator_config::validate::check_admin_not_mediator(
+        &config.admin_did,
+        &config.mediator_did,
+    )
+    .map_err(|msg| MediatorError::ConfigError(12, "builder".into(), msg))?;
     if !has_store && config.database.database_url.is_empty() {
         return Err(MediatorError::ConfigError(
             12,

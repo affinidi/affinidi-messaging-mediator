@@ -1317,6 +1317,15 @@ async fn mint_artefacts(
         (None, ADMIN_SKIP) => (None, None),
         (None, _) => (None, None),
     };
+    // The admin is a separate identity from the mediator; the mediator
+    // refuses to start otherwise, so stop here rather than write that config.
+    if let Some(admin) = admin_did.as_deref() {
+        affinidi_messaging_mediator_config::validate::check_admin_not_mediator(
+            admin,
+            &mediator_did,
+        )
+        .map_err(|msg| anyhow::anyhow!(msg))?;
+    }
 
     Ok(MintedArtefacts {
         mediator_did,
