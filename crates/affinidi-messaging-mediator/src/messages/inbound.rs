@@ -674,10 +674,11 @@ async fn dispatch_tsp_trust_task(
 /// Deliver a TSP message to the local recipient named in *its own envelope*:
 /// parse the envelope for its receiver and hand off to [`deliver_opaque`].
 ///
-/// `from_vid` is supplied by the caller rather than read from `bytes`, so the
-/// recipient's access list is always applied against the sender the caller
-/// established for this hop, never against a sender claimed by whatever bytes
-/// are being delivered.
+/// `from_vid` is supplied by the caller rather than read from `bytes`: it is
+/// the sender the caller vouches for. On the relay and to-mediator arms that
+/// is the sender `unpack` verified; on pass-through it is the envelope sender,
+/// bound to the session DID when `force_session_did_match` is on and the
+/// session is authenticated.
 #[cfg(feature = "tsp")]
 async fn deliver_tsp_local(
     state: &SharedData,
