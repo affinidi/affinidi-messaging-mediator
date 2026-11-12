@@ -42,18 +42,22 @@ pub fn warn_implicit_relay(
 
 /// Warn when `admin_did` equals `mediator_did`: sharing one identity lets
 /// the mediator's operating key authenticate as admin (privilege confusion)
-/// and conflates two distinct trust roles.
+/// and conflates two distinct trust roles. At startup the shared account ends
+/// up holding the root-admin role, so whoever holds the mediator's operating
+/// keys can administer every account.
 ///
-/// This is a *warning*, not a hard error: existing deployments may use a
-/// single DID for both, so rejecting it at boot would break a currently-valid
-/// deployment — which the validation contract forbids. The footgun is still
-/// surfaced loudly.
+/// This is a *warning*, not a hard error: earlier versions of the shipped
+/// template set both to one DID, so deployments built from it would stop
+/// starting — which the validation contract forbids. The mediator logs it at
+/// `ERROR` on every start so it is not missed.
 pub fn warn_admin_is_mediator(admin_did: &str, mediator_did: &str) -> Option<String> {
-    if admin_did == mediator_did {
+    if !admin_did.is_empty() && admin_did == mediator_did {
         return Some(format!(
             "admin_did equals mediator_did ('{admin_did}') — the admin role shares the mediator's \
-             operating DID/key (privilege confusion). Use a separate DID for admin unless this is \
-             intentional."
+             operating DID/key (privilege confusion): this one account holds the root-admin role, \
+             so the mediator's operating keys can administer every account. Give the admin its \
+             own DID (set ADMIN_DID, or re-run mediator-setup). A later release may refuse this \
+             configuration."
         ));
     }
     None
@@ -311,6 +315,9 @@ mod tests {
         let msg = warn_admin_is_mediator("did:peer:2.same", "did:peer:2.same")
             .expect("identical DIDs should warn");
         assert!(msg.contains("privilege confusion"), "msg was: {msg}");
+        assert!(msg.contains("root-admin role"), "msg was: {msg}");
+        // Unset on both sides is not one shared identity.
+        assert!(warn_admin_is_mediator("", "").is_none());
     }
 
     #[test]

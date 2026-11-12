@@ -14,7 +14,7 @@ use affinidi_messaging_mediator_config::validate::{
     warn_implicit_relay, warn_per_peer_not_below_receive_limit,
     warn_permissive_default_with_denylist_mode, warn_remote_admin_allowed,
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::Config;
 use crate::common::error_codes;
@@ -44,8 +44,10 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     check_trust_xff_cidrs(&config.trust_xff_cidrs).map_err(cfg_err)?;
 
     // ── Warnings (legal, but usually a mistake) ──────────────────────
+    // Logged at ERROR, not WARN: the mediator's operating keys then hold the
+    // root-admin role. Not refused, as earlier templates set both to one DID.
     if let Some(msg) = warn_admin_is_mediator(&config.admin_did, &config.mediator_did) {
-        warn!("{msg}");
+        error!("{msg}");
     }
     if let Some(msg) = warn_permissive_default_with_denylist_mode(
         &config.security.mediator_acl_mode,
