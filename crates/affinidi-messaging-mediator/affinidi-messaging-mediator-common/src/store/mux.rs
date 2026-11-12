@@ -254,7 +254,47 @@ pub struct MuxDidRecord {
     /// about in a `grantsPresent` notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_told: Option<String>,
+    /// The wire this DID last used with the mediator: its last mux
+    /// connection's, or its last direct login's. Its notices are sealed for
+    /// it; `None` means DIDComm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<NoticeWire>,
+    /// The recent notices in [`notices`](Self::notices) that can be sealed
+    /// again: the wire each was stored for and its payload. When this DID
+    /// connects on the other wire, they are re-issued for it. Bounded by
+    /// [`MAX_NOTICE_FORMS`] and [`MAX_NOTICE_FORM_BYTES`]; an older notice is
+    /// still counted, but stays in the form it was stored in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notice_forms: Vec<NoticeForm>,
 }
+
+/// The wire a notice is sealed for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeWire {
+    /// Packed as DIDComm, authcrypted from the mediator.
+    #[serde(rename = "didcomm")]
+    DidComm,
+    /// Sealed as a TSP Direct message from the mediator's VID.
+    Tsp,
+}
+
+/// A stored notice that can be sealed again for the other wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeForm {
+    /// The stored message's id, as in [`MuxDidRecord::notices`].
+    pub id: String,
+    pub wire: NoticeWire,
+    /// The notice's `payload`, before it was signed and sealed.
+    pub payload: serde_json::Value,
+}
+
+/// The most notices a record keeps re-sealable.
+pub const MAX_NOTICE_FORMS: usize = 32;
+
+/// The most bytes of notice payloads a record keeps; past it, the oldest go.
+pub const MAX_NOTICE_FORM_BYTES: usize = 64 * 1024;
 
 /// The most notice ids a record tracks; older ones are forgotten (the notices
 /// themselves stay in the inbox until deleted).
@@ -280,11 +320,48 @@ impl MuxDidRecord {
             && self.present_told.is_none()
     }
 
-    /// Remember a notice stored in this DID's inbox.
-    pub fn track_notice(&mut self, msg_id: String) {
-        self.notices.push(msg_id);
+    /// Remember a notice stored in this DID's inbox, sealed for `wire` from
+    /// `payload`.
+    pub fn track_notice(&mut self, msg_id: String, wire: NoticeWire, payload: serde_json::Value) {
+        self.notices.push(msg_id.clone());
         let over = self.notices.len().saturating_sub(MAX_TRACKED_NOTICES);
         self.notices.drain(..over);
+        self.notice_forms.push(NoticeForm {
+            id: msg_id,
+            wire,
+            payload,
+        });
+        self.bound_notice_forms();
+    }
+
+    /// Replace the tracked notice `old` with `new`, the same notice stored
+    /// again for `wire`.
+    pub fn retrack_notice(&mut self, old: &str, new: String, wire: NoticeWire) {
+        for id in self.notices.iter_mut().filter(|id| *id == old) {
+            *id = new.clone();
+        }
+        for form in self.notice_forms.iter_mut().filter(|f| f.id == old) {
+            form.id = new.clone();
+            form.wire = wire;
+        }
+    }
+
+    /// Forget the notices in `gone` (deleted from the inbox).
+    pub fn forget_notices(&mut self, gone: &HashSet<String>) {
+        self.notices.retain(|id| !gone.contains(id));
+        self.notice_forms.retain(|f| !gone.contains(&f.id));
+    }
+
+    fn bound_notice_forms(&mut self) {
+        let tracked: HashSet<&String> = self.notices.iter().collect();
+        self.notice_forms.retain(|f| tracked.contains(&f.id));
+        let over = self.notice_forms.len().saturating_sub(MAX_NOTICE_FORMS);
+        self.notice_forms.drain(..over);
+        let size = |f: &NoticeForm| f.payload.to_string().len();
+        let mut total: usize = self.notice_forms.iter().map(size).sum();
+        while total > MAX_NOTICE_FORM_BYTES && !self.notice_forms.is_empty() {
+            total -= size(&self.notice_forms.remove(0));
+        }
     }
 
     /// A digest of the grant set on this DID (ids and states), so a
@@ -966,6 +1043,77 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
             r#"["receive","pickup"]"#
+        );
+    }
+
+    #[test]
+    fn notice_forms_follow_the_tracked_notices_within_their_bounds() {
+        let mut rec = MuxDidRecord::default();
+        rec.track_notice(
+            "n1".into(),
+            NoticeWire::DidComm,
+            serde_json::json!({"n": 1}),
+        );
+        rec.track_notice("n2".into(), NoticeWire::Tsp, serde_json::json!({"n": 2}));
+        assert_eq!(rec.notices, vec!["n1", "n2"]);
+        assert_eq!(rec.notice_forms.len(), 2);
+
+        // Re-issued for the other wire under a new id.
+        rec.retrack_notice("n1", "n1b".into(), NoticeWire::Tsp);
+        assert_eq!(rec.notices, vec!["n1b", "n2"]);
+        assert_eq!(rec.notice_forms[0].id, "n1b");
+        assert_eq!(rec.notice_forms[0].wire, NoticeWire::Tsp);
+
+        // Forgotten with the notice.
+        rec.forget_notices(&HashSet::from(["n2".to_string()]));
+        assert_eq!(rec.notices, vec!["n1b"]);
+        assert_eq!(rec.notice_forms.len(), 1);
+
+        // Bounded by count, oldest first.
+        for i in 0..MAX_NOTICE_FORMS + 5 {
+            rec.track_notice(format!("c{i}"), NoticeWire::Tsp, serde_json::json!({}));
+        }
+        assert_eq!(rec.notice_forms.len(), MAX_NOTICE_FORMS);
+        assert_eq!(
+            rec.notice_forms.last().unwrap().id,
+            format!("c{}", MAX_NOTICE_FORMS + 4)
+        );
+        assert!(
+            rec.notices.len() > MAX_NOTICE_FORMS,
+            "older notices stay counted"
+        );
+
+        // And by payload bytes.
+        let big = serde_json::json!({ "x": "y".repeat(MAX_NOTICE_FORM_BYTES / 2) });
+        for i in 0..3 {
+            rec.track_notice(format!("b{i}"), NoticeWire::Tsp, big.clone());
+        }
+        let total: usize = rec
+            .notice_forms
+            .iter()
+            .map(|f| f.payload.to_string().len())
+            .sum();
+        assert!(total <= MAX_NOTICE_FORM_BYTES, "{total}");
+        assert_eq!(rec.notice_forms.last().unwrap().id, "b2");
+    }
+
+    #[test]
+    fn a_record_from_before_notice_forms_reads_and_round_trips() {
+        let old = r#"{"version":3,"epoch":0,"grants":[],"notices":["n1"]}"#;
+        let rec: MuxDidRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.notices, vec!["n1"]);
+        assert!(rec.notice_forms.is_empty() && rec.wire.is_none());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("noticeForms") && !json.contains("wire"),
+            "{json}"
+        );
+        let mut rec = rec;
+        rec.wire = Some(NoticeWire::DidComm);
+        assert!(
+            serde_json::to_string(&rec)
+                .unwrap()
+                .contains(r#""wire":"didcomm""#)
         );
     }
 
