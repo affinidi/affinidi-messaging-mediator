@@ -1,12 +1,13 @@
 //! DID multiplexing on a **raw-TSP** socket: the `tsp-mux` subprotocol (spec
 //! `messaging/mux/event`, "Raw-TSP sockets"; design §4.10).
 //!
-//! The SDK has no `tsp-mux` client, so the socket is driven directly with
-//! `tokio-tungstenite`, as `tsp_websocket.rs` drives `tsp` / `tsp-ack`. Grants
-//! are stored through the mediator's own grant operation, as in
+//! Most tests drive the socket directly with `tokio-tungstenite`, as
+//! `tsp_websocket.rs` drives `tsp` / `tsp-ack`, to check the wire itself; the
+//! rest use the SDK's `tsp-mux` client (`TspOps::connect_websocket_mux`).
+//! Grants are stored through the mediator's own grant operation, as in
 //! `mux_connection.rs`. Mux events arrive as TSP Direct messages from the
-//! mediator's VID to the principal's, which the principal unpacks with the
-//! SDK.
+//! mediator's VID to the principal's. The cross-instance paths are in
+//! `tsp_mux_two_instances.rs`.
 #![cfg(feature = "tsp")]
 
 mod common;
@@ -764,6 +765,350 @@ async fn the_sdk_client_drives_a_tsp_mux_connection() {
         TspMuxFrame::Data { receiver, .. } => assert_eq!(receiver, work.did),
         other => panic!("expected a member frame, got {other:?}"),
     }
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}
+
+// ─── Member lifecycle on a tsp-mux socket, through the SDK client ───────────
+
+type SdkMux = affinidi_messaging_sdk::protocols::tsp_mux::TspMuxWebSocket;
+use affinidi_messaging_sdk::protocols::tsp_mux::TspMuxFrame;
+
+/// The next frame on the SDK socket, within 5 s.
+async fn sdk_next(sock: &mut SdkMux) -> TspMuxFrame {
+    timeout(Duration::from_secs(5), sock.recv())
+        .await
+        .expect("a frame within 5s")
+        .expect("socket readable")
+        .expect("socket open")
+}
+
+/// The next `event` naming `did`, as JSON, skipping data frames and other
+/// events; also returns the data frames skipped on the way.
+async fn sdk_event_for(
+    sock: &mut SdkMux,
+    event: &str,
+    did: &str,
+) -> (Value, Vec<(String, Vec<u8>)>) {
+    let mut data = Vec::new();
+    loop {
+        match sdk_next(sock).await {
+            TspMuxFrame::Event(e) => {
+                let e = serde_json::to_value(&*e).unwrap();
+                if e["event"] == event
+                    && e["dids"]
+                        .as_array()
+                        .is_some_and(|ds| ds.iter().any(|d| d["did"] == did))
+                {
+                    let entry = e["dids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|d| d["did"] == did)
+                        .unwrap()
+                        .clone();
+                    return (entry, data);
+                }
+            }
+            TspMuxFrame::Data {
+                receiver, frame, ..
+            } => data.push((receiver, frame)),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
+/// The next data frame on the SDK socket.
+async fn sdk_data(sock: &mut SdkMux) -> (String, Vec<u8>) {
+    loop {
+        if let TspMuxFrame::Data {
+            receiver, frame, ..
+        } = sdk_next(sock).await
+        {
+            return (receiver, frame);
+        }
+    }
+}
+
+/// A member's revoke and a full connection both reach the tsp-mux
+/// socket as `detached` events, sealed for TSP.
+#[tokio::test]
+async fn revokes_and_a_full_connection_are_reported_on_a_tsp_mux_socket() {
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .mux_max_dids_per_connection(2)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .expect("spawn");
+    let env = TestEnvironment::new(mediator).await.expect("env");
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    let spare = env.add_user("spare").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    // Three grants, room for two: the connection reports the one left out.
+    grant(&env, &work, &principal, &["receive", "pickup", "delete"]).await;
+    grant(&env, &home, &principal, &["receive", "pickup", "delete"]).await;
+    grant(&env, &spare, &principal, &["receive"]).await;
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    let mut left_out = None;
+    while left_out.is_none() {
+        match sdk_next(&mut sock).await {
+            TspMuxFrame::Event(e) => {
+                let e = serde_json::to_value(&*e).unwrap();
+                if e["event"] == "detached" {
+                    left_out = Some(e["dids"][0].clone());
+                }
+            }
+            other => panic!("expected events only, got {other:?}"),
+        }
+    }
+    let left_out = left_out.unwrap();
+    assert_eq!(left_out["reason"], "connectionFull", "{left_out:#}");
+    assert_eq!(sock.members().len(), 2);
+    // Revoke one of the two carried.
+    let home = if sock.members().is_reachable(&home.did) {
+        home
+    } else if sock.members().is_reachable(&work.did) && left_out["did"] == home.did {
+        // `home` was the one left out: revoke `work` instead and check `spare`
+        // stays out.
+        work
+    } else {
+        home
+    };
+
+    // `home` revokes its grant; the event comes on the tsp-mux socket. (The
+    // member asks, not the principal: the SDK's TSP request would wait for its
+    // reply in the principal's inbox, which this socket drains first.)
+    // Its request goes over its own websocket, which supersedes it here
+    // first.
+    env.atm
+        .profile_add(&home.profile, true)
+        .await
+        .expect("home's own websocket");
+    env.atm
+        .trust_tasks()
+        .mux_revoke(&home.profile, true, vec![], vec![principal.did.clone()])
+        .await
+        .expect("mux_revoke");
+    let entry = loop {
+        let (entry, _) = sdk_event_for(&mut sock, "detached", &home.did).await;
+        if entry["reason"] != "superseded" {
+            break entry;
+        }
+    };
+    assert_eq!(entry["reason"], "revokedByMember", "{entry:#}");
+    assert!(!sock.members().is_reachable(&home.did));
+    assert_eq!(sock.members().len(), 1);
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}
+
+/// The member's own socket takes the DID (`superseded`); when it closes the
+/// member is `reactivated` on the tsp-mux socket, and what arrived meanwhile,
+/// never acknowledged, is redelivered there as TSP frames.
+#[tokio::test]
+async fn a_superseded_member_comes_back_with_its_mail() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    env.relate_directly(&sender, &work).await.unwrap();
+    grant(&env, &work, &principal, &["receive", "pickup", "delete"]).await;
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    sdk_event_for(&mut sock, "attached", &work.did).await;
+
+    // `work`'s own raw-TSP socket (ack mode: nothing it is sent is deleted
+    // until acknowledged) outranks the mux entry.
+    let (mut own, selected, _) = connect(&env, &work, &["tsp", "tsp-ack"]).await;
+    assert_eq!(selected.as_deref(), Some("tsp-ack"));
+    let (entry, _) = sdk_event_for(&mut sock, "detached", &work.did).await;
+    assert_eq!(entry["reason"], "superseded", "{entry:#}");
+
+    env.atm
+        .tsp()
+        .send(&sender.profile, &work.did, b"while superseded")
+        .await
+        .expect("send");
+    let on_own = next_binary(&mut own).await;
+    assert_eq!(receiver(&on_own), work.did, "pushed to work's own socket");
+
+    // `work` goes; the mux entry takes the DID back and redelivers.
+    own.close(None).await.ok();
+    drop(own);
+    let (entry, mut data) = sdk_event_for(&mut sock, "attached", &work.did).await;
+    assert_eq!(entry["reason"], "reactivated", "{entry:#}");
+    while data.is_empty() {
+        data.push(sdk_data(&mut sock).await);
+    }
+    let (to, frame) = &data[0];
+    assert_eq!(*to, work.did);
+    assert_eq!(*frame, on_own, "the unacknowledged frame is redelivered");
+    let (payload, _) = env
+        .atm
+        .tsp()
+        .unpack_bytes(&work.profile, frame)
+        .await
+        .expect("work opens it");
+    assert_eq!(payload, b"while superseded");
+
+    // And new mail is pushed live again.
+    env.atm
+        .tsp()
+        .send(&sender.profile, &work.did, b"after")
+        .await
+        .expect("send");
+    let (to, frame) = sdk_data(&mut sock).await;
+    assert_eq!(to, work.did);
+    assert_ne!(frame, on_own);
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}
+
+/// A tsp-mux socket replaced by the principal's next one is closed with a
+/// close frame only: a raw-TSP socket never gets a DIDComm Text frame.
+#[tokio::test]
+async fn a_replaced_tsp_mux_socket_closes_without_a_text_frame() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+
+    let (mut first, selected, _) = connect(&env, &principal, &MUX_OFFER).await;
+    assert_eq!(selected.as_deref(), Some("tsp-mux"));
+    let ready = open_event(&env, &principal, &next_binary(&mut first).await).await;
+    assert_eq!(ready["payload"]["event"], "ready");
+
+    let (_second, _, _) = connect(&env, &principal, &MUX_OFFER).await;
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match first.next().await {
+                None | Some(Err(_)) => return None,
+                Some(Ok(Message::Close(frame))) => return Some(frame),
+                Some(Ok(Message::Text(t))) => panic!("a Text frame on a raw-TSP socket: {t}"),
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("the replaced socket closes");
+    let frame = closed.expect("with a close frame").expect("and a reason");
+    assert!(!frame.reason.is_empty(), "the close frame says why");
+    env.shutdown().await.expect("shutdown");
+}
+
+/// The drain writes TSP frames only, and records as delivered only what it
+/// wrote: a DIDComm message in the principal's inbox is left unstamped, for
+/// a client that can read it.
+#[tokio::test]
+async fn the_drain_stamps_only_what_it_writes() {
+    use affinidi_messaging_didcomm::message::Message as DidcommMessage;
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    env.relate_directly(&sender, &principal).await.unwrap();
+
+    // A DIDComm message, then a TSP one, wait in the principal's inbox.
+    let t = now();
+    let msg = DidcommMessage::build(
+        Uuid::new_v4().to_string(),
+        "https://didcomm.org/basicmessage/2.0/message".to_string(),
+        json!({ "content": "didcomm" }),
+    )
+    .to(principal.did.clone())
+    .from(sender.did.clone())
+    .created_time(t)
+    .expires_time(t + 300)
+    .finalize();
+    let (packed, _) = env
+        .atm
+        .pack_encrypted(&msg, &principal.did, Some(&sender.did), Some(&sender.did))
+        .await
+        .unwrap();
+    env.atm
+        .send_message(&sender.profile, &packed, &msg.id, false, false)
+        .await
+        .unwrap();
+    env.atm
+        .tsp()
+        .send(&sender.profile, &principal.did, b"tsp")
+        .await
+        .expect("send");
+
+    let store = env.mediator.store();
+    for m in store
+        .fetch_messages("test", &principal.did_hash(), &FetchOptions::default())
+        .await
+        .expect("fetch")
+        .success
+    {
+        let state = store.delivery_state(&m.msg_id).await.unwrap().unwrap();
+        assert!(
+            state.first_delivered_at_ms.is_none(),
+            "nothing is stamped before the socket opens: {}",
+            m.msg_id
+        );
+    }
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    let (to, _) = sdk_data(&mut sock).await;
+    assert_eq!(to, principal.did, "the TSP message is drained");
+
+    let inbox = store
+        .fetch_messages("test", &principal.did_hash(), &FetchOptions::default())
+        .await
+        .expect("fetch");
+    let mut checked = (0, 0);
+    for m in inbox.success {
+        let tsp = m
+            .msg
+            .as_deref()
+            .and_then(|b| BASE64_URL_SAFE_NO_PAD.decode(b).ok())
+            .is_some_and(|b| affinidi_tsp::is_tsp(&b));
+        let state = store
+            .delivery_state(&m.msg_id)
+            .await
+            .expect("delivery state")
+            .expect("exists");
+        if tsp {
+            assert!(
+                state.first_delivered_at_ms.is_some(),
+                "the written frame is stamped"
+            );
+            checked.0 += 1;
+        } else {
+            assert!(
+                state.first_delivered_at_ms.is_none(),
+                "a DIDComm message the drain skipped is not stamped"
+            );
+            checked.1 += 1;
+        }
+    }
+    assert_eq!(checked, (1, 1), "one of each");
     sock.close().await.expect("close");
     env.shutdown().await.expect("shutdown");
 }

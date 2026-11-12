@@ -421,9 +421,31 @@ pub struct DeliveryReport {
     /// The frame's protocol, read from the body when the report is made. The
     /// report holds no copy of the body: the monitor never publishes one.
     pub protocol: crate::monitor::Protocol,
+    /// Record the message as handed over in the store once it is written, as
+    /// a pickup does (`limits.delivered_expiry_seconds`). Set by the inbox
+    /// redelivery, which re-sends stored mail; a live push is not stamped.
+    pub stamp: bool,
 }
 
 impl DeliveryReport {
+    /// The frame is on the wire: stamp the message when [`stamp`](Self::stamp)
+    /// says so, then report the delivery.
+    pub async fn written(self, state: &crate::SharedData) {
+        if self.stamp
+            && let Err(err) = state
+                .database
+                .record_delivered(
+                    std::slice::from_ref(&self.msg_id),
+                    state.clock.unix_millis() as u64,
+                    state.config.limits.delivered_expiry_seconds,
+                )
+                .await
+        {
+            warn!(msg_id = %self.msg_id, "couldn't record a redelivered message as delivered: {err}");
+        }
+        self.emit(&state.monitor);
+    }
+
     /// Report the delivery: call once the frame is on the wire.
     pub fn emit(self, monitor: &crate::monitor::TrafficMonitor) {
         monitor.delivered_as(
@@ -609,10 +631,6 @@ pub struct StreamingTask {
     pub channel: mpsc::Sender<StreamingUpdate>,
     /// Global byte pool shared by every connection's send queue.
     pub send_budget: WsSendBudget,
-    /// `limits.delivered_expiry_seconds`, carried so the redelivery drain
-    /// records handovers on the same terms as every other delivery path. `0`
-    /// leaves expiry untouched, which is the default.
-    pub delivered_expiry_seconds: u64,
     /// Heartbeat and ownership-recheck timing.
     pub liveness: StreamingLiveness,
 }
@@ -638,7 +656,6 @@ impl StreamingTask {
         database: Arc<dyn MediatorStore>,
         mediator_uuid: &str,
         send_budget: WsSendBudget,
-        delivered_expiry_seconds: u64,
         liveness: StreamingLiveness,
     ) -> Self {
         // Control-plane channel (register/start/stop/deregister). Carries no
@@ -649,7 +666,6 @@ impl StreamingTask {
             channel: tx,
             uuid: mediator_uuid.to_string(),
             send_budget,
-            delivered_expiry_seconds,
             liveness,
         };
         let rx = Arc::new(Mutex::new(rx));
@@ -859,6 +875,7 @@ impl StreamingTask {
                             to: Some(did_hash.clone()),
                             size: message.len() as u64,
                             protocol: crate::monitor::Protocol::detect(&message),
+                            stamp: false,
                         });
                         // Moved, not cloned: the body already exists in the
                         // broadcast ring slot, and `payload` is owned here.
@@ -1047,7 +1064,6 @@ impl StreamingTask {
                     did_hash.to_string(),
                     session_id.to_string(),
                     Arc::clone(replay_in_progress),
-                    self.delivered_expiry_seconds,
                 );
             } else {
                 debug!(
@@ -1432,7 +1448,6 @@ impl StreamingTask {
                     did_hash.to_string(),
                     session_id,
                     Arc::clone(replay_in_progress),
-                    self.delivered_expiry_seconds,
                 );
             } else {
                 debug!(
@@ -1839,7 +1854,6 @@ fn spawn_inbox_redelivery(
     did_hash: String,
     session_id: String,
     replay_in_progress: Arc<DashSet<String>>,
-    delivered_expiry_seconds: u64,
 ) {
     tokio::spawn(async move {
         let mut start_id: Option<String> = None;
@@ -1853,18 +1867,14 @@ fn spawn_inbox_redelivery(
                 start_id: start_id.clone(),
                 ..Default::default() // delete_policy defaults to DoNotDelete
             };
+            // Fetched without stamping, in stream order (this drain re-covers
+            // a socket's whole inbox, paging with `start_id`). Each message is
+            // stamped by the socket once its frame is written
+            // (`DeliveryReport::stamp`): queueing is not delivery (R1.1), and a
+            // raw-TSP socket answers these with its own drain, writing only
+            // TSP frames.
             let page = match database
-                .fetch_messages_delivering(
-                    &session_id,
-                    &did_hash,
-                    &options,
-                    affinidi_messaging_mediator_common::time::unix_timestamp_millis() as u64,
-                    delivered_expiry_seconds,
-                    // This drain pages with `start_id` and wants stream order:
-                    // it is re-covering a socket's whole inbox, not choosing
-                    // between competing senders.
-                    false,
-                )
+                .fetch_messages(&session_id, &did_hash, &options)
                 .await
             {
                 Ok(page) => page,
@@ -1895,6 +1905,7 @@ fn spawn_inbox_redelivery(
                     to: element.to_address,
                     size: element.size,
                     protocol: crate::monitor::Protocol::detect(&msg),
+                    stamp: true,
                 };
 
                 // Fetched with `DoNotDelete`, so anything not queued here stays
@@ -1969,7 +1980,6 @@ mod tests {
             // buffer exhaustion (which `ws_budget` covers directly).
             send_budget: WsSendBudget::new(16 * 1024 * 1024),
             liveness: StreamingLiveness::default(),
-            delivered_expiry_seconds: 0,
         }
     }
 

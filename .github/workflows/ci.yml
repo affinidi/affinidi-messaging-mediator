@@ -360,7 +360,7 @@ jobs:
             --test redis_reconnect \
             --test redis_storage_full \
             --test redis_streaming_heartbeat
-      - name: cargo test mux_cross_instance, mux_two_instances, mux_two_processes and mux_standing_two_instances against Redis
+      - name: cargo test the cross-instance mux suites (DIDComm and tsp-mux) against Redis
         # A grant change published by another instance reaches this one's
         # connections through Redis pub/sub. Needs the fixture's
         # `redis-backend` feature, which the workspace test job does not set.
@@ -374,6 +374,10 @@ jobs:
             --test mux_two_instances \
             --test mux_two_processes \
             --test mux_standing_two_instances
+          cargo test \
+            -p affinidi-messaging-test-mediator \
+            --features redis-backend,tsp \
+            --test tsp_mux_two_instances
 
   redis-conformance-cluster:
     # The same checks against a single-node Valkey cluster (all slots on one
@@ -434,6 +438,10 @@ jobs:
             --test mux_two_instances \
             --test mux_two_processes \
             --test mux_standing_two_instances
+          cargo test \
+            -p affinidi-messaging-test-mediator \
+            --features redis-backend,tsp \
+            --test tsp_mux_two_instances
 
   test-mediator-fjall:
     # The e2e suite against the on-disk Fjall backend (each store in its own

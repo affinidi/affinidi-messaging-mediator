@@ -650,13 +650,30 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // could not read, and stamping those would record a handover that
         // never happened.
         let delivered: Vec<String> = response.success.iter().map(|m| m.msg_id.clone()).collect();
-        if !delivered.is_empty() {
+        self.record_delivered(&delivered, now_ms, delivered_ttl_secs)
+            .await?;
+        Ok(response)
+    }
+
+    /// Stamp `msg_ids` as handed over, as
+    /// [`fetch_messages_delivering`](Self::fetch_messages_delivering) does for
+    /// what it returns, and publish the delivery metrics. For a caller that
+    /// fetches with [`fetch_messages`](Self::fetch_messages) and writes the
+    /// messages itself: it stamps only what it actually wrote (R1.1), so a
+    /// message it skips keeps its expiry.
+    async fn record_delivered(
+        &self,
+        msg_ids: &[String],
+        now_ms: u64,
+        delivered_ttl_secs: u64,
+    ) -> Result<(), MediatorError> {
+        if !msg_ids.is_empty() {
             let report = self
-                .mark_delivered(&delivered, now_ms, delivered_ttl_secs)
+                .mark_delivered(msg_ids, now_ms, delivered_ttl_secs)
                 .await?;
             publish_delivery_metrics(&report);
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Record that `msg_ids` have been handed to their recipient: stamp the
