@@ -1135,10 +1135,21 @@ async fn notice_in(env: &TestEnvironment, principal: &TestUser, frame: &[u8]) ->
 /// The next notice on the SDK socket, skipping events and other frames.
 async fn sdk_notice(env: &TestEnvironment, principal: &TestUser, sock: &mut SdkMux) -> Value {
     loop {
-        if let TspMuxFrame::Data { frame, .. } = sdk_next(sock).await
-            && let Some(doc) = notice_in(env, principal, &frame).await
-        {
-            return doc;
+        match sdk_next(sock).await {
+            // The SDK opens and verifies a notice itself; the frame it came in
+            // is still sealed for the principal over TSP.
+            TspMuxFrame::Notice { notice, frame } => {
+                assert!(
+                    notice_in(env, principal, &frame).await.is_some(),
+                    "a TSP frame from the mediator, to the principal"
+                );
+                return serde_json::to_value(&*notice).expect("notice as JSON");
+            }
+            TspMuxFrame::Data { frame, .. } => assert!(
+                notice_in(env, principal, &frame).await.is_none(),
+                "the SDK hands a notice over as a notice"
+            ),
+            _ => {}
         }
     }
 }
