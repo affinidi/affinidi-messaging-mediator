@@ -1209,10 +1209,14 @@ fn refuse_blocked(state: &SharedData, next: &str, hop: RemoteHop) -> NextHop {
     NextHop::Remote(hop)
 }
 
+/// Each of the endpoint, relay DID and next hop is compared in its
+/// [`canonical_relay_target`](crate::common::relay_target::canonical_relay_target)
+/// form, so another spelling of a listed DID or URL is still refused.
 fn blocked_relay(blocked: &ahash::AHashSet<String>, next: &str, hop: &RemoteHop) -> bool {
-    blocked.contains(hop.endpoint.trim_matches('"'))
-        || blocked.contains(&hop.relay_to)
-        || blocked.contains(next)
+    crate::common::relay_target::relay_target_blocked(
+        blocked,
+        [hop.endpoint.as_str(), hop.relay_to.as_str(), next],
+    )
 }
 
 /// Decide whether a forward's next hop is served by this mediator or a remote
@@ -1774,6 +1778,22 @@ mod tests {
             &blocked,
             "did:example:blocked",
             &hop("https://other.example", "did:example:blocked")
+        ));
+        // Another spelling of a listed endpoint or DID.
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("HTTPS://Mediator.EXAMPLE:443/api", "did:example:bob")
+        ));
+        assert!(blocked_relay(
+            &blocked,
+            "did:example:bob",
+            &hop("https://mediator.example./api#x", "did:example:bob")
+        ));
+        assert!(blocked_relay(
+            &blocked,
+            "DID:Example:blocked#key-1",
+            &hop("https://other.example", "did:example:bob")
         ));
         // Anything else relays.
         assert!(!blocked_relay(

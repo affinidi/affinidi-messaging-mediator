@@ -978,7 +978,7 @@ async fn tsp_forward_endpoint(
     ) {
         TspRelay::Direct(url) => {
             let blocked = &state.config.processors.forwarding.blocked_forwarding;
-            if blocked.contains(&url) || blocked.contains(next) {
+            if crate::common::relay_target::relay_target_blocked(blocked, [url.as_str(), next]) {
                 return Err(tsp_problem(
                     session,
                     94,
@@ -1028,7 +1028,10 @@ async fn tsp_forward_endpoint(
     match classify_tsp_relay(&peer, &state.config.mediator_did, &state.self_authorities) {
         TspRelay::Direct(url) => {
             let blocked = &state.config.processors.forwarding.blocked_forwarding;
-            if blocked.contains(&url) || blocked.contains(&mediator) || blocked.contains(next) {
+            if crate::common::relay_target::relay_target_blocked(
+                blocked,
+                [url.as_str(), mediator.as_str(), next],
+            ) {
                 return Err(tsp_problem(
                     session,
                     94,

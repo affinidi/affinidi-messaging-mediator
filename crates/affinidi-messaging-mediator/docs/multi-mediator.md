@@ -357,7 +357,11 @@ Once A classifies a next hop as remote, the forward is enqueued on `FORWARD_Q`
   `load_forwarding_protection_blocks` — plus any `blocked_forwarding_dids`
   and their endpoints: a forward whose relay endpoint, relay DID or next hop
   is on that list is refused (DIDComm `delivery_refused`, TSP error 94)
-  instead of queued. Declare this mediator's public aliases in
+  instead of queued. Entries and candidates are compared in one canonical
+  form: a DID with its `did:` and method lowercased and any query or
+  fragment dropped; a URL with its scheme and host lowercased, the host in
+  punycode without a trailing dot, the default port and fragment dropped.
+  Declare this mediator's public aliases in
   `local_endpoints` so forwards addressed to them are delivered locally.
 - **Observability.** `FORWARD_ENQUEUED` (with `endpoint=`),
   `MESSAGES_FORWARDED_TOTAL`, `FORWARD_LOOP_DETECTED_TOTAL`.
