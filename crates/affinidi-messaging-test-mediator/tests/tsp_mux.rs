@@ -1467,15 +1467,11 @@ async fn an_ack_off_a_mux_connection_is_refused() {
 /// the principal reads again, `quiet`'s frame arrives live, promptly, and not
 /// behind the whole of `busy`'s backlog.
 ///
-/// Fails today: on raw TSP the resync for `busy`'s dropped pushes is a drain
-/// of `busy`'s inbox (`drain_tsp_inbox`, handlers/websocket.rs), which the
-/// socket loop runs inline to completion (up to `TSP_DRAIN_MAX` = 1000
-/// frames) while `quiet`'s live frame waits in the fair queue. Observed:
-/// all 80 busy frames (15 live, 65 drained), then `quiet`'s.
+/// On raw TSP the resync for `busy`'s dropped pushes is a drain of `busy`'s
+/// inbox (`drain_tsp_inbox`). The drain stops between pages whenever live
+/// frames are waiting, so `quiet`'s frame goes first; before that it ran to
+/// completion (up to 1000 frames) with `quiet`'s frame queued behind it.
 #[tokio::test]
-#[ignore = "mediator bug: the tsp-mux resync drain of a flooded member holds other members' \
-            queued live frames until it finishes (handlers/websocket.rs drain_tsp_inbox, \
-            called from the resync branch of the socket loop)"]
 async fn a_flooded_member_does_not_starve_another_on_a_tsp_mux_socket() {
     use std::time::Instant;
     const FLOOD: usize = 80;
@@ -1565,6 +1561,12 @@ async fn a_flooded_member_does_not_starve_another_on_a_tsp_mux_socket() {
     assert!(
         seen[quiet_at..].contains(&'B'),
         "the quiet member's frame waited out the busy member's whole queue: {summary}"
+    );
+    // ...and the drain, cut short for it, resumed: every busy frame arrived,
+    // once each.
+    assert_eq!(
+        busy_seen, FLOOD,
+        "the busy member's backlog must be delivered in full, without repeats: {summary}"
     );
     env.shutdown().await.expect("shutdown");
 }
