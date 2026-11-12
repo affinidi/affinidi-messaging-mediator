@@ -105,6 +105,9 @@ pub enum LeaveReason {
     /// Never joined: the grant is valid and stored, but the connection
     /// already carries `max_dids_per_connection` members.
     ConnectionFull,
+    /// An operator acted: `messaging/mux/admin-revoke` or
+    /// `admin-revoke-all`.
+    Admin,
 }
 
 impl LeaveReason {
@@ -122,7 +125,25 @@ impl LeaveReason {
             LeaveReason::ResolutionFailed => "resolutionFailed",
             LeaveReason::Superseded => "superseded",
             LeaveReason::ConnectionFull => "connectionFull",
+            LeaveReason::Admin => "admin",
         }
+    }
+
+    /// The reason a grant removal or epoch advance carried across instances
+    /// ([`MuxChange::reason`](affinidi_messaging_mediator_common::store::mux::MuxChange::reason)),
+    /// read back. Only the reasons that end a grant from outside the
+    /// receiving connection are accepted; anything else is `None`, and the
+    /// receiver keeps the reason the store implies.
+    pub fn removal_from_wire(wire: &str) -> Option<Self> {
+        [
+            LeaveReason::RevokedByMember,
+            LeaveReason::RevokedByPrincipal,
+            LeaveReason::EpochBumped,
+            LeaveReason::AccountRemoved,
+            LeaveReason::Admin,
+        ]
+        .into_iter()
+        .find(|r| r.wire() == wire)
     }
 
     /// Count `members` leaving (or never joining) for this reason, on

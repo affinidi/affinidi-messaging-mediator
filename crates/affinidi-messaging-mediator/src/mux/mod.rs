@@ -6,6 +6,7 @@
 //! (`proof`) and the grant operations the protocol handlers call (`grants`).
 
 pub mod admin;
+pub mod admin_grants;
 pub mod audit;
 pub mod connection;
 pub mod fair_queue;

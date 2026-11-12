@@ -399,7 +399,8 @@ jobs:
             --test mux_cross_instance \
             --test mux_two_instances \
             --test mux_two_processes \
-            --test mux_standing_two_instances
+            --test mux_standing_two_instances \
+            --test mux_admin_two_instances
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend,tsp \
@@ -463,7 +464,8 @@ jobs:
             --test mux_cross_instance \
             --test mux_two_instances \
             --test mux_two_processes \
-            --test mux_standing_two_instances
+            --test mux_standing_two_instances \
+            --test mux_admin_two_instances
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend,tsp \

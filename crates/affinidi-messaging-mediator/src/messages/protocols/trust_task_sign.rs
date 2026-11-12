@@ -67,7 +67,7 @@ pub(crate) async fn sign_response(
 
 /// The mediator's Ed25519 secret to sign with: an `assertionMethod` key if its
 /// DID declares one, else an `authentication` key.
-async fn signing_secret(state: &SharedData) -> Option<Secret> {
+pub(crate) async fn signing_secret(state: &SharedData) -> Option<Secret> {
     let did = &state.config.mediator_did;
     let doc = match state.did_resolver.resolve(did).await {
         Ok(resolved) => resolved.doc,

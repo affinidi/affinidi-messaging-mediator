@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
-use super::grants::{self, Ctx, MuxError};
+use super::grants::{self, Ctx, EpochAdvance, MuxError};
 use super::proof::Expect;
 use super::registry::MuxConn;
 use super::session::{LeaveReason, MuxSource, verify_attach};
@@ -49,6 +49,9 @@ pub struct TaskError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    /// For an `epochMismatch`: the member DID's epoch in force, which the
+    /// refusal carries for the requester to send instead.
+    pub current_epoch: Option<u64>,
 }
 
 impl TaskError {
@@ -66,6 +69,10 @@ impl TaskError {
             code: format!("{prefix}:{code}"),
             message: e.to_string(),
             retryable: e.retryable(),
+            current_epoch: match e {
+                MuxError::Store(MuxStoreError::EpochMismatch { current, .. }) => Some(*current),
+                _ => None,
+            },
         }
     }
 
@@ -74,6 +81,7 @@ impl TaskError {
             code: "malformedRequest".into(),
             message: message.into(),
             retryable: false,
+            current_epoch: None,
         }
     }
 
@@ -82,6 +90,7 @@ impl TaskError {
             code: "messaging/mux:memberNotProven".into(),
             message: message.into(),
             retryable: false,
+            current_epoch: None,
         }
     }
 }
@@ -460,33 +469,12 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
         .await
         .map_err(|e| TaskError::new("revoke-all", &MuxError::Statement(e)))?;
 
-    enum Outcome {
-        Bumped(u64, Vec<MuxGrant>),
-        AlreadyPast(u64),
-        Future(u64),
-    }
-    let outcome = mux::modify(
-        ctx.store,
-        &st.did_hash,
-        &ctx.limits,
-        ctx.now,
-        None,
-        |rec, _| {
-            Ok(if rec.epoch > st.epoch {
-                Outcome::AlreadyPast(rec.epoch)
-            } else if rec.epoch < st.epoch {
-                Outcome::Future(rec.epoch)
-            } else {
-                let (e, voided) = mux::revoke_all(rec, ctx.now);
-                Outcome::Bumped(e, voided)
-            })
-        },
-    )
-    .await
-    .map_err(|e| TaskError::new("revoke-all", &MuxError::Store(e)))?;
+    let outcome = grants::advance_epoch(ctx, &st.did_hash, st.epoch)
+        .await
+        .map_err(|e| TaskError::new("revoke-all", &e))?;
 
     match outcome {
-        Outcome::Bumped(epoch, voided) => Ok((
+        EpochAdvance::Advanced(epoch, voided) => Ok((
             json!({ "did": st.did, "epoch": epoch, "epochAdvanced": true, "revokedGrants": voided.len() }),
             Changed {
                 removed: voided,
@@ -495,17 +483,18 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
                 ..Default::default()
             },
         )),
-        Outcome::AlreadyPast(epoch) => Ok((
+        EpochAdvance::AlreadyPast(epoch) => Ok((
             json!({ "did": st.did, "epoch": epoch, "epochAdvanced": false, "revokedGrants": 0 }),
             Changed::default(),
         )),
-        Outcome::Future(current) => Err(TaskError {
+        EpochAdvance::Future(current) => Err(TaskError {
             code: "messaging/mux/revoke-all:epochMismatch".into(),
             message: format!(
                 "statement voids epoch {}, the DID's current epoch is {current}",
                 st.epoch
             ),
             retryable: false,
+            current_epoch: Some(current),
         }),
     }
 }
@@ -835,6 +824,7 @@ pub async fn ack(
                     code: "storageError".into(),
                     message: format!("the store could not delete a frame: {e}"),
                     retryable: true,
+                    current_epoch: None,
                 });
             }
             Err(_) => refused.push(json!({

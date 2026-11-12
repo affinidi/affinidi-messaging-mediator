@@ -306,6 +306,68 @@ pub async fn revoke_all(ctx: &Ctx<'_>, member_did: &str) -> Result<(u64, Vec<Mux
     .await?)
 }
 
+/// What [`advance_epoch`] found and did.
+#[derive(Debug)]
+pub enum EpochAdvance {
+    /// The named epoch was current: the epoch is now `.0`, and `.1` are the
+    /// grants that were active and are now `epochRevoked`.
+    Advanced(u64, Vec<MuxGrant>),
+    /// The named epoch was already void; nothing changed. The current epoch.
+    AlreadyPast(u64),
+    /// The named epoch is later than the current one; nothing changed. The
+    /// current epoch.
+    Future(u64),
+}
+
+/// Advance member `did_hash`'s epoch if `epoch` is its current one — the
+/// compare-and-set every epoch advance makes, whoever asks: a member's own
+/// `revoke-all` statement or an administrator's `admin-revoke-all` (design
+/// §5.2). One atomic write; [`MuxStoreError::Contended`] when it could not
+/// be made, with nothing changed.
+pub async fn advance_epoch(
+    ctx: &Ctx<'_>,
+    did_hash: &str,
+    epoch: u64,
+) -> Result<EpochAdvance, MuxError> {
+    Ok(
+        mux::modify(ctx.store, did_hash, &ctx.limits, ctx.now, None, |rec, _| {
+            Ok(if rec.epoch > epoch {
+                EpochAdvance::AlreadyPast(rec.epoch)
+            } else if rec.epoch < epoch {
+                EpochAdvance::Future(rec.epoch)
+            } else {
+                let (e, voided) = mux::revoke_all(rec, ctx.now);
+                EpochAdvance::Advanced(e, voided)
+            })
+        })
+        .await?,
+    )
+}
+
+/// Revoke the named grants on member `did_hash`'s record: each `(grant id,
+/// principal hash)` pair, so a grant id re-used after a revocation is never
+/// mistaken for the one selected. The same rule as every other revocation —
+/// delete and raise the principal's replay floor — in one atomic write.
+/// Returns the grants it deleted; one already gone is not an error.
+pub async fn revoke_grants(
+    ctx: &Ctx<'_>,
+    did_hash: &str,
+    selected: &HashSet<(String, String)>,
+) -> Result<Vec<MuxGrant>, MuxError> {
+    Ok(
+        mux::modify(ctx.store, did_hash, &ctx.limits, ctx.now, None, |rec, _| {
+            let ids: HashSet<String> = rec
+                .grants
+                .iter()
+                .filter(|g| selected.contains(&(g.grant_id.clone(), g.principal_hash.clone())))
+                .map(|g| g.grant_id.clone())
+                .collect();
+            Ok(mux::revoke_grant_ids(rec, &ids, ctx.now))
+        })
+        .await?,
+    )
+}
+
 /// Re-check a grant's signing key (§5.1); mark it stale if it no longer
 /// belongs to the member. Returns the grant when it was marked stale, `None`
 /// when it is still current, and leaves it alone when the member's DID could

@@ -44,14 +44,25 @@ use super::tasks::Changed;
 use crate::SharedData;
 use crate::tasks::websocket_streaming::StreamingTask;
 
-/// The pairs a Trust Task's [`Changed`] touched, for [`publish`].
+/// The pairs a Trust Task's [`Changed`] touched, for [`publish`]. A removed
+/// pair carries the reason this instance detached it with, so the other
+/// instances report the same one.
 pub fn changes_of(changed: &Changed) -> Vec<MuxChange> {
-    changed
-        .removed
-        .iter()
-        .chain(&changed.suspended)
-        .chain(&changed.narrowed)
-        .map(|g| MuxChange::of(g, false))
+    let removed = changed.removed.iter().map(|g| {
+        let c = MuxChange::of(g, false);
+        match changed.reason {
+            Some(r) => c.with_reason(r.wire()),
+            None => c,
+        }
+    });
+    removed
+        .chain(
+            changed
+                .suspended
+                .iter()
+                .chain(&changed.narrowed)
+                .map(|g| MuxChange::of(g, false)),
+        )
         .chain(changed.stored.iter().map(|g| MuxChange::of(g, true)))
         .collect()
 }
@@ -123,15 +134,19 @@ async fn apply_members(state: &SharedData, members: &[MemberHint]) {
             MemberHint::StandingChanged { did_hash } => {
                 super::connection::recheck_member(state, did_hash).await;
             }
-            MemberHint::AttachesEnded { did_hash, at } => {
+            MemberHint::AttachesEnded {
+                did_hash,
+                at,
+                reason,
+            } => {
+                use super::session::LeaveReason;
+                let reason = reason
+                    .as_deref()
+                    .and_then(LeaveReason::removal_from_wire)
+                    .unwrap_or(LeaveReason::EpochBumped);
                 state
                     .mux
-                    .detach_attaches(
-                        state.streaming_task.as_ref(),
-                        did_hash,
-                        *at,
-                        super::session::LeaveReason::EpochBumped,
-                    )
+                    .detach_attaches(state.streaming_task.as_ref(), did_hash, *at, reason)
                     .await;
             }
         }
@@ -215,7 +230,7 @@ pub async fn reconcile(
             }
         };
         for (conn, grant_id) in held {
-            match grant_leave_reason(&rec, &grant_id, now) {
+            match leave_reason(&rec, &grant_id, now, c.reason.as_deref()) {
                 Some(reason) => {
                     if conn
                         .detach_grant_id(streaming, &c.did_hash, &grant_id, reason)
@@ -238,6 +253,26 @@ pub async fn reconcile(
             }
         }
     }
+}
+
+/// Why a member admitted by `grant_id` leaves, as the store decides, labelled
+/// with the reason the originating instance gave where the store cannot tell
+/// it: a deleted grant reads as `revokedByMember` and a voided one as
+/// `epochBumped` whoever ended it, so the hint's `revokedByPrincipal` or
+/// `admin` is kept for those two. The hint never makes a member leave.
+fn leave_reason(
+    rec: &mux::MuxDidRecord,
+    grant_id: &str,
+    now: u64,
+    hint: Option<&str>,
+) -> Option<super::session::LeaveReason> {
+    use super::session::LeaveReason;
+    let from_store = grant_leave_reason(rec, grant_id, now)?;
+    let hinted = hint.and_then(LeaveReason::removal_from_wire);
+    Some(match (from_store, hinted) {
+        (LeaveReason::RevokedByMember | LeaveReason::EpochBumped, Some(h)) => h,
+        _ => from_store,
+    })
 }
 
 /// [`reconcile`] against this instance's state.
@@ -270,6 +305,7 @@ pub async fn resync(state: &SharedData) {
                     did_hash: m.did_hash.clone(),
                     principal_hash: s.principal_hash.clone(),
                     stored: false,
+                    reason: None,
                 });
             }
         }
@@ -638,10 +674,55 @@ mod tests {
             did_hash: did_hash(WORK),
             principal_hash: did_hash("did:example:other"),
             stored: false,
+            reason: None,
         };
         b.hear(&store, &[other, MuxChange::of(&g, false)]).await;
         assert!(b.member().await.is_some());
         assert!(b.left().await.is_empty());
+    }
+
+    /// The originating instance's reason labels a detach the store cannot
+    /// attribute (a deleted or voided grant), and never overrides one it can
+    /// or makes a member with an active grant leave.
+    #[test]
+    fn a_hinted_reason_labels_only_what_the_store_cannot_attribute() {
+        use mux::MuxDidRecord;
+        let gone = MuxDidRecord::default();
+        assert_eq!(
+            leave_reason(&gone, "g1", 10, Some("admin")),
+            Some(LeaveReason::Admin)
+        );
+        assert_eq!(
+            leave_reason(&gone, "g1", 10, Some("revokedByPrincipal")),
+            Some(LeaveReason::RevokedByPrincipal)
+        );
+        assert_eq!(
+            leave_reason(&gone, "g1", 10, None),
+            Some(LeaveReason::RevokedByMember)
+        );
+        assert_eq!(
+            leave_reason(&gone, "g1", 10, Some("superseded")),
+            Some(LeaveReason::RevokedByMember),
+            "not a removal reason"
+        );
+
+        let mut voided = grant("g1", 1);
+        voided.state = MuxGrantState::EpochRevoked;
+        let mut suspended = grant("g2", 1);
+        suspended.state = MuxGrantState::Suspended;
+        let rec = MuxDidRecord {
+            grants: vec![voided, suspended, grant("g3", 1)],
+            ..Default::default()
+        };
+        assert_eq!(
+            leave_reason(&rec, "g1", 10, Some("admin")),
+            Some(LeaveReason::Admin)
+        );
+        assert_eq!(
+            leave_reason(&rec, "g2", 10, Some("admin")),
+            Some(LeaveReason::SuspendedUnknownKey)
+        );
+        assert_eq!(leave_reason(&rec, "g3", 10, Some("admin")), None);
     }
 
     #[test]
@@ -684,6 +765,7 @@ mod tests {
                 MemberHint::AttachesEnded {
                     did_hash: did_hash(WORK),
                     at: 42,
+                    reason: None,
                 },
             ],
         };
