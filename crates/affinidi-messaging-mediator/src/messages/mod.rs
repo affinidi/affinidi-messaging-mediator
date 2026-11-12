@@ -106,8 +106,6 @@ use crate::didcomm_compat;
 #[cfg(feature = "didcomm")]
 use crate::messages::protocols::discover_features;
 #[cfg(feature = "didcomm")]
-use affinidi_did_common::service::Endpoint;
-#[cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
@@ -123,15 +121,10 @@ use affinidi_messaging_sdk::messages::{
 };
 #[cfg(feature = "didcomm")]
 use affinidi_secrets_resolver::SecretsResolver;
-#[cfg(feature = "didcomm")]
-use ahash::AHashSet as HashSet;
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
-#[cfg(feature = "didcomm")]
-use serde_json::Value;
-
 #[cfg(feature = "didcomm")]
 pub mod error_response;
 pub mod inbound;
@@ -276,7 +269,8 @@ pub(crate) struct ProcessMessageResponse {
 #[cfg(feature = "didcomm")]
 #[derive(Debug)]
 pub struct PackOptions {
-    /// Protects against DoS attacks by limiting the number of keys per recipient
+    /// The most key-agreement keys a recipient may publish for the mediator to
+    /// encrypt a message to it ().
     pub to_keys_per_recipient_limit: usize,
     /// If true, then will repack the message for the next recipient if possible
     pub forward: bool,
@@ -314,7 +308,6 @@ pub(crate) trait MessageHandler {
         secrets_resolver: &S,
         did_resolver: &DIDCacheClient,
         pack_options: &PackOptions,
-        forward_locals: &HashSet<String>,
     ) -> Result<(String, PackEncryptedMetadata), MediatorError>
     where
         S: SecretsResolver;
@@ -382,13 +375,12 @@ impl MessageHandler for Message {
         metadata: &UnpackMetadata,
         secrets_resolver: &S,
         did_resolver: &DIDCacheClient,
-        _pack_options: &PackOptions,
-        forward_locals: &HashSet<String>,
+        pack_options: &PackOptions,
     ) -> Result<(String, PackEncryptedMetadata), MediatorError>
     where
         S: SecretsResolver,
     {
-        // Check if this message would route back to the mediator based on potential next hops
+        // Resolved for the key-count check; the cache serves pack_encrypted's own lookup.
         let to_doc = did_resolver.resolve(to_did).await.map_err(|e| {
             MediatorError::MediatorError(
                 74,
@@ -407,36 +399,35 @@ impl MessageHandler for Message {
             )
         })?;
 
-        fn check_loopback(endpoint: &Value, forward_locals: &HashSet<String>) -> bool {
-            let uri = if let Some(uri) = endpoint.get("uri") {
-                if let Some(uri) = uri.as_str() {
-                    uri
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            };
-            forward_locals.contains(uri)
+        // A recipient that publishes more key-agreement keys than the limit
+        // would make every reply encrypt to all of them.
+        if let Some(key_count) =
+            key_agreement_over_limit(&to_doc.doc, pack_options.to_keys_per_recipient_limit)
+        {
+            return Err(MediatorError::MediatorError(
+                47,
+                session_id.to_string(),
+                Some(self.id.clone()),
+                Box::new(ProblemReport::new(
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.pack".into(),
+                    "Couldn't pack DIDComm message: recipient ({1}) publishes {2} key-agreement keys, more than the limit of {3}".into(),
+                    vec![
+                        to_did.to_string(),
+                        key_count.to_string(),
+                        pack_options.to_keys_per_recipient_limit.to_string(),
+                    ],
+                    None,
+                )),
+                StatusCode::BAD_REQUEST.as_u16(),
+                format!(
+                    "Couldn't pack DIDComm message: recipient ({to_did}) publishes {key_count} \
+                     key-agreement keys, more than the limit of {}",
+                    pack_options.to_keys_per_recipient_limit
+                ),
+            ));
         }
-
-        let _forward_loopback = to_doc.doc.service.iter().any(|service| {
-            if let Endpoint::Map(endpoints) = &service.service_endpoint {
-                if endpoints.is_array() {
-                    endpoints
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .any(|endpoint| check_loopback(endpoint, forward_locals))
-                        })
-                        .unwrap_or(false)
-                } else {
-                    check_loopback(endpoints, forward_locals)
-                }
-            } else {
-                false
-            }
-        });
 
         if metadata.encrypted {
             // Respond with an encrypted message
@@ -483,6 +474,42 @@ impl MessageHandler for Message {
                 StatusCode::NOT_IMPLEMENTED,
             ))
         }
+    }
+}
+
+/// The number of key-agreement keys `doc` publishes, when that is more than
+/// `limit`. Read from the length of the parsed list: no id is copied, so the
+/// check costs the same however many keys the document lists.
+#[cfg(feature = "didcomm")]
+fn key_agreement_over_limit(doc: &affinidi_did_common::Document, limit: usize) -> Option<usize> {
+    let count = doc.key_agreement.len();
+    (count > limit).then_some(count)
+}
+
+#[cfg(all(test, feature = "didcomm"))]
+mod key_limit_tests {
+    use super::key_agreement_over_limit;
+
+    fn doc_with_keys(n: usize) -> affinidi_did_common::Document {
+        let ids: Vec<String> = (0..n)
+            .map(|i| format!("did:example:alice#key-{i}"))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "did:example:alice",
+            "keyAgreement": ids,
+        }))
+        .expect("document")
+    }
+
+    #[test]
+    fn a_recipient_over_the_key_limit_is_counted_and_refused() {
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(0), 2), None);
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(2), 2), None);
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(3), 2), Some(3));
+        assert_eq!(
+            key_agreement_over_limit(&doc_with_keys(500), 100),
+            Some(500)
+        );
     }
 }
 

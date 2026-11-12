@@ -192,7 +192,6 @@ pub(crate) async fn store_message(
                                         .to_keys_per_recipient,
                                     forward: true,
                                 },
-                                &state.config.processors.forwarding.blocked_forwarding,
                             )
                             .await?;
 
@@ -292,11 +291,8 @@ pub(crate) async fn store_message(
                         to_keys_per_recipient_limit: state.limits().to_keys_per_recipient,
                         forward: true,
                     },
-                    &state.config.processors.forwarding.blocked_forwarding,
                 )
                 .await?;
-            // NOTE: messaging_service forwarding check removed during migration to affinidi-messaging-didcomm.
-            // The new pack implementation does not auto-forward via service endpoints.
             trace!("Ephemeral message packed (meta):\n{:#?}", meta);
             trace!("Ephemeral message (msg):\n{:#?}", packed);
             // Live stream the message?

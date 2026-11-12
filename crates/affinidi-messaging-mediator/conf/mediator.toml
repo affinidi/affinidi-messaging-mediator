@@ -708,8 +708,9 @@ external_forwarding = "true"
 report_errors = "true"
 
 ### Env: PROCESSOR_FORWARDING_BLOCKED_DIDS
-### Additional DIDs to block forwarding to (JSON array)
-### Always includes the mediator's own DID
+### Additional DIDs to block forwarding to (JSON array). A forward relayed to
+### one of these DIDs or to an endpoint in its document is refused.
+### Always includes the mediator's own DID and endpoints
 blocked_forwarding_dids = "[]"
 
 ### Env: PROCESSOR_FORWARDING_RATE_WINDOW
