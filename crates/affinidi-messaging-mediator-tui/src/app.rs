@@ -841,10 +841,13 @@ impl App {
                         .map(str::to_string)
                         .or_else(|| self.target.clone())
                         .unwrap_or_else(|| self.console.did_hash().to_string());
+                    // Only a rootAdmin may change roles: every role an admin
+                    // could set other than `standard` is privileged, so the
+                    // row is offered to a rootAdmin alone.
                     self.popup = Some(Popup::EditAccount(AccountEdit::new(
                         hash,
                         info,
-                        self.admin(),
+                        matches!(self.console.mode(), Mode::Admin { root: true }),
                     )));
                 } else {
                     self.set_notice(("the account's settings are still loading".into(), true));

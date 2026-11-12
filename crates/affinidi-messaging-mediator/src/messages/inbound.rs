@@ -563,6 +563,9 @@ async fn dispatch_tsp_trust_task(
     raw: &serde_json::Value,
 ) -> Result<InboundMessageResponse, MediatorError> {
     let now_secs = state.clock.unix_secs();
+    // A refusal is threaded to the task, as the DIDComm dispatcher threads
+    // one to the message carrying it, so the caller can match it.
+    let task_id = doc.id.clone();
 
     // The sender VID is the framework identity; TSP VIDs carry no key fragment,
     // so it is already the shape `consume` wants.
@@ -575,7 +578,8 @@ async fn dispatch_tsp_trust_task(
         now_secs,
         trust_tasks::TaskTransport::Tsp,
     )
-    .await?
+    .await
+    .map_err(|e| e.threaded_to(&task_id))?
     else {
         // A ping identity mismatch emits nothing — same as the DIDComm path.
         return Ok(InboundMessageResponse::Stored(
@@ -1218,9 +1222,10 @@ async fn handle_inbound_didcomm(
 
                     // `from` must name the DID that authenticated the message;
                     // the routing and ACL checks below rely on it.
-                    if let Err(reason) = crate::messages::authenticated_sender(&msg, &metadata) {
-                        return Err(sender_mismatch(session, &msg.id, &reason));
-                    }
+                    let sender_did = match crate::messages::authenticated_sender(&msg, &metadata) {
+                        Ok(sender_did) => sender_did,
+                        Err(reason) => return Err(sender_mismatch(session, &msg.id, &reason)),
+                    };
 
                     // Does the sender identity match the session DID?
                     // The sender can be identified by JWS signing (sign_from) or
@@ -1257,6 +1262,15 @@ async fn handle_inbound_didcomm(
                     } else {
                         session
                     };
+
+                    // Anything other than a forward is a request the mediator
+                    // serves for an account (pickup, ping, discovery, Trust
+                    // Tasks), so it needs an authenticated session whose DID
+                    // sent it. Forwards are relayed and keep the rules above,
+                    // which is what lets the anonymous relay session work.
+                    if !is_forward(&msg) {
+                        authz::require_session_sender(session, sender_did.as_deref(), Some(&msg.id))?;
+                    }
 
                     // Process the message
                     let response = msg.process(state, session, &metadata).await?;

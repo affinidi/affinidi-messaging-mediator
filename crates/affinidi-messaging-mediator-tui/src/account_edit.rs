@@ -4,8 +4,9 @@
 //! [`AccountEdit`] starts from the account as `account/get` reported it, lets
 //! the user change rows, and yields only what changed — `account/update` is a
 //! partial update, so an untouched setting is never sent. The mediator decides
-//! who may change what (a role change needs an administrator; an account may
-//! manage only the flags its own ACL lets it) and refuses the rest.
+//! who may change what (granting or changing a privileged role — admin,
+//! rootAdmin — needs a rootAdmin; an account may manage only the flags its own
+//! ACL lets it) and refuses the rest.
 
 use serde_json::{Map, Value, json};
 
@@ -62,7 +63,8 @@ pub struct AccountEdit {
 
 impl AccountEdit {
     /// Rows for `account` (an `account/get` answer). `with_role` offers the
-    /// role row, for administrators.
+    /// role row, for a rootAdmin: only a rootAdmin may grant or change a
+    /// privileged role.
     pub fn new(target: String, account: &Value, with_role: bool) -> Self {
         let mut rows = Vec::new();
         if with_role
