@@ -67,12 +67,6 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     env_override!(config.server.admin_did, "ADMIN_DID");
     env_override_opt!(config.server.did_web_self_hosted, "DID_WEB_SELF_HOSTED");
     env_override_list!(config.server.local_endpoints, "LOCAL_ENDPOINTS");
-    if let Ok(val) = std::env::var("METRICS_BEARER_TOKEN") {
-        // An empty value clears a token set in the file.
-        config.server.metrics_bearer_token =
-            (!val.is_empty()).then_some(crate::RedactedString(val));
-    }
-
     env_override!(config.database.functions_file, "DATABASE_FUNCTIONS_FILE");
     env_override!(config.database.database_url, "DATABASE_URL");
     // DATABASE_POOL_SIZE removed — the mediator uses a multiplexed
@@ -399,6 +393,42 @@ fn apply_metrics_allow_cidrs_override(
     Ok(())
 }
 
+/// Override `[server] metrics_bearer_token` from `METRICS_BEARER_TOKEN`.
+///
+/// An empty (or all-whitespace) value is refused, as is an empty token in the
+/// file: either would leave `/metrics` without the token the operator meant to
+/// require, usually because a secret reference rendered as `""`. Leave the
+/// variable unset to keep the file's token; remove the key from the file to
+/// require none.
+fn apply_metrics_bearer_token_override(
+    config: &mut ConfigRaw,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(ConfigError::Parse(
+                "METRICS_BEARER_TOKEN is set but empty. Unset it to keep [server] \
+                 metrics_bearer_token from the configuration file, or set a token"
+                    .into(),
+            ));
+        }
+        config.server.metrics_bearer_token = Some(crate::RedactedString(value));
+    }
+    if config
+        .server
+        .metrics_bearer_token
+        .as_ref()
+        .is_some_and(|token| token.0.trim().is_empty())
+    {
+        return Err(ConfigError::Parse(
+            "[server] metrics_bearer_token is empty. Set a token, or remove the key to \
+             require none"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Read the primary configuration file for the mediator.
 /// Returns a [`ConfigRaw`] with env var overrides applied.
 ///
@@ -436,6 +466,7 @@ pub fn read_config_file_with_unknown_keys(
     apply_env_overrides(&mut config);
     apply_trust_xff_cidrs_override(&mut config, std::env::var("TRUST_XFF_CIDRS").ok())?;
     apply_metrics_allow_cidrs_override(&mut config, std::env::var("METRICS_ALLOW_CIDRS").ok())?;
+    apply_metrics_bearer_token_override(&mut config, std::env::var("METRICS_BEARER_TOKEN").ok())?;
 
     Ok((config, unknown_keys))
 }
@@ -536,8 +567,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_metrics_allow_cidrs_override, apply_trust_xff_cidrs_override, parse_config,
-        split_list, unknown_key_message,
+        apply_metrics_allow_cidrs_override, apply_metrics_bearer_token_override,
+        apply_trust_xff_cidrs_override, parse_config, split_list, unknown_key_message,
     };
 
     const SHIPPED: &str = include_str!("../../conf/mediator.toml");
@@ -708,6 +739,42 @@ mod tests {
             Err(crate::error::ConfigError::Parse(msg)) => assert!(msg.contains("nope")),
             other => panic!("expected Parse error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_empty_metrics_bearer_token_is_refused_not_cleared() {
+        let token = |config: &crate::ConfigRaw| {
+            config
+                .server
+                .metrics_bearer_token
+                .as_ref()
+                .map(|t| t.0.clone())
+        };
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        config.server.metrics_bearer_token = Some(crate::RedactedString("from-file".into()));
+
+        // Unset keeps the file's token; a value replaces it.
+        apply_metrics_bearer_token_override(&mut config, None).expect("unset");
+        assert_eq!(token(&config).as_deref(), Some("from-file"));
+        apply_metrics_bearer_token_override(&mut config, Some("from-env".into())).expect("set");
+        assert_eq!(token(&config).as_deref(), Some("from-env"));
+
+        // An empty or blank value is refused and leaves the token in place.
+        for empty in ["", "   "] {
+            let err = apply_metrics_bearer_token_override(&mut config, Some(empty.into()))
+                .expect_err("an empty METRICS_BEARER_TOKEN is refused");
+            assert!(err.to_string().contains("METRICS_BEARER_TOKEN"), "{err}");
+            assert_eq!(token(&config).as_deref(), Some("from-env"));
+        }
+
+        // An empty token in the file is refused too.
+        config.server.metrics_bearer_token = Some(crate::RedactedString(String::new()));
+        assert!(apply_metrics_bearer_token_override(&mut config, None).is_err());
+
+        // No token anywhere is allowed: the allow-list alone applies.
+        config.server.metrics_bearer_token = None;
+        apply_metrics_bearer_token_override(&mut config, None).expect("no token");
+        assert_eq!(token(&config), None);
     }
 
     #[test]

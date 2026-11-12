@@ -704,6 +704,43 @@ mod tests {
         }
 
         #[test]
+        fn a_forwarded_header_from_an_untrusted_peer_is_ignored() {
+            // Only a peer in trust_xff_cidrs has its X-Forwarded-For read.
+            let access = MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                None,
+                ClientIpExtractor::trusted_proxies(vec!["10.0.0.0/24".parse().unwrap()]).unwrap(),
+                1_000,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.2"));
+            assert_eq!(
+                status(access.admit(ip("203.0.113.9"), &headers)),
+                StatusCode::FORBIDDEN,
+                "a public peer naming a private address is judged by its own address"
+            );
+            headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.5"));
+            assert_eq!(
+                status(access.admit(ip("192.168.1.7"), &headers)),
+                StatusCode::OK,
+                "a private peer outside trust_xff_cidrs is judged by its own address"
+            );
+
+            // With no trusted proxies the header is never read.
+            let direct = MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                None,
+                ClientIpExtractor::direct_peer(),
+                1_000,
+            );
+            headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+            assert_eq!(
+                status(direct.admit(ip("203.0.113.9"), &headers)),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[test]
         fn an_empty_allow_list_refuses_everyone() {
             let access =
                 MetricsAccess::new(Vec::new(), None, ClientIpExtractor::direct_peer(), 1_000);

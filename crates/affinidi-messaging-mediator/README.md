@@ -305,7 +305,7 @@ unique-local addresses, so a scraper in the same host, cluster or VPC works and
 a client on the public internet gets `403`. Widen or narrow it with
 `[server] metrics_allow_cidrs` (env `METRICS_ALLOW_CIDRS`; `[]` refuses
 everyone), require a bearer token with `metrics_bearer_token` (env
-`METRICS_BEARER_TOKEN`), and bound the request rate with
+`METRICS_BEARER_TOKEN`; an empty value is refused at startup), and bound the request rate with
 `[limits] metrics_requests_per_second` (default 5, shared by all callers).
 Refusals are counted in `metrics_requests_refused_total{reason}`. Behind a load
 balancer that does not appear in `trust_xff_cidrs`, every request seems to come

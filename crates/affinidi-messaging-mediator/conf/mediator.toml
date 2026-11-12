@@ -104,7 +104,9 @@ trust_xff_cidrs = []
 
 ### Env: METRICS_BEARER_TOKEN
 ### When set, /metrics also requires `Authorization: Bearer <token>`. Prefer
-### the environment variable to keep the token out of this file.
+### the environment variable to keep the token out of this file. An empty
+### value (here or in METRICS_BEARER_TOKEN) is refused at startup; leave the
+### key out to require no token.
 # metrics_bearer_token = "change-me"
 
 ### Env: DID_WEB_SELF_HOSTED
