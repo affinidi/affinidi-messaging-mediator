@@ -393,3 +393,172 @@ async fn the_state_turns_closed_when_the_socket_goes() {
     }
     env.shutdown().await.expect("shutdown");
 }
+
+/// `messaging/mux/list` sent on the `tsp-mux` socket and answered there: as
+/// principal, the grants the socket's principal holds; as member, none (the
+/// principal granted nothing). No answer reaches `recv`.
+#[tokio::test]
+async fn mux_list_is_answered_on_the_socket() {
+    use affinidi_messaging_sdk::tasks::messaging::mux::list::v0_1::Payload;
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    grant(&env, &work, &principal, &["receive", "delete"]).await;
+    grant(&env, &home, &principal, &["receive"]).await;
+    let mediator = env.mediator.did().to_string();
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    event(&mut sock, &principal.did, &mediator, "attached").await;
+    let sender = sock.sender();
+
+    let answer = sender
+        .request::<Payload, Value>(json!({ "as": "principal" }))
+        .await
+        .expect("list on the socket");
+    let p = &answer.payload;
+    assert_eq!(p["as"], "principal", "{p:#}");
+    let grants = p["grants"].as_array().expect("grants");
+    let mut members: Vec<(String, Value)> = grants
+        .iter()
+        .map(|g| {
+            assert_eq!(g["state"], "active", "{g:#}");
+            assert_eq!(g["statement"]["principal"], principal.did, "{g:#}");
+            (
+                g["statement"]["issuer"].as_str().unwrap().to_string(),
+                g["scope"].clone(),
+            )
+        })
+        .collect();
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want = vec![
+        (work.did.clone(), json!(["receive", "delete"])),
+        (home.did.clone(), json!(["receive"])),
+    ];
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(members, want, "{p:#}");
+
+    // As member: the principal's own DID carries no grants.
+    let answer = sender
+        .request::<Payload, Value>(json!({ "as": "member" }))
+        .await
+        .expect("list as member on the socket");
+    assert_eq!(answer.payload["as"], "member");
+    assert_eq!(answer.payload["grants"], json!([]));
+
+    // The answers were routed to their requests, never handed to `recv`.
+    while let Ok(Ok(Some(f))) = timeout(Duration::from_millis(500), sock.recv()).await {
+        if let TspMuxFrame::Data {
+            receiver, sender, ..
+        } = f
+        {
+            assert!(
+                !(receiver == principal.did && sender == mediator),
+                "an answer reached the application"
+            );
+        }
+    }
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}
+
+/// `messaging/mux/connections` reports a `tsp-mux` connection with wire
+/// `tsp`, its session id, and its members (the DIDComm view is in
+/// `mux_sdk.rs`, `an_administrator_lists_live_mux_connections`).
+#[tokio::test]
+async fn an_administrator_sees_a_tsp_mux_connection_as_wire_tsp() {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+    use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    let admin = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&admin.did_hash(), &AccountType::Admin)
+        .await
+        .expect("promote");
+    env.atm
+        .profile_add(&admin.profile, true)
+        .await
+        .expect("admin websocket");
+    relate_to_mediator(&env, &principal).await;
+    grant(&env, &work, &principal, &["receive", "delete"]).await;
+    grant(&env, &home, &principal, &["receive"]).await;
+    let mediator = env.mediator.did().to_string();
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    event(&mut sock, &principal.did, &mediator, "attached").await;
+
+    let page = serde_json::to_value(
+        env.atm
+            .trust_tasks()
+            .mux_connections(&admin.profile, &MuxConnectionsQuery::all())
+            .await
+            .expect("mux_connections"),
+    )
+    .unwrap();
+    let conns = page["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1, "{page:#}");
+    let c = &conns[0];
+    assert_eq!(c["principal"], principal.did.as_str());
+    assert_eq!(c["wire"], "tsp", "{c:#}");
+    assert_eq!(c["sessionId"], sock.ready().session_id.as_str());
+    assert_eq!(c["memberCount"], 2);
+    let members = c["members"].as_array().unwrap();
+    let mut dids: Vec<&str> = members.iter().map(|m| m["did"].as_str().unwrap()).collect();
+    dids.sort();
+    let mut want = [work.did.as_str(), home.did.as_str()];
+    want.sort();
+    assert_eq!(dids, want);
+    for m in members {
+        assert_eq!(m["source"], "grant", "{m:#}");
+        assert!(m["grantId"].is_string(), "{m:#}");
+        assert_eq!(m["deliveryActive"], true, "{m:#}");
+        let scope = if m["did"] == work.did.as_str() {
+            json!(["receive", "delete"])
+        } else {
+            json!(["receive"])
+        };
+        assert_eq!(m["scope"], scope, "{m:#}");
+    }
+
+    // Closed: the connection leaves the view.
+    sock.close().await.expect("close");
+    let gone = timeout(Duration::from_secs(5), async {
+        loop {
+            let page = serde_json::to_value(
+                env.atm
+                    .trust_tasks()
+                    .mux_connections(&admin.profile, &MuxConnectionsQuery::all())
+                    .await
+                    .expect("mux_connections"),
+            )
+            .unwrap();
+            if page["connections"] == json!([]) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "a closed tsp-mux connection is no longer listed"
+    );
+    env.shutdown().await.expect("shutdown");
+}

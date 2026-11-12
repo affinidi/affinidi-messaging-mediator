@@ -590,3 +590,248 @@ async fn a_grant_past_three_quarters_of_its_life_is_announced_once() {
     ready(&env, &phone).await;
     assert_eq!(notices(&env, &phone).await.len(), 1);
 }
+
+// ─── Direct TSP login ───────────────────────────────────────────────────────
+
+/// The unknown-key rule and `grantsPresent` on the other direct login: a
+/// pure-TSP `POST /tsp/authenticate`, which proves the VID's signing key (its
+/// first Ed25519 `authentication` key) rather than a key-agreement key. The
+/// rule compares that key with the keys that signed the member's active
+/// grants, and the member's `grantsPresent` is sealed for TSP, the wire it
+/// logged in on.
+#[cfg(feature = "tsp")]
+mod tsp_login {
+    use super::*;
+    use affinidi_messaging_mediator_common::store::mux::{self, MuxGrantState, MuxLimits};
+    use affinidi_messaging_sdk::protocols::tsp::RelationshipState;
+    use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+
+    /// A real `/tsp/authenticate` handshake as `user`: the challenge signed
+    /// with `#key-1`, the key the mediator resolves as the VID's signing key.
+    async fn tsp_login(env: &TestEnvironment, user: &TestUser) {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let post = async |path: &str, body: Value| {
+            let resp = http
+                .post(format!("{}{path}", env.mediator.endpoint()))
+                .json(&body)
+                .send()
+                .await
+                .expect("request");
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            assert_eq!(status, 200, "{path}: {body:#}");
+            body
+        };
+        let challenge = post("authenticate/challenge", json!({ "did": user.did })).await;
+        let key: [u8; 32] = user
+            .secrets
+            .iter()
+            .find(|s| s.id.ends_with("#key-1"))
+            .expect("the VID's signing key")
+            .get_private_bytes()
+            .try_into()
+            .unwrap();
+        let signature = affinidi_tsp::crypto::signing::sign(
+            challenge["data"]["challenge"].as_str().unwrap().as_bytes(),
+            &key,
+        )
+        .unwrap();
+        post(
+            "tsp/authenticate",
+            json!({
+                "vid": user.did,
+                "session_id": challenge["data"]["session_id"],
+                "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+            }),
+        )
+        .await;
+    }
+
+    /// The relationship a TSP client holds with its mediator, seeded so the
+    /// SDK opens the mediator's Direct messages to `user`.
+    async fn relate_to_mediator(env: &TestEnvironment, user: &TestUser) {
+        let mediator = env.mediator.did().to_string();
+        for (ours, theirs) in [(&user.did, &mediator), (&mediator, &user.did)] {
+            env.relationship_store
+                .set(ours, theirs, RelationshipState::Bidirectional)
+                .await
+                .expect("seed the relationship with the mediator");
+        }
+    }
+
+    /// Every mux notice in `user`'s inbox sealed for TSP (a Direct message
+    /// from the mediator's VID), opened as `user`. Each must parse as the
+    /// spec's notice type. DIDComm messages are skipped, not failed.
+    async fn tsp_notices(env: &TestEnvironment, user: &TestUser) -> Vec<Value> {
+        use affinidi_messaging_mediator::task_specs::messaging::mux::notice::v0_1::Payload;
+        let store = env.mediator.store();
+        let hash = user.did_hash();
+        let mut out = Vec::new();
+        for m in store
+            .list_messages(&hash, Folder::Inbox, None, 100)
+            .await
+            .expect("list inbox")
+        {
+            let Some(full) = store.get_message(&hash, &m.msg_id).await.unwrap() else {
+                continue;
+            };
+            let Some(qb2) = full
+                .msg
+                .as_deref()
+                .and_then(|b| BASE64_URL_SAFE_NO_PAD.decode(b).ok())
+                .filter(|b| affinidi_tsp::is_tsp(b))
+            else {
+                continue;
+            };
+            let (payload, sender) = env
+                .atm
+                .tsp()
+                .unpack_bytes(&user.profile, &qb2)
+                .await
+                .expect("open as the recipient");
+            assert_eq!(sender, env.mediator.did(), "sealed by the mediator");
+            let doc: Value = serde_json::from_slice(&payload).expect("a JSON document");
+            if doc["type"] != NOTICE_TYPE {
+                continue;
+            }
+            assert_eq!(doc["issuer"], env.mediator.did());
+            assert_eq!(doc["recipient"], user.did);
+            assert!(doc["proof"].is_object(), "a notice is signed: {doc:#}");
+            serde_json::from_value::<trust_tasks_rs::TrustTask<Payload>>(doc.clone())
+                .unwrap_or_else(|e| panic!("notice does not match the spec: {e}\n{doc:#}"));
+            out.push(doc);
+        }
+        out
+    }
+
+    async fn wait_for_tsp_notices(env: &TestEnvironment, user: &TestUser, n: usize) -> Vec<Value> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let got = tsp_notices(env, user).await;
+                if got.len() >= n {
+                    return got;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} TSP notices for {}", n, user.alias))
+    }
+
+    async fn grant_states(env: &TestEnvironment, member: &TestUser) -> Vec<MuxGrantState> {
+        mux::load(
+            &*env.mediator.store(),
+            &member.did_hash(),
+            &MuxLimits::default(),
+            now(),
+        )
+        .await
+        .unwrap()
+        .grants
+        .iter()
+        .map(|g| g.state)
+        .collect()
+    }
+
+    /// Mirrors `a_login_with_a_key_agreement_key_added_since_the_grant_suspends_it`
+    /// for TSP: the grant was signed with `key-2`; the TSP login proves
+    /// `key-1`, which signed no active grant, so the grant is suspended before
+    /// the login answers. The principal gets `grantsSuspended`, the member a
+    /// `grantsPresent` sealed for TSP.
+    #[tokio::test]
+    async fn a_tsp_login_with_a_key_that_signed_no_grant_suspends_it() {
+        init_tracing();
+        let env = env().await;
+        let member = env.add_multi_key_user("work", 2).await.unwrap();
+        let phone = env.add_user("phone").await.unwrap();
+        online(&env, &phone).await;
+        relate_to_mediator(&env, &member).await;
+
+        let statement = signed_grant(&env, &member, "key-2", &phone).await;
+        let grant_id = statement["grantId"].as_str().unwrap().to_string();
+        present(&env, &phone, statement).await;
+        assert_eq!(grant_states(&env, &member).await, [MuxGrantState::Active]);
+
+        tsp_login(&env, &member).await;
+
+        // Committed and audited before the login answered.
+        assert_eq!(
+            grant_states(&env, &member).await,
+            [MuxGrantState::Suspended],
+            "suspended by the time the TSP login succeeds"
+        );
+        let audit = env.mediator.store().audit_log_list(0, 100).await.unwrap();
+        let entry = audit
+            .entries
+            .iter()
+            .find(|e| {
+                e.action
+                    == affinidi_messaging_mediator_common::types::audit::AuditAction::MuxGrantSuspend
+            })
+            .expect("a mux_grant_suspend audit entry");
+        assert_eq!(entry.actor_did_hash, member.did_hash());
+        assert_eq!(entry.target_did_hash, phone.did_hash());
+        assert!(
+            entry.detail.contains("direct TSP authentication"),
+            "{}",
+            entry.detail
+        );
+
+        // The principal, offline throughout, has the durable notice to
+        // recreate the grant.
+        let got = wait_for_notices(&env, &phone, 1).await;
+        assert_eq!(got.len(), 1, "{got:#?}");
+        let p = &got[0]["payload"];
+        assert_eq!(p["notice"], "grantsSuspended");
+        assert_eq!(p["suspensions"][0]["did"], member.did);
+        assert_eq!(p["suspensions"][0]["grantIds"], json!([grant_id]));
+        assert_eq!(p["suspensions"][0]["reason"], "suspendedUnknownKey");
+
+        // The member learns delegations of it existed, sealed for TSP.
+        let got = wait_for_tsp_notices(&env, &member, 1).await;
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(
+            got[0]["payload"],
+            json!({ "notice": "grantsPresent", "did": member.did, "count": 1, "suspended": 1, "epoch": 0 })
+        );
+    }
+
+    /// Mirrors `direct_authentication_tells_the_member_once_per_change` for
+    /// TSP: a login with the key that signed the grant suspends nothing, and
+    /// the member is told once, sealed for TSP, that delegations of it exist.
+    #[tokio::test]
+    async fn a_tsp_login_tells_the_member_its_grants_exist() {
+        init_tracing();
+        let env = env().await;
+        let member = env.add_user("work").await.unwrap();
+        let phone = env.add_user("phone").await.unwrap();
+        online(&env, &phone).await;
+        relate_to_mediator(&env, &member).await;
+        present(
+            &env,
+            &phone,
+            signed_grant(&env, &member, "key-1", &phone).await,
+        )
+        .await;
+        assert!(tsp_notices(&env, &member).await.is_empty());
+
+        tsp_login(&env, &member).await;
+        let got = wait_for_tsp_notices(&env, &member, 1).await;
+        assert_eq!(
+            got[0]["payload"],
+            json!({ "notice": "grantsPresent", "did": member.did, "count": 1, "suspended": 0, "epoch": 0 })
+        );
+        // The key that signed the grant is known: nothing suspended, and the
+        // phone is told nothing.
+        assert_eq!(grant_states(&env, &member).await, [MuxGrantState::Active]);
+        assert!(notices(&env, &phone).await.is_empty());
+
+        // Nothing changed: logging in again stores nothing new.
+        tsp_login(&env, &member).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tsp_notices(&env, &member).await.len(), 1);
+    }
+}
