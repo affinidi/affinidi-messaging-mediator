@@ -762,13 +762,23 @@ pub(crate) async fn consume_message_status(
         .map_err(serialize_err)
 }
 
-/// Handle `messaging/monitor/subscribe`: open or renew a leased, filtered live
-/// tap on the mediator's traffic metadata (see [`crate::monitor`]).
-///
-/// An administrator may watch anything. Anyone else sees only traffic to or
-/// from their own account: an omitted `dids` is narrowed to it, and naming any
-/// other account is refused rather than silently narrowed. The response
-/// carries the filter actually in force.
+/// A `messaging/monitor/subscribe` request, read the same way at either
+/// version: 0.2 extends 0.1 with `traffic` and `membership`, which a 0.1
+/// request never carries.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribeRequest {
+    filter: Option<crate::monitor::Filter>,
+    lease_seconds: Option<i64>,
+    max_events_per_second: Option<u64>,
+    subscription_id: Option<String>,
+    traffic: Option<bool>,
+    membership: Option<crate::monitor::MembershipFilter>,
+}
+
+/// Handle `messaging/monitor/subscribe` 0.1: open or renew a leased, filtered
+/// live tap on the mediator's traffic metadata (see [`crate::monitor`]). Its
+/// batches are `messaging/monitor/event` 0.2, traffic only.
 pub(crate) async fn consume_monitor_subscribe(
     typed: TrustTask<monitor::subscribe::v0_1::Payload>,
     state: &SharedData,
@@ -777,45 +787,163 @@ pub(crate) async fn consume_monitor_subscribe(
     now: DateTime<Utc>,
     transport: super::trust_tasks::TaskTransport,
 ) -> Result<Value, MediatorError> {
-    use crate::monitor::{
-        DEFAULT_LEASE_SECONDS, DEFAULT_MAX_EVENTS_PER_SECOND, Delivery, Filter,
-        MAX_EVENTS_PER_SECOND, MAX_LEASE_SECONDS, MonitorError,
-    };
-
     validate_tt_basic(&typed, session, mediator_did, now)?;
-    let payload = &typed.payload;
-    let is_admin = roles::can_administer(session.account_type);
+    let request: SubscribeRequest =
+        from_json(serde_json::to_value(&typed.payload).map_err(serialize_err)?)?;
+    let granted = monitor_subscribe(
+        request,
+        crate::monitor::EventVersion::V0_2,
+        state,
+        session,
+        transport,
+    )
+    .await?;
+    let response: monitor::subscribe::v0_1::Response = from_json(json!({
+        "subscriptionId": granted.subscription_id,
+        "expiresAt": granted.expires_at,
+        "filter": granted.tap.filter.to_json(),
+        "maxEventsPerSecond": granted.max_eps,
+    }))?;
+    serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
+        .map_err(serialize_err)
+}
 
-    let mut filter: Filter = match &payload.filter {
-        Some(f) => serde_json::to_value(f)
-            .and_then(serde_json::from_value)
-            .map_err(serialize_err)?,
-        None => Filter::default(),
-    };
-    if !is_admin {
-        match &filter.dids {
-            None => filter.dids = Some(vec![session.did_hash.clone()]),
-            Some(dids) if dids.iter().all(|d| *d == session.did_hash) => {}
-            Some(_) => {
-                return Err(tt_problem(
-                    session,
-                    "permissionDenied",
-                    "only an administrator may monitor another account's traffic".into(),
-                    StatusCode::FORBIDDEN,
-                ));
-            }
+/// Handle `messaging/monitor/subscribe` 0.2: as 0.1, plus the opt-in to mux
+/// membership events (`membership`) and a membership-only tap
+/// (`traffic: false`). Its batches are `messaging/monitor/event` 0.3. The
+/// response states what the subscriber will see: `membership` only when it
+/// will receive membership events, `traffic: false` only when it will
+/// receive no traffic events.
+pub(crate) async fn consume_monitor_subscribe_v0_2(
+    typed: TrustTask<monitor::subscribe::v0_2::Payload>,
+    state: &SharedData,
+    session: &Session,
+    mediator_did: &str,
+    now: DateTime<Utc>,
+    transport: super::trust_tasks::TaskTransport,
+) -> Result<Value, MediatorError> {
+    validate_tt_basic(&typed, session, mediator_did, now)?;
+    let request: SubscribeRequest =
+        from_json(serde_json::to_value(&typed.payload).map_err(serialize_err)?)?;
+    let granted = monitor_subscribe(
+        request,
+        crate::monitor::EventVersion::V0_3,
+        state,
+        session,
+        transport,
+    )
+    .await?;
+    let mut response = json!({
+        "subscriptionId": granted.subscription_id,
+        "expiresAt": granted.expires_at,
+        "filter": granted.tap.filter.to_json(),
+        "maxEventsPerSecond": granted.max_eps,
+    });
+    if !granted.tap.traffic {
+        response["traffic"] = json!(false);
+    }
+    if let Some(m) = &granted.tap.membership {
+        response["membership"] = m.to_json();
+    }
+    let response: monitor::subscribe::v0_2::Response = from_json(response)?;
+    serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
+        .map_err(serialize_err)
+}
+
+/// Narrow `dids` to what `session` may watch: an administrator anything;
+/// anyone else only its own account — an omitted `dids` is narrowed to it,
+/// and naming any other account is refused rather than silently narrowed.
+fn narrow_dids(
+    dids: &mut Option<Vec<String>>,
+    is_admin: bool,
+    session: &Session,
+    what: &str,
+) -> Result<(), MediatorError> {
+    if is_admin {
+        return Ok(());
+    }
+    match dids {
+        None => *dids = Some(vec![session.did_hash.clone()]),
+        Some(d) if d.iter().all(|d| *d == session.did_hash) => {}
+        Some(_) => {
+            return Err(tt_problem(
+                session,
+                "permissionDenied",
+                format!("only an administrator may monitor another account's {what}"),
+                StatusCode::FORBIDDEN,
+            ));
         }
     }
+    Ok(())
+}
 
-    let lease = payload.lease_seconds.map_or(DEFAULT_LEASE_SECONDS, |s| {
+/// Open or renew a subscription for `request` at either subscribe version.
+///
+/// An administrator may watch anything. Anyone else sees only traffic to or
+/// from its own account, and only membership changes it is party to (as
+/// principal or member); see [`narrow_dids`]. Membership events are sent
+/// only to a subscription whose request carried `membership`, and only while
+/// mux is enabled here: otherwise there are none to send, and the effective
+/// tap says so by carrying no membership filter.
+async fn monitor_subscribe(
+    request: SubscribeRequest,
+    version: crate::monitor::EventVersion,
+    state: &SharedData,
+    session: &Session,
+    transport: super::trust_tasks::TaskTransport,
+) -> Result<crate::monitor::Granted, MediatorError> {
+    use crate::monitor::{
+        DEFAULT_LEASE_SECONDS, DEFAULT_MAX_EVENTS_PER_SECOND, Delivery, MAX_EVENTS_PER_SECOND,
+        MAX_LEASE_SECONDS, MonitorError, Tap,
+    };
+
+    let is_admin = roles::can_administer(session.account_type);
+    let traffic = request.traffic.unwrap_or(true);
+    if !traffic && request.filter.is_some() {
+        return Err(tt_problem(
+            session,
+            "malformedRequest",
+            "`filter` selects traffic events, which `traffic: false` turns off".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    if !traffic && request.membership.is_none() {
+        return Err(tt_problem(
+            session,
+            "malformedRequest",
+            "`traffic: false` without `membership` would select nothing".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    let mut filter = request.filter.unwrap_or_default();
+    if traffic {
+        narrow_dids(&mut filter.dids, is_admin, session, "traffic")?;
+    }
+    let mut membership = request.membership;
+    if let Some(m) = &mut membership {
+        narrow_dids(&mut m.dids, is_admin, session, "mux membership")?;
+    }
+    // No mux here, no membership events: the response must not promise any.
+    if !state.config.limits.mux.enabled {
+        membership = None;
+    }
+    let tap = Tap {
+        filter,
+        traffic,
+        membership,
+        version,
+    };
+
+    let lease = request.lease_seconds.map_or(DEFAULT_LEASE_SECONDS, |s| {
         s.clamp(10, MAX_LEASE_SECONDS as i64) as u64
     });
-    let max_eps = payload
+    let max_eps = request
         .max_events_per_second
         .map_or(DEFAULT_MAX_EVENTS_PER_SECOND, |n| {
-            n.get().min(MAX_EVENTS_PER_SECOND)
+            n.clamp(1, MAX_EVENTS_PER_SECOND)
         });
-    let renew = payload.subscription_id.as_ref().map(|s| s.to_string());
+    let renew = request.subscription_id;
 
     // Served over the transport it was opened on: a TSP subscriber's batches
     // are sealed to its VID, which needs its encryption key. Resolving it here
@@ -842,7 +970,7 @@ pub(crate) async fn consume_monitor_subscribe(
             &session.did,
             &session.did_hash,
             renew.as_deref(),
-            filter,
+            tap,
             lease,
             max_eps,
             delivery,
@@ -866,43 +994,60 @@ pub(crate) async fn consume_monitor_subscribe(
             ),
         })?;
 
-    // An administrator's tap can see other accounts' traffic metadata, so it
-    // is on the record: who watched which accounts, and for how long. (A
-    // non-admin's subscription is confined to its own traffic.)
+    // An administrator's tap can see other accounts' traffic metadata and mux
+    // membership, so it is on the record: who watched which accounts, with
+    // which filters, and for how long. (A non-admin's subscription is
+    // confined to its own account.)
     if is_admin {
-        let scope = granted
-            .filter
-            .dids
-            .as_ref()
-            .map_or_else(|| "all accounts".to_string(), |d| abbreviate(d));
+        let tap = &granted.tap;
+        let traffic_dids = tap.traffic.then_some(&tap.filter.dids);
+        let membership_dids = tap.membership.as_ref().map(|m| &m.dids);
+        let describe = |dids: &Option<Vec<String>>| {
+            dids.as_ref()
+                .map_or_else(|| "all accounts".to_string(), |d| abbreviate(d))
+        };
+        let mut scope = Vec::new();
+        if let Some(d) = traffic_dids {
+            scope.push(format!("traffic of {}", describe(d)));
+        }
+        if let Some(d) = membership_dids {
+            scope.push(format!("mux membership of {}", describe(d)));
+        }
+        // The one account watched, when there is exactly one; else `*`.
+        let named: Vec<&[String]> = traffic_dids
+            .into_iter()
+            .chain(membership_dids)
+            .map(|d| d.as_deref().unwrap_or_default())
+            .collect();
+        let target = match named.as_slice() {
+            [first, rest @ ..] if first.len() == 1 && rest.iter().all(|d| d == first) => {
+                first[0].as_str()
+            }
+            _ => "*",
+        };
+        let mut filters = format!("filter: {}", tap.filter.to_json());
+        if !tap.traffic {
+            filters = "traffic: off".to_string();
+        }
+        if let Some(m) = &tap.membership {
+            filters.push_str(&format!(", membership: {}", m.to_json()));
+        }
         record_audit(
             state,
             session,
-            granted
-                .filter
-                .dids
-                .as_ref()
-                .and_then(|d| (d.len() == 1).then(|| d[0].as_str()))
-                .unwrap_or("*"),
+            target,
             AuditAction::MonitorSubscribe,
             format!(
-                "{} monitor {} watching {scope} for {lease}s (filter: {})",
+                "{} monitor {} watching {} for {lease}s ({filters})",
                 if renew.is_some() { "renewed" } else { "opened" },
                 granted.subscription_id,
-                granted.filter.to_json(),
+                scope.join(" and "),
             ),
         )
         .await;
     }
 
-    let response: monitor::subscribe::v0_1::Response = from_json(json!({
-        "subscriptionId": granted.subscription_id,
-        "expiresAt": granted.expires_at,
-        "filter": granted.filter.to_json(),
-        "maxEventsPerSecond": granted.max_eps,
-    }))?;
-    serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
-        .map_err(serialize_err)
+    Ok(granted)
 }
 
 /// Handle `messaging/monitor/unsubscribe`: end a subscription — the owner's

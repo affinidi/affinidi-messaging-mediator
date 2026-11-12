@@ -138,13 +138,25 @@ digest = "sha256:1893fabb483d24671e95a0916dc00590026d0966eddcb16d7f2a2d9ad73e7d8
 slug = "messaging/monitor/event"
 version = "0.2"
 type_uri = "https://trusttasks.org/spec/messaging/monitor/event/0.2"
-digest = "sha256:a69e1e7c826b09edf5443c3004625e53fd72fcd8da271b67a890b24d0c054cce"
+digest = "sha256:25f52fd8095f35a56b475831b3a702b2508e12f5c602fc3b8c0f9f9d961f7817"
+
+[[task]]
+slug = "messaging/monitor/event"
+version = "0.3"
+type_uri = "https://trusttasks.org/spec/messaging/monitor/event/0.3"
+digest = "sha256:087cf8b4d80eff4849b186c958663dc42e0aa7aa0309dd2fee2d8ae40f635e43"
 
 [[task]]
 slug = "messaging/monitor/subscribe"
 version = "0.1"
 type_uri = "https://trusttasks.org/spec/messaging/monitor/subscribe/0.1"
-digest = "sha256:6969ac62e8016132a0c2a4950f28a25b7894127558cb940383902f68e9de3785"
+digest = "sha256:910adeec2e1c529898289516b9cd2e83789c019eff98b15bae3a80dce43b5277"
+
+[[task]]
+slug = "messaging/monitor/subscribe"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/messaging/monitor/subscribe/0.2"
+digest = "sha256:536be9624d7c311dc39464cb6f4ee24e5f4c3e6e3f92c238648731ea9302110f"
 
 [[task]]
 slug = "messaging/monitor/unsubscribe"
@@ -198,7 +210,7 @@ digest = "sha256:8879f4125157a304d5dbde40234164b065f32cee8b33f844b1fc371cc13d08a
 slug = "messaging/mux/notice"
 version = "0.1"
 type_uri = "https://trusttasks.org/spec/messaging/mux/notice/0.1"
-digest = "sha256:f092d704f11509345a2ecfd6a4bf348d92fc5931fb1fdf1138464c4ab84bfcbc"
+digest = "sha256:1300f82f0a915d8f143e55ede541401b42ed5cccd896adaedba47dd47492149e"
 
 [[task]]
 slug = "messaging/mux/revoke"

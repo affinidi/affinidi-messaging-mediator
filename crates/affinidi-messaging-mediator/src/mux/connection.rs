@@ -151,6 +151,59 @@ fn grant_id(member: &MuxMember) -> Option<&str> {
     }
 }
 
+/// One member change, as the traffic monitor reports it.
+struct Watched<'a> {
+    member_hash: &'a str,
+    source: &'static str,
+    reason: &'static str,
+}
+
+impl<'a> Watched<'a> {
+    fn of(member: &'a MuxMember, reason: &'static str) -> Self {
+        Self {
+            member_hash: &member.did_hash,
+            source: match member.source {
+                MuxSource::Grant { .. } => "grant",
+                MuxSource::Attach => "attach",
+            },
+            reason,
+        }
+    }
+}
+
+/// Report to the traffic monitor's membership subscribers
+/// (`messaging/monitor/event` 0.3) the member changes one `attached` or `detached`
+/// `messaging/mux/event` is about to tell the principal: one event each.
+///
+/// Called only where those events are built (here, in [`open`],
+/// [`on_member_change`] and [`drain_changes`]), each from changes already made
+/// to the connection's member set, so a change is reported after it has
+/// happened (R1.1). Every queued change is taken exactly once, by
+/// [`drain_changes`] or, if the socket closes first, by [`close`] — so each
+/// is reported once. Costs one atomic load when nobody watches.
+fn watch<'a>(
+    state: &SharedData,
+    conn: (&str, &str, MuxWire),
+    change: crate::monitor::MembershipChange,
+    members: impl IntoIterator<Item = Watched<'a>>,
+) {
+    let (principal_hash, session_id, wire) = conn;
+    for m in members {
+        state
+            .monitor
+            .emit_membership(|| crate::monitor::MembershipEvent {
+                at: chrono::Utc::now(),
+                change,
+                principal: principal_hash.to_string(),
+                member: m.member_hash.to_string(),
+                wire: wire.label(),
+                source: m.source,
+                reason: m.reason,
+                session_id: Some(session_id.to_string()),
+            });
+    }
+}
+
 /// The signed `messaging/mux/event` document for `payload`, addressed to the
 /// principal.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
@@ -433,7 +486,14 @@ pub async fn open(
         "pendingNotices": pending_notices,
     });
     frames.extend(event(state, wire, &session.did, ready).await);
+    let watched = (session.did_hash.as_str(), session.session_id.as_str(), wire);
     if !admitted.is_empty() {
+        watch(
+            state,
+            watched,
+            crate::monitor::MembershipChange::Attached,
+            admitted.iter().map(|m| Watched::of(m, "connect")),
+        );
         let dids: Vec<Value> = admitted
             .iter()
             .map(|m| attached(m, "connect", true))
@@ -455,6 +515,20 @@ pub async fn open(
         for r in &refused {
             r.reason.count(1);
         }
+        let hashes: Vec<String> = refused
+            .iter()
+            .map(|r| affinidi_messaging_mediator_common::did_identity::did_hash(&r.did))
+            .collect();
+        watch(
+            state,
+            watched,
+            crate::monitor::MembershipChange::Detached,
+            refused.iter().zip(&hashes).map(|(r, h)| Watched {
+                member_hash: h,
+                source: "grant",
+                reason: r.reason.wire(),
+            }),
+        );
         let dids: Vec<Value> = refused
             .iter()
             .map(|r| detached(&r.did, Some(&r.grant_id), r.reason))
@@ -572,10 +646,16 @@ pub async fn on_member_change(
         | MemberChange::Inactive { did_hash }
         | MemberChange::Reactivated { did_hash } => did_hash,
     };
-    let (member, principal) = {
+    let (member, principal, principal_hash, session_id) = {
         let s = conn.session.lock().await;
-        (s.get(hash).cloned()?, s.principal_did.clone())
+        (
+            s.get(hash).cloned()?,
+            s.principal_did.clone(),
+            s.principal_hash.clone(),
+            s.session_id.clone(),
+        )
     };
+    let watched = (principal_hash.as_str(), session_id.as_str(), wire);
     {
         let mut inactive = conn.inactive.lock().await;
         match &change_ {
@@ -590,6 +670,12 @@ pub async fn on_member_change(
     let payload = match change_ {
         MemberChange::Superseded { .. } => {
             LeaveReason::Superseded.count(1);
+            watch(
+                state,
+                watched,
+                crate::monitor::MembershipChange::Detached,
+                [Watched::of(&member, LeaveReason::Superseded.wire())],
+            );
             json!({
                 "event": "detached",
                 "dids": [detached(&member.did, grant_id(&member), LeaveReason::Superseded)],
@@ -597,7 +683,9 @@ pub async fn on_member_change(
         }
         // Restates a member just admitted while the DID's own direct socket
         // keeps its live traffic. The reason must be an AttachReason, and
-        // `superseded` is not one: name how the member joined.
+        // `superseded` is not one: name how the member joined. Not reported
+        // to the monitor: the join itself already was, and a membership event
+        // carries no `deliveryActive`, so this would read as a second join.
         MemberChange::Inactive { .. } => {
             let reason = match member.source {
                 MuxSource::Attach => "attach",
@@ -606,6 +694,12 @@ pub async fn on_member_change(
             json!({ "event": "attached", "dids": [attached(&member, reason, false)] })
         }
         MemberChange::Reactivated { .. } => {
+            watch(
+                state,
+                watched,
+                crate::monitor::MembershipChange::Attached,
+                [Watched::of(&member, "reactivated")],
+            );
             json!({ "event": "attached", "dids": [attached(&member, "reactivated", true)] })
         }
     };
@@ -616,8 +710,7 @@ pub async fn on_member_change(
 /// `attached` and one `detached` frame. A join is reported with how the member
 /// came (`grant` or `attach`) and whether its live traffic comes here.
 pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) -> Vec<EventFrame> {
-    let joined: Vec<MuxMember> = std::mem::take(&mut *conn.joined.lock().await);
-    let left: Vec<(MuxMember, LeaveReason)> = std::mem::take(&mut *conn.left.lock().await);
+    let (joined, left) = take_changes(state, conn, wire).await;
     let principal = conn.session.lock().await.principal_did.clone();
     let mut frames = Vec::new();
     if !joined.is_empty() {
@@ -658,6 +751,45 @@ pub async fn drain_changes(state: &SharedData, conn: &MuxConn, wire: MuxWire) ->
         );
     }
     frames
+}
+
+/// Take the changes queued on `conn` since the last call and report them to
+/// the traffic monitor ([`watch`]). Each queued change is taken once, so it is
+/// reported once.
+async fn take_changes(
+    state: &SharedData,
+    conn: &MuxConn,
+    wire: MuxWire,
+) -> (Vec<MuxMember>, Vec<(MuxMember, LeaveReason)>) {
+    let joined: Vec<MuxMember> = std::mem::take(&mut *conn.joined.lock().await);
+    let left: Vec<(MuxMember, LeaveReason)> = std::mem::take(&mut *conn.left.lock().await);
+    if joined.is_empty() && left.is_empty() {
+        return (joined, left);
+    }
+    let (principal_hash, session_id) = {
+        let s = conn.session.lock().await;
+        (s.principal_hash.clone(), s.session_id.clone())
+    };
+    let watched = (principal_hash.as_str(), session_id.as_str(), wire);
+    watch(
+        state,
+        watched,
+        crate::monitor::MembershipChange::Attached,
+        joined.iter().map(|m| {
+            let reason = match m.source {
+                MuxSource::Attach => "attach",
+                MuxSource::Grant { .. } => "grant",
+            };
+            Watched::of(m, reason)
+        }),
+    );
+    watch(
+        state,
+        watched,
+        crate::monitor::MembershipChange::Detached,
+        left.iter().map(|(m, r)| Watched::of(m, r.wire())),
+    );
+    (joined, left)
 }
 
 /// Periodic sweep: expire lapsed members and, when `revalidate` is set,
@@ -1121,9 +1253,16 @@ pub async fn members_reading(state: &SharedData, session_id: &str) -> Vec<String
 /// connection out of the registry. The members are not reported or counted
 /// as detached: nobody is left to read the event, and the connection ending
 /// is not a detach.
+///
+/// Changes made before the close but not yet drained into an event (a revoke
+/// that landed as the socket went) did happen, so the traffic monitor is told
+/// of them here; the principal, gone, is not.
 pub async fn close(state: &SharedData, session: &Session, conn: &MuxConn) {
     conn.close_members(state.streaming_task.as_ref()).await;
     state.mux.remove(&session.session_id, &session.did_hash);
+    // After the member set is emptied, so no later detach can queue a change
+    // here that nobody takes.
+    let _ = take_changes(state, conn, conn.wire).await;
 }
 
 #[cfg(all(test, feature = "tsp"))]

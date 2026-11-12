@@ -31,6 +31,21 @@
 //! behind a shared Redis, a subscriber sees the traffic of the instance it is
 //! connected to.
 //!
+//! # Membership events
+//!
+//! A subscription opened with `messaging/monitor/subscribe` 0.2 may opt in,
+//! with a `membership` filter, to mux membership events: one
+//! [`MembershipEvent`] per member change the mediator reports to a mux
+//! connection's principal in an `attached` or `detached`
+//! `messaging/mux/event` (see `crate::mux::connection`, which emits them where
+//! it builds those events). They ride the same batches, as
+//! `messaging/monitor/event` 0.3's `membership` array with its own
+//! `membershipDropped` count, under the same rate ceiling, and are never sent
+//! to a subscription that did not ask. A 0.1 subscription is served exactly as
+//! before: event 0.2 batches, traffic only. Like traffic, membership is per
+//! instance: a connection's changes are seen by subscribers on the instance
+//! that holds the connection.
+//!
 //! # What a subscription reveals
 //!
 //! Correspondence metadata: who exchanged messages with whom (as DID hashes),
@@ -81,8 +96,23 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// An empty batch is sent at least this often, so a dead tap is visible.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// `messaging/monitor/event` type URI.
-const EVENT_TYPE: &str = "https://trusttasks.org/spec/messaging/monitor/event/0.2";
+/// The `messaging/monitor/event` version a subscription's batches are sent
+/// in: 0.2 for a subscription opened (or last renewed) with subscribe 0.1,
+/// 0.3 for one opened with subscribe 0.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventVersion {
+    V0_2,
+    V0_3,
+}
+
+impl EventVersion {
+    fn type_uri(self) -> &'static str {
+        match self {
+            EventVersion::V0_2 => "https://trusttasks.org/spec/messaging/monitor/event/0.2",
+            EventVersion::V0_3 => "https://trusttasks.org/spec/messaging/monitor/event/0.3",
+        }
+    }
+}
 
 /// Which way traffic moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +280,60 @@ impl TrafficEvent {
 
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// What happened to a member's place on a mux connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MembershipChange {
+    Attached,
+    Detached,
+}
+
+impl MembershipChange {
+    fn as_str(self) -> &'static str {
+        match self {
+            MembershipChange::Attached => "attached",
+            MembershipChange::Detached => "detached",
+        }
+    }
+}
+
+/// One member change on one mux connection, as its `messaging/mux/event`
+/// reported it to the principal. Metadata only: no statement, nonce, scope or
+/// key material. Accounts are DID hashes, as in [`TrafficEvent`].
+#[derive(Clone, Debug)]
+pub struct MembershipEvent {
+    pub at: DateTime<Utc>,
+    pub change: MembershipChange,
+    /// The connection's principal (DID hash).
+    pub principal: String,
+    /// The member (DID hash).
+    pub member: String,
+    /// `didcomm` or `tsp`.
+    pub wire: &'static str,
+    /// `grant` or `attach`.
+    pub source: &'static str,
+    /// The reason the `messaging/mux/event` entry carries.
+    pub reason: &'static str,
+    pub session_id: Option<String>,
+}
+
+impl MembershipEvent {
+    fn to_json(&self) -> Value {
+        let mut v = json!({
+            "occurredAt": self.at,
+            "change": self.change.as_str(),
+            "principal": self.principal,
+            "member": self.member,
+            "wire": self.wire,
+            "source": self.source,
+            "reason": self.reason,
+        });
+        if let Some(id) = self.session_id.as_deref().filter(|id| !id.is_empty()) {
+            v["sessionId"] = json!(truncate(id, 256));
+        }
+        v
+    }
 }
 
 tokio::task_local! {
@@ -586,6 +670,74 @@ impl Filter {
     }
 }
 
+/// A subscriber's membership filter (`MembershipFilter`). Present means the
+/// subscription receives membership events; members narrow which (ANDed,
+/// values ORed).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MembershipFilter {
+    pub dids: Option<Vec<String>>,
+    pub changes: Option<Vec<String>>,
+    pub wires: Option<Vec<String>>,
+    pub sources: Option<Vec<String>>,
+}
+
+impl MembershipFilter {
+    fn matches(&self, e: &MembershipEvent) -> bool {
+        let in_set = |set: &Option<Vec<String>>, val: &str| {
+            set.as_ref().is_none_or(|s| s.iter().any(|x| x == val))
+        };
+        if let Some(dids) = &self.dids
+            && !dids.iter().any(|d| *d == e.principal || *d == e.member)
+        {
+            return false;
+        }
+        in_set(&self.changes, e.change.as_str())
+            && in_set(&self.wires, e.wire)
+            && in_set(&self.sources, e.source)
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        let mut v = json!({});
+        for (k, val) in [
+            ("dids", &self.dids),
+            ("changes", &self.changes),
+            ("wires", &self.wires),
+            ("sources", &self.sources),
+        ] {
+            if let Some(val) = val {
+                v[k] = json!(val);
+            }
+        }
+        v
+    }
+}
+
+/// What a subscription taps, as normalised by
+/// `mediator_ops::consume_monitor_subscribe`: the traffic filter, whether
+/// traffic events are on, the membership filter (its presence is the opt-in)
+/// and the event version its batches are sent in.
+#[derive(Clone, Debug)]
+pub(crate) struct Tap {
+    pub filter: Filter,
+    pub traffic: bool,
+    pub membership: Option<MembershipFilter>,
+    pub version: EventVersion,
+}
+
+impl Tap {
+    /// Whether this tap shows anything beyond `owner`'s own account, which
+    /// only an administrator may open. Traffic counts only while it is on;
+    /// membership only when opted in.
+    fn reaches_beyond(&self, owner: &str) -> bool {
+        let own = |dids: &Option<Vec<String>>| {
+            dids.as_ref().is_some_and(|d| d.iter().all(|x| x == owner))
+        };
+        (self.traffic && !own(&self.filter.dids))
+            || self.membership.as_ref().is_some_and(|m| !own(&m.dids))
+    }
+}
+
 /// Why a subscribe or unsubscribe was refused.
 #[derive(Debug)]
 pub(crate) enum MonitorError {
@@ -597,7 +749,7 @@ pub(crate) enum MonitorError {
 
 /// Mutable state of one subscription.
 struct Settings {
-    filter: Filter,
+    tap: Tap,
     expires_at: DateTime<Utc>,
     max_eps: u64,
     /// Set, under this lock, when the subscription ends because its owner's
@@ -716,10 +868,13 @@ impl ForwardingObserver for TrafficMonitor {
     }
 }
 
-/// The bus and the subscriptions reading it. Cheap to clone.
+/// The buses and the subscriptions reading them. Cheap to clone.
 #[derive(Clone)]
 pub struct TrafficMonitor {
     tx: broadcast::Sender<Arc<TrafficEvent>>,
+    /// Mux membership events, on their own bus: a subscription that did not
+    /// opt in ignores them, and they cannot crowd traffic out of `tx`.
+    membership_tx: broadcast::Sender<Arc<MembershipEvent>>,
     subscriptions: Arc<DashMap<String, Subscription>>,
 }
 
@@ -741,15 +896,17 @@ impl std::fmt::Debug for TrafficMonitor {
 pub(crate) struct Granted {
     pub subscription_id: String,
     pub expires_at: DateTime<Utc>,
-    pub filter: Filter,
+    pub tap: Tap,
     pub max_eps: u64,
 }
 
 impl TrafficMonitor {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BUS_CAPACITY);
+        let (membership_tx, _) = broadcast::channel(BUS_CAPACITY);
         Self {
             tx,
+            membership_tx,
             subscriptions: Arc::new(DashMap::new()),
         }
     }
@@ -776,8 +933,24 @@ impl TrafficMonitor {
         }
     }
 
+    /// Emit a mux membership event if any subscription could see it. Called
+    /// once per member change reported in `messaging/mux/event`, after the
+    /// change is made (`crate::mux::connection`).
+    pub fn emit_membership(&self, build: impl FnOnce() -> MembershipEvent) {
+        if self.membership_tx.receiver_count() > 0 {
+            let _ = self.membership_tx.send(Arc::new(build()));
+        }
+    }
+
+    /// Every membership event on the bus, unfiltered: for tests of the code
+    /// that emits.
+    #[cfg(test)]
+    pub(crate) fn tap_membership(&self) -> broadcast::Receiver<Arc<MembershipEvent>> {
+        self.membership_tx.subscribe()
+    }
+
     /// Open a subscription, or renew and re-filter an existing one owned by
-    /// the same account. `filter` must already be narrowed to what the owner
+    /// the same account. `tap` must already be narrowed to what the owner
     /// may see (see `mediator_ops::consume_monitor_subscribe`).
     #[cfg(any(feature = "didcomm", feature = "tsp"))]
     #[allow(clippy::too_many_arguments)]
@@ -787,7 +960,7 @@ impl TrafficMonitor {
         owner_did: &str,
         owner_did_hash: &str,
         renew: Option<&str>,
-        filter: Filter,
+        tap: Tap,
         lease_seconds: u64,
         max_eps: u64,
         delivery: Delivery,
@@ -806,13 +979,13 @@ impl TrafficMonitor {
             if guard.ended {
                 return Err(MonitorError::UnknownSubscription);
             }
-            guard.filter = filter.clone();
+            guard.tap = tap.clone();
             guard.expires_at = expires_at;
             guard.max_eps = max_eps;
             return Ok(Granted {
                 subscription_id: id.to_string(),
                 expires_at,
-                filter,
+                tap,
                 max_eps,
             });
         }
@@ -828,7 +1001,7 @@ impl TrafficMonitor {
 
         let id = format!("urn:uuid:{}", Uuid::new_v4());
         let settings = Arc::new(Mutex::new(Settings {
-            filter: filter.clone(),
+            tap: tap.clone(),
             expires_at,
             max_eps,
             ended: false,
@@ -861,6 +1034,7 @@ impl TrafficMonitor {
             sent,
             dropped,
             rx: self.tx.subscribe(),
+            membership_rx: self.membership_tx.subscribe(),
             subscriptions: self.subscriptions.clone(),
         };
         tokio::spawn(task.run());
@@ -868,7 +1042,7 @@ impl TrafficMonitor {
         Ok(Granted {
             subscription_id: id,
             expires_at,
-            filter,
+            tap,
             max_eps,
         })
     }
@@ -952,20 +1126,69 @@ struct DeliveryTask {
     sent: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     rx: broadcast::Receiver<Arc<TrafficEvent>>,
+    membership_rx: broadcast::Receiver<Arc<MembershipEvent>>,
     subscriptions: Arc<DashMap<String, Subscription>>,
+}
+
+/// What a subscription has gathered since its last batch.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+#[derive(Default)]
+struct Pending {
+    events: Vec<Value>,
+    /// Traffic events discarded since the last batch.
+    dropped: u64,
+    membership: Vec<Value>,
+    /// Membership events discarded since the last batch.
+    membership_dropped: u64,
+}
+
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+            && self.membership.is_empty()
+            && self.dropped == 0
+            && self.membership_dropped == 0
+    }
+
+    fn full(&self) -> bool {
+        self.events.len() >= MAX_BATCH || self.membership.len() >= MAX_BATCH
+    }
+
+    /// Discard the gathered events, counting each as dropped in its own
+    /// count. Returns how many were discarded.
+    fn discard(&mut self) -> u64 {
+        let traffic = std::mem::take(&mut self.events).len() as u64;
+        let membership = std::mem::take(&mut self.membership).len() as u64;
+        self.dropped += traffic;
+        self.membership_dropped += membership;
+        traffic + membership
+    }
 }
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 impl DeliveryTask {
     async fn run(mut self) {
-        let mut batch: Vec<Value> = Vec::new();
-        let mut dropped_since_batch: u64 = 0;
+        let mut pending = Pending::default();
         let mut seq: u64 = 0;
         let mut window_start = tokio::time::Instant::now();
         let mut in_window: u64 = 0;
         let mut last_sent = tokio::time::Instant::now();
         let mut flush = tokio::time::interval(FLUSH_INTERVAL);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // One rate ceiling over traffic and membership events together.
+        let mut admit = |max_eps: u64| {
+            if window_start.elapsed() >= Duration::from_secs(1) {
+                window_start = tokio::time::Instant::now();
+                in_window = 0;
+            }
+            if in_window >= max_eps {
+                return false;
+            }
+            in_window += 1;
+            true
+        };
 
         loop {
             tokio::select! {
@@ -974,29 +1197,54 @@ impl DeliveryTask {
                     Ok(event) => {
                         let (keep, max_eps) = {
                             let s = self.settings.lock().await;
-                            (s.filter.matches(&event) && !self.is_own_management(&event), s.max_eps)
+                            (
+                                s.tap.traffic
+                                    && s.tap.filter.matches(&event)
+                                    && !self.is_own_management(&event),
+                                s.max_eps,
+                            )
                         };
                         if !keep {
                             continue;
                         }
-                        if window_start.elapsed() >= Duration::from_secs(1) {
-                            window_start = tokio::time::Instant::now();
-                            in_window = 0;
-                        }
-                        if in_window >= max_eps {
-                            dropped_since_batch += 1;
+                        if !admit(max_eps) {
+                            pending.dropped += 1;
                             continue;
                         }
-                        in_window += 1;
-                        batch.push(event.to_json());
-                        if batch.len() >= MAX_BATCH {
-                            if !self.deliver_if_standing(&mut batch, &mut dropped_since_batch, &mut seq).await {
-                                break;
-                            }
-                            last_sent = tokio::time::Instant::now();
-                        }
+                        pending.events.push(event.to_json());
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => dropped_since_batch += n,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        if self.settings.lock().await.tap.traffic {
+                            pending.dropped += n;
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                received = self.membership_rx.recv() => match received {
+                    Ok(event) => {
+                        let (keep, max_eps) = {
+                            let s = self.settings.lock().await;
+                            (
+                                s.tap.membership.as_ref().is_some_and(|f| f.matches(&event)),
+                                s.max_eps,
+                            )
+                        };
+                        if !keep {
+                            continue;
+                        }
+                        if !admit(max_eps) {
+                            pending.membership_dropped += 1;
+                            continue;
+                        }
+                        pending.membership.push(event.to_json());
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        if self.settings.lock().await.tap.membership.is_some() {
+                            pending.membership_dropped += n;
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = flush.tick() => {
@@ -1004,13 +1252,21 @@ impl DeliveryTask {
                     if expired {
                         break;
                     }
-                    if !batch.is_empty() || dropped_since_batch > 0 || last_sent.elapsed() >= HEARTBEAT {
-                        if !self.deliver_if_standing(&mut batch, &mut dropped_since_batch, &mut seq).await {
+                    if !pending.is_empty() || last_sent.elapsed() >= HEARTBEAT {
+                        if !self.deliver_if_standing(&mut pending, &mut seq).await {
                             break;
                         }
                         last_sent = tokio::time::Instant::now();
                     }
+                    continue;
                 }
+            }
+            // A full batch goes at once rather than at the next tick.
+            if pending.full() {
+                if !self.deliver_if_standing(&mut pending, &mut seq).await {
+                    break;
+                }
+                last_sent = tokio::time::Instant::now();
             }
         }
         self.subscriptions.remove(&self.subscription_id);
@@ -1029,7 +1285,12 @@ impl DeliveryTask {
     /// Returns the standing and whether the filter it was judged against
     /// reaches beyond the owner's own account.
     async fn standing(&self) -> (SubscriberStanding, bool) {
-        let reaches = self.reaches_other_accounts().await;
+        let reaches = self
+            .settings
+            .lock()
+            .await
+            .tap
+            .reaches_beyond(&self.owner_did_hash);
         (self.standing_for(reaches).await, reaches)
     }
 
@@ -1072,16 +1333,6 @@ impl DeliveryTask {
         SubscriberStanding::Good
     }
 
-    /// Whether the filter in force reaches beyond the subscriber's own
-    /// account: a non-administrator's is narrowed to it at subscribe.
-    async fn reaches_other_accounts(&self) -> bool {
-        let s = self.settings.lock().await;
-        !s.filter
-            .dids
-            .as_ref()
-            .is_some_and(|d| d.iter().all(|x| *x == self.owner_did_hash))
-    }
-
     /// [`Self::deliver`] the batch if the subscriber still stands. Returns
     /// `false` when the subscription must end:
     ///
@@ -1092,27 +1343,20 @@ impl DeliveryTask {
     ///   audit log when it opens, so its end is too.
     /// - standing unreadable (store failure): this batch is withheld and
     ///   counted as dropped; the next one checks again.
-    async fn deliver_if_standing(
-        &self,
-        batch: &mut Vec<Value>,
-        dropped: &mut u64,
-        seq: &mut u64,
-    ) -> bool {
+    async fn deliver_if_standing(&self, pending: &mut Pending, seq: &mut u64) -> bool {
         let (standing, reached) = self.standing().await;
         match standing {
             SubscriberStanding::Good => {
-                self.deliver(batch, dropped, seq).await;
+                self.deliver(pending, seq).await;
                 true
             }
             SubscriberStanding::Unknown => {
-                let n = std::mem::take(batch).len() as u64;
-                *dropped += n;
+                let n = pending.discard();
                 self.dropped.fetch_add(n, Ordering::Relaxed);
                 true
             }
             SubscriberStanding::Lapsed(why) => {
-                let n = std::mem::take(batch).len() as u64;
-                *dropped += n;
+                let n = pending.discard();
                 self.dropped.fetch_add(n, Ordering::Relaxed);
                 // Ended first, under the settings lock a renewal takes, and
                 // out of the map: no renewal succeeds from here on. Only then
@@ -1123,7 +1367,7 @@ impl DeliveryTask {
                     s.expires_at = Utc::now();
                 }
                 self.subscriptions.remove(&self.subscription_id);
-                self.deliver(batch, dropped, seq).await;
+                self.deliver(pending, seq).await;
                 tracing::info!(subscription = %self.subscription_id, owner = %self.owner_did_hash, "monitor subscription ended: {why}");
                 if reached {
                     use affinidi_messaging_mediator_common::types::audit::{
@@ -1167,10 +1411,29 @@ impl DeliveryTask {
     /// not live, nothing is sent and the batch's events are counted as dropped
     /// — `seq` only advances for a batch actually handed to the connection, so
     /// the subscriber sees a gap only when a sent batch was lost.
-    async fn deliver(&self, batch: &mut Vec<Value>, dropped: &mut u64, seq: &mut u64) {
-        let events: Vec<Value> = std::mem::take(batch);
-        let count = events.len() as u64;
-        let expires_at = self.settings.lock().await.expires_at;
+    async fn deliver(&self, pending: &mut Pending, seq: &mut u64) {
+        let (expires_at, traffic, membership, version) = {
+            let s = self.settings.lock().await;
+            (
+                s.expires_at,
+                s.tap.traffic,
+                s.tap.membership.is_some(),
+                s.tap.version,
+            )
+        };
+        // A renewal may have turned a kind off since these were gathered:
+        // they are not sent, and count as dropped toward the totals only.
+        if !traffic {
+            let n = std::mem::take(&mut pending.events).len() as u64;
+            pending.dropped = 0;
+            self.dropped.fetch_add(n, Ordering::Relaxed);
+        }
+        if !membership {
+            let n = std::mem::take(&mut pending.membership).len() as u64;
+            pending.membership_dropped = 0;
+            self.dropped.fetch_add(n, Ordering::Relaxed);
+        }
+        let count = (pending.events.len() + pending.membership.len()) as u64;
 
         let Some(uuid) = self
             .state
@@ -1178,32 +1441,37 @@ impl DeliveryTask {
             .streaming_is_client_live(&self.owner_did_hash, true)
             .await
         else {
-            *dropped += count;
-            self.dropped.fetch_add(count, Ordering::Relaxed);
+            self.dropped.fetch_add(pending.discard(), Ordering::Relaxed);
             return;
         };
 
         let next_seq = *seq + 1;
         let mediator_did = &self.state.config.mediator_did;
+        let mut payload = json!({
+            "subscriptionId": self.subscription_id,
+            "seq": next_seq,
+            "events": pending.events,
+            "dropped": pending.dropped,
+            "expiresAt": expires_at,
+        });
+        // `membership` and `membershipDropped` go on every batch of a
+        // subscription that opted in, and on no other (event 0.3 rule 7).
+        if membership && version == EventVersion::V0_3 {
+            payload["membership"] = json!(pending.membership);
+            payload["membershipDropped"] = json!(pending.membership_dropped);
+        }
         let doc = json!({
             "id": format!("urn:uuid:{}", Uuid::new_v4()),
-            "type": EVENT_TYPE,
+            "type": version.type_uri(),
             "issuer": mediator_did,
             "recipient": self.owner_did,
-            "payload": {
-                "subscriptionId": self.subscription_id,
-                "seq": next_seq,
-                "events": events,
-                "dropped": *dropped,
-                "expiresAt": expires_at,
-            },
+            "payload": payload,
         });
         let packed = match self.pack(doc).await {
             Ok(packed) => packed,
             Err(e) => {
                 tracing::debug!(subscription = %self.subscription_id, "monitor batch not sent: {e}");
-                *dropped += count;
-                self.dropped.fetch_add(count, Ordering::Relaxed);
+                self.dropped.fetch_add(pending.discard(), Ordering::Relaxed);
                 return;
             }
         };
@@ -1229,13 +1497,12 @@ impl DeliveryTask {
         match published {
             Ok(()) => {
                 *seq = next_seq;
-                *dropped = 0;
+                *pending = Pending::default();
                 self.sent.fetch_add(count, Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::debug!(subscription = %self.subscription_id, "monitor batch not published: {e}");
-                *dropped += count;
-                self.dropped.fetch_add(count, Ordering::Relaxed);
+                self.dropped.fetch_add(pending.discard(), Ordering::Relaxed);
             }
         }
     }
@@ -1575,6 +1842,116 @@ mod tests {
         let (code, detail) = refusal_outcome(&internal);
         assert_eq!(code, "internalError");
         assert!(detail.is_none(), "backend text must not reach a subscriber");
+    }
+
+    fn membership(change: MembershipChange, principal: &str, member: &str) -> MembershipEvent {
+        MembershipEvent {
+            at: Utc::now(),
+            change,
+            principal: principal.into(),
+            member: member.into(),
+            wire: "didcomm",
+            source: "grant",
+            reason: match change {
+                MembershipChange::Attached => "grant",
+                MembershipChange::Detached => "revokedByPrincipal",
+            },
+            session_id: Some("ses_1".into()),
+        }
+    }
+
+    #[test]
+    fn an_empty_membership_filter_matches_every_change() {
+        let f = MembershipFilter::default();
+        assert!(f.matches(&membership(MembershipChange::Attached, "p", "m")));
+        assert!(f.matches(&membership(MembershipChange::Detached, "p", "m")));
+    }
+
+    #[test]
+    fn membership_dids_match_principal_or_member_and_members_are_anded() {
+        let f = MembershipFilter {
+            dids: Some(vec!["m".into()]),
+            changes: Some(vec!["detached".into()]),
+            ..Default::default()
+        };
+        assert!(f.matches(&membership(MembershipChange::Detached, "p", "m")));
+        assert!(f.matches(&membership(MembershipChange::Detached, "m", "x")));
+        assert!(!f.matches(&membership(MembershipChange::Detached, "p", "x")));
+        assert!(
+            !f.matches(&membership(MembershipChange::Attached, "p", "m")),
+            "wrong change"
+        );
+        let tsp = MembershipFilter {
+            wires: Some(vec!["tsp".into()]),
+            ..Default::default()
+        };
+        assert!(!tsp.matches(&membership(MembershipChange::Attached, "p", "m")));
+        let attach = MembershipFilter {
+            sources: Some(vec!["attach".into()]),
+            ..Default::default()
+        };
+        assert!(!attach.matches(&membership(MembershipChange::Attached, "p", "m")));
+    }
+
+    #[test]
+    fn a_tap_reaches_beyond_its_owner_only_through_what_it_shows() {
+        let own = |o: &str| Some(vec![o.to_string()]);
+        let tap = |traffic, filter_dids, membership: Option<Option<Vec<String>>>| Tap {
+            filter: Filter {
+                dids: filter_dids,
+                ..Default::default()
+            },
+            traffic,
+            membership: membership.map(|dids| MembershipFilter {
+                dids,
+                ..Default::default()
+            }),
+            version: EventVersion::V0_3,
+        };
+        assert!(!tap(true, own("me"), None).reaches_beyond("me"));
+        assert!(tap(true, None, None).reaches_beyond("me"));
+        assert!(
+            !tap(false, None, Some(own("me"))).reaches_beyond("me"),
+            "traffic off: its empty filter shows nothing"
+        );
+        assert!(tap(false, None, Some(None)).reaches_beyond("me"));
+        assert!(tap(true, own("me"), Some(own("other"))).reaches_beyond("me"));
+    }
+
+    #[test]
+    fn membership_events_match_the_spec_and_carry_metadata_only() {
+        use crate::task_specs::messaging::monitor::event::v0_3::Payload;
+        let attached = membership(MembershipChange::Attached, "p", "m").to_json();
+        let detached = MembershipEvent {
+            session_id: None,
+            ..membership(MembershipChange::Detached, "p", "m")
+        }
+        .to_json();
+        assert!(detached.get("sessionId").is_none());
+        for key in ["scope", "muxNonce", "statement", "proof", "grantId"] {
+            assert!(attached.get(key).is_none(), "{key} is not monitor metadata");
+        }
+        let batch = json!({
+            "subscriptionId": "s",
+            "seq": 1,
+            "events": [],
+            "dropped": 0,
+            "membership": [attached, detached],
+            "membershipDropped": 0,
+            "expiresAt": Utc::now(),
+        });
+        serde_json::from_value::<Payload>(batch.clone())
+            .unwrap_or_else(|e| panic!("not an event 0.3 batch: {e}\n{batch:#}"));
+    }
+
+    #[test]
+    fn membership_is_emitted_only_while_someone_listens() {
+        let monitor = TrafficMonitor::new();
+        monitor.emit_membership(|| panic!("nobody listens"));
+        let mut rx = monitor.tap_membership();
+        monitor.emit_membership(|| membership(MembershipChange::Attached, "p", "m"));
+        assert_eq!(rx.try_recv().unwrap().member, "m");
+        assert!(rx.try_recv().is_err(), "one change, one event");
     }
 
     #[test]
