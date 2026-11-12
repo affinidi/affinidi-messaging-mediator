@@ -106,7 +106,6 @@ use crate::didcomm_compat;
 #[cfg(feature = "didcomm")]
 use crate::messages::protocols::discover_features;
 #[cfg(feature = "didcomm")]
-use affinidi_did_common::document::DocumentExt;
 #[cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 #[cfg(feature = "didcomm")]
@@ -405,8 +404,9 @@ impl MessageHandler for Message {
 
         // A recipient that publishes more key-agreement keys than the limit
         // would make every reply encrypt to all of them.
-        let key_count = to_doc.doc.find_key_agreement(None).len();
-        if key_count > pack_options.to_keys_per_recipient_limit {
+        if let Some(key_count) =
+            key_agreement_over_limit(&to_doc.doc, pack_options.to_keys_per_recipient_limit)
+        {
             return Err(MediatorError::MediatorError(
                 47,
                 session_id.to_string(),
@@ -477,6 +477,41 @@ impl MessageHandler for Message {
                 StatusCode::NOT_IMPLEMENTED,
             ))
         }
+    }
+}
+
+/// The number of key-agreement keys `doc` publishes, when that is more than
+/// `limit`. Read from the length of the parsed list: no id is copied, so the
+/// check costs the same however many keys the document lists.
+fn key_agreement_over_limit(doc: &affinidi_did_common::Document, limit: usize) -> Option<usize> {
+    let count = doc.key_agreement.len();
+    (count > limit).then_some(count)
+}
+
+#[cfg(test)]
+mod key_limit_tests {
+    use super::key_agreement_over_limit;
+
+    fn doc_with_keys(n: usize) -> affinidi_did_common::Document {
+        let ids: Vec<String> = (0..n)
+            .map(|i| format!("did:example:alice#key-{i}"))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "did:example:alice",
+            "keyAgreement": ids,
+        }))
+        .expect("document")
+    }
+
+    #[test]
+    fn a_recipient_over_the_key_limit_is_counted_and_refused() {
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(0), 2), None);
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(2), 2), None);
+        assert_eq!(key_agreement_over_limit(&doc_with_keys(3), 2), Some(3));
+        assert_eq!(
+            key_agreement_over_limit(&doc_with_keys(500), 100),
+            Some(500)
+        );
     }
 }
 
