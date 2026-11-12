@@ -169,8 +169,7 @@ impl MuxConn {
             (s.detach(did_hash)?, s.session_id.clone())
         };
         self.deregister(streaming, did_hash, &session_id).await;
-        self.left.lock().await.push((member.clone(), reason));
-        self.notify.notify_one();
+        self.report_left(vec![(member.clone(), reason)]).await;
         Some(member)
     }
 
@@ -203,9 +202,36 @@ impl MuxConn {
             (s.detach(did_hash)?, s.session_id.clone())
         };
         self.deregister(streaming, did_hash, &session_id).await;
-        self.left.lock().await.push((member.clone(), reason));
-        self.notify.notify_one();
+        self.report_left(vec![(member.clone(), reason)]).await;
         Some(member)
+    }
+
+    /// Queue `left` for the socket's next `detached` event and count each on
+    /// [`MUX_DETACH_TOTAL`](crate::common::metrics::names::MUX_DETACH_TOTAL):
+    /// every member that leaves a live connection, or that a stored grant
+    /// could not put on it, is reported here.
+    pub async fn report_left(&self, left: Vec<(MuxMember, LeaveReason)>) {
+        if left.is_empty() {
+            return;
+        }
+        for (_, reason) in &left {
+            reason.count(1);
+        }
+        self.left.lock().await.extend(left);
+        self.notify.notify_one();
+    }
+
+    /// Take every member off the connection as it closes: out of the member
+    /// set, then out of the streaming task. Nothing is reported or counted as
+    /// detached; the connection ending is not a detach.
+    pub async fn close_members(&self, streaming: Option<&StreamingTask>) {
+        let (gone, session_id) = {
+            let mut s = self.session.lock().await;
+            (s.close(), s.session_id.clone())
+        };
+        for m in &gone {
+            self.deregister(streaming, &m.did_hash, &session_id).await;
+        }
     }
 
     async fn deregister(
@@ -253,8 +279,7 @@ impl MuxConn {
             (s.detach(did_hash)?, s.session_id.clone())
         };
         self.deregister(streaming, did_hash, &session_id).await;
-        self.left.lock().await.push((member.clone(), reason));
-        self.notify.notify_one();
+        self.report_left(vec![(member.clone(), reason)]).await;
         Some(member)
     }
 
@@ -272,13 +297,8 @@ impl MuxConn {
         for m in &gone {
             self.deregister(streaming, &m.did_hash, &session_id).await;
         }
-        if !gone.is_empty() {
-            self.left
-                .lock()
-                .await
-                .extend(gone.iter().cloned().map(|m| (m, reason)));
-            self.notify.notify_one();
-        }
+        self.report_left(gone.iter().cloned().map(|m| (m, reason)).collect())
+            .await;
         gone
     }
 
@@ -329,6 +349,12 @@ pub struct MuxSummary {
     pub inactive: u64,
 }
 
+/// Move the connection gauge for `wire` by `delta`.
+fn connection_gauge(wire: super::connection::MuxWire, delta: f64) {
+    metrics::gauge!(crate::common::metrics::names::MUX_CONNECTIONS, "wire" => wire.label())
+        .increment(delta);
+}
+
 /// All live mux connections, by session id and by principal.
 #[derive(Default)]
 pub struct MuxRegistry {
@@ -337,8 +363,15 @@ pub struct MuxRegistry {
 }
 
 impl MuxRegistry {
+    /// Publish `conn`. With [`Self::remove`], the one place the
+    /// [`MUX_CONNECTIONS`](crate::common::metrics::names::MUX_CONNECTIONS)
+    /// gauge moves, so it always equals the connections registered here.
     pub fn insert(&self, session_id: &str, principal_hash: &str, conn: Arc<MuxConn>) {
-        self.conns.insert(session_id.to_string(), conn);
+        let wire = conn.wire;
+        if let Some(old) = self.conns.insert(session_id.to_string(), conn) {
+            connection_gauge(old.wire, -1.0);
+        }
+        connection_gauge(wire, 1.0);
         self.by_principal
             .entry(principal_hash.to_string())
             .or_default()
@@ -346,7 +379,9 @@ impl MuxRegistry {
     }
 
     pub fn remove(&self, session_id: &str, principal_hash: &str) {
-        self.conns.remove(session_id);
+        if let Some((_, conn)) = self.conns.remove(session_id) {
+            connection_gauge(conn.wire, -1.0);
+        }
         if let Some(mut set) = self.by_principal.get_mut(principal_hash) {
             set.remove(session_id);
         }
@@ -524,11 +559,8 @@ impl MuxRegistry {
                             grant = %g.grant_id,
                             "stored grant not carried live: {e}"
                         );
-                        conn.left
-                            .lock()
-                            .await
-                            .push((member.clone(), LeaveReason::ConnectionFull));
-                        conn.notify.notify_one();
+                        conn.report_left(vec![(member.clone(), LeaveReason::ConnectionFull)])
+                            .await;
                     }
                 }
             }
@@ -573,6 +605,89 @@ async fn current_grant(
             && s.principal_hash == g.principal_hash
             && matches!(s.state_at(now), MuxGrantState::Active)
     }))
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::common::metrics::testing::{recorder, value};
+    use crate::mux::connection::MuxWire;
+    use crate::mux::session::{MuxSource, gauge_tests::member};
+
+    fn conn(principal: &str, session: &str, wire: MuxWire) -> Arc<MuxConn> {
+        let (tx, _rx) = mpsc::channel(8);
+        Arc::new(
+            MuxConn::new(
+                MuxSession::new(principal, session, 10),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_origin(wire, 0),
+        )
+    }
+
+    /// The connection gauge counts what the registry holds, by wire: a
+    /// re-insert under one session id is one connection, and removing one
+    /// that is not there moves nothing (never below zero).
+    #[test]
+    fn the_connection_gauge_follows_the_registry() {
+        let rec = recorder();
+        let _local = metrics::set_default_local_recorder(&rec);
+        let gauges = || {
+            (
+                value(&rec, "mux_connections{wire=\"didcomm\"}"),
+                value(&rec, "mux_connections{wire=\"tsp\"}"),
+            )
+        };
+        let registry = MuxRegistry::default();
+        registry.insert("s1", "p", conn("did:example:p", "s1", MuxWire::DidComm));
+        registry.insert("s2", "p", conn("did:example:p", "s2", MuxWire::Tsp));
+        assert_eq!(gauges(), (1.0, 1.0));
+        // Replaced under the same id, on another wire.
+        registry.insert("s1", "p", conn("did:example:p", "s1", MuxWire::Tsp));
+        assert_eq!(gauges(), (0.0, 2.0));
+        registry.remove("s1", "p");
+        registry.remove("s1", "p");
+        registry.remove("never", "p");
+        assert_eq!(gauges(), (0.0, 1.0));
+        registry.remove("s2", "p");
+        assert_eq!(gauges(), (0.0, 0.0));
+    }
+
+    /// Every leave from a live connection is counted once, by reason; a
+    /// detach that finds nothing counts nothing; and closing the connection
+    /// takes its members off the gauge without counting them as detached.
+    #[tokio::test]
+    async fn detaches_are_counted_and_a_close_is_not() {
+        let rec = recorder();
+        let _local = metrics::set_default_local_recorder(&rec);
+        let reason = |r: &str| value(&rec, &format!("mux_detach_total{{reason=\"{r}\"}}"));
+        let members = || value(&rec, "mux_members{source=\"attach\"}");
+
+        let c = conn("did:example:p", "s", MuxWire::DidComm);
+        {
+            let mut s = c.session.lock().await;
+            for d in ["did:example:a", "did:example:b", "did:example:c"] {
+                s.admit(member(d, MuxSource::Attach, 100)).unwrap();
+            }
+        }
+        assert_eq!(members(), 3.0);
+        let a = member("did:example:a", MuxSource::Attach, 100).did_hash;
+        c.detach(None, &a, LeaveReason::DetachRequested).await;
+        c.detach(None, &a, LeaveReason::DetachRequested).await;
+        let b = member("did:example:b", MuxSource::Attach, 100).did_hash;
+        c.detach_if(None, &b, LeaveReason::AccountBlocked, |_| false)
+            .await;
+        assert_eq!(reason("detachRequested"), 1.0);
+        assert_eq!(reason("accountBlocked"), 0.0);
+        assert_eq!(members(), 2.0);
+        assert_eq!(c.left.lock().await.len(), 1);
+
+        c.close_members(None).await;
+        assert_eq!(members(), 0.0);
+        assert_eq!(reason("detachRequested"), 1.0, "a close is not a detach");
+        assert_eq!(c.left.lock().await.len(), 1, "and queues no event");
+    }
 }
 
 #[cfg(all(test, feature = "memory-backend"))]

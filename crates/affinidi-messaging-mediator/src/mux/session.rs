@@ -40,6 +40,22 @@ pub enum MuxSource {
     Grant { grant_id: String },
 }
 
+impl MuxSource {
+    /// The `source` label on [`MUX_MEMBERS`](crate::common::metrics::names::MUX_MEMBERS).
+    pub fn label(&self) -> &'static str {
+        match self {
+            MuxSource::Attach => "attach",
+            MuxSource::Grant { .. } => "grant",
+        }
+    }
+}
+
+/// Move the member gauge for `source` (a [`MuxSource::label`]) by `delta`.
+fn member_gauge(source: &'static str, delta: f64) {
+    metrics::gauge!(crate::common::metrics::names::MUX_MEMBERS, "source" => source)
+        .increment(delta);
+}
+
 /// One DID this connection carries.
 #[derive(Clone, Debug)]
 pub struct MuxMember {
@@ -108,9 +124,23 @@ impl LeaveReason {
             LeaveReason::ConnectionFull => "connectionFull",
         }
     }
+
+    /// Count `members` leaving (or never joining) for this reason, on
+    /// [`MUX_DETACH_TOTAL`](crate::common::metrics::names::MUX_DETACH_TOTAL).
+    pub fn count(self, members: usize) {
+        if members > 0 {
+            metrics::counter!(crate::common::metrics::names::MUX_DETACH_TOTAL, "reason" => self.wire())
+                .increment(members as u64);
+        }
+    }
 }
 
 /// A connection's mux state.
+///
+/// The member map is changed only through `put` and `take` (and dropped with
+/// the session), which keep the
+/// [`MUX_MEMBERS`](crate::common::metrics::names::MUX_MEMBERS) gauge in step
+/// with it: every way a member joins or leaves passes through them.
 #[derive(Debug)]
 pub struct MuxSession {
     pub principal_did: String,
@@ -150,6 +180,34 @@ impl MuxSession {
         self.members.get(did_hash)
     }
 
+    /// Put `member` in the map, replacing any entry for its DID, and move the
+    /// member gauge to match.
+    fn put(&mut self, member: MuxMember) {
+        let source = member.source.label();
+        match self.members.insert(member.did_hash.clone(), member) {
+            Some(old) if old.source.label() == source => {}
+            Some(old) => {
+                member_gauge(old.source.label(), -1.0);
+                member_gauge(source, 1.0);
+            }
+            None => member_gauge(source, 1.0),
+        }
+    }
+
+    /// Take `did_hash` out of the map, moving the member gauge to match.
+    fn take(&mut self, did_hash: &str) -> Option<MuxMember> {
+        let m = self.members.remove(did_hash)?;
+        member_gauge(m.source.label(), -1.0);
+        Some(m)
+    }
+
+    /// Take every member off: the connection is closing. No member is
+    /// reported or counted as detached; the gauge moves.
+    pub fn close(&mut self) -> Vec<MuxMember> {
+        let hashes: Vec<String> = self.members.keys().cloned().collect();
+        hashes.iter().filter_map(|h| self.take(h)).collect()
+    }
+
     /// Whether this connection may do `cap` for `did_hash` at `now`. The
     /// principal itself may do everything its own session allows; that check
     /// is the caller's, as it is today.
@@ -178,11 +236,11 @@ impl MuxSession {
                 max: self.max_members,
             });
         }
-        let member = match self.members.remove(&member.did_hash) {
-            Some(existing) => merge(existing, member),
+        let member = match self.members.get(&member.did_hash) {
+            Some(existing) => merge(existing.clone(), member),
             None => member,
         };
-        self.members.insert(member.did_hash.clone(), member.clone());
+        self.put(member.clone());
         Ok(member)
     }
 
@@ -244,7 +302,7 @@ impl MuxSession {
                     grant_id: grant.grant_id.clone(),
                     reason,
                 };
-                match ctx.verifier.key_is_current(&grant.kid, &grant.key_fp).await {
+                match super::grants::key_is_current(ctx.verifier, &grant.kid, &grant.key_fp).await {
                     Ok(true) => {}
                     Ok(false) => {
                         let _ = super::grants::revalidate(ctx, &grant).await;
@@ -284,11 +342,11 @@ impl MuxSession {
                     grant_iat: grant.iat,
                     attached_at: 0,
                 };
-                let member = match self.members.remove(&grant.did_hash) {
-                    Some(existing) => merge(existing, member),
+                let member = match self.members.get(&grant.did_hash) {
+                    Some(existing) => merge(existing.clone(), member),
                     None => member,
                 };
-                self.members.insert(grant.did_hash.clone(), member.clone());
+                self.put(member.clone());
                 admitted.push(member);
             }
             match next {
@@ -321,7 +379,7 @@ impl MuxSession {
             // The same grant again (already carried): nothing changes.
             Some((source, _)) if source == member.source => Ok(None),
             Some((MuxSource::Grant { .. }, _)) => {
-                self.members.insert(member.did_hash.clone(), member.clone());
+                self.put(member.clone());
                 Ok(Some((member, false)))
             }
             Some((MuxSource::Attach, _)) => Ok(Some((self.admit(member)?, false))),
@@ -331,7 +389,7 @@ impl MuxSession {
 
     /// Remove a member. Returns it if it was on the connection.
     pub fn detach(&mut self, did_hash: &str) -> Option<MuxMember> {
-        self.members.remove(did_hash)
+        self.take(did_hash)
     }
 
     /// Remove members whose admission covered `grant_ids` (revoked,
@@ -347,7 +405,7 @@ impl MuxSession {
                     == (MuxSource::Grant {
                         grant_id: g.grant_id.clone(),
                     })
-                && let Some(m) = self.members.remove(&g.did_hash)
+                && let Some(m) = self.take(&g.did_hash)
             {
                 out.push(m);
             }
@@ -385,7 +443,18 @@ impl MuxSession {
             .filter(|m| m.expires_at <= now)
             .map(|m| m.did_hash.clone())
             .collect();
-        gone.iter().filter_map(|h| self.members.remove(h)).collect()
+        gone.iter().filter_map(|h| self.take(h)).collect()
+    }
+}
+
+/// A session dropped with members still on it (a connection torn down
+/// without [`MuxSession::close`], or one never published) takes them off the
+/// gauge, so it never leaks.
+impl Drop for MuxSession {
+    fn drop(&mut self) {
+        for m in self.members.values() {
+            member_gauge(m.source.label(), -1.0);
+        }
     }
 }
 
@@ -517,6 +586,117 @@ mod nonce_tests {
             );
         }
         assert_ne!(super::new_nonce(), super::new_nonce());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod gauge_tests {
+    use super::*;
+    use crate::common::metrics::testing::{recorder, value};
+
+    const GRANT: &str = "mux_members{source=\"grant\"}";
+    const ATTACH: &str = "mux_members{source=\"attach\"}";
+
+    pub(crate) fn member(did: &str, source: MuxSource, expires_at: u64) -> MuxMember {
+        let grant_iat = match source {
+            MuxSource::Grant { .. } => 1,
+            MuxSource::Attach => 0,
+        };
+        MuxMember {
+            did: did.into(),
+            did_hash: did_hash(did),
+            source,
+            scope: MuxScope::new([MuxCapability::Receive]).unwrap(),
+            kid: format!("{did}#key-1"),
+            key_fp: "fp".into(),
+            expires_at,
+            grant_iat,
+            attached_at: 0,
+        }
+    }
+
+    fn grant(id: &str) -> MuxSource {
+        MuxSource::Grant {
+            grant_id: id.into(),
+        }
+    }
+
+    /// The member gauge follows the member set through every way a member
+    /// joins, changes source or leaves, and comes back to zero when the
+    /// session ends with members still on it.
+    #[test]
+    fn the_member_gauge_follows_the_member_set() {
+        let rec = recorder();
+        let _local = metrics::set_default_local_recorder(&rec);
+        let gauges = || (value(&rec, GRANT), value(&rec, ATTACH));
+
+        let mut s = MuxSession::new("did:example:device", "sess", 10);
+        s.admit(member("did:example:a", MuxSource::Attach, 100))
+            .unwrap();
+        s.admit(member("did:example:b", MuxSource::Attach, 100))
+            .unwrap();
+        assert_eq!(gauges(), (0.0, 2.0));
+
+        // The same attach again: still one member.
+        s.admit(member("did:example:a", MuxSource::Attach, 200))
+            .unwrap();
+        assert_eq!(gauges(), (0.0, 2.0));
+
+        // A grant merged into an attach: the member counts as `grant` now.
+        s.admit_grant(member("did:example:a", grant("g1"), 300))
+            .unwrap();
+        assert_eq!(gauges(), (1.0, 1.0));
+        // A replacing grant: still one grant member.
+        let mut newer = member("did:example:a", grant("g2"), 300);
+        newer.grant_iat = 2;
+        s.admit_grant(newer).unwrap();
+        assert_eq!(gauges(), (1.0, 1.0));
+
+        // A refused admission moves nothing.
+        let mut full = MuxSession::new("did:example:other", "s2", 0);
+        assert!(
+            full.admit(member("did:example:c", MuxSource::Attach, 100))
+                .is_err()
+        );
+        assert_eq!(gauges(), (1.0, 1.0));
+
+        // Expiry, then a detach of one already gone.
+        assert_eq!(s.expire(150).len(), 1);
+        assert_eq!(gauges(), (1.0, 0.0));
+        assert!(s.detach(&did_hash("did:example:b")).is_none());
+        assert_eq!(gauges(), (1.0, 0.0));
+
+        // Close, then drop: nothing left to count, never negative.
+        s.admit(member("did:example:d", MuxSource::Attach, 400))
+            .unwrap();
+        assert_eq!(s.close().len(), 2);
+        assert_eq!(gauges(), (0.0, 0.0));
+        drop(s);
+        assert_eq!(gauges(), (0.0, 0.0));
+
+        // A session dropped with members on it gives them back.
+        let mut s = MuxSession::new("did:example:device", "sess", 10);
+        s.admit(member("did:example:e", grant("g3"), 400)).unwrap();
+        s.admit(member("did:example:f", MuxSource::Attach, 400))
+            .unwrap();
+        assert_eq!(gauges(), (1.0, 1.0));
+        drop(s);
+        assert_eq!(gauges(), (0.0, 0.0));
+    }
+
+    /// Detach reasons are counted under the spec's wire names, and a count
+    /// of none records nothing.
+    #[test]
+    fn detach_reasons_are_counted_by_wire_name() {
+        let rec = recorder();
+        let _local = metrics::set_default_local_recorder(&rec);
+        LeaveReason::RevokedByMember.count(2);
+        LeaveReason::Expired.count(0);
+        assert_eq!(
+            value(&rec, "mux_detach_total{reason=\"revokedByMember\"}"),
+            2.0
+        );
+        assert!(!rec.handle().render().contains("reason=\"expired\""));
     }
 }
 
