@@ -782,3 +782,58 @@ mod tests {
         assert_eq!(changed.removed.len(), 1);
     }
 }
+
+/// `messaging/mux/ack`: delete the frames named, as the connection's
+/// principal may (its own, and each member's while the member holds
+/// `delete`). Sorted into `acked` and `refused` (`notFound` /
+/// `notPermitted`); a store failure fails the request, retryable, rather than
+/// reporting a frame as not found.
+pub async fn ack(
+    state: &crate::SharedData,
+    session: &crate::common::session::Session,
+    payload: &Value,
+) -> Result<Value, TaskError> {
+    let ids: Vec<String> = payload
+        .get("messageIds")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let results = crate::handlers::message_delete::delete_for_session(
+        state,
+        session,
+        &ids,
+        crate::monitor::Channel::Websocket,
+    )
+    .await;
+    let (mut acked, mut refused) = (Vec::new(), Vec::new());
+    for r in results {
+        match r.outcome {
+            Ok(()) => acked.push(r.id),
+            Err(e)
+                if e.is_storage_cap()
+                    || matches!(
+                        e,
+                        affinidi_messaging_mediator_common::errors::MediatorError::DatabaseError(
+                            ..
+                        )
+                    ) =>
+            {
+                return Err(TaskError {
+                    code: "storageError".into(),
+                    message: format!("the store could not delete a frame: {e}"),
+                    retryable: true,
+                });
+            }
+            Err(_) => refused.push(json!({
+                "messageId": r.id,
+                "reason": if r.member_without_delete { "notPermitted" } else { "notFound" },
+            })),
+        }
+    }
+    Ok(json!({ "acked": acked, "refused": refused }))
+}

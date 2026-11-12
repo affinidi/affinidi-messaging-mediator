@@ -531,6 +531,10 @@ pub(crate) async fn handle_inbound_tsp(
     }
 }
 
+/// The type of a `messaging/mux/ack` answer, delivered to the connection only.
+#[cfg(feature = "tsp")]
+const MUX_ACK_RESPONSE_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1#response";
+
 /// Answer a management Trust Task that arrived over TSP.
 ///
 /// The mediator's management surface is one core
@@ -614,6 +618,37 @@ async fn dispatch_tsp_trust_task(
             StatusCode::INTERNAL_SERVER_ERROR,
         )
     })?;
+
+    // The answer to `messaging/mux/ack` is pushed to the connection only, not
+    // stored: acknowledging is idempotent, so a lost answer is recovered by
+    // asking again, while a stored one would itself need acknowledging, and
+    // the answer to that, without end (spec, consumer rule 4).
+    if response.get("type").and_then(serde_json::Value::as_str) == Some(MUX_ACK_RESPONSE_TYPE) {
+        use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+        match state
+            .database
+            .streaming_is_client_live(&session.did_hash, true)
+            .await
+        {
+            Some(uuid) => {
+                if let Err(e) = state
+                    .database
+                    .streaming_publish_verbatim(
+                        &session.did_hash,
+                        &uuid,
+                        &BASE64_URL_SAFE_NO_PAD.encode(&packed.bytes),
+                    )
+                    .await
+                {
+                    tracing::debug!("mux ack answer not pushed (the client may ask again): {e}");
+                }
+            }
+            None => tracing::debug!("mux ack answer not pushed: the connection is gone"),
+        }
+        return Ok(InboundMessageResponse::Stored(
+            affinidi_messaging_sdk::messages::sending::InboundMessageList::default(),
+        ));
+    }
 
     // Delivered as any other local message: `deliver_opaque` applies the
     // recipient's own access-list against the mediator as sender, then stores +

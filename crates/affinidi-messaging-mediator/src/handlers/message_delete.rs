@@ -72,90 +72,12 @@ pub async fn message_delete_handler(
             .into());
         }
         let mut deleted: DeleteMessageResponse = DeleteMessageResponse::default();
-
-        // Whose messages this session may delete: its own, and on a mux
-        // connection (the same session) each member's with `delete` scope.
-        // The store authorises each delete; the first owner it accepts wins.
-        let mut owners = vec![session.did_hash.clone()];
-        owners.extend(
-            crate::mux::connection::members_with(
-                &state,
-                &session.session_id,
-                affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
-            )
-            .await,
-        );
-
-        for message in &body.message_ids {
-            let mut result: Result<(), MediatorError> = Err(MediatorError::RequestDataError(
-                44,
-                session.session_id.clone(),
-                "message not found for this session".into(),
-            ));
-            let mut deleted_as = session.did_hash.clone();
-            let mut parties = None;
-            for owner in &owners {
-                let for_member = *owner != session.did_hash;
-                // Read the message for a mux member, to know it is that
-                // member's before its standing is checked; otherwise only
-                // while someone is watching, so its `deleted` event names both
-                // parties.
-                let stored = if for_member || state.monitor.is_active() {
-                    match state.database.get_message(owner, message).await {
-                        Ok(Some(m)) => Some(m),
-                        _ if for_member => continue,
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                // A member's message is deleted only while the member's own
-                // account still stands; checked for the one member the id
-                // belongs to, not for every member the connection carries.
-                if for_member
-                    && !crate::mux::connection::allows(
-                        &state,
-                        &session.session_id,
-                        owner,
-                        affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
-                    )
-                    .await
-                {
-                    continue;
-                }
-                let seen = stored.map(|m| (m.from_address, m.to_address, m.msg));
-                result = state
-                    .database
-                    .delete_message(
-                        message,
-                        DeletionAuthority::Owner {
-                            did_hash: owner.clone(),
-                        },
-                    )
-                    .await;
-                if result.is_ok() {
-                    deleted_as = owner.clone();
-                    parties = seen;
-                    break;
-                }
-            }
-
-            match result {
-                Ok(_) => {
-                    let (from, to, body) = parties.unwrap_or_default();
-                    state.monitor.deleted(
-                        message,
-                        &deleted_as,
-                        from.as_deref(),
-                        to.as_deref(),
-                        crate::monitor::Channel::Rest,
-                        body.as_deref(),
-                    );
-                    deleted.success.push(message.into())
-                }
+        for r in delete_for_session(&state, &session, &body.message_ids, crate::monitor::Channel::Rest).await {
+            match r.outcome {
+                Ok(()) => deleted.success.push(r.id),
                 Err(err) => {
-                    debug!(message_id = message, error = %err, "Delete failed (may already be deleted)");
-                    deleted.errors.push((message.into(), err.to_string()));
+                    debug!(message_id = %r.id, error = %err, "Delete failed (may already be deleted)");
+                    deleted.errors.push((r.id, err.to_string()));
                 }
             }
         }
@@ -174,4 +96,128 @@ pub async fn message_delete_handler(
     }
     .instrument(_span)
     .await
+}
+
+/// What [`delete_for_session`] did with one id.
+pub(crate) struct DeleteResult {
+    pub id: String,
+    /// `Ok` once the message is deleted.
+    pub outcome: Result<(), MediatorError>,
+    /// Not deleted, but held for a member this connection carries without
+    /// the `delete` scope (or whose standing has lapsed).
+    pub member_without_delete: bool,
+}
+
+/// Delete `ids` with `session`'s authority: its own messages, and on a mux
+/// connection (the same session) each member's while the member holds
+/// `delete` and its account stands. The store authorises each delete; the
+/// first owner it accepts wins. A message held for no one this session may
+/// act for is reported as not found, whoever it belongs to: an id is a hash
+/// of the message, and the answer must not confirm another DID's mail.
+pub(crate) async fn delete_for_session(
+    state: &SharedData,
+    session: &Session,
+    ids: &[String],
+    channel: crate::monitor::Channel,
+) -> Vec<DeleteResult> {
+    use affinidi_messaging_mediator_common::store::mux::MuxCapability;
+    let mut owners = vec![session.did_hash.clone()];
+    owners.extend(
+        crate::mux::connection::members_with(state, &session.session_id, MuxCapability::Delete)
+            .await,
+    );
+    let mut results = Vec::with_capacity(ids.len());
+    for message in ids {
+        let mut result: Result<(), MediatorError> = Err(MediatorError::RequestDataError(
+            44,
+            session.session_id.clone(),
+            "message not found for this session".into(),
+        ));
+        let mut deleted_as = session.did_hash.clone();
+        let mut parties = None;
+        for owner in &owners {
+            let for_member = *owner != session.did_hash;
+            // Read the message for a mux member, to know it is that member's
+            // before its standing is checked; otherwise only while someone is
+            // watching, so its `deleted` event names both parties.
+            let stored = if for_member || state.monitor.is_active() {
+                match state.database.get_message(owner, message).await {
+                    Ok(Some(m)) => Some(m),
+                    _ if for_member => continue,
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // A member's message is deleted only while the member's own
+            // account still stands; checked for the one member the id belongs
+            // to, not for every member the connection carries.
+            if for_member
+                && !crate::mux::connection::allows(
+                    state,
+                    &session.session_id,
+                    owner,
+                    MuxCapability::Delete,
+                )
+                .await
+            {
+                continue;
+            }
+            let seen = stored.map(|m| (m.from_address, m.to_address, m.msg));
+            result = state
+                .database
+                .delete_message(
+                    message,
+                    DeletionAuthority::Owner {
+                        did_hash: owner.clone(),
+                    },
+                )
+                .await;
+            if result.is_ok() {
+                deleted_as = owner.clone();
+                parties = seen;
+                break;
+            }
+        }
+
+        let mut member_without_delete = false;
+        match &result {
+            Ok(()) => {
+                let (from, to, body) = parties.unwrap_or_default();
+                state.monitor.deleted(
+                    message,
+                    &deleted_as,
+                    from.as_deref(),
+                    to.as_deref(),
+                    channel,
+                    body.as_deref(),
+                );
+            }
+            Err(_) => {
+                // Held for a member this connection carries, which may not
+                // delete it?
+                for member in crate::mux::connection::members(state, &session.session_id).await {
+                    if (!owners.contains(&member)
+                        || !crate::mux::connection::allows(
+                            state,
+                            &session.session_id,
+                            &member,
+                            MuxCapability::Delete,
+                        )
+                        .await)
+                        && let Ok(Some(_)) = state.database.get_message(&member, message).await
+                    {
+                        member_without_delete = true;
+                        break;
+                    }
+                }
+            }
+        }
+        results.push(DeleteResult {
+            id: message.clone(),
+            outcome: result,
+            member_without_delete,
+        });
+    }
+    results
 }

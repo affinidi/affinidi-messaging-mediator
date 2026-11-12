@@ -1080,6 +1080,19 @@ pub async fn members_with(state: &SharedData, session_id: &str, cap: MuxCapabili
         .collect()
 }
 
+/// Every member of `session_id`'s mux connection, whatever its scope.
+pub async fn members(state: &SharedData, session_id: &str) -> Vec<String> {
+    let Some(conn) = state.mux.get(session_id) else {
+        return Vec::new();
+    };
+    conn.session
+        .lock()
+        .await
+        .members()
+        .map(|m| m.did_hash.clone())
+        .collect()
+}
+
 /// Tear the connection down: every member out of the streaming task, the
 /// connection out of the registry.
 pub async fn close(state: &SharedData, session: &Session, conn: &MuxConn) {
