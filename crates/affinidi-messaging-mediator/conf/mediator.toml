@@ -93,6 +93,22 @@ admin_did = "did://did:peer:2.Vz6MkksX9huJxJwvLtj9vc3gXbT2m1WVy4Uoi3ssEiSSH2ZYJ.
 ### listed proxy is refused with 400. No effect when rate_limit_per_ip = 0.
 trust_xff_cidrs = []
 
+### Env: METRICS_ALLOW_CIDRS — comma-separated (the TOML form is an array).
+### Client ranges allowed to read <api_prefix>/metrics. The client address is
+### resolved as for per-IP rate limiting (through trust_xff_cidrs). Commented
+### out = loopback plus the private, shared (100.64/10), link-local and IPv6
+### unique-local ranges, so an in-cluster or sidecar Prometheus keeps working
+### and a public client gets 403. [] refuses everyone. Refusals:
+### `metrics_requests_refused_total`.
+# metrics_allow_cidrs = ["10.0.0.0/8", "127.0.0.1/32"]
+
+### Env: METRICS_BEARER_TOKEN
+### When set, /metrics also requires `Authorization: Bearer <token>`. Prefer
+### the environment variable to keep the token out of this file. An empty
+### value (here or in METRICS_BEARER_TOKEN) is refused at startup; leave the
+### key out to require no token.
+# metrics_bearer_token = "change-me"
+
 ### Env: DID_WEB_SELF_HOSTED
 ### Path to the self-hosted DID Document
 ### Supported formats:
@@ -643,6 +659,32 @@ oob_invite_ttl = "86400"
 ### lagging costs a live push (the message still lands in the inbox), it does not
 ### lose messages. Costs up to this much RSS.
 # pubsub_buffer = "16777216"
+
+### Env: LIMIT_RELAY_CONNECTIONS_PER_IP
+### Anonymous inter-mediator relay WebSockets one client address may hold at
+### once (only when security.enable_inter_mediator_relay is on). All relay
+### sockets share the max_websocket_connections_per_did bucket; this keeps one
+### source from holding every slot. The address is resolved as for
+### rate_limit_per_ip (an IPv6 client is counted by its /64), so behind a load
+### balancer set [server] trust_xff_cidrs.
+### Refusals: `relay_connections_refused_total`. Must be > 0. Default 10.
+# relay_connections_per_ip = "10"
+
+### Env: LIMIT_RELAY_FRAMES_PER_SECOND / LIMIT_RELAY_FRAME_BURST /
+### LIMIT_RELAY_BYTES_PER_SECOND
+### Inbound budget for each relay WebSocket: frames per second, the burst above
+### it, and bytes per second (the byte burst is never below ws_size). A frame
+### over budget gets a negative relay-ack (code 429) and the relaying mediator
+### sends that message over REST instead. Refusals:
+### `relay_frames_throttled_total`. Each must be > 0.
+# relay_frames_per_second = "50"
+# relay_frame_burst = "100"
+# relay_bytes_per_second = "4194304"
+
+### Env: LIMIT_METRICS_REQUESTS_PER_SECOND
+### Requests per second /metrics answers, shared by every caller (burst: twice
+### this). Over it: 429. See [server] metrics_allow_cidrs. Must be > 0.
+# metrics_requests_per_second = "5"
 
 ### ─── DID multiplexing ───────────────────────────────────────────────────────
 ### One authenticated WebSocket (the "principal") carrying live delivery and

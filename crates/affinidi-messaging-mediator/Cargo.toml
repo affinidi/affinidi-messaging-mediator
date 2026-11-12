@@ -311,7 +311,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 # ── Rate Limiting & Resilience ───────────────────────────────────────────
 ## Per-IP and per-DID rate limiting (in-memory, not distributed)
-affinidi-rate-limit = "0.1.3"
+affinidi-rate-limit = "0.1.4"
 governor = "0.10"
 
 # ── HTTP Client (for forwarding to remote mediators) ─────────────────────

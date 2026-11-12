@@ -86,9 +86,48 @@ pub struct LimitsConfig {
     /// Byte ceiling for the live-delivery pub/sub ring. The ring's slot count is
     /// derived from this — see [`LimitsConfig::pubsub_capacity`].
     pub pubsub_buffer: usize,
+    /// Concurrent anonymous inter-mediator relay WebSockets one client address
+    /// may hold, so one source cannot take every relay slot. Must be > 0.
+    #[serde(default = "defaults::relay_connections_per_ip")]
+    pub relay_connections_per_ip: usize,
+    /// Sustained frames per second read from one relay WebSocket. Must be > 0.
+    #[serde(default = "defaults::relay_frames_per_second")]
+    pub relay_frames_per_second: u32,
+    /// Frames a relay WebSocket may send back-to-back above the sustained
+    /// rate. Must be > 0.
+    #[serde(default = "defaults::relay_frame_burst")]
+    pub relay_frame_burst: u32,
+    /// Sustained bytes per second read from one relay WebSocket. The bucket is
+    /// at least `ws_size` deep, so a frame of any admitted size can pass.
+    /// Must be > 0.
+    #[serde(default = "defaults::relay_bytes_per_second")]
+    pub relay_bytes_per_second: u32,
+    /// Requests per second `/metrics` answers, across all callers. Must be > 0.
+    #[serde(default = "defaults::metrics_requests_per_second")]
+    pub metrics_requests_per_second: u32,
     /// `[limits.mux]` — DID multiplexing. Off unless an operator enables it.
     #[serde(default)]
     pub mux: MuxConfig,
+}
+
+/// Defaults for the endpoint and relay limits, shared by [`LimitsConfig`]'s
+/// `Default`, its serde defaults and the raw-config parse.
+mod defaults {
+    pub(super) fn relay_connections_per_ip() -> usize {
+        10
+    }
+    pub(super) fn relay_frames_per_second() -> u32 {
+        50
+    }
+    pub(super) fn relay_frame_burst() -> u32 {
+        100
+    }
+    pub(super) fn relay_bytes_per_second() -> u32 {
+        4_194_304
+    }
+    pub(super) fn metrics_requests_per_second() -> u32 {
+        5
+    }
 }
 
 /// DID multiplexing: one authenticated connection carrying live delivery and
@@ -309,6 +348,11 @@ impl Default for LimitsConfig {
             did_rate_limit_burst: 10,
             ws_send_buffer: 33_554_432,
             pubsub_buffer: 16_777_216,
+            relay_connections_per_ip: defaults::relay_connections_per_ip(),
+            relay_frames_per_second: defaults::relay_frames_per_second(),
+            relay_frame_burst: defaults::relay_frame_burst(),
+            relay_bytes_per_second: defaults::relay_bytes_per_second(),
+            metrics_requests_per_second: defaults::metrics_requests_per_second(),
             mux: MuxConfig::default(),
         }
     }
@@ -333,6 +377,27 @@ impl LimitsConfig {
         let per_slot = self.message_size.max(1);
         (self.pubsub_buffer / per_slot).max(8)
     }
+}
+
+/// Parse a limit that has no "unlimited" setting: an unparseable value falls
+/// back to `default` with a warning (as every other limit does), and `0` is
+/// refused, because these bound traffic that nothing else bounds.
+fn positive<T>(field: &str, value: &str, default: T) -> Result<T, MediatorError>
+where
+    T: std::str::FromStr + Default + PartialEq + std::fmt::Display + Copy,
+{
+    let parsed = value.trim().parse().unwrap_or_else(|_| {
+        eprintln!("WARN: Could not parse limits.{field} config value, using default: {default}");
+        default
+    });
+    if parsed == T::default() {
+        return Err(MediatorError::ConfigError(
+            crate::common::error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("limits.{field} must be greater than 0"),
+        ));
+    }
+    Ok(parsed)
 }
 
 impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
@@ -475,6 +540,31 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 warn_default("pubsub_buffer", "16777216");
                 16_777_216
             }),
+            relay_connections_per_ip: positive(
+                "relay_connections_per_ip",
+                &raw.relay_connections_per_ip,
+                defaults::relay_connections_per_ip(),
+            )?,
+            relay_frames_per_second: positive(
+                "relay_frames_per_second",
+                &raw.relay_frames_per_second,
+                defaults::relay_frames_per_second(),
+            )?,
+            relay_frame_burst: positive(
+                "relay_frame_burst",
+                &raw.relay_frame_burst,
+                defaults::relay_frame_burst(),
+            )?,
+            relay_bytes_per_second: positive(
+                "relay_bytes_per_second",
+                &raw.relay_bytes_per_second,
+                defaults::relay_bytes_per_second(),
+            )?,
+            metrics_requests_per_second: positive(
+                "metrics_requests_per_second",
+                &raw.metrics_requests_per_second,
+                defaults::metrics_requests_per_second(),
+            )?,
             mux: MuxConfig::from(raw.mux),
         })
     }
@@ -566,6 +656,11 @@ mod tests {
         assert_eq!(limits.max_websocket_connections, 10000);
         assert_eq!(limits.did_rate_limit_per_second, 0);
         assert_eq!(limits.did_rate_limit_burst, 10);
+        assert_eq!(limits.relay_connections_per_ip, 10);
+        assert_eq!(limits.relay_frames_per_second, 50);
+        assert_eq!(limits.relay_frame_burst, 100);
+        assert_eq!(limits.relay_bytes_per_second, 4_194_304);
+        assert_eq!(limits.metrics_requests_per_second, 5);
     }
 
     #[test]
@@ -600,9 +695,39 @@ mod tests {
             did_rate_limit_burst: "20".to_string(),
             ws_send_buffer: "8388608".to_string(),
             pubsub_buffer: "4194304".to_string(),
+            relay_connections_per_ip: "4".to_string(),
+            relay_frames_per_second: "7".to_string(),
+            relay_frame_burst: "9".to_string(),
+            relay_bytes_per_second: "65536".to_string(),
+            metrics_requests_per_second: "2".to_string(),
             mux: MuxConfigRaw::default(),
         };
+        // No "unlimited" setting for the relay and metrics bounds: 0 is refused.
+        for field in [
+            "relay_connections_per_ip",
+            "relay_frames_per_second",
+            "relay_frame_burst",
+            "relay_bytes_per_second",
+            "metrics_requests_per_second",
+        ] {
+            let mut zeroed = raw.clone();
+            let slot = match field {
+                "relay_connections_per_ip" => &mut zeroed.relay_connections_per_ip,
+                "relay_frames_per_second" => &mut zeroed.relay_frames_per_second,
+                "relay_frame_burst" => &mut zeroed.relay_frame_burst,
+                "relay_bytes_per_second" => &mut zeroed.relay_bytes_per_second,
+                _ => &mut zeroed.metrics_requests_per_second,
+            };
+            *slot = "0".to_string();
+            let err = LimitsConfig::try_from(zeroed).expect_err(field);
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
         let limits = LimitsConfig::try_from(raw).unwrap();
+        assert_eq!(limits.relay_connections_per_ip, 4);
+        assert_eq!(limits.relay_frames_per_second, 7);
+        assert_eq!(limits.relay_frame_burst, 9);
+        assert_eq!(limits.relay_bytes_per_second, 65_536);
+        assert_eq!(limits.metrics_requests_per_second, 2);
         assert_eq!(limits.ws_send_buffer, 8_388_608);
         assert_eq!(limits.pubsub_buffer, 4_194_304);
         assert_eq!(limits.attachments_max_count, 5);
@@ -663,12 +788,18 @@ mod tests {
             did_rate_limit_burst: "10".to_string(),
             ws_send_buffer: "67108864".to_string(),
             pubsub_buffer: "33554432".to_string(),
+            relay_connections_per_ip: "x".to_string(),
+            relay_frames_per_second: "50".to_string(),
+            relay_frame_burst: "100".to_string(),
+            relay_bytes_per_second: "4194304".to_string(),
+            metrics_requests_per_second: "5".to_string(),
             mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
         // Invalid values should fall back to unwrap_or defaults
         assert_eq!(limits.attachments_max_count, 20);
         assert_eq!(limits.crypto_operations_per_message, 1000);
+        assert_eq!(limits.relay_connections_per_ip, 10);
     }
 }
 

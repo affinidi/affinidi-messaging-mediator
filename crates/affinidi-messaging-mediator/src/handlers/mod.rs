@@ -1,7 +1,4 @@
-use crate::{
-    SharedData, common::session::Session, common::storage_timeout::with_storage_timeout,
-    tasks::supervisor::ComponentState,
-};
+use crate::{SharedData, common::session::Session};
 use affinidi_messaging_mediator_common::errors::AppError;
 use affinidi_messaging_sdk::messages::SuccessResponse;
 use axum::{
@@ -11,7 +8,6 @@ use axum::{
     routing::{delete, get, post},
 };
 use http::StatusCode;
-use tracing::warn;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub mod authenticate;
@@ -21,6 +17,8 @@ pub mod message_delete;
 pub mod message_inbound;
 pub mod message_list;
 pub mod message_outbound;
+pub mod readiness;
+pub use readiness::readiness_handler;
 #[cfg(feature = "didcomm")]
 pub(crate) mod oob_discovery;
 pub mod websocket;
@@ -188,252 +186,6 @@ pub async fn liveness_handler() -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({ "status": "alive" })),
     )
-}
-
-/// Deep readiness check that verifies the mediator can serve traffic.
-/// Checks Redis connectivity, queue health, shutdown state, and the health
-/// of supervised background tasks.
-///
-/// Returns 503 `not_ready` when a hard dependency or a **load-bearing**
-/// background task is down; 200 `degraded` when only non-load-bearing
-/// components are unhealthy; 200 `ready` otherwise.
-pub async fn readiness_handler(State(state): State<SharedData>) -> impl IntoResponse {
-    let mut checks: Vec<serde_json::Value> = Vec::new();
-    let mut all_ok = true;
-    // Non-fatal degradation (non-load-bearing components down). Keeps the
-    // instance in rotation (200) but flags the condition for dashboards.
-    let mut degraded = false;
-
-    // Check if shutdown has been initiated
-    if state.shutdown_token.is_cancelled() {
-        all_ok = false;
-        checks.push(serde_json::json!({
-            "name": "shutdown",
-            "status": "fail",
-            "message": "Shutdown in progress"
-        }));
-    } else {
-        checks.push(serde_json::json!({
-            "name": "shutdown",
-            "status": "pass"
-        }));
-    }
-
-    // Check Redis circuit breaker state
-    let cb_state = state.database.circuit_breaker_state();
-    if cb_state != "closed" {
-        all_ok = false;
-        checks.push(serde_json::json!({
-            "name": "redis_circuit_breaker",
-            "status": "fail",
-            "state": cb_state,
-            "message": "Redis circuit breaker is not closed"
-        }));
-    } else {
-        checks.push(serde_json::json!({
-            "name": "redis_circuit_breaker",
-            "status": "pass",
-            "state": cb_state
-        }));
-    }
-
-    // Check Redis connectivity. Bounded so a wedged backend fails the probe
-    // promptly rather than hanging the load-balancer health check.
-    match with_storage_timeout(
-        state.storage_timeout(),
-        "get_global_stats",
-        "NA",
-        state.database.get_global_stats(),
-    )
-    .await
-    {
-        Ok(_) => {
-            checks.push(serde_json::json!({
-                "name": "redis",
-                "status": "pass"
-            }));
-        }
-        Err(e) => {
-            all_ok = false;
-            // /readyz is unauthenticated: never echo the backend error, which
-            // can carry Redis host:port / connection detail. Static message in
-            // the body, detail to the operator log (mirrors secrets_backend).
-            warn!(error = %e, "Redis readiness check failed");
-            checks.push(serde_json::json!({
-                "name": "redis",
-                "status": "fail",
-                "message": "Redis check failed"
-            }));
-        }
-    }
-
-    // Check FORWARD_Q length (bounded — see above).
-    match with_storage_timeout(
-        state.storage_timeout(),
-        "forward_queue_len",
-        "NA",
-        state.database.forward_queue_len(),
-    )
-    .await
-    {
-        Ok(len) => {
-            let queue_status = if len >= state.limits().forward_task_queue {
-                all_ok = false;
-                "warn"
-            } else {
-                "pass"
-            };
-            checks.push(serde_json::json!({
-                "name": "forward_queue",
-                "status": queue_status,
-                "length": len,
-                "limit": state.limits().forward_task_queue
-            }));
-        }
-        Err(e) => {
-            all_ok = false;
-            // Unauthenticated probe: queue backend errors carry host:port /
-            // connection detail. Static body message, detail to operator log.
-            warn!(error = %e, "Forward-queue readiness check failed");
-            checks.push(serde_json::json!({
-                "name": "forward_queue",
-                "status": "fail",
-                "message": "Queue check failed"
-            }));
-        }
-    }
-
-    // ── Unified secret backend: live probe + cache freshness ─────────
-    //
-    // Boot-time probe already happened in `Config::TryFrom<ConfigRaw>`
-    // (Phase E), so a backend that was reachable at boot is highly
-    // likely still reachable here. Re-probing on every /readyz catches
-    // mid-flight credential expiries / network blips that the boot-
-    // time probe couldn't. Uses the read-only probe, so repeated /readyz
-    // polling never writes/deletes a sentinel (no write perms on the role).
-    //
-    // /readyz is unauthenticated, so the response must not echo the
-    // backend URL or the underlying probe error: those can leak
-    // internal hostnames, ARNs, Vault paths, or credential-shaped
-    // strings to anyone who can reach the load-balancer probe path.
-    // Keep a boolean `secrets_backend_reachable` for monitoring; log
-    // the detailed error at warn level for operators.
-    let backend_reachable = match state.config.secrets_backend.probe_readonly().await {
-        Ok(()) => {
-            checks.push(serde_json::json!({
-                "name": "secrets_backend",
-                "status": "pass",
-            }));
-            true
-        }
-        Err(e) => {
-            all_ok = false;
-            warn!(error = %e, "Secret backend probe failed");
-            checks.push(serde_json::json!({
-                "name": "secrets_backend",
-                "status": "fail",
-                "message": "Secret backend probe failed",
-            }));
-            false
-        }
-    };
-
-    // VTA cache age — `None` means "no cache present", which is fine
-    // when self-hosting; only flag it as a problem when the cache is
-    // expected but stale beyond its TTL (load_vta_cached_bundle
-    // already enforces TTL by returning None on expiry, so a present
-    // cache here is by definition still valid).
-    let vta_cache_age_secs = match state.config.secrets_backend.load_vta_cached_bundle().await {
-        Ok(Some(cached)) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(cached.fetched_at);
-            Some(now.saturating_sub(cached.fetched_at))
-        }
-        Ok(None) => None,
-        Err(e) => {
-            // Failing to read the cache isn't fatal — the mediator can
-            // still serve traffic from in-memory keys — but it's worth
-            // surfacing because it usually indicates an HMAC mismatch
-            // (admin key was rotated externally) or a corrupt entry.
-            // Unauthenticated probe: keep the detail (which can carry a
-            // secrets-backend path) out of the body; log it for operators.
-            warn!(error = %e, "Could not read VTA cache during readiness probe");
-            checks.push(serde_json::json!({
-                "name": "vta_cache",
-                "status": "warn",
-                "message": "Could not read VTA cache",
-            }));
-            None
-        }
-    };
-
-    // ── Supervised background-task health ────────────────────────────
-    //
-    // A load-bearing component that isn't `Running` fails readiness (503);
-    // a non-load-bearing one only marks the instance `degraded` (still 200,
-    // stays in rotation). A component that is `Running` but has restarted is
-    // reported for visibility without affecting the verdict.
-    let mut components: Vec<serde_json::Value> = Vec::new();
-    for entry in state.component_health.iter() {
-        let h = entry.value();
-        let healthy = h.state == ComponentState::Running;
-        if !healthy {
-            if h.load_bearing {
-                all_ok = false;
-            } else {
-                degraded = true;
-            }
-        }
-        // Unauthenticated probe: a component's `last_error` can carry internal
-        // paths / backend detail. Expose only a boolean in the body; log the
-        // detail for operators (mirrors the secrets_backend treatment).
-        if let Some(err) = h.last_error.as_deref() {
-            warn!(component = %h.name, error = %err, "Supervised component reported an error");
-        }
-        components.push(serde_json::json!({
-            "name": h.name,
-            "state": h.state,
-            "load_bearing": h.load_bearing,
-            "restarts": h.restarts,
-            "has_error": h.last_error.is_some(),
-        }));
-    }
-    // Stable order so dashboards diffing the payload don't see churn.
-    components.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-
-    let status_code = if all_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    let status = if !all_ok {
-        "not_ready"
-    } else if degraded {
-        "degraded"
-    } else {
-        "ready"
-    };
-
-    let response = serde_json::json!({
-        "status": status,
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime_seconds": (chrono::Utc::now() - state.service_start_timestamp).num_seconds(),
-        "checks": checks,
-        "components": components,
-        // Top-level fields (alongside `checks`) so ops dashboards can
-        // pluck them without parsing the variable-length checks list.
-        // The secrets backend URL is intentionally NOT exposed here —
-        // /readyz is unauthenticated and an attacker scraping it should
-        // not learn the backend's identity. Operators can read the URL
-        // from logs.
-        "secrets_backend_reachable": backend_reachable,
-        "vta_cache_age_secs": vta_cache_age_secs,
-        "operating_keys_loaded": state.config.operating_keys_loaded,
-    });
-
-    (status_code, Json(response))
 }
 
 /// Determine the current load state of the mediator.

@@ -196,6 +196,20 @@ pub mod names {
     /// anything above zero points at a proxy or listener misconfiguration, not
     /// a noisy client.
     pub const RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL: &str = "rate_limit_attribution_failures_total";
+    /// counter: `/metrics` requests refused (label: reason = address | token |
+    /// rate | no_client_ip). `address` means the client is outside
+    /// `server.metrics_allow_cidrs`; `rate` means the endpoint's own request
+    /// bound (`limits.metrics_requests_per_second`) was reached.
+    pub const METRICS_REQUESTS_REFUSED_TOTAL: &str = "metrics_requests_refused_total";
+    /// counter: Anonymous inter-mediator relay WebSockets refused at admission
+    /// (label: reason = per_ip | no_client_ip). `per_ip` means one client
+    /// address already holds `limits.relay_connections_per_ip` relay sockets.
+    pub const RELAY_CONNECTIONS_REFUSED_TOTAL: &str = "relay_connections_refused_total";
+    /// counter: Frames refused on an anonymous relay WebSocket because the
+    /// socket was over its frame or byte rate (label: limit = frames | bytes).
+    /// Each is answered with a negative `relay-ack`, so the relaying mediator
+    /// sends the message again over REST.
+    pub const RELAY_FRAMES_THROTTLED_TOTAL: &str = "relay_frames_throttled_total";
 
     // ── Queue depth ─────────────────────────────────────────────────────────
     //
@@ -466,6 +480,130 @@ pub async fn metrics_handler(State(handle): State<PrometheusHandle>) -> impl Int
     )
 }
 
+/// Who may read `/metrics`, and how often it answers.
+///
+/// The endpoint carries traffic, authentication-failure and connection counts,
+/// so it is not served to everyone who can reach the listener. A request must
+/// come from a client inside `allow` (resolved exactly as the per-IP rate
+/// limiter resolves it, honouring `server.trust_xff_cidrs`), present `token`
+/// when one is configured, and fit inside one global request budget so a burst
+/// of scrapes cannot keep the renderer busy.
+#[derive(Clone)]
+pub struct MetricsAccess {
+    allow: Vec<affinidi_rate_limit::IpNet>,
+    token: Option<String>,
+    client_ip: affinidi_rate_limit::ClientIpExtractor,
+    budget: affinidi_rate_limit::KeyedRateLimiterState<()>,
+}
+
+impl MetricsAccess {
+    /// `requests_per_second` is shared by every caller; the burst is twice
+    /// that, so two scrapers landing together are both answered.
+    pub fn new(
+        allow: Vec<affinidi_rate_limit::IpNet>,
+        token: Option<String>,
+        client_ip: affinidi_rate_limit::ClientIpExtractor,
+        requests_per_second: u32,
+    ) -> Self {
+        let budget = affinidi_rate_limit::KeyedRateLimiterState::new(
+            requests_per_second.max(1),
+            requests_per_second.max(1).saturating_mul(2),
+        )
+        .with_source(crate::server::RATE_LIMIT_SOURCE)
+        .with_limiter_name("metrics");
+        Self {
+            allow,
+            token: token.filter(|t| !t.is_empty()),
+            client_ip,
+            budget,
+        }
+    }
+
+    fn refuse(reason: &'static str, status: StatusCode) -> axum::response::Response {
+        ::metrics::counter!(names::METRICS_REQUESTS_REFUSED_TOTAL, "reason" => reason).increment(1);
+        tracing::debug!(reason, "/metrics request refused");
+        let mut response = (status, "metrics access refused").into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
+    }
+
+    /// Admit (`None`) or refuse (the response to send) one request, in the
+    /// order address, token, budget, so an unlisted client cannot spend the
+    /// budget the scrapers rely on.
+    fn admit(
+        &self,
+        peer: Option<std::net::IpAddr>,
+        headers: &http::HeaderMap,
+    ) -> Option<axum::response::Response> {
+        self.check(peer, headers).err()
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check(
+        &self,
+        peer: Option<std::net::IpAddr>,
+        headers: &http::HeaderMap,
+    ) -> Result<(), axum::response::Response> {
+        let Some(peer) = peer else {
+            return Err(Self::refuse("no_client_ip", StatusCode::FORBIDDEN));
+        };
+        let client = self
+            .client_ip
+            .client_ip(peer, headers)
+            .map_err(|_| Self::refuse("no_client_ip", StatusCode::BAD_REQUEST))?;
+        if !self.allow.iter().any(|net| net.contains(&client)) {
+            return Err(Self::refuse("address", StatusCode::FORBIDDEN));
+        }
+        if let Some(expected) = &self.token {
+            use subtle::ConstantTimeEq;
+            // The scheme name is case-insensitive (RFC 7235 §2.1).
+            let presented = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map_or("", |(_, token)| token.trim());
+            // Compare digests so the comparison takes the same time whatever
+            // the presented length.
+            let matches: bool = sha256::digest(presented.as_bytes())
+                .as_bytes()
+                .ct_eq(sha256::digest(expected.as_bytes()).as_bytes())
+                .into();
+            if !matches {
+                return Err(Self::refuse("token", StatusCode::UNAUTHORIZED));
+            }
+        }
+        if let Err(refusal) = self.budget.check(()) {
+            ::metrics::counter!(names::METRICS_REQUESTS_REFUSED_TOTAL, "reason" => "rate")
+                .increment(1);
+            tracing::debug!("/metrics request refused: request budget reached");
+            return Err(self.budget.refuse(&refusal));
+        }
+        Ok(())
+    }
+}
+
+/// Middleware applying [`MetricsAccess`] in front of [`metrics_handler`].
+pub async fn metrics_access(
+    State(access): State<std::sync::Arc<MetricsAccess>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    match access.admit(peer, request.headers()) {
+        None => next.run(request).await,
+        Some(response) => response,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +627,205 @@ mod tests {
                 .is_ok(),
             "exporter rejected the duration bucket set"
         );
+    }
+
+    mod access {
+        use super::super::MetricsAccess;
+        use crate::common::config::default_metrics_allow_cidrs;
+        use affinidi_rate_limit::ClientIpExtractor;
+        use http::{HeaderMap, HeaderValue, StatusCode, header};
+        use std::net::IpAddr;
+
+        fn ip(s: &str) -> Option<IpAddr> {
+            Some(s.parse().unwrap())
+        }
+
+        fn status(refusal: Option<axum::response::Response>) -> StatusCode {
+            refusal.map_or(StatusCode::OK, |response| response.status())
+        }
+
+        fn open_access(token: Option<&str>, rps: u32) -> MetricsAccess {
+            MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                token.map(str::to_string),
+                ClientIpExtractor::direct_peer(),
+                rps,
+            )
+        }
+
+        #[test]
+        fn the_default_ranges_admit_local_scrapers_and_refuse_public_clients() {
+            let access = open_access(None, 1_000);
+            let none = HeaderMap::new();
+            for local in [
+                "127.0.0.1",
+                "10.4.5.6",
+                "172.20.0.3",
+                "192.168.1.9",
+                "::1",
+                "fd00::7",
+            ] {
+                assert_eq!(
+                    status(access.admit(ip(local), &none)),
+                    StatusCode::OK,
+                    "{local}"
+                );
+            }
+            for public in ["203.0.113.5", "8.8.8.8", "2001:db8::1"] {
+                assert_eq!(
+                    status(access.admit(ip(public), &none)),
+                    StatusCode::FORBIDDEN,
+                    "{public}"
+                );
+            }
+            assert_eq!(status(access.admit(None, &none)), StatusCode::FORBIDDEN);
+        }
+
+        #[test]
+        fn a_client_behind_a_trusted_proxy_is_judged_by_its_own_address() {
+            let access = MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                None,
+                ClientIpExtractor::trusted_proxies(vec!["10.0.0.0/24".parse().unwrap()]).unwrap(),
+                1_000,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.5"));
+            assert_eq!(
+                status(access.admit(ip("10.0.0.1"), &headers)),
+                StatusCode::FORBIDDEN,
+                "a public client forwarded by the load balancer is refused"
+            );
+            headers.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.2"));
+            assert_eq!(
+                status(access.admit(ip("10.0.0.1"), &headers)),
+                StatusCode::OK
+            );
+        }
+
+        #[test]
+        fn a_forwarded_header_from_an_untrusted_peer_is_ignored() {
+            // Only a peer in trust_xff_cidrs has its X-Forwarded-For read.
+            let access = MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                None,
+                ClientIpExtractor::trusted_proxies(vec!["10.0.0.0/24".parse().unwrap()]).unwrap(),
+                1_000,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.2"));
+            assert_eq!(
+                status(access.admit(ip("203.0.113.9"), &headers)),
+                StatusCode::FORBIDDEN,
+                "a public peer naming a private address is judged by its own address"
+            );
+            headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.5"));
+            assert_eq!(
+                status(access.admit(ip("192.168.1.7"), &headers)),
+                StatusCode::OK,
+                "a private peer outside trust_xff_cidrs is judged by its own address"
+            );
+
+            // With no trusted proxies the header is never read.
+            let direct = MetricsAccess::new(
+                default_metrics_allow_cidrs(),
+                None,
+                ClientIpExtractor::direct_peer(),
+                1_000,
+            );
+            headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+            assert_eq!(
+                status(direct.admit(ip("203.0.113.9"), &headers)),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[test]
+        fn an_empty_allow_list_refuses_everyone() {
+            let access =
+                MetricsAccess::new(Vec::new(), None, ClientIpExtractor::direct_peer(), 1_000);
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &HeaderMap::new())),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[test]
+        fn a_configured_token_is_required() {
+            let access = open_access(Some("scrape-token"), 1_000);
+            let mut headers = HeaderMap::new();
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &headers)),
+                StatusCode::UNAUTHORIZED
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer wrong"),
+            );
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &headers)),
+                StatusCode::UNAUTHORIZED
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer scrape-token"),
+            );
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &headers)),
+                StatusCode::OK
+            );
+            for scheme in ["bearer scrape-token", "BEARER scrape-token"] {
+                headers.insert(header::AUTHORIZATION, HeaderValue::from_static(scheme));
+                assert_eq!(
+                    status(access.admit(ip("127.0.0.1"), &headers)),
+                    StatusCode::OK,
+                    "{scheme}"
+                );
+            }
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic scrape-token"),
+            );
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &headers)),
+                StatusCode::UNAUTHORIZED,
+                "another scheme is not a bearer token"
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer scrape-token"),
+            );
+            // The token does not widen the address check.
+            assert_eq!(
+                status(access.admit(ip("203.0.113.5"), &headers)),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[test]
+        fn requests_past_the_budget_are_refused_with_429() {
+            // 1/s with a burst of 2.
+            let access = open_access(None, 1);
+            let none = HeaderMap::new();
+            assert_eq!(status(access.admit(ip("127.0.0.1"), &none)), StatusCode::OK);
+            assert_eq!(status(access.admit(ip("127.0.0.1"), &none)), StatusCode::OK);
+            assert_eq!(
+                status(access.admit(ip("127.0.0.1"), &none)),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        #[test]
+        fn a_refused_address_does_not_spend_the_budget() {
+            let access = open_access(None, 1);
+            let none = HeaderMap::new();
+            for _ in 0..10 {
+                assert_eq!(
+                    status(access.admit(ip("203.0.113.5"), &none)),
+                    StatusCode::FORBIDDEN
+                );
+            }
+            assert_eq!(status(access.admit(ip("127.0.0.1"), &none)), StatusCode::OK);
+        }
     }
 }

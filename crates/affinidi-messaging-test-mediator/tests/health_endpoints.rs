@@ -107,6 +107,51 @@ async fn readyz_reports_supervised_component_health() {
     let _ = mediator.join().await;
 }
 
+/// A burst of `/readyz` requests is answered in full, every response carrying
+/// both the per-request checks and the shared backend checks.
+#[tokio::test]
+async fn a_burst_of_readyz_requests_gets_complete_answers() {
+    init_tracing();
+    let mediator = TestMediator::spawn().await.expect("spawn");
+    let client = http_client();
+    let url = format!("{}readyz", mediator.endpoint());
+
+    let mut requests = Vec::new();
+    for _ in 0..50 {
+        let client = client.clone();
+        let url = url.clone();
+        requests.push(tokio::spawn(async move {
+            let resp = client.get(url).send().await.expect("readyz request");
+            resp.json::<Value>().await.expect("readyz json")
+        }));
+    }
+    for request in requests {
+        let body = request.await.expect("request task");
+        let names: Vec<&str> = body["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        for expected in [
+            "shutdown",
+            "redis_circuit_breaker",
+            "redis",
+            "forward_queue",
+            "secrets_backend",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        assert!(body["secrets_backend_reachable"].is_boolean());
+    }
+
+    mediator.shutdown();
+    let _ = mediator.join().await;
+}
+
 /// A browser client the mediator admits can read `readyz` — the release a
 /// console reports. The health routes used to be added after the CORS layer,
 /// which does not wrap them, so they answered without

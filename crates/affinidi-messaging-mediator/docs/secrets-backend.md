@@ -312,7 +312,9 @@ Cloud secret stores bill per call, so the mediator keeps calls down:
 - The VTA cache is rewritten only when its content changes or it is older
   than half its TTL. `/readyz` `vta_cache_age_secs` is the age of the last
   write, not of the last VTA fetch.
-- `/readyz` reuses a successful backend probe for 30 s.
+- `/readyz` reuses a successful backend probe for 30 s, and runs its backend
+  checks (probe and VTA cache read) at most once every 5 s however often it
+  is polled; requests in between get the last result.
 - On GCP every write adds a billed version, so the superseded version is
   destroyed after each write. This needs `secretmanager.versions.destroy`
   (in `roles/secretmanager.admin`); without it a warning is logged and old
@@ -573,6 +575,16 @@ unauthenticated:
 `status` is `ready`, `degraded`, or `not_ready`. Any failing check
 (including `secrets_backend_reachable: false`) returns HTTP 503 and
 `not_ready`. The backend URL is not exposed; it is in the startup log.
+
+The storage, forwarding-queue, secret-backend and VTA-cache checks are run at
+most once every 5 s and shared by every request in that window, so a burst of
+probes costs no more backend calls than one; each secret-backend read is
+bounded at 5 s. The refresh completes and is stored even if the request that
+started it gives up. While one is running, requests get the previous result
+only while it is younger than two intervals plus the longest a refresh can
+take; after that `/readyz` reports `not_ready` with a failing
+`backend_checks` check. Shutdown, the storage circuit breaker and
+supervised-task health are read on every request.
 
 ### Rotation
 

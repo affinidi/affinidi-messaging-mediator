@@ -63,6 +63,18 @@ pub struct ServerConfig {
     /// disabled.
     #[serde(default)]
     pub trust_xff_cidrs: Vec<ipnet::IpNet>,
+    /// Client ranges allowed to read `/metrics`. The client address is
+    /// resolved as for per-IP rate limiting (through `trust_xff_cidrs`).
+    ///
+    /// Absent means loopback plus the private, unique-local, shared (CGNAT) and
+    /// link-local ranges, so an in-cluster or sidecar scraper keeps working
+    /// while a client on the public internet is refused. An empty list refuses
+    /// everyone.
+    #[serde(default)]
+    pub metrics_allow_cidrs: Option<Vec<ipnet::IpNet>>,
+    /// When set, `/metrics` also requires `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub metrics_bearer_token: Option<RedactedString>,
     pub did_web_self_hosted: Option<String>,
     /// Additional URL aliases the mediator should treat as
     /// pointing at *itself* when resolving a routing-2.0 next-hop.
@@ -74,6 +86,17 @@ pub struct ServerConfig {
     /// behind a load balancer or reverse proxy).
     #[serde(default)]
     pub local_endpoints: Vec<String>,
+}
+
+/// A string that never appears in `Debug` output (a credential).
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
 }
 
 /// Live streaming configuration

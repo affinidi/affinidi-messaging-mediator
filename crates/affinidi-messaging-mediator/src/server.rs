@@ -9,7 +9,10 @@ use crate::{
         },
         did_rate_limiter::DidRateLimiter,
         error_codes,
-        metrics::{self, metrics_handler, names::WS_SEND_BUFFER_AVAILABLE_BYTES},
+        metrics::{
+            self, MetricsAccess, metrics_access, metrics_handler,
+            names::WS_SEND_BUFFER_AVAILABLE_BYTES,
+        },
         request_id::RequestIdLayer,
         ws_budget::WsSendBudget,
     },
@@ -26,7 +29,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
-use affinidi_rate_limit::{IpNet, RateLimitLayer, RateLimiterState, Refusal};
+use affinidi_rate_limit::{ClientIpExtractor, IpNet, RateLimitLayer, RateLimiterState, Refusal};
 use axum::{Router, routing::get};
 use std::{
     collections::HashSet, env, net::SocketAddr, sync::Arc, sync::atomic::AtomicUsize,
@@ -840,6 +843,11 @@ pub async fn serve_internal(
         discover_features,
         active_websocket_count: Arc::new(AtomicUsize::new(0)),
         ws_connections_per_did: Arc::new(dashmap::DashMap::new()),
+        relay_connections_per_ip: Arc::new(dashmap::DashMap::new()),
+        relay_client_ip: relay_client_ip_extractor(&config.trust_xff_cidrs)?,
+        readiness: Arc::new(crate::handlers::readiness::ReadinessCache::new(
+            crate::handlers::readiness::REFRESH_INTERVAL,
+        )),
         did_rate_limiter,
         shutdown_token: shutdown_token.clone(),
         self_authorities: Arc::new(self_authorities),
@@ -975,10 +983,41 @@ pub async fn serve_internal(
             config.security.cors_allow_origin.clone(),
         ));
 
+    // `/metrics` sits outside the per-IP limiter (a scraper must not compete
+    // with traffic) but behind its own address/token check and request budget.
     let app = if let Some(handle) = metrics_handle {
+        let access = Arc::new(MetricsAccess::new(
+            config.metrics_allow_cidrs.clone(),
+            config.metrics_bearer_token.as_ref().map(|t| t.0.clone()),
+            client_ip_extractor(&config.trust_xff_cidrs)?,
+            config.limits.metrics_requests_per_second,
+        ));
+        info!(
+            allow = %config
+                .metrics_allow_cidrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            bearer_token = config.metrics_bearer_token.is_some(),
+            requests_per_second = config.limits.metrics_requests_per_second,
+            "/metrics access"
+        );
+        if config.trust_xff_cidrs.is_empty()
+            && config.metrics_allow_cidrs == crate::common::config::default_metrics_allow_cidrs()
+        {
+            warn!(
+                "/metrics admits private addresses and server.trust_xff_cidrs is empty: behind a \
+                 load balancer or reverse proxy every request appears to come from the proxy, \
+                 so clients reaching the mediator through it can read /metrics. Set \
+                 trust_xff_cidrs to the proxy's ranges, or narrow server.metrics_allow_cidrs."
+            );
+        }
         app.route(
             join_api_path(&api_prefix, "metrics").as_str(),
-            get(metrics_handler).with_state(handle),
+            get(metrics_handler)
+                .with_state(handle)
+                .layer(axum::middleware::from_fn_with_state(access, metrics_access)),
         )
     } else {
         app
@@ -1439,6 +1478,35 @@ fn ip_rate_limit_layer(
         })
 }
 
+/// The client-address resolver shared by the relay admission check and the
+/// `/metrics` gate: the same attribution the per-IP limiter uses.
+fn client_ip_extractor(trust_xff_cidrs: &[IpNet]) -> Result<ClientIpExtractor, MediatorError> {
+    ClientIpExtractor::trusted_proxies(trust_xff_cidrs.to_vec()).map_err(|e| {
+        MediatorError::ConfigError(
+            error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("server.trust_xff_cidrs: {e}"),
+        )
+    })
+}
+
+/// The key relay WebSockets are counted under: [`client_ip_extractor`], with
+/// an IPv6 client masked to its /64. A host is normally given a whole /64, so
+/// counting each address separately would let one host hold every relay slot.
+pub(crate) fn relay_client_ip_extractor(
+    trust_xff_cidrs: &[IpNet],
+) -> Result<ClientIpExtractor, MediatorError> {
+    client_ip_extractor(trust_xff_cidrs)?
+        .ipv6_prefix(64)
+        .map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "NA".into(),
+                format!("relay client key: {e}"),
+            )
+        })
+}
+
 /// Say at startup how the per-IP limiter will attribute requests, so an
 /// operator can see from the log alone whether `X-Forwarded-For` is in play.
 fn log_ip_rate_limiter(limiter: &RateLimiterState, limits: &LimitsConfig, trusted: &[IpNet]) {
@@ -1543,6 +1611,16 @@ mod rate_limit_tests {
     use axum::{body::Body, extract::ConnectInfo};
     use http::{Request, StatusCode, header};
     use tower::ServiceExt;
+
+    #[test]
+    fn relay_sockets_from_one_ipv6_64_share_a_key() {
+        let extractor = relay_client_ip_extractor(&[]).unwrap();
+        let none = http::HeaderMap::new();
+        let key = |ip: &str| extractor.client_key(ip.parse().unwrap(), &none).unwrap();
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(key("192.0.2.1"), key("192.0.2.2"), "IPv4 is per address");
+    }
 
     fn limits(per_second: u32, burst: u32) -> LimitsConfig {
         LimitsConfig {

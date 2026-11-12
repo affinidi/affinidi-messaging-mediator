@@ -868,9 +868,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-rate-limit"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb219bc4d342f68f68b1be95edd0f458b65f0197327add493acb911c3abc77c8"
+checksum = "bf917044c3ef68fe294b0e97611ee507a2ae07f92140bcd6a81068a1751ef27e"
 dependencies = [
  "axum",
  "governor",
