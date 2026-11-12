@@ -905,3 +905,195 @@ async fn an_ack_on_the_socket_is_answered_there_and_not_stored() {
     );
     env.shutdown().await.unwrap();
 }
+
+/// The SDK's mux connection is dropped by the mediator and the SDK reconnects
+/// on its own (design §10, "Disconnect/reconnect"): the new socket gets a new
+/// `ready`, the stored grant comes back attached without the device doing
+/// anything, and a member's message that arrived while the SDK was off is
+/// delivered after the reconnect.
+///
+/// The drop: a second mux socket for the same principal, opened by hand,
+/// replaces the SDK's ("replaced by a newer connection"). That socket holds
+/// the principal's slot while the member's message arrives (it is pushed
+/// there, which proves the SDK was not connected) and never acknowledges it.
+/// The SDK's own reconnect (after its ~1 s backoff for a young socket) then
+/// replaces the hand-opened socket, and the unacknowledged message is
+/// redelivered to it.
+#[tokio::test]
+async fn after_a_reconnect_stored_grants_reattach_and_missed_mail_arrives() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{ClientRequestBuilder, Message, http::Uri},
+    };
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut ready_rx = device.profile.mux_ready().await.expect("mux ready watch");
+    let first = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(r) = ready_rx.borrow_and_update().clone() {
+                return r;
+            }
+            ready_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("ready within 5s");
+    let (g, grant_id) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[
+            MuxCapability::Receive,
+            MuxCapability::Pickup,
+            MuxCapability::Delete,
+        ],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g])
+        .await
+        .expect("mux_grant");
+    let mut members_rx = device.profile.mux_members().await.expect("mux members");
+    members_until(&mut members_rx, "work attached", |m| {
+        m.is_reachable(&work.did)
+    })
+    .await;
+
+    // A second mux socket for the device replaces the SDK's.
+    let tokens = env
+        .tdk
+        .authentication()
+        .authenticate(device.did.clone(), mediator_did.clone(), 3, None)
+        .await
+        .expect("authenticate device");
+    let ws_uri: Uri = env.mediator.ws_endpoint().as_str().parse().unwrap();
+    let request = ClientRequestBuilder::new(ws_uri)
+        .with_sub_protocol("affinidi-mux")
+        .with_sub_protocol(format!("bearer.{}", tokens.access_token));
+    let (mut raw, _) = connect_async(request).await.expect("upgrade");
+    let mut conn = device
+        .profile
+        .connection_state()
+        .await
+        .expect("connection state");
+    timeout(
+        Duration::from_secs(5),
+        conn.wait_for(|s| !matches!(s, affinidi_messaging_core::ConnState::Connected)),
+    )
+    .await
+    .expect("the SDK's socket is dropped")
+    .unwrap();
+
+    // `work`'s mail arrives while the SDK is off: pushed to the socket that
+    // holds the device's slot, which does not acknowledge it.
+    send(&env, &sender, &work, "while away").await;
+    let pushed = timeout(Duration::from_secs(5), async {
+        loop {
+            match raw.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    let to_work = v["recipients"].as_array().is_some_and(|rs| {
+                        rs.iter().any(|r| {
+                            r["header"]["kid"]
+                                .as_str()
+                                .is_some_and(|k| k.starts_with(&work.did))
+                        })
+                    });
+                    if to_work {
+                        return;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("the hand-opened socket went before the push: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        pushed.is_ok(),
+        "the message arrived while the SDK was not connected"
+    );
+
+    // The SDK reconnects by itself: a new `ready` (a new connection nonce;
+    // the session id is the login's and is kept), and the stored grant is
+    // attached again without the device asking.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(r) = ready_rx.borrow_and_update().clone()
+                && r.mux_nonce != first.mux_nonce
+            {
+                return r;
+            }
+            ready_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a new ready after the SDK reconnects");
+    let members = members_until(&mut members_rx, "work attached again", |m| {
+        m.is_reachable(&work.did)
+    })
+    .await;
+    let w = members.get(&work.did).unwrap();
+    assert_eq!(w.grant_id.as_deref(), Some(grant_id.as_str()));
+    assert!(w.delivery_active);
+
+    // The hand-opened socket was replaced in turn.
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match raw.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the SDK's reconnect replaces the other socket"
+    );
+
+    // The message that arrived while away, never acknowledged, is
+    // redelivered; new mail is pushed live.
+    let next_basic = async || loop {
+        let (msg, meta) = env
+            .atm
+            .message_pickup()
+            .live_stream_next(&device.profile, Some(Duration::from_secs(5)), true)
+            .await
+            .unwrap()
+            .expect("a message");
+        if msg.typ == "https://didcomm.org/basicmessage/2.0/message" {
+            return (
+                mux_recipient(&meta).unwrap(),
+                msg.body["content"].as_str().unwrap().to_string(),
+            );
+        }
+    };
+    assert_eq!(
+        next_basic().await,
+        (work.did.clone(), "while away".to_string())
+    );
+    send(&env, &sender, &work, "after").await;
+    assert_eq!(next_basic().await, (work.did.clone(), "after".to_string()));
+}

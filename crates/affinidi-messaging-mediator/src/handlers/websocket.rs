@@ -1368,13 +1368,20 @@ async fn handle_socket(
         // after `TSP_DRAIN_COALESCE` of them under a steady stream.
         #[cfg(feature = "tsp")]
         let mut tsp_drain_owed: usize = 0;
+        // What a drain on a `tsp-mux` socket left undone because live frames
+        // were waiting (see [`drain_tsp_inbox`]). Resumed whenever the queue
+        // is empty, not on the resync flag, so the resync floor does not hold
+        // it back.
+        #[cfg(feature = "tsp")]
+        let mut tsp_drain_rest: Option<TspDrainRest> = None;
 
         // Flush-on-connect for raw-TSP delivery: drain whatever is already queued
         // for this DID straight onto the socket before entering the live-delivery
         // loop. If the socket is already gone, exit cleanly.
         #[cfg(feature = "tsp")]
-        if tsp_mode && drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, None)))
+        if tsp_mode && drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, true, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, None)), tsp_mux_conn.as_ref().map(|_| (&rx, fair.as_ref())))
             .await
+            .map_continue(|rest| TspDrainRest::merge(&mut tsp_drain_rest, rest))
             .is_break() {
             if let Some(conn) = &mux_conn {
                 crate::mux::connection::close(&state, &session, conn).await;
@@ -1404,6 +1411,12 @@ async fn handle_socket(
             // reading) gets a fresh window now that the loop reads again.
             socket.pings.after_pass(woke, liveness.ping_interval);
             let ping_deadline = socket.pings.deadline();
+            // A drain left undone for live frames, with nothing queued ahead
+            // of it.
+            #[cfg(feature = "tsp")]
+            let drain_pending = tsp_drain_rest.is_some() && queue_idle(&rx, fair.as_ref());
+            #[cfg(not(feature = "tsp"))]
+            let drain_pending = false;
             select! {
                 // The mediator is stopping. The HTTP server's graceful
                 // shutdown does not track upgraded sockets; before this they
@@ -1710,6 +1723,12 @@ async fn handle_socket(
                         crate::mux::connection::sweep(&state, conn, false).await;
                     }
                 }
+                // A drain left undone for live frames resumes after the select
+                // once the queue is empty; this wakes the loop for it when
+                // nothing else would.
+                _ = std::future::ready(()), if drain_pending => {
+                    woke = tokio::time::Instant::now();
+                }
                 _ = mux_revalidate.tick(), if mux_conn.is_some() => {
                     woke = tokio::time::Instant::now();
                     if let Some(conn) = &mux_conn {
@@ -1936,8 +1955,27 @@ async fn handle_socket(
             #[cfg(feature = "tsp")]
             if tsp_drain_owed > 0 && (rx.is_empty() || tsp_drain_owed >= TSP_DRAIN_COALESCE) {
                 tsp_drain_owed = 0;
-                if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, None)
+                if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, true, None, tsp_mux_conn.as_ref().map(|_| (&rx, fair.as_ref())))
                     .await
+                    .map_continue(|rest| TspDrainRest::merge(&mut tsp_drain_rest, rest))
+                    .is_break()
+                {
+                    close_reason = (close_code::GOING_AWAY, "client disconnected");
+                    break;
+                }
+            }
+
+            // A drain cut short so live frames could go first, resumed once
+            // they have (`tsp-mux` fairness: one member's backlog must not
+            // hold another's live frame behind it).
+            #[cfg(feature = "tsp")]
+            if queue_idle(&rx, fair.as_ref())
+                && let Some(rest) = tsp_drain_rest.take()
+            {
+                let only = rest.only;
+                if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, rest.principal, tsp_mux_conn.as_deref().filter(|_| rest.members).map(|c| (c, &mut member_inflight, only.as_ref())), Some((&rx, fair.as_ref())))
+                    .await
+                    .map_continue(|rest| TspDrainRest::merge(&mut tsp_drain_rest, rest))
                     .is_break()
                 {
                     close_reason = (close_code::GOING_AWAY, "client disconnected");
@@ -1982,8 +2020,9 @@ async fn handle_socket(
                         .as_ref()
                         .filter(|_| tsp_mux_conn.is_some())
                         .map(|slots| slots.take_resync().into_iter().collect());
-                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, owed.as_ref())))
+                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, true, tsp_mux_conn.as_deref().map(|c| (c, &mut member_inflight, owed.as_ref())), tsp_mux_conn.as_ref().map(|_| (&rx, fair.as_ref())))
                         .await
+                        .map_continue(|rest| TspDrainRest::merge(&mut tsp_drain_rest, rest))
                         .is_break()
                     {
                         close_reason = (close_code::GOING_AWAY, "client disconnected");
@@ -2159,18 +2198,24 @@ const TSP_DRAIN_MAX: usize = 1000;
 /// - [`ControlFlow::Continue`] when the inbox is drained (or the safety
 ///   cap was hit) and the connection should keep running.
 #[cfg(feature = "tsp")]
+#[allow(clippy::too_many_arguments)]
 async fn drain_tsp_inbox(
     state: &SharedData,
     session: &Session,
     socket: &mut BoundedSocket,
     ack_mode: bool,
     inflight: &mut std::collections::HashSet<String>,
+    principal: bool,
     members: Option<(
         &crate::mux::registry::MuxConn,
         &mut MemberInflight,
         Option<&std::collections::HashSet<String>>,
     )>,
-) -> ControlFlow<(), ()> {
+    yield_to: Option<(
+        &Receiver<QueuedCommand>,
+        Option<&crate::mux::fair_queue::FairOrder<QueuedCommand>>,
+    )>,
+) -> ControlFlow<(), Option<TspDrainRest>> {
     use affinidi_messaging_mediator_common::store::mux::MuxCapability;
     // Delete-on-send is never used for a member: `tsp-mux` forces ack mode.
     debug_assert!(ack_mode || members.is_none());
@@ -2179,12 +2224,20 @@ async fn drain_tsp_inbox(
         total: 0,
     };
 
+    // Live frames are waiting: stop between pages and say what is left.
+    let live_waiting = || yield_to.is_some_and(|(rx, fair)| !queue_idle(rx, fair));
+    let members_owed = members.as_ref().map(|(_, _, only)| only.cloned());
+
     // The principal's own inbox, to the end. Every id walked past (ack mode
     // only) is kept, to prune `inflight` against once the walk completes, so
     // ids the client has since acked stop occupying the set.
     let mut seen = std::collections::HashSet::new();
     let mut cursor: Option<String> = None;
     loop {
+        // Resuming a drain whose principal part was done already.
+        if !principal {
+            break;
+        }
         match drain_tsp_page(
             state,
             session,
@@ -2204,12 +2257,19 @@ async fn drain_tsp_inbox(
             // complete walk proves an absent id was acked, and pruning against
             // a walk cut short by the cap (or a failed fetch) would resurrect
             // still-in-flight messages as duplicates.
-            TspPage::Stopped => return ControlFlow::Continue(()),
+            TspPage::Stopped => return ControlFlow::Continue(None),
+            TspPage::More if live_waiting() => {
+                return ControlFlow::Continue(Some(TspDrainRest {
+                    principal: true,
+                    members: members_owed.is_some(),
+                    only: members_owed.flatten(),
+                }));
+            }
             TspPage::More => continue,
             TspPage::Exhausted => break,
         }
     }
-    if ack_mode {
+    if principal && ack_mode {
         // Anything no longer in the inbox has been acked (or expired): drop it
         // so the set tracks only what is genuinely outstanding.
         inflight.retain(|id| seen.contains(id));
@@ -2243,7 +2303,8 @@ async fn drain_tsp_inbox(
         > = std::collections::HashMap::new();
         while !order.is_empty() {
             let mut still: Vec<String> = Vec::with_capacity(order.len());
-            for member in order {
+            let mut round = order.into_iter();
+            while let Some(member) = round.next() {
                 // Still attached, still with `pickup`? Re-read per page: a
                 // detach between pages must stop this member's frames (§7.3).
                 let allowed = conn.session.lock().await.allows(
@@ -2271,10 +2332,25 @@ async fn drain_tsp_inbox(
                 .await
                 {
                     TspPage::SocketGone => return ControlFlow::Break(()),
-                    TspPage::Stopped => return ControlFlow::Continue(()),
+                    TspPage::Stopped => return ControlFlow::Continue(None),
                     TspPage::More => still.push(member),
                     // This member's walk is complete: prune its set.
                     TspPage::Exhausted => inflight.retain(|id| seen.contains(id)),
+                }
+                // Another member's live frame is waiting: let it go first.
+                // The members not done are drained again from the head of
+                // their inbox, skipping what is already in flight.
+                if live_waiting() {
+                    let left: std::collections::HashSet<String> =
+                        still.drain(..).chain(round.by_ref()).collect();
+                    if left.is_empty() {
+                        break;
+                    }
+                    return ControlFlow::Continue(Some(TspDrainRest {
+                        principal: false,
+                        members: true,
+                        only: Some(left),
+                    }));
                 }
             }
             order = still;
@@ -2289,7 +2365,54 @@ async fn drain_tsp_inbox(
             "TSP inbox drain complete"
         );
     }
-    ControlFlow::Continue(())
+    ControlFlow::Continue(None)
+}
+
+/// Nothing waits to be written: the channel is empty, and so are the fair
+/// queue's lanes it was moved into.
+#[cfg(feature = "tsp")]
+fn queue_idle(
+    rx: &Receiver<QueuedCommand>,
+    fair: Option<&crate::mux::fair_queue::FairOrder<QueuedCommand>>,
+) -> bool {
+    rx.is_empty() && fair.is_none_or(|f| f.is_empty())
+}
+
+/// What a [`drain_tsp_inbox`] on a `tsp-mux` socket left undone when live
+/// frames were waiting: the principal's inbox, and the members (`only` =
+/// those named, or every member with `pickup` when `None`).
+#[cfg(feature = "tsp")]
+#[derive(Debug)]
+struct TspDrainRest {
+    principal: bool,
+    members: bool,
+    only: Option<std::collections::HashSet<String>>,
+}
+
+#[cfg(feature = "tsp")]
+impl TspDrainRest {
+    /// Fold `more` into what is already pending.
+    fn merge(pending: &mut Option<TspDrainRest>, more: Option<TspDrainRest>) {
+        let Some(more) = more else { return };
+        *pending = Some(match pending.take() {
+            None => more,
+            Some(had) => {
+                // Every member owed on either side means every member.
+                let only = if (had.members && had.only.is_none())
+                    || (more.members && more.only.is_none())
+                {
+                    None
+                } else {
+                    Some(had.only.into_iter().chain(more.only).flatten().collect())
+                };
+                TspDrainRest {
+                    principal: had.principal || more.principal,
+                    members: had.members || more.members,
+                    only,
+                }
+            }
+        });
+    }
 }
 
 /// Members' pages are smaller than the principal's, so a round over many

@@ -1462,3 +1462,115 @@ async fn an_ack_off_a_mux_connection_is_refused() {
     );
     env.shutdown().await.expect("shutdown");
 }
+
+/// Fair queuing on a raw-TSP mux socket (design §7.2 "Back-pressure", §10
+/// "Fairness"), as `mux_fair_queue.rs` shows it for DIDComm: the principal
+/// stops reading while one member (`busy`) is sent far more live frames than
+/// the socket buffers hold, so the writer stalls and `busy`'s share of the
+/// send queue fills. A frame for a second member (`quiet`) then arrives. When
+/// the principal reads again, `quiet`'s frame arrives live, promptly, and not
+/// behind the whole of `busy`'s backlog.
+///
+/// On raw TSP the resync for `busy`'s dropped pushes is a drain of `busy`'s
+/// inbox (`drain_tsp_inbox`). The drain stops between pages whenever live
+/// frames are waiting, so `quiet`'s frame goes first; before that it ran to
+/// completion (up to 1000 frames) with `quiet`'s frame queued behind it.
+#[tokio::test]
+async fn a_flooded_member_does_not_starve_another_on_a_tsp_mux_socket() {
+    use std::time::Instant;
+    const FLOOD: usize = 80;
+    const FLOOD_BYTES: usize = 256 * 1024;
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .queue_send_limit_per_peer(-1)
+        .spawn()
+        .await
+        .expect("spawn mediator with mux");
+    let env = TestEnvironment::new(mediator).await.expect("env");
+    let principal = env.add_user("device").await.unwrap();
+    let busy = env.add_user("busy").await.unwrap();
+    let quiet = env.add_user("quiet").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    for m in [&busy, &quiet] {
+        env.relate_directly(&sender, m).await.unwrap();
+        grant(&env, m, &principal, &["receive", "pickup", "delete"]).await;
+    }
+
+    let (mut ws, selected, _) = connect(&env, &principal, &MUX_OFFER).await;
+    assert_eq!(selected.as_deref(), Some("tsp-mux"));
+    expect_ready_and_attached(&env, &mut ws, &principal, &[&busy, &quiet]).await;
+
+    // Stop reading, and flood the busy member.
+    let filler = "x".repeat(FLOOD_BYTES);
+    for i in 0..FLOOD {
+        env.atm
+            .tsp()
+            .send(
+                &sender.profile,
+                &busy.did,
+                format!("{i}:{filler}").as_bytes(),
+            )
+            .await
+            .expect("send to busy");
+    }
+    // Let the streaming task push (and drop) the flood before the quiet
+    // member's frame arrives behind it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    env.atm
+        .tsp()
+        .send(&sender.profile, &quiet.did, b"for quiet")
+        .await
+        .expect("send to quiet");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Read again, recording each frame's receiver in order, until idle.
+    let resumed = Instant::now();
+    let mut seen: Vec<char> = Vec::new();
+    let mut quiet_after = None;
+    while let Ok(Some(frame)) = timeout(Duration::from_secs(3), ws.next()).await {
+        let Message::Binary(b) = frame.expect("frame") else {
+            continue;
+        };
+        let to = receiver(&b);
+        seen.push(if to == busy.did {
+            'B'
+        } else if to == quiet.did {
+            quiet_after.get_or_insert(resumed.elapsed());
+            'Q'
+        } else {
+            '?'
+        });
+    }
+    let summary: String = seen.iter().collect();
+    let busy_seen = seen.iter().filter(|c| **c == 'B').count();
+    assert!(
+        busy_seen > 1,
+        "the flood must reach the socket for this test to mean anything: {summary}"
+    );
+
+    // The quiet member's frame arrived live, promptly...
+    let quiet_at = seen
+        .iter()
+        .position(|c| *c == 'Q')
+        .unwrap_or_else(|| panic!("the quiet member's frame never arrived: {summary}"));
+    assert!(
+        quiet_after.is_some_and(|d| d < Duration::from_secs(5)),
+        "the quiet member's frame took {quiet_after:?}: {summary}"
+    );
+    // ...and not behind the busy member's whole backlog: busy frames were
+    // still queued behind it.
+    assert!(
+        seen[quiet_at..].contains(&'B'),
+        "the quiet member's frame waited out the busy member's whole queue: {summary}"
+    );
+    // ...and the drain, cut short for it, resumed: every busy frame arrived,
+    // once each.
+    assert_eq!(
+        busy_seen, FLOOD,
+        "the busy member's backlog must be delivered in full, without repeats: {summary}"
+    );
+    env.shutdown().await.expect("shutdown");
+}
