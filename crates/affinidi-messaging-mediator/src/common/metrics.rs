@@ -127,6 +127,9 @@ pub mod names {
     /// timeout. Each one closes its connection: the peer has stopped reading,
     /// and nothing queued for it is reported delivered.
     pub const WS_WRITE_TIMEOUTS_TOTAL: &str = "ws_write_timeouts_total";
+    /// counter: WebSocket connections closed because nothing (not even a
+    /// pong) arrived from the peer within `limits.ws_pong_timeout_secs`.
+    pub const WS_PONG_TIMEOUTS_TOTAL: &str = "ws_pong_timeouts_total";
     /// counter: Live pushes for a DID on a mux connection refused because that
     /// DID already held its own share (8) of the connection's send queue.
     ///

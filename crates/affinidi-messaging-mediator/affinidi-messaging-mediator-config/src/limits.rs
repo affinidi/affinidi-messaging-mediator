@@ -68,6 +68,17 @@ pub struct LimitsConfigRaw {
     /// Requests per second the `/metrics` endpoint answers, across all callers.
     #[serde(default = "default_metrics_requests_per_second")]
     pub metrics_requests_per_second: String,
+    /// Seconds between the pings the mediator sends on each WebSocket.
+    #[serde(default = "default_ws_ping_interval_secs")]
+    pub ws_ping_interval_secs: String,
+    /// How long a WebSocket peer may stay silent: once a ping goes
+    /// unanswered, the peer has this minus the ping interval to send any
+    /// frame (a pong counts) before the mediator closes it.
+    #[serde(default = "default_ws_pong_timeout_secs")]
+    pub ws_pong_timeout_secs: String,
+    /// Seconds one write to a WebSocket may take before the mediator closes it.
+    #[serde(default = "default_ws_write_timeout_secs")]
+    pub ws_write_timeout_secs: String,
     /// `[limits.mux]` — DID multiplexing. Absent means disabled.
     #[serde(default)]
     pub mux: MuxConfigRaw,
@@ -162,6 +173,22 @@ fn default_relay_bytes_per_second() -> String {
 fn default_metrics_requests_per_second() -> String {
     "5".to_string()
 }
+
+/// 30 s between pings.
+fn default_ws_ping_interval_secs() -> String {
+    "30".to_string()
+}
+
+/// 90 s — three ping intervals of silence before a socket is treated as gone.
+fn default_ws_pong_timeout_secs() -> String {
+    "90".to_string()
+}
+
+/// 30 s for one write to complete.
+fn default_ws_write_timeout_secs() -> String {
+    "30".to_string()
+}
+
 fn default_rate_limit_burst() -> String {
     "50".to_string()
 }

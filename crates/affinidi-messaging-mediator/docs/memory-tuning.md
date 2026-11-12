@@ -105,6 +105,14 @@ fewer disk reads. Costs exactly what you give it, once warm.
 pool shared by all connections; each connection's queue is also capped at 8
 messages. Watch `ws_live_delivery_dropped_total` (below) to decide.
 
+**Slow or vanished clients** — a connection's slots and queued frames are held
+until it closes. Two settings bound how long an unresponsive client keeps them:
+`limits.ws_write_timeout_secs` (default 30) closes a connection whose client
+has stopped reading, and `limits.ws_pong_timeout_secs` (default 90) closes one
+that has sent nothing, not even a pong to the mediator's pings
+(`limits.ws_ping_interval_secs`, default 30), for that long. Both close with 1001
+and are counted in `ws_write_timeouts_total` and `ws_pong_timeouts_total`.
+
 **Bursty throughput with lag warnings** — raise `limits.pubsub_buffer`. The
 ring holds `pubsub_buffer / message_size` messages (16 at the defaults).
 
@@ -133,6 +141,7 @@ Two signals tell you a budget is too small:
 | Signal | Means | Fix |
 |---|---|---|
 | `ws_live_delivery_dropped_total` rising | A client's send queue or the global byte pool filled | Raise `limits.ws_send_buffer`, or find the slow client |
+| `ws_write_timeouts_total` or `ws_pong_timeouts_total` rising | Clients stopped reading, or went away without closing | Usually the network or the client; raise the timeouts only for links known to stall |
 | `Streaming subscriber lagged` in logs | The pub/sub ring was overwritten before it could be read | Raise `limits.pubsub_buffer` |
 
 Both are latency symptoms, not correctness ones. A steadily rising drop count

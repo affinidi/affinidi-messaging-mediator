@@ -215,6 +215,18 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.limits.metrics_requests_per_second,
         "LIMIT_METRICS_REQUESTS_PER_SECOND"
     );
+    env_override!(
+        config.limits.ws_ping_interval_secs,
+        "LIMIT_WS_PING_INTERVAL_SECS"
+    );
+    env_override!(
+        config.limits.ws_pong_timeout_secs,
+        "LIMIT_WS_PONG_TIMEOUT_SECS"
+    );
+    env_override!(
+        config.limits.ws_write_timeout_secs,
+        "LIMIT_WS_WRITE_TIMEOUT_SECS"
+    );
     env_override!(config.limits.mux.enabled, "LIMIT_MUX_ENABLED");
     env_override!(
         config.limits.mux.max_dids_per_connection,
