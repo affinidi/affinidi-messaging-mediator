@@ -1216,3 +1216,195 @@ async fn notices_reach_a_tsp_principal_sealed_for_tsp() {
     sock.close().await.expect("close");
     env.shutdown().await.expect("shutdown");
 }
+
+// ─── messaging/mux/ack on the socket ────────────────────────────────────────
+
+const ACK_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1";
+
+/// The id `messaging/mux/ack` names a frame by.
+fn frame_message_id(qb2: &[u8]) -> String {
+    sha256::digest(BASE64_URL_SAFE_NO_PAD.encode(qb2))
+}
+
+/// Send `messaging/mux/ack` for `ids` on the socket as `principal`, and
+/// return the answer's document, read off the socket. Frames read on the way
+/// are returned too.
+async fn ack_on_socket(
+    env: &TestEnvironment,
+    principal: &TestUser,
+    ws: &mut Ws,
+    ids: &[String],
+) -> (Value, Vec<Vec<u8>>) {
+    let request_id = format!("urn:uuid:{}", Uuid::new_v4());
+    let doc = json!({
+        "id": request_id,
+        "type": ACK_TYPE,
+        "issuer": principal.did,
+        "recipient": env.mediator.did(),
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": { "messageIds": ids },
+    });
+    let frame = env
+        .atm
+        .tsp()
+        .pack(
+            &principal.profile,
+            env.mediator.did(),
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("pack the ack");
+    ws.send(Message::Binary(frame.into()))
+        .await
+        .expect("write the ack");
+    let mut others = Vec::new();
+    loop {
+        let f = next_binary(ws).await;
+        if receiver(&f) == principal.did
+            && let Ok((payload, sender)) = env.atm.tsp().unpack_bytes(&principal.profile, &f).await
+            && sender == env.mediator.did()
+            && let Ok(answer) = serde_json::from_slice::<Value>(&payload)
+            && answer["threadId"] == request_id
+        {
+            return (answer, others);
+        }
+        others.push(f);
+    }
+}
+
+/// `messaging/mux/ack` on a tsp-mux socket deletes the principal's own frame
+/// and a member's with `delete`, refuses a member's without it
+/// (`notPermitted`) and an id nobody here holds (`notFound`), and its answer
+/// comes on the socket without being stored.
+#[tokio::test]
+async fn acks_on_the_socket_follow_each_members_delete_scope() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    for m in [&work, &home, &principal] {
+        env.relate_directly(&sender, m).await.unwrap();
+    }
+    grant(&env, &work, &principal, &["receive", "delete"]).await;
+    grant(&env, &home, &principal, &["receive"]).await;
+
+    let (mut ws, _, _) = connect(&env, &principal, &MUX_OFFER).await;
+    expect_ready_and_attached(&env, &mut ws, &principal, &[&work, &home]).await;
+
+    let mut frames = std::collections::HashMap::new();
+    for to in [&principal, &work, &home] {
+        env.atm
+            .tsp()
+            .send(&sender.profile, &to.did, b"ack me")
+            .await
+            .expect("send");
+        let f = next_binary(&mut ws).await;
+        frames.insert(receiver(&f), f);
+    }
+    let id = |u: &TestUser| frame_message_id(&frames[&u.did]);
+    let unknown = sha256::digest("no such message");
+    let (answer, _) = ack_on_socket(
+        &env,
+        &principal,
+        &mut ws,
+        &[id(&principal), id(&work), id(&home), unknown.clone()],
+    )
+    .await;
+    assert_eq!(answer["type"], format!("{ACK_TYPE}#response"), "{answer:#}");
+    use affinidi_messaging_mediator::task_specs::messaging::mux::ack::v0_1::Response;
+    serde_json::from_value::<Response>(answer["payload"].clone())
+        .unwrap_or_else(|e| panic!("the answer does not match the spec: {e}\n{answer:#}"));
+    let mut acked: Vec<String> = answer["payload"]["acked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    acked.sort();
+    let mut want = vec![id(&principal), id(&work)];
+    want.sort();
+    assert_eq!(acked, want);
+    let refused: Vec<(String, String)> = answer["payload"]["refused"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["messageId"].as_str().unwrap().to_string(),
+                r["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        refused.contains(&(id(&home), "notPermitted".into())),
+        "{refused:?}"
+    );
+    assert!(
+        refused.contains(&(unknown, "notFound".into())),
+        "{refused:?}"
+    );
+
+    assert_eq!(
+        inbox_len(&env, &principal).await,
+        0,
+        "deleted, and the answer is not stored"
+    );
+    assert_eq!(inbox_len(&env, &work).await, 0, "deleted with `delete`");
+    assert_eq!(inbox_len(&env, &home).await, 1, "kept without `delete`");
+
+    // Asking again changes nothing.
+    let (answer, _) = ack_on_socket(&env, &principal, &mut ws, &[id(&work)]).await;
+    assert_eq!(answer["payload"]["refused"][0]["reason"], "notFound");
+    env.shutdown().await.expect("shutdown");
+}
+
+/// Not on a mux connection, the ack is refused (`notMuxConnection`). A plain
+/// `tsp-ack` socket reports a refused frame by closing, as it always has; only
+/// `tsp-mux` reports refusals in band.
+#[tokio::test]
+async fn an_ack_off_a_mux_connection_is_refused() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    let (mut ws, selected, _) = connect(&env, &principal, &["tsp", "tsp-ack"]).await;
+    assert_eq!(selected.as_deref(), Some("tsp-ack"));
+    let doc = json!({
+        "id": format!("urn:uuid:{}", Uuid::new_v4()),
+        "type": ACK_TYPE,
+        "issuer": principal.did,
+        "recipient": env.mediator.did(),
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": { "messageIds": [sha256::digest("x")] },
+    });
+    let frame = env
+        .atm
+        .tsp()
+        .pack(
+            &principal.profile,
+            env.mediator.did(),
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("pack the ack");
+    ws.send(Message::Binary(frame.into())).await.expect("write");
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(f))) => return f,
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("refused");
+    assert!(
+        closed.is_some_and(|f| f.code
+            == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+    );
+    env.shutdown().await.expect("shutdown");
+}

@@ -11,7 +11,11 @@
 //!    `superseded`, and the member's mail goes to its own socket;
 //! 3. that socket closes: B reports the member `reactivated` and redelivers,
 //!    as a TSP frame, what arrived meanwhile, without sending again what it
-//!    already sent on this connection.
+//!    already sent on this connection;
+//! 4. the principal acknowledges the member's frames with
+//!    `messaging/mux/ack` on its socket on B, and they are deleted there. A
+//!    REST delete may land on an instance that does not hold the connection,
+//!    and so cannot see its members.
 //!
 //! Needs a Redis server:
 //! ```text
@@ -36,8 +40,9 @@ use affinidi_messaging_mediator_common::store::MediatorStore;
 use affinidi_messaging_mediator_common::{store::mux::MuxLimits, types::acls::MediatorACLSet};
 use affinidi_messaging_sdk::protocols::tsp::RelationshipState;
 use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator, TestUser};
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use common::init_tracing;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
@@ -353,5 +358,70 @@ async fn a_tsp_mux_socket_on_one_instance_follows_a_member_on_another() {
         .await
         .expect("work opens it");
     assert_eq!(payload, b"while superseded");
+
+    // 4. Acknowledged on the socket on B.
+    let ids: Vec<String> = [&frame, &missed]
+        .iter()
+        .map(|f| sha256::digest(BASE64_URL_SAFE_NO_PAD.encode(f)))
+        .collect();
+    let request_id = format!("urn:uuid:{}", Uuid::new_v4());
+    let doc = json!({
+        "id": request_id,
+        "type": "https://trusttasks.org/spec/messaging/mux/ack/0.1",
+        "issuer": principal.did,
+        "recipient": env.mediator.did(),
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": { "messageIds": ids },
+    });
+    let ack = env
+        .atm
+        .tsp()
+        .pack(
+            &principal.profile,
+            env.mediator.did(),
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("pack the ack");
+    ws.send(Message::Binary(ack.into()))
+        .await
+        .expect("write the ack");
+    let answer = loop {
+        let f = next_binary(&mut ws).await;
+        if receiver(&f) != principal.did {
+            continue;
+        }
+        let (payload, _) = env
+            .atm
+            .tsp()
+            .unpack_bytes(&principal.profile, &f)
+            .await
+            .expect("unpack");
+        let doc: Value = serde_json::from_slice(&payload).unwrap();
+        if doc["threadId"] == request_id {
+            break doc;
+        }
+    };
+    let mut acked: Vec<String> = answer["payload"]["acked"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{answer:#}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    acked.sort();
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(acked, want, "{answer:#}");
+    for id in &ids {
+        assert!(
+            env.mediator
+                .store()
+                .delivery_state(id)
+                .await
+                .unwrap()
+                .is_none(),
+            "deleted"
+        );
+    }
     env.shutdown().await.expect("shutdown");
 }

@@ -483,7 +483,8 @@ pub(crate) async fn consume(
             )
             .await?
         }
-        ServedTask::MuxAttach
+        ServedTask::MuxAck
+        | ServedTask::MuxAttach
         | ServedTask::MuxDetach
         | ServedTask::MuxGrant
         | ServedTask::MuxList
@@ -574,6 +575,7 @@ served_tasks! {
     QueuePurge => queue::purge::v0_1::Payload,
     MonitorSubscribe => monitor::subscribe::v0_1::Payload,
     MonitorUnsubscribe => monitor::unsubscribe::v0_1::Payload,
+    MuxAck => crate::task_specs::messaging::mux::ack::v0_1::Payload,
     MuxAttach => crate::task_specs::messaging::mux::attach::v0_1::Payload,
     MuxDetach => crate::task_specs::messaging::mux::detach::v0_1::Payload,
     MuxGrant => crate::task_specs::messaging::mux::grant::v0_1::Payload,
@@ -2409,6 +2411,13 @@ async fn consume_mux(
             tasks::detach(&*conn()?, streaming, payload).await,
             tasks::Changed::default(),
         ),
+        ServedTask::MuxAck => {
+            conn()?;
+            (
+                tasks::ack(state, session, payload).await.map_err(refused)?,
+                tasks::Changed::default(),
+            )
+        }
         ServedTask::MuxGrant => tasks::grant(&ctx, sender_did, payload).await,
         ServedTask::MuxList => (
             tasks::list(&ctx, sender_did, payload)
@@ -2541,6 +2550,9 @@ async fn consume_mux(
             respond::<mux::detach::v0_1::Payload, mux::detach::v0_1::Response>(
                 doc, session, response,
             )
+        }
+        ServedTask::MuxAck => {
+            respond::<mux::ack::v0_1::Payload, mux::ack::v0_1::Response>(doc, session, response)
         }
         ServedTask::MuxGrant => {
             respond::<mux::grant::v0_1::Payload, mux::grant::v0_1::Response>(doc, session, response)
