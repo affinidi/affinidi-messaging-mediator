@@ -17,9 +17,13 @@ at the worst moment — mid-cut, or mid-publish:
      a hand-edited one drifts, and a published crate then requires a sibling
      version that is never published.
   3. changelog — CHANGELOG.md exists at the root. On main it has an
-     `## Unreleased` section (cut-release.py and the GA prep rename it). On a
-     release branch at a GA or patch version it has that version's section,
-     which release-tag.yml turns into the GitHub Release notes.
+     `## Unreleased` section holding nothing but the pointer line: entries are
+     `changelog.d/` fragments until a release assembles them
+     (changelog_fragments.py; cut-release.py and the GA prep). On a release
+     branch at a GA or patch version it has that version's section, which
+     release-tag.yml turns into the GitHub Release notes. Every fragment, on
+     any branch, is well-formed (`### <Kind> — <title>` entries, kebab-case
+     file name).
   4. RELEASE ↔ version — on a release branch, RELEASE's `major.minor.patch` is
      the workspace version, and a PR (with --base-sha) never moves RELEASE
      backwards. publish.yml refuses to publish when these disagree; this says
@@ -36,7 +40,8 @@ import sys
 import tomllib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from release_lib import ROOT, lockstep_problems, parse_release, workspace_version  # noqa: E402
+from changelog_fragments import POINTER, fragment_problems, unreleased_is_pointer_only  # noqa: E402
+from release_lib import ROOT, lockstep_problems, parse_release, unreleased_split, workspace_version  # noqa: E402
 
 SETUP_DOCKER_SRC = "crates/affinidi-messaging-mediator/tools/mediator-setup/src/docker.rs"
 
@@ -87,11 +92,19 @@ def release_problems(base_sha):
     if not changelog.exists():
         return ["CHANGELOG.md is missing at the repository root (the release tooling writes to it)"]
     text = changelog.read_text()
+    problems += fragment_problems(ROOT)
 
     if not release_file.exists():
         # main (or a feature branch off it).
-        if not re.search(r"^## Unreleased", text, re.M):
+        parts = unreleased_split(text)
+        if not parts:
             problems.append("CHANGELOG.md has no `## Unreleased` section (main always carries one)")
+        elif not unreleased_is_pointer_only(parts[1]):
+            problems.append(
+                "CHANGELOG.md's `## Unreleased` holds entries: on main it holds only the line "
+                f"{POINTER!r}. Move each entry into its own changelog.d/<name>.md fragment "
+                "(changelog.d/README.md)"
+            )
         return problems
 
     current = release_file.read_text().strip()

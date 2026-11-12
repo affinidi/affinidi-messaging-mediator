@@ -5,9 +5,12 @@ name: Backport
 # backport). Add the label before or after merging; one label per branch.
 #
 # A cherry-pick that conflicts still opens a PR, as a draft carrying the
-# conflict, for a person to resolve — never silently dropped. A conflict in
-# CHANGELOG.md is expected (main's `## Unreleased` is not on the branch): drop
-# the hunk; the patch's changelog is generated from commit subjects.
+# conflict, for a person to resolve — never silently dropped.
+#
+# Changelog notes stay on main: a patch's changelog is generated from the
+# commit subjects it ships. So once the backport PRs exist, the last step
+# removes from each the `changelog.d/` fragments it adds and any change (or
+# conflict) it makes to CHANGELOG.md, in one signed-off commit.
 #
 # pull_request_target, so it runs with this repository's token even for a PR
 # from a fork. It checks out no PR code to run: the action only cherry-picks
@@ -50,6 +53,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
       - uses: korthout/backport-action@8560fb503c275d433c56f05a2f64850093baa9f7 # v4.7.0
+        id: backport
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           label_pattern: '^backport (release/\d+\.\d+)$'
@@ -61,3 +65,37 @@ jobs:
           add_labels: backport
           copy_assignees: true
           experimental: '{"conflict_resolution": "draft_commit_conflicts"}'
+      - name: Drop changelog notes from the backport PRs
+        if: steps.backport.outputs.created_pull_numbers != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CREATED: ${{ steps.backport.outputs.created_pull_numbers }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for n in $CREATED; do
+            read -r head base < <(gh pr view "$n" --json headRefName,baseRefName \
+              --jq '.headRefName + " " + .baseRefName')
+            git fetch --no-tags --depth=1 origin \
+              "+refs/heads/$base:refs/remotes/origin/$base" \
+              "+refs/heads/$head:refs/remotes/origin/$head"
+            git switch -q --detach "origin/$head"
+            # Fragments the backport adds (the base's own, kept from before its
+            # GA, are not in this list), README excepted.
+            mapfile -t added < <(git diff --name-only --diff-filter=A "origin/$base" HEAD -- \
+              'changelog.d/*.md' ':(exclude)changelog.d/README.md')
+            if [ "${#added[@]}" -gt 0 ]; then
+              git rm -q -- "${added[@]}"
+            fi
+            if ! git diff --quiet "origin/$base" HEAD -- CHANGELOG.md; then
+              git checkout "origin/$base" -- CHANGELOG.md
+            fi
+            if git diff --cached --quiet; then
+              echo "#$n: no changelog notes to drop"
+              continue
+            fi
+            git commit -q -s -m "chore(backport): drop changelog notes; a patch's notes come from commit subjects"
+            git push -q origin "HEAD:refs/heads/$head"
+            echo "#$n: dropped changelog notes from $head"
+          done
