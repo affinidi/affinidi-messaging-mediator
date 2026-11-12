@@ -1200,7 +1200,8 @@ fn refuse_blocked(state: &SharedData, next: &str, hop: RemoteHop) -> NextHop {
     ) {
         return NextHop::Unroutable {
             reason: format!(
-                "next hop ({next}) relays via ({}) at ({}), which is on this mediator's                  forwarding block list",
+                "next hop ({next}) relays via ({}) at ({}), which is on this mediator's \
+                 forwarding block list",
                 hop.relay_to, hop.endpoint
             ),
             retryable: false,
