@@ -1,9 +1,10 @@
 //! Who a request to the mediator acts for, and what each role may do.
 //!
-//! - A request the mediator serves (trust ping, Trust Tasks, pickup) needs an
-//!   authenticated session whose DID sent it. The anonymous inter-mediator relay
-//!   session may only relay, and `force_session_did_match = false` does not let
-//!   one account's session carry another account's requests.
+//! - A request the mediator serves (trust ping, discover features, pickup,
+//!   Trust Tasks) needs an authenticated session whose DID sent it. The
+//!   anonymous inter-mediator relay session may only relay, and
+//!   `force_session_did_match = false` does not let one account's session
+//!   carry another account's requests.
 //! - Granting or changing a privileged role (admin, root admin, the mediator's
 //!   own account) is for a root admin; a privileged account is changed or
 //!   removed only by itself or a root admin; an account whose role is `Unknown`
@@ -108,21 +109,52 @@ async fn the_anonymous_relay_session_may_only_relay() {
     let alice = env.add_user("alice").await.expect("alice");
     let bob = env.add_user("bob").await.expect("bob");
 
-    // Requests the mediator would serve for alice are refused without a session.
-    let pickup_status = Message::build(
-        Uuid::new_v4().to_string(),
-        "https://didcomm.org/messagepickup/3.0/status-request".to_string(),
-        json!({}),
-    )
-    .from(alice.did.clone())
-    .to(mediator_did.clone())
-    .created_time(now())
-    .expires_time(now() + 60)
-    .finalize();
+    // Every kind of request the mediator serves for alice is refused without a
+    // session: each type `Message::process` dispatches to a handler.
+    let to_mediator = |typ: &str, body: serde_json::Value| {
+        Message::build(Uuid::new_v4().to_string(), typ.to_string(), body)
+            .from(alice.did.clone())
+            .to(mediator_did.clone())
+            .created_time(now())
+            .expires_time(now() + 60)
+            .finalize()
+    };
+    const PICKUP: &str = "https://didcomm.org/messagepickup/3.0";
     for (name, msg) in [
         ("trust ping", trust_ping(&alice.did, &mediator_did)),
         ("trust task", account_get_task(&alice, &mediator_did)),
-        ("pickup status request", pickup_status),
+        (
+            "pickup status request",
+            to_mediator(&format!("{PICKUP}/status-request"), json!({})),
+        ),
+        (
+            "pickup delivery request",
+            to_mediator(
+                &format!("{PICKUP}/delivery-request"),
+                json!({ "limit": 10 }),
+            ),
+        ),
+        (
+            "pickup messages received",
+            to_mediator(
+                &format!("{PICKUP}/messages-received"),
+                json!({ "message_id_list": [] }),
+            ),
+        ),
+        (
+            "pickup live delivery change",
+            to_mediator(
+                &format!("{PICKUP}/live-delivery-change"),
+                json!({ "live_delivery": true }),
+            ),
+        ),
+        (
+            "discover features",
+            to_mediator(
+                "https://didcomm.org/discover-features/2.0/queries",
+                json!({ "queries": [{ "feature-type": "protocol", "match": "*" }] }),
+            ),
+        ),
     ] {
         let packed = authcrypt(&env, &msg, &mediator_did, &alice).await;
         let (status, body) = post_anonymous(&env, packed).await;
