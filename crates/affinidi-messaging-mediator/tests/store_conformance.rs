@@ -559,6 +559,70 @@ async fn check_session_lifecycle(store: Arc<dyn MediatorStore>) {
         store.get_session(&session.session_id, did).await.is_err(),
         "get_session must error once the session is deleted"
     );
+
+    // A challenge is answered once: promoting needs the challenge session,
+    // and a second promotion of it finds nothing to promote.
+    assert!(
+        store
+            .update_session_authenticated(
+                "conformance-no-such-challenge",
+                "conformance-x",
+                did,
+                "r"
+            )
+            .await
+            .is_err(),
+        "promoting a session that does not exist must fail"
+    );
+    let challenge = Session {
+        session_id: "conformance-challenge-1".to_string(),
+        did: did.to_string(),
+        did_hash: did_hash.clone(),
+        state: SessionState::ChallengeSent,
+        ..Default::default()
+    };
+    store
+        .put_session(&challenge, Duration::from_secs(300))
+        .await
+        .expect("put_session (challenge)");
+    store
+        .update_session_authenticated(&challenge.session_id, "conformance-auth-1", did, "r1")
+        .await
+        .expect("first promotion");
+    assert!(
+        store
+            .update_session_authenticated(&challenge.session_id, "conformance-auth-2", did, "r2")
+            .await
+            .is_err(),
+        "a second promotion of the same challenge must fail"
+    );
+    assert!(
+        store.get_session("conformance-auth-2", did).await.is_err(),
+        "the failed promotion leaves no session behind"
+    );
+    assert_eq!(
+        store
+            .get_session("conformance-auth-1", did)
+            .await
+            .expect("promoted session")
+            .state,
+        SessionState::Authenticated
+    );
+
+    // Updating the refresh hash of a session that has ended must not bring
+    // it back.
+    store
+        .delete_session("conformance-auth-1")
+        .await
+        .expect("delete_session");
+    assert!(
+        store
+            .update_refresh_token_hash("conformance-auth-1", "r3")
+            .await
+            .is_err(),
+        "updating an ended session must fail"
+    );
+    assert!(store.get_session("conformance-auth-1", did).await.is_err());
 }
 
 /// Access-list add → count → list → remove → clear.
@@ -602,6 +666,72 @@ async fn check_access_list_lifecycle(store: Arc<dyn MediatorStore>) {
         .await
         .expect("access_list_clear");
     assert_eq!(access_list_len(&store, owner).await, 0);
+
+    // The limit holds below, at and above it, the same on every backend.
+    let limited = "did_hash_access_list_limited";
+    let batch = |from: usize, n: usize| -> Vec<String> {
+        (from..from + n)
+            .map(|i| format!("did_hash_member_{i}"))
+            .collect()
+    };
+
+    let empty = store
+        .access_list_add(3, limited, &[])
+        .await
+        .expect("access_list_add with nothing to add");
+    assert!(empty.did_hashes.is_empty() && !empty.truncated);
+
+    let below = store
+        .access_list_add(3, limited, &batch(0, 2))
+        .await
+        .expect("access_list_add below the limit");
+    assert_eq!(below.did_hashes, batch(0, 2));
+    assert!(!below.truncated);
+
+    let to_limit = store
+        .access_list_add(3, limited, &batch(2, 3))
+        .await
+        .expect("access_list_add across the limit");
+    assert_eq!(
+        to_limit.did_hashes,
+        batch(2, 1),
+        "only the room left is used"
+    );
+    assert!(to_limit.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+
+    let at_limit = store
+        .access_list_add(3, limited, &batch(5, 2))
+        .await
+        .expect("access_list_add at the limit");
+    assert!(at_limit.did_hashes.is_empty(), "a full list takes nothing");
+    assert!(at_limit.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+
+    // A limit lowered below the current size adds nothing and does not fail.
+    let above = store
+        .access_list_add(1, limited, &batch(7, 1))
+        .await
+        .expect("access_list_add over a lowered limit");
+    assert!(above.did_hashes.is_empty() && above.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+    store
+        .access_list_clear(limited)
+        .await
+        .expect("access_list_clear");
+
+    // One request larger than the whole limit adds the first `limit` hashes.
+    let oversized = store
+        .access_list_add(3, limited, &batch(100, 50))
+        .await
+        .expect("access_list_add larger than the limit");
+    assert_eq!(oversized.did_hashes, batch(100, 3));
+    assert!(oversized.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+    store
+        .access_list_clear(limited)
+        .await
+        .expect("access_list_clear");
 }
 
 /// Forward-queue: an unread enqueued entry can be deleted directly, dropping

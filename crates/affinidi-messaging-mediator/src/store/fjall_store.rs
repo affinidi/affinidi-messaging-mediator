@@ -2058,24 +2058,31 @@ impl MediatorStore for FjallStore {
         {
             let _guard = self.write_lock.lock().await;
 
-            // Read the old record directly; fall back to a fresh session
-            // if it's already gone, matching the trait default's
-            // defensive `unwrap_or_else`.
+            // The challenge session must exist, be unexpired and still be
+            // waiting for its answer. Under the write lock, so of two
+            // answers to one challenge only the first promotes it.
             let mut stored: StoredSession = match self
                 .sessions
                 .get(old_session_id.as_bytes())
                 .map_err(|e| Self::db_err("update_session_authenticated:get", e))?
             {
                 Some(raw) => Self::decode(&raw)?,
-                None => StoredSession {
-                    session: Session {
-                        did: did.to_string(),
-                        did_hash: did_hash.clone(),
-                        ..Default::default()
-                    },
-                    expires_at_unix: 0,
-                },
+                None => {
+                    return Err(
+                        affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                            old_session_id,
+                        ),
+                    );
+                }
             };
+            if stored.expires_at_unix <= now || stored.session.state != SessionState::ChallengeSent
+            {
+                return Err(
+                    affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                        old_session_id,
+                    ),
+                );
+            }
 
             if stored.session.did.is_empty() {
                 stored.session.did = did.to_string();

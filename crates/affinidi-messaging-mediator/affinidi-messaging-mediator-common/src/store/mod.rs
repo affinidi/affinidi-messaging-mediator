@@ -322,6 +322,17 @@ pub fn account_gone(session_id: &str) -> MediatorError {
     )
 }
 
+/// The error `update_session_authenticated` returns when the challenge
+/// session is gone, expired, or no longer waiting for its answer (it was
+/// already answered). The client must ask for a new challenge.
+pub fn session_not_awaiting_answer(session_id: &str) -> MediatorError {
+    MediatorError::SessionError(
+        14,
+        session_id.into(),
+        format!("Session ({session_id}) is not waiting for a challenge answer"),
+    )
+}
+
 /// How long a sender's [`OutboxReceipt`] is kept after its message leaves the
 /// queue (`messaging/message/status/0.1` asks for at least 24 hours).
 ///
@@ -2153,15 +2164,14 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         refresh_token_hash: &str,
     ) -> Result<(), MediatorError> {
         let did_hash = crate::did_identity::did_hash(did);
-        let mut session = self
-            .get_session(old_session_id, did)
-            .await
-            .unwrap_or_else(|_| Session {
-                session_id: new_session_id.to_string(),
-                did: did.to_string(),
-                did_hash: did_hash.clone(),
-                ..Default::default()
-            });
+        // The challenge session must still exist and still be waiting for
+        // its answer: a challenge is answered once. Backends without an
+        // atomic rename override this (the delete below and a second
+        // caller's read can still interleave here).
+        let mut session = self.get_session(old_session_id, did).await?;
+        if session.state != SessionState::ChallengeSent {
+            return Err(session_not_awaiting_answer(old_session_id));
+        }
         session.session_id = new_session_id.to_string();
         // Defensive: if get_session returned a session with an empty
         // `did` (e.g. from a partially-populated legacy record), fill
@@ -2202,14 +2212,9 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ) -> Result<(), MediatorError> {
         // We don't know the DID at this layer; pass empty so the
         // join-with-account in `get_session` is best-effort. Backends
-        // that need the DID for the refresh path should override.
-        let mut session = self
-            .get_session(session_id, "")
-            .await
-            .unwrap_or_else(|_| Session {
-                session_id: session_id.to_string(),
-                ..Default::default()
-            });
+        // that need the DID for the refresh path should override. A session
+        // that has ended is not recreated: the update fails.
+        let mut session = self.get_session(session_id, "").await?;
         session.refresh_token_hash = Some(refresh_token_hash.to_string());
         self.put_session(&session, std::time::Duration::from_secs(86_400))
             .await
