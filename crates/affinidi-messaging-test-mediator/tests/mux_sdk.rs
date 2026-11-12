@@ -758,3 +758,150 @@ async fn an_administrator_lists_live_mux_connections() {
         "a standard account is refused: {refused:?}"
     );
 }
+
+/// `messaging/mux/ack` on the DIDComm mux socket: the device acks a member's
+/// message there (no REST delete), the member's inbox drains, and the answer
+/// comes back on the connection without being stored, since a stored one
+/// would need acknowledging in turn (spec, consumer rule 4).
+#[tokio::test]
+async fn an_ack_on_the_socket_is_answered_there_and_not_stored() {
+    use affinidi_messaging_sdk::messages::fetch::FetchOptions;
+    use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let sender = env.add_user("sender").await.unwrap();
+    let mediator_did = env.mediator.did().to_string();
+
+    env.atm
+        .profile_enable_mux_websocket(&device.profile)
+        .await
+        .expect("mux websocket");
+    let mut members_rx = device.profile.mux_members().await.expect("members");
+    let (g_work, _) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        &mediator_did,
+        &[MuxCapability::Receive, MuxCapability::Delete],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g_work])
+        .await
+        .expect("mux_grant");
+    members_until(&mut members_rx, "work attached", |m| {
+        m.is_reachable(&work.did)
+    })
+    .await;
+
+    send(&env, &sender, &work, "for work").await;
+    let pickup = env.atm.message_pickup();
+    let work_id = loop {
+        let (msg, meta) = pickup
+            .live_stream_next(&device.profile, Some(Duration::from_secs(5)), false)
+            .await
+            .unwrap()
+            .expect("a message");
+        if msg.typ == "https://didcomm.org/basicmessage/2.0/message" {
+            assert_eq!(mux_recipient(&meta).as_deref(), Some(work.did.as_str()));
+            break meta.sha256_hash.clone();
+        }
+    };
+
+    // The ack, sent on the socket as the SDK sends a Trust Task.
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let signer = device
+        .secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .expect("device's Ed25519 key");
+    let doc = sign_trust_task(
+        &json!({
+            "id": format!("urn:uuid:{}", Uuid::new_v4()),
+            "type": "https://trusttasks.org/spec/messaging/mux/ack/0.1",
+            "issuer": device.did,
+            "recipient": mediator_did,
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": { "messageIds": [work_id] },
+        }),
+        signer,
+        SignOptions::new(),
+    )
+    .await
+    .expect("sign the ack");
+    let msg = DidcommMessage::build(
+        Uuid::new_v4().to_string(),
+        "https://trusttasks.org/binding/didcomm/0.1/envelope".to_string(),
+        doc,
+    )
+    .to(mediator_did.clone())
+    .from(device.did.clone())
+    .created_time(t)
+    .expires_time(t + 60)
+    .finalize();
+    let (packed, _) = env
+        .atm
+        .pack_encrypted(&msg, &mediator_did, Some(&device.did), None)
+        .await
+        .unwrap();
+    env.atm
+        .send_message(&device.profile, &packed, &msg.id, false, false)
+        .await
+        .expect("ack sent on the socket");
+
+    // The answer arrives on the connection (read without deleting it).
+    let (answer, answer_meta) = loop {
+        let (m, meta) = pickup
+            .live_stream_next(&device.profile, Some(Duration::from_secs(5)), false)
+            .await
+            .unwrap()
+            .expect("the ack's answer");
+        if m.thid.as_deref() == Some(msg.id.as_str()) {
+            break (m, meta);
+        }
+    };
+    assert_eq!(
+        answer.body["type"], "https://trusttasks.org/spec/messaging/mux/ack/0.1#response",
+        "{:#}",
+        answer.body
+    );
+    assert_eq!(answer.body["payload"]["acked"], json!([work_id]));
+
+    let store = env.mediator.store();
+    assert_eq!(
+        store
+            .inbox_status(&work.did_hash())
+            .await
+            .unwrap()
+            .message_count,
+        0,
+        "the member's message was deleted by the ack"
+    );
+    let inbox = store
+        .fetch_messages("test", &device.did_hash(), &FetchOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        inbox
+            .success
+            .iter()
+            .all(|m| m.msg_id != answer_meta.sha256_hash),
+        "the ack's answer must not be stored"
+    );
+    env.shutdown().await.unwrap();
+}

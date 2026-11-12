@@ -783,6 +783,12 @@ mod tests {
     }
 }
 
+/// The type of a `messaging/mux/ack` answer. It goes to the connection only,
+/// never stored: acknowledging is idempotent, so a lost answer is recovered by
+/// asking again, while a stored one would itself need acknowledging, and the
+/// answer to that, without end (spec, consumer rule 4). Both wires.
+pub const ACK_RESPONSE_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1#response";
+
 /// `messaging/mux/ack`: delete the frames named, as the connection's
 /// principal may (its own, and each member's while the member holds
 /// `delete`). Sorted into `acked` and `refused` (`notFound` /
