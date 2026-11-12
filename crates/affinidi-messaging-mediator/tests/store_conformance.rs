@@ -719,6 +719,19 @@ async fn check_access_list_lifecycle(store: Arc<dyn MediatorStore>) {
         .access_list_clear(limited)
         .await
         .expect("access_list_clear");
+
+    // One request larger than the whole limit adds the first `limit` hashes.
+    let oversized = store
+        .access_list_add(3, limited, &batch(100, 50))
+        .await
+        .expect("access_list_add larger than the limit");
+    assert_eq!(oversized.did_hashes, batch(100, 3));
+    assert!(oversized.truncated);
+    assert_eq!(access_list_len(&store, limited).await, 3);
+    store
+        .access_list_clear(limited)
+        .await
+        .expect("access_list_clear");
 }
 
 /// Forward-queue: an unread enqueued entry can be deleted directly, dropping

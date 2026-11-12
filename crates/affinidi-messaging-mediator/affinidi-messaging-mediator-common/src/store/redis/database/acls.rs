@@ -315,6 +315,12 @@ impl Database {
                 });
             }
 
+            // The script never adds more than `access_list_limit` hashes, so
+            // only that many are sent to it: a request larger than the limit
+            // costs no more than one at the limit, and is reported truncated.
+            let over_limit = hashes.len() > access_list_limit;
+            let hashes = &hashes[..hashes.len().min(access_list_limit)];
+
             // Count, truncate and add in one step, so concurrent adds cannot
             // each see room that only one of them has.
             let mut con = self.get_connection().await?;
@@ -332,7 +338,7 @@ impl Database {
                         format!("access_list_add failed. Reason: {err}"),
                     )
                 })?;
-            let truncated = truncated != 0;
+            let truncated = over_limit || truncated != 0;
 
             Ok(MediatorAccessListAddResponse {
                 did_hashes: hashes,
