@@ -31,4 +31,11 @@ pub struct SecurityConfigRaw {
     /// without it (empty → `warn`).
     #[serde(default)]
     pub trust_task_verification: String,
+    /// RFC 3339 time until which `POST /tsp/authenticate` also accepts the
+    /// older request that signs only the challenge string. Empty (the default)
+    /// accepts only the signed statement that names this mediator.
+    /// `#[serde(default)]` so configs that predate the setting deserialize
+    /// without it.
+    #[serde(default)]
+    pub tsp_auth_accept_unbound_until: String,
 }

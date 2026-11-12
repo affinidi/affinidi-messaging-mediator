@@ -333,6 +333,16 @@ block_remote_admin_msgs = "true"
 ### a later release will make "enforce" the default.
 trust_task_verification = "warn"
 
+### Env: TSP_AUTH_ACCEPT_UNBOUND_UNTIL
+### POST /tsp/authenticate takes a signed statement that names this mediator,
+### the challenge, its session and an expiry (affinidi-messaging-sdk 0.45.16+).
+### Clients built on older SDKs sign only the challenge string. Set this to an
+### RFC 3339 time (e.g. "2027-03-01T00:00:00Z") to keep accepting that older
+### form until then while those clients upgrade. Empty (the default) accepts
+### only the signed statement. When set, it is logged at boot and on every
+### login that uses it; once the time passes it has no effect.
+tsp_auth_accept_unbound_until = ""
+
 ### Env: ENABLE_INTER_MEDIATOR_RELAY
 ### Explicitly act as an inter-mediator relay (accept anonymous /inbound
 ### forwards from other mediators). Defaults to "false".

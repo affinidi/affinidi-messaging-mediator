@@ -73,6 +73,15 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
              to see who does not yet."
         );
     }
+    if let Some(msg) = tsp_auth_unbound_notice(
+        config.security.tsp_auth_accept_unbound_until,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    ) {
+        warn!("{msg}");
+    }
     if let Some(msg) = warn_implicit_relay(
         config.security.enable_inter_mediator_relay,
         &config.security.global_acl_default,
@@ -81,6 +90,31 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     }
 
     Ok(())
+}
+
+/// What to say at boot about `security.tsp_auth_accept_unbound_until`:
+/// nothing when it is unset, otherwise when the older TSP login form stops
+/// being accepted (or that it already has).
+fn tsp_auth_unbound_notice(until: Option<u64>, now: u64) -> Option<String> {
+    let until = until?;
+    let at = humantime::format_rfc3339_seconds(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(until),
+    );
+    Some(if until > now {
+        format!(
+            "security.tsp_auth_accept_unbound_until = \"{at}\": until then, \
+             POST /tsp/authenticate also accepts a signature over the bare challenge \
+             string, which names neither this mediator nor an expiry. Every such \
+             login is logged. Upgrade TSP clients to affinidi-messaging-sdk 0.45.16+ \
+             and clear this setting."
+        )
+    } else {
+        format!(
+            "security.tsp_auth_accept_unbound_until = \"{at}\" has passed: \
+             POST /tsp/authenticate accepts only the signed statement naming this \
+             mediator. Clear the setting."
+        )
+    })
 }
 
 /// Applies the policy for a sample/test identity (see
@@ -130,6 +164,15 @@ mod tests {
         SAMPLE_DID_KEYS, SAMPLE_JWT_PUBLIC_KEYS, check_not_sample_jwt_key,
     };
     use base64::Engine;
+
+    #[test]
+    fn the_older_tsp_login_form_is_announced_until_its_deadline() {
+        assert_eq!(super::tsp_auth_unbound_notice(None, 100), None);
+        let open = super::tsp_auth_unbound_notice(Some(200), 100).unwrap();
+        assert!(open.contains("also accepts"), "{open}");
+        let lapsed = super::tsp_auth_unbound_notice(Some(200), 200).unwrap();
+        assert!(lapsed.contains("has passed"), "{lapsed}");
+    }
 
     #[test]
     fn a_sample_identity_is_refused_unless_allowed() {

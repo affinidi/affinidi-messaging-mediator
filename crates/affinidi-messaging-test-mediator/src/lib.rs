@@ -342,6 +342,8 @@ pub struct TestMediatorBuilder {
     enable_inter_mediator_relay: Option<bool>,
     /// Override for `SecurityConfig.trust_task_verification`.
     trust_task_verification: Option<TrustTaskVerification>,
+    /// Override for `SecurityConfig.tsp_auth_accept_unbound_until`.
+    tsp_auth_accept_unbound_until: Option<Option<u64>>,
     /// Override for the CORS origin policy (`security.cors_allow_origin`).
     cors_origins: Option<CorsOriginPolicy>,
     /// Override for `SecurityConfig.jwt_access_expiry` (seconds).
@@ -420,6 +422,7 @@ impl Default for TestMediatorBuilder {
             block_remote_admin_msgs: None,
             enable_inter_mediator_relay: None,
             trust_task_verification: None,
+            tsp_auth_accept_unbound_until: None,
             cors_origins: None,
             jwt_access_expiry_secs: None,
             jwt_refresh_expiry_secs: None,
@@ -831,6 +834,14 @@ impl TestMediatorBuilder {
         self
     }
 
+    /// Override `tsp_auth_accept_unbound_until`: the Unix time until which
+    /// `POST /tsp/authenticate` also accepts the older request that signs only
+    /// the challenge string. Defaults to the production value, `None` (never).
+    pub fn tsp_auth_accept_unbound_until(mut self, until: Option<u64>) -> Self {
+        self.tsp_auth_accept_unbound_until = Some(until);
+        self
+    }
+
     /// Override JWT expiries. Defaults: 900 s access, 86 400 s refresh.
     /// Useful for testing token-refresh flows by shrinking access
     /// expiry to a few seconds.
@@ -1066,6 +1077,9 @@ impl TestMediatorBuilder {
         }
         if let Some(b) = self.enable_inter_mediator_relay {
             security.enable_inter_mediator_relay = b;
+        }
+        if let Some(until) = self.tsp_auth_accept_unbound_until {
+            security.tsp_auth_accept_unbound_until = until;
         }
         if let Some(mode) = self.trust_task_verification {
             security.trust_task_verification = mode;
