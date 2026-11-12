@@ -288,7 +288,8 @@ async fn a_named_account_gets_room_beside_the_monitor() {
     let anon_before = before.contains("✓anonReceive");
 
     app.handle_key(key(KeyCode::Char('e')));
-    app.handle_key(key(KeyCode::Down)); // past the role row, to anonReceive
+    // A non-root admin is not offered the role row (only a rootAdmin may
+    // change roles), so the first row is anonReceive.
     app.handle_key(key(KeyCode::Char(' ')));
     app.handle_key(key(KeyCode::Char('s')));
     // Saved, and the reloaded account shows the flag flipped.

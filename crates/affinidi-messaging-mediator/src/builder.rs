@@ -457,9 +457,11 @@ impl MediatorBuilder {
     /// pre-built JWT keys from your secrets backend, configure CORS,
     /// adjust ACL defaults, etc.
     ///
-    /// Defaults from [`Config::headless`] use zero-byte JWT keys —
-    /// **that is not usable in production**. Embedded callers must set
-    /// real keys before starting.
+    /// Defaults from [`Config::headless`] use a JWT key pair generated for
+    /// this process, so sessions do not survive a restart and are not shared
+    /// between instances. Set a persistent key with
+    /// [`SecurityConfig::set_jwt_keys_from_pkcs8`] for anything beyond a
+    /// single short-lived process.
     pub fn security(mut self, security: SecurityConfig) -> Self {
         self.config.security = security;
         self

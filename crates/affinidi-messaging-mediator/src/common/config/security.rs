@@ -418,10 +418,11 @@ impl SecurityConfig {
     }
 
     /// Construct a baseline `SecurityConfig` with conservative defaults
-    /// and zero-byte JWT keys. Used by [`Config::headless`] and the
-    /// `MediatorBuilder` as a starting point — embedded callers MUST
-    /// overwrite `jwt_encoding_key` / `jwt_decoding_key` with real
-    /// material before starting the mediator.
+    /// and a JWT key pair generated for this process. Used by
+    /// [`Config::headless`] and the `MediatorBuilder` as a starting point.
+    /// Sessions signed with the generated key end when the process
+    /// restarts, and other instances cannot verify them: a deployment sets
+    /// its own key with [`Self::set_jwt_keys_from_pkcs8`].
     ///
     /// [`Config::headless`]: crate::common::config::Config::headless
     pub fn headless(secrets_resolver: Arc<ThreadedSecretsResolver>) -> Self {
@@ -429,6 +430,7 @@ impl SecurityConfig {
     }
 
     pub(crate) fn default(secrets_resolver: Arc<ThreadedSecretsResolver>) -> Self {
+        let (jwt_encoding_key, jwt_decoding_key) = ephemeral_jwt_keys();
         SecurityConfig {
             mediator_acl_mode: AccessListModeType::ExplicitDeny,
             global_acl_default: MediatorACLSet::default(),
@@ -438,8 +440,8 @@ impl SecurityConfig {
             use_ssl: true,
             ssl_certificate_file: None,
             ssl_key_file: None,
-            jwt_encoding_key: EncodingKey::from_ed_der(&[0; 32]),
-            jwt_decoding_key: DecodingKey::from_ed_der(&[0; 32]),
+            jwt_encoding_key,
+            jwt_decoding_key,
             jwt_access_expiry: 900,
             jwt_refresh_expiry: 86_400,
             cors_allow_origin: build_cors_layer(&CorsOriginPolicy::None),
@@ -841,6 +843,21 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     }
 }
 
+/// A JWT key pair generated for this process. The default until a real key
+/// is set with [`SecurityConfig::set_jwt_keys_from_pkcs8`]: tokens it signs
+/// verify only in this process, and stop verifying when it restarts.
+fn ephemeral_jwt_keys() -> (EncodingKey, DecodingKey) {
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .expect("the system random number generator is available");
+    let pair =
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("a freshly generated key pair parses");
+    (
+        EncodingKey::from_ed_der(pkcs8.as_ref()),
+        DecodingKey::from_ed_der(pair.public_key().as_ref()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -867,6 +884,31 @@ mod tests {
     /// Does `spec`'s allowlist admit request origin `origin`?
     fn allows(spec: &str, origin: &str) -> bool {
         origin_matches(&matchers(spec), &hv(origin))
+    }
+
+    /// The default JWT key signs tokens that verify with its own public key,
+    /// and each process (here, each call) gets a different one.
+    #[test]
+    fn the_default_jwt_key_is_generated_and_distinct() {
+        use jsonwebtoken::{Algorithm, Header, Validation, decode, encode};
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Claims {
+            sub: String,
+            exp: u64,
+        }
+        let claims = Claims {
+            sub: "did:example:alice".into(),
+            exp: u64::MAX / 2,
+        };
+        let (enc, dec) = super::ephemeral_jwt_keys();
+        let (_, other_dec) = super::ephemeral_jwt_keys();
+        let token = encode(&Header::new(Algorithm::EdDSA), &claims, &enc).expect("signs");
+        let validation = Validation::new(Algorithm::EdDSA);
+        assert!(decode::<Claims>(&token, &dec, &validation).is_ok());
+        assert!(
+            decode::<Claims>(&token, &other_dec, &validation).is_err(),
+            "another generated key must not verify it"
+        );
     }
 
     #[test]

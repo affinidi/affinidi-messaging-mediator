@@ -171,6 +171,15 @@ const ENDPOINT_IDLE_TTL: Duration = Duration::from_secs(300);
 /// which gains the capability (or recovers) is picked up without a restart.
 const WS_SUPPRESSION_WINDOW: Duration = Duration::from_secs(300);
 
+/// Whether a WebSocket delivery error is the peer's negative `relay-ack` with
+/// code 429: its per-socket frame budget refused that one frame. That says
+/// nothing about the socket or the next frame, so it must not suppress the
+/// WebSocket transport for the whole endpoint. Matches the text
+/// `send_and_await_ack` builds for a negative ack.
+fn is_frame_budget_refusal(error: &str) -> bool {
+    error.starts_with("peer refused the relayed message:") && error.ends_with("(code 429)")
+}
+
 /// State for a connection to a remote mediator endpoint
 struct EndpointState {
     rate_tracker: EndpointRateTracker,
@@ -1844,21 +1853,32 @@ impl ForwardingProcessor {
                     // refusal carries a mediator error code, not an HTTP
                     // status, so the REST answer is what classifies it as
                     // final or retryable.
-                    let until = Instant::now() + WS_SUPPRESSION_WINDOW;
-                    let first = self.set_ws_suppression(endpoint_url, Some(until)).await;
-                    if first {
-                        warn!(
-                            "WebSocket delivery to {} failed ({}). Falling back to REST and \
-                             suppressing WebSocket for {}s.",
-                            endpoint_url,
-                            ws_err,
-                            WS_SUPPRESSION_WINDOW.as_secs()
+                    if is_frame_budget_refusal(&ws_err) {
+                        // The peer's per-socket frame budget refused this one
+                        // frame. The socket is fine and the next frame may be
+                        // accepted, so only this message goes over REST; the
+                        // endpoint is not suppressed.
+                        debug!(
+                            "Relay frame to {} was over the peer's frame budget; sending it over REST",
+                            endpoint_url
                         );
                     } else {
-                        debug!(
-                            "WebSocket delivery failed for {}, falling back to REST: {}",
-                            endpoint_url, ws_err
-                        );
+                        let until = Instant::now() + WS_SUPPRESSION_WINDOW;
+                        let first = self.set_ws_suppression(endpoint_url, Some(until)).await;
+                        if first {
+                            warn!(
+                                "WebSocket delivery to {} failed ({}). Falling back to REST and \
+                                 suppressing WebSocket for {}s.",
+                                endpoint_url,
+                                ws_err,
+                                WS_SUPPRESSION_WINDOW.as_secs()
+                            );
+                        } else {
+                            debug!(
+                                "WebSocket delivery failed for {}, falling back to REST: {}",
+                                endpoint_url, ws_err
+                            );
+                        }
                     }
                     // The WebSocket attempt can take as long as the relay-ack
                     // timeout; the fallback is a new send, so it is held to
@@ -3507,5 +3527,22 @@ mod tests {
             "reconnected once"
         );
         assert_eq!(pool.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn only_a_429_nack_is_treated_as_a_frame_budget_refusal() {
+        use super::is_frame_budget_refusal;
+        assert!(is_frame_budget_refusal(
+            "peer refused the relayed message: relay frame rate exceeded; send again later (code 429)"
+        ));
+        assert!(!is_frame_budget_refusal(
+            "peer refused the relayed message: loop detected (code 94)"
+        ));
+        assert!(!is_frame_budget_refusal(
+            "peer refused the relayed message: no reason given (code -)"
+        ));
+        assert!(!is_frame_budget_refusal(
+            "no relay-ack within 30s (code 429)"
+        ));
     }
 }

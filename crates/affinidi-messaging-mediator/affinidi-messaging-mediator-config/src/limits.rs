@@ -52,6 +52,22 @@ pub struct LimitsConfigRaw {
     pub ws_send_buffer: String,
     #[serde(default = "default_pubsub_buffer")]
     pub pubsub_buffer: String,
+    /// Concurrent anonymous inter-mediator relay WebSockets one source address
+    /// may hold. Defaulted so an existing `mediator.toml` keeps loading.
+    #[serde(default = "default_relay_connections_per_ip")]
+    pub relay_connections_per_ip: String,
+    /// Sustained frames per second accepted on one relay WebSocket.
+    #[serde(default = "default_relay_frames_per_second")]
+    pub relay_frames_per_second: String,
+    /// Frames a relay WebSocket may send back-to-back above the sustained rate.
+    #[serde(default = "default_relay_frame_burst")]
+    pub relay_frame_burst: String,
+    /// Sustained bytes per second accepted on one relay WebSocket.
+    #[serde(default = "default_relay_bytes_per_second")]
+    pub relay_bytes_per_second: String,
+    /// Requests per second the `/metrics` endpoint answers, across all callers.
+    #[serde(default = "default_metrics_requests_per_second")]
+    pub metrics_requests_per_second: String,
     /// Seconds between the pings the mediator sends on each WebSocket.
     #[serde(default = "default_ws_ping_interval_secs")]
     pub ws_ping_interval_secs: String,
@@ -137,6 +153,27 @@ fn default_ws_send_buffer() -> String {
 fn default_pubsub_buffer() -> String {
     "16777216".to_string()
 }
+/// 10 — a relaying mediator pools one socket per endpoint, so ten covers a
+/// handful of peers sharing one egress address.
+fn default_relay_connections_per_ip() -> String {
+    "10".to_string()
+}
+fn default_relay_frames_per_second() -> String {
+    "50".to_string()
+}
+fn default_relay_frame_burst() -> String {
+    "100".to_string()
+}
+/// 4 MiB/s. A single frame larger than this is still admitted (the byte bucket
+/// is always at least `ws_size` deep), it just uses up the allowance.
+fn default_relay_bytes_per_second() -> String {
+    "4194304".to_string()
+}
+/// 5 — a Prometheus scrape is one request every 10-60 s per scraper.
+fn default_metrics_requests_per_second() -> String {
+    "5".to_string()
+}
+
 /// 30 s between pings.
 fn default_ws_ping_interval_secs() -> String {
     "30".to_string()

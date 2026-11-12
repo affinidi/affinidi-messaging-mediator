@@ -192,8 +192,9 @@ Same as online mode:
 
 | Symptom | Cause | Remedy |
 |---|---|---|
-| "A bootstrap is already in progress" on phase 1 | Previous phase-1 run didn't finalise; seed is still in the secret backend's sweep index | Either run phase 2 with `--bundle` to finalise, wait for the 24h auto-sweep (`MEDIATOR_BOOTSTRAP_SEED_TTL` overrides), or re-run with `--force-reprovision` to wipe |
+| "A bootstrap is already in progress" on phase 1 | Previous phase-1 run didn't finalise; seed is still in the secret backend's sweep index | Either run phase 2 with `--bundle` to finalise, wait for the 24h auto-sweep (`MEDIATOR_BOOTSTRAP_SEED_TTL` overrides), or re-run phase 1 with `--force-reprovision`, which discards the in-flight request's seed (a bundle already made for it can no longer be opened) |
 | "could not locate the ephemeral seed" on phase 2 | Phase 2 is pointing at a different secret backend than phase 1, or the seed was swept / manually deleted | Re-run phase 2 with the same recipe (same `[secrets].backend`) as phase 1; confirm the bundle id in the error matches what phase 1 printed |
+| "the bundle digest is required" on phase 2 | `--digest` was not given | Pass the digest the VTA host printed. `--allow-bundle-without-digest` skips it for a throwaway dev setup only |
 | "provided digest did not match the bundle" | The digest you typed differs from what the VTA printed | Re-copy the digest from the VTA host; if it still fails, the bundle was tampered with — re-request |
 | Phase 1 fails with "requires identity.public_url" | Recipe doesn't set the mediator URL | Add `public_url = "https://..."` under `[identity]` in the recipe — the VTA's `didcomm-mediator` template needs it to render the mediator DID |
 | Bundle opens but `did.jsonl` doesn't get written | Config dir is not writable, or `--config` points at a path with no parent directory | Check permissions on the directory holding `mediator.toml` |
@@ -364,16 +365,25 @@ wizard surfaces the proof type after unsealing:
   from its declared DID. Stronger, but requires the VTA's DID to be
   publicly resolvable at the time of unsealing. The wizard logs the
   claim today but does not perform the resolve-and-verify step — a
-  tracked gap for a future release.
+  tracked gap for a future release. Until it does, a `DidSigned`
+  bundle is trusted only through the digest, like `PinnedOnly`.
 - `Attested`: vendor-format attestation (e.g. AWS Nitro). Not yet
   wired into the mediator wizard.
 
 **Out-of-band SHA-256 digest.** The VTA side prints a digest when it
 produces the bundle. You type that into `--digest` (or the TUI's
 verify screen). Any mismatch aborts the apply before any key
-material leaves the bundle. The optional-ness is intentional — for
-low-stakes dev work the bundle's AEAD is sufficient — but for
-production rollouts always pass `--digest`.
+material leaves the bundle. The digest is required for every proof
+type. The bundle's encryption (HPKE base mode) does not identify the
+sender: it shows only that the bundle was sealed to the request's
+public key, and the request file is public. Without the digest,
+anyone who has seen the request file could seal a bundle the wizard
+would accept. Carry the digest over a different channel from the
+bundle. For a throwaway dev setup, `--allow-bundle-without-digest`
+opens a bundle without one; the TUI has no such option.
+
+The bundle must also answer this run's request: a bundle whose id
+differs from the request's nonce is refused.
 
 **Authorization VC inside the bundle.** FullSetup-shaped bundles
 include a VC. The mediator archives it next to `mediator.toml` for

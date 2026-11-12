@@ -59,7 +59,12 @@ impl Database {
 
         if let Some(state) = session_db.get("state") {
             match SessionState::try_from(state) {
-                Ok(parsed) => session.state = parsed,
+                Ok(parsed) => {
+                    // The record holds the state only; `authenticated` is
+                    // derived from it, as the other backends store it.
+                    session.authenticated = parsed == SessionState::Authenticated;
+                    session.state = parsed;
+                }
                 Err(_) => {
                     // Corrupt session record — typically left over
                     // from a pre-0.14.x mediator that wrote `Unknown`
@@ -307,17 +312,38 @@ impl Database {
 
         let sid = format!("SESSION:{session_id}");
 
-        redis::Cmd::hset(&sid, "refresh_token_hash", refresh_token_hash)
-            .exec_async(&mut con)
-            .await
-            .map_err(|err| {
-                MediatorError::session_from_redis(
-                    14,
-                    session_id.into(),
-                    &err,
-                    format!("Failed to update refresh token hash for session ({session_id}). Reason: {err}"),
-                )
-            })?;
+        // Only an existing session is updated: a bare HSET would recreate a
+        // session that expired or ended meanwhile, as a hash with no TTL.
+        let updated: i64 = redis::Script::new(
+            r#"
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], 'refresh_token_hash', ARGV[1])
+  return 1
+end
+return 0
+"#,
+        )
+        .key(&sid)
+        .arg(refresh_token_hash)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::session_from_redis(
+                14,
+                session_id.into(),
+                &err,
+                format!(
+                    "Failed to update refresh token hash for session ({session_id}). Reason: {err}"
+                ),
+            )
+        })?;
+        if updated == 0 {
+            return Err(MediatorError::SessionError(
+                14,
+                session_id.into(),
+                format!("Session not found: {session_id}"),
+            ));
+        }
 
         Ok(())
     }

@@ -26,6 +26,12 @@ on:
 permissions:
   contents: read
 
+# The `closed` and `labeled` events for one PR can run at once; one run at a
+# time per PR, so they never push to the same backport branch together.
+concurrency:
+  group: backport-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   backport:
     name: Backport
@@ -70,13 +76,23 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           CREATED: ${{ steps.backport.outputs.created_pull_numbers }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Commit as the app that pushes, not as github-actions[bot].
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
           for n in $CREATED; do
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::not a PR number: $n"; exit 1; }
             read -r head base < <(gh pr view "$n" --json headRefName,baseRefName \
               --jq '.headRefName + " " + .baseRefName')
+            # Only a backport branch onto a release branch is touched.
+            if ! [[ "$base" =~ ^release/[0-9]+\.[0-9]+$ && "$head" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+              echo "::error::#$n: unexpected branches '$head' -> '$base'"
+              exit 1
+            fi
             git fetch --no-tags --depth=1 origin \
               "+refs/heads/$base:refs/remotes/origin/$base" \
               "+refs/heads/$head:refs/remotes/origin/$head"

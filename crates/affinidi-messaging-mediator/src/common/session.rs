@@ -91,7 +91,7 @@ impl Display for SessionState {
 }
 
 /// An authentication session, linking a DID to its auth state and permissions.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     /// Unique session identifier (not serialized; populated from the
     /// backend's session key on read).

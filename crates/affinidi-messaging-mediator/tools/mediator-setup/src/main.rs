@@ -77,6 +77,19 @@ const RENDERING_TICK_RATE: Duration = Duration::from_millis(250);
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Headless modes write to a plain terminal or a CI log, so their
+    // `tracing` diagnostics (sweep and cleanup failures, the trust
+    // posture of a sealed bundle) go to stderr. The TUI gets no
+    // subscriber: output there would draw over the alternate screen.
+    if args.from.is_some()
+        || args.non_interactive
+        || args.uninstall
+        || args.setup_key_out.is_some()
+        || args.setup_key_file.is_some()
+    {
+        init_headless_logging();
+    }
+
     // `--uninstall` is mutually exclusive with every other mode. Run it
     // up-front so flag combinations like `--uninstall --from recipe.toml`
     // can't accidentally re-provision after teardown.
@@ -137,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
             args.force_reprovision,
             args.bundle.as_deref(),
             args.digest.as_deref(),
+            args.allow_bundle_without_digest,
         )
         .await;
     } else if args.bundle.is_some() {
@@ -413,6 +427,7 @@ async fn run_from_recipe(
     force_reprovision: bool,
     bundle_path: Option<&std::path::Path>,
     digest: Option<&str>,
+    allow_bundle_without_digest: bool,
 ) -> anyhow::Result<()> {
     let recipe = recipe::load(recipe_path)?;
     let mut config = recipe::to_wizard_config(&recipe)?;
@@ -448,7 +463,16 @@ async fn run_from_recipe(
             consts::VTA_MODE_SEALED_MINT | consts::VTA_MODE_SEALED_EXPORT | consts::VTA_MODE_ONLINE
         ) {
         use bootstrap_headless::HeadlessOutcome;
-        let outcome = bootstrap_headless::dispatch(&config, bundle_path, digest).await?;
+        let outcome = bootstrap_headless::dispatch(
+            &config,
+            bundle_path,
+            bootstrap_headless::DispatchOptions {
+                digest,
+                allow_without_digest: allow_bundle_without_digest,
+                force_reprovision,
+            },
+        )
+        .await?;
         match outcome {
             HeadlessOutcome::RequestEmitted {
                 request_path,
@@ -636,19 +660,6 @@ fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: KeyModifiers)
     // creds in the environment).
     if code == KeyCode::F(5) {
         app.kick_off_discovery();
-        return;
-    }
-
-    // F2 on the sealed-handoff DigestVerify phase copies the
-    // wizard-computed digest to the clipboard. F2 (not a bare
-    // letter) because the panel has an active text input for the
-    // operator's OOB-shared digest — letters would land in the
-    // field. Routes through the SSH-aware copy helper.
-    if code == KeyCode::F(2)
-        && let Some(state) = app.sealed_handoff.as_mut()
-        && state.phase == crate::sealed_handoff::SealedPhase::DigestVerify
-    {
-        state.copy_digest_to_clipboard();
         return;
     }
 
@@ -1519,7 +1530,10 @@ async fn provision_secret_backend(
     probe: secret_backend::ProvisionProbe,
 ) -> anyhow::Result<()> {
     let backend_url = config_writer::build_backend_url(config);
-    println!("  Provisioning unified secret backend: {backend_url}");
+    println!(
+        "  Provisioning unified secret backend: {}",
+        affinidi_messaging_mediator_common::redact::redact_url(&backend_url)
+    );
     // macOS Keychain prompts once per keychain item the first time a
     // given binary (code-signature ACL) accesses it. Each `cargo
     // build` produces a new binary — so operators rebuilding the
@@ -2200,12 +2214,12 @@ fn print_phase1_next_steps(
     println!();
     println!("  \x1b[1mThen — back on this host, run:\x1b[0m");
     println!(
-        "    \x1b[36mmediator-setup --from {recipe_path} --bundle bundle.armor \\\n     [--digest <sha256>]\x1b[0m"
+        "    \x1b[36mmediator-setup --from {recipe_path} --bundle bundle.armor \\\n     --digest <sha256>\x1b[0m"
     );
     println!();
     println!(
-        "  \x1b[2mThe --digest is optional but recommended — paste the SHA-256\n  \
-         the VTA admin prints out-of-band.\x1b[0m"
+        "  \x1b[2mThe --digest is required — paste the SHA-256 the VTA admin\n  \
+         prints, received over a separate channel from the bundle.\x1b[0m"
     );
 }
 
@@ -2441,6 +2455,19 @@ fn print_final_summary(config: &app::WizardConfig) {
     );
 
     println!();
+}
+
+/// stderr logging for the headless modes. `RUST_LOG` overrides the
+/// default, which shows this tool's own info lines and every warning.
+fn init_headless_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,mediator_setup=info"));
+    // Another subscriber already installed is not an error worth failing on.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }
 
 #[cfg(test)]

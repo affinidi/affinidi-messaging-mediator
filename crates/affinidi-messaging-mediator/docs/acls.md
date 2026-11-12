@@ -347,9 +347,30 @@ blunt instrument for cutting a DID off from its inbox.
 ### Account types
 
 `Standard`, `Admin`, `RootAdmin`, `Mediator`. Admin and RootAdmin may
-operate on any DID; a Standard account may only target its own DID hash.
-Creating an Admin requires admin rights; creating a RootAdmin requires
-RootAdmin.
+operate on any DID; any other account — `Mediator` (the mediator's own
+account) and an account whose role did not decode included — may only target
+its own DID hash and is gated like a Standard account.
+
+`Admin`, `RootAdmin` and `Mediator` are privileged roles. Only a RootAdmin
+may create an account with one, grant one, change the role of an account
+holding one, or change, remove or edit the access list of an account holding
+one other than its own. An account whose stored role did not decode is
+treated the same way, so only a RootAdmin can change or repair it. An Admin
+manages Standard accounts. The roles of the mediator's own account and of
+the configured `admin_did` are not changed by any Trust Task.
+
+The caller's role is read from the store for each Trust Task and OOB
+invitation delete, not from the session token.
+
+### Who a request acts for
+
+A request to the mediator itself — trust ping, discover features, message
+pickup, any Trust Task — acts for the session's account, so it must arrive on
+an authenticated session and must not be authenticated as a different DID
+(`400 authorization.did.session_mismatch`). The anonymous inter-mediator
+relay session may only relay forwards (`401
+authorization.authentication_required`). This holds whatever
+`force_session_did_match` says; that switch governs what a session may send.
 
 Administration is done only through Trust Tasks; the list is in
 [`didcomm-protocols.md` §4](./didcomm-protocols.md#4-administration-trust-tasks).
@@ -358,7 +379,8 @@ Administration is done only through Trust Tasks; the list is in
 
 - `block_remote_admin_msgs = "true"` (default) requires an admin's Trust
   Task to be signed or authcrypted by a key of the session DID, so admin
-  operations cannot be relayed in from elsewhere.
+  operations cannot be relayed in from elsewhere. Every Trust Task is now
+  held to this (see "Who a request acts for").
 - `trust_task_verification` checks each Trust Task's `proof`, `issuedAt`
   (bounding replay) and issuer. The default `"warn"` logs failures and still
   runs the task; `"enforce"` refuses them.

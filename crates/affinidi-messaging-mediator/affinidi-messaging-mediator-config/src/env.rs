@@ -67,7 +67,6 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     env_override!(config.server.admin_did, "ADMIN_DID");
     env_override_opt!(config.server.did_web_self_hosted, "DID_WEB_SELF_HOSTED");
     env_override_list!(config.server.local_endpoints, "LOCAL_ENDPOINTS");
-
     env_override!(config.database.functions_file, "DATABASE_FUNCTIONS_FILE");
     env_override!(config.database.database_url, "DATABASE_URL");
     // DATABASE_POOL_SIZE removed — the mediator uses a multiplexed
@@ -199,6 +198,23 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
     env_override!(config.limits.ws_send_buffer, "LIMIT_WS_SEND_BUFFER");
     env_override!(config.limits.pubsub_buffer, "LIMIT_PUBSUB_BUFFER");
+    env_override!(
+        config.limits.relay_connections_per_ip,
+        "LIMIT_RELAY_CONNECTIONS_PER_IP"
+    );
+    env_override!(
+        config.limits.relay_frames_per_second,
+        "LIMIT_RELAY_FRAMES_PER_SECOND"
+    );
+    env_override!(config.limits.relay_frame_burst, "LIMIT_RELAY_FRAME_BURST");
+    env_override!(
+        config.limits.relay_bytes_per_second,
+        "LIMIT_RELAY_BYTES_PER_SECOND"
+    );
+    env_override!(
+        config.limits.metrics_requests_per_second,
+        "LIMIT_METRICS_REQUESTS_PER_SECOND"
+    );
     env_override!(
         config.limits.ws_ping_interval_secs,
         "LIMIT_WS_PING_INTERVAL_SECS"
@@ -345,12 +361,25 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     env_override_opt!(config.secrets.cache_ttl, "MEDIATOR_SECRETS_CACHE_TTL");
 }
 
-/// Override `[server] trust_xff_cidrs` from a comma-separated `TRUST_XFF_CIDRS`
-/// value.
+/// Parse a comma-separated list of CIDR ranges from environment variable
+/// `var`.
 ///
 /// Unlike the plain string lists this one is parsed, and a bad entry is an
-/// error: silently dropping a typo would leave every client behind the proxy
-/// sharing one rate-limit bucket with no sign why. `""` clears the list.
+/// error: silently dropping a typo would change who the range admits with no
+/// sign why. `""` is the empty list.
+fn parse_cidr_list(var: &str, value: &str) -> Result<Vec<ipnet::IpNet>, ConfigError> {
+    split_list(value)
+        .iter()
+        .map(|entry| {
+            entry.parse().map_err(|err| {
+                ConfigError::Parse(format!("{var} entry '{entry}' is not a CIDR range: {err}"))
+            })
+        })
+        .collect()
+}
+
+/// Override `[server] trust_xff_cidrs` from a comma-separated `TRUST_XFF_CIDRS`
+/// value. `""` clears the list.
 fn apply_trust_xff_cidrs_override(
     config: &mut ConfigRaw,
     value: Option<String>,
@@ -358,16 +387,57 @@ fn apply_trust_xff_cidrs_override(
     let Some(value) = value else {
         return Ok(());
     };
-    config.server.trust_xff_cidrs = split_list(&value)
-        .iter()
-        .map(|entry| {
-            entry.parse().map_err(|err| {
-                ConfigError::Parse(format!(
-                    "TRUST_XFF_CIDRS entry '{entry}' is not a CIDR range: {err}"
-                ))
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    config.server.trust_xff_cidrs = parse_cidr_list("TRUST_XFF_CIDRS", &value)?;
+    Ok(())
+}
+
+/// Override `[server] metrics_allow_cidrs` from a comma-separated
+/// `METRICS_ALLOW_CIDRS` value. `""` is an empty list, which refuses every
+/// caller; leave the variable unset to keep the file's value (or the default).
+fn apply_metrics_allow_cidrs_override(
+    config: &mut ConfigRaw,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    config.server.metrics_allow_cidrs = Some(parse_cidr_list("METRICS_ALLOW_CIDRS", &value)?);
+    Ok(())
+}
+
+/// Override `[server] metrics_bearer_token` from `METRICS_BEARER_TOKEN`.
+///
+/// An empty (or all-whitespace) value is refused, as is an empty token in the
+/// file: either would leave `/metrics` without the token the operator meant to
+/// require, usually because a secret reference rendered as `""`. Leave the
+/// variable unset to keep the file's token; remove the key from the file to
+/// require none.
+fn apply_metrics_bearer_token_override(
+    config: &mut ConfigRaw,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(ConfigError::Parse(
+                "METRICS_BEARER_TOKEN is set but empty. Unset it to keep [server] \
+                 metrics_bearer_token from the configuration file, or set a token"
+                    .into(),
+            ));
+        }
+        config.server.metrics_bearer_token = Some(crate::RedactedString(value));
+    }
+    if config
+        .server
+        .metrics_bearer_token
+        .as_ref()
+        .is_some_and(|token| token.0.trim().is_empty())
+    {
+        return Err(ConfigError::Parse(
+            "[server] metrics_bearer_token is empty. Set a token, or remove the key to \
+             require none"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -407,6 +477,8 @@ pub fn read_config_file_with_unknown_keys(
 
     apply_env_overrides(&mut config);
     apply_trust_xff_cidrs_override(&mut config, std::env::var("TRUST_XFF_CIDRS").ok())?;
+    apply_metrics_allow_cidrs_override(&mut config, std::env::var("METRICS_ALLOW_CIDRS").ok())?;
+    apply_metrics_bearer_token_override(&mut config, std::env::var("METRICS_BEARER_TOKEN").ok())?;
 
     Ok((config, unknown_keys))
 }
@@ -506,7 +578,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_trust_xff_cidrs_override, parse_config, split_list, unknown_key_message};
+    use super::{
+        apply_metrics_allow_cidrs_override, apply_metrics_bearer_token_override,
+        apply_trust_xff_cidrs_override, parse_config, split_list, unknown_key_message,
+    };
 
     const SHIPPED: &str = include_str!("../../conf/mediator.toml");
 
@@ -676,5 +751,69 @@ mod tests {
             Err(crate::error::ConfigError::Parse(msg)) => assert!(msg.contains("nope")),
             other => panic!("expected Parse error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_empty_metrics_bearer_token_is_refused_not_cleared() {
+        let token = |config: &crate::ConfigRaw| {
+            config
+                .server
+                .metrics_bearer_token
+                .as_ref()
+                .map(|t| t.0.clone())
+        };
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        config.server.metrics_bearer_token = Some(crate::RedactedString("from-file".into()));
+
+        // Unset keeps the file's token; a value replaces it.
+        apply_metrics_bearer_token_override(&mut config, None).expect("unset");
+        assert_eq!(token(&config).as_deref(), Some("from-file"));
+        apply_metrics_bearer_token_override(&mut config, Some("from-env".into())).expect("set");
+        assert_eq!(token(&config).as_deref(), Some("from-env"));
+
+        // An empty or blank value is refused and leaves the token in place.
+        for empty in ["", "   "] {
+            let err = apply_metrics_bearer_token_override(&mut config, Some(empty.into()))
+                .expect_err("an empty METRICS_BEARER_TOKEN is refused");
+            assert!(err.to_string().contains("METRICS_BEARER_TOKEN"), "{err}");
+            assert_eq!(token(&config).as_deref(), Some("from-env"));
+        }
+
+        // An empty token in the file is refused too.
+        config.server.metrics_bearer_token = Some(crate::RedactedString(String::new()));
+        assert!(apply_metrics_bearer_token_override(&mut config, None).is_err());
+
+        // No token anywhere is allowed: the allow-list alone applies.
+        config.server.metrics_bearer_token = None;
+        apply_metrics_bearer_token_override(&mut config, None).expect("no token");
+        assert_eq!(token(&config), None);
+    }
+
+    #[test]
+    fn metrics_allow_cidrs_env_sets_clears_or_keeps_the_list() {
+        let (mut config, _) = parse_config(SHIPPED).expect("shipped config parses");
+        apply_metrics_allow_cidrs_override(&mut config, None).expect("no-op");
+        assert_eq!(
+            config.server.metrics_allow_cidrs, None,
+            "absent keeps default"
+        );
+        apply_metrics_allow_cidrs_override(&mut config, Some("10.1.0.0/16, ::1/128".into()))
+            .expect("valid list");
+        assert_eq!(
+            config.server.metrics_allow_cidrs.as_ref().map(Vec::len),
+            Some(2)
+        );
+        apply_metrics_allow_cidrs_override(&mut config, Some(String::new())).expect("empty");
+        assert_eq!(config.server.metrics_allow_cidrs, Some(Vec::new()));
+        let err = apply_metrics_allow_cidrs_override(&mut config, Some("nope".into()));
+        assert!(
+            matches!(err, Err(crate::error::ConfigError::Parse(m)) if m.contains("METRICS_ALLOW_CIDRS"))
+        );
+    }
+
+    #[test]
+    fn the_metrics_token_is_not_printed_by_debug() {
+        let token = crate::RedactedString("s3cret-value".into());
+        assert!(!format!("{token:?}").contains("s3cret"));
     }
 }

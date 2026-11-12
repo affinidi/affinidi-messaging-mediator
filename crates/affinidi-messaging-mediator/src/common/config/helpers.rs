@@ -40,6 +40,7 @@ use tracing::{error, info, warn};
 
 use super::AwsConfig;
 use super::processors::ForwardingConfig;
+use crate::common::relay_target::canonical_relay_target;
 
 /// Check if any DID-resolution field uses `aws_parameter_store://` or
 /// `s3://`, requiring the AWS SDK to be initialised. Secret-store backends
@@ -532,7 +533,9 @@ pub(crate) async fn assert_operating_secrets_cover_key_agreement(
     ))
 }
 
-/// Creates a set of URI's that can be used to detect if forwarding loopbacks to the mediator could occur
+/// Creates a set of URI's that can be used to detect if forwarding loopbacks to the mediator could occur.
+/// Entries are stored in their [`canonical_relay_target`] form, which is the form
+/// every lookup compares against.
 pub(crate) async fn load_forwarding_protection_blocks(
     did_resolver: &DIDCacheClient,
     forwarding_config: &mut ForwardingConfig,
@@ -563,19 +566,25 @@ pub(crate) async fn load_forwarding_protection_blocks(
             )
         })?;
 
-        forwarding_config.blocked_forwarding.insert(did.clone());
+        forwarding_config
+            .blocked_forwarding
+            .insert(canonical_relay_target(&did));
 
         for service in doc.doc.service.iter() {
             match &service.service_endpoint {
                 Endpoint::Url(uri) => {
-                    forwarding_config.blocked_forwarding.insert(uri.to_string());
+                    forwarding_config
+                        .blocked_forwarding
+                        .insert(canonical_relay_target(uri.as_ref()));
                 }
                 Endpoint::Map(map) => {
                     if let Some(endpoints) = map.as_array() {
                         for endpoint in endpoints {
                             if let Some(uri) = endpoint.get("uri") {
                                 if let Some(uri) = uri.as_str() {
-                                    forwarding_config.blocked_forwarding.insert(uri.into());
+                                    forwarding_config
+                                        .blocked_forwarding
+                                        .insert(canonical_relay_target(uri));
                                 } else {
                                     warn!("Couldn't parse URI as a string: {uri:#?}");
                                 }
@@ -587,7 +596,9 @@ pub(crate) async fn load_forwarding_protection_blocks(
                         }
                     } else if let Some(uri) = map.get("uri") {
                         if let Some(uri) = uri.as_str() {
-                            forwarding_config.blocked_forwarding.insert(uri.into());
+                            forwarding_config
+                                .blocked_forwarding
+                                .insert(canonical_relay_target(uri));
                         } else {
                             warn!("Couldn't parse URI as a string: {uri:#?}");
                         }

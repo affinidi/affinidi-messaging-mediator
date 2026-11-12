@@ -1116,6 +1116,53 @@ impl MediatorStore for MemoryStore {
         Ok(())
     }
 
+    /// Promote and rename under the store's single state lock: the challenge
+    /// session must exist, be unexpired and still be waiting for its answer,
+    /// so of two answers to one challenge only the first promotes it.
+    async fn update_session_authenticated(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(record) = state.get_session_record(old_session_id) else {
+            return Err(
+                affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                    old_session_id,
+                ),
+            );
+        };
+        if record.session.state != SessionState::ChallengeSent {
+            return Err(
+                affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                    old_session_id,
+                ),
+            );
+        }
+        let mut session = record.session.clone();
+        state.sessions.remove(old_session_id);
+
+        session.session_id = new_session_id.to_string();
+        if session.did.is_empty() {
+            session.did = did.to_string();
+            session.did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
+        }
+        session.state = SessionState::Authenticated;
+        session.authenticated = true;
+        session.refresh_token_hash = Some(refresh_token_hash.to_string());
+        state.sessions.insert(
+            new_session_id.to_string(),
+            SessionRecord {
+                session,
+                expires_at: Instant::now() + Duration::from_secs(86_400),
+            },
+        );
+        state.incr_counter("SESSIONS_SUCCESS", 1);
+        Ok(())
+    }
+
     /// Compare-and-swap under the store's single state lock, so it cannot
     /// interleave with another rotation or session write.
     async fn rotate_refresh_token_hash(

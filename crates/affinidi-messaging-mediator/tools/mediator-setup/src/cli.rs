@@ -96,13 +96,20 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub bundle: Option<PathBuf>,
 
-    /// Phase 2 only: optional SHA-256 digest the VTA admin printed
-    /// out-of-band. When present, the wizard verifies the bundle's
-    /// canonical digest matches before unsealing and refuses on
-    /// mismatch. Omit to skip the OOB check (the bundle's internal
-    /// AEAD still authenticates the payload).
+    /// Phase 2 only: the SHA-256 digest the VTA admin printed, carried
+    /// over a separate channel. Required: the wizard verifies the
+    /// bundle's canonical digest before unsealing and refuses on
+    /// mismatch. The bundle's encryption does not identify its sender
+    /// and the producer's signature is not verified yet, so the digest
+    /// is what ties the bundle to the VTA admin.
     #[arg(long, value_name = "HEX")]
     pub digest: Option<String>,
+
+    /// Phase 2 only: open the bundle without `--digest`. Nothing then
+    /// ties the bundle to the VTA admin — anyone who has seen the
+    /// request file could have sealed it. For throwaway dev setups.
+    #[arg(long, requires = "bundle", conflicts_with = "digest")]
+    pub allow_bundle_without_digest: bool,
 
     // ── Online-VTA connection flags ────────────────────────────────────
     /// VTA DID (e.g. did:webvh:vta.example.com). Pre-fills the TUI; required

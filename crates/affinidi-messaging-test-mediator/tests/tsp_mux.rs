@@ -1135,10 +1135,21 @@ async fn notice_in(env: &TestEnvironment, principal: &TestUser, frame: &[u8]) ->
 /// The next notice on the SDK socket, skipping events and other frames.
 async fn sdk_notice(env: &TestEnvironment, principal: &TestUser, sock: &mut SdkMux) -> Value {
     loop {
-        if let TspMuxFrame::Data { frame, .. } = sdk_next(sock).await
-            && let Some(doc) = notice_in(env, principal, &frame).await
-        {
-            return doc;
+        match sdk_next(sock).await {
+            // The SDK opens and verifies a notice itself; the frame it came in
+            // is still sealed for the principal over TSP.
+            TspMuxFrame::Notice { notice, frame } => {
+                assert!(
+                    notice_in(env, principal, &frame).await.is_some(),
+                    "a TSP frame from the mediator, to the principal"
+                );
+                return serde_json::to_value(&*notice).expect("notice as JSON");
+            }
+            TspMuxFrame::Data { frame, .. } => assert!(
+                notice_in(env, principal, &frame).await.is_none(),
+                "the SDK hands a notice over as a notice"
+            ),
+            _ => {}
         }
     }
 }
@@ -1275,7 +1286,9 @@ async fn ack_on_socket(
 /// `messaging/mux/ack` on a tsp-mux socket deletes the principal's own frame
 /// and a member's with `delete`, refuses a member's without it
 /// (`notPermitted`) and an id nobody here holds (`notFound`), and its answer
-/// comes on the socket without being stored.
+/// comes on the socket without being stored. A member carried only to send
+/// is not told apart: its message is `notFound`, though the principal knows
+/// the id, as the sender of a message would.
 #[tokio::test]
 async fn acks_on_the_socket_follow_each_members_delete_scope() {
     init_tracing();
@@ -1283,16 +1296,42 @@ async fn acks_on_the_socket_follow_each_members_delete_scope() {
     let principal = env.add_user("device").await.unwrap();
     let work = env.add_user("work").await.unwrap();
     let home = env.add_user("home").await.unwrap();
+    let outbox = env.add_user("outbox").await.unwrap();
     let sender = env.add_user("sender").await.unwrap();
     relate_to_mediator(&env, &principal).await;
-    for m in [&work, &home, &principal] {
+    for m in [&work, &home, &principal, &outbox] {
         env.relate_directly(&sender, m).await.unwrap();
     }
     grant(&env, &work, &principal, &["receive", "delete"]).await;
     grant(&env, &home, &principal, &["receive"]).await;
+    grant(&env, &outbox, &principal, &["send"]).await;
 
     let (mut ws, _, _) = connect(&env, &principal, &MUX_OFFER).await;
-    expect_ready_and_attached(&env, &mut ws, &principal, &[&work, &home]).await;
+    expect_ready_and_attached(&env, &mut ws, &principal, &[&work, &home, &outbox]).await;
+
+    // Mail for the send-only member is not delivered here; its id is known
+    // all the same (read from the member's own inbox, as its sender could
+    // compute it).
+    env.atm
+        .tsp()
+        .send(&sender.profile, &outbox.did, b"not yours")
+        .await
+        .expect("send");
+    let outbox_id = timeout(Duration::from_secs(5), async {
+        loop {
+            let listed = env
+                .atm
+                .fetch_messages(&outbox.profile, &FetchOptions::default())
+                .await
+                .expect("fetch");
+            if let Some(m) = listed.success.first() {
+                return m.msg_id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("stored for the send-only member");
 
     let mut frames = std::collections::HashMap::new();
     for to in [&principal, &work, &home] {
@@ -1310,7 +1349,13 @@ async fn acks_on_the_socket_follow_each_members_delete_scope() {
         &env,
         &principal,
         &mut ws,
-        &[id(&principal), id(&work), id(&home), unknown.clone()],
+        &[
+            id(&principal),
+            id(&work),
+            id(&home),
+            unknown.clone(),
+            outbox_id.clone(),
+        ],
     )
     .await;
     assert_eq!(answer["type"], format!("{ACK_TYPE}#response"), "{answer:#}");
@@ -1346,6 +1391,10 @@ async fn acks_on_the_socket_follow_each_members_delete_scope() {
         refused.contains(&(unknown, "notFound".into())),
         "{refused:?}"
     );
+    assert!(
+        refused.contains(&(outbox_id, "notFound".into())),
+        "a send-only member's mail is not confirmed: {refused:?}"
+    );
 
     assert_eq!(
         inbox_len(&env, &principal).await,
@@ -1354,6 +1403,7 @@ async fn acks_on_the_socket_follow_each_members_delete_scope() {
     );
     assert_eq!(inbox_len(&env, &work).await, 0, "deleted with `delete`");
     assert_eq!(inbox_len(&env, &home).await, 1, "kept without `delete`");
+    assert_eq!(inbox_len(&env, &outbox).await, 1, "kept, never shown here");
 
     // Asking again changes nothing.
     let (answer, _) = ack_on_socket(&env, &principal, &mut ws, &[id(&work)]).await;
