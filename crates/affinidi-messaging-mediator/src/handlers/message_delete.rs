@@ -103,8 +103,9 @@ pub(crate) struct DeleteResult {
     pub id: String,
     /// `Ok` once the message is deleted.
     pub outcome: Result<(), MediatorError>,
-    /// Not deleted, but held for a member this connection carries without
-    /// the `delete` scope (or whose standing has lapsed).
+    /// Not deleted, but held for a member whose mail this connection reads
+    /// (`receive` or `pickup`), without the `delete` scope (or whose
+    /// standing has lapsed).
     pub member_without_delete: bool,
 }
 
@@ -194,9 +195,13 @@ pub(crate) async fn delete_for_session(
                 );
             }
             Err(_) => {
-                // Held for a member this connection carries, which may not
-                // delete it?
-                for member in crate::mux::connection::members(state, &session.session_id).await {
+                // Held for a member whose mail this connection reads, which
+                // may not delete it? Only such a member is told apart: for
+                // any other, the answer would confirm a message the principal
+                // was never shown (one it sent, say).
+                for member in
+                    crate::mux::connection::members_reading(state, &session.session_id).await
+                {
                     if (!owners.contains(&member)
                         || !crate::mux::connection::allows(
                             state,

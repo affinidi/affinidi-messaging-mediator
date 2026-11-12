@@ -1080,15 +1080,22 @@ pub async fn members_with(state: &SharedData, session_id: &str, cap: MuxCapabili
         .collect()
 }
 
-/// Every member of `session_id`'s mux connection, whatever its scope.
-pub async fn members(state: &SharedData, session_id: &str) -> Vec<String> {
+/// The members of `session_id`'s mux connection whose mail it may read
+/// (`receive` or `pickup`, unexpired), whatever their other scopes and
+/// standing. Telling such a member's message apart from a missing one shows
+/// the principal nothing it could not already see; for any other member it
+/// would confirm mail the principal was never shown.
+pub async fn members_reading(state: &SharedData, session_id: &str) -> Vec<String> {
     let Some(conn) = state.mux.get(session_id) else {
         return Vec::new();
     };
-    conn.session
-        .lock()
-        .await
-        .members()
+    let now = state.clock.unix_secs();
+    let s = conn.session.lock().await;
+    s.members()
+        .filter(|m| {
+            s.allows(&m.did_hash, MuxCapability::Receive, now)
+                || s.allows(&m.did_hash, MuxCapability::Pickup, now)
+        })
         .map(|m| m.did_hash.clone())
         .collect()
 }
