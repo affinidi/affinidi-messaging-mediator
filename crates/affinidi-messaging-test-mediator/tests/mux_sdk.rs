@@ -905,7 +905,6 @@ async fn an_ack_on_the_socket_is_answered_there_and_not_stored() {
     );
     env.shutdown().await.unwrap();
 }
-}
 
 /// The SDK's mux connection is dropped by the mediator and the SDK reconnects
 /// on its own (design §10, "Disconnect/reconnect"): the new socket gets a new
