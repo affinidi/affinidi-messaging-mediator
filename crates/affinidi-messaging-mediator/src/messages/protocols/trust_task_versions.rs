@@ -23,8 +23,11 @@
 //! | `audit/list` | `limit` → `pageSize` | `cursor` → `nextCursor`; `truncated` removed |
 //! | `messaging/message/status` | — | `statuses[].at` → `reachedAt` |
 //!
-//! `messaging/monitor/event` is pushed at 0.2 only (`at` → `occurredAt`); it
-//! is not served, so there is no 0.1 to keep beside it (see `crate::monitor`).
+//! `messaging/monitor/event` is pushed, not served: at 0.2 to a subscription
+//! opened with subscribe 0.1, and at 0.3 to one opened with subscribe 0.2
+//! (see `crate::monitor`). `messaging/monitor/subscribe` 0.2 extends 0.1 with
+//! requests 0.1's handler cannot take, so it is served as its own task
+//! (`ServedTask::MonitorSubscribeV0_2`), not through this rewrite.
 
 use std::str::FromStr;
 

@@ -468,6 +468,17 @@ pub(crate) async fn consume(
             )
             .await?
         }
+        ServedTask::MonitorSubscribeV0_2 => {
+            mediator_ops::consume_monitor_subscribe_v0_2(
+                downcast(&doc, session)?,
+                state,
+                session,
+                &mediator_did,
+                now,
+                transport,
+            )
+            .await?
+        }
         ServedTask::MonitorUnsubscribe => {
             mediator_ops::consume_monitor_unsubscribe(
                 downcast(&doc, session)?,
@@ -590,6 +601,9 @@ served_tasks! {
     MessageStatus => message::status::v0_1::Payload,
     QueuePurge => queue::purge::v0_1::Payload,
     MonitorSubscribe => monitor::subscribe::v0_1::Payload,
+    // 0.2 extends 0.1 with requests 0.1's handler cannot take (the
+    // membership opt-in), so it is its own task rather than a rewrite.
+    MonitorSubscribeV0_2 => monitor::subscribe::v0_2::Payload,
     MonitorUnsubscribe => monitor::unsubscribe::v0_1::Payload,
     MuxAck => crate::task_specs::messaging::mux::ack::v0_1::Payload,
     MuxAttach => crate::task_specs::messaging::mux::attach::v0_1::Payload,
