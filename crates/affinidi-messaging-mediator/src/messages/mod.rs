@@ -106,7 +106,6 @@ use crate::didcomm_compat;
 #[cfg(feature = "didcomm")]
 use crate::messages::protocols::discover_features;
 #[cfg(feature = "didcomm")]
-#[cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_didcomm::message::Message;
@@ -122,12 +121,10 @@ use affinidi_messaging_sdk::messages::{
 };
 #[cfg(feature = "didcomm")]
 use affinidi_secrets_resolver::SecretsResolver;
-#[cfg(feature = "didcomm")]
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
-#[cfg(feature = "didcomm")]
 #[cfg(feature = "didcomm")]
 pub mod error_response;
 pub mod inbound;
@@ -483,12 +480,13 @@ impl MessageHandler for Message {
 /// The number of key-agreement keys `doc` publishes, when that is more than
 /// `limit`. Read from the length of the parsed list: no id is copied, so the
 /// check costs the same however many keys the document lists.
+#[cfg(feature = "didcomm")]
 fn key_agreement_over_limit(doc: &affinidi_did_common::Document, limit: usize) -> Option<usize> {
     let count = doc.key_agreement.len();
     (count > limit).then_some(count)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "didcomm"))]
 mod key_limit_tests {
     use super::key_agreement_over_limit;
 
