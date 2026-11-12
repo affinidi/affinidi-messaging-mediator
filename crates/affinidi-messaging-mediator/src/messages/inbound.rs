@@ -546,9 +546,8 @@ pub(crate) async fn handle_inbound_tsp(
     }
 }
 
-/// The type of a `messaging/mux/ack` answer, delivered to the connection only.
 #[cfg(feature = "tsp")]
-const MUX_ACK_RESPONSE_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1#response";
+use crate::mux::tasks::ACK_RESPONSE_TYPE as MUX_ACK_RESPONSE_TYPE;
 
 /// Answer a management Trust Task that arrived over TSP.
 ///

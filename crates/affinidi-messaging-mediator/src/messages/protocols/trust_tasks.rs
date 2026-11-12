@@ -159,6 +159,12 @@ pub(crate) async fn process(
         return Ok(ProcessMessageResponse::default());
     };
     let sender_did = vid_of(&sender_kid);
+    // The answer to `messaging/mux/ack` goes to the connection only, never
+    // stored (`mux::tasks::ACK_RESPONSE_TYPE`): a stored one would need
+    // acknowledging in turn. Lost with the connection, it is recovered by
+    // asking again.
+    let push_only = response_value.get("type").and_then(Value::as_str)
+        == Some(crate::mux::tasks::ACK_RESPONSE_TYPE);
 
     // Pack the response back through the mediator's existing outbound path.
     // `thid` threads it to the request so the caller's live-stream correlates it.
@@ -175,8 +181,8 @@ pub(crate) async fn process(
     .finalize();
 
     Ok(ProcessMessageResponse {
-        store_message: true,
-        force_live_delivery: false,
+        store_message: !push_only,
+        force_live_delivery: push_only,
         data: WrapperType::Message(Box::new(response_msg)),
         forward_message: false,
     })
