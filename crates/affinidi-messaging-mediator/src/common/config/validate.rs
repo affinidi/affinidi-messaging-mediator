@@ -9,12 +9,12 @@
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_config::validate::{
-    ALLOW_SAMPLE_IDENTITY_ENV, check_did_syntax, check_jwt_expiry, check_not_sample_did,
-    check_not_sample_operating_key, check_tls, check_trust_xff_cidrs, warn_admin_is_mediator,
+    ALLOW_SAMPLE_IDENTITY_ENV, check_admin_not_mediator, check_did_syntax, check_jwt_expiry,
+    check_not_sample_did, check_not_sample_operating_key, check_tls, check_trust_xff_cidrs,
     warn_implicit_relay, warn_per_peer_not_below_receive_limit,
     warn_permissive_default_with_denylist_mode, warn_remote_admin_allowed,
 };
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::Config;
 use crate::common::error_codes;
@@ -28,6 +28,7 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     // ── Hard errors ──────────────────────────────────────────────────
     check_did_syntax("mediator_did", &config.mediator_did).map_err(cfg_err)?;
     check_did_syntax("admin_did", &config.admin_did).map_err(cfg_err)?;
+    check_admin_not_mediator(&config.admin_did, &config.mediator_did).map_err(cfg_err)?;
     sample_identity_guard(check_not_sample_did("mediator_did", &config.mediator_did))?;
     sample_identity_guard(check_not_sample_did("admin_did", &config.admin_did))?;
     check_jwt_expiry(
@@ -44,11 +45,6 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
     check_trust_xff_cidrs(&config.trust_xff_cidrs).map_err(cfg_err)?;
 
     // ── Warnings (legal, but usually a mistake) ──────────────────────
-    // Logged at ERROR, not WARN: the mediator's operating keys then hold the
-    // root-admin role. Not refused, as earlier templates set both to one DID.
-    if let Some(msg) = warn_admin_is_mediator(&config.admin_did, &config.mediator_did) {
-        error!("{msg}");
-    }
     if let Some(msg) = warn_permissive_default_with_denylist_mode(
         &config.security.mediator_acl_mode,
         &config.security.global_acl_default,

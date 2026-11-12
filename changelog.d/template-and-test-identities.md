@@ -13,8 +13,15 @@
   `MEDIATOR_ALLOW_TEST_IDENTITY=true` for a test deployment;
   `docker-compose.test.yml` does. Debug builds only log a warning, so a
   debug build is not a substitute for this check.
-- An `admin_did` equal to `mediator_did` is now logged at `ERROR` on every
-  start, not `WARN`, and the message says what it means: the one account
-  holds the root-admin role, so the mediator's operating keys can administer
-  every account. It is still accepted, since the earlier template set both
-  to one DID; give the admin its own DID.
+- **Behaviour change (R3.6):** the mediator refuses to start, in every
+  build, when `admin_did` names the mediator's own DID. The two are compared
+  as accounts: a `did://` prefix, a fragment, a query (including a did:scid
+  `src` locator) and the case of `did:` and the method do not hide a match.
+  One account would otherwise hold the root-admin role, so the mediator's
+  operating keys could administer every account. `MediatorBuilder` applies
+  the same check, and `mediator-setup` stops before writing such a config.
+  Migration: a deployment that set both to one DID (as the earlier template
+  did) must give the admin its own DID before upgrading. Run
+  `mediator-setup` (Admin step, "Generate did:key"), or create one and set
+  `[server] admin_did` / `ADMIN_DID`, and give its keys to whoever
+  administers the mediator.

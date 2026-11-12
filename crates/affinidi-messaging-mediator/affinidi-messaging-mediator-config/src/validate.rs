@@ -40,27 +40,49 @@ pub fn warn_implicit_relay(
     None
 }
 
-/// Warn when `admin_did` equals `mediator_did`: sharing one identity lets
-/// the mediator's operating key authenticate as admin (privilege confusion)
-/// and conflates two distinct trust roles. At startup the shared account ends
-/// up holding the root-admin role, so whoever holds the mediator's operating
-/// keys can administer every account.
+/// The account a configured DID names, for comparing two of them: the
+/// `did://` loader prefix, any query (including a did:scid `src` locator)
+/// and any fragment removed, and the `did` scheme and method lowercased. The
+/// method-specific id keeps its case, which its method defines.
+fn did_account_form(did: &str) -> String {
+    let did = did.trim();
+    let did = did.strip_prefix("did://").unwrap_or(did);
+    let did = affinidi_messaging_mediator_common::did_identity::account_did(did);
+    let end = did.find(['?', '#']).unwrap_or(did.len());
+    let did = &did[..end];
+    let mut parts = did.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(scheme), Some(method), Some(id)) => format!(
+            "{}:{}:{id}",
+            scheme.to_ascii_lowercase(),
+            method.to_ascii_lowercase()
+        ),
+        _ => did.to_string(),
+    }
+}
+
+/// Refuse an `admin_did` that names the mediator's own DID. The admin is the
+/// root administrator; the mediator's DID is its operating identity, whose
+/// keys sit on the server. One account would hold both roles, so whoever
+/// holds the mediator's operating keys could administer every account.
 ///
-/// This is a *warning*, not a hard error: earlier versions of the shipped
-/// template set both to one DID, so deployments built from it would stop
-/// starting — which the validation contract forbids. The mediator logs it at
-/// `ERROR` on every start so it is not missed.
-pub fn warn_admin_is_mediator(admin_did: &str, mediator_did: &str) -> Option<String> {
-    if !admin_did.is_empty() && admin_did == mediator_did {
-        return Some(format!(
-            "admin_did equals mediator_did ('{admin_did}') — the admin role shares the mediator's \
-             operating DID/key (privilege confusion): this one account holds the root-admin role, \
-             so the mediator's operating keys can administer every account. Give the admin its \
-             own DID (set ADMIN_DID, or re-run mediator-setup). A later release may refuse this \
-             configuration."
+/// Compared as accounts (see [`did_account_form`]), so a fragment, a did:scid
+/// `src` locator or the case of `did:` and the method do not hide a match.
+/// Refused in every build.
+pub fn check_admin_not_mediator(admin_did: &str, mediator_did: &str) -> Result<(), String> {
+    if admin_did.trim().is_empty() || mediator_did.trim().is_empty() {
+        return Ok(());
+    }
+    if did_account_form(admin_did) == did_account_form(mediator_did) {
+        return Err(format!(
+            "admin_did names the mediator's own DID ('{}'). The admin must be a separate \
+             identity: set [server] admin_did (env ADMIN_DID) to a DID of its own. \
+             `mediator-setup` creates one (Admin step: \"Generate did:key\"); see \"Run the \
+             setup wizard\" in the mediator README.",
+            admin_did.trim()
         ));
     }
-    None
+    Ok(())
 }
 
 /// Environment variable that lets a release build start with one of the
@@ -310,14 +332,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warns_only_when_admin_equals_mediator() {
-        assert!(warn_admin_is_mediator("did:key:zAdmin", "did:peer:2.zMediator").is_none());
-        let msg = warn_admin_is_mediator("did:peer:2.same", "did:peer:2.same")
-            .expect("identical DIDs should warn");
-        assert!(msg.contains("privilege confusion"), "msg was: {msg}");
-        assert!(msg.contains("root-admin role"), "msg was: {msg}");
-        // Unset on both sides is not one shared identity.
-        assert!(warn_admin_is_mediator("", "").is_none());
+    fn an_admin_did_naming_the_mediator_is_refused() {
+        let mediator = "did:peer:2.Ez6LSmediator.Vz6Mkmediator";
+        assert!(check_admin_not_mediator("did:key:z6MkAdmin", mediator).is_ok());
+        for admin in [
+            mediator.to_string(),
+            format!("did://{mediator}"),
+            format!("{mediator}#key-1"),
+            format!("  {mediator} "),
+            "DID:PEER:2.Ez6LSmediator.Vz6Mkmediator".to_string(),
+        ] {
+            let err = check_admin_not_mediator(&admin, mediator).expect_err(&admin);
+            assert!(
+                err.contains("admin_did names the mediator's own DID"),
+                "{err}"
+            );
+            assert!(err.contains("mediator-setup"), "says how to fix it: {err}");
+        }
+        // A did:scid `src` locator does not change the account.
+        assert!(
+            check_admin_not_mediator(
+                "did:scid:vh:1:QmScid?src=example.com",
+                "did:scid:vh:1:QmScid"
+            )
+            .is_err()
+        );
+        // The method-specific id keeps its case.
+        assert!(check_admin_not_mediator("did:example:ABC", "did:example:abc").is_ok());
+        // Unset on either side is checked elsewhere.
+        assert!(check_admin_not_mediator("", "").is_ok());
+        assert!(check_admin_not_mediator("", mediator).is_ok());
     }
 
     #[test]
