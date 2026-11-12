@@ -1563,13 +1563,17 @@ async fn handle_socket(
                 }
                 _ = ping_interval.tick() => {
                     woke = tokio::time::Instant::now();
+                    #[cfg(feature = "test-hooks")]
+                    let starts_wait = socket.pings.deadline().is_none();
                     if let Err(e) = socket.ping(liveness.grace).await {
                         debug!("Failed to send WebSocket ping: {e}");
                         close_reason = (close_code::GOING_AWAY, "connection unresponsive");
                         break;
                     }
                     #[cfg(feature = "test-hooks")]
-                    if let Some(stall) = test_hooks::stall_after_ping(&session.did_hash) {
+                    if starts_wait
+                        && let Some(stall) = test_hooks::stall_after_ping(&session.did_hash)
+                    {
                         tokio::time::sleep(stall).await;
                     }
                 }
@@ -2719,8 +2723,11 @@ pub mod test_hooks {
         LazyLock::new(Default::default);
 
     /// Make the connection loop of `did_hash`'s sockets sleep for `stall`
-    /// right after each of its next `times` pings, as a long-running pass
-    /// would, so it reads nothing in that time.
+    /// right after each of its next `times` pings that start a wait (no
+    /// earlier ping outstanding), as a long-running pass would, so it reads
+    /// nothing in that time. One stall per ping: a ping missed across
+    /// several consecutive busy passes is closed once its fresh windows run
+    /// out, by design.
     pub fn stall_loop_after_ping(did_hash: &str, stall: Duration, times: u32) {
         STALL_AFTER_PING
             .lock()

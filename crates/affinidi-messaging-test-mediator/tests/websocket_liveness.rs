@@ -44,21 +44,53 @@ async fn open_ws(env: &TestEnvironment, user: &TestUser) -> Socket {
     stream
 }
 
-/// Read until the server's close, skipping pings, and return its code.
-/// Bounded overall: once this reads, the client answers pings, so a socket
-/// the server had not closed by now would stay open.
-async fn close_code(socket: &mut Socket) -> Option<u16> {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Close(Some(frame)))) => return Some(u16::from(frame.code)),
-                Some(Ok(Message::Close(None))) | None | Some(Err(_)) => return None,
-                Some(Ok(_)) => continue,
-            }
+/// The test mediator's liveness settings: ping interval and pong timeout.
+const PING_SECS: u64 = 2;
+const PONG_SECS: u64 = 4;
+/// How many fresh windows the mediator may give one unanswered ping when its
+/// loop was busy (`PingWatch::MAX_EXTENSIONS`).
+const MAX_EXTENSIONS: u64 = 2;
+
+/// The longest a silent client may take to be closed: the first ping (one
+/// interval after the socket opens), its grace, every fresh window a busy
+/// loop may add, and a margin for a slow machine.
+fn close_bound() -> Duration {
+    let grace = PONG_SECS - PING_SECS;
+    Duration::from_secs(PING_SECS + grace + MAX_EXTENSIONS * PING_SECS + 5)
+}
+
+/// Read the server's frames off the TCP stream *without answering any*, up
+/// to the end of the stream, and return the code of the close frame if one
+/// came. A WebSocket client library answers each ping as it reads it, and a
+/// pong written to a socket the server has already closed draws a TCP reset,
+/// which can discard the close frame before it is read; reading the raw
+/// bytes keeps the client truly silent until the server is done.
+async fn raw_close_code(socket: &mut Socket, within: Duration) -> Option<u16> {
+    use tokio::io::AsyncReadExt;
+    let MaybeTlsStream::Plain(tcp) = socket.get_mut() else {
+        panic!("the test mediator serves plain ws://");
+    };
+    let mut bytes = Vec::new();
+    timeout(within, tcp.read_to_end(&mut bytes))
+        .await
+        .expect("the server should have closed the socket within the bound")
+        .expect("read the server's frames");
+    // Server frames are unmasked, and every frame here is a small control
+    // frame: FIN|opcode, a 7-bit length, then the payload.
+    let mut at = 0;
+    while at + 2 <= bytes.len() {
+        let opcode = bytes[at] & 0x0f;
+        let len = usize::from(bytes[at + 1] & 0x7f);
+        let payload = &bytes[at + 2..(at + 2 + len).min(bytes.len())];
+        match opcode {
+            0x9 => {} // ping
+            0x8 if payload.len() >= 2 => return Some(u16::from_be_bytes([payload[0], payload[1]])),
+            0x8 => return None,
+            other => panic!("unexpected frame opcode {other:#x} on a silent socket"),
         }
-    })
-    .await
-    .expect("the server should have closed the socket")
+        at += 2 + len;
+    }
+    None
 }
 
 #[tokio::test]
@@ -69,7 +101,7 @@ async fn a_client_that_never_answers_pings_is_disconnected() {
     // DID, so a second socket only opens once the first has given its slot
     // back.
     let mediator = TestMediator::builder()
-        .websocket_liveness(2, 4, 5)
+        .websocket_liveness(PING_SECS, PONG_SECS, 5)
         .max_websocket_connections_per_did(1)
         .spawn()
         .await
@@ -77,27 +109,34 @@ async fn a_client_that_never_answers_pings_is_disconnected() {
     let env = TestEnvironment::new(mediator).await.expect("environment");
     let alice = env.add_user("Alice").await.expect("add user");
 
-    // Open a socket and read nothing: its pings go unanswered, because a
-    // client only answers a ping when it reads it.
+    // Open a socket and answer nothing. The client reads only raw bytes,
+    // so none of the mediator's pings is answered.
     let mut silent = open_ws(&env, &alice).await;
-    // The first ping goes out about 2 s after the socket opens and has 2 s of
-    // grace; 9 s leaves room for a slow machine.
-    tokio::time::sleep(Duration::from_secs(9)).await;
-
-    // Reading now shows the pings that were never answered, then the close.
+    let started = std::time::Instant::now();
+    let code = raw_close_code(&mut silent, close_bound()).await;
+    let took = started.elapsed();
     assert_eq!(
-        close_code(&mut silent).await,
+        code,
         Some(1001),
-        "a socket that answered no ping is closed as unresponsive (1001)"
+        "a socket that answered no ping is closed as unresponsive (1001), with a close frame"
     );
+    // Not before the first ping's grace could have run out.
+    assert!(
+        took >= Duration::from_secs(PONG_SECS - PING_SECS),
+        "closed after {took:?}, before an unanswered ping's grace"
+    );
+    drop(silent);
 
-    // The slot was given back: a new socket for the same DID opens, and one
-    // that reads (and so answers each ping) stays open past the deadline.
+    // The slot was given back: under a cap of one socket per DID, a new
+    // socket for the same DID is admitted (an over-cap one is closed at once
+    // with 1008), and one that reads (and so answers each ping) stays open
+    // well past the deadline.
     let mut reading = open_ws(&env, &alice).await;
-    let stayed_open = read_for(&mut reading, Duration::from_secs(10)).await;
+    let stayed_open = read_for(&mut reading, close_bound()).await;
     assert!(
         stayed_open.is_err(),
-        "a socket that answers pings must stay open, got: {stayed_open:?}"
+        "the slot must be released and a socket that answers pings must stay open, \
+         got: {stayed_open:?}"
     );
 
     drop(reading);
@@ -126,17 +165,18 @@ async fn a_client_that_answers_pings_survives_a_busy_mediator_loop() {
 
     // Ping every 2 s; 2 s of grace for an unanswered ping.
     let mediator = TestMediator::builder()
-        .websocket_liveness(2, 4, 5)
+        .websocket_liveness(PING_SECS, PONG_SECS, 5)
         .spawn()
         .await
         .expect("spawn mediator");
     let env = TestEnvironment::new(mediator).await.expect("environment");
     let alice = env.add_user("Alice").await.expect("add user");
 
-    // Right after each of its next three pings, the mediator's loop for this
-    // socket spends 4.5 s not reading, as a long flush or a slow message
-    // would. The client answers every ping at once, but the mediator only
-    // reads the answer after the ping's grace has run out.
+    // Right after each of its next three pings that start a wait, the
+    // mediator's loop for this socket spends 4.5 s not reading, as a long
+    // flush or a slow message would. The client answers every ping at once,
+    // but the mediator only reads the answer after the ping's grace has run
+    // out.
     stall_loop_after_ping(&alice.did_hash(), Duration::from_millis(4500), 3);
     let mut socket = open_ws(&env, &alice).await;
 
