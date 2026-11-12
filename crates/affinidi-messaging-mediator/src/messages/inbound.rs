@@ -135,7 +135,7 @@ pub(crate) async fn handle_inbound_tsp(
         )
     })?;
 
-    use affinidi_tsp::message::routed::{RouteStep, next_hop, pack_routed};
+    use affinidi_tsp::message::routed::{next_hop, pack_routed};
 
     // Bind the cleartext envelope sender to the identity that authenticated,
     // exactly as the DIDComm paths do. A TSP envelope names its sender in the
@@ -256,7 +256,7 @@ pub(crate) async fn handle_inbound_tsp(
             ));
         }
 
-        return deliver_tsp_local(state, session, raw).await;
+        return deliver_tsp_local(state, session, &meta.sender, raw).await;
     }
 
     let identity = state.tsp_identity().await?;
@@ -397,23 +397,33 @@ pub(crate) async fn handle_inbound_tsp(
                 )
             })?;
 
-            match step {
+            let plan = plan_route_step(step, &meta.sender).map_err(|e| {
+                tsp_problem(
+                    session,
+                    37,
+                    "message.tsp.malformed",
+                    format!("malformed routed inner TSP envelope: {e}"),
+                    StatusCode::BAD_REQUEST,
+                )
+            })?;
+
+            match plan {
                 // Last relay hop: `next` is the final recipient named in the route
                 // and `inner` is already sealed end-to-end to them. Deliver the
                 // opaque inner — which may be a TSP *or* a DIDComm message — to that
                 // recipient, who handles it natively on pickup. This is the
                 // TSP↔DIDComm bridge point: the mediator forwards on the route, not
                 // on the inner's (possibly non-TSP) envelope.
-                RouteStep::Forward {
+                RoutePlan::ToNext {
                     next,
-                    remaining,
+                    from_vid,
                     inner,
-                } if remaining.is_empty() => {
+                } => {
                     forward_to_next(
                         state,
                         session,
                         &next,
-                        &meta.sender,
+                        &from_vid,
                         &inner,
                         Destination::Routing,
                     )
@@ -421,7 +431,7 @@ pub(crate) async fn handle_inbound_tsp(
                 }
                 // Intermediate hop: re-seal the onward route to the next hop,
                 // authenticating as this mediator, and forward.
-                RouteStep::Forward {
+                RoutePlan::Reseal {
                     next,
                     remaining,
                     inner,
@@ -455,9 +465,14 @@ pub(crate) async fn handle_inbound_tsp(
                     )
                     .await
                 }
-                // Empty route: `inner` is sealed to its own final recipient —
-                // deliver by its (TSP) envelope.
-                RouteStep::Deliver { inner } => deliver_tsp_local(state, session, &inner).await,
+                // Empty route: `inner` is sealed to its own final recipient, who
+                // is named by its envelope. See `plan_route_step` for why the
+                // access list is applied against the verified hop sender.
+                RoutePlan::DeliverLocal {
+                    to_vid,
+                    from_vid,
+                    inner,
+                } => deliver_opaque(state, session, &to_vid, &from_vid, &inner).await,
             }
         }
 
@@ -517,7 +532,7 @@ pub(crate) async fn handle_inbound_tsp(
                     .map_err(|e| MediatorError::InternalError(14, "NA".into(), e.to_string()))?;
                 return dispatch_tsp_trust_task(state, session, &meta.sender, doc, &raw).await;
             }
-            deliver_tsp_local(state, session, raw).await
+            deliver_tsp_local(state, session, &meta.sender, raw).await
         }
         // Rev 3's two new end-to-end types, which the mediator only carries.
         // `GenericControl` is control for the layer *above* TSP and
@@ -526,7 +541,7 @@ pub(crate) async fn handle_inbound_tsp(
         // whose answer is always no. They store for the recipient like a Direct
         // message and are never opened.
         TspMessageType::GenericControl | TspMessageType::PaddingOnly => {
-            deliver_tsp_local(state, session, raw).await
+            deliver_tsp_local(state, session, &meta.sender, raw).await
         }
     }
 }
@@ -661,13 +676,18 @@ async fn dispatch_tsp_trust_task(
 }
 
 /// Deliver a TSP message to the local recipient named in *its own envelope*:
-/// parse the envelope and hand off to [`deliver_opaque`]. Used for Direct
-/// delivery and the empty-route (`Deliver`) relay case, where the recipient is
-/// the TSP receiver rather than a route hop.
+/// parse the envelope for its receiver and hand off to [`deliver_opaque`].
+///
+/// `from_vid` is supplied by the caller rather than read from `bytes`: it is
+/// the sender the caller vouches for. On the relay and to-mediator arms that
+/// is the sender `unpack` verified; on pass-through it is the envelope sender,
+/// bound to the session DID when `force_session_did_match` is on and the
+/// session is authenticated.
 #[cfg(feature = "tsp")]
 async fn deliver_tsp_local(
     state: &SharedData,
     session: &Session,
+    from_vid: &str,
     bytes: &[u8],
 ) -> Result<InboundMessageResponse, MediatorError> {
     let meta = TspMetaEnvelope::parse(bytes).map_err(|e| {
@@ -679,7 +699,80 @@ async fn deliver_tsp_local(
             StatusCode::BAD_REQUEST,
         )
     })?;
-    deliver_opaque(state, session, &meta.receiver, &meta.sender, bytes).await
+    deliver_opaque(state, session, &meta.receiver, from_vid, bytes).await
+}
+
+/// What the mediator does with one step of a routed TSP message addressed to it.
+#[cfg(feature = "tsp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoutePlan {
+    /// Hand `inner` to `next` (local or remote) on behalf of `from_vid`.
+    ToNext {
+        next: String,
+        from_vid: String,
+        inner: Vec<u8>,
+    },
+    /// Re-seal `inner` + `remaining` as this mediator and forward to `next`.
+    Reseal {
+        next: String,
+        remaining: Vec<String>,
+        inner: Vec<u8>,
+    },
+    /// Store `inner` for the local recipient its own envelope names, applying
+    /// that recipient's access list against `from_vid`.
+    DeliverLocal {
+        to_vid: String,
+        from_vid: String,
+        inner: Vec<u8>,
+    },
+}
+
+/// Turn a [`RouteStep`] into the action the mediator takes, given the sender
+/// that `direct::unpack` verified for this hop (`verified_sender`).
+///
+/// Every arm that delivers or forwards on someone's behalf uses
+/// `verified_sender`. That matters most for the empty-route step: its `inner`
+/// is an opaque message sealed to its final recipient, and its envelope names
+/// a sender in the clear that nothing on this hop has checked. Only the inner
+/// *receiver* is read from it (to know where to deliver); the access list is
+/// applied against the hop sender, the same identity the last-hop and nested
+/// arms use. `affinidi-tsp` 0.3 decodes an empty route as `Nested`, so this
+/// step is not produced today, but the decision is fixed here so that a
+/// decoder change cannot alter it.
+#[cfg(feature = "tsp")]
+fn plan_route_step(
+    step: affinidi_tsp::RouteStep,
+    verified_sender: &str,
+) -> Result<RoutePlan, affinidi_tsp::TspError> {
+    use affinidi_tsp::RouteStep;
+    Ok(match step {
+        RouteStep::Forward {
+            next,
+            remaining,
+            inner,
+        } if remaining.is_empty() => RoutePlan::ToNext {
+            next,
+            from_vid: verified_sender.to_string(),
+            inner,
+        },
+        RouteStep::Forward {
+            next,
+            remaining,
+            inner,
+        } => RoutePlan::Reseal {
+            next,
+            remaining,
+            inner,
+        },
+        RouteStep::Deliver { inner } => {
+            let to_vid = TspMetaEnvelope::parse(&inner)?.receiver;
+            RoutePlan::DeliverLocal {
+                to_vid,
+                from_vid: verified_sender.to_string(),
+                inner,
+            }
+        }
+    })
 }
 
 /// Deliver an opaque message to a known local recipient: check the recipient is a
@@ -2076,5 +2169,83 @@ mod tsp_relay_tests {
         );
         // `tsp_forward_endpoint` maps this second-hop `ViaMediator` onto the same
         // "no transport URL" error as `Nothing`, and does not resolve again.
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "tsp")]
+mod route_plan_tests {
+    use super::*;
+    use affinidi_tsp::{PrivateVid, RouteStep, message::routed::next_hop_parts};
+
+    const HOP_SENDER: &str = "did:example:verified-hop";
+
+    /// A packed TSP message whose envelope claims `sender` and names `receiver`.
+    fn inner_message(sender: &str, receiver: &str) -> Vec<u8> {
+        let from = PrivateVid::generate(sender);
+        let to = PrivateVid::generate(receiver);
+        affinidi_tsp::message::direct::pack(
+            b"hello",
+            affinidi_tsp::MessageType::Direct,
+            sender,
+            receiver,
+            &from.signing_key,
+            &to.encryption_key,
+        )
+        .expect("inner message packs")
+        .bytes
+    }
+
+    #[test]
+    fn empty_route_delivers_as_the_verified_hop_sender() {
+        // Built directly: `affinidi-tsp` 0.3 never yields an empty route from
+        // `unpack`, but the step must already resolve correctly if it ever does.
+        let inner = inner_message("did:example:claimed-in-inner", "did:example:bob");
+        let step = next_hop_parts(&[], &inner).expect("an empty route is a valid step");
+        assert!(matches!(step, RouteStep::Deliver { .. }));
+
+        let plan = plan_route_step(step, HOP_SENDER).expect("inner envelope parses");
+        assert_eq!(
+            plan,
+            RoutePlan::DeliverLocal {
+                to_vid: "did:example:bob".to_string(),
+                from_vid: HOP_SENDER.to_string(),
+                inner,
+            },
+            "the recipient comes from the inner envelope, the sender from this hop"
+        );
+    }
+
+    #[test]
+    fn empty_route_with_unparseable_inner_is_refused() {
+        let step = next_hop_parts(&[], b"not a TSP message").expect("step");
+        assert!(plan_route_step(step, HOP_SENDER).is_err());
+    }
+
+    #[test]
+    fn last_hop_forwards_as_the_verified_hop_sender() {
+        let step = next_hop_parts(&["did:example:bob".to_string()], b"opaque").expect("step");
+        assert_eq!(
+            plan_route_step(step, HOP_SENDER).expect("plan"),
+            RoutePlan::ToNext {
+                next: "did:example:bob".to_string(),
+                from_vid: HOP_SENDER.to_string(),
+                inner: b"opaque".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn intermediate_hop_is_resealed() {
+        let hops = ["did:example:m2".to_string(), "did:example:bob".to_string()];
+        let step = next_hop_parts(&hops, b"opaque").expect("step");
+        assert_eq!(
+            plan_route_step(step, HOP_SENDER).expect("plan"),
+            RoutePlan::Reseal {
+                next: "did:example:m2".to_string(),
+                remaining: vec!["did:example:bob".to_string()],
+                inner: b"opaque".to_vec(),
+            }
+        );
     }
 }
