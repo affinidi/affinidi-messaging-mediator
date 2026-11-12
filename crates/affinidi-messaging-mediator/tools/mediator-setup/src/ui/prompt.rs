@@ -111,9 +111,8 @@ fn render_prompt_inner(
     // don't duplicate those keys here.
     //
     // The hint region is `Min(5)` — enough to fit our widest hint today
-    // (the DigestVerify screen: "Computed digest…" + "<digest>" + blank
-    // + "If the producer…" wrapping to 2 rows on narrow terminals = 5
-    // rows). When a hint is only one line, the extra rows are wasted
+    // (the DigestVerify screen: two short paragraphs that wrap to 5
+    // rows on narrow terminals). When a hint is only one line, the extra rows are wasted
     // visual space but would have gone to the trailing flex anyway, so
     // there's no cost to short-hint screens. When two Min constraints
     // compete for leftover rows, ratatui divides them evenly, which on

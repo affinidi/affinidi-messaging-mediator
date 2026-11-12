@@ -644,6 +644,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
  "tui-input",
  "url",
  "vta-sdk",

@@ -165,7 +165,7 @@ fn push_selection_hint(out: &mut String) {
     let _ = writeln!(out, "    gnome-terminal / xterm:  Ctrl+drag");
     let _ = writeln!(
         out,
-        "  Or use the `[c]` / `[v]` / `[m]` / `[a]` / `[F2]` hotkeys to copy via"
+        "  Or use the `[c]` / `[v]` / `[m]` / `[a]` hotkeys to copy via"
     );
     let _ = writeln!(
         out,

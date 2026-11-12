@@ -157,6 +157,10 @@ humantime = "2"
 
 # ── Logging ──────────────────────────────────────────────────────────────
 tracing = "0.1"
+## Prints warnings to stderr in the headless modes (`--from`,
+## `--non-interactive`, `--uninstall`, `--setup-key-*`). The TUI installs
+## no subscriber: output there would draw over the alternate screen.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # ── AWS SSM (optional — gated by the `publish-aws` feature) ──────────────
 ## Publishes the minted DID to SSM Parameter Store when `[output].did_target`

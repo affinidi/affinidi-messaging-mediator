@@ -75,7 +75,8 @@ pub async fn inspect_existing(config_path: &Path) -> anyhow::Result<Option<Exist
     };
     let secrets = MediatorSecrets::from_url(&backend_url).map_err(|e| {
         anyhow::anyhow!(
-            "Could not open backend '{backend_url}' from {}: {e}",
+            "Could not open backend '{}' from {}: {e}",
+            affinidi_messaging_mediator_common::redact::redact_url(&backend_url),
             config_path.display()
         )
     })?;
@@ -86,7 +87,7 @@ pub async fn inspect_existing(config_path: &Path) -> anyhow::Result<Option<Exist
             Ok(None) => {}
             Err(e) => {
                 warn!(
-                    backend = %backend_url,
+                    backend = %affinidi_messaging_mediator_common::redact::redact_url(&backend_url),
                     key = %key,
                     error = %e,
                     "Could not probe well-known key during re-run safety check"
@@ -162,7 +163,10 @@ pub async fn run_uninstall(config_path: &str) -> anyhow::Result<()> {
         }
         Some(s) => {
             println!("Mediator setup at {} will be removed.", path.display());
-            println!("Backend: \x1b[1m{}\x1b[0m", s.backend_url);
+            println!(
+                "Backend: \x1b[1m{}\x1b[0m",
+                affinidi_messaging_mediator_common::redact::redact_url(&s.backend_url)
+            );
             println!("Keys to delete:");
             for key in &s.provisioned_keys {
                 println!("  - {key}");
@@ -188,12 +192,12 @@ pub async fn run_uninstall(config_path: &str) -> anyhow::Result<()> {
         for key in &setup.provisioned_keys {
             match secrets.store().delete(key).await {
                 Ok(()) => {
-                    info!(backend = %setup.backend_url, key = %key, "Deleted well-known key");
+                    info!(backend = %affinidi_messaging_mediator_common::redact::redact_url(&setup.backend_url), key = %key, "Deleted well-known key");
                     println!("  \x1b[32m\u{2714}\x1b[0m deleted {key}");
                 }
                 Err(e) => {
                     warn!(
-                        backend = %setup.backend_url,
+                        backend = %affinidi_messaging_mediator_common::redact::redact_url(&setup.backend_url),
                         key = %key,
                         error = %e,
                         "Failed to delete well-known key"
@@ -205,10 +209,12 @@ pub async fn run_uninstall(config_path: &str) -> anyhow::Result<()> {
         // Deleting each key leaves the (now empty) single-secret bundle and
         // any bootstrap seeds behind; purge removes the rest.
         match secrets.purge().await {
-            Ok(()) => info!(backend = %setup.backend_url, "Removed remaining mediator secrets"),
+            Ok(()) => {
+                info!(backend = %affinidi_messaging_mediator_common::redact::redact_url(&setup.backend_url), "Removed remaining mediator secrets")
+            }
             Err(e) => {
                 warn!(
-                    backend = %setup.backend_url,
+                    backend = %affinidi_messaging_mediator_common::redact::redact_url(&setup.backend_url),
                     error = %e,
                     "Failed to remove remaining mediator secrets"
                 );
