@@ -663,9 +663,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't read the acknowledgement: {err}"),
                 )
             })
@@ -685,9 +686,10 @@ impl MediatorStore for RedisStore {
             .query_async(&mut conn)
             .await
             .map_err(|err| {
-                MediatorError::DatabaseError(
+                MediatorError::database_from_redis(
                     14,
                     "NA".into(),
+                    &err,
                     format!("Couldn't read outbox receipts: {err}"),
                 )
             })?;

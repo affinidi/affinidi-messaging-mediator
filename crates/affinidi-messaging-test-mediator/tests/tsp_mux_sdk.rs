@@ -336,7 +336,11 @@ async fn an_answer_for_another_request_is_left_alone() {
         }
     }
     assert!(
-        store.delivery_state(&answer).await.unwrap().is_some(),
+        store
+            .delivery_state(&principal.did_hash(), &answer)
+            .await
+            .unwrap()
+            .is_some(),
         "not acknowledged by the socket"
     );
     sock.close().await.expect("close");
