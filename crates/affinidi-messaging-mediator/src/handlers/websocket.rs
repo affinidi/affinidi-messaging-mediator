@@ -1405,6 +1405,17 @@ async fn handle_socket(
             socket.pings.after_pass(woke, liveness.ping_interval);
             let ping_deadline = socket.pings.deadline();
             select! {
+                // The mediator is stopping. The HTTP server's graceful
+                // shutdown does not track upgraded sockets; before this they
+                // were closed only once the streaming task had gone, with
+                // 1011 "streaming task unavailable", which reads as a server
+                // fault. Close with 1001 "going away": clients reconnect, and
+                // the reason says why (R6.2).
+                _ = state.shutdown_token.cancelled() => {
+                    debug!("Mediator shutting down; closing the socket");
+                    close_reason = (close_code::GOING_AWAY, "mediator shutting down");
+                    break;
+                }
                 _ = &mut auth_timeout => {
                     debug!("Socket lifetime reached");
                     close_reason = if is_relay {
