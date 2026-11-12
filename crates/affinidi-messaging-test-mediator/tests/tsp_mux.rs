@@ -1112,3 +1112,107 @@ async fn the_drain_stamps_only_what_it_writes() {
     sock.close().await.expect("close");
     env.shutdown().await.expect("shutdown");
 }
+
+/// The `messaging/mux/notice` in a frame from the mediator to `principal`,
+/// if it is one.
+async fn notice_in(env: &TestEnvironment, principal: &TestUser, frame: &[u8]) -> Option<Value> {
+    if receiver(frame) != principal.did {
+        return None;
+    }
+    let (payload, sender) = env
+        .atm
+        .tsp()
+        .unpack_bytes(&principal.profile, frame)
+        .await
+        .ok()?;
+    if sender != env.mediator.did() {
+        return None;
+    }
+    let doc: Value = serde_json::from_slice(&payload).ok()?;
+    (doc["type"] == "https://trusttasks.org/spec/messaging/mux/notice/0.1").then_some(doc)
+}
+
+/// The next notice on the SDK socket, skipping events and other frames.
+async fn sdk_notice(env: &TestEnvironment, principal: &TestUser, sock: &mut SdkMux) -> Value {
+    loop {
+        if let TspMuxFrame::Data { frame, .. } = sdk_next(sock).await
+            && let Some(doc) = notice_in(env, principal, &frame).await
+        {
+            return doc;
+        }
+    }
+}
+
+/// A notice reaches a principal on the wire it uses. One stored while the
+/// principal's wire was unknown (DIDComm) is re-issued as TSP when the
+/// principal opens a `tsp-mux` connection, and the DIDComm copy goes; one
+/// stored once the principal is known to use TSP is sealed for TSP at once.
+#[tokio::test]
+async fn notices_reach_a_tsp_principal_sealed_for_tsp() {
+    init_tracing();
+    let env = mux_env().await;
+    let principal = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    relate_to_mediator(&env, &principal).await;
+    grant(&env, &work, &principal, &["receive"]).await;
+    grant(&env, &home, &principal, &["receive"]).await;
+
+    // `home` revokes while the principal is offline: a `grantsRevoked`
+    // notice, stored for DIDComm (the principal's wire is not known yet).
+    env.atm
+        .profile_add(&home.profile, true)
+        .await
+        .expect("home's own websocket");
+    env.atm
+        .trust_tasks()
+        .mux_revoke(&home.profile, true, vec![], vec![principal.did.clone()])
+        .await
+        .expect("home revokes");
+
+    let mut sock = env
+        .atm
+        .tsp()
+        .connect_websocket_mux(&principal.profile)
+        .await
+        .expect("tsp-mux");
+    assert_eq!(sock.ready().pending_notices, Some(1), "{:?}", sock.ready());
+    let notice = sdk_notice(&env, &principal, &mut sock).await;
+    assert_eq!(notice["payload"]["notice"], "grantsRevoked", "{notice:#}");
+    assert_eq!(notice["payload"]["revocations"][0]["did"], home.did);
+
+    // One copy left in the inbox, in TSP form.
+    let store = env.mediator.store();
+    let bodies: Vec<String> = store
+        .fetch_messages("test", &principal.did_hash(), &FetchOptions::default())
+        .await
+        .expect("fetch")
+        .success
+        .into_iter()
+        .filter_map(|m| m.msg)
+        .collect();
+    assert_eq!(bodies.len(), 1, "the DIDComm copy is gone");
+    assert!(
+        BASE64_URL_SAFE_NO_PAD
+            .decode(&bodies[0])
+            .is_ok_and(|b| affinidi_tsp::is_tsp(&b)),
+        "the copy left is TSP"
+    );
+
+    // `work` revokes while the principal is connected over TSP: sealed for
+    // TSP from the start.
+    env.atm
+        .profile_add(&work.profile, true)
+        .await
+        .expect("work's own websocket");
+    env.atm
+        .trust_tasks()
+        .mux_revoke(&work.profile, true, vec![], vec![principal.did.clone()])
+        .await
+        .expect("work revokes");
+    let notice = sdk_notice(&env, &principal, &mut sock).await;
+    assert_eq!(notice["payload"]["notice"], "grantsRevoked", "{notice:#}");
+    assert_eq!(notice["payload"]["revocations"][0]["did"], work.did);
+    sock.close().await.expect("close");
+    env.shutdown().await.expect("shutdown");
+}

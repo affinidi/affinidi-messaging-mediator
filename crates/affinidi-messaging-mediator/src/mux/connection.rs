@@ -212,25 +212,38 @@ pub async fn seal_event(
     payload: Value,
 ) -> Option<Vec<u8>> {
     let signed = signed_event(state, principal_did, payload).await?;
+    seal_document(state, principal_did, &signed, "mux-event").await
+}
+
+/// Seal a signed Trust Task document as a TSP Direct message from the
+/// mediator's VID to `recipient_did`'s; the document is the payload,
+/// verbatim. `what` names it in logs.
+#[cfg(feature = "tsp")]
+pub async fn seal_document(
+    state: &SharedData,
+    recipient_did: &str,
+    signed: &Value,
+    what: &str,
+) -> Option<Vec<u8>> {
     let identity = match state.tsp_identity().await {
         Ok(i) => i,
         Err(e) => {
-            warn!("mux event not sealed, no mediator TSP identity: {e}");
+            warn!("{what} not sealed, no mediator TSP identity: {e}");
             return None;
         }
     };
     let recipient =
-        match crate::messages::inbound::resolve_tsp_vid(state, principal_did, "mux-event").await {
+        match crate::messages::inbound::resolve_tsp_vid(state, recipient_did, what).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("mux event not sealed, principal VID unresolved: {e}");
+                warn!("{what} not sealed, recipient VID unresolved: {e}");
                 return None;
             }
         };
-    let bytes = match serde_json::to_vec(&signed) {
+    let bytes = match serde_json::to_vec(signed) {
         Ok(b) => b,
         Err(e) => {
-            warn!("mux event not serialised: {e}");
+            warn!("{what} not serialised: {e}");
             return None;
         }
     };
@@ -238,13 +251,13 @@ pub async fn seal_event(
         &bytes,
         affinidi_tsp::MessageType::Direct,
         &identity.vid,
-        principal_did,
+        recipient_did,
         &identity.signing_key,
         &recipient.encryption_key,
     ) {
         Ok(packed) => Some(packed.bytes),
         Err(e) => {
-            warn!("mux event not sealed: {e}");
+            warn!("{what} not sealed: {e}");
             None
         }
     }
@@ -364,9 +377,17 @@ pub async fn open(
             (Vec::new(), Vec::new())
         }
     };
-    // Notices owed from before a crash first, so the count includes them.
+    // Notices are sealed for the wire this principal now uses, and those
+    // pending in the other wire's form are re-issued for this one. Notices
+    // owed from before a crash first, so the count includes them.
+    let notice_wire = match wire {
+        MuxWire::DidComm => affinidi_messaging_mediator_common::store::mux::NoticeWire::DidComm,
+        MuxWire::Tsp => affinidi_messaging_mediator_common::store::mux::NoticeWire::Tsp,
+    };
+    super::notice::set_wire(state, &session.did_hash, notice_wire).await;
     super::notice::recover(state, &session.did_hash).await;
     super::notice::expiring(state, &session.did_hash).await;
+    super::notice::reissue(state, &session.did_hash, &session.did, notice_wire).await;
     let pending_notices = super::notice::pending(state, &session.did_hash).await;
     let nonce = mux.nonce.clone();
     let conn = Arc::new(

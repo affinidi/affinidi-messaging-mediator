@@ -236,7 +236,14 @@ pub async fn tsp_authentication_response(
             let (state, did, did_hash) =
                 (state.clone(), session.did.clone(), session.did_hash.clone());
             tokio::spawn(async move {
-                crate::mux::notice::after_direct_auth(&state, &did, &did_hash, suspended).await;
+                crate::mux::notice::after_direct_auth(
+                    &state,
+                    &did,
+                    &did_hash,
+                    suspended,
+                    affinidi_messaging_mediator_common::store::mux::NoticeWire::Tsp,
+                )
+                .await;
             });
         }
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);

@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use affinidi_messaging_mediator_common::store::mux::{self, MuxGrant, MuxGrantState};
+use affinidi_messaging_mediator_common::store::mux::{self, MuxGrant, MuxGrantState, NoticeWire};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -147,33 +147,69 @@ fn conforms(payload: &Value) -> bool {
     }
 }
 
-/// Sign, pack and store `notice` in its recipient's inbox, then remember it
-/// on the recipient's record for `ready.pendingNotices`. Returns whether it
-/// was stored.
+/// The wire `did_hash`'s notices are sealed for: the one its record names,
+/// or the one this build carries when it names none.
+async fn wire_of(state: &SharedData, did_hash: &str) -> NoticeWire {
+    let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
+    let named = mux::load(&*state.database, did_hash, &limits, now)
+        .await
+        .ok()
+        .and_then(|rec| rec.wire);
+    usable_wire(named)
+}
+
+/// `wanted`, if this build can seal for it; otherwise the wire it can.
+fn usable_wire(wanted: Option<NoticeWire>) -> NoticeWire {
+    match wanted {
+        Some(NoticeWire::Tsp) if cfg!(feature = "tsp") => NoticeWire::Tsp,
+        Some(NoticeWire::DidComm) if cfg!(feature = "didcomm") => NoticeWire::DidComm,
+        _ if cfg!(feature = "didcomm") => NoticeWire::DidComm,
+        _ => NoticeWire::Tsp,
+    }
+}
+
+/// Record that `did_hash` last used `wire` with the mediator, so its
+/// notices are sealed for it. Written only when it changes.
+pub async fn set_wire(state: &SharedData, did_hash: &str, wire: NoticeWire) {
+    let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
+    match mux::load(&*state.database, did_hash, &limits, now).await {
+        Ok(rec) if rec.wire == Some(wire) => return,
+        Ok(rec) if rec == mux::MuxDidRecord::default() => {
+            // Nothing stored for this DID: it has no notice to seal, and a
+            // record holding only its wire is not kept.
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            debug!(did_hash, "notice wire not recorded: {e}");
+            return;
+        }
+    }
+    if let Err(e) = mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
+        rec.wire = Some(wire);
+        Ok(())
+    })
+    .await
+    {
+        debug!(did_hash, "notice wire not recorded: {e}");
+    }
+}
+
+/// Sign, seal and store `notice` in its recipient's inbox, for the wire the
+/// recipient last used, then remember it on the recipient's record for
+/// `ready.pendingNotices` and for re-sealing. Returns whether it was stored.
 pub async fn store(state: &SharedData, notice: &Notice) -> bool {
     if !conforms(&notice.payload) {
         return false;
     }
-    let Some(packed) = pack(state, notice).await else {
+    let wire = wire_of(state, &notice.recipient_hash).await;
+    let Some(msg_id) = store_sealed(state, notice, wire).await else {
         return false;
     };
-    let now = state.clock.unix_secs();
-    let expiry = now + state.limits().message_expiry_seconds;
-    let msg_id = match crate::messages::store::store_system_message(
-        state,
-        &packed,
-        &notice.recipient_hash,
-        expiry,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(recipient = %notice.recipient_hash, "mux notice not stored: {e}");
-            return false;
-        }
-    };
     let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
     if let Err(e) = mux::modify(
         &*state.database,
         &notice.recipient_hash,
@@ -181,7 +217,7 @@ pub async fn store(state: &SharedData, notice: &Notice) -> bool {
         now,
         None,
         |rec, _| {
-            rec.track_notice(msg_id.clone());
+            rec.track_notice(msg_id.clone(), wire, notice.payload.clone());
             Ok(())
         },
     )
@@ -190,13 +226,34 @@ pub async fn store(state: &SharedData, notice: &Notice) -> bool {
         // The notice is in the inbox; only the `pendingNotices` count misses it.
         warn!(recipient = %notice.recipient_hash, "mux notice stored but not tracked: {e}");
     }
-    debug!(recipient = %notice.recipient_hash, kind = %notice.payload["notice"], "mux notice stored");
+    debug!(recipient = %notice.recipient_hash, kind = %notice.payload["notice"], ?wire, "mux notice stored");
     true
 }
 
-#[cfg(feature = "didcomm")]
-async fn pack(state: &SharedData, notice: &Notice) -> Option<String> {
-    use affinidi_messaging_didcomm::message::Message;
+/// Seal `notice` for `wire` and store it in its recipient's inbox; returns
+/// the stored message's id.
+async fn store_sealed(state: &SharedData, notice: &Notice, wire: NoticeWire) -> Option<String> {
+    let packed = pack(state, notice, wire).await?;
+    let now = state.clock.unix_secs();
+    let expiry = now + state.limits().message_expiry_seconds;
+    match crate::messages::store::store_system_message(
+        state,
+        &packed,
+        &notice.recipient_hash,
+        expiry,
+    )
+    .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(recipient = %notice.recipient_hash, "mux notice not stored: {e}");
+            None
+        }
+    }
+}
+
+/// The signed `messaging/mux/notice` document for `notice`.
+async fn signed_notice(state: &SharedData, notice: &Notice) -> Option<Value> {
     use uuid::Uuid;
     let mediator_did = &state.config.mediator_did;
     let now = state.clock.unix_secs();
@@ -223,6 +280,39 @@ async fn pack(state: &SharedData, notice: &Notice) -> Option<String> {
         warn!("mux notice not stored: the mediator has no key to sign it with");
         return None;
     }
+    Some(signed)
+}
+
+/// The stored body of `notice` sealed for `wire`: a packed DIDComm message,
+/// or the base64url of a TSP Direct message's qb2, as a TSP message is stored.
+async fn pack(state: &SharedData, notice: &Notice, wire: NoticeWire) -> Option<String> {
+    let signed = signed_notice(state, notice).await?;
+    match wire {
+        NoticeWire::DidComm => pack_didcomm(state, notice, signed).await,
+        NoticeWire::Tsp => seal_tsp(state, notice, signed).await,
+    }
+}
+
+#[cfg(feature = "tsp")]
+async fn seal_tsp(state: &SharedData, notice: &Notice, signed: Value) -> Option<String> {
+    use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+    let qb2 = super::connection::seal_document(state, &notice.recipient_did, &signed, "mux notice")
+        .await?;
+    Some(BASE64_URL_SAFE_NO_PAD.encode(qb2))
+}
+
+#[cfg(not(feature = "tsp"))]
+async fn seal_tsp(_: &SharedData, notice: &Notice, _: Value) -> Option<String> {
+    warn!(recipient = %notice.recipient_hash, "mux notice not stored: TSP is not built in");
+    None
+}
+
+#[cfg(feature = "didcomm")]
+async fn pack_didcomm(state: &SharedData, notice: &Notice, signed: Value) -> Option<String> {
+    use affinidi_messaging_didcomm::message::Message;
+    use uuid::Uuid;
+    let mediator_did = &state.config.mediator_did;
+    let now = state.clock.unix_secs();
     let message = Message::build(
         Uuid::new_v4().to_string(),
         crate::messages::protocols::trust_tasks::ENVELOPE_TYPE.to_string(),
@@ -251,9 +341,98 @@ async fn pack(state: &SharedData, notice: &Notice) -> Option<String> {
 }
 
 #[cfg(not(feature = "didcomm"))]
-async fn pack(_: &SharedData, notice: &Notice) -> Option<String> {
+async fn pack_didcomm(_: &SharedData, notice: &Notice, _: Value) -> Option<String> {
     warn!(recipient = %notice.recipient_hash, "mux notice not stored: DIDComm is not built in");
     None
+}
+
+/// Re-issue `did_hash`'s pending notices sealed for the other wire, now that
+/// it connected on `wire`: each is stored again for `wire` and the old copy
+/// deleted, so the inbox holds one copy, in the form this client reads.
+/// Called when a mux connection opens, before `pendingNotices` is counted.
+/// A notice that cannot be re-sealed (too old to have kept its payload, or
+/// the seal failed) stays as it was.
+pub async fn reissue(state: &SharedData, did_hash: &str, did: &str, wire: NoticeWire) {
+    let wire = usable_wire(Some(wire));
+    let limits = state.config.limits.mux.store_limits();
+    let now = state.clock.unix_secs();
+    let rec = match mux::load(&*state.database, did_hash, &limits, now).await {
+        Ok(rec) => rec,
+        Err(e) => {
+            debug!(did_hash, "notices not re-issued: {e}");
+            return;
+        }
+    };
+    let stale: Vec<mux::NoticeForm> = rec
+        .notice_forms
+        .into_iter()
+        .filter(|f| f.wire != wire)
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = stale.iter().map(|f| f.id.clone()).collect();
+    let present = match state.database.get_messages(did_hash, &ids).await {
+        Ok(found) => found,
+        Err(e) => {
+            debug!(did_hash, "notices not re-issued: {e}");
+            return;
+        }
+    };
+    let mut moved: Vec<(String, String)> = Vec::new();
+    for (form, found) in stale.into_iter().zip(present) {
+        if found.is_none() {
+            continue; // already deleted; `pending` forgets it
+        }
+        let notice = Notice {
+            recipient_did: did.to_string(),
+            recipient_hash: did_hash.to_string(),
+            payload: form.payload,
+        };
+        let Some(new_id) = store_sealed(state, &notice, wire).await else {
+            continue;
+        };
+        moved.push((form.id, new_id));
+    }
+    if moved.is_empty() {
+        return;
+    }
+    // Tracked first, then the old copies go: a crash in between leaves both
+    // copies, never neither.
+    if let Err(e) = mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
+        for (old, new) in &moved {
+            rec.retrack_notice(old, new.clone(), wire);
+        }
+        Ok(())
+    })
+    .await
+    {
+        warn!(
+            did_hash,
+            "re-issued notices not tracked, old copies kept: {e}"
+        );
+        return;
+    }
+    for (old, _) in &moved {
+        if let Err(e) = state
+            .database
+            .delete_message(
+                old,
+                affinidi_messaging_mediator_common::store::types::DeletionAuthority::Owner {
+                    did_hash: did_hash.to_string(),
+                },
+            )
+            .await
+        {
+            warn!(did_hash, message_id = %old, "notice re-issued, old copy not deleted: {e}");
+        }
+    }
+    debug!(
+        did_hash,
+        count = moved.len(),
+        ?wire,
+        "pending mux notices re-issued for this wire"
+    );
 }
 
 /// Store the notices a committed change owes, after its members were
@@ -485,7 +664,10 @@ pub async fn after_direct_auth(
     did: &str,
     did_hash: &str,
     suspended: Vec<MuxGrant>,
+    wire: NoticeWire,
 ) {
+    // A `grantsPresent` for this DID is sealed for the wire it just used.
+    set_wire(state, did_hash, wire).await;
     if suspended.is_empty() {
         tell_present(state, did, did_hash, 0).await;
     } else {
@@ -707,7 +889,7 @@ pub async fn pending(state: &SharedData, did_hash: &str) -> u64 {
     let waiting = (rec.notices.len() - gone.len()) as u64;
     if !gone.is_empty()
         && let Err(e) = mux::modify(&*state.database, did_hash, &limits, now, None, |rec, _| {
-            rec.notices.retain(|id| !gone.contains(id));
+            rec.forget_notices(&gone);
             Ok(())
         })
         .await
