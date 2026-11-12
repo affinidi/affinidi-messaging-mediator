@@ -1114,6 +1114,12 @@ async fn handle_socket(
         let tsp_mux_conn = if tsp_mode { mux_conn.clone() } else { None };
         #[cfg(feature = "tsp")]
         let mut member_inflight = MemberInflight::new();
+        // Principal wake-ups waiting for one drain (raw TSP). An inbox
+        // redelivery queues one per message, and each drain walks the whole
+        // inbox, so they are answered together once the queue is empty, or
+        // after `TSP_DRAIN_COALESCE` of them under a steady stream.
+        #[cfg(feature = "tsp")]
+        let mut tsp_drain_owed: usize = 0;
 
         // Flush-on-connect for raw-TSP delivery: drain whatever is already queued
         // for this DID straight onto the socket before entering the live-delivery
@@ -1475,7 +1481,7 @@ async fn handle_socket(
                                         }
                                         ControlFlow::Continue(true) => {
                                             if let Some(r) = report {
-                                                r.emit(&state.monitor);
+                                                r.written(&state).await;
                                             }
                                         }
                                         ControlFlow::Continue(false) => {}
@@ -1487,26 +1493,29 @@ async fn handle_socket(
                                 // re-fetches with ids, sends Binary, and deletes-on-send). The
                                 // DIDComm path is unchanged — send the body as Text.
                                 #[cfg(feature = "tsp")]
-                                if tsp_mode {
-                                    let _ = &msg; // body intentionally ignored in TSP mode
-                                    // The drain reports what it writes; this
-                                    // notification is not itself a delivery.
+                                let raw_tsp = tsp_mode;
+                                #[cfg(not(feature = "tsp"))]
+                                let raw_tsp = false;
+                                if raw_tsp {
+                                    // The body is ignored: the drain re-fetches
+                                    // with ids and reports what it writes, so
+                                    // this notification is not itself a
+                                    // delivery. Answered after this select,
+                                    // together with any queued behind it.
                                     drop(report);
-                                    if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, None)
-            .await
-            .is_break() {
-                                        close_reason = (close_code::GOING_AWAY, "client disconnected");
-                                        break;
+                                    #[cfg(feature = "tsp")]
+                                    {
+                                        tsp_drain_owed += 1;
                                     }
-                                    continue;
-                                }
-                                match socket.send(Message::Text(msg.into())).await {
-                                    Ok(()) => {
-                                        if let Some(r) = report {
-                                            r.emit(&state.monitor);
+                                } else {
+                                    match socket.send(Message::Text(msg.into())).await {
+                                        Ok(()) => {
+                                            if let Some(r) = report {
+                                                r.written(&state).await;
+                                            }
                                         }
+                                        Err(e) => warn!("Failed to send message to WebSocket client: {e}"),
                                     }
-                                    Err(e) => warn!("Failed to send message to WebSocket client: {e}"),
                                 }
                             },
                             WebSocketCommands::Verbatim(body) => {
@@ -1555,12 +1564,22 @@ async fn handle_socket(
                                 }
                             }
                             WebSocketCommands::Close(why) => {
+                                // A raw-TSP socket carries TSP frames only, so
+                                // it gets no DIDComm problem report: the close
+                                // frame's code and reason say why.
+                                #[cfg(feature = "tsp")]
+                                let raw_tsp = tsp_mode;
+                                #[cfg(not(feature = "tsp"))]
+                                let raw_tsp = false;
                                 #[cfg(feature = "didcomm")]
-                                if let Ok(msg) =  _package_problem_report(&state, &session, None, _close_problem_report(why)).await
+                                if !raw_tsp
+                                    && let Ok(msg) =  _package_problem_report(&state, &session, None, _close_problem_report(why)).await
                                     && let Err(e) = socket.send(Message::Text(msg.into())).await
                                 {
                                     warn!("Failed to send message to WebSocket client: {e}");
                                 }
+                                #[cfg(not(feature = "didcomm"))]
+                                let _ = raw_tsp;
                                 debug!(reason = ?why, "Streaming task requested close");
                                 // The streaming task has dropped this socket's
                                 // registration (e.g. a newer socket replaced it);
@@ -1575,6 +1594,20 @@ async fn handle_socket(
                         close_reason = (close_code::SERVER_ERROR, "streaming task unavailable");
                         break;
                     }
+                }
+            }
+
+            // Principal wake-ups, answered by one drain once nothing more is
+            // queued behind them (raw TSP).
+            #[cfg(feature = "tsp")]
+            if tsp_drain_owed > 0 && (rx.is_empty() || tsp_drain_owed >= TSP_DRAIN_COALESCE) {
+                tsp_drain_owed = 0;
+                if drain_tsp_inbox(&state, &session, &mut socket, tsp_ack_mode, &mut tsp_inflight, None)
+                    .await
+                    .is_break()
+                {
+                    close_reason = (close_code::GOING_AWAY, "client disconnected");
+                    break;
                 }
             }
 
@@ -1717,6 +1750,12 @@ async fn next_queued(
         Some(fair) => fair.next(rx).await,
     }
 }
+
+/// The most principal wake-ups one TSP drain answers while more keep
+/// arriving; past this it drains anyway, so a steady stream is still
+/// delivered.
+#[cfg(feature = "tsp")]
+const TSP_DRAIN_COALESCE: usize = 64;
 
 /// Page size for the TSP inbox drain — reuses the same shape as
 /// [`crate::tasks::websocket_streaming`]'s redelivery drain.
@@ -1979,18 +2018,23 @@ async fn drain_tsp_page(
         start_id: cursor.clone(),
         ..Default::default() // delete_policy defaults to DoNotDelete; we delete explicitly.
     };
-    let page = match state
-        .database
-        .fetch_messages_delivering(
-            &session.session_id,
-            did_hash,
-            &options,
-            state.clock.unix_millis() as u64,
-            state.config.limits.delivered_expiry_seconds,
-            state.config.limits.pickup_round_robin,
-        )
-        .await
-    {
+    // Fetched without stamping: a message is recorded as delivered only once
+    // its frame is written (R1.1), so one this drain skips (not a TSP frame:
+    // a DIDComm message for this DID) keeps its expiry. Paging needs stream
+    // order, so round-robin applies to a first page only, as in
+    // `fetch_messages_delivering`.
+    let fetched = if state.config.limits.pickup_round_robin && options.start_id.is_none() {
+        state
+            .database
+            .fetch_messages_fair(&session.session_id, did_hash, &options)
+            .await
+    } else {
+        state
+            .database
+            .fetch_messages(&session.session_id, did_hash, &options)
+            .await
+    };
+    let page = match fetched {
         Ok(page) => page,
         Err(err) => {
             warn!(
@@ -2004,7 +2048,53 @@ async fn drain_tsp_page(
         return TspPage::Exhausted;
     }
 
-    for element in page.success {
+    let mut written: Vec<String> = Vec::new();
+    let outcome = drain_tsp_elements(
+        state,
+        session,
+        did_hash,
+        socket,
+        ack_mode,
+        inflight,
+        seen,
+        walk,
+        cursor,
+        page.success,
+        &mut written,
+    )
+    .await;
+    if let Err(err) = state
+        .database
+        .record_delivered(
+            &written,
+            state.clock.unix_millis() as u64,
+            state.config.limits.delivered_expiry_seconds,
+        )
+        .await
+    {
+        warn!(%did_hash, "couldn't record {} TSP frames as delivered: {err}", written.len());
+    }
+    outcome
+}
+
+/// Write `elements` (one fetched page) to the socket, adding each written
+/// message's id to `written`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "tsp")]
+async fn drain_tsp_elements(
+    state: &SharedData,
+    session: &Session,
+    did_hash: &str,
+    socket: &mut BoundedSocket,
+    ack_mode: bool,
+    inflight: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+    walk: &mut TspDrainWalk,
+    cursor: &mut Option<String>,
+    elements: Vec<affinidi_messaging_sdk::messages::MessageListElement>,
+    written: &mut Vec<String>,
+) -> TspPage {
+    for element in elements {
         // Advance the cursor regardless of body presence so a missing body
         // can't pin the drain on the same page forever. `receive_id` is the
         // inbox stream id, used as the exclusive fetch cursor.
@@ -2027,16 +2117,18 @@ async fn drain_tsp_page(
         }
 
         // Stored body is base64url(qb2). Decode back to raw qb2 bytes for
-        // the wire. A malformed entry is skipped (not deleted) so it can be
-        // inspected rather than silently dropped.
+        // the wire. Anything else (a DIDComm message for this DID, or a
+        // malformed entry) is skipped, not deleted: a raw-TSP socket carries
+        // TSP frames only, and the message stays for a client that can read
+        // it.
         let qb2 = match BASE64_URL_SAFE_NO_PAD.decode(&body) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(
-                    %did_hash,
-                    message_id = %id,
-                    "Skipping inbox entry that isn't valid base64url: {err}"
-                );
+            Ok(bytes) if affinidi_tsp::is_tsp(&bytes) => bytes,
+            Ok(_) => {
+                debug!(%did_hash, message_id = %id, "not a TSP frame; left for another client");
+                continue;
+            }
+            Err(_) => {
+                debug!(%did_hash, message_id = %id, "not a TSP frame (not base64url); left for another client");
                 continue;
             }
         };
@@ -2048,6 +2140,7 @@ async fn drain_tsp_page(
             return TspPage::SocketGone;
         }
         // Only once it is on the wire.
+        written.push(id.clone());
         state.monitor.delivered(
             &id,
             parties.0.as_deref(),
