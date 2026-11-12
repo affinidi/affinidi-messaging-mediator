@@ -479,3 +479,108 @@ fn seen(screen: &str) -> u64 {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("the monitor's count:\n{screen}"))
 }
+
+/// The Grants tab: look a member's grants up, advance its epoch after
+/// confirming the one shown, and revoke a grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_looks_up_revokes_and_bumps_mux_grants() {
+    use affinidi_messaging_sdk::protocols::mux::{MuxCapability, sign_grant};
+    use affinidi_messaging_test_mediator::TestMediator;
+
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let op = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&op.did_hash(), &AccountType::Admin)
+        .await
+        .unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    env.atm.profile_add(&device.profile, true).await.unwrap();
+    let (g, _) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        env.mediator.did(),
+        &[MuxCapability::Receive],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+    env.atm
+        .trust_tasks()
+        .mux_grant(&device.profile, vec![g])
+        .await
+        .expect("grant stored");
+
+    let console = MediatorConsole::connect(Identity {
+        alias: "operator".into(),
+        did: op.did.clone(),
+        secrets: op.secrets.clone(),
+        mediator_did: Some(env.mediator.did().to_string()),
+    })
+    .await
+    .unwrap();
+    let mut app = App::new(console).with_color_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+    // The tab with nothing looked up says how to.
+    app.handle_key(key(KeyCode::Char('8')));
+    let empty = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("Press / to look one up")
+    })
+    .await;
+    assert!(empty.contains("8 Grants"), "{empty}");
+
+    // Find by member: Tab to the member field, paste, list.
+    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_paste(&work.did);
+    app.handle_key(key(KeyCode::Enter));
+    let listed = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("member epoch 0") && s.contains("active")
+    })
+    .await;
+    println!("{listed}");
+    assert!(listed.contains("member epoch 0: 1 "), "{listed}");
+
+    // Advance the member's epoch: the confirmation shows the epoch named.
+    app.handle_key(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+    let confirm = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("Current epoch 0 → 1")
+    })
+    .await;
+    assert!(confirm.contains("Advance a member's epoch"), "{confirm}");
+    app.handle_key(key(KeyCode::Char('y')));
+    let bumped = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("advanced 0 → 1") && s.contains("epochRevoked")
+    })
+    .await;
+    println!("{bumped}");
+    assert!(bumped.contains("1 grant(s) voided"), "{bumped}");
+    assert!(bumped.contains("member epoch 1"), "{bumped}");
+
+    // Revoke the (voided) grant: it is deleted.
+    app.handle_key(key(KeyCode::Char('d')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let confirm = screen(&terminal);
+    assert!(confirm.contains("Revoke 1 grant of member"), "{confirm}");
+    app.handle_key(key(KeyCode::Char('y')));
+    let revoked = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("revoked 1 grant(s); none remain") && s.contains("member epoch 1: 0 ")
+    })
+    .await;
+    println!("{revoked}");
+    assert!(
+        revoked.contains("revoked 1 grant(s); none remain"),
+        "{revoked}"
+    );
+    assert!(revoked.contains("member epoch 1: 0 "), "{revoked}");
+}

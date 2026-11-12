@@ -83,6 +83,8 @@ is reported plainly.
 | `4` | **Audit** *(admin)* | The mediator's audit log of privileged changes. Monitor subscriptions and cross-account reads are recorded here too. |
 | `5` | **Accounts** *(admin)* | Every account on the mediator: name, hash, role (coloured), receive and send depth, bytes queued, access-list size. The mediator and administrators come first, then accounts you've named, then the rest. `⏎` opens one. Works on older mediators too. |
 | `6` | **Config** *(admin)* | The mediator's configuration: key, value, source (`override` when a patch set it) and whether a change applies live or at restart. A **rootAdmin** can change a `limits.*` value (`⏎`) or reset an override (`x`); a patch can tighten a limit, not loosen it past the configuration. |
+| `7` | **Mux** *(admin)* | Live mux connections and the member DIDs each carries. `g` lists the selected connection's stored grants. |
+| `8` | **Grants** *(admin)* | Stored mux grants of a principal or member DID (`/` to look one up): member, principal, state, scope, expiry, the epoch each was signed under, and the member's current epoch. `d` revokes the selected grant, `D` every grant listed, `E` advances the member's epoch (voiding every grant it gave). Each asks for confirmation first. Needs mediator 0.52.0. |
 
 **Quota bars** shade smoothly from green through amber to red along the bar,
 so how full a queue is shows as colour at its leading edge. They use 24-bit
@@ -103,7 +105,13 @@ to 256 colours, then to three plain colours; `NO_COLOR` switches colour off.
 | `d` | Account | **delete** the selected message (asks for confirmation) |
 | `p` / `P` | Account | **purge** the queue, or only messages exchanged with the selected message's counterparty (see below) |
 | `o` | Account | back to your own account |
-| `m` | anywhere | show or hide the **traffic monitor** |
+| `g` | Mux | the selected connection's **stored grants** |
+| `/` | Grants | **find** grants by principal DID, member DID, or both |
+| `p` / `g` | Grants | list the selected grant's principal's / member's grants |
+| `d` / `D` | Grants | **revoke** the selected grant / every grant listed (asks for confirmation) |
+| `E` | Grants | **advance the member's epoch**: shows its current epoch, and names only that one, so nothing changes if it moved on meanwhile |
+| `]` | Grants | load the next page |
+| `m` | anywhere | show or hide the **traffic monitor**; an administrator watching everything also sees mux members attach and detach |
 | `f` | anywhere | monitor failures only |
 | `t` | monitor open | switch the monitor between live lines and **per-account totals** |
 | `PgUp` `PgDn` / `⇧↑` `⇧↓` | monitor open | **scroll back** through traffic that has left the pane; `Home` goes to the oldest kept, `End` follows new traffic again |
