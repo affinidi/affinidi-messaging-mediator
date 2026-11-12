@@ -15,7 +15,10 @@ redelivered for ever.
   session. Both now go through one function, so they cannot drift.
 - **Privacy:** an id held for no one the connection may act for is
   `notFound`, whoever holds it: an id is a hash of the message, and the
-  answer does not confirm another DID's mail.
+  answer does not confirm another DID's mail. `notPermitted` is given only
+  for a member whose mail the connection reads (`receive` or `pickup`); a
+  member carried with neither (say, only `send`) gets `notFound`, so a
+  principal cannot confirm that such a member still holds a message it sent.
 - On `tsp-mux` the answer is pushed to the socket and not stored.
   Acknowledging is idempotent, and a stored answer would itself need
   acknowledging.
