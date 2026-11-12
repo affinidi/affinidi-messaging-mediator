@@ -66,7 +66,7 @@ fn did_account_form(did: &str) -> String {
 /// keys sit on the server. One account would hold both roles, so whoever
 /// holds the mediator's operating keys could administer every account.
 ///
-/// Compared as accounts (see [`did_account_form`]), so a fragment, a did:scid
+/// Compared as accounts (see `did_account_form`), so a fragment, a did:scid
 /// `src` locator or the case of `did:` and the method do not hide a match.
 /// Refused in every build.
 pub fn check_admin_not_mediator(admin_did: &str, mediator_did: &str) -> Result<(), String> {
