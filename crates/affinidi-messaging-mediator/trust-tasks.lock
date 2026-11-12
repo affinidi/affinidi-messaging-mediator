@@ -159,6 +159,24 @@ type_uri = "https://trusttasks.org/spec/messaging/mux/ack/0.1"
 digest = "sha256:1cb6857af57558210ac9a42e8902c3275095466eb7d9d8c97890b3e49423e72c"
 
 [[task]]
+slug = "messaging/mux/admin-list"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/messaging/mux/admin-list/0.1"
+digest = "sha256:55a973274d75a69aa380a3f63ccfcc081c8146acd8813e9d49bb93c15111b63a"
+
+[[task]]
+slug = "messaging/mux/admin-revoke"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/messaging/mux/admin-revoke/0.1"
+digest = "sha256:cbffe3ae665e938a6281a73a355b7e00b96d3c30a33425c125f94ea8d5002a47"
+
+[[task]]
+slug = "messaging/mux/admin-revoke-all"
+version = "0.1"
+type_uri = "https://trusttasks.org/spec/messaging/mux/admin-revoke-all/0.1"
+digest = "sha256:30bf71416381df4e38dfe14b4efc2c56a8949c6c939bdcce875328329734fd46"
+
+[[task]]
 slug = "messaging/mux/attach"
 version = "0.1"
 type_uri = "https://trusttasks.org/spec/messaging/mux/attach/0.1"
