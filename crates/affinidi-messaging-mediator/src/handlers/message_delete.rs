@@ -150,13 +150,24 @@ pub(crate) async fn delete_for_session(
         // each member it belongs to (read first, to know it is that member's
         // before its standing is checked) while the member's own account
         // still stands — checked for the members the id belongs to, not for
-        // every member the connection carries.
+        // every member the connection carries. A member that already
+        // acknowledged its copy of the id is an owner too, so a repeat of
+        // that acknowledgement is told apart from a withdrawal; it holds
+        // nothing, so it can remove nothing.
         let mut owners = vec![session.did_hash.clone()];
         // Only while someone is watching: the body, so each `deleted` event
         // names the wire protocol. The same in every copy.
         let mut body_seen: Option<String> = None;
         for member in &members {
             let Ok(Some(stored)) = state.database.get_message(member, message).await else {
+                if state
+                    .database
+                    .acknowledged(member, message)
+                    .await
+                    .unwrap_or(false)
+                {
+                    owners.push(member.clone());
+                }
                 continue;
             };
             if !crate::mux::connection::allows(
