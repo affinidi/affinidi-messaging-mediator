@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use affinidi_messaging_didcomm::message::Message;
-use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+use affinidi_messaging_sdk::protocols::trust_tasks::{MuxAdminRevokeOutcome, MuxConnectionsQuery};
 use affinidi_messaging_sdk::tasks::messaging::{account, message, mux, queue, stats};
 use affinidi_messaging_sdk::tasks::{audit, config};
 use affinidi_messaging_sdk::{
@@ -14,8 +14,9 @@ use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
 
 use crate::error::{ConsoleError, Result};
+use crate::grants::GrantSelection;
 use crate::identity::Identity;
-use crate::live::{LiveStream, MonitorFeed, MonitorFilter};
+use crate::live::{LiveStream, MembershipFilter, MonitorFeed, MonitorFilter};
 use crate::purge::{PurgePlan, PurgeRequest};
 
 /// Which account a call acts on: `None` is the console's own.
@@ -91,6 +92,15 @@ pub const OPERATIONS_SINCE: (u64, u64, u64) = (0, 28, 20);
 
 /// The first mediator release that serves `config/patch`.
 pub const CONFIG_PATCH_SINCE: (u64, u64, u64) = (0, 28, 27);
+
+/// The first mediator release that serves the administrator's stored-grant
+/// tasks (`messaging/mux/admin-list`, `admin-revoke`, `admin-revoke-all`)
+/// and `messaging/monitor/subscribe` 0.2, with its mux membership events.
+pub const MUX_ADMIN_SINCE: (u64, u64, u64) = (0, 52, 0);
+
+/// How many `admin-revoke` requests [`MediatorConsole::mux_revoke`] sends at
+/// most, each revoking up to 500 grants.
+pub const MUX_REVOKE_MAX_ROUNDS: usize = 20;
 
 /// The first mediator release that serves account activity times
 /// (`includeActivity` on `account/get` and `account/list`).
@@ -595,8 +605,155 @@ impl MediatorConsole {
     /// other account only its own traffic. The feed renews its lease itself
     /// and unsubscribes when dropped.
     pub async fn monitor(&self, filter: MonitorFilter) -> Result<MonitorFeed> {
+        self.monitor_with(filter, None).await
+    }
+
+    /// [`monitor`](Self::monitor), with mux membership events as well when
+    /// `membership` is given: each member DID attached to or detached from a
+    /// principal's mux connection, as [`MonitorUpdate::Membership`]. An
+    /// administrator sees every change; any other account only those it is
+    /// party to. The feed's [`membership`](MonitorFeed::membership) is `None`
+    /// when the mediator sends none (mux is not enabled there).
+    ///
+    /// Membership events need `monitor/subscribe` 0.2 ([`MUX_ADMIN_SINCE`]);
+    /// a traffic-only feed falls back to 0.1 on an older mediator.
+    ///
+    /// [`MonitorUpdate::Membership`]: crate::MonitorUpdate::Membership
+    pub async fn monitor_with(
+        &self,
+        filter: MonitorFilter,
+        membership: Option<MembershipFilter>,
+    ) -> Result<MonitorFeed> {
         self.require_operations("messaging/monitor/subscribe")?;
-        self.live.open_feed(&self.atm, &self.profile, filter).await
+        if membership.is_some() {
+            self.require_mux_admin_release("mux membership events")?;
+        }
+        self.live
+            .open_feed(
+                &self.atm,
+                &self.profile,
+                filter,
+                membership,
+                self.serves_mux_admin(),
+            )
+            .await
+    }
+
+    // ─── Stored mux grants (administrators) ─────────────────────────────
+
+    /// Whether this mediator serves the stored-grant administration tasks
+    /// and monitor membership events. Assumed to when its version is
+    /// unknown; the mediator then answers for itself.
+    pub fn serves_mux_admin(&self) -> bool {
+        self.mediator_version
+            .as_deref()
+            .and_then(parse_version)
+            .is_none_or(|v| v >= MUX_ADMIN_SINCE)
+    }
+
+    fn require_mux_admin_release(&self, task: &'static str) -> Result<()> {
+        if self.serves_mux_admin() {
+            return Ok(());
+        }
+        let (major, minor, patch) = MUX_ADMIN_SINCE;
+        Err(ConsoleError::Refused {
+            code: "protocol.trust_task.unsupported".into(),
+            comment: format!(
+                "this mediator ({}) does not serve {task}: it needs \
+                 affinidi-messaging-mediator {major}.{minor}.{patch} or later",
+                self.mediator_version
+                    .as_deref()
+                    .unwrap_or("unknown version")
+            ),
+        })
+    }
+
+    /// One page of stored mux grants (`messaging/mux/admin-list`): those of
+    /// a `principal` DID, of a `member` DID, or between the two — at least
+    /// one is required. Each grant's parties, state, effective scope and
+    /// expiry, and the epoch it was signed under; never the signed
+    /// statement. With `member`, the page's `epoch` is that DID's current
+    /// epoch. Pass the previous page's `next_cursor`, with the same DIDs, to
+    /// continue; `limit` is 1–500.
+    pub async fn mux_grants(
+        &self,
+        principal: Option<&str>,
+        member: Option<&str>,
+        cursor: Option<String>,
+        limit: Option<u64>,
+    ) -> Result<mux::admin_list::v0_1::Response> {
+        self.require_admin("the stored mux grants")?;
+        self.require_mux_admin_release("messaging/mux/admin-list")?;
+        if principal.is_none() && member.is_none() {
+            return Err(ConsoleError::Invalid(
+                "name a principal DID, a member DID, or both".into(),
+            ));
+        }
+        self.atm
+            .trust_tasks()
+            .mux_admin_list(&self.profile, principal, member, cursor, limit)
+            .await
+            .map_err(ConsoleError::from_call)
+    }
+
+    /// A member DID's current mux epoch: the one
+    /// [`mux_bump_epoch`](Self::mux_bump_epoch) names to void it.
+    pub async fn mux_epoch(&self, member: &str) -> Result<u64> {
+        let page = self.mux_grants(None, Some(member), None, Some(1)).await?;
+        page.epoch.ok_or_else(|| {
+            ConsoleError::Unexpected("the mediator listed a member without its epoch".into())
+        })
+    }
+
+    /// Revoke the stored grants `selection` names
+    /// (`messaging/mux/admin-revoke`), sending the request again while grants
+    /// still match, at most [`MUX_REVOKE_MAX_ROUNDS`] times. Revoked grants
+    /// are deleted and their members detached before each answer; the
+    /// statements can never be stored again.
+    ///
+    /// The outcome says what was revoked, what still matches and why it
+    /// stopped; [`revoke_summary`](crate::revoke_summary) puts that in a
+    /// sentence. A refusal of the first request, with nothing revoked, is the
+    /// error — `…:protectedAccount` when a party is a root administrator and
+    /// this session is not one.
+    pub async fn mux_revoke(&self, selection: &GrantSelection) -> Result<MuxAdminRevokeOutcome> {
+        self.require_admin("revoking stored mux grants")?;
+        self.require_mux_admin_release("messaging/mux/admin-revoke")?;
+        selection.check()?;
+        self.atm
+            .trust_tasks()
+            .mux_admin_revoke_until_done(
+                &self.profile,
+                selection.principal.as_deref(),
+                selection.member.as_deref(),
+                &selection.grant_ids,
+                None,
+                MUX_REVOKE_MAX_ROUNDS,
+            )
+            .await
+            .map_err(ConsoleError::from_call)
+    }
+
+    /// Advance member `did`'s mux epoch (`messaging/mux/admin-revoke-all`),
+    /// voiding every grant on it and ending its session attaches, without the
+    /// member's signature. `epoch` is the one being voided — the DID's
+    /// current epoch, from [`mux_epoch`](Self::mux_epoch) — so the change is
+    /// a compare-and-set: naming an epoch already voided changes nothing
+    /// (`epoch_advanced` is false), and naming a later one is refused with
+    /// `…:epochMismatch` ([`ConsoleError::current_epoch`] reads the epoch in
+    /// force from it).
+    pub async fn mux_bump_epoch(
+        &self,
+        did: &str,
+        epoch: u64,
+    ) -> Result<mux::admin_revoke_all::v0_1::Response> {
+        self.require_admin("advancing a member's mux epoch")?;
+        self.require_mux_admin_release("messaging/mux/admin-revoke-all")?;
+        self.atm
+            .trust_tasks()
+            .mux_admin_revoke_all(&self.profile, did, epoch)
+            .await
+            .map_err(ConsoleError::from_call)
     }
 
     /// The SDK instance, for an embedding application.

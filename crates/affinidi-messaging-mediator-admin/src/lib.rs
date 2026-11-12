@@ -20,22 +20,30 @@
 pub mod address_book;
 mod console;
 mod error;
+mod grants;
 mod identity;
 mod live;
 mod purge;
 
 pub use address_book::{AddressBook, AddressEntry, account_hash};
 pub use console::{
-    CONFIG_PATCH_SINCE, Capabilities, InspectedMessage, MediatorConsole, Mode, OPERATIONS_SINCE,
-    Target,
+    CONFIG_PATCH_SINCE, Capabilities, InspectedMessage, MUX_ADMIN_SINCE, MUX_REVOKE_MAX_ROUNDS,
+    MediatorConsole, Mode, OPERATIONS_SINCE, Target,
 };
 pub use error::{ConsoleError, Result};
+pub use grants::{GrantSelection, revoke_summary};
 pub use identity::{Identity, IdentityChoice, IdentitySource, ProfileFileSource, StaticIdentities};
-pub use live::{MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate};
+pub use live::{
+    MembershipEvent, MembershipFilter, MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate,
+};
 pub use purge::{PurgePlan, PurgeRequest};
 
 /// What a `messaging/mux/connections` page lists: see
 /// [`MediatorConsole::mux_connections`].
 pub use affinidi_messaging_sdk::protocols::trust_tasks::MuxConnectionsQuery;
+/// What [`MediatorConsole::mux_revoke`] did, and why it stopped.
+pub use affinidi_messaging_sdk::protocols::trust_tasks::{
+    MuxAdminRevokeOutcome, MuxAdminRevokeStop,
+};
 /// The generated Trust Task types the console's calls take and return.
 pub use affinidi_messaging_sdk::tasks::messaging as specs;

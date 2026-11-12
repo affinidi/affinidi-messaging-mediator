@@ -118,6 +118,7 @@ let mut feed = console.monitor(filter).await?;
 while let Some(update) = feed.next().await {
     match update {
         MonitorUpdate::Events { events, dropped } => { /* render */ }
+        MonitorUpdate::Membership { events, dropped } => { /* only with monitor_with */ }
         MonitorUpdate::Gap { missing } => { /* batches lost in transit */ }
         MonitorUpdate::Heartbeat => { /* the tap is alive */ }
         MonitorUpdate::Ended(reason) => break,
@@ -132,6 +133,42 @@ while let Some(update) = feed.next().await {
   Never a message body.
 - **Accountability:** every administrator subscription is recorded in the
   mediator's audit log.
+- **Mux membership:** `console.monitor_with(filter, Some(membership))` also
+  reports each member DID that attaches to or detaches from a principal's mux
+  connection, as `MonitorUpdate::Membership`. That needs mediator 0.52.0
+  (`messaging/monitor/subscribe` 0.2). A traffic-only feed on an older
+  mediator falls back to subscribe 0.1 by itself.
+
+## Stored mux grants
+
+An administrator can list, revoke and void the stored grants of DID
+multiplexing (mediator 0.52.0 and later):
+
+```rust
+use affinidi_messaging_mediator_admin::{GrantSelection, revoke_summary};
+
+// A member's grants, a page at a time; `epoch` is the member's current one.
+let page = console.mux_grants(None, Some(&member_did), None, Some(100)).await?;
+
+// Revoke chosen grants, or all of a principal's or member's. It keeps going
+// while grants still match, a bounded number of rounds.
+let outcome = console
+    .mux_revoke(&GrantSelection::grants(&member_did, vec![grant_id]))
+    .await?;
+println!("{}", revoke_summary(&outcome)); // "revoked 1 grant(s); none remain"
+
+// Void every grant a member gave: read its epoch, confirm, then name it.
+let epoch = console.mux_epoch(&member_did).await?;
+match console.mux_bump_epoch(&member_did, epoch).await {
+    Ok(r) if r.epoch_advanced => { /* r.revoked_grants voided */ }
+    Ok(_) => { /* someone voided that epoch already: nothing changed */ }
+    Err(e) => eprintln!("{}", e.explain()), // epochMismatch, protectedAccount, …
+}
+```
+
+`ConsoleError::explain` puts the stored-grant refusals in plain words, and
+`ConsoleError::current_epoch` reads the epoch in force from an
+`epochMismatch`.
 
 ## How the console reads its connection
 
