@@ -2377,6 +2377,14 @@ async fn check_login_session(store: Arc<dyn MediatorStore>) {
         .await
         .expect("get_session for the authenticated session");
     assert_eq!(session.state, SessionState::Authenticated);
+    assert!(
+        session.authenticated,
+        "a session read back after login is marked authenticated"
+    );
+    assert!(
+        !challenge.authenticated,
+        "a challenge session is not marked authenticated"
+    );
     assert_eq!(
         store
             .get_refresh_token_hash(session_id)
