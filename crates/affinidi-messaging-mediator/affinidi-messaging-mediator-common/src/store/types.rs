@@ -156,6 +156,79 @@ pub struct MessageMetaData {
     pub timestamp: u128,
 }
 
+/// One stored copy of a message: the message id (`sha256` of the body) and
+/// the recipient it is held for.
+///
+/// # Why a message needs a recipient to be named
+///
+/// The id clients see is the hash of the body alone, and deployed SDKs derive
+/// it from the bytes they sent or received, so it cannot change. But the same
+/// bytes may be stored for more than one recipient — one multi-recipient
+/// message forwarded to two local recipients is the ordinary case — and
+/// ownership, queue entries, counters and expiry all belong to one recipient.
+/// So each recipient gets its own record, and the record is named by the pair.
+/// Storing the same bytes again for the **same** recipient is still one record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageRef {
+    /// The recipient the copy is held for.
+    pub to_did_hash: String,
+    /// The client-visible message id.
+    pub msg_id: String,
+}
+
+impl MessageRef {
+    pub fn new(to_did_hash: impl Into<String>, msg_id: impl Into<String>) -> Self {
+        MessageRef {
+            to_did_hash: to_did_hash.into(),
+            msg_id: msg_id.into(),
+        }
+    }
+}
+
+/// One copy a delete removed: the recipient it was held for and its sender
+/// (`None` for an anonymous one). A delete that withdraws several copies
+/// reports each, so callers can report each removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedCopy {
+    pub to_did_hash: String,
+    pub from_did_hash: Option<String>,
+}
+
+/// Which of the records stored under one message id an operation acts on.
+///
+/// See [`MessageRef`] for why one id can name several records. A caller that
+/// knows the recipient names it; a caller that knows only the id says whose
+/// queues it is acting on, and the store resolves that the same way in every
+/// backend ([`ops::select_records`](crate::store::ops::select_records)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageScope<'a> {
+    /// Exactly the record held for this recipient.
+    Recipient(&'a str),
+    /// The records in this account's queues: the one held for it as
+    /// recipient when there is one; otherwise every record it sent under
+    /// the id (a sender withdrawing by id withdraws every copy it sent).
+    ///
+    /// Never use this to acknowledge a delivery: once the recipient's own
+    /// copy is gone it falls through to the copies it sent, which belong to
+    /// other recipients. Acknowledgements use [`Recipient`](Self::Recipient).
+    Party(&'a str),
+    /// Every record stored under the id. Only an admin acts on these; an
+    /// owner asking for `All` is treated as [`Party`](Self::Party) of itself.
+    All,
+}
+
+impl<'a> MessageScope<'a> {
+    /// The scope an id-only delete uses for `by`: an owner acts on its own
+    /// inbox copy only, an admin on every copy. Withdrawing what one sent is
+    /// always asked for explicitly, with [`Party`](Self::Party).
+    pub fn for_authority(by: &'a DeletionAuthority) -> Self {
+        match by {
+            DeletionAuthority::Owner { did_hash } => MessageScope::Recipient(did_hash),
+            DeletionAuthority::Admin { .. } => MessageScope::All,
+        }
+    }
+}
+
 /// Reply to a Message Pickup 3.0 status query for one DID.
 ///
 /// Currently produced by the `get_status_reply` Lua function on Redis;

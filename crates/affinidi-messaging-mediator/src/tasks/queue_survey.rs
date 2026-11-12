@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
-    store::MediatorStore,
+    store::{MediatorStore, MessageRef},
     types::{
         accounts::{AccountType, MediatorAccountList},
         clock::Clock,
@@ -141,14 +141,25 @@ impl<T: MediatorStore + ?Sized> QueueSource for T {
         limit: u32,
     ) -> Result<(usize, usize), MediatorError> {
         let page = self
-            .list_messages(did_hash, folder, Some(("-", "+")), limit)
+            .list_messages(did_hash, folder.clone(), Some(("-", "+")), limit)
             .await?;
         if page.is_empty() {
             return Ok((0, 0));
         }
-        let ids: Vec<String> = page.iter().map(|m| m.msg_id.clone()).collect();
+        // Each entry is one recipient's copy: this DID's own in an inbox, the
+        // entry's recipient in an outbox.
+        let records: Vec<MessageRef> = page
+            .iter()
+            .map(|m| {
+                let to = match folder {
+                    Folder::Inbox => did_hash,
+                    Folder::Outbox => m.to_address.as_deref().unwrap_or(did_hash),
+                };
+                MessageRef::new(to, m.msg_id.clone())
+            })
+            .collect();
         // Batched: one round trip for the page rather than one per message.
-        let states = self.delivery_states(&ids).await?;
+        let states = self.delivery_states(&records).await?;
         let delivered = states
             .iter()
             .filter(|state| state.as_ref().is_some_and(|s| s.delivered()))

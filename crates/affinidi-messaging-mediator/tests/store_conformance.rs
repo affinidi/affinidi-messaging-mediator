@@ -1820,7 +1820,7 @@ async fn check_expiry_sweep_reports_each_message(store: Arc<dyn MediatorStore>) 
 
     // Readable by id on every backend (Redis read a key nothing wrote).
     let meta = store
-        .get_message_metadata("s", &expiring)
+        .get_message_metadata(to, &expiring)
         .await
         .expect("metadata");
     assert_eq!(meta.to_did_hash, to);
@@ -1899,20 +1899,25 @@ async fn remove_receipt_fixture(
     from: &str,
     admin: &str,
 ) {
-    use affinidi_messaging_mediator_common::store::DeletionAuthority;
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
     let owner = |did: &str| DeletionAuthority::Owner {
         did_hash: did.to_string(),
     };
     let admin = DeletionAuthority::Admin {
         admin_did_hash: admin.to_string(),
     };
-    for (id, by) in [
-        (&ids[0], owner(to)),
-        (&ids[1], owner(from)),
-        (&ids[2], admin),
-        (&ids[3], owner(to)),
+    // The sender withdraws explicitly (`Party`): an id-only delete by an
+    // owner acknowledges its own copy only.
+    for (id, scope, by) in [
+        (&ids[0], MessageScope::Recipient(to), owner(to)),
+        (&ids[1], MessageScope::Party(from), owner(from)),
+        (&ids[2], MessageScope::All, admin),
+        (&ids[3], MessageScope::Recipient(to), owner(to)),
     ] {
-        store.delete_message(id, by).await.expect("delete_message");
+        store
+            .delete_message_in(id, scope, by)
+            .await
+            .expect("delete_message_in");
     }
 }
 
@@ -1954,7 +1959,7 @@ async fn check_outbox_receipts(store: Arc<dyn MediatorStore>) {
 
     // Handed over, not yet removed.
     store
-        .mark_delivered(&ids[..1], 1_700_000_000_000, 0)
+        .mark_delivered(to, &ids[..1], 1_700_000_000_000, 0)
         .await
         .expect("mark_delivered");
     let states = store.sent_message_states(from, &ids).await.expect("states");
@@ -2944,8 +2949,8 @@ async fn check_repeated_store(store: Arc<dyn MediatorStore>) {
 /// rest find it gone (R1.7), and nothing is left queued or counted. The
 /// Redis library is atomic; cluster mode must give the same answer.
 async fn check_concurrent_delete(store: Arc<dyn MediatorStore>) {
-    use affinidi_messaging_mediator_common::store::DeletionAuthority;
     use affinidi_messaging_mediator_common::store::ops::is_delete_not_found;
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
 
     let (to, from) = ("did_hash_concurrent_to", "did_hash_concurrent_from");
     for did in [to, from] {
@@ -2964,14 +2969,17 @@ async fn check_concurrent_delete(store: Arc<dyn MediatorStore>) {
             let store = store.clone();
             let id = id.clone();
             async move {
+                // The recipient acknowledges; the sender withdraws.
                 store
-                    .delete_message(
+                    .delete_message_in(
                         &id,
+                        MessageScope::Party(did),
                         DeletionAuthority::Owner {
                             did_hash: did.to_string(),
                         },
                     )
                     .await
+                    .map(|_| ())
             }
         };
         let results = [delete(to), delete(from), delete(to), delete(from)];
@@ -3412,6 +3420,707 @@ async fn check_fetch_counts_sent(store: Arc<dyn MediatorStore>) {
     );
 }
 
+// ─── One body, several recipients ───────────────────────────────────────────
+
+/// Queue counters for `did`: (receive count, receive bytes, send count, send
+/// bytes). An absent account reads as zeros.
+async fn queue_counters(store: &Arc<dyn MediatorStore>, did: &str) -> (u32, u64, u32, u64) {
+    store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .map(|a| {
+            (
+                a.receive_queue_count,
+                a.receive_queue_bytes,
+                a.send_queue_count,
+                a.send_queue_bytes,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Asserts `dids` have nothing queued or counted, `from` has no per-peer count
+/// towards any of them, and their folders are empty.
+async fn assert_nothing_queued(store: &Arc<dyn MediatorStore>, from: &str, dids: &[&str]) {
+    use affinidi_messaging_mediator_common::types::messages::Folder;
+    for did in dids {
+        assert_eq!(
+            queue_counters(store, did).await,
+            (0, 0, 0, 0),
+            "nothing is left counted for {did}"
+        );
+        for folder in [Folder::Inbox, Folder::Outbox] {
+            let listed = store
+                .list_messages(did, folder.clone(), None, 100)
+                .await
+                .expect("list_messages");
+            assert!(listed.is_empty(), "{did} {folder:?} is empty: {listed:?}");
+        }
+        assert_eq!(
+            store.peer_queue_count(from, did).await.expect("peer count"),
+            0,
+            "no per-peer count is left from {from} to {did}"
+        );
+    }
+}
+
+/// The same bytes stored for two recipients get a record each: both can read,
+/// fetch and delete their own, one's delete leaves the other's intact, every
+/// counter (receive, send, per-peer) returns to zero, purge works, and one
+/// copy's expiry does not remove the other. Previously the second store
+/// replaced the first recipient's record, leaving its inbox entry and counters
+/// with nothing behind them.
+async fn check_same_body_for_two_recipients(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::ops::is_delete_not_found;
+    use affinidi_messaging_mediator_common::store::{
+        DeletionAuthority, MessageScope, RemovalReason, SentMessageState,
+    };
+    use affinidi_messaging_mediator_common::types::messages::{
+        FetchDeletePolicy, FetchOptions, Folder,
+    };
+
+    let (a, b, from) = (
+        "did_hash_two_copies_a",
+        "did_hash_two_copies_b",
+        "did_hash_two_copies_sender",
+    );
+    for did in [a, b, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let owner = |did: &str| DeletionAuthority::Owner {
+        did_hash: did.to_string(),
+    };
+    let body = "{\"protected\":\"one-body-two-recipients\"}";
+    let len = body.len() as u64;
+    let store_for = |to: &'static str, expires_at: u64| {
+        let store = store.clone();
+        async move {
+            store
+                .store_message("s", body, to, Some(from), expires_at, 0)
+                .await
+                .expect("store_message")
+        }
+    };
+
+    // ── Both stored: one id, a record each, each counted once ─────────────
+    let id = store_for(a, NEVER).await;
+    assert_eq!(store_for(b, NEVER).await, id, "the id is the body hash");
+    assert_eq!(store_for(a, NEVER).await, id, "a repeat for a is a no-op");
+    assert_eq!(queue_counters(&store, a).await, (1, len, 0, 0));
+    assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
+    assert_eq!(queue_counters(&store, from).await, (0, 0, 2, 2 * len));
+    for to in [a, b] {
+        assert_eq!(store.peer_queue_count(from, to).await.unwrap(), 1);
+        let own = store
+            .get_message(to, &id)
+            .await
+            .expect("get_message")
+            .unwrap_or_else(|| panic!("{to} reads its copy"));
+        assert_eq!(own.to_address.as_deref(), Some(to), "{to}'s own copy");
+        assert_eq!(own.from_address.as_deref(), Some(from));
+        assert_eq!(own.msg.as_deref(), Some(body));
+        assert_eq!(
+            store
+                .get_message_metadata(to, &id)
+                .await
+                .expect("metadata")
+                .to_did_hash,
+            to
+        );
+    }
+    assert_eq!(
+        store
+            .list_messages(from, Folder::Outbox, None, 100)
+            .await
+            .expect("outbox")
+            .len(),
+        2,
+        "the sender has an outbox entry per copy"
+    );
+
+    // ── Delivery is per copy ────────────────────────────────────────────────
+    let fetched = store
+        .fetch_messages_delivering(
+            "s",
+            a,
+            &FetchOptions {
+                limit: 10,
+                start_id: None,
+                delete_policy: FetchDeletePolicy::DoNotDelete,
+            },
+            1_700_000_000_000,
+            0,
+            false,
+        )
+        .await
+        .expect("fetch");
+    assert_eq!(fetched.success.len(), 1);
+    assert_eq!(fetched.success[0].msg.as_deref(), Some(body), "a's body");
+    assert!(
+        store
+            .delivery_state(a, &id)
+            .await
+            .unwrap()
+            .is_some_and(|s| s.first_delivered_at_ms.is_some()),
+        "a's copy is marked delivered"
+    );
+    if let Some(state) = store.delivery_state(b, &id).await.unwrap() {
+        assert_eq!(state.first_delivered_at_ms, None, "b's copy is not");
+    }
+    let sent = store
+        .sent_message_states(from, std::slice::from_ref(&id))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent[0],
+            SentMessageState::Queued | SentMessageState::Unknown
+        ),
+        "one copy still waits: {sent:?}"
+    );
+
+    // ── a deletes its own; b's is untouched ────────────────────────────────
+    store
+        .delete_message(&id, owner(a))
+        .await
+        .expect("a deletes its copy");
+    let again = store.delete_message(&id, owner(a)).await;
+    assert!(
+        again.as_ref().is_err_and(is_delete_not_found),
+        "a's second delete finds nothing of its own: {again:?}"
+    );
+    assert_eq!(queue_counters(&store, a).await, (0, 0, 0, 0));
+    assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
+    assert_eq!(queue_counters(&store, from).await, (0, 0, 1, len));
+    assert_eq!(store.peer_queue_count(from, a).await.unwrap(), 0);
+    assert_eq!(store.peer_queue_count(from, b).await.unwrap(), 1);
+    assert!(store.get_message(a, &id).await.unwrap().is_none());
+    assert!(store.get_message(b, &id).await.unwrap().is_some());
+    let fetched = store
+        .fetch_messages(
+            "s",
+            b,
+            &FetchOptions {
+                limit: 10,
+                start_id: None,
+                delete_policy: FetchDeletePolicy::Optimistic,
+            },
+        )
+        .await
+        .expect("b fetches");
+    assert_eq!(fetched.success.len(), 1);
+    assert_eq!(fetched.success[0].msg.as_deref(), Some(body), "b's body");
+    assert!(
+        fetched.delete_errors.is_empty(),
+        "{:?}",
+        fetched.delete_errors
+    );
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+
+    // ── A purge removes the purger's copy only ─────────────────────────────
+    store_for(a, NEVER).await;
+    store_for(b, NEVER).await;
+    let (count, bytes) = store
+        .purge_folder("s", a, Folder::Inbox)
+        .await
+        .expect("purge a's inbox");
+    assert_eq!((count, bytes as u64), (1, len));
+    assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
+    assert!(store.get_message(b, &id).await.unwrap().is_some());
+    let (count, _) = store
+        .purge_folder("s", b, Folder::Inbox)
+        .await
+        .expect("purge b's inbox");
+    assert_eq!(count, 1);
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+
+    // ── The sender withdrawing by id withdraws every copy it sent ──────────
+    store_for(a, NEVER).await;
+    store_for(b, NEVER).await;
+    let stranger = store
+        .delete_message_in(
+            &id,
+            MessageScope::Party("did_hash_two_copies_x"),
+            owner("did_hash_two_copies_x"),
+        )
+        .await;
+    assert!(
+        stranger.is_err(),
+        "a non-party may not delete: {stranger:?}"
+    );
+    store
+        .delete_message_in(&id, MessageScope::Party(from), owner(from))
+        .await
+        .expect("the sender withdraws");
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+    let sent = store
+        .sent_message_states(from, std::slice::from_ref(&id))
+        .await
+        .unwrap();
+    assert_eq!(
+        sent[0],
+        SentMessageState::Removed(affinidi_messaging_mediator_common::store::OutboxReceipt {
+            reason: RemovalReason::Withdrawn,
+            ..match sent[0] {
+                SentMessageState::Removed(receipt) => receipt,
+                other => panic!("withdrawn, got {other:?}"),
+            }
+        })
+    );
+
+    // ── An admin acting on one account's queue removes that copy only ─────
+    store_for(a, NEVER).await;
+    store_for(b, NEVER).await;
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Party(a),
+            DeletionAuthority::Admin {
+                admin_did_hash: "did_hash_two_copies_admin".to_string(),
+            },
+        )
+        .await
+        .expect("admin removes a's copy");
+    assert_eq!(queue_counters(&store, a).await, (0, 0, 0, 0));
+    assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
+    store
+        .delete_message(&id, owner(b))
+        .await
+        .expect("b deletes its copy");
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+
+    // ── One copy's expiry does not remove the other ────────────────────────
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    store_for(a, now - 10).await;
+    store_for(b, NEVER).await;
+    let report = store
+        .sweep_expired_messages(now, "did_hash_two_copies_admin")
+        .await
+        .expect("sweep");
+    assert_eq!(report.expired, 1, "only a's copy was due: {report:?}");
+    assert!(store.get_message(a, &id).await.unwrap().is_none());
+    assert!(store.get_message(b, &id).await.unwrap().is_some());
+    assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
+    store
+        .delete_message(&id, owner(b))
+        .await
+        .expect("b deletes its copy");
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+}
+
+/// An acknowledgement removes the acknowledging recipient's own copy only.
+/// A DID that sent the same bytes to itself and to another recipient, and
+/// acknowledges its copy twice (a redelivered message), must not remove the
+/// other recipient's copy the second time: that answers not found. Its
+/// sender's receipt for its own copy is what tells the second delete apart
+/// from a withdrawal. Withdrawing is asked for explicitly.
+async fn check_acknowledgement_never_removes_another_copy(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::ops::is_delete_not_found;
+    use affinidi_messaging_mediator_common::store::{
+        DeletionAuthority, MessageScope, RemovalReason,
+    };
+
+    let (a, b) = ("did_hash_ack_self", "did_hash_ack_other");
+    for did in [a, b] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let owner = |did: &str| DeletionAuthority::Owner {
+        did_hash: did.to_string(),
+    };
+    let body = "{\"protected\":\"to-self-and-other\"}";
+    let id = store
+        .store_message("s", body, a, Some(a), NEVER, 0)
+        .await
+        .expect("store for a");
+    store
+        .store_message("s", body, b, Some(a), NEVER, 0)
+        .await
+        .expect("store for b");
+
+    let removed = store
+        .delete_message_in(&id, MessageScope::Recipient(a), owner(a))
+        .await
+        .expect("a acknowledges its copy");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].to_did_hash, a);
+    assert_eq!(removed[0].from_did_hash.as_deref(), Some(a));
+
+    let again = store.delete_message(&id, owner(a)).await;
+    assert!(
+        again.as_ref().is_err_and(is_delete_not_found),
+        "a second acknowledgement finds nothing: {again:?}"
+    );
+    assert!(
+        store.get_message(b, &id).await.unwrap().is_some(),
+        "b's copy is untouched"
+    );
+    assert_eq!(queue_counters(&store, b).await.0, 1);
+
+    // a acknowledged its own copy; b did nothing.
+    assert!(store.acknowledged(a, &id).await.unwrap());
+    assert!(!store.acknowledged(b, &id).await.unwrap());
+
+    // The sender's receipt names the copy that went: a's own.
+    let receipts = store.outbox_receipts(a, &id).await.expect("receipts");
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(receipts[0].0, a);
+    assert_eq!(receipts[0].1.reason, RemovalReason::Collected);
+
+    // Withdrawing what it sent is explicit, and removes b's copy.
+    let removed = store
+        .delete_message_in(&id, MessageScope::Party(a), owner(a))
+        .await
+        .expect("a withdraws");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].to_did_hash, b);
+    assert_nothing_queued(&store, a, &[a, b]).await;
+}
+
+/// Only a recipient removing its own copy records an acknowledgement: a copy
+/// removed by the mediator (expiry, an administrator) or withdrawn by its
+/// sender does not, so it never makes a later delete read as a repeat.
+async fn check_only_the_recipient_acknowledges(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
+
+    let (a, b, from) = (
+        "did_hash_only_recipient_a",
+        "did_hash_only_recipient_b",
+        "did_hash_only_recipient_sender",
+    );
+    for did in [a, b, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = "{\"protected\":\"only-the-recipient\"}";
+    let id = store
+        .store_message("s", body, a, Some(from), now - 10, 0)
+        .await
+        .expect("store for a");
+    store
+        .store_message("s", body, b, Some(from), NEVER, 0)
+        .await
+        .expect("store for b");
+
+    // a's copy expires; b's is withdrawn by the sender.
+    let report = store
+        .sweep_expired_messages(now, "did_hash_only_recipient_admin")
+        .await
+        .expect("sweep");
+    assert_eq!(report.expired, 1, "{report:?}");
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Party(from),
+            DeletionAuthority::Owner {
+                did_hash: from.to_string(),
+            },
+        )
+        .await
+        .expect("withdrawn");
+    assert!(!store.acknowledged(a, &id).await.unwrap(), "expiry is not");
+    assert!(
+        !store.acknowledged(b, &id).await.unwrap(),
+        "withdrawal is not"
+    );
+    assert!(!store.acknowledged(from, &id).await.unwrap());
+
+    // An administrator's removal is not either; the recipient's own is.
+    let id = store
+        .store_message(
+            "s",
+            "{\"protected\":\"admin-then-own\"}",
+            a,
+            Some(from),
+            NEVER,
+            0,
+        )
+        .await
+        .expect("store");
+    store
+        .store_message(
+            "s",
+            "{\"protected\":\"admin-then-own\"}",
+            b,
+            Some(from),
+            NEVER,
+            0,
+        )
+        .await
+        .expect("store");
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Recipient(a),
+            DeletionAuthority::Admin {
+                admin_did_hash: "did_hash_only_recipient_admin".to_string(),
+            },
+        )
+        .await
+        .expect("admin removal");
+    assert!(!store.acknowledged(a, &id).await.unwrap());
+    store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: b.to_string(),
+            },
+        )
+        .await
+        .expect("b acknowledges");
+    assert!(store.acknowledged(b, &id).await.unwrap());
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+}
+
+/// The sender's receipts are kept per recipient, and its status never hides a
+/// copy that will not arrive: one copy discarded while the other is delivered
+/// and then collected answers `discarded`, not `delivered` or `collected`.
+async fn check_receipts_are_per_recipient(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{
+        DeletionAuthority, MessageScope, RemovalReason, SentMessageState,
+    };
+
+    let (a, b, from) = (
+        "did_hash_receipt_copy_a",
+        "did_hash_receipt_copy_b",
+        "did_hash_receipt_copy_sender",
+    );
+    for did in [a, b, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let admin = DeletionAuthority::Admin {
+        admin_did_hash: "did_hash_receipt_copy_admin".to_string(),
+    };
+    let status = |id: String| {
+        let store = store.clone();
+        async move {
+            store
+                .sent_message_states(from, &[id])
+                .await
+                .expect("states")[0]
+        }
+    };
+
+    let body = "{\"protected\":\"receipt-per-copy\"}";
+    let id = store
+        .store_message("s", body, a, Some(from), NEVER, 0)
+        .await
+        .expect("store for a");
+    store
+        .store_message("s", body, b, Some(from), NEVER, 0)
+        .await
+        .expect("store for b");
+    store
+        .mark_delivered(b, std::slice::from_ref(&id), 1_700_000_000_000, 0)
+        .await
+        .expect("mark b");
+
+    store
+        .delete_message_in(&id, MessageScope::Recipient(a), admin.clone())
+        .await
+        .expect("a's copy discarded");
+    let discarded = match status(id.clone()).await {
+        SentMessageState::Removed(receipt) if receipt.reason == RemovalReason::Discarded => receipt,
+        other => panic!("one copy will never arrive, got {other:?}"),
+    };
+
+    store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: b.to_string(),
+            },
+        )
+        .await
+        .expect("b collects");
+    assert_eq!(
+        status(id.clone()).await,
+        SentMessageState::Removed(discarded),
+        "b's collection does not hide a's discard"
+    );
+    let mut receipts = store.outbox_receipts(from, &id).await.expect("receipts");
+    receipts.sort_by(|x, y| x.0.cmp(&y.0));
+    let reasons: Vec<(&str, RemovalReason)> = receipts
+        .iter()
+        .map(|(to, r)| (to.as_str(), r.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [(a, RemovalReason::Discarded), (b, RemovalReason::Collected)]
+    );
+
+    // Every copy collected: `collected`.
+    let body = "{\"protected\":\"receipt-per-copy-collected\"}";
+    let id = store
+        .store_message("s", body, a, Some(from), NEVER, 0)
+        .await
+        .expect("store for a");
+    store
+        .store_message("s", body, b, Some(from), NEVER, 0)
+        .await
+        .expect("store for b");
+    for to in [a, b] {
+        store
+            .delete_message(
+                &id,
+                DeletionAuthority::Owner {
+                    did_hash: to.to_string(),
+                },
+            )
+            .await
+            .expect("collected");
+    }
+    assert!(
+        matches!(
+            status(id).await,
+            SentMessageState::Removed(r) if r.reason == RemovalReason::Collected
+        ),
+        "every copy collected"
+    );
+    assert_nothing_queued(&store, from, &[a, b, from]).await;
+}
+
+/// Anything that is not a message id (64 lowercase hex) names no message: it
+/// is not found, and never resolves to a stored record.
+async fn check_non_ids_name_nothing(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::ops::is_delete_not_found;
+    use affinidi_messaging_mediator_common::store::{
+        DeletionAuthority, MessageScope, SentMessageState,
+    };
+
+    let (to, from) = ("did_hash_non_id_to", "did_hash_non_id_from");
+    for did in [to, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let id = store
+        .store_message("s", "{\"protected\":\"non-id\"}", to, Some(from), NEVER, 0)
+        .await
+        .expect("store");
+    let owner = DeletionAuthority::Owner {
+        did_hash: to.to_string(),
+    };
+    for bogus in [
+        format!("{id}:{to}"),
+        id.to_uppercase(),
+        id[..63].to_string(),
+        String::new(),
+    ] {
+        let deleted = store
+            .delete_message_in(&bogus, MessageScope::Recipient(to), owner.clone())
+            .await;
+        assert!(
+            deleted.as_ref().is_err_and(is_delete_not_found),
+            "{bogus:?}: {deleted:?}"
+        );
+        assert!(store.get_message(to, &bogus).await.unwrap().is_none());
+        assert!(store.get_message_metadata(to, &bogus).await.is_err());
+        assert!(store.delivery_state(to, &bogus).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .sent_message_states(from, std::slice::from_ref(&bogus))
+                .await
+                .unwrap(),
+            [SentMessageState::Unknown]
+        );
+    }
+    assert!(store.get_message(to, &id).await.unwrap().is_some());
+    store
+        .delete_message(&id, owner)
+        .await
+        .expect("delete the real one");
+}
+
+/// An expiry entry left by an earlier copy of the same bytes for the same
+/// recipient does not remove a later copy before its own expiry: the sweeper
+/// drops the entry and keeps the record.
+async fn check_stale_expiry_entry_keeps_a_later_copy(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::DeletionAuthority;
+
+    let (to, from) = ("did_hash_stale_expiry_to", "did_hash_stale_expiry_from");
+    for did in [to, from] {
+        store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = "{\"protected\":\"stale-expiry-entry\"}";
+
+    // First copy: due ten seconds ago, collected before the sweep ran.
+    let id = store
+        .store_message("s", body, to, Some(from), now - 10, 0)
+        .await
+        .expect("first store");
+    store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: to.to_string(),
+            },
+        )
+        .await
+        .expect("collected");
+
+    // Second copy of the same bytes, with an expiry far away.
+    store
+        .store_message("s", body, to, Some(from), NEVER, 0)
+        .await
+        .expect("second store");
+
+    let report = store
+        .sweep_expired_messages(now, "did_hash_stale_expiry_admin")
+        .await
+        .expect("sweep");
+    assert_eq!(report.expired, 0, "nothing was due: {report:?}");
+    assert!(
+        store.get_message(to, &id).await.unwrap().is_some(),
+        "the later copy is still held"
+    );
+    assert_eq!(queue_counters(&store, to).await.0, 1);
+
+    // The stale entry is gone: a second sweep finds nothing to look at.
+    let again = store
+        .sweep_expired_messages(now, "did_hash_stale_expiry_admin")
+        .await
+        .expect("second sweep");
+    assert_eq!((again.expired, again.already_deleted), (0, 0), "{again:?}");
+
+    store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: to.to_string(),
+            },
+        )
+        .await
+        .expect("delete");
+    assert_nothing_queued(&store, from, &[to, from]).await;
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -3433,6 +4142,12 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_repeated_store(store.clone()).await;
     check_concurrent_delete(store.clone()).await;
     check_fetch_counts_sent(store.clone()).await;
+    check_same_body_for_two_recipients(store.clone()).await;
+    check_stale_expiry_entry_keeps_a_later_copy(store.clone()).await;
+    check_acknowledgement_never_removes_another_copy(store.clone()).await;
+    check_only_the_recipient_acknowledges(store.clone()).await;
+    check_receipts_are_per_recipient(store.clone()).await;
+    check_non_ids_name_nothing(store.clone()).await;
     check_scid_sources(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
@@ -3604,6 +4319,30 @@ macro_rules! conformance_for {
                 check_concurrent_delete(ready($ctor).await).await;
             }
             #[tokio::test]
+            async fn same_body_for_two_recipients() {
+                check_same_body_for_two_recipients(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn stale_expiry_entry_keeps_a_later_copy() {
+                check_stale_expiry_entry_keeps_a_later_copy(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn acknowledgement_never_removes_another_copy() {
+                check_acknowledgement_never_removes_another_copy(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn only_the_recipient_acknowledges() {
+                check_only_the_recipient_acknowledges(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn receipts_are_per_recipient() {
+                check_receipts_are_per_recipient(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn non_ids_name_nothing() {
+                check_non_ids_name_nothing(ready($ctor).await).await;
+            }
+            #[tokio::test]
             async fn mux_primitives() {
                 check_mux_primitives(ready($ctor).await).await;
             }
@@ -3747,6 +4486,366 @@ async fn check_redis_malformed_forward_entries_are_dropped(
         .await;
 }
 
+/// Writes a message in the layout used before records were per recipient —
+/// one `MSG:<id>` / `MSG:META:<id>` per body, its id alone in the expiry
+/// bucket and (in cluster mode) as the queue-id field — with the queue
+/// entries and counters the earlier library kept. Returns the id.
+#[cfg(feature = "redis-backend")]
+async fn write_legacy_redis_record(
+    store: &affinidi_messaging_mediator::store::RedisStore,
+    body: &str,
+    to: &str,
+    from: &str,
+    expires_at: u64,
+) -> String {
+    use affinidi_messaging_mediator_common::database::keys::Keys;
+    let keys = Keys::new(std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true"));
+    let id = sha256::digest(body.as_bytes());
+    let bytes = body.len();
+    let mut conn = store.get_connection().await.expect("redis connection");
+    let receive_id: String = ::redis::cmd("XADD")
+        .arg(keys.receive_q(to))
+        .arg("*")
+        .arg("MSG_ID")
+        .arg(&id)
+        .arg("BYTES")
+        .arg(bytes)
+        .arg("FROM")
+        .arg(from)
+        .query_async(&mut conn)
+        .await
+        .expect("XADD inbox");
+    let send_id: String = ::redis::cmd("XADD")
+        .arg(keys.send_q(from))
+        .arg("*")
+        .arg("MSG_ID")
+        .arg(&id)
+        .arg("BYTES")
+        .arg(bytes)
+        .arg("TO")
+        .arg(to)
+        .query_async(&mut conn)
+        .await
+        .expect("XADD outbox");
+    let bucket = format!("MSG_EXPIRY:{expires_at}");
+    let commands: Vec<::redis::Cmd> = vec![
+        ::redis::cmd("SET")
+            .arg(keys.msg(&id, None))
+            .arg(body)
+            .to_owned(),
+        ::redis::cmd("HSET")
+            .arg(keys.msg_meta(&id, None))
+            .arg("BYTES")
+            .arg(bytes)
+            .arg("TO")
+            .arg(to)
+            .arg("FROM")
+            .arg(from)
+            .arg("TIMESTAMP")
+            .arg(1_700_000_000_000u64)
+            .arg("RECEIVE_ID")
+            .arg(&receive_id)
+            .arg("SEND_ID")
+            .arg(&send_id)
+            .to_owned(),
+        ::redis::cmd("HINCRBY")
+            .arg(keys.did(to))
+            .arg("RECEIVE_QUEUE_COUNT")
+            .arg(1)
+            .to_owned(),
+        ::redis::cmd("HINCRBY")
+            .arg(keys.did(to))
+            .arg("RECEIVE_QUEUE_BYTES")
+            .arg(bytes)
+            .to_owned(),
+        ::redis::cmd("HINCRBY")
+            .arg(keys.did(from))
+            .arg("SEND_QUEUE_COUNT")
+            .arg(1)
+            .to_owned(),
+        ::redis::cmd("HINCRBY")
+            .arg(keys.did(from))
+            .arg("SEND_QUEUE_BYTES")
+            .arg(bytes)
+            .to_owned(),
+        ::redis::cmd("HINCRBY")
+            .arg(keys.peer_q(from))
+            .arg(to)
+            .arg(1)
+            .to_owned(),
+        ::redis::cmd("ZADD")
+            .arg("MSG_EXPIRY")
+            .arg(expires_at)
+            .arg(&bucket)
+            .to_owned(),
+        ::redis::cmd("SADD").arg(&bucket).arg(&id).to_owned(),
+        ::redis::cmd("HSET")
+            .arg(keys.receive_ids(to))
+            .arg(&id)
+            .arg(&receive_id)
+            .to_owned(),
+        ::redis::cmd("HSET")
+            .arg(keys.send_ids(from))
+            .arg(&id)
+            .arg(&send_id)
+            .to_owned(),
+    ];
+    for cmd in commands {
+        cmd.query_async::<::redis::Value>(&mut conn)
+            .await
+            .expect("legacy write");
+    }
+    id
+}
+
+/// Messages stored before records were per recipient keep working: the
+/// recipient fetches, reads and deletes them; storing the same bytes again
+/// for that recipient is still one record; the same bytes for another
+/// recipient get a record of their own; purge and expiry remove them; and
+/// every counter returns to zero. Part of the DB 0 sequence.
+#[cfg(feature = "redis-backend")]
+async fn check_redis_legacy_records_keep_working(
+    store: &affinidi_messaging_mediator::store::RedisStore,
+) {
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, SentMessageState};
+    use affinidi_messaging_mediator_common::types::messages::{
+        FetchDeletePolicy, FetchOptions, Folder,
+    };
+
+    let dyn_store: Arc<dyn MediatorStore> = Arc::new(store.clone());
+    let (a, b, from) = (
+        "did_hash_legacy_a",
+        "did_hash_legacy_b",
+        "did_hash_legacy_sender",
+    );
+    for did in [a, b, from] {
+        dyn_store
+            .account_add(did, &allow_all(), None)
+            .await
+            .expect("account_add");
+    }
+    let body = "{\"protected\":\"legacy-record\"}";
+    let len = body.len() as u64;
+    let id = write_legacy_redis_record(store, body, a, from, NEVER).await;
+    assert_eq!(queue_counters(&dyn_store, a).await, (1, len, 0, 0));
+
+    // Read and fetched by its recipient, read by its sender.
+    let fetched = dyn_store
+        .fetch_messages(
+            "s",
+            a,
+            &FetchOptions {
+                limit: 10,
+                start_id: None,
+                delete_policy: FetchDeletePolicy::DoNotDelete,
+            },
+        )
+        .await
+        .expect("fetch");
+    assert_eq!(fetched.success.len(), 1);
+    assert_eq!(fetched.success[0].msg.as_deref(), Some(body));
+    for party in [a, from] {
+        let read = dyn_store
+            .get_message(party, &id)
+            .await
+            .expect("get_message")
+            .unwrap_or_else(|| panic!("{party} reads the legacy record"));
+        assert_eq!(read.to_address.as_deref(), Some(a));
+    }
+    assert_eq!(
+        dyn_store
+            .get_message_metadata(a, &id)
+            .await
+            .expect("metadata")
+            .to_did_hash,
+        a
+    );
+
+    // Stored again for its recipient: still one record. For another: a new one.
+    dyn_store
+        .store_message("s", body, a, Some(from), NEVER, 0)
+        .await
+        .expect("store again for a");
+    assert_eq!(queue_counters(&dyn_store, a).await, (1, len, 0, 0));
+    dyn_store
+        .store_message("s", body, b, Some(from), NEVER, 0)
+        .await
+        .expect("store for b");
+    assert_eq!(queue_counters(&dyn_store, b).await, (1, len, 0, 0));
+    assert_eq!(queue_counters(&dyn_store, from).await, (0, 0, 2, 2 * len));
+
+    // Delivery is recorded on the legacy record, and only there.
+    dyn_store
+        .mark_delivered(a, std::slice::from_ref(&id), 1_700_000_000_000, 0)
+        .await
+        .expect("mark");
+    assert!(
+        dyn_store
+            .delivery_state(a, &id)
+            .await
+            .unwrap()
+            .is_some_and(|s| s.first_delivered_at_ms.is_some())
+    );
+    assert_eq!(
+        dyn_store
+            .delivery_state(b, &id)
+            .await
+            .unwrap()
+            .and_then(|s| s.first_delivered_at_ms),
+        None
+    );
+    let sent = dyn_store
+        .sent_message_states(from, std::slice::from_ref(&id))
+        .await
+        .unwrap();
+    assert_eq!(sent[0], SentMessageState::Queued, "b's copy still waits");
+
+    // The recipient deletes its legacy record; b's copy stays.
+    dyn_store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: a.to_string(),
+            },
+        )
+        .await
+        .expect("a deletes the legacy record");
+    assert_eq!(queue_counters(&dyn_store, a).await, (0, 0, 0, 0));
+    assert_eq!(queue_counters(&dyn_store, from).await, (0, 0, 1, len));
+    assert_eq!(dyn_store.peer_queue_count(from, a).await.unwrap(), 0);
+    assert!(dyn_store.get_message(b, &id).await.unwrap().is_some());
+    dyn_store
+        .delete_message(
+            &id,
+            DeletionAuthority::Owner {
+                did_hash: b.to_string(),
+            },
+        )
+        .await
+        .expect("b deletes its copy");
+    assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+
+    // A purge removes a legacy record at the head of the inbox.
+    write_legacy_redis_record(store, "{\"protected\":\"legacy-purge\"}", a, from, NEVER).await;
+    let (count, _) = dyn_store
+        .purge_folder("s", a, Folder::Inbox)
+        .await
+        .expect("purge");
+    assert_eq!(count, 1);
+    assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+
+    // An instance of an earlier build calls `delete_message` with the
+    // requester alone and expects `OK`; the library keeps that contract.
+    // (Single-node only: cluster mode has no function library.)
+    if !std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true") {
+        let id = dyn_store
+            .store_message(
+                "s",
+                "{\"protected\":\"older-caller\"}",
+                a,
+                Some(from),
+                NEVER,
+                0,
+            )
+            .await
+            .expect("store");
+        let mut conn = store.get_connection().await.expect("redis connection");
+        let reply: String = ::redis::cmd("FCALL")
+            .arg("delete_message")
+            .arg(1)
+            .arg(&id)
+            .arg(a)
+            .query_async(&mut conn)
+            .await
+            .expect("an earlier build's delete call");
+        assert_eq!(reply, "OK");
+        assert!(dyn_store.get_message(a, &id).await.unwrap().is_none());
+        assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+    }
+
+    // An earlier build's sweeper passes bucket members, now `<id>:<to>`, as
+    // the admin: a record whose expiry has not come is left alone, one whose
+    // expiry has passed is removed. A bare id from it reaches only a legacy
+    // record, never a per-recipient one.
+    if !std::env::var("REDIS_CLUSTER_MODE").is_ok_and(|v| v == "true") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let admin = "did_hash_legacy_older_sweeper";
+        let mut conn = store.get_connection().await.expect("redis connection");
+        let mut older_sweeper = async |member: &str| -> ::redis::RedisResult<String> {
+            ::redis::cmd("FCALL")
+                .arg("delete_message")
+                .arg(1)
+                .arg(member)
+                .arg(admin)
+                .arg(admin)
+                .query_async(&mut conn)
+                .await
+        };
+        let kept = dyn_store
+            .store_message("s", "{\"protected\":\"not-due\"}", a, Some(from), NEVER, 0)
+            .await
+            .expect("store");
+        let refused = older_sweeper(&format!("{kept}:{a}")).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("NOT_FOUND")),
+            "{refused:?}"
+        );
+        let refused = older_sweeper(&kept).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("NOT_FOUND")),
+            "a bare id reaches no per-recipient record: {refused:?}"
+        );
+        assert!(dyn_store.get_message(a, &kept).await.unwrap().is_some());
+        let due = dyn_store
+            .store_message("s", "{\"protected\":\"due\"}", a, Some(from), now - 10, 0)
+            .await
+            .expect("store");
+        assert_eq!(
+            older_sweeper(&format!("{due}:{a}")).await.expect("due"),
+            "OK"
+        );
+        assert!(dyn_store.get_message(a, &due).await.unwrap().is_none());
+        dyn_store
+            .delete_message(
+                &kept,
+                DeletionAuthority::Owner {
+                    did_hash: a.to_string(),
+                },
+            )
+            .await
+            .expect("delete");
+        assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+    }
+
+    // The sweeper expires a legacy record from its bare-id bucket entry.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expiring = write_legacy_redis_record(
+        store,
+        "{\"protected\":\"legacy-expiry\"}",
+        a,
+        from,
+        now - 10,
+    )
+    .await;
+    let report = dyn_store
+        .sweep_expired_messages(now, "did_hash_legacy_admin")
+        .await
+        .expect("sweep");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert!(dyn_store.get_message(a, &expiring).await.unwrap().is_none());
+    assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
+}
+
 /// DB 0: every numbered index a default Redis offers (0..=15) is in use, so
 /// the checks added since share it, one after another in a single test. The
 /// start-up check needs the concrete `RedisStore`, so this test is written out
@@ -3761,5 +4860,6 @@ async fn redis_db0_checks() {
     check_redis_startup(&store).await;
     flush_db(&store).await;
     check_redis_malformed_forward_entries_are_dropped(&store).await;
+    check_redis_legacy_records_keep_working(&store).await;
     check_db0_in_sequence(Arc::new(store)).await;
 }

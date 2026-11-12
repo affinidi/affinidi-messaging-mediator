@@ -1061,7 +1061,11 @@ async fn the_drain_stamps_only_what_it_writes() {
         .expect("fetch")
         .success
     {
-        let state = store.delivery_state(&m.msg_id).await.unwrap().unwrap();
+        let state = store
+            .delivery_state(&principal.did_hash(), &m.msg_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             state.first_delivered_at_ms.is_none(),
             "nothing is stamped before the socket opens: {}",
@@ -1090,7 +1094,7 @@ async fn the_drain_stamps_only_what_it_writes() {
             .and_then(|b| BASE64_URL_SAFE_NO_PAD.decode(b).ok())
             .is_some_and(|b| affinidi_tsp::is_tsp(&b));
         let state = store
-            .delivery_state(&m.msg_id)
+            .delivery_state(&principal.did_hash(), &m.msg_id)
             .await
             .expect("delivery state")
             .expect("exists");

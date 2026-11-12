@@ -5,7 +5,8 @@
 
 use super::Database;
 use crate::errors::MediatorError;
-use crate::store::types::{DeletionAuthority, Session};
+use crate::store::ops;
+use crate::store::types::{DeletionAuthority, MessageScope, Session};
 use crate::types::messages::Folder;
 use ahash::AHashMap as HashMap;
 use tracing::{Instrument, Level, debug, span, warn};
@@ -26,14 +27,11 @@ impl Database {
         let mut purge_count: usize = 0;
         let mut purge_bytes: usize = 0;
 
-        loop {
-            let (count, bytes) = self._purge_messages(session, did_hash, &folder, by).await?;
+        while let Some((count, bytes)) =
+            self._purge_messages(session, did_hash, &folder, by).await?
+        {
             purge_count += count;
             purge_bytes += bytes;
-
-            if count == 0 {
-                break;
-            }
         }
 
         // Remove the stream key
@@ -43,14 +41,19 @@ impl Database {
         Ok((purge_count, purge_bytes))
     }
 
-    // Helper function that does the actual work of purging messages
+    // Helper function that does the actual work of purging messages: removes
+    // the record behind the folder's first entry, then the entry. Returns
+    // `None` once the folder is empty, else what this step removed (`(0, 0)`
+    // for an entry whose record was already gone — a concurrent pickup, the
+    // expiry sweep, or one left behind before records were per recipient —
+    // which is dropped so it cannot hold up the rest of the folder).
     async fn _purge_messages(
         &self,
         session: &Session,
         did_hash: &str,
         folder: &Folder,
         by: &DeletionAuthority,
-    ) -> Result<(usize, usize), MediatorError> {
+    ) -> Result<Option<(usize, usize)>, MediatorError> {
         let _span = span!(Level::DEBUG, "purge_messages", did_hash = did_hash, folder = ?folder);
 
         async move {
@@ -75,21 +78,18 @@ impl Database {
                         )
                     })?;
 
-            let (stream_id, message) = if message.is_empty() {
+            let Some((stream_id, message)) = message.first() else {
                 debug!("No messages to purge...");
-                return Ok((0, 0));
-            } else if let Some(first) = message.first() {
-                first
-            } else {
-                return Ok((0, 0));
+                return Ok(None);
             };
 
-            // Extract the message details
-            let message_hash = if let Some(message_id) = message.get("MSG_ID") {
-                message_id
-            } else {
+            // Extract the message details. An entry without them names no
+            // record; drop it so the purge moves on.
+            let Some(message_hash) = message.get("MSG_ID") else {
                 warn!("Couldn't find MSG_ID");
-                return Ok((0, 0));
+                self._delete_msg_stream_record(session, &key, stream_id)
+                    .await?;
+                return Ok(Some((0, 0)));
             };
 
             let bytes = if let Some(bytes) = message.get("BYTES") {
@@ -108,6 +108,15 @@ impl Database {
                 0_usize
             };
 
+            // The record this entry is for: the folder owner's in an inbox,
+            // the entry's recipient in an outbox — never another recipient's
+            // copy of the same bytes.
+            let scope = match (folder, message.get("TO")) {
+                (Folder::Outbox, Some(to)) => MessageScope::Recipient(to),
+                (Folder::Outbox, None) => MessageScope::Party(did_hash),
+                (Folder::Inbox, _) => MessageScope::Recipient(did_hash),
+            };
+
             // Delete the message. An admin delete passes the admin DID as both
             // requester and admin, as `RedisStore::delete_message` does, so the
             // Lua check accepts it and the receipt reads `discarded`.
@@ -117,21 +126,29 @@ impl Database {
                     (admin_did_hash.as_str(), Some(admin_did_hash.as_str()))
                 }
             };
-            self.handler
+            let removed = match self
+                .handler
                 .delete_message(
                     Some(&session.session_id),
                     requester,
                     message_hash,
-                    None,
+                    scope,
                     admin,
+                    None,
                 )
-                .await?;
+                .await
+            {
+                Ok(_) => (1, bytes),
+                Err(e) if ops::is_delete_not_found(&e) => (0, 0),
+                Err(e) => return Err(e),
+            };
 
-            // Delete the stream entry
+            // Delete the stream entry (the delete removed it already when it
+            // removed the record; this covers an entry with no record)
             self._delete_msg_stream_record(session, &key, stream_id)
                 .await?;
 
-            Ok((1, bytes))
+            Ok(Some(removed))
         }
         .instrument(_span)
         .await

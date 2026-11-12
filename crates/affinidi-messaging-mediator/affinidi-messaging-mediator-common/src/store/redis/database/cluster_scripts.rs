@@ -32,8 +32,25 @@ pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 /// then releases nothing: its claimed entry ids no longer match.
 /// `RECORD_QUEUE_IDS` clears the fields once the store completes.
 ///
-/// KEYS: body, metadata. ARGV: body, bytes, to, from (`ANONYMOUS` for none),
-/// delete lease ms, store token, store lease ms.
+/// Records are per recipient (see `Keys::msg`): the body and metadata here
+/// are the record held for `to`. A legacy per-id record already complete for
+/// `to` (written before records were per recipient) counts as stored, so the
+/// same bytes are still one record per recipient across the upgrade. The
+/// recipient is added to the id's recipient index, and the record carries its
+/// expiry so the sweeper can tell a current expiry entry from a stale one.
+///
+/// Known edge, left as is: a legacy record for `to` whose own store was
+/// interrupted by an earlier build (no `RECEIVE_ID` yet) or is being deleted
+/// does not count as stored, so the same bytes stored again get a
+/// per-recipient record beside it. The two are separate records with their
+/// own queue entries and counters, each removed on its own (the legacy one by
+/// the delete or sweep that takes its lapsed hold over), so nothing leaks; the
+/// recipient may see the message twice. It needs an earlier build to have
+/// died mid-store of exactly these bytes just before the upgrade.
+///
+/// KEYS: body, metadata, legacy metadata, recipient index. ARGV: body, bytes,
+/// to, from (`ANONYMOUS` for none), delete lease ms, store token, store lease
+/// ms, expires at (epoch secs).
 /// Returns `{result, release_to, release_from, release_bytes,
 /// release_receive_id, release_send_id}`. `result` is 1 when newly written,
 /// 2 when an unfinished store (a retry, the same message stored
@@ -45,6 +62,10 @@ pub(crate) static STORE_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
         r#"
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local legacy = redis.call('HMGET', KEYS[3], 'TO', 'RECEIVE_ID', 'DELETING')
+if legacy[1] == ARGV[3] and legacy[2] and not legacy[3] then
+    return { '0', '', '', '', '', '' }
+end
 local flat = redis.call('HGETALL', KEYS[2])
 local meta, storing = {}, false
 for i = 1, #flat, 2 do
@@ -83,8 +104,9 @@ if meta.TO then
     end
 end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3],
+redis.call('HSET', KEYS[2], 'BYTES', ARGV[2], 'TO', ARGV[3], 'EXPIRES_AT', ARGV[8],
     'TIMESTAMP', string.format('%d%03d', t[1], t[2] / 1000), 'STORING:' .. ARGV[6], now_ms)
+redis.call('SADD', KEYS[4], ARGV[3])
 if ARGV[4] ~= 'ANONYMOUS' then
     redis.call('HSET', KEYS[2], 'FROM', ARGV[4])
 end
@@ -99,12 +121,13 @@ return { tostring(result), meta.RELEASE_TO or '', meta.RELEASE_FROM or '',
 /// first entry and counts nothing, the rule the library's `store_message`
 /// keeps for the same recipient.
 ///
-/// KEYS: account, inbox, inbox ids. ARGV: message hash, bytes, from, queue
-/// maxlen (0 for none). Returns the inbox stream id.
+/// KEYS: account, inbox, inbox ids. ARGV: message hash (the entry's
+/// `MSG_ID`), bytes, from, queue maxlen (0 for none), record member (the
+/// inbox-ids field, `Keys::record_member`). Returns the inbox stream id.
 pub(crate) static ENQUEUE_INBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
-local queued = redis.call('HGET', KEYS[3], ARGV[1])
+local queued = redis.call('HGET', KEYS[3], ARGV[5])
 if queued then
     return queued
 end
@@ -119,7 +142,7 @@ if maxlen > 0 then
 else
     id = redis.call('XADD', KEYS[2], id, 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'FROM', ARGV[3])
 end
-redis.call('HSET', KEYS[3], ARGV[1], id)
+redis.call('HSET', KEYS[3], ARGV[5], id)
 return id
 "#,
     )
@@ -129,11 +152,13 @@ return id
 /// to the outbox, once, as [`ENQUEUE_INBOX`].
 ///
 /// KEYS: account, per-recipient counts, outbox, outbox ids. ARGV: message
-/// hash, bytes, to, queue maxlen (0 for none). Returns the outbox stream id.
+/// hash (the entry's `MSG_ID`), bytes, to, queue maxlen (0 for none), record
+/// member (the outbox-ids field: one sender may queue the same bytes for
+/// several recipients, one entry each). Returns the outbox stream id.
 pub(crate) static ENQUEUE_OUTBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
-local queued = redis.call('HGET', KEYS[4], ARGV[1])
+local queued = redis.call('HGET', KEYS[4], ARGV[5])
 if queued then
     return queued
 end
@@ -149,7 +174,7 @@ if maxlen > 0 then
 else
     id = redis.call('XADD', KEYS[3], id, 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'TO', ARGV[3])
 end
-redis.call('HSET', KEYS[4], ARGV[1], id)
+redis.call('HSET', KEYS[4], ARGV[5], id)
 return id
 "#,
     )
@@ -192,13 +217,18 @@ return 1
 /// A hold past its lease belongs to a caller that died part-way and is taken
 /// over, so the message is never stuck.
 ///
+/// A delete by the expiry sweep passes the bucket's time: a record whose
+/// current expiry is later is not due (the entry belongs to a deadline it no
+/// longer has) and is refused as NOT_FOUND, so the sweeper drops the entry
+/// and keeps the record.
+///
 /// KEYS: metadata. ARGV: message hash, requester, delete token, store lease
-/// ms, delete lease ms, admin (optional).
+/// ms, delete lease ms, admin ("" for none), expiry slot ("" for none).
 /// Returns TO, FROM ("" for an anonymous sender), BYTES, and the inbox and
 /// outbox entry ids ("" when not recorded), which bind the releases to the
 /// entries this claim saw. Then the five `RELEASE_*` fields of a taken-over
 /// delete whose store died before releasing them ("" when none): the delete
-/// releases those entries too.
+/// releases those entries too. Last, the record's `EXPIRES_AT` ("" for none).
 pub(crate) static CLAIM_MESSAGE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -215,12 +245,18 @@ for i = 1, #flat, 2 do
     end
 end
 local is_owner = (meta.TO == ARGV[2]) or (meta.FROM == ARGV[2])
-local is_admin = (#ARGV >= 6 and ARGV[2] == ARGV[6])
+local is_admin = (#ARGV >= 6 and ARGV[6] ~= '' and ARGV[2] == ARGV[6])
 if not is_owner and not is_admin then
     return redis.error_reply('PERMISSION_DENIED: Requesting DID does not have ownership of this message')
 end
 if meta.BYTES == nil then
     return redis.error_reply('message (' .. ARGV[1] .. ') metadata did not contain BYTES field.')
+end
+if #ARGV >= 7 and ARGV[7] ~= '' and meta.EXPIRES_AT then
+    local expires = tonumber(meta.EXPIRES_AT) or 0
+    if expires == 0 or expires > tonumber(ARGV[7]) then
+        return redis.error_reply('NOT_FOUND: message_hash (' .. ARGV[1] .. ') is not due at this expiry')
+    end
 end
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -241,7 +277,7 @@ if #expired > 0 then
 end
 return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta.SEND_ID or '',
     meta.RELEASE_TO or '', meta.RELEASE_FROM or '', meta.RELEASE_BYTES or '',
-    meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '' }
+    meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '', meta.EXPIRES_AT or '' }
 "#,
     )
 });
@@ -251,7 +287,11 @@ return { meta.TO or '', meta.FROM or '', meta.BYTES, meta.RECEIVE_ID or '', meta
 /// lease and was taken over) removes nothing, so exactly one delete reports
 /// the message removed.
 ///
-/// KEYS: body, metadata. ARGV: delete token. Returns 1 when removed.
+/// Also drops the recipient from the id's recipient index (a per-recipient
+/// record; `to` is "" for a legacy one, which is not indexed).
+///
+/// KEYS: body, metadata, recipient index. ARGV: delete token, to. Returns 1
+/// when removed.
 pub(crate) static FINISH_DELETE: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -259,6 +299,9 @@ if redis.call('HGET', KEYS[2], 'DELETING') ~= ARGV[1] then
     return 0
 end
 redis.call('DEL', KEYS[1], KEYS[2])
+if ARGV[2] ~= '' then
+    redis.call('SREM', KEYS[3], ARGV[2])
+end
 return 1
 "#,
     )
@@ -288,8 +331,8 @@ return 1
 /// nor when the entry isn't the one the claim saw: a delete that stalled
 /// past its lease must not release the entry of the message stored again.
 ///
-/// KEYS: account, inbox, inbox ids. ARGV: message hash, bytes, claimed entry
-/// id ("" to release whatever is queued).
+/// KEYS: account, inbox, inbox ids. ARGV: record member (the inbox-ids
+/// field), bytes, claimed entry id ("" to release whatever is queued).
 pub(crate) static RELEASE_INBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -309,8 +352,9 @@ return 1
 /// Sender slot of a delete: release the counters, the per-recipient count
 /// (dropped at zero) and the outbox entry, as [`RELEASE_INBOX`].
 ///
-/// KEYS: account, per-recipient counts, outbox, outbox ids. ARGV: message
-/// hash, bytes, to, claimed entry id ("" to release whatever is queued).
+/// KEYS: account, per-recipient counts, outbox, outbox ids. ARGV: record
+/// member (the outbox-ids field), bytes, to, claimed entry id ("" to release
+/// whatever is queued).
 pub(crate) static RELEASE_OUTBOX: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -326,6 +370,49 @@ end
 redis.call('XDEL', KEYS[3], queued)
 redis.call('HDEL', KEYS[4], ARGV[1])
 return 1
+"#,
+    )
+});
+
+/// Message slot: record one handover of a recipient's copy, in both modes
+/// (single-node uses it too; it is not part of the function library, for
+/// the reason `MediatorStore::mark_delivered` gives). Writes nothing when
+/// the recipient holds no copy, so a mark racing a delete never recreates
+/// the metadata hash.
+///
+/// The first handover stamps `FIRST_DELIVERED_AT`; with a deadline, it also
+/// brings the record's `EXPIRES_AT` forward when the deadline is sooner, so
+/// the sweeper treats the original entry as stale once the new one is added.
+/// A legacy record has no `EXPIRES_AT` and is advanced unconditionally, as
+/// before.
+///
+/// KEYS: metadata, legacy metadata. ARGV: recipient, now ms, deadline (epoch
+/// secs, 0 for none). Returns `{found, first, advanced, per_recipient}`.
+pub(crate) static MARK_DELIVERED: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+local key, per_recipient = nil, 0
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    key, per_recipient = KEYS[1], 1
+elseif redis.call('HGET', KEYS[2], 'TO') == ARGV[1] then
+    key = KEYS[2]
+else
+    return { 0, 0, 0, 0 }
+end
+local first = redis.call('HSETNX', key, 'FIRST_DELIVERED_AT', ARGV[2])
+redis.call('HINCRBY', key, 'DELIVERY_ATTEMPTS', 1)
+local advanced = 0
+local deadline = tonumber(ARGV[3])
+if first == 1 and deadline > 0 then
+    local expires = redis.call('HGET', key, 'EXPIRES_AT')
+    if not expires then
+        advanced = 1
+    elseif tonumber(expires) == 0 or deadline < tonumber(expires) then
+        redis.call('HSET', key, 'EXPIRES_AT', deadline)
+        advanced = 1
+    end
+end
+return { 1, first, advanced, per_recipient }
 "#,
     )
 });
@@ -393,6 +480,18 @@ mod tests {
     }
 
     impl Message {
+        fn body(&self) -> String {
+            self.keys.msg(&self.hash, Some(&self.to))
+        }
+
+        fn meta(&self) -> String {
+            self.keys.msg_meta(&self.hash, Some(&self.to))
+        }
+
+        fn member(&self) -> String {
+            Keys::record_member(&self.hash, Some(&self.to))
+        }
+
         fn new() -> Self {
             let id = uuid::Uuid::new_v4();
             Message {
@@ -406,8 +505,10 @@ mod tests {
         /// The first step of a store: `{result, release_*}`.
         async fn store(&self, conn: &mut ClusterConnection, token: &str) -> Vec<String> {
             STORE_MESSAGE
-                .key(self.keys.msg(&self.hash))
-                .key(self.keys.msg_meta(&self.hash))
+                .key(self.body())
+                .key(self.meta())
+                .key(self.keys.msg_meta(&self.hash, None))
+                .key(self.keys.msg_recipients(&self.hash))
                 .arg("body")
                 .arg(4)
                 .arg(&self.to)
@@ -415,6 +516,7 @@ mod tests {
                 .arg(LEASE_MS)
                 .arg(token)
                 .arg(LEASE_MS)
+                .arg(0)
                 .invoke_async(conn)
                 .await
                 .expect("STORE_MESSAGE")
@@ -427,7 +529,7 @@ mod tests {
                 .key(self.keys.did(&self.to))
                 .key(self.keys.receive_q(&self.to))
                 .key(self.keys.receive_ids(&self.to))
-                .arg(&self.hash)
+                .arg(self.member())
                 .arg(4)
                 .arg(receive_id)
                 .invoke_async(conn)
@@ -438,7 +540,7 @@ mod tests {
                 .key(self.keys.peer_q(&self.from))
                 .key(self.keys.send_q(&self.from))
                 .key(self.keys.send_ids(&self.from))
-                .arg(&self.hash)
+                .arg(self.member())
                 .arg(4)
                 .arg(&self.to)
                 .arg(send_id)
@@ -468,6 +570,7 @@ mod tests {
                 .arg(4)
                 .arg(&self.from)
                 .arg(0)
+                .arg(self.member())
                 .invoke_async(conn)
                 .await
                 .expect("ENQUEUE_INBOX");
@@ -480,11 +583,12 @@ mod tests {
                 .arg(4)
                 .arg(&self.to)
                 .arg(0)
+                .arg(self.member())
                 .invoke_async(conn)
                 .await
                 .expect("ENQUEUE_OUTBOX");
             let recorded: i64 = RECORD_QUEUE_IDS
-                .key(self.keys.msg_meta(&self.hash))
+                .key(self.meta())
                 .arg(token)
                 .arg(vec!["RECEIVE_ID", &receive_id, "SEND_ID", &send_id])
                 .invoke_async(conn)
@@ -513,7 +617,7 @@ mod tests {
             delete_lease_ms: u64,
         ) -> redis::RedisResult<Vec<String>> {
             CLAIM_MESSAGE
-                .key(self.keys.msg_meta(&self.hash))
+                .key(self.meta())
                 .arg(&self.hash)
                 .arg(&self.to)
                 .arg(token)
@@ -532,9 +636,11 @@ mod tests {
         ) -> i64 {
             self.release_claimed(conn, claimed).await;
             FINISH_DELETE
-                .key(self.keys.msg(&self.hash))
-                .key(self.keys.msg_meta(&self.hash))
+                .key(self.body())
+                .key(self.meta())
+                .key(self.keys.msg_recipients(&self.hash))
                 .arg(token)
+                .arg(&self.to)
                 .invoke_async(conn)
                 .await
                 .expect("FINISH_DELETE")
@@ -627,7 +733,7 @@ mod tests {
             .await
             .expect("an expired store doesn't hold the message");
         let marked: bool = redis::cmd("HEXISTS")
-            .arg(msg.keys.msg_meta(&msg.hash))
+            .arg(msg.meta())
             .arg("STORING:dead")
             .query_async(&mut conn)
             .await
@@ -673,7 +779,7 @@ mod tests {
     /// had stalled for longer than `DELETE_LEASE_MS`.
     async fn expire_delete_hold(msg: &Message, conn: &mut ClusterConnection) {
         let _: () = redis::cmd("HSET")
-            .arg(msg.keys.msg_meta(&msg.hash))
+            .arg(msg.meta())
             .arg("DELETING_AT")
             .arg(0)
             .query_async(conn)
@@ -717,7 +823,7 @@ mod tests {
             "the message stored again is still queued"
         );
         let fields: Vec<String> = redis::cmd("HKEYS")
-            .arg(msg.keys.msg_meta(&msg.hash))
+            .arg(msg.meta())
             .query_async(&mut conn)
             .await
             .expect("HKEYS");
@@ -804,7 +910,7 @@ mod tests {
             Ok(claimed) => panic!("claimed while held: {claimed:?}"),
         }
         let abandoned: i64 = ABANDON_DELETE
-            .key(msg.keys.msg_meta(&msg.hash))
+            .key(msg.meta())
             .arg("d1")
             .invoke_async(&mut conn)
             .await

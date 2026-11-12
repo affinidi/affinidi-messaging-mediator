@@ -13,14 +13,26 @@
 //! subscribers can share one Redis pubsub bridge.
 
 use crate::circuit_breaker::CircuitBreaker;
+use crate::database::keys::Keys;
+use crate::store::redis::database::cluster_scripts::MARK_DELIVERED;
 use crate::store::redis::database::{
     forwarding::ForwardQueueEntry as InnerForwardEntry, stats::MetadataStats as InnerMetadataStats,
     store::MessageMetaData as InnerMessageMetaData,
 };
 use crate::store::{
-    DeliveryDecision, DeliveryMarkReport, DeliveryState, OutboxReceipt, SentMessageState,
-    StoredMessageRef, mux, ops,
+    DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope,
+    OUTBOX_RECEIPT_TTL, OutboxReceipt, RemovedCopy, SentMessageState, StoredMessageRef, mux, ops,
 };
+
+/// Whether a per-recipient receipt is still within [`OUTBOX_RECEIPT_TTL`]. Its
+/// hash lives as long as the latest removal, so older fields are dropped here.
+fn receipt_is_current(receipt: &OutboxReceipt) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    receipt.at_ms + OUTBOX_RECEIPT_TTL.as_millis() as u64 > now_ms
+}
 use crate::types::{
     accounts::{
         Account, AccountActivity, AccountStats, AccountStatsDelta, AccountType, ActivityKind,
@@ -622,11 +634,12 @@ impl MediatorStore for RedisStore {
         .await
     }
 
-    async fn delete_message(
+    async fn delete_message_in(
         &self,
         message_hash: &str,
+        scope: MessageScope<'_>,
         by: DeletionAuthority,
-    ) -> Result<(), MediatorError> {
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
         let (did_hash, admin) = match &by {
             DeletionAuthority::Owner { did_hash } => (did_hash.as_str(), None),
             DeletionAuthority::Admin { admin_did_hash } => {
@@ -636,139 +649,160 @@ impl MediatorStore for RedisStore {
             }
         };
         self.handler
-            .delete_message(None, did_hash, message_hash, None, admin)
+            .delete_message(None, did_hash, message_hash, scope, admin, None)
             .await
     }
 
-    async fn mark_delivered(
-        &self,
-        msg_ids: &[String],
-        now_ms: u64,
-        delivered_ttl_secs: u64,
-    ) -> Result<DeliveryMarkReport, MediatorError> {
-        let mut report = DeliveryMarkReport::default();
-        if msg_ids.is_empty() {
-            return Ok(report);
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(false);
         }
         let mut conn = self.get_connection().await?;
-
-        // Write only to metadata hashes that still exist.
-        //
-        // `HSETNX` and `HINCRBY` both **create** a hash when the key is
-        // missing, so marking a message that has already been deleted does not
-        // quietly do nothing — it resurrects `MSG:META:<id>` as an orphan with
-        // two fields, no body, no stream entry, and nothing that will ever
-        // clean it up, because `delete_message` has already run. An earlier
-        // version of this comment asserted the opposite, which was wrong in
-        // exactly the case that matters.
-        //
-        // The caller already declines to mark an optimistic fetch, where the
-        // read deletes as it goes and every message would hit this. The check
-        // here covers the rest: a concurrent delete, or the expiry sweeper,
-        // landing between the fetch and the mark.
-        //
-        // It narrows that window rather than closing it — a delete landing
-        // between this `EXISTS` and the write below still resurrects the hash.
-        // Closing it properly needs the read and the mark in one round trip,
-        // which means a stored function, and the reasons for staying out of
-        // `atm-functions.lua` are on `MediatorStore::mark_delivered`. Stated
-        // rather than papered over.
-        let mut exists_pipe = redis::pipe();
-        for id in msg_ids {
-            exists_pipe.cmd("EXISTS").arg(self.keys().msg_meta(id));
-        }
-        let present: Vec<bool> = self
-            .query_each(&mut conn, exists_pipe)
+        redis::cmd("EXISTS")
+            .arg(self.keys().acknowledged(to_did_hash, msg_id))
+            .query_async(&mut conn)
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
                     14,
                     "NA".into(),
                     &err,
-                    format!("Couldn't check message metadata before marking delivery: {err}"),
+                    format!("Couldn't read the acknowledgement: {err}"),
+                )
+            })
+    }
+
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let raw: HashMap<String, String> = redis::cmd("HGETALL")
+            .arg(self.keys().outbox_receipts(from_did_hash, msg_id))
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &err,
+                    format!("Couldn't read outbox receipts: {err}"),
                 )
             })?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(to, raw)| Some((to, OutboxReceipt::decode(&raw)?)))
+            .filter(|(_, receipt)| receipt_is_current(receipt))
+            .collect())
+    }
 
-        // One pipeline for the whole pickup. `HSETNX` on the first-delivery
-        // stamp is what makes the stamp itself idempotent: the first handover
-        // wins and a redelivery leaves it alone, with no read-modify-write and
-        // no race between two concurrent pickups.
-        let mut pipe = redis::pipe();
-        let mut marked: Vec<&String> = Vec::new();
-        for (id, exists) in msg_ids.iter().zip(present) {
-            if !exists {
+    async fn mark_delivered(
+        &self,
+        recipient_did_hash: &str,
+        msg_ids: &[String],
+        now_ms: u64,
+        delivered_ttl_secs: u64,
+    ) -> Result<DeliveryMarkReport, MediatorError> {
+        let mut report = DeliveryMarkReport::default();
+        let msg_ids: Vec<String> = msg_ids
+            .iter()
+            .filter(|id| ops::is_message_id(id))
+            .cloned()
+            .collect();
+        let msg_ids = msg_ids.as_slice();
+        if msg_ids.is_empty() {
+            return Ok(report);
+        }
+        let mut conn = self.get_connection().await?;
+
+        // One script per message, sent together, on the recipient's copy
+        // (`MARK_DELIVERED`): it writes nothing when the copy is gone, so a
+        // mark racing a delete or the expiry sweeper cannot recreate the
+        // metadata hash as an orphan — `HSETNX`/`HINCRBY` would create it on
+        // a missing key. The script is not part of the function library, for
+        // the reasons on `MediatorStore::mark_delivered`.
+        //
+        // `HSETNX` on the first-delivery stamp is what makes the stamp itself
+        // idempotent: the first handover wins and a redelivery leaves it
+        // alone, with no read-modify-write and no race between two pickups.
+        let deadline = if delivered_ttl_secs == 0 {
+            0
+        } else {
+            now_ms / 1_000 + delivered_ttl_secs
+        };
+        let keys = self.keys();
+        let replies: Vec<Vec<i64>> =
+            match futures_util::future::try_join_all(msg_ids.iter().map(|id| {
+                let mut conn = conn.clone();
+                async move {
+                    MARK_DELIVERED
+                        .key(keys.msg_meta(id, Some(recipient_did_hash)))
+                        .key(keys.msg_meta(id, None))
+                        .arg(recipient_did_hash)
+                        .arg(now_ms)
+                        .arg(deadline)
+                        .invoke_async::<Vec<i64>>(&mut conn)
+                        .await
+                }
+            }))
+            .await
+            {
+                Ok(replies) => replies,
+                // Best-effort by the trait's contract: this is bookkeeping beside
+                // a pickup that has already succeeded, and failing the pickup
+                // because the bookkeeping failed would trade a real delivery for
+                // a statistic.
+                Err(err) => {
+                    warn!(
+                        "Couldn't record delivery for {} message(s): {}",
+                        msg_ids.len(),
+                        err
+                    );
+                    return Ok(report);
+                }
+            };
+
+        // Bring the deadline forward, for first deliveries only, and only
+        // where the script moved the record's own expiry (a legacy record,
+        // which carries none, is always given the entry, as before).
+        //
+        // Added, not moved: the record's original entry stays, and the
+        // sweeper drops it as stale once it sees the record's expiry is the
+        // earlier deadline — or finds the record already gone.
+        let slot_key = format!("MSG_EXPIRY:{deadline}");
+        let mut moving: Vec<String> = Vec::new();
+        for (id, reply) in msg_ids.iter().zip(replies) {
+            let [found, first, advanced, per_recipient] = reply.as_slice() else {
+                continue;
+            };
+            if *found == 0 {
                 continue;
             }
-            marked.push(id);
-            let key = self.keys().msg_meta(id);
-            // The HSETNX reply says whether this was the first delivery (1) or
-            // a redelivery (0), which is what decides below whether the expiry
-            // deadline moves. Reading it back beats inferring it, and costs
-            // nothing — the command runs either way.
-            pipe.cmd("HSETNX")
-                .arg(&key)
-                .arg("FIRST_DELIVERED_AT")
-                .arg(now_ms);
-            pipe.cmd("HINCRBY")
-                .arg(&key)
-                .arg("DELIVERY_ATTEMPTS")
-                .arg(1);
-        }
-        if marked.is_empty() {
-            return Ok(report);
-        }
-
-        // Best-effort by the trait's contract: this is bookkeeping beside a
-        // pickup that has already succeeded, and failing the pickup because the
-        // bookkeeping failed would trade a real delivery for a statistic.
-        let stamped: Vec<bool> = match self.query_each::<Value>(&mut conn, pipe).await {
-            // HSETNX, HINCRBY per message: keep each HSETNX reply.
-            Ok(replies) => replies
-                .into_iter()
-                .step_by(2)
-                .map(|reply| from_redis_value::<bool>(reply).unwrap_or(false))
-                .collect(),
-            Err(err) => {
-                warn!(
-                    "Couldn't record delivery for {} message(s): {}",
-                    msg_ids.len(),
-                    err
-                );
-                return Ok(report);
+            if *first == 1 {
+                report.first_delivered += 1;
+            } else {
+                report.redelivered += 1;
             }
-        };
-
-        // A `1` from `HSETNX` means this call set the stamp, so it was the
-        // first handover; `0` means the stamp was already there.
-        report.first_delivered = stamped.iter().filter(|first| **first).count();
-        report.redelivered = stamped.len() - report.first_delivered;
-
-        if delivered_ttl_secs == 0 {
-            return Ok(report);
+            if *advanced == 1 {
+                moving.push(Keys::record_member(
+                    id,
+                    (*per_recipient == 1).then_some(recipient_did_hash),
+                ));
+            }
         }
-
-        // Bring the deadline forward, for first deliveries only.
-        //
-        // Added, not moved: the metadata hash does not carry the message's own
-        // expiry, so this cannot compare the two — and does not need to.
-        // Whichever slot the sweeper reaches first deletes the message and the
-        // other resolves to `already_deleted`, so a message whose own expiry is
-        // sooner simply keeps it.
-        let deadline = now_ms / 1_000 + delivered_ttl_secs;
-        let slot_key = format!("MSG_EXPIRY:{deadline}");
-        let moving: Vec<&String> = marked
-            .iter()
-            .zip(stamped)
-            .filter(|(_, first_delivery)| *first_delivery)
-            .map(|(id, _)| *id)
-            .collect();
         if moving.is_empty() {
             return Ok(report);
         }
         report.expiry_advanced = moving.len();
         // Index before bucket, as `store_message` keeps them: a failure
         // between the steps leaves an empty bucket in the index, which the
-        // sweeper passes over, never ids in a bucket it can't reach.
+        // sweeper passes over, never ids in a bucket it can't reach. A
+        // failure leaves the record due at its original entry, which the
+        // sweeper accepts because the record's expiry is now earlier.
         let mut index = redis::pipe();
         index
             .cmd("ZADD")
@@ -794,114 +828,167 @@ impl MediatorStore for RedisStore {
             return Ok(Vec::new());
         }
         let mut conn = self.get_connection().await?;
-
-        // One round trip: each message's sender and first-delivery stamp, and
-        // the requester's receipt for it.
-        let mut pipe = redis::pipe();
-        for id in msg_ids {
-            pipe.cmd("HMGET")
-                .arg(self.keys().msg_meta(id))
-                .arg("FROM")
-                .arg("FIRST_DELIVERED_AT");
-            pipe.cmd("GET")
-                .arg(self.keys().outbox_receipt(sender_did_hash, id));
-        }
-        let replies: Vec<redis::Value> = self.query_each(&mut conn, pipe).await.map_err(|err| {
+        let keys = self.keys();
+        let read_err = |err: redis::RedisError| {
             MediatorError::database_from_redis(
                 14,
                 "NA".into(),
                 &err,
                 format!("Couldn't read sent-message states: {err}"),
             )
-        })?;
+        };
+        // Anything that is not a message id is `Unknown`, unread.
+        let valid: Vec<&String> = msg_ids.iter().filter(|id| ops::is_message_id(id)).collect();
 
-        let mut states = Vec::with_capacity(msg_ids.len());
-        let mut replies = replies.into_iter();
-        while let (Some(meta), Some(receipt)) = (replies.next(), replies.next()) {
-            let fields: Vec<Option<String>> = redis::from_redis_value(meta).unwrap_or_default();
-            let receipt: Option<String> = redis::from_redis_value(receipt).unwrap_or(None);
-            // `HMGET` on a missing key answers with nulls, so no `FROM` is how
-            // a removed message presents.
-            let held = fields
-                .first()
-                .cloned()
-                .flatten()
-                .map(|from| (from, fields.get(1).cloned().flatten()));
-            let state = ops::sent_message_state(
-                sender_did_hash,
-                held.as_ref().map(|(from, first)| ops::HeldMessage {
-                    from_did_hash: Some(from.as_str()),
-                    first_delivered_at_ms: first.as_ref().and_then(|v| v.parse().ok()),
-                }),
-                receipt.as_deref().and_then(OutboxReceipt::decode),
-            );
-            states.push(state);
+        // First round trip: each id's legacy record, its recipient index, the
+        // requester's per-recipient receipts and its receipt from before
+        // receipts were per recipient.
+        let mut pipe = redis::pipe();
+        for id in &valid {
+            pipe.cmd("HMGET")
+                .arg(keys.msg_meta(id, None))
+                .arg("TO")
+                .arg("FROM")
+                .arg("FIRST_DELIVERED_AT");
+            pipe.cmd("SMEMBERS").arg(keys.msg_recipients(id));
+            pipe.cmd("HGETALL")
+                .arg(keys.outbox_receipts(sender_did_hash, id));
+            pipe.cmd("GET")
+                .arg(keys.outbox_receipt(sender_did_hash, id));
         }
-        Ok(states)
+        let replies: Vec<redis::Value> = if valid.is_empty() {
+            Vec::new()
+        } else {
+            self.query_each(&mut conn, pipe).await.map_err(read_err)?
+        };
+        type Row = (
+            Vec<Option<String>>,
+            Vec<String>,
+            HashMap<String, String>,
+            Option<String>,
+        );
+        let mut rows: Vec<Row> = Vec::with_capacity(valid.len());
+        let mut replies = replies.into_iter();
+        while let (Some(legacy), Some(members), Some(receipts), Some(old_receipt)) = (
+            replies.next(),
+            replies.next(),
+            replies.next(),
+            replies.next(),
+        ) {
+            rows.push((
+                redis::from_redis_value(legacy).unwrap_or_default(),
+                redis::from_redis_value(members).unwrap_or_default(),
+                redis::from_redis_value(receipts).unwrap_or_default(),
+                redis::from_redis_value(old_receipt).unwrap_or(None),
+            ));
+        }
+
+        // Second round trip: every per-recipient copy's sender and stamp.
+        let mut pipe = redis::pipe();
+        let mut copies = 0;
+        for (id, (_, members, _, _)) in valid.iter().zip(&rows) {
+            for to in members {
+                pipe.cmd("HMGET")
+                    .arg(keys.msg_meta(id, Some(to)))
+                    .arg("TO")
+                    .arg("FROM")
+                    .arg("FIRST_DELIVERED_AT");
+                copies += 1;
+            }
+        }
+        let copy_rows: Vec<Vec<Option<String>>> = if copies == 0 {
+            Vec::new()
+        } else {
+            let replies: Vec<redis::Value> =
+                self.query_each(&mut conn, pipe).await.map_err(read_err)?;
+            replies
+                .into_iter()
+                .map(|v| redis::from_redis_value(v).unwrap_or_default())
+                .collect()
+        };
+
+        let mut copy_rows = copy_rows.into_iter();
+        let mut by_id: HashMap<&str, SentMessageState> = HashMap::new();
+        for (id, (legacy, members, receipts, old_receipt)) in valid.iter().zip(rows) {
+            // `HMGET` on a missing key answers with nulls, so no `TO` is how a
+            // removed copy presents.
+            let mut held: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+            for fields in
+                std::iter::once(legacy).chain(members.iter().map_while(|_| copy_rows.next()))
+            {
+                if let [Some(to), from, first] = fields.as_slice() {
+                    held.push((to.clone(), from.clone(), first.clone()));
+                }
+            }
+            let held: Vec<ops::HeldMessage<'_>> = held
+                .iter()
+                .map(|(to, from, first)| ops::HeldMessage {
+                    to_did_hash: to,
+                    from_did_hash: from.as_deref(),
+                    first_delivered_at_ms: first.as_ref().and_then(|v| v.parse().ok()),
+                })
+                .collect();
+            let mut found: Vec<(String, OutboxReceipt)> = receipts
+                .into_iter()
+                .filter_map(|(to, raw)| Some((to, OutboxReceipt::decode(&raw)?)))
+                .filter(|(_, receipt)| receipt_is_current(receipt))
+                .collect();
+            if let Some(receipt) = old_receipt.as_deref().and_then(OutboxReceipt::decode) {
+                found.push((String::new(), receipt));
+            }
+            by_id.insert(
+                id.as_str(),
+                ops::sent_message_state(sender_did_hash, &held, &found),
+            );
+        }
+        Ok(msg_ids
+            .iter()
+            .map(|id| {
+                by_id
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(SentMessageState::Unknown)
+            })
+            .collect())
     }
 
-    async fn delivery_state(&self, msg_id: &str) -> Result<Option<DeliveryState>, MediatorError> {
-        let mut conn = self.get_connection().await?;
-        let key = self.keys().msg_meta(msg_id);
-
-        let fields: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(&key)
-            .arg("FIRST_DELIVERED_AT")
-            .arg("DELIVERY_ATTEMPTS")
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    14,
-                    "NA".into(),
-                    &err,
-                    format!("Couldn't read delivery state for ({msg_id}): {err}"),
-                )
-            })?;
-
-        // `HMGET` on a missing key answers with nulls rather than an error, so
-        // "no metadata at all" is how a missing message presents.
-        let exists: bool = redis::cmd("EXISTS")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    14,
-                    "NA".into(),
-                    &err,
-                    format!("Couldn't check message metadata for ({msg_id}): {err}"),
-                )
-            })?;
-        if !exists {
-            return Ok(None);
-        }
-
-        Ok(Some(DeliveryState {
-            first_delivered_at_ms: fields.first().and_then(|v| v.as_ref()?.parse().ok()),
-            attempts: fields
-                .get(1)
-                .and_then(|v| v.as_ref()?.parse().ok())
-                .unwrap_or(0),
-        }))
+    async fn delivery_state(
+        &self,
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
+        Ok(self
+            .delivery_states(&[MessageRef::new(recipient_did_hash, msg_id)])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     async fn delivery_states(
         &self,
-        msg_ids: &[String],
+        records: &[MessageRef],
     ) -> Result<Vec<Option<DeliveryState>>, MediatorError> {
-        if msg_ids.is_empty() {
+        if records.is_empty() {
             return Ok(Vec::new());
         }
         let mut conn = self.get_connection().await?;
+        let keys = self.keys();
 
-        // One round trip for the whole batch. The default implementation loops
-        // `delivery_state`, which is two commands per message — fine for a
-        // lookup, wrong for a sample of a hundred.
+        // One round trip for the whole batch: each recipient's copy, and the
+        // legacy per-id record in case that is the copy it holds. `BYTES` and
+        // `TO` tell a copy that exists (and whose it is) from a missing one,
+        // which `HMGET` answers with nulls.
         let mut pipe = redis::pipe();
-        for id in msg_ids {
+        for record in records {
             pipe.cmd("HMGET")
-                .arg(self.keys().msg_meta(id))
+                .arg(keys.msg_meta(&record.msg_id, Some(&record.to_did_hash)))
+                .arg("BYTES")
+                .arg("FIRST_DELIVERED_AT")
+                .arg("DELIVERY_ATTEMPTS");
+            pipe.cmd("HMGET")
+                .arg(keys.msg_meta(&record.msg_id, None))
+                .arg("TO")
                 .arg("FIRST_DELIVERED_AT")
                 .arg("DELIVERY_ATTEMPTS");
         }
@@ -915,28 +1002,36 @@ impl MediatorStore for RedisStore {
                 )
             })?;
 
-        Ok(rows
-            .into_iter()
-            .map(|fields| {
-                // `HMGET` on a missing key answers with nulls, so a row of all
-                // nulls is a message that no longer exists — which is `None`,
-                // not a default state. A message that exists but was never
-                // delivered still carries `BYTES`, so its row is not all-null
-                // only because we asked for two fields it lacks... which means
-                // the two cases are indistinguishable here. They are told apart
-                // by the caller: this is used to sample *queued* messages,
-                // which by definition exist.
-                let first = fields.first().and_then(|v| v.as_ref()?.parse().ok());
-                let attempts = fields
-                    .get(1)
+        let mut rows = rows.into_iter();
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            let (Some(own), Some(legacy)) = (rows.next(), rows.next()) else {
+                out.push(None);
+                continue;
+            };
+            if !ops::is_message_id(&record.msg_id) {
+                out.push(None);
+                continue;
+            }
+            let fields = if own.first().is_some_and(Option::is_some) {
+                own
+            } else if legacy.first().cloned().flatten().as_deref()
+                == Some(record.to_did_hash.as_str())
+            {
+                legacy
+            } else {
+                out.push(None);
+                continue;
+            };
+            out.push(Some(DeliveryState {
+                first_delivered_at_ms: fields.get(1).and_then(|v| v.as_ref()?.parse().ok()),
+                attempts: fields
+                    .get(2)
                     .and_then(|v| v.as_ref()?.parse().ok())
-                    .unwrap_or(0);
-                Some(DeliveryState {
-                    first_delivered_at_ms: first,
-                    attempts,
-                })
-            })
-            .collect())
+                    .unwrap_or(0),
+            }));
+        }
+        Ok(out)
     }
 
     async fn get_messages(
@@ -966,10 +1061,12 @@ impl MediatorStore for RedisStore {
 
     async fn get_message_metadata(
         &self,
-        session_id: &str,
+        recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
-        let inner = self.get_message_metadata(session_id, message_hash).await?;
+        let inner = self
+            .get_message_metadata(recipient_did_hash, message_hash)
+            .await?;
         Ok(message_meta_into_new(inner))
     }
 
@@ -2486,6 +2583,11 @@ impl MediatorStore for RedisStore {
 
         for key in &timeslot_keys {
             let mut conn = self.get_connection().await?;
+            // The bucket's own time, from its name: a deferred bucket keeps
+            // its name but not its score. Records are due at or after it.
+            let slot: Option<u64> = key
+                .strip_prefix("MSG_EXPIRY:")
+                .and_then(|ts| ts.parse().ok());
             // A message leaves its bucket only after its delete has
             // succeeded or found it already gone. Removing it first (SPOP)
             // and putting it back on failure loses it for good when the
@@ -2514,35 +2616,62 @@ impl MediatorStore for RedisStore {
                     })?;
 
                 let mut done: Vec<String> = Vec::new();
-                for msg_id in batch {
-                    if !seen.insert(msg_id.clone()) {
+                for member in batch {
+                    if !seen.insert(member.clone()) {
                         continue;
                     }
+                    // `<id>:<to>` names one recipient's record. A bare `<id>`
+                    // is a legacy per-id record, named by its own TO.
+                    let (msg_id, to) = Keys::parse_record_member(&member);
+                    let to = match to {
+                        Some(to) => Some(to.to_string()),
+                        None => redis::cmd("HGET")
+                            .arg(self.keys().msg_meta(msg_id, None))
+                            .arg("TO")
+                            .query_async::<Option<String>>(&mut conn)
+                            .await
+                            .unwrap_or(None),
+                    };
+                    let Some(to) = to else {
+                        report.already_deleted += 1;
+                        done.push(member);
+                        continue;
+                    };
                     let meta = match on_expired {
-                        Some(_) => MediatorStore::get_message_metadata(self, "expiry", &msg_id)
+                        Some(_) => MediatorStore::get_message_metadata(self, &to, msg_id)
                             .await
                             .ok(),
                         None => None,
                     };
+                    // Only if this entry is still the record's expiry: an
+                    // entry left by a deadline the record no longer has is
+                    // answered as not found and dropped, sparing the record.
                     match self
                         .handler
-                        .delete_message(None, admin_did_hash, &msg_id, None, Some(admin_did_hash))
+                        .delete_message(
+                            None,
+                            admin_did_hash,
+                            msg_id,
+                            MessageScope::Recipient(&to),
+                            Some(admin_did_hash),
+                            slot,
+                        )
                         .await
                     {
                         Ok(_) => {
                             report.expired += 1;
                             if let (Some(observe), Some(meta)) = (on_expired, &meta) {
-                                observe(&msg_id, meta);
+                                observe(msg_id, meta);
                             }
-                            done.push(msg_id);
+                            done.push(member);
                         }
                         Err(err) if ops::is_delete_not_found(&err) => {
                             report.already_deleted += 1;
-                            done.push(msg_id);
+                            done.push(member);
                         }
                         Err(err) => {
                             // Left in the bucket; the next sweep retries it.
-                            warn!("Couldn't expire message {msg_id}, retrying next sweep: {err}");
+                            warn!("Couldn't expire message {member}, retrying next sweep: {err}");
                             bucket_cleared = false;
                         }
                     }

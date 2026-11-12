@@ -416,7 +416,7 @@ async fn a_tsp_mux_socket_on_one_instance_follows_a_member_on_another() {
         assert!(
             env.mediator
                 .store()
-                .delivery_state(id)
+                .delivery_state(&work.did_hash(), id)
                 .await
                 .unwrap()
                 .is_none(),

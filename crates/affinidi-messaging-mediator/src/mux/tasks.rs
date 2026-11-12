@@ -791,7 +791,8 @@ pub const ACK_RESPONSE_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/a
 
 /// `messaging/mux/ack`: delete the frames named, as the connection's
 /// principal may (its own, and each member's while the member holds
-/// `delete`). Sorted into `acked` and `refused` (`notFound` /
+/// `delete`). An acknowledgement: it removes only a copy held for the
+/// principal or such a member, never one they sent to someone else. Sorted into `acked` and `refused` (`notFound` /
 /// `notPermitted`); a store failure fails the request, retryable, rather than
 /// reporting a frame as not found.
 pub async fn ack(
@@ -814,6 +815,7 @@ pub async fn ack(
         session,
         &ids,
         crate::monitor::Channel::Websocket,
+        crate::handlers::message_delete::DeleteKind::Acknowledge,
     )
     .await;
     let (mut acked, mut refused) = (Vec::new(), Vec::new());

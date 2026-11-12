@@ -125,6 +125,7 @@ use affinidi_secrets_resolver::SecretsResolver;
 use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
+pub(crate) mod client_delete;
 #[cfg(feature = "didcomm")]
 pub mod error_response;
 pub mod inbound;

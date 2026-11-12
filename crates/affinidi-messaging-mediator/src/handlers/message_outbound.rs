@@ -1,7 +1,4 @@
-use affinidi_messaging_mediator_common::{
-    errors::{AppError, MediatorError, SuccessResponse},
-    store::DeletionAuthority,
-};
+use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
 use affinidi_messaging_sdk::messages::{
     GetMessagesRequest, GetMessagesResponse,
     problem_report::{ProblemReportScope, ProblemReportSorter},
@@ -14,6 +11,7 @@ use crate::{
     SharedData,
     common::authz::{self, Capability},
     common::session::Session,
+    messages::client_delete::delete_for_client,
 };
 
 /// Delivers messages to the client for given message_ids
@@ -86,7 +84,6 @@ pub async fn message_outbound_handler(
                     state
                         .monitor
                         .delivered_element(&msg, crate::monitor::Channel::Rest);
-                    let parties = (msg.from_address.clone(), msg.to_address.clone());
                     // Kept for the delete event below: `msg` moves into the
                     // response, and the body is what names the wire protocol.
                     let msg_body = msg.msg.clone();
@@ -94,25 +91,22 @@ pub async fn message_outbound_handler(
 
                     if body.delete {
                         debug!("Deleting message: {}", msg_id);
-                        let result: Result<(), MediatorError> = state
-                            .database
-                            .delete_message(
-                                msg_id,
-                                DeletionAuthority::Owner {
-                                    did_hash: session.did_hash.clone(),
-                                },
-                            )
-                            .await;
-                        match result {
-                            Ok(_) => {
-                                state.monitor.deleted(
-                                    msg_id,
-                                    &session.did_hash,
-                                    parties.0.as_deref(),
-                                    parties.1.as_deref(),
-                                    crate::monitor::Channel::Rest,
-                                    msg_body.as_deref(),
-                                );
+                        // As `DELETE /delete`: the caller's own copy, else
+                        // what it sent unless this repeats an acknowledgement.
+                        let owners = [session.did_hash.clone()];
+                        match delete_for_client(&*state.database, &owners, msg_id, true).await {
+                            Ok(removed) => {
+                                // One event per copy removed.
+                                for copy in &removed.copies {
+                                    state.monitor.deleted(
+                                        msg_id,
+                                        &session.did_hash,
+                                        copy.from_did_hash.as_deref(),
+                                        Some(copy.to_did_hash.as_str()),
+                                        crate::monitor::Channel::Rest,
+                                        msg_body.as_deref(),
+                                    );
+                                }
                                 debug!("Deleted message: {}", msg_id);
                             }
                             Err(err) => {

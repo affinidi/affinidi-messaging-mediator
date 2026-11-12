@@ -424,17 +424,20 @@ pub struct DeliveryReport {
     /// Record the message as handed over in the store once it is written, as
     /// a pickup does (`limits.delivered_expiry_seconds`). Set by the inbox
     /// redelivery, which re-sends stored mail; a live push is not stamped.
-    pub stamp: bool,
+    /// Holds the DID hash of the recipient whose copy is stamped: the same
+    /// bytes held for another recipient are a separate copy.
+    pub stamp: Option<String>,
 }
 
 impl DeliveryReport {
     /// The frame is on the wire: stamp the message when [`stamp`](Self::stamp)
     /// says so, then report the delivery.
     pub async fn written(self, state: &crate::SharedData) {
-        if self.stamp
+        if let Some(recipient) = &self.stamp
             && let Err(err) = state
                 .database
                 .record_delivered(
+                    recipient,
                     std::slice::from_ref(&self.msg_id),
                     state.clock.unix_millis() as u64,
                     state.config.limits.delivered_expiry_seconds,
@@ -875,7 +878,7 @@ impl StreamingTask {
                             to: Some(did_hash.clone()),
                             size: message.len() as u64,
                             protocol: crate::monitor::Protocol::detect(&message),
-                            stamp: false,
+                            stamp: None,
                         });
                         // Moved, not cloned: the body already exists in the
                         // broadcast ring slot, and `payload` is owned here.
@@ -1905,7 +1908,7 @@ fn spawn_inbox_redelivery(
                     to: element.to_address,
                     size: element.size,
                     protocol: crate::monitor::Protocol::detect(&msg),
-                    stamp: true,
+                    stamp: Some(did_hash.clone()),
                 };
 
                 // Fetched with `DoNotDelete`, so anything not queued here stays

@@ -5,6 +5,7 @@ use super::cluster_scripts::{
     DELETE_LEASE_MS, ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_LEASE_MS, STORE_MESSAGE,
 };
 use crate::database::RedisConnection;
+use crate::database::keys::Keys;
 use crate::errors::MediatorError;
 
 // Mirror of the metric names declared in the mediator's
@@ -81,7 +82,20 @@ impl Database {
                 if queue_maxlen > 0 {
                     cmd.arg(queue_maxlen);
                 }
-                cmd.exec_async(&mut conn).await
+                match cmd.query_async::<String>(&mut conn).await {
+                    // This build's library answers `STORED`. `OK` is the
+                    // library of an earlier build, loaded over this one by an
+                    // instance of that build: the message is stored, in the
+                    // per-id layout this build still reads, so it is not
+                    // stored again — only this build's library is loaded
+                    // again for the calls that follow.
+                    Ok(reply) if reply == "OK" => {
+                        self.handler.ensure_library(&mut conn).await;
+                        Ok(())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err),
+                }
             };
             stored.map_err(|err| {
                 event!(Level::ERROR, "Couldn't store message in database: {}", err);
@@ -143,6 +157,8 @@ impl Database {
         let keys = self.keys();
         let bytes = message.len();
         let token = uuid::Uuid::new_v4().to_string();
+        // This recipient's record; see `Keys::msg`.
+        let member = Keys::record_member(message_hash, Some(to_did_hash));
 
         // Index before the message: a failure part-way then leaves at most an
         // index entry for a message that isn't there, which the sweeper drops
@@ -159,13 +175,15 @@ impl Database {
             .await?;
         redis::cmd("SADD")
             .arg(&bucket)
-            .arg(message_hash)
+            .arg(&member)
             .exec_async(conn)
             .await?;
 
         let stored: Vec<String> = STORE_MESSAGE
-            .key(keys.msg(message_hash))
-            .key(keys.msg_meta(message_hash))
+            .key(keys.msg(message_hash, Some(to_did_hash)))
+            .key(keys.msg_meta(message_hash, Some(to_did_hash)))
+            .key(keys.msg_meta(message_hash, None))
+            .key(keys.msg_recipients(message_hash))
             .arg(message)
             .arg(bytes)
             .arg(to_did_hash)
@@ -173,6 +191,7 @@ impl Database {
             .arg(DELETE_LEASE_MS)
             .arg(&token)
             .arg(STORE_LEASE_MS)
+            .arg(expires_at)
             .invoke_async(conn)
             .await?;
         let [
@@ -200,7 +219,7 @@ impl Database {
             self.handler
                 .release_queues(
                     conn,
-                    message_hash,
+                    &member,
                     &release_to,
                     &release_from,
                     &release_bytes,
@@ -220,6 +239,7 @@ impl Database {
                 .arg(bytes)
                 .arg(from_hash)
                 .arg(queue_maxlen)
+                .arg(&member)
                 .invoke_async::<String>(&mut inbox_conn)
                 .await
         };
@@ -237,6 +257,7 @@ impl Database {
                 .arg(bytes)
                 .arg(to_did_hash)
                 .arg(queue_maxlen)
+                .arg(&member)
                 .invoke_async::<String>(&mut outbox_conn)
                 .await
                 .map(Some)
@@ -248,7 +269,7 @@ impl Database {
             ids.extend(["SEND_ID".to_string(), send_id]);
         }
         let recorded: i64 = RECORD_QUEUE_IDS
-            .key(keys.msg_meta(message_hash))
+            .key(keys.msg_meta(message_hash, Some(to_did_hash)))
             .arg(&token)
             .arg(&ids)
             .invoke_async(conn)
@@ -261,7 +282,7 @@ impl Database {
                 .handler
                 .release_queues(
                     conn,
-                    message_hash,
+                    &member,
                     to_did_hash,
                     if from_hash == "ANONYMOUS" {
                         ""
@@ -303,29 +324,41 @@ impl Database {
         Ok(())
     }
 
-    /// Retrieves the message MetaData for a given message hash
-    /// - session_id: The session_id for the request
-    /// - message_hash: The hash of the message to retrieve
+    /// Retrieves the metadata of the record of `message_hash` held for
+    /// `recipient` — its per-recipient record, else a legacy per-id record
+    /// whose TO is `recipient`.
     pub async fn get_message_metadata(
         &self,
-        session_id: &str,
+        recipient: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
+        let session_id = "NA";
         let _span = span!(
             Level::DEBUG,
             "get_message_metadata",
-            session_id = session_id,
+            recipient = recipient,
             message_hash = message_hash
         );
         async move {
+            if !crate::store::ops::is_message_id(message_hash) {
+                return Err(MediatorError::DatabaseError(
+                    22,
+                    session_id.into(),
+                    format!("No usable metadata for message {message_hash}"),
+                ));
+            }
             // The `store_message` Lua function keeps a message's metadata in
             // the hash `MSG:META:{id}`: BYTES, TO, TIMESTAMP (unix ms), and
             // FROM when the sender is known. (This read used to look for a
             // `MESSAGE_STORE` hash field that nothing writes, so it could
             // never succeed.)
             let mut conn = self.get_connection().await?;
-            let fields: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
-                .arg(self.keys().msg_meta(message_hash))
+            let (own, legacy): (
+                std::collections::HashMap<String, String>,
+                std::collections::HashMap<String, String>,
+            ) = redis::pipe()
+                .hgetall(self.keys().msg_meta(message_hash, Some(recipient)))
+                .hgetall(self.keys().msg_meta(message_hash, None))
                 .query_async(&mut conn)
                 .await
                 .map_err(|err| {
@@ -341,6 +374,13 @@ impl Database {
                         format!("Couldn't get message metadata from database: {err}"),
                     )
                 })?;
+            let fields = if !own.is_empty() {
+                own
+            } else if legacy.get("TO").map(String::as_str) == Some(recipient) {
+                legacy
+            } else {
+                Default::default()
+            };
             let metadata = metadata_from_fields(&fields).ok_or_else(|| {
                 MediatorError::DatabaseError(
                     22,

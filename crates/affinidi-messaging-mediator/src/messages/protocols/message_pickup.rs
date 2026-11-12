@@ -5,7 +5,10 @@
  * They are fire and forget messages
  */
 use affinidi_messaging_didcomm::message::{Attachment, Message};
-use affinidi_messaging_mediator_common::{errors::MediatorError, store::DeletionAuthority};
+use affinidi_messaging_mediator_common::{
+    errors::MediatorError,
+    store::{DeletionAuthority, MessageScope},
+};
 use affinidi_messaging_sdk::{
     messages::{
         fetch::FetchOptions,
@@ -470,9 +473,13 @@ pub(crate) async fn messages_received(
         for msg_id in &message_id_list {
             debug!("getting message with id: {}", msg_id);
             // The store authorises the delete itself; try each owner this
-            // session may delete for until one is accepted.
+            // session may delete for until one is accepted, those whose copy
+            // was handed over first (a principal and a member may both hold
+            // the same bytes; the one acknowledged is the one delivered).
             let mut deleted = false;
-            for owner_hash in &owners {
+            let ordered =
+                crate::messages::client_delete::ack_order(&*state.database, &owners, msg_id).await;
+            for owner_hash in &ordered {
                 let msg = match state.database.get_message(owner_hash, msg_id).await {
                     Ok(Some(m)) => Some(m),
                     Ok(None) => continue,
@@ -498,8 +505,11 @@ pub(crate) async fn messages_received(
                 debug!("Deleting message: {}", msg_id);
                 match state
                     .database
-                    .delete_message(
+                    // An acknowledgement: the owner's own copy only, never
+                    // a copy it sent to someone else.
+                    .delete_message_in(
                         msg_id,
+                        MessageScope::Recipient(owner_hash),
                         DeletionAuthority::Owner {
                             did_hash: owner_hash.clone(),
                         },
