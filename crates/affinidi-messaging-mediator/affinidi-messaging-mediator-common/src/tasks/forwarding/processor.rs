@@ -33,7 +33,7 @@ use crate::tasks::forwarding::config::ForwardingConfig;
 use crate::tasks::forwarding::observer::{ForwardOutcome, ForwardTransport, ForwardingObserver};
 use crate::tasks::forwarding::packer::SystemMessagePacker;
 use crate::time::{unix_timestamp_millis, unix_timestamp_secs};
-use affinidi_net_guard::{EgressPolicy, guarded_dns_resolver};
+use affinidi_net_guard::{EgressPolicy, GuardedResolver, guarded_dns_resolver};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -850,6 +850,17 @@ impl ForwardingProcessor {
                  under way when this processor's claims stop being confirmed can outlast its \
                  claim, so another processor may take the entry over and send it again",
                 self.config.reclaim_idle_seconds, self.config.delivery_timeout_seconds
+            );
+        }
+
+        if self.config.delivery_timeout_seconds < 60 {
+            let ws = ws_limits_for(Duration::from_secs(
+                self.config.delivery_timeout_seconds.max(1),
+            ));
+            warn!(
+                "delivery_timeout_seconds ({}) is below 60: a WebSocket relay attempt is cut to                  {} ms to leave time for the REST fallback, and the REST request may itself be                  cut short of its 30 s",
+                self.config.delivery_timeout_seconds,
+                ws.attempt.as_millis()
             );
         }
 
@@ -1943,12 +1954,6 @@ impl ForwardingProcessor {
         }
     }
 
-    /// How long to wait for a peer's [`RelayAck`] before giving up on the frame.
-    ///
-    /// Matches the REST client's request timeout, so a stalled peer costs the
-    /// same on either transport.
-    const RELAY_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-
     /// Deliver a message via WebSocket to the remote mediator, and wait for the
     /// peer's acknowledgement.
     ///
@@ -1967,6 +1972,9 @@ impl ForwardingProcessor {
     /// frames over the socket at all: the connection is closed and the error
     /// sends this endpoint back to REST (and, via the suppression window, keeps
     /// it there for a while).
+    ///
+    /// The whole attempt is bounded by [`ws_limits_for`] the delivery timeout,
+    /// so a peer that stalls at any step leaves time for the REST fallback.
     async fn deliver_via_websocket(
         &self,
         endpoint_url: &str,
@@ -1984,220 +1992,21 @@ impl ForwardingProcessor {
 
         let frame = msg.message.clone();
         let id = frame_id(frame.as_bytes());
+        let resolver = GuardedResolver::new(self.http_pool.policy.clone());
+        let limits = ws_limits_for(Duration::from_secs(
+            self.config.delivery_timeout_seconds.max(1),
+        ));
 
-        // Take the pooled connection out for the duration of the exchange, so
-        // the pool lock is never held across network I/O: deliveries to other
-        // endpoints run concurrently and need the pool too. Only one delivery
-        // task runs per endpoint, so nothing else wants this connection.
-        let pooled = self.ws_pool.lock().await.remove(endpoint_url);
-
-        // Try the pooled connection first.
-        if let Some(mut ws) = pooled {
-            match Self::send_and_await_ack(&mut ws.stream, &frame, &id).await {
-                Ok(()) => {
-                    ws.last_used = Instant::now();
-                    self.ws_pool
-                        .lock()
-                        .await
-                        .insert(endpoint_url.to_string(), ws);
-                    debug!("Relayed via pooled WebSocket to {} (acked)", endpoint_url);
-                    return Ok(());
-                }
-                Err(AckFailure::Rejected(reason)) => {
-                    // The peer answered, and refused. The connection is fine;
-                    // the message is not. Keep the socket, fail the message —
-                    // retry/abandonment is the caller's job, as on REST.
-                    ws.last_used = Instant::now();
-                    self.ws_pool
-                        .lock()
-                        .await
-                        .insert(endpoint_url.to_string(), ws);
-                    return Err(reason);
-                }
-                Err(AckFailure::Transport(e)) => {
-                    warn!(
-                        "Pooled WebSocket relay to {} failed: {}. Reconnecting...",
-                        endpoint_url, e
-                    );
-                }
-            }
-        }
-
-        // No usable connection — establish one, negotiating `relay-ack`.
-
-        // DNS-rebinding guard for the WS path: the URL vet above blocks
-        // IP-literal internal targets, but `tokio_tungstenite` resolves the
-        // *name* itself at connect, so a name pointing at an internal address
-        // would still be dialed. Resolve it here first and refuse if it maps to
-        // a non-routable address. (A narrow resolve-then-connect TOCTOU race
-        // remains — far harder to win than a static internal-resolving name —
-        // and the REST path closes it fully via the guarded resolver.)
-        Self::refuse_ws_if_resolves_nonpublic(&vetted).await?;
-
-        let mut request = ws_url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| format!("WebSocket request for {ws_url} is not valid: {e}"))?;
-        request.headers_mut().insert(
-            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-            tungstenite::http::HeaderValue::from_static(RELAY_ACK_SUBPROTOCOL),
-        );
-
-        let (mut stream, response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| format!("WebSocket connect to {ws_url} failed: {e}"))?;
-
-        // The subprotocol IS the negotiation: a peer that doesn't echo it
-        // cannot acknowledge frames, so it must not be relayed to over this
-        // socket. (An anonymous relay upgrade is also only admitted by a peer
-        // that offers it, so in practice a non-echoing peer has refused the
-        // upgrade outright and we never reach here.)
-        let negotiated = response
-            .headers()
-            .get(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if negotiated != RELAY_ACK_SUBPROTOCOL {
-            let _ = stream.close(None).await;
-            return Err(format!(
-                "peer at {ws_url} did not negotiate the `{RELAY_ACK_SUBPROTOCOL}` subprotocol \
-                 (got {negotiated:?}); relaying over REST instead"
-            ));
-        }
-
-        info!("WebSocket connected to {} (relay-ack, pool)", endpoint_url);
-
-        let outcome = Self::send_and_await_ack(&mut stream, &frame, &id).await;
-
-        // A transport failure means the socket is not worth keeping; a
-        // rejection is about the message and leaves the connection usable.
-        match outcome {
-            Ok(()) | Err(AckFailure::Rejected(_)) => {
-                let mut pool = self.ws_pool.lock().await;
-                pool.insert(
-                    endpoint_url.to_string(),
-                    PooledWebSocket {
-                        stream,
-                        last_used: Instant::now(),
-                    },
-                );
-            }
-            Err(AckFailure::Transport(_)) => {
-                let _ = stream.close(None).await;
-            }
-        }
-
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(AckFailure::Rejected(reason)) => Err(reason),
-            Err(AckFailure::Transport(e)) => Err(e),
-        }
-    }
-
-    /// Write one relayed frame and wait for the peer's [`RelayAck`] for it.
-    ///
-    /// Frames that are not this frame's ack — a ping, a stray text frame, an
-    /// ack for something else — are skipped rather than mistaken for the
-    /// answer, until the ack arrives or [`RELAY_ACK_TIMEOUT`] elapses.
-    async fn send_and_await_ack(
-        stream: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        frame: &str,
-        id: &str,
-    ) -> Result<(), AckFailure> {
-        stream
-            .send(tungstenite::Message::Text(frame.to_string().into()))
-            .await
-            .map_err(|e| AckFailure::Transport(format!("WebSocket send failed: {e}")))?;
-
-        let deadline = tokio::time::sleep(Self::RELAY_ACK_TIMEOUT);
-        tokio::pin!(deadline);
-
-        loop {
-            tokio::select! {
-                _ = &mut deadline => {
-                    return Err(AckFailure::Transport(format!(
-                        "no relay-ack within {}s",
-                        Self::RELAY_ACK_TIMEOUT.as_secs()
-                    )));
-                }
-                incoming = stream.next() => {
-                    match incoming {
-                        Some(Ok(tungstenite::Message::Text(text))) => {
-                            let Ok(ack) = serde_json::from_str::<RelayAck>(&text) else {
-                                debug!("Ignoring a non-ack text frame on the relay socket");
-                                continue;
-                            };
-                            if !ack.answers(id) {
-                                debug!("Ignoring a relay-ack for another frame ({})", ack.id);
-                                continue;
-                            }
-                            return if ack.ok {
-                                Ok(())
-                            } else {
-                                Err(AckFailure::Rejected(format!(
-                                    "peer refused the relayed message: {} (code {})",
-                                    ack.reason.as_deref().unwrap_or("no reason given"),
-                                    ack.code.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
-                                )))
-                            };
-                        }
-                        Some(Ok(tungstenite::Message::Close(frame))) => {
-                            return Err(AckFailure::Transport(format!(
-                                "peer closed the relay socket before acknowledging ({frame:?})"
-                            )));
-                        }
-                        // Ping/Pong/Binary on a relay socket are not ours to
-                        // interpret; tungstenite answers pings itself.
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => {
-                            return Err(AckFailure::Transport(format!(
-                                "WebSocket error awaiting relay-ack: {e}"
-                            )));
-                        }
-                        None => {
-                            return Err(AckFailure::Transport(
-                                "relay socket ended before acknowledging".to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Refuse a WebSocket dial whose host is a DNS name that resolves to a
-    /// non-globally-routable address — the DNS-rebinding guard for the WS path.
-    /// IP-literal hosts are already address-class-checked by `policy.vet()`, so
-    /// only names are resolved here.
-    async fn refuse_ws_if_resolves_nonpublic(
-        vetted: &affinidi_net_guard::VettedUrl,
-    ) -> Result<(), String> {
-        let url = vetted.as_url();
-        let name = match url.host() {
-            Some(url::Host::Domain(name)) => name.to_string(),
-            // An IP-literal host already passed the address-class vet.
-            _ => return Ok(()),
-        };
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name.as_str(), port))
-            .await
-            .map_err(|e| format!("WebSocket host {name} did not resolve: {e}"))?
-            .collect();
-        if addrs.is_empty() {
-            return Err(format!("WebSocket host {name} resolved to no addresses"));
-        }
-        for addr in &addrs {
-            if !affinidi_net_guard::is_globally_routable(addr.ip()) {
-                return Err(format!(
-                    "Refusing WebSocket relay to {name}: it resolves to a non-routable address ({})",
-                    addr.ip()
-                ));
-            }
-        }
-        Ok(())
+        relay_frame(
+            &self.ws_pool,
+            endpoint_url,
+            &ws_url,
+            || resolve_vetted(resolver, vetted),
+            &frame,
+            &id,
+            limits,
+        )
+        .await
     }
 
     /// Convert an HTTP(S) endpoint URL to a WebSocket URL
@@ -2220,6 +2029,384 @@ impl ForwardingProcessor {
         let backoff = base.saturating_mul(2u64.saturating_pow(consecutive_failures.min(10)));
         Duration::from_millis(backoff.min(max))
     }
+}
+
+// ─── WebSocket relay ────────────────────────────────────────────────────────
+
+type RelaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Time limits on one WebSocket relay attempt.
+#[derive(Clone, Copy, Debug)]
+struct WsLimits {
+    /// The whole attempt: the pooled socket, a new connection if that one
+    /// failed, the send and the peer's [`RelayAck`]. See [`ws_limits_for`].
+    attempt: Duration,
+    /// Opening a new connection: name resolution, TCP connect, TLS and the
+    /// WebSocket upgrade, together.
+    connect: Duration,
+    /// The least time one resolved address is given before the next is tried
+    /// (unless less than that is left). Each address otherwise gets an equal
+    /// share of what remains of `connect`.
+    per_address_min: Duration,
+    /// The close handshake on a socket that is being discarded. It runs on its
+    /// own task, so the delivery never waits for it.
+    close: Duration,
+}
+
+/// The longest a WebSocket attempt may take. Matches the REST client's request
+/// timeout, so a stalled peer costs the same on either transport.
+const WS_ATTEMPT_MAX: Duration = Duration::from_secs(30);
+
+/// The limits on a WebSocket attempt inside a delivery attempt of
+/// `delivery_timeout`.
+///
+/// The WebSocket attempt gets at most a third of the delivery timeout (and at
+/// most [`WS_ATTEMPT_MAX`]), so that however short the delivery timeout is
+/// configured, a stalled WebSocket attempt ends with time left for the REST
+/// fallback rather than being cancelled with the delivery attempt.
+fn ws_limits_for(delivery_timeout: Duration) -> WsLimits {
+    let attempt = WS_ATTEMPT_MAX.min(delivery_timeout / 3);
+    WsLimits {
+        attempt,
+        connect: Duration::from_secs(10).min(attempt),
+        per_address_min: Duration::from_secs(2),
+        close: Duration::from_secs(5),
+    }
+}
+
+/// Relay one frame over the endpoint's pooled socket, or a new one, and wait
+/// for the peer's [`RelayAck`].
+///
+/// The pooled socket is taken out of `pool` before any network I/O and put
+/// back only once the exchange is over, so the pool lock is never held across
+/// an await on the network and no two deliveries use one socket at the same
+/// time. A socket that failed is not put back.
+///
+/// `resolve` yields the addresses that were checked against the egress policy;
+/// a new connection is made to one of those, never to a fresh lookup of the
+/// name. It is only called when there is no usable pooled socket.
+async fn relay_frame<R, F>(
+    pool: &Mutex<HashMap<String, PooledWebSocket>>,
+    endpoint_url: &str,
+    ws_url: &str,
+    resolve: R,
+    frame: &str,
+    id: &str,
+    limits: WsLimits,
+) -> Result<(), String>
+where
+    R: FnOnce() -> F,
+    F: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+{
+    let deadline = tokio::time::Instant::now() + limits.attempt;
+
+    let pooled = pool.lock().await.remove(endpoint_url);
+    if let Some(mut ws) = pooled {
+        match send_and_await_ack(&mut ws.stream, frame, id, deadline).await {
+            Ok(()) => {
+                ws.last_used = Instant::now();
+                pool.lock().await.insert(endpoint_url.to_string(), ws);
+                debug!("Relayed via pooled WebSocket to {} (acked)", endpoint_url);
+                return Ok(());
+            }
+            Err(AckFailure::Rejected(reason)) => {
+                // The peer answered, and refused. The connection is fine; the
+                // message is not. Keep the socket, fail the message —
+                // retry/abandonment is the caller's job, as on REST.
+                ws.last_used = Instant::now();
+                pool.lock().await.insert(endpoint_url.to_string(), ws);
+                return Err(reason);
+            }
+            Err(AckFailure::Transport(e)) => {
+                discard_socket(ws.stream, endpoint_url, &e, limits.close);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                warn!(
+                    "Pooled WebSocket relay to {} failed: {}. Reconnecting...",
+                    endpoint_url, e
+                );
+            }
+        }
+    }
+
+    // No usable connection — open one to a vetted address, negotiating
+    // `relay-ack`.
+    let connect_started = tokio::time::Instant::now();
+    let connect_deadline = deadline.min(connect_started + limits.connect);
+    let (mut stream, response) = tokio::time::timeout_at(
+        connect_deadline,
+        open_relay_socket(ws_url, resolve, connect_deadline, limits.per_address_min),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "WebSocket connect to {ws_url} did not complete within the {} ms allowed",
+            connect_deadline
+                .saturating_duration_since(connect_started)
+                .as_millis()
+        )
+    })??;
+
+    // The subprotocol IS the negotiation: a peer that doesn't echo it cannot
+    // acknowledge frames, so it must not be relayed to over this socket. (An
+    // anonymous relay upgrade is also only admitted by a peer that offers it,
+    // so in practice a non-echoing peer has refused the upgrade outright and
+    // we never reach here.)
+    let negotiated = response
+        .headers()
+        .get(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if negotiated != RELAY_ACK_SUBPROTOCOL {
+        let reason = format!(
+            "peer at {ws_url} did not negotiate the `{RELAY_ACK_SUBPROTOCOL}` subprotocol \
+             (got {negotiated:?}); relaying over REST instead"
+        );
+        discard_socket(stream, endpoint_url, &reason, limits.close);
+        return Err(reason);
+    }
+
+    info!("WebSocket connected to {} (relay-ack, pool)", endpoint_url);
+
+    // A transport failure means the socket is not worth keeping; a rejection
+    // is about the message and leaves the connection usable.
+    match send_and_await_ack(&mut stream, frame, id, deadline).await {
+        Ok(()) => {
+            pool.lock().await.insert(
+                endpoint_url.to_string(),
+                PooledWebSocket {
+                    stream,
+                    last_used: Instant::now(),
+                },
+            );
+            Ok(())
+        }
+        Err(AckFailure::Rejected(reason)) => {
+            pool.lock().await.insert(
+                endpoint_url.to_string(),
+                PooledWebSocket {
+                    stream,
+                    last_used: Instant::now(),
+                },
+            );
+            Err(reason)
+        }
+        Err(AckFailure::Transport(e)) => {
+            discard_socket(stream, endpoint_url, &e, limits.close);
+            Err(e)
+        }
+    }
+}
+
+/// Resolve `ws_url`'s host to addresses and open the relay socket on the first
+/// of them that completes TCP connect, TLS and the WebSocket upgrade by
+/// `deadline`.
+///
+/// Each address gets an equal share of the time left (at least
+/// `per_address_min`, unless less than that is left), so an address that
+/// never answers — an unreachable IPv6 address listed first, say — does not
+/// use up the time the others need.
+///
+/// The request still names the host, so TLS SNI, certificate validation and
+/// the `Host` header are those of the name; only the address is pinned. The
+/// caller must bound the whole of this by `deadline`.
+async fn open_relay_socket<R, F>(
+    ws_url: &str,
+    resolve: R,
+    deadline: tokio::time::Instant,
+    per_address_min: Duration,
+) -> Result<(RelaySocket, tungstenite::handshake::client::Response), String>
+where
+    R: FnOnce() -> F,
+    F: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+{
+    let request = || {
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|e| format!("WebSocket request for {ws_url} is not valid: {e}"))?;
+        request.headers_mut().insert(
+            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            tungstenite::http::HeaderValue::from_static(RELAY_ACK_SUBPROTOCOL),
+        );
+        Ok::<_, String>(request)
+    };
+    // Checked before anything is dialed.
+    request()?;
+
+    let addrs = resolve().await?;
+    let mut last_error = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        if left.is_zero() {
+            break;
+        }
+        let share = (left / (addrs.len() - i) as u32)
+            .max(per_address_min)
+            .min(left);
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = tcp.set_nodelay(true);
+            tokio_tungstenite::client_async_tls_with_config(request()?, tcp, None, None)
+                .await
+                .map_err(|e| e.to_string())
+        };
+        // An address given all the time that is left runs to the caller's
+        // deadline, which bounds this whole function and reports the time
+        // allowed.
+        let outcome = if share >= left {
+            Ok(attempt.await)
+        } else {
+            tokio::time::timeout(share, attempt).await
+        };
+        match outcome {
+            Ok(Ok(opened)) => return Ok(opened),
+            Ok(Err(e)) => last_error = Some(format!("{addr}: {e}")),
+            Err(_) => {
+                last_error = Some(format!("{addr}: no answer within {} ms", share.as_millis()))
+            }
+        }
+        debug!("WebSocket connect to {ws_url} via {addr} failed; trying the next address");
+    }
+    Err(format!(
+        "WebSocket connect to {ws_url} failed: {}",
+        last_error.unwrap_or_else(|| "no addresses".into())
+    ))
+}
+
+/// The addresses a vetted WebSocket URL may be dialed at.
+///
+/// An IP-literal host was address-checked by `vet`. A name is resolved through
+/// the same guarded resolver the REST client uses: any answer the policy does
+/// not admit fails the whole name, and the connection is then made to exactly
+/// the addresses returned here, so there is no second lookup to answer
+/// differently.
+async fn resolve_vetted(
+    resolver: GuardedResolver,
+    vetted: affinidi_net_guard::VettedUrl,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    use reqwest::dns::Resolve;
+
+    let url = vetted.as_url();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| format!("WebSocket URL {url} has no port"))?;
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => Ok(vec![std::net::SocketAddr::new(ip.into(), port)]),
+        Some(url::Host::Ipv6(ip)) => Ok(vec![std::net::SocketAddr::new(ip.into(), port)]),
+        Some(url::Host::Domain(name)) => {
+            let host: reqwest::dns::Name = name
+                .parse()
+                .map_err(|e| format!("WebSocket host {name} is not a valid name: {e}"))?;
+            let addrs = resolver
+                .resolve(host)
+                .await
+                .map_err(|e| format!("Refusing WebSocket relay to {name}: {e}"))?;
+            Ok(addrs
+                .map(|mut addr| {
+                    addr.set_port(port);
+                    addr
+                })
+                .collect())
+        }
+        None => Err(format!("WebSocket URL {url} has no host")),
+    }
+}
+
+/// Write one relayed frame and wait for the peer's [`RelayAck`] for it, all by
+/// `deadline`.
+///
+/// Frames that are not this frame's ack — a ping, a stray text frame, an ack
+/// for something else — are skipped rather than mistaken for the answer, until
+/// the ack arrives or the deadline passes.
+async fn send_and_await_ack(
+    stream: &mut RelaySocket,
+    frame: &str,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), AckFailure> {
+    match tokio::time::timeout_at(
+        deadline,
+        stream.send(tungstenite::Message::Text(frame.to_string().into())),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(AckFailure::Transport(format!("WebSocket send failed: {e}")));
+        }
+        Err(_) => {
+            return Err(AckFailure::Transport(
+                "WebSocket send did not complete in time".to_string(),
+            ));
+        }
+    }
+
+    loop {
+        let incoming = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(incoming) => incoming,
+            Err(_) => {
+                return Err(AckFailure::Transport(
+                    "no relay-ack before the attempt's deadline".to_string(),
+                ));
+            }
+        };
+        match incoming {
+            Some(Ok(tungstenite::Message::Text(text))) => {
+                let Ok(ack) = serde_json::from_str::<RelayAck>(&text) else {
+                    debug!("Ignoring a non-ack text frame on the relay socket");
+                    continue;
+                };
+                if !ack.answers(id) {
+                    debug!("Ignoring a relay-ack for another frame ({})", ack.id);
+                    continue;
+                }
+                return if ack.ok {
+                    Ok(())
+                } else {
+                    Err(AckFailure::Rejected(format!(
+                        "peer refused the relayed message: {} (code {})",
+                        ack.reason.as_deref().unwrap_or("no reason given"),
+                        ack.code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                    )))
+                };
+            }
+            Some(Ok(tungstenite::Message::Close(frame))) => {
+                return Err(AckFailure::Transport(format!(
+                    "peer closed the relay socket before acknowledging ({frame:?})"
+                )));
+            }
+            // Ping/Pong/Binary on a relay socket are not ours to interpret;
+            // tungstenite answers pings itself.
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => {
+                return Err(AckFailure::Transport(format!(
+                    "WebSocket error awaiting relay-ack: {e}"
+                )));
+            }
+            None => {
+                return Err(AckFailure::Transport(
+                    "relay socket ended before acknowledging".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Drop a relay socket that is no longer usable, after a bounded close
+/// handshake on a task of its own so the caller never waits on the peer.
+fn discard_socket(mut stream: RelaySocket, endpoint_url: &str, reason: &str, close: Duration) {
+    info!("Discarding WebSocket relay connection to {endpoint_url}: {reason}");
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(close, stream.close(None)).await;
+    });
 }
 
 #[cfg(test)]
@@ -2902,5 +3089,423 @@ mod tests {
     #[test]
     fn ws_suppression_window_outlasts_the_rate_window() {
         assert!(WS_SUPPRESSION_WINDOW > Duration::from_secs(10));
+    }
+
+    // --- WebSocket relay ---
+
+    type Pool = Arc<Mutex<HashMap<String, PooledWebSocket>>>;
+
+    fn limits(attempt_ms: u64, connect_ms: u64) -> WsLimits {
+        WsLimits {
+            attempt: Duration::from_millis(attempt_ms),
+            connect: Duration::from_millis(connect_ms),
+            per_address_min: Duration::from_millis(100),
+            close: Duration::from_millis(200),
+        }
+    }
+
+    fn resolved_to(
+        addr: std::net::SocketAddr,
+    ) -> impl FnOnce() -> std::future::Ready<Result<Vec<std::net::SocketAddr>, String>> {
+        move || std::future::ready(Ok(vec![addr]))
+    }
+
+    /// Accepts TCP connections and never says anything on them.
+    async fn silent_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    /// A peer that speaks `relay-ack`.
+    struct RelayPeer {
+        addr: std::net::SocketAddr,
+        /// The `Host` header of each upgrade it accepted.
+        hosts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// Accepts the upgrade, records its `Host`, and acknowledges each frame
+    /// after `ack_delay` — or never, if `None`.
+    async fn relay_peer(ack_delay: Option<Duration>) -> RelayPeer {
+        relay_peer_closing(ack_delay, false).await
+    }
+
+    /// As [`relay_peer`]; with `close_after_ack`, each connection is dropped
+    /// right after its first ack.
+    async fn relay_peer_closing(ack_delay: Option<Duration>, close_after_ack: bool) -> RelayPeer {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let hosts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = hosts.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    // The error type is tungstenite's; this callback never uses it.
+                    #[allow(clippy::result_large_err)]
+                    let callback = |request: &Request, mut response: Response| {
+                        let host = request
+                            .headers()
+                            .get("host")
+                            .and_then(|h| h.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().expect("hosts").push(host);
+                        response.headers_mut().insert(
+                            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+                            tungstenite::http::HeaderValue::from_static(RELAY_ACK_SUBPROTOCOL),
+                        );
+                        Ok(response)
+                    };
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(socket, callback).await
+                    else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let tungstenite::Message::Text(text) = message else {
+                            continue;
+                        };
+                        let Some(delay) = ack_delay else { continue };
+                        tokio::time::sleep(delay).await;
+                        let ack = RelayAck::accepted(frame_id(text.as_bytes()));
+                        let ack = serde_json::to_string(&ack).expect("ack json");
+                        if ws
+                            .send(tungstenite::Message::Text(ack.into()))
+                            .await
+                            .is_err()
+                            || close_after_ack
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        RelayPeer { addr, hosts }
+    }
+
+    /// A peer that accepts TCP and never completes the handshake costs only
+    /// the connect limit, does not hold the pool, and does not hold up a relay
+    /// to another endpoint meanwhile.
+    #[tokio::test]
+    async fn a_handshake_that_never_completes_times_out_without_holding_anything() {
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let stalled = silent_listener().await;
+        let healthy = relay_peer(Some(Duration::ZERO)).await;
+
+        let stalled_pool = pool.clone();
+        let started = Instant::now();
+        let stalled_relay = tokio::spawn(async move {
+            relay_frame(
+                &stalled_pool,
+                "stalled",
+                &format!("ws://{stalled}/ws"),
+                resolved_to(stalled),
+                "frame-a",
+                &frame_id(b"frame-a"),
+                limits(10_000, 1_500),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pool.try_lock().is_ok(),
+            "the pool lock is free while a handshake is under way"
+        );
+
+        let ws_url = format!("ws://{}/ws", healthy.addr);
+        relay_frame(
+            &pool,
+            "healthy",
+            &ws_url,
+            resolved_to(healthy.addr),
+            "frame-b",
+            &frame_id(b"frame-b"),
+            limits(10_000, 1_500),
+        )
+        .await
+        .expect("the other endpoint is relayed to meanwhile");
+        assert!(
+            !stalled_relay.is_finished(),
+            "relayed before the stall ended"
+        );
+
+        let err = stalled_relay
+            .await
+            .expect("join")
+            .expect_err("a stalled handshake fails");
+        let elapsed = started.elapsed();
+        assert!(err.contains("did not complete"), "{err}");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        let pool = pool.lock().await;
+        assert!(!pool.contains_key("stalled"));
+        assert!(pool.contains_key("healthy"));
+    }
+
+    /// While a frame is in flight on a pooled socket, the socket is out of the
+    /// pool and the pool lock is free; afterwards the same socket is back.
+    #[tokio::test]
+    async fn a_pooled_socket_is_out_of_the_pool_while_in_use() {
+        let peer = relay_peer(Some(Duration::from_millis(400))).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let ws_url = format!("ws://{}/ws", peer.addr);
+
+        relay_frame(
+            &pool,
+            "peer",
+            &ws_url,
+            resolved_to(peer.addr),
+            "first",
+            &frame_id(b"first"),
+            limits(5_000, 1_000),
+        )
+        .await
+        .expect("first frame acked");
+        assert_eq!(pool.lock().await.len(), 1);
+
+        let in_flight = pool.clone();
+        let url = ws_url.clone();
+        let second = tokio::spawn(async move {
+            relay_frame(
+                &in_flight,
+                "peer",
+                &url,
+                || async { Err("a pooled socket was available".to_string()) },
+                "second",
+                &frame_id(b"second"),
+                limits(5_000, 1_000),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let guard = pool.try_lock().expect("pool lock is free during I/O");
+            assert!(guard.is_empty(), "the socket in use is not in the pool");
+        }
+        second.await.expect("join").expect("second frame acked");
+        assert_eq!(pool.lock().await.len(), 1);
+        assert_eq!(peer.hosts.lock().expect("hosts").len(), 1, "one connection");
+    }
+
+    /// The connection goes to the address that was checked, while the request
+    /// still names the host.
+    #[tokio::test]
+    async fn the_socket_is_opened_to_the_resolved_address_under_the_hosts_name() {
+        let peer = relay_peer(Some(Duration::ZERO)).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let port = peer.addr.port();
+
+        relay_frame(
+            &pool,
+            "named",
+            &format!("ws://relay.invalid:{port}/ws"),
+            resolved_to(peer.addr),
+            "frame",
+            &frame_id(b"frame"),
+            limits(5_000, 1_000),
+        )
+        .await
+        .expect("acked");
+        assert_eq!(
+            peer.hosts.lock().expect("hosts").as_slice(),
+            [format!("relay.invalid:{port}")]
+        );
+    }
+
+    /// A peer that never acknowledges fails the frame at the attempt's
+    /// deadline, and its socket is not kept.
+    #[tokio::test]
+    async fn a_missing_ack_fails_at_the_deadline_and_the_socket_is_dropped() {
+        let peer = relay_peer(None).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let started = Instant::now();
+
+        let err = relay_frame(
+            &pool,
+            "silent",
+            &format!("ws://{}/ws", peer.addr),
+            resolved_to(peer.addr),
+            "frame",
+            &frame_id(b"frame"),
+            limits(500, 400),
+        )
+        .await
+        .expect_err("no ack, no delivery");
+        assert!(err.contains("no relay-ack"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(pool.lock().await.is_empty());
+    }
+
+    /// No address to connect to is an error, not a hang.
+    #[tokio::test]
+    async fn a_failed_resolution_fails_the_attempt() {
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let err = relay_frame(
+            &pool,
+            "unresolved",
+            "ws://relay.invalid/ws",
+            || async { Err("resolution refused".to_string()) },
+            "frame",
+            &frame_id(b"frame"),
+            limits(500, 400),
+        )
+        .await
+        .expect_err("nothing to connect to");
+        assert!(err.contains("resolution refused"), "{err}");
+    }
+
+    /// An IP-literal host is dialed as given; there is nothing to look up.
+    #[tokio::test]
+    async fn an_ip_literal_resolves_to_itself() {
+        let policy = EgressPolicy::public_internet();
+        let vetted = policy
+            .vet("wss://93.184.216.34/ws")
+            .expect("public literal");
+        let addrs = resolve_vetted(GuardedResolver::new(policy), vetted)
+            .await
+            .expect("resolved");
+        assert_eq!(addrs, vec!["93.184.216.34:443".parse().unwrap()]);
+    }
+
+    /// A name that resolves to an address the policy does not admit is
+    /// refused, and nothing is returned to dial.
+    #[tokio::test]
+    async fn a_name_resolving_to_a_private_address_is_refused() {
+        use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+
+        struct Private;
+        impl Resolve for Private {
+            fn resolve(&self, _: Name) -> Resolving {
+                Box::pin(async {
+                    let addrs: Vec<std::net::SocketAddr> = vec![
+                        "93.184.216.34:0".parse().unwrap(),
+                        "10.0.0.7:0".parse().unwrap(),
+                    ];
+                    Ok(Box::new(addrs.into_iter()) as Addrs)
+                })
+            }
+        }
+
+        let policy = EgressPolicy::public_internet();
+        let vetted = policy.vet("wss://relay.example.com/ws").expect("vetted");
+        let resolver = GuardedResolver::new(policy).with_inner(Arc::new(Private));
+        let err = resolve_vetted(resolver, vetted)
+            .await
+            .expect_err("a private answer fails the name");
+        assert!(err.contains("relay.example.com"), "{err}");
+    }
+
+    /// The WebSocket attempt always leaves part of the delivery attempt for
+    /// the REST fallback, however short the delivery timeout is.
+    #[test]
+    fn the_websocket_attempt_leaves_time_for_the_fallback() {
+        let default = ws_limits_for(Duration::from_secs(90));
+        assert_eq!(default.attempt, Duration::from_secs(30));
+        assert_eq!(default.connect, Duration::from_secs(10));
+
+        for secs in [1, 5, 20, 45, 60] {
+            let delivery = Duration::from_secs(secs);
+            let limits = ws_limits_for(delivery);
+            assert!(limits.attempt * 3 <= delivery, "{secs}s: {limits:?}");
+            assert!(limits.connect <= limits.attempt, "{secs}s: {limits:?}");
+        }
+    }
+
+    /// An address that accepts and never completes the handshake gets only
+    /// its share of the connect time; the next address is then tried.
+    #[tokio::test]
+    async fn an_unresponsive_first_address_does_not_use_up_the_connect_time() {
+        let stalled = silent_listener().await;
+        let peer = relay_peer(Some(Duration::ZERO)).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let port = peer.addr.port();
+        let second = peer.addr;
+        let started = Instant::now();
+
+        relay_frame(
+            &pool,
+            "two-addresses",
+            &format!("ws://relay.invalid:{port}/ws"),
+            move || std::future::ready(Ok(vec![stalled, second])),
+            "frame",
+            &frame_id(b"frame"),
+            limits(5_000, 2_000),
+        )
+        .await
+        .expect("the second address answers");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(1_800), "{elapsed:?}");
+        assert_eq!(peer.hosts.lock().expect("hosts").len(), 1);
+    }
+
+    /// The connect error names the time actually allowed, which is what is
+    /// left of the attempt when that is less than the connect limit.
+    #[tokio::test]
+    async fn the_connect_error_reports_the_time_allowed() {
+        let stalled = silent_listener().await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let err = relay_frame(
+            &pool,
+            "stalled",
+            &format!("ws://{stalled}/ws"),
+            resolved_to(stalled),
+            "frame",
+            &frame_id(b"frame"),
+            limits(300, 10_000),
+        )
+        .await
+        .expect_err("stalled");
+        // What was left of the 300 ms attempt, not the 10 s connect limit.
+        let allowed: u64 = err
+            .split("within the ")
+            .nth(1)
+            .and_then(|rest| rest.split(" ms allowed").next())
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!((200..=300).contains(&allowed), "{err}");
+    }
+
+    /// A pooled socket the peer has since closed is discarded and a new
+    /// connection carries the frame.
+    #[tokio::test]
+    async fn a_closed_pooled_socket_is_replaced_by_a_new_connection() {
+        let peer = relay_peer_closing(Some(Duration::ZERO), true).await;
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let ws_url = format!("ws://{}/ws", peer.addr);
+
+        for frame in ["first", "second"] {
+            relay_frame(
+                &pool,
+                "peer",
+                &ws_url,
+                resolved_to(peer.addr),
+                frame,
+                &frame_id(frame.as_bytes()),
+                limits(5_000, 1_000),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{frame}: {e}"));
+            // Let the peer's close reach this side.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            peer.hosts.lock().expect("hosts").len(),
+            2,
+            "reconnected once"
+        );
+        assert_eq!(pool.lock().await.len(), 1);
     }
 }

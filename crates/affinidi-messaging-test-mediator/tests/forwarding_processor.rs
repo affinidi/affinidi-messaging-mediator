@@ -1275,3 +1275,110 @@ async fn no_rest_fallback_once_claims_are_unconfirmed() {
         "{other:?}"
     );
 }
+
+/// A next hop that accepts the connection but never answers the WebSocket
+/// upgrade costs only the relay's connect limit: the forward then falls back
+/// to REST inside the same delivery attempt, and a forward to another
+/// endpoint is not held up meanwhile.
+#[tokio::test]
+async fn a_websocket_upgrade_that_never_completes_falls_back_to_rest() {
+    let stalling = spawn_mediator_refusing_websocket(Duration::from_secs(3600)).await;
+    let mut healthy = spawn_stub_mediator(0).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    store
+        .forward_queue_enqueue(
+            &forward_entry(&stalling.endpoint_url, "after-stalled-upgrade"),
+            0,
+        )
+        .await
+        .expect("enqueue");
+    store
+        .forward_queue_enqueue(&forward_entry(&healthy.endpoint_url, "prompt-forward"), 0)
+        .await
+        .expect("enqueue");
+
+    spawn_processor(
+        ForwardingConfig {
+            // WebSocket first, for every endpoint.
+            ws_threshold_msgs_per_10s: 0,
+            delivery_timeout_seconds: 60,
+            ..test_config()
+        },
+        store.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), stalling.first_arrived.notified())
+        .await
+        .expect("the stalled upgrade was never attempted");
+    let body = tokio::time::timeout(Duration::from_secs(5), healthy.received.recv())
+        .await
+        .expect("the healthy endpoint waited on the stalled upgrade")
+        .expect("stub channel closed");
+    assert_eq!(body, "prompt-forward");
+
+    // The connect limit (10 s), then REST — well inside the 60 s attempt.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if stalling
+                .accepted
+                .lock()
+                .expect("accepted log")
+                .contains_key("after-stalled-upgrade")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the forward did not fall back to REST after the stalled upgrade");
+    assert_queue_drains(&store).await;
+    let accepted = stalling.accepted.lock().expect("accepted log").clone();
+    assert_eq!(
+        accepted.get("after-stalled-upgrade").copied(),
+        Some(1),
+        "{accepted:?}"
+    );
+}
+
+/// With a delivery timeout shorter than the WebSocket limits, the WebSocket
+/// attempt is cut to a share of it, so a stalled upgrade still falls back to
+/// REST inside the same delivery attempt rather than being cancelled with it.
+#[tokio::test]
+async fn a_short_delivery_timeout_still_leaves_time_for_the_rest_fallback() {
+    let stalling = spawn_mediator_refusing_websocket(Duration::from_secs(3600)).await;
+    let store: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+    store
+        .forward_queue_enqueue(&forward_entry(&stalling.endpoint_url, "short-timeout"), 0)
+        .await
+        .expect("enqueue");
+
+    let observer = Arc::new(RecordingObserver::default());
+    let processor = ForwardingProcessor::new(
+        ForwardingConfig {
+            ws_threshold_msgs_per_10s: 0,
+            // The WebSocket attempt gets a third: 2 s.
+            delivery_timeout_seconds: 6,
+            ..test_config()
+        },
+        store.clone(),
+    )
+    .expect("create processor")
+    .with_observer(observer.clone());
+    tokio::spawn(async move {
+        let _ = processor.start().await;
+    });
+
+    assert_queue_drains(&store).await;
+    let accepted = stalling.accepted.lock().expect("accepted log").clone();
+    assert_eq!(
+        accepted.get("short-timeout").copied(),
+        Some(1),
+        "{accepted:?}"
+    );
+    let outcomes = observer.outcomes.lock().expect("observer log").clone();
+    assert!(
+        matches!(outcomes.as_slice(), [(_, ForwardOutcome::Relayed { .. })]),
+        "delivered on the first attempt: {outcomes:?}"
+    );
+}
