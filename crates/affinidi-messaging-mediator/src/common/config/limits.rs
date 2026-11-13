@@ -1198,11 +1198,25 @@ mod tests {
     fn a_queue_limit_below_minus_one_refuses_to_start() {
         let base: LimitsConfigRaw = toml::from_str(
             r#"
+            attachments_max_count = "20"
+            crypto_operations_per_message = "1000"
+            deleted_messages = "100"
+            forward_task_queue = "50000"
+            http_size = "10485760"
+            listed_messages = "100"
+            local_max_acl = "1000"
+            message_expiry_seconds = "604800"
+            message_size = "1048576"
             queued_send_messages_per_peer = "50"
             queued_send_messages_soft = "2000"
             queued_send_messages_hard = "10000"
             queued_receive_messages_soft = "200"
             queued_receive_messages_hard = "1000"
+            to_keys_per_recipient = "100"
+            to_recipients = "100"
+            ws_size = "10485760"
+            access_list_limit = "1000"
+            oob_invite_ttl = "86400"
             "#,
         )
         .unwrap();

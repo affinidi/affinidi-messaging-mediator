@@ -3450,7 +3450,7 @@ mod tests {
             ping::v0_1::ResponseStatus::Ok
         ));
         assert_eq!(resp.payload.nonce.as_deref(), Some("nonce-xyz"));
-        assert!(resp.payload.protocols.iter().any(|p| p == "tsp"));
+        assert_eq!(resp.payload.protocols, super::served_protocols());
         // respond_with swaps the parties: the mediator answers alice.
         assert_eq!(resp.issuer.as_deref(), Some("did:example:mediator"));
         assert_eq!(resp.recipient.as_deref(), Some("did:example:alice"));

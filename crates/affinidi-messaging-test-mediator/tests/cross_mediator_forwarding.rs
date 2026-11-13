@@ -1199,8 +1199,8 @@ async fn relayed_sender_without_an_account_is_held_to_the_per_peer_limit() {
         .enable_forwarding(true)
         .enable_external_forwarding(true)
         .global_acl_default(acl::allow_all())
-        // A queue at the limit refuses, so a limit of 3 holds two.
-        .queue_send_limit_per_peer(3)
+        // A limit of N holds N: a limit of 2 holds two.
+        .queue_send_limit_per_peer(2)
         .spawn()
         .await
         .expect("spawn mediator B");
