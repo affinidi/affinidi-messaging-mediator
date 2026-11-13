@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use affinidi_messaging_mediator_admin::{
-    AddressBook, ConsoleError, InspectedMessage, MediatorConsole, Mode, MonitorFilter,
-    MonitorUpdate, MuxConnectionsQuery, PurgePlan, PurgeRequest, account_hash, specs,
+    AddressBook, ConsoleError, GrantSelection, InspectedMessage, MediatorConsole, MembershipFilter,
+    Mode, MonitorFilter, MonitorUpdate, MuxConnectionsQuery, PurgePlan, PurgeRequest, account_hash,
+    revoke_summary, specs,
 };
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -64,6 +65,9 @@ pub enum Tab {
     /// Live mux connections and the member DIDs each carries
     /// (administrators).
     Mux,
+    /// Stored mux grants of a principal or member DID: list, revoke, advance
+    /// a member's epoch (administrators).
+    Grants,
 }
 
 impl Tab {
@@ -76,9 +80,28 @@ impl Tab {
             Tab::Accounts => "Accounts",
             Tab::Config => "Config",
             Tab::Mux => "Mux",
+            Tab::Grants => "Grants",
         }
     }
 }
+
+/// Which stored grants the Grants tab lists: a principal DID's, a member
+/// DID's, or those between the two.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GrantQuery {
+    principal: Option<String>,
+    member: Option<String>,
+}
+
+impl GrantQuery {
+    fn is_empty(&self) -> bool {
+        self.principal.is_none() && self.member.is_none()
+    }
+}
+
+/// Grants asked for per page; a refresh asks for what is shown, up to the
+/// mediator's 500.
+const GRANT_PAGE: u64 = 100;
 
 /// A result of background work, applied with [`App::apply`].
 #[non_exhaustive]
@@ -94,6 +117,17 @@ pub enum Update {
     Config(Result<Value, ConsoleError>),
     /// A page of live mux connections.
     Mux(Result<Value, ConsoleError>),
+    /// A page of stored mux grants for the Grants tab's query: the first
+    /// page (replacing what is shown) or, with `more`, the next one.
+    Grants {
+        result: Result<Value, ConsoleError>,
+        more: bool,
+    },
+    /// A member DID's current mux epoch, read to confirm advancing it.
+    Epoch {
+        did: String,
+        result: Result<u64, ConsoleError>,
+    },
     /// The account on the Account tab, as `account/get` reports it.
     AccountInfo(Result<Value, ConsoleError>),
     /// The mediator's answer to a configuration change.
@@ -153,12 +187,28 @@ enum Popup {
     Logs {
         back: usize,
     },
+    /// Look up stored grants by principal and/or member DID.
+    FindGrants {
+        principal: String,
+        member: String,
+        /// Which field typing goes to: the member (true) or the principal.
+        on_member: bool,
+    },
+    /// Revoke the grants a selection names.
+    ConfirmRevoke(GrantSelection),
+    /// Advance member `did`'s epoch, voiding `epoch`.
+    ConfirmBumpEpoch {
+        did: String,
+        epoch: u64,
+    },
 }
 
 /// One line of the monitor pane. Events are kept raw and drawn on each frame,
 /// so naming an account renames it in the lines already shown.
 enum MonitorLine {
     Event(Value),
+    /// A mux member attached to or detached from a principal's connection.
+    Membership(Value),
     Note(Line<'static>),
     /// The feed was interrupted; one line however many attempts it takes.
     Retry {
@@ -213,6 +263,14 @@ pub struct App {
     /// The last `messaging/mux/connections` page.
     mux: Value,
     mux_state: TableState,
+    /// What the Grants tab lists, and what it has loaded of it.
+    grant_query: GrantQuery,
+    grants: Vec<Value>,
+    grants_state: TableState,
+    /// The listed member's current epoch, when the query names a member.
+    grants_epoch: Option<u64>,
+    /// The cursor for the next page, when there is one.
+    grants_next: Option<String>,
     accounts: Vec<Value>,
     accounts_state: TableState,
     config: Vec<Value>,
@@ -273,6 +331,11 @@ impl App {
             audit: Vec::new(),
             mux: Value::Null,
             mux_state: TableState::default().with_selected(Some(0)),
+            grant_query: GrantQuery::default(),
+            grants: Vec::new(),
+            grants_state: TableState::default().with_selected(Some(0)),
+            grants_epoch: None,
+            grants_next: None,
             accounts: Vec::new(),
             accounts_state: TableState::default().with_selected(Some(0)),
             config: Vec::new(),
@@ -354,6 +417,16 @@ impl App {
             value.push_str(text.trim());
             return;
         }
+        if let Some(Popup::FindGrants {
+            principal,
+            member,
+            on_member,
+        }) = &mut self.popup
+        {
+            let field = if *on_member { member } else { principal };
+            field.push_str(text.trim());
+            return;
+        }
         if let Some(Popup::Name {
             did, name, on_name, ..
         }) = &mut self.popup
@@ -376,6 +449,7 @@ impl App {
                 .selected_message_field(if self.message_send { "to" } else { "from" })
                 .or_else(|| self.target.clone())
                 .or_else(|| Some(self.console.did_hash().to_string())),
+            Tab::Grants => self.selected_grant_field("did").map(|d| account_hash(&d)),
             Tab::Audit | Tab::Config | Tab::Mux => None,
         }
     }
@@ -459,6 +533,13 @@ impl App {
         self.refresh();
     }
 
+    /// Show the stored mux grants of a `principal` DID, a `member` DID, or
+    /// those between the two on the Grants tab. Naming neither shows how to
+    /// look some up.
+    pub fn open_grants_of(&mut self, principal: Option<String>, member: Option<String>) {
+        self.open_grants(GrantQuery { principal, member });
+    }
+
     /// Force a colour depth (the default is detected from the environment).
     pub fn with_color_depth(mut self, depth: ColorDepth) -> Self {
         self.depth = depth;
@@ -480,6 +561,7 @@ impl App {
                 Tab::Config,
                 // Last, so the other tabs keep their number keys.
                 Tab::Mux,
+                Tab::Grants,
             ]
         } else {
             vec![Tab::Account]
@@ -550,6 +632,11 @@ impl App {
                 let query = MuxConnectionsQuery::all().limit(100);
                 Update::Mux(to_value(c.mux_connections(query).await))
             }),
+            // Again from the first page, as many as are shown.
+            Tab::Grants => {
+                let limit = (self.grants.len() as u64).clamp(GRANT_PAGE, 500);
+                self.load_grants(None, limit);
+            }
             Tab::Config => {
                 self.spawn(|c| async move { Update::Config(to_value(c.config().await)) })
             }
@@ -571,6 +658,49 @@ impl App {
             Update::Queues(to_value(
                 c.queues(Some(queue), Some(sort), None, Some(200)).await,
             ))
+        });
+    }
+
+    /// A page of the Grants tab's query: from its start, or from `cursor`
+    /// (then added to what is shown). Nothing while there is no query.
+    fn load_grants(&self, cursor: Option<String>, limit: u64) {
+        if self.grant_query.is_empty() {
+            return;
+        }
+        let GrantQuery { principal, member } = self.grant_query.clone();
+        let more = cursor.is_some();
+        self.spawn(move |c| async move {
+            let page = c
+                .mux_grants(principal.as_deref(), member.as_deref(), cursor, Some(limit))
+                .await;
+            Update::Grants {
+                result: to_value(page),
+                more,
+            }
+        });
+    }
+
+    /// Show the Grants tab for `query`, from its first page.
+    fn open_grants(&mut self, query: GrantQuery) {
+        self.grant_query = query;
+        self.grants.clear();
+        self.grants_epoch = None;
+        self.grants_next = None;
+        self.grants_state.select(Some(0));
+        self.tab = Tab::Grants;
+        self.refresh();
+    }
+
+    fn selected_grant_field(&self, field: &str) -> Option<String> {
+        let i = self.grants_state.selected()?;
+        self.grants.get(i)?[field].as_str().map(str::to_string)
+    }
+
+    /// Read member `did`'s current epoch, to confirm advancing it.
+    fn ask_bump_epoch(&self, did: String) {
+        self.spawn(move |c| async move {
+            let result = c.mux_epoch(&did).await;
+            Update::Epoch { did, result }
         });
     }
 
@@ -615,6 +745,28 @@ impl App {
                     }
                     ok(self)
                 }
+                Err(e) => self.error(e),
+            },
+            Update::Grants { result, more } => match result {
+                Ok(v) => {
+                    let page = v["grants"].as_array().cloned().unwrap_or_default();
+                    if more {
+                        self.grants.extend(page);
+                    } else {
+                        self.grants = page;
+                    }
+                    self.grants_epoch = v["epoch"].as_u64();
+                    self.grants_next = v["nextCursor"].as_str().map(str::to_string);
+                    let len = self.grants.len();
+                    if self.grants_state.selected().is_none_or(|i| i >= len) {
+                        self.grants_state.select(Some(0));
+                    }
+                    ok(self)
+                }
+                Err(e) => self.error(e),
+            },
+            Update::Epoch { did, result } => match result {
+                Ok(epoch) => self.popup = Some(Popup::ConfirmBumpEpoch { did, epoch }),
                 Err(e) => self.error(e),
             },
             Update::Audit(r) => match r {
@@ -716,7 +868,9 @@ impl App {
     }
 
     fn error(&mut self, e: ConsoleError) {
-        self.set_notice((e.to_string(), true));
+        // In plain words where the refusal has them (epoch mismatches,
+        // protected accounts, permissions); otherwise as it reads.
+        self.set_notice((e.explain(), true));
     }
 
     // ─── Keys ────────────────────────────────────────────────────────────
@@ -735,7 +889,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Control::Quit,
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 if let Some(tab) = self.tabs().get((c as u8 - b'1') as usize) {
                     self.tab = *tab;
                     self.refresh();
@@ -827,6 +981,76 @@ impl App {
             (Tab::Accounts, KeyCode::Enter) => {
                 if let Some(did) = self.selected_account_did() {
                     self.open_account(Some(did));
+                }
+            }
+            (Tab::Mux, KeyCode::Char('g')) => {
+                let principal = self
+                    .mux_state
+                    .selected()
+                    .and_then(|i| self.mux["connections"].get(i))
+                    .and_then(|c| c["principal"].as_str())
+                    .map(str::to_string);
+                if let Some(principal) = principal {
+                    self.open_grants(GrantQuery {
+                        principal: Some(principal),
+                        member: None,
+                    });
+                }
+            }
+            (Tab::Grants, KeyCode::Char('/')) => {
+                self.popup = Some(Popup::FindGrants {
+                    principal: self.grant_query.principal.clone().unwrap_or_default(),
+                    member: self.grant_query.member.clone().unwrap_or_default(),
+                    on_member: false,
+                });
+            }
+            (Tab::Grants, KeyCode::Char('p')) => {
+                if let Some(principal) = self.selected_grant_field("principal") {
+                    self.open_grants(GrantQuery {
+                        principal: Some(principal),
+                        member: None,
+                    });
+                }
+            }
+            (Tab::Grants, KeyCode::Char('g')) => {
+                if let Some(member) = self.selected_grant_field("did") {
+                    self.open_grants(GrantQuery {
+                        principal: None,
+                        member: Some(member),
+                    });
+                }
+            }
+            (Tab::Grants, KeyCode::Char(']')) => match self.grants_next.clone() {
+                Some(cursor) => self.load_grants(Some(cursor), GRANT_PAGE),
+                None => self.set_notice(("no more grants".into(), false)),
+            },
+            (Tab::Grants, KeyCode::Char('d')) => {
+                if let (Some(member), Some(id)) = (
+                    self.selected_grant_field("did"),
+                    self.selected_grant_field("grantId"),
+                ) {
+                    self.popup = Some(Popup::ConfirmRevoke(GrantSelection::grants(
+                        member,
+                        vec![id],
+                    )));
+                }
+            }
+            (Tab::Grants, KeyCode::Char('D')) if !self.grant_query.is_empty() => {
+                self.popup = Some(Popup::ConfirmRevoke(GrantSelection {
+                    principal: self.grant_query.principal.clone(),
+                    member: self.grant_query.member.clone(),
+                    grant_ids: Vec::new(),
+                }));
+            }
+            (Tab::Grants, KeyCode::Char('E')) => {
+                match self
+                    .grant_query
+                    .member
+                    .clone()
+                    .or_else(|| self.selected_grant_field("did"))
+                {
+                    Some(did) => self.ask_bump_epoch(did),
+                    None => self.set_notice(("select a grant, or list a member's".into(), true)),
                 }
             }
             (Tab::Account, KeyCode::Char('x')) => {
@@ -1029,6 +1253,68 @@ impl App {
                     self.popup = Some(Popup::EditConfig { key, value });
                 }
             },
+            Popup::FindGrants {
+                mut principal,
+                mut member,
+                on_member,
+            } => match code {
+                KeyCode::Esc => self.set_notice(("cancelled".into(), false)),
+                KeyCode::Enter => {
+                    let query = grant_query(&principal, &member);
+                    if query.is_empty() {
+                        self.set_notice((
+                            "name a principal DID, a member DID, or both".into(),
+                            true,
+                        ));
+                        self.popup = Some(Popup::FindGrants {
+                            principal,
+                            member,
+                            on_member,
+                        });
+                    } else {
+                        self.open_grants(query);
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                    self.popup = Some(Popup::FindGrants {
+                        principal,
+                        member,
+                        on_member: !on_member,
+                    })
+                }
+                other => {
+                    let field = if on_member {
+                        &mut member
+                    } else {
+                        &mut principal
+                    };
+                    match other {
+                        KeyCode::Backspace => {
+                            field.pop();
+                        }
+                        KeyCode::Char(c) => field.push(c),
+                        _ => {}
+                    }
+                    self.popup = Some(Popup::FindGrants {
+                        principal,
+                        member,
+                        on_member,
+                    });
+                }
+            },
+            Popup::ConfirmRevoke(selection) if yes => {
+                self.spawn(move |c| async move {
+                    Update::Done(c.mux_revoke(&selection).await.map(|o| revoke_summary(&o)))
+                });
+            }
+            Popup::ConfirmBumpEpoch { did, epoch } if yes => {
+                let name = did_label(&self.book, &did);
+                self.spawn(move |c| async move {
+                    Update::Done(c.mux_bump_epoch(&did, epoch).await.map(|r| {
+                        bump_summary(&name, epoch, r.epoch, r.epoch_advanced, r.revoked_grants)
+                    }))
+                });
+            }
             Popup::Text { .. } => {}
             Popup::ConfirmDelete { target, ids } if yes => {
                 self.spawn(move |c| async move {
@@ -1054,7 +1340,10 @@ impl App {
                 });
             }
             // Anything but "y" cancels a confirmation.
-            Popup::ConfirmDelete { .. } | Popup::ConfirmPurge(_) => {
+            Popup::ConfirmDelete { .. }
+            | Popup::ConfirmPurge(_)
+            | Popup::ConfirmRevoke(_)
+            | Popup::ConfirmBumpEpoch { .. } => {
                 self.set_notice(("cancelled".into(), false));
             }
         }
@@ -1070,6 +1359,7 @@ impl App {
                 &mut self.mux_state,
                 self.mux["connections"].as_array().map_or(0, Vec::len),
             ),
+            Tab::Grants => (&mut self.grants_state, self.grants.len()),
             Tab::Audit => return,
         };
         if len == 0 {
@@ -1157,6 +1447,7 @@ impl App {
             (Some(t), Tab::Account) => Some(vec![t.clone()]),
             _ => None,
         };
+        let everyone = dids.is_none();
         self.monitor.watching = match (&dids, self.admin()) {
             (Some(d), _) => format!("account {}", label(&self.book, &d[0])),
             (None, true) => "all traffic".into(),
@@ -1172,9 +1463,17 @@ impl App {
         let filter: MonitorFilter = serde_json::from_value(filter).unwrap_or_else(|_| {
             serde_json::from_value(serde_json::json!({})).expect("empty filter")
         });
+        // Mux members attaching and detaching too, for an administrator
+        // watching everything (they are not failures, nor one account's
+        // traffic).
+        let membership: Option<MembershipFilter> = (self.admin()
+            && everyone
+            && !self.monitor.failures_only
+            && self.console.serves_mux_admin())
+        .then(|| serde_json::from_value(serde_json::json!({})).expect("empty membership filter"));
         let (console, tx) = (self.console.clone(), self.tx.clone());
         self.monitor.retry_at = None;
-        self.monitor.task = Some(tokio::spawn(watch(console, filter, tx)));
+        self.monitor.task = Some(tokio::spawn(watch(console, filter, membership, tx)));
     }
 
     /// This console's own requests to the mediator, and the clean-up of their
@@ -1216,6 +1515,13 @@ impl App {
                         self.monitor.tally.record(&v, Instant::now());
                         self.monitor.lines.push_back(MonitorLine::Event(v));
                     }
+                }
+            }
+            MonitorUpdate::Membership { events, dropped } => {
+                self.monitor.dropped += dropped;
+                for e in events {
+                    let v = serde_json::to_value(e).unwrap_or(Value::Null);
+                    self.monitor.lines.push_back(MonitorLine::Membership(v));
                 }
             }
             MonitorUpdate::Gap { missing } => {
@@ -1347,7 +1653,95 @@ impl App {
             Tab::Accounts => self.render_accounts(f, body),
             Tab::Config => self.render_config(f, body),
             Tab::Mux => self.render_mux(f, body),
+            Tab::Grants => self.render_grants(f, body),
         }
+    }
+
+    fn render_grants(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default().borders(Borders::ALL).title(grants_title(
+            &self.grant_query,
+            self.grants_epoch,
+            self.grants.len(),
+            self.grants_next.is_some(),
+            &self.book,
+        ));
+        if self.grant_query.is_empty() {
+            f.render_widget(
+                Paragraph::new(
+                    "Stored mux grants: what each member DID delegated to which principal, \
+                     in what state, until when.\n\n\
+                     Press / to look one up by principal or member DID, or g on a \
+                     connection in the Mux tab.\n\n\
+                     On a grant: d revokes it, E advances its member's epoch (voiding every \
+                     grant the member gave), p and g list its principal's or member's grants.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(block),
+                area,
+            );
+            return;
+        }
+        let rows: Vec<Row> = self
+            .grants
+            .iter()
+            .map(|g| {
+                let state = g["state"].as_str().unwrap_or("?").to_string();
+                let color = match state.as_str() {
+                    "active" => Color::Green,
+                    "suspended" | "staleKey" => Color::Yellow,
+                    _ => Color::DarkGray,
+                };
+                let scope = g["scope"]
+                    .as_array()
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                let narrowed = if g["narrowed"] == true { "*" } else { "" };
+                Row::new(vec![
+                    Cell::from(did_label(&self.book, g["did"].as_str().unwrap_or("?"))),
+                    Cell::from(did_label(
+                        &self.book,
+                        g["principal"].as_str().unwrap_or("?"),
+                    )),
+                    Cell::from(state).style(Style::default().fg(color)),
+                    Cell::from(format!("{scope}{narrowed}")),
+                    Cell::from(g["expiresAt"].as_str().unwrap_or("").replace('T', " ")),
+                    Cell::from(g["epoch"].as_u64().map_or(String::new(), |e| e.to_string())),
+                    Cell::from(short(g["grantId"].as_str().unwrap_or(""))),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Fill(2),
+                Constraint::Fill(2),
+                Constraint::Length(12),
+                Constraint::Fill(1),
+                Constraint::Length(21),
+                Constraint::Length(6),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(
+            Row::new(vec![
+                "member",
+                "principal",
+                "state",
+                "scope",
+                "expires",
+                "epoch",
+                "grant",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(block);
+        f.render_stateful_widget(table, area, &mut self.grants_state);
     }
 
     /// What a screen shows when the mediator predates the tasks it needs.
@@ -1525,7 +1919,10 @@ impl App {
                     }
                     Tab::Audit => "n name  b book  m monitor  r refresh  q quit",
                     Tab::Mux => {
-                        "↑↓ select connection  n name  b book  m monitor  r refresh  q quit"
+                        "↑↓ select connection  g its grants  n name  b book  m monitor  r refresh  q quit"
+                    }
+                    Tab::Grants => {
+                        "/ find  ↑↓ select  p principal's  g member's  d revoke  D revoke all listed  E bump epoch  ] more  m monitor  q quit"
                     }
                     Tab::Accounts => {
                         "↑↓ select  ⏎ open  n name  b book  m monitor  r refresh  q quit"
@@ -2320,6 +2717,7 @@ impl App {
             .take(height)
             .map(|l| match l {
                 MonitorLine::Event(v) => event_line(v, &self.book, name_w),
+                MonitorLine::Membership(v) => membership_line(v, &self.book, name_w),
                 MonitorLine::Note(line) => line.clone(),
                 // The count ahead of the reason, which is often a long error
                 // the pane cuts off.
@@ -2674,6 +3072,46 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
             ),
             true,
         ),
+        Popup::FindGrants {
+            principal,
+            member,
+            on_member,
+        } => {
+            let cursor = |on: bool| if on { "▏" } else { "" };
+            (
+                " Find stored grants ".into(),
+                format!(
+                    "Principal DID  {principal}{}\nMember DID     {member}{}\n\n\
+                     Paste or type either or both. Tab switches field, ⏎ lists, Esc cancels.\n\
+                     A member's listing shows its current epoch.",
+                    cursor(!*on_member),
+                    cursor(*on_member),
+                ),
+                false,
+            )
+        }
+        Popup::ConfirmRevoke(selection) => (
+            " Revoke grants ".into(),
+            format!(
+                "Revoke {}?\n\nRevoked grants are deleted and their members detached at once; \
+                 the signed statements can never be stored again.\n\n\
+                 y to confirm, any other key to cancel",
+                selection.describe()
+            ),
+            true,
+        ),
+        Popup::ConfirmBumpEpoch { did, epoch } => (
+            " Advance a member's epoch ".into(),
+            format!(
+                "Member {did}\nCurrent epoch {epoch} → {}\n\n\
+                 Every grant the member gave is voided and its session attaches end, \
+                 without its signature. Only epoch {epoch} is named: if it has moved \
+                 on since, nothing changes.\n\n\
+                 y to confirm, any other key to cancel",
+                epoch + 1
+            ),
+            true,
+        ),
         Popup::ConfirmPurge(plan) => (
             " Purge ".into(),
             format!(
@@ -2694,7 +3132,7 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
     let h = area
         .height
         .saturating_sub(4)
-        .min(if danger { 9 } else { 40 });
+        .min(if danger { 12 } else { 40 });
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
@@ -2721,14 +3159,29 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
 /// ends (its lease renewal failed, say, with the connection down) or goes
 /// silent is replaced, after a backoff. Only a refusal stops it, since asking
 /// again would get the same answer.
+///
+/// `membership` adds mux membership events; a mediator that doesn't serve
+/// them (one that predates them, its version unknown) gets the traffic feed
+/// alone rather than no feed.
 async fn watch(
     console: Arc<MediatorConsole>,
     filter: MonitorFilter,
+    mut membership: Option<MembershipFilter>,
     tx: mpsc::UnboundedSender<Update>,
 ) {
     let mut failures = 0;
     loop {
-        let reason = match console.monitor(filter.clone()).await {
+        let opened = console
+            .monitor_with(filter.clone(), membership.clone())
+            .await;
+        let reason = match opened {
+            Err(e) if membership.is_some() && is_unsupported(&e) => {
+                membership = None;
+                continue;
+            }
+            opened => opened,
+        };
+        let reason = match reason {
             Ok(mut feed) => loop {
                 match tokio::time::timeout(MONITOR_SILENCE, feed.next()).await {
                     Ok(Some(MonitorUpdate::Ended(reason))) => break reason,
@@ -2761,6 +3214,12 @@ async fn watch(
         }
         tokio::time::sleep(after).await;
     }
+}
+
+/// The mediator doesn't serve what was asked (its type is unsupported).
+fn is_unsupported(e: &ConsoleError) -> bool {
+    e.refusal_code()
+        .is_some_and(|c| c.ends_with("protocol.trust_task.unsupported"))
 }
 
 /// A subscribe the mediator (or the console, knowing its answer) turned down.
@@ -2928,6 +3387,83 @@ fn did_label(book: &AddressBook, did: &str) -> String {
         .unwrap_or_else(|| short(did))
 }
 
+/// The Grants tab's query from the find popup's fields: blank is none.
+fn grant_query(principal: &str, member: &str) -> GrantQuery {
+    let did = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    GrantQuery {
+        principal: did(principal),
+        member: did(member),
+    }
+}
+
+/// The Grants tab's title: what is listed, the member's epoch, how many.
+fn grants_title(
+    query: &GrantQuery,
+    epoch: Option<u64>,
+    shown: usize,
+    more: bool,
+    book: &AddressBook,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = &query.principal {
+        parts.push(format!("principal {}", did_label(book, p)));
+    }
+    if let Some(m) = &query.member {
+        parts.push(format!("member {}", did_label(book, m)));
+    }
+    if parts.is_empty() {
+        return " Stored grants ".into();
+    }
+    let mut title = format!(" Grants of {}", parts.join(" · "));
+    if let Some(e) = epoch {
+        title.push_str(&format!(" · member epoch {e}"));
+    }
+    title.push_str(&format!(
+        ": {shown}{} ",
+        if more { "+ (] for more)" } else { "" }
+    ));
+    title
+}
+
+/// What advancing member `name`'s epoch did, in a sentence.
+fn bump_summary(name: &str, named: u64, epoch: u64, advanced: bool, revoked: u64) -> String {
+    if advanced {
+        format!("epoch of {name} advanced {named} → {epoch}: {revoked} grant(s) voided")
+    } else {
+        format!("epoch {named} of {name} was already voided (now {epoch}); nothing changed")
+    }
+}
+
+/// One mux membership change as a monitor line: who attached to or
+/// detached from whose connection, how and why.
+fn membership_line(e: &Value, book: &AddressBook, name_w: usize) -> Line<'static> {
+    let s = |k: &str| e[k].as_str().unwrap_or("").to_string();
+    let change = s("change");
+    let (arrow, color) = match change.as_str() {
+        "attached" => ("⊕", Color::Green),
+        "detached" => ("⊖", Color::Yellow),
+        _ => ("·", Color::Reset),
+    };
+    Line::from(vec![
+        Span::styled(
+            time_of(&s("occurredAt")),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!(" {arrow} ")),
+        Span::styled(format!("{change:<9}"), Style::default().fg(color)),
+        Span::raw(format!(" {:<9} {:<9} ", "mux", s("wire"))),
+        Span::raw(format!(
+            "{} ⇢ {} ",
+            fit(&label(book, &s("member")), name_w),
+            fit(&label(book, &s("principal")), name_w),
+        )),
+        Span::styled(
+            format!("{} {}", s("source"), s("reason")),
+            Style::default().fg(Color::Magenta),
+        ),
+    ])
+}
+
 /// The Mux tab's title: how many connections, and whether the page covers
 /// every instance of the mediator or only the one that answered.
 fn mux_title(page: &Value) -> String {
@@ -2968,6 +3504,70 @@ fn mux_summary_line(mux: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_find_popup_s_blank_fields_name_nothing() {
+        let q = super::grant_query("  did:example:p ", "");
+        assert_eq!(q.principal.as_deref(), Some("did:example:p"));
+        assert_eq!(q.member, None);
+        assert!(super::grant_query(" ", "").is_empty());
+    }
+
+    #[test]
+    fn the_grants_title_says_what_is_listed_and_the_member_s_epoch() {
+        let book = super::AddressBook::new();
+        let none = super::GrantQuery::default();
+        assert_eq!(
+            super::grants_title(&none, None, 0, false, &book),
+            " Stored grants "
+        );
+        let member = super::GrantQuery {
+            principal: None,
+            member: Some("did:ex:m".into()),
+        };
+        assert_eq!(
+            super::grants_title(&member, Some(2), 3, true, &book),
+            " Grants of member did:ex:m · member epoch 2: 3+ (] for more) "
+        );
+        let both = super::GrantQuery {
+            principal: Some("did:ex:p".into()),
+            member: Some("did:ex:m".into()),
+        };
+        assert_eq!(
+            super::grants_title(&both, None, 1, false, &book),
+            " Grants of principal did:ex:p · member did:ex:m: 1 "
+        );
+    }
+
+    #[test]
+    fn an_epoch_bump_says_whether_it_advanced() {
+        assert_eq!(
+            super::bump_summary("work", 0, 1, true, 2),
+            "epoch of work advanced 0 → 1: 2 grant(s) voided"
+        );
+        assert_eq!(
+            super::bump_summary("work", 0, 3, false, 0),
+            "epoch 0 of work was already voided (now 3); nothing changed"
+        );
+    }
+
+    #[test]
+    fn a_membership_event_shows_who_joined_whom_and_why() {
+        let book = super::AddressBook::new();
+        let e = serde_json::json!({
+            "occurredAt": "2026-09-21T10:11:12Z", "change": "detached",
+            "member": "abcdef0123456789", "principal": "0123456789abcdef",
+            "reason": "admin", "source": "grant", "wire": "tsp",
+        });
+        let text: String = super::membership_line(&e, &book, 14)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("⊖ detached"), "{text}");
+        assert!(text.contains("tsp"), "{text}");
+        assert!(text.contains("grant admin"), "{text}");
+    }
+
     #[test]
     fn the_mux_title_says_what_the_page_covers() {
         let page = serde_json::json!({
