@@ -1,3 +1,15 @@
+# ############################################################################
+# TEST HARNESS ONLY. NOT A LOCAL STACK. DO NOT EXPOSE.
+#
+# The mediator here runs with an admin key, JWT secret and operating keys that
+# are COMMITTED TO THIS PUBLIC REPOSITORY (docker/test/conf), in open network
+# mode. Anyone can read them. Ports are bound to 127.0.0.1 and nothing restarts
+# on its own, but treat a running instance as compromised by design.
+#
+# Want a mediator to play with locally? Use docker/quickstart/docker-compose.yml,
+# which generates a fresh identity on first start.
+# ############################################################################
+#
 # TEST harness (TI3): the PRODUCTION mediator image + Redis + a static did:web
 # host.
 #
@@ -21,7 +33,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-    restart: unless-stopped
 
   mediator:
     build:
@@ -46,10 +57,10 @@ services:
       # unless told this is a test deployment.
       MEDIATOR_ALLOW_TEST_IDENTITY: "true"
     ports:
-      - "7037:7037"
-    # No container healthcheck: the production image ships without curl.
-    # smoke.sh polls /mediator/v1/livez from the host instead.
-    restart: unless-stopped
+      # Loopback only: these keys are public.
+      - "127.0.0.1:7037:7037"
+    # Container health comes from the image's HEALTHCHECK (`mediator
+    # healthcheck`); smoke.sh also polls /mediator/v1/livez from the host.
 
   did-web:
     image: nginx:alpine
@@ -57,10 +68,9 @@ services:
       - ./docker/did-web/.well-known:/usr/share/nginx/html/.well-known:ro
       - ./docker/did-web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/.well-known/did.json"]
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
