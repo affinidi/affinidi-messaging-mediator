@@ -72,40 +72,52 @@ cargo run --locked --bin mediator-setup -- --non-interactive \
   --secret-storage aws \
   --database-url "redis://redis.internal:6379/"
 
-# Container
+# Container (a plaintext file store outside `local` must be accepted explicitly;
+# prefer `--set secrets.storage='file://conf/secrets.json?encrypt=1'`)
 cargo run --locked --bin mediator-setup -- --non-interactive \
   --deployment container \
   --did-method peer \
-  --secret-storage file
+  --secret-storage file --allow-plaintext-file
 ```
+
+Every headless run is one build recipe: `--from <recipe.toml>` (optional),
+then these flags — each a shorthand for one recipe key — then
+`--set section.key=value` for any other key (e.g.
+`--set security.network_mode=open`). Each override is printed, and so is any
+flag the run does not use.
 
 | Flag | Values | Default |
 |---|---|---|
 | `--deployment` | `local`, `server`, `container` | `local` |
 | `--protocol` | `didcomm` (DIDComm only), `tsp` (DIDComm + TSP) | `tsp` |
-| `--did-method` | `peer`, `webvh`, `vta` | `vta` (see note) |
+| `--did-method` | `peer`, `webvh`, `vta` | required with `--non-interactive` (see note) |
 | `--public-url` | URL | required for `webvh` |
 | `--key-suite` | `p256`, `secp256k1` (repeatable) | none (Ed25519 + X25519 only) |
 | `--save-did-web` | flag | off |
-| `--secret-storage` | `file`, `keyring`, `aws`, `gcp`, `azure`, `vault` | `keyring` |
+| `--secret-storage` | `file`, `keyring`, `aws`, `gcp`, `azure`, `vault`, `k8s` | `keyring` |
+| `--allow-plaintext-file` | flag | unencrypted `file://` refused outside `local` |
 | `--ssl` | `none`, `self-signed` | `none` |
 | `--database-url` | Redis URL | `redis://127.0.0.1/` |
-| `--admin` | `generate`, `skip` | `generate` |
+| `--admin` | `generate`, `vta`, `skip` | `generate` |
+| `--admin-did` | an existing admin DID | — |
 | `--listen-address` | `ip:port` | `0.0.0.0:7037` |
 | `-c, --config` | file path | `conf/mediator.toml` |
-| `--force-reprovision` | flag | refuse to overwrite an existing setup |
-| `--uninstall` | flag | delete the stored keys and local config |
+| `--set` | `section.key=value` (repeatable) | — |
+| `--force-reprovision` | flag | refuse to write into a backend that holds a mediator |
+| `--show-admin-key` | flag | the admin key is never printed |
+| `--uninstall` | flag | delete the stored keys and every file the setup wrote |
 
-`--non-interactive` cannot provision a VTA-managed DID. With the default
-`--did-method vta` it writes a placeholder DID that you must replace by hand,
-so pass `peer` or `webvh`, or use the TUI or a recipe for VTA setups.
+`--non-interactive` cannot provision a VTA-managed DID — there is no VTA
+session — so `--did-method vta` is refused (exit 5); use a sealed-mint recipe,
+the `--setup-key-out` / `--setup-key-file` pair (VTA admin credential, own
+DID), or the TUI. The network posture defaults to `open` for `local` and
+`closed` for `server` / `container`.
 
-`--secret-storage` picks only the backend kind and uses the wizard's defaults
-(region, project, vault name). `k8s://` and any non-default backend URL (a
-custom AWS region, a sovereign-cloud Azure URL, a remote Vault) need a recipe:
-`mediator-setup --from <recipe.toml>`. See
-[docs/setup-guide.md](docs/setup-guide.md#recipe-fields-by-mode) and
-`tools/mediator-setup/examples/mediator-build.toml`.
+`--secret-storage` picks only the backend kind with its defaults (region,
+namespace, service). GCP, Azure and Vault have no usable default: give the
+full URL, e.g. `--set secrets.storage=vault://vault.internal:8200/secret/mediator`.
+See [docs/setup-guide.md](docs/setup-guide.md#headless-runs) (including the
+exit codes) and `tools/mediator-setup/examples/mediator-build.toml`.
 
 ## Feature flags
 
@@ -261,7 +273,7 @@ admin credential into your secret backend. See
 
 ```sh
 mediator-setup --force-reprovision   # overwrite an existing setup (rotates every key)
-mediator-setup --uninstall           # delete stored keys and local config files
+mediator-setup --uninstall --config conf/mediator.toml   # delete stored keys and every file the setup wrote
 mediator rotate-admin --dry-run      # preview an admin credential rotation
 mediator rotate-admin                # rotate it (VTA-linked deployments)
 ```

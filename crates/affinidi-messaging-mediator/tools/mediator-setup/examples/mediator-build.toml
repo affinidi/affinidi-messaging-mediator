@@ -1,24 +1,30 @@
 # ============================================================================
-# Mediator Build Recipe
+# Mediator Build Recipe — a production mediator whose DID the VTA mints
 # ============================================================================
 #
-# A declarative configuration file for the mediator setup wizard.
-# Instead of answering interactive prompts, define all options here
-# and run:
+# A build recipe describes a mediator setup declaratively, so it can run
+# without the interactive wizard (CI/CD, reproducible deployments):
 #
 #   mediator-setup --from mediator-build.toml
 #
-# This is ideal for CI/CD pipelines, reproducible deployments, and
-# sharing a standardised setup across a team.
+# This example is a sealed-mint setup: the VTA mints the mediator's DID and
+# keys and hands them over in a sealed bundle, with no live network path
+# between this host and the VTA. It runs in two phases:
 #
-# All sections except [deployment] are optional and use sensible defaults.
+#   1. mediator-setup --from mediator-build.toml
+#        writes a bootstrap request file and keeps its ephemeral key in the
+#        secret backend below; it prints the command the VTA admin runs.
+#   2. mediator-setup --from mediator-build.toml \
+#        --bundle bundle.armor --digest <sha256 the VTA admin printed>
+#        opens the bundle and writes the mediator config + secrets.
 #
-# SECURITY: This file is safe to commit to version control.
-# No secrets, passwords, or private keys are stored here.
-# When the wizard auto-generates this file, credentials embedded in
-# URLs (e.g. Redis passwords) are automatically stripped.
+# Any value can be overridden on the command line without editing this
+# file: `--set section.key=value` (e.g. `--set security.network_mode=open`).
+# Every key is listed below; everything except [deployment].type has a
+# default. The full schema is in docs/setup-guide.md.
 #
-# To supply credentials at runtime:
+# This file holds no secrets. Credentials in URLs (a Redis password) are
+# supplied at runtime instead:
 #   DATABASE_URL="redis://:secret@host/" mediator-setup --from mediator-build.toml
 # ============================================================================
 
@@ -28,178 +34,172 @@
 # type: "local" | "server" | "container"
 #   local     — desktop / quick-start development
 #   server    — headless production (cloud or bare-metal)
-#   container — Docker image (generates Dockerfile alongside config)
+#   container — Docker image (writes Dockerfile + docker-compose.yml next to
+#               the config; the config directory is mounted, never baked in)
 type = "server"
 
-# protocols: ["didcomm", "tsp"] (the default) | ["didcomm"] | ["tsp"]
-#   didcomm — DIDComm v2 (industry standard)
-#   tsp     — Trust Spanning Protocol, the preferred transport; advertised as
-#             `#tsp` in the mediator's DID. Keep `didcomm` alongside it: TSP
-#             currently authenticates over the DIDComm session.
+# protocols: any of "didcomm", "tsp", "didcomm-v1". Default ["didcomm", "tsp"].
+#   didcomm    — DIDComm v2
+#   tsp        — Trust Spanning Protocol, advertised as `#tsp` in the DID.
+#                Keep `didcomm` alongside it: TSP authenticates over DIDComm.
+#   didcomm-v1 — Aries RFC 0019 (implies didcomm)
 protocols = ["didcomm", "tsp"]
 
-# use_vta: enable VTA (Verifiable Trust Agent) integration
-#   true  — VTA manages DIDs and keys centrally (recommended for production)
-#   false — manage keys independently (local dev, no VTA dependency)
+# With "didcomm-v1": accept v1 forwards without an authenticated session
+# (stock Credo wallets need this). Default false.
+# didcomm_v1_allow_unauthenticated_forwards = false
+
+# use_vta: link the mediator to a VTA (Verifiable Trust Agent).
 use_vta = true
 
-# vta_mode: how the mediator connects to VTA (only when use_vta = true)
-#   "online"     — VTA is accessible, connection mode auto-detected from credential
-#   "cold-start" — VTA not accessible, use pre-provisioned/cached credentials
-vta_mode = "online"
+# vta_mode (with use_vta = true):
+#   "sealed-mint"   — the VTA mints a fresh mediator DID + keys and returns
+#                     them in a sealed bundle (greenfield deployments).
+#   "sealed-export" — the VTA re-exports a mediator it already provisioned
+#                     (migrations, restores).
+#   "online"        — live VTA session; interactive wizard only. (For an
+#                     admin credential only, see --setup-key-out /
+#                     --setup-key-file in the setup guide.)
+vta_mode = "sealed-mint"
+
+
+# ── VTA ─────────────────────────────────────────────────────────────────────
+[vta]
+# The VTA context this mediator lives in. Default "mediator".
+context = "mediator"
+# sealed-mint only: pin the minted DID's did.jsonl to a webvh server the VTA
+# knows, and optionally the path on it. Omit to self-host at public_url.
+# webvh_server = "prod-1"
+# webvh_path = "mediator"
 
 
 # ── Identity ────────────────────────────────────────────────────────────────
 [identity]
-# did_method: "vta" | "did:peer" | "did:webvh" | "import"
-#   vta       — VTA creates and manages the DID centrally (recommended)
-#   did:peer  — self-contained, no hosting required (good for local dev)
-#   did:webvh — production, requires a webvh server
-#   import    — bring your own DID and keys
+# did_method: "vta" | "did:peer" | "did:webvh"
+#   vta       — the VTA mints and manages the DID (needs a sealed vta_mode)
+#   did:peer  — self-contained, no hosting (local development)
+#   did:webvh — generated here; you host its did.jsonl. The update and
+#               pre-rotation keys are stored in the secret backend
+#               (mediator_webvh_update_keys) so the DID can be updated later.
 did_method = "vta"
 
-# public_url: required when did_method = "did:webvh"
-# public_url = "https://mediator.example.com"
+# The mediator's public URL. Required for did:webvh and for sealed-mint (the
+# VTA's DID template renders the service endpoints from it).
+public_url = "https://mediator.example.com"
+
+# Also write a did:web copy of a did:webvh document (did-web.json).
+# save_did_web = false
+
+# did:webvh only: present the log as its did:scid:vh:1 DID ("scid") rather
+# than its did:webvh DID ("webvh", the default).
+# present_as = "webvh"
+# did:webvh only: list the did:scid alias in alsoKnownAs. Default true.
+# scid_also_known_as = true
+
+# did:peer / did:webvh only: key suites minted alongside Ed25519 + X25519.
+# extra_key_suites = ["p256", "secp256k1"]
 
 
 # ── Secrets ─────────────────────────────────────────────────────────────────
 [secrets]
-# storage: where cryptographic keys are stored. The VTA is a *source*
-# of keys, not a storage backend — pick whichever real store the
-# wizard should write the provisioned keys into.
-#   "keyring://"         — OS keyring (macOS Keychain, Linux Secret Service)
-#   "aws_secrets://"     — AWS Secrets Manager
-#   "gcp_secrets://"     — Google Cloud Secret Manager
-#   "azure_keyvault://"  — Azure Key Vault
-#   "vault://"           — HashiCorp Vault
-#   "file://"            — local JSON file; pair with `?encrypt=1` for
-#                          AES-256-GCM + Argon2id envelope encryption.
-#                          Plain `file://` is dev-only.
-storage = "keyring://"
+# Where the mediator's keys are stored. A bare scheme takes that backend's
+# defaults; a full URL sets them.
+#   "keyring://affinidi-mediator"             — OS keyring (desktop)
+#   "aws_secrets://us-east-1/mediator/"       — AWS Secrets Manager
+#   "gcp_secrets://<project>/mediator-"       — Google Secret Manager (project required)
+#   "azure_keyvault://<vault-name>"           — Azure Key Vault (vault required)
+#   "vault://<host:port>/secret/mediator"     — HashiCorp Vault KV v2 (endpoint required)
+#   "k8s://<namespace>/mediator-secrets"      — Kubernetes Secret
+#   "file://conf/secrets.json?encrypt=1"      — local file, passphrase-encrypted
+#                                               (MEDIATOR_FILE_BACKEND_PASSPHRASE)
+storage = "aws_secrets://us-east-1/mediator/"
+
+# An unencrypted file:// store outside a "local" deployment is refused
+# unless explicitly accepted. Default false.
+# allow_plaintext_file = false
 
 
 # ── Security ────────────────────────────────────────────────────────────────
 [security]
-# ssl: "none" | "self-signed" | "existing"
-#   none        — run behind a TLS-terminating proxy (nginx, Caddy, ALB)
-#   self-signed — generate self-signed certs (local dev only)
-#   existing    — provide paths to existing cert + key files
+# ssl: "none" (TLS-terminating proxy) | "self-signed" (local dev) | "existing"
 ssl = "none"
-
 # Required when ssl = "existing":
-# ssl_cert = "/path/to/cert.pem"
-# ssl_key  = "/path/to/key.pem"
+# ssl_cert = "/etc/tls/cert.pem"
+# ssl_key  = "/etc/tls/key.pem"
 
-# admin: "generate" | "skip" | "import"
-#   generate — create a new Ed25519 admin did:key
-#   skip     — configure admin later
-#   import   — use an existing DID (set admin_did below)
+# The mediator's admin-API identity:
+#   "generate" — a fresh did:key (default). In a VTA setup it is separate from
+#                the VTA credential, which stays the mediator↔VTA identity;
+#                its key goes to admin-monitor.json.
+#   "vta"      — reuse the VTA-issued credential's DID as the admin identity.
+#   "import"   — an existing DID you hold the key for (set admin_did).
+#   "skip"     — no admin DID for now.
 admin = "generate"
-
 # Required when admin = "import":
 # admin_did = "did:key:z6Mk..."
 
-# network_mode: "open" (default) | "closed"
-#   open   — any DID can message any other DID by default. Override per-DID
-#            via the ACL. Wizard emits:
-#              mediator_acl_mode = "explicit_deny"
-#              global_acl_default = "ALLOW_ALL"
-#              local_direct_delivery_allowed = "true"
-#   closed — restricted: every cross-DID exchange requires an explicit ACL
-#            grant. Wizard emits:
+# jwt_mode: "generate" (default) | "provide" (MEDIATOR_JWT_SECRET at boot)
+jwt_mode = "generate"
+
+# network_mode: "open" | "closed". Default: "open" for a local deployment,
+# "closed" for server and container.
+#   closed — every cross-DID exchange needs an explicit ACL grant:
 #              mediator_acl_mode = "explicit_allow"
 #              global_acl_default = "DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES"
-#              local_direct_delivery_allowed = "true"
-network_mode = "open"
+#   open   — any DID can message any other DID; deny per DID via the ACL:
+#              mediator_acl_mode = "explicit_deny"
+#              global_acl_default = "ALLOW_ALL"
+network_mode = "closed"
 
-# cors: "none" (default) | "any" | "list"
-#   none — deny all cross-origin browser access. `cors_allow_origin` is left
-#          unset. Right for mediators with no browser-based clients.
-#   any  — allow any origin. Wizard emits `cors_allow_origin = "*"`. Suggested
-#          for public mediators (endpoints gate on a bearer token, so a
-#          wildcard is not a CSRF risk).
-#   list — allow only the origins in `cors_domains` (required for this mode).
-#          Each entry is an exact, scheme-qualified origin
-#          (https://app.affinidi.com) or a leftmost-label sub-domain wildcard
-#          (https://*.affinidi.com, optionally with a :port). Scheme and port
-#          must match exactly; a wildcard does NOT cover its apex domain.
+# cors: "none" (default — no cross-origin browser access) | "any" ("*") |
+# "list" (only cors_domains: exact origins or *.subdomain wildcards).
 cors = "none"
 # Required when cors = "list":
-# cors_domains = "https://app.affinidi.com,https://*.affinidi.com"
+# cors_domains = "https://app.example.com,https://*.example.com"
 
 
 # ── Database ────────────────────────────────────────────────────────────────
 [database]
-# Redis connection URL. Use database partitions (e.g. redis://host/1)
-# to isolate data when sharing a Redis instance across applications.
-#
-# DO NOT put passwords in this file — use the DATABASE_URL env var instead:
-#   DATABASE_URL="redis://:password@host:6379/" mediator-setup --from mediator-build.toml
+# Redis URL (with [storage] backend = "redis"). No passwords here — use the
+# DATABASE_URL environment variable.
 url = "redis://127.0.0.1/"
+
+
+# ── Storage ─────────────────────────────────────────────────────────────────
+[storage]
+# "redis" (default; multi-mediator) | "fjall" (embedded, single node)
+backend = "redis"
+# fjall only:
+# data_dir = "./data/mediator"
 
 
 # ── Output ──────────────────────────────────────────────────────────────────
 [output]
-# Path for the generated mediator.toml configuration file.
+# Where to write mediator.toml; did.jsonl, atm-functions.lua and the other
+# generated files go next to it.
 config_path = "conf/mediator.toml"
-
-# Listen address for the mediator (ip:port).
 listen_address = "0.0.0.0:7037"
+api_prefix = "/mediator/v1/"
 
-# Optional: reverse-proxy / load-balancer ranges whose X-Forwarded-For the
-# per-IP rate limiter trusts (written to `[server] trust_xff_cidrs`). Omit
-# (the default) to key on the socket peer. List only proxies that append to
-# X-Forwarded-For (an ALB does), and only when the mediator is reachable solely
-# through them. A catch-all range (0.0.0.0/0, ::/0) is refused.
-#
-#   trust_xff_cidrs = ["10.0.0.0/8"]
+# Reverse-proxy ranges whose X-Forwarded-For the rate limiter trusts. A
+# catch-all range (0.0.0.0/0, ::/0) is refused.
+# trust_xff_cidrs = ["10.0.0.0/8"]
 
-# Optional: publish the minted public DID string after provisioning.
-# Omit (the default) to publish nowhere -- interactive/local setups.
-# Either an SSM parameter, or a local file:
-#
-#   did_target = "aws_parameter_store:///mediator/did?region=eu-west-1"
-#   did_target = "file:///run/mediator/did.txt"
-#
-# A hierarchical SSM name keeps its leading slash (hence three slashes);
-# AWS rejects a hierarchy without one. Without ?region= the ambient AWS
-# region is used (AWS_REGION, profile, then IMDS).
-#
-# Only the aws_parameter_store:// form round-trips: it is exactly the
-# string mediator.toml accepts for `mediator_did`, so it can be pasted
-# across verbatim.
-#
-# A file:// target does NOT round-trip. The mediator cannot read
-# `mediator_did` from a file -- it accepts only did://<did> and
-# aws_parameter_store://. Use a file target to hand the DID to something
-# else (a relying party, a CI step, an operator); to put it in
-# mediator.toml, paste the file's contents as `mediator_did = "did://..."`.
+# Publish the minted DID string after setup (only aws_parameter_store://
+# round-trips into mediator.toml's mediator_did):
+# did_target = "aws_parameter_store:///mediator/did?region=us-east-1"
 
-# Optional: publish the minted did:webvh log document (did.jsonl content)
-# after provisioning, so a self-hosted mediator on ephemeral compute can
-# serve /.well-known/did.jsonl after the one-shot setup task exits. The
-# generated mediator.toml points `did_web_self_hosted` at this SAME target
-# automatically, so the runtime reads the published copy — no hand-editing.
+# Publish the DID log (did.jsonl) after setup; mediator.toml then reads it
+# from there (did_web_self_hosted), so ephemeral compute keeps serving it:
+# did_log_target = "s3://my-bucket/mediator/did.jsonl?region=us-east-1"
 #
-#   did_log_target = "s3://my-bucket/mediator/did.jsonl?region=eu-west-1"
-#   did_log_target = "aws_parameter_store:///mediator/did-log?region=eu-west-1"
-#   did_log_target = "file:///run/mediator/did.jsonl"
-#
-# All three forms round-trip into `did_web_self_hosted` (which reads a DID
-# *document*, not a DID string). Prefer s3:// for a rotating deployment: the
-# did:webvh v1.0 log embeds the full DID document in every entry (no JSON
-# Patch), so it grows with each key rotation and can outgrow Parameter
-# Store's value-size limit -- S3 has no such ceiling.
+# Publishing runs last: if it fails, the setup is still complete and the
+# wizard exits 7 with the command to retry by hand.
 
 
 # ── Install ─────────────────────────────────────────────────────────────────
 [install]
-# Set to true to automatically run `cargo install` after generating config.
-# When false, the recipe only generates configuration files.
+# Run `cargo install` for the mediator after writing the config.
 enabled = false
-
-# Custom install root (passed as `cargo install --root <path>`).
-# The binary is placed at <path>/bin/mediator.
-# Omit to use the default (~/.cargo/bin).
-# Note: custom paths may require elevated permissions (sudo).
+# Install root (`cargo install --root <path>`).
 # path = "/usr/local"
