@@ -89,10 +89,41 @@ impl ConsoleError {
                 code,
                 comment,
                 current_epoch,
-            } => explain_refusal(code, comment, *current_epoch).unwrap_or_else(|| self.to_string()),
-            other => other.to_string(),
+            } => display_safe(
+                &explain_refusal(code, comment, *current_epoch).unwrap_or_else(|| self.to_string()),
+            ),
+            other => display_safe(&other.to_string()),
         }
     }
+}
+
+/// `s` with control characters, line and paragraph separators and
+/// bidirectional formatting marks escaped (`\u{1b}`), so text a mediator
+/// sent cannot drive the operator's terminal: no ANSI or OSC sequences, no
+/// rewritten lines, no reordered words in a confirmation. Other text,
+/// non-ASCII included, is kept as is. Escaping twice changes nothing more.
+pub(crate) fn display_safe(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let unsafe_char = c.is_control()
+            || matches!(
+                c,
+                '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+        if unsafe_char {
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Shorthand for console results.
@@ -105,12 +136,16 @@ pub type Result<T> = std::result::Result<T, ConsoleError>;
 pub(crate) fn refusal(e: &ATMError) -> Option<(String, String, Option<u64>)> {
     let comment = match e {
         ATMError::ProblemReport(code, comment, _) => {
-            return Some((code.clone(), comment.clone(), e.current_epoch()));
+            return Some((display_safe(code), display_safe(comment), e.current_epoch()));
         }
         ATMError::TrustTaskError(r) => r.message.clone().unwrap_or_else(|| r.code.clone()),
         _ => return None,
     };
-    Some((e.mediator_code()?.to_string(), comment, e.current_epoch()))
+    Some((
+        display_safe(e.mediator_code()?),
+        display_safe(&comment),
+        e.current_epoch(),
+    ))
 }
 
 /// What a refusal of a stored-grant task means, by its code; `None` for a
@@ -178,6 +213,31 @@ mod tests {
             }))
             .expect("a trust-task-error");
         ConsoleError::from_call(ATMError::TrustTaskError(Box::new(refusal)))
+    }
+
+    #[test]
+    fn mediator_text_cannot_drive_the_terminal() {
+        let e = refused(
+            "e.p.authorization.permissionDenied",
+            "no\u{1b}]0;owned\u{7}\r\nconfirm? [y]\u{202e}",
+        );
+        let ConsoleError::Refused { comment, .. } = &e else {
+            panic!("a refusal");
+        };
+        assert!(!comment.chars().any(char::is_control), "{comment:?}");
+        assert!(!comment.contains('\u{202e}'), "{comment:?}");
+        assert!(comment.contains("\\u{1b}]0;owned"), "{comment:?}");
+        let shown = e.explain();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert_eq!(
+            display_safe(&shown),
+            shown,
+            "escaping twice changes nothing"
+        );
+        assert_eq!(display_safe("épée ok"), "épée ok");
+        // Not a refusal: what the SDK reported is escaped when shown too.
+        let other = ConsoleError::Unexpected("bad\u{1b}[2J".into());
+        assert!(!other.explain().chars().any(char::is_control));
     }
 
     #[test]
