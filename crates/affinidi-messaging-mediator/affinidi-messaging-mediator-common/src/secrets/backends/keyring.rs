@@ -32,6 +32,8 @@ use crate::secrets::store::DynSecretStore;
 use crate::secrets::url::BackendUrl;
 
 #[cfg(feature = "secrets-keyring")]
+use crate::secrets::backends::run_blocking;
+#[cfg(feature = "secrets-keyring")]
 use crate::secrets::store::SecretStore;
 #[cfg(feature = "secrets-keyring")]
 use async_trait::async_trait;
@@ -130,12 +132,26 @@ pub struct KeyringStore {
 }
 
 #[cfg(feature = "secrets-keyring")]
+fn entry(service: &str, key: &str) -> Result<keyring_core::Entry> {
+    keyring_core::Entry::new(service, key).map_err(|e| SecretStoreError::Unreachable {
+        backend: BACKEND_LABEL,
+        reason: format!("could not open keyring entry '{service}/{key}': {e}"),
+    })
+}
+
+#[cfg(feature = "secrets-keyring")]
 impl KeyringStore {
-    fn entry(&self, key: &str) -> Result<keyring_core::Entry> {
-        keyring_core::Entry::new(&self.service, key).map_err(|e| SecretStoreError::Unreachable {
-            backend: BACKEND_LABEL,
-            reason: format!("could not open keyring entry '{}/{key}': {e}", self.service),
-        })
+    /// Run `f` against the entry for `key` on tokio's blocking pool: the
+    /// keychain and keyutils calls are synchronous, and the macOS Keychain
+    /// can block on an unlock prompt.
+    async fn with_entry<T, F>(&self, key: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(keyring_core::Entry) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let service = self.service.clone();
+        let key = key.to_string();
+        run_blocking(BACKEND_LABEL, move || f(entry(&service, &key)?)).await
     }
 }
 
@@ -147,16 +163,18 @@ impl SecretStore for KeyringStore {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let entry = self.entry(key)?;
-        let raw = match entry.get_password() {
-            Ok(s) => s,
-            Err(keyring_core::Error::NoEntry) => return Ok(None),
-            Err(e) => {
-                return Err(SecretStoreError::Unreachable {
+        let raw = self
+            .with_entry(key, |entry| match entry.get_password() {
+                Ok(s) => Ok(Some(zeroize::Zeroizing::new(s))),
+                Err(keyring_core::Error::NoEntry) => Ok(None),
+                Err(e) => Err(SecretStoreError::Unreachable {
                     backend: BACKEND_LABEL,
                     reason: format!("keyring read failed: {e}"),
-                });
-            }
+                }),
+            })
+            .await?;
+        let Some(raw) = raw else {
+            return Ok(None);
         };
         let bytes = B64URL
             .decode(raw.as_bytes())
@@ -168,27 +186,28 @@ impl SecretStore for KeyringStore {
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
-        let entry = self.entry(key)?;
-        let encoded = B64URL.encode(value);
-        entry
-            .set_password(&encoded)
-            .map_err(|e| SecretStoreError::Unreachable {
-                backend: BACKEND_LABEL,
-                reason: format!("keyring write failed: {e}"),
-            })?;
-        Ok(())
+        let encoded = zeroize::Zeroizing::new(B64URL.encode(value));
+        self.with_entry(key, move |entry| {
+            entry
+                .set_password(&encoded)
+                .map_err(|e| SecretStoreError::Unreachable {
+                    backend: BACKEND_LABEL,
+                    reason: format!("keyring write failed: {e}"),
+                })
+        })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let entry = self.entry(key)?;
-        match entry.delete_credential() {
+        self.with_entry(key, |entry| match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(SecretStoreError::Unreachable {
                 backend: BACKEND_LABEL,
                 reason: format!("keyring delete failed: {e}"),
             }),
-        }
+        })
+        .await
     }
 
     /// Override the default put+get+delete roundtrip with a read-only
@@ -219,13 +238,15 @@ impl SecretStore for KeyringStore {
         // refuses to answer is the failure we want to catch; leaving no
         // residue keeps us out of the keychain's write ACL dialog on
         // macOS. Name lives in the shared `mediator_probe_*` namespace.
-        let entry = self.entry("mediator_probe_keyring_sentinel")?;
-        match entry.get_password() {
-            Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(SecretStoreError::ProbeFailed {
-                backend: BACKEND_LABEL,
-                reason: format!("keyring read-probe failed: {e}"),
-            }),
-        }
+        self.with_entry("mediator_probe_keyring_sentinel", |entry| {
+            match entry.get_password() {
+                Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
+                Err(e) => Err(SecretStoreError::ProbeFailed {
+                    backend: BACKEND_LABEL,
+                    reason: format!("keyring read-probe failed: {e}"),
+                }),
+            }
+        })
+        .await
     }
 }

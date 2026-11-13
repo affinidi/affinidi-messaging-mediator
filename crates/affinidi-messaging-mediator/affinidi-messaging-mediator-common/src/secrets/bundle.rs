@@ -61,6 +61,7 @@
 //! stopped.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -69,6 +70,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use zeroize::Zeroize;
 
 use crate::secrets::envelope::{ENVELOPE_VERSION, Envelope};
 use crate::secrets::error::{Result, SecretStoreError};
@@ -133,7 +135,9 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` names the entries but never prints their values, and dropping
+/// a bundle wipes the values from memory.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Bundle {
     #[serde(default, skip_serializing_if = "State::is_active")]
     state: State,
@@ -147,6 +151,25 @@ struct Bundle {
     /// Stray `mediator_probe_<uuid>` sentinels, deleted at the cutover.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     stray_keys: Vec<String>,
+}
+
+impl std::fmt::Debug for Bundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bundle")
+            .field("state", &self.state)
+            .field("entries", &self.entries.keys().collect::<Vec<_>>())
+            .field("legacy_keys", &self.legacy_keys)
+            .field("stray_keys", &self.stray_keys)
+            .finish()
+    }
+}
+
+impl Drop for Bundle {
+    fn drop(&mut self) {
+        for value in self.entries.values_mut() {
+            value.zeroize();
+        }
+    }
 }
 
 impl Bundle {
@@ -214,7 +237,8 @@ pub struct BundledStore {
     layout: std::sync::Mutex<Option<Layout>>,
     resolving: Mutex<()>,
     /// Last bundle read or written, and when. See [`READ_CACHE_TTL`].
-    cached: std::sync::Mutex<Option<(Instant, Option<Bundle>)>>,
+    /// Shared, so a cached read hands out the bundle without copying it.
+    cached: std::sync::Mutex<Option<(Instant, Option<Arc<Bundle>>)>>,
     write_lock: Mutex<()>,
 }
 
@@ -666,29 +690,37 @@ impl BundledStore {
             .filter(|bytes| !bytes.is_empty()))
     }
 
+    /// Read the bundle from the backend, leaving the read cache alone.
+    async fn load_bundle(&self) -> Result<Option<Bundle>> {
+        match self.get_bundle_bytes().await? {
+            Some(bytes) => Ok(Some(Bundle::open(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Read the bundle from the backend, bypassing (and refreshing) the
     /// read cache.
     async fn read_bundle(&self) -> Result<Option<Bundle>> {
-        let bundle = match self.get_bundle_bytes().await? {
-            Some(bytes) => Some(Bundle::open(&bytes)?),
-            None => None,
-        };
-        self.remember(bundle.clone());
+        let bundle = self.load_bundle().await?;
+        self.remember(bundle.clone().map(Arc::new));
         Ok(bundle)
     }
 
-    /// The bundle as of at most [`READ_CACHE_TTL`] ago.
-    async fn cached_bundle(&self) -> Result<Option<Bundle>> {
+    /// The bundle as of at most [`READ_CACHE_TTL`] ago, shared with the
+    /// cache rather than copied.
+    async fn cached_bundle(&self) -> Result<Option<Arc<Bundle>>> {
         if let Ok(cached) = self.cached.lock()
             && let Some((at, bundle)) = cached.as_ref()
             && at.elapsed() < READ_CACHE_TTL
         {
             return Ok(bundle.clone());
         }
-        self.read_bundle().await
+        let bundle = self.load_bundle().await?.map(Arc::new);
+        self.remember(bundle.clone());
+        Ok(bundle)
     }
 
-    fn remember(&self, bundle: Option<Bundle>) {
+    fn remember(&self, bundle: Option<Arc<Bundle>>) {
         if let Ok(mut cached) = self.cached.lock() {
             *cached = Some((Instant::now(), bundle));
         }
@@ -710,13 +742,16 @@ impl BundledStore {
         let mut backoff = CONFLICT_BACKOFF;
         let mut attempt = 1;
         loop {
-            let mut bundle = self.read_bundle().await?.unwrap_or_default();
+            let loaded = self.load_bundle().await?;
+            let existed = loaded.is_some();
+            let mut bundle = loaded.unwrap_or_default();
             if !edit(&mut bundle) {
+                self.remember(existed.then(|| Arc::new(bundle)));
                 return Ok(());
             }
             match self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await {
                 Ok(()) => {
-                    self.remember(Some(bundle));
+                    self.remember(Some(Arc::new(bundle)));
                     return Ok(());
                 }
                 Err(SecretStoreError::Conflict { .. }) if attempt < CONFLICT_ATTEMPTS => {
@@ -824,7 +859,7 @@ impl SecretStore for BundledStore {
         Ok(self
             .cached_bundle()
             .await?
-            .map(|bundle| bundle.entries.into_keys().collect())
+            .map(|bundle| bundle.entries.keys().cloned().collect())
             .unwrap_or_default())
     }
 
