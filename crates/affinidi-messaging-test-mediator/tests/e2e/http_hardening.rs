@@ -5,7 +5,7 @@
 //! - an unknown OOB invitation id is a real HTTP 404, not a 200 whose body
 //!   says 404.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

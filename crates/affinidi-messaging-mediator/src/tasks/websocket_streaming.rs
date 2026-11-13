@@ -2600,7 +2600,7 @@ mod tests {
             &database,
             &mut HashMap::new(),
             &mut HashMap::new(),
-            &Arc::new(DashSet::new()),
+            &Arc::new(Redeliveries::default()),
             PubSubRecord {
                 did_hash: "bob".to_string(),
                 message: "body".to_string(),

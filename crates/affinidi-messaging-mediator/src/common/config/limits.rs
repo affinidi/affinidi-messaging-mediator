@@ -463,36 +463,6 @@ where
     Ok(parsed)
 }
 
-/// Parse a whole number that cannot be guessed at: a value that does not read
-/// refuses to start, naming the key. `note` says what the value means.
-fn whole_number<T: std::str::FromStr>(
-    field: &str,
-    value: &str,
-    note: &str,
-) -> Result<T, MediatorError> {
-    let value = value.trim();
-    value.parse().map_err(|_| {
-        MediatorError::ConfigError(
-            crate::common::error_codes::CONFIG_ERROR,
-            "NA".into(),
-            format!("limits.{field} must be a whole number ({note}); got {value:?}"),
-        )
-    })
-}
-
-/// As [`whole_number`], and 0 is refused too: these have no "off" setting.
-fn positive_strict(field: &str, value: &str) -> Result<u64, MediatorError> {
-    let parsed: u64 = whole_number(field, value, "at least 1")?;
-    if parsed == 0 {
-        return Err(MediatorError::ConfigError(
-            crate::common::error_codes::CONFIG_ERROR,
-            "NA".into(),
-            format!("limits.{field} must be greater than 0"),
-        ));
-    }
-    Ok(parsed)
-}
-
 /// The WebSocket message rate: `(ws_messages_per_second, ws_message_burst,
 /// ws_message_throttle_close_secs)`.
 ///
