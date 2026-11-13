@@ -22,7 +22,7 @@ use affinidi_messaging_sdk::{
 use base64::prelude::*;
 use http::StatusCode;
 use serde_json::json;
-use tracing::{Instrument, debug, info, span, warn};
+use tracing::{Instrument, debug, info, span};
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +34,25 @@ use crate::{
 
 const MAX_RETRIEVED_MSGS: usize = 100;
 const MIN_RETRIEVED_MSGS: usize = 1;
+
+/// Most ids one `messages-received` may acknowledge, as the v1 twin and
+/// `messaging/message/delete` allow. Each id costs store round trips.
+const MAX_RECEIVED_IDS: usize = 100;
+
+/// A `delivery` carries at most this many `message_size`s of stored bodies.
+///
+/// `limit` alone bounds the count, not the bytes: 100 messages at the 1 MiB
+/// `message_size` is ~100 MiB of bodies, base64-encoded and then encrypted
+/// (base64 again) in memory for one request — two orders of magnitude over the
+/// bound `message_size` is meant to give every buffer. Past the budget the
+/// rest stay queued and come with the next request.
+const DELIVERY_BUDGET_MESSAGES: usize = 4;
+
+/// The byte budget for one `delivery`'s stored bodies. A delivery always
+/// carries at least one message, whatever its size.
+pub(crate) fn delivery_byte_budget(message_size: usize) -> usize {
+    message_size.saturating_mul(DELIVERY_BUDGET_MESSAGES)
+}
 
 /// Process a Status Request message and generates a response
 pub(crate) async fn status_request(
@@ -52,8 +71,8 @@ pub(crate) async fn status_request(
         };
         debug!("thid = ({})", thid);
 
-        // Pull recipient_did from message body
-        let recipient_did: String = if let Ok(body) =
+        // Pull recipient_did from message body: (DID, its hash)
+        let (recipient_did, recipient_did_hash): (String, String) = if let Ok(body) =
             serde_json::from_value::<MessagePickupStatusRequest>(msg.body.to_owned())
         {
             if let Some(recipient_did) = body.recipient_did {
@@ -89,29 +108,43 @@ pub(crate) async fn status_request(
                         "recipient_did doesn't match session.did",
                     ));
                 } else {
-                    affinidi_messaging_mediator_common::did_identity::did_hash(&recipient_did)
+                    let hash =
+                        affinidi_messaging_mediator_common::did_identity::did_hash(&recipient_did);
+                    (recipient_did, hash)
                 }
             } else {
-                session.did_hash.clone()
+                (session.did.clone(), session.did_hash.clone())
             }
         } else {
-            session.did_hash.clone()
+            (session.did.clone(), session.did_hash.clone())
         };
         debug!("Body: recipient_did: {}", recipient_did);
 
         info!(
             "MessagePickup Status-Request received from: ({}) recipient_did_hash({:?})",
             msg.from.clone().unwrap_or_else(|| "ANONYMOUS".to_string()),
-            recipient_did
+            recipient_did_hash
         );
 
-        generate_status_reply(state, session, &recipient_did, &thid, false, None).await
+        generate_status_reply(
+            state,
+            session,
+            &recipient_did_hash,
+            &recipient_did,
+            &thid,
+            false,
+            None,
+        )
+        .await
     }
     .instrument(_span)
     .await
 }
 
 /// Creates the reply to a valid StatusRequest message
+/// did_hash / recipient_did: the account reported on — the session's own, or
+///           a mux member's — and the DID the reply names, so a mux principal
+///           can tell whose counts it received.
 /// force_live_delivery: If true, will force the message to be live streamed even if live streaming is disabled.
 ///           Required due to the protocol specification to send a status update on live_streaming changes
 /// override_live_delivery: If Some(bool), will override the live delivery status of the recipient
@@ -120,6 +153,7 @@ async fn generate_status_reply(
     state: &SharedData,
     session: &Session,
     did_hash: &str,
+    recipient_did: &str,
     thid: &str,
     force_live_delivery: bool,
     override_live_delivery: Option<bool>,
@@ -159,7 +193,7 @@ async fn generate_status_reply(
         };
 
         let mut status = MessagePickupStatusReply {
-            recipient_did: session.did.clone(),
+            recipient_did: recipient_did.to_string(),
             message_count: u32::try_from(inbox.message_count).unwrap_or(u32::MAX),
             total_bytes: inbox.total_bytes,
             live_delivery: inbox.live_delivery,
@@ -195,6 +229,7 @@ async fn generate_status_reply(
         debug!("status message =\n{:?}", status_msg);
 
         Ok(ProcessMessageResponse {
+            handed_over: None,
             store_message: false,
             force_live_delivery,
             data: crate::messages::WrapperType::Message(Box::new(status_msg)),
@@ -249,6 +284,23 @@ pub(crate) async fn toggle_live_delivery(
             msg.from.clone().unwrap_or_else(|| "ANONYMOUS".to_string()),
             live_delivery
         );
+
+        // Live delivery needs the streaming task. Without it the mediator
+        // cannot push anything, so turning it on is refused rather than
+        // answered with a status claiming it is on (R6.2).
+        if live_delivery && state.streaming_task.is_none() {
+            return Err(MediatorError::problem(
+                55,
+                &session.session_id,
+                Some(msg.id.clone()),
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "protocol.pickup.live_streaming",
+                "Live delivery is not available on this mediator",
+                vec![],
+                StatusCode::NOT_IMPLEMENTED,
+            ));
+        }
 
         // Take action to change live delivery status
         if live_delivery {
@@ -311,6 +363,7 @@ pub(crate) async fn toggle_live_delivery(
             state,
             session,
             &session.did_hash,
+            &session.did,
             &thid,
             true,
             Some(live_delivery),
@@ -371,28 +424,50 @@ pub(crate) async fn delivery_request(
             limit
         );
 
-        // All the parsing is done, lets attempt to retrieve messages
-        let messages = state
-            .database
-            .fetch_messages_delivering(
-                &session.session_id,
-                &recipient_did_hash,
-                &FetchOptions {
-                    limit,
-                    ..Default::default()
-                },
-                state.clock.unix_millis() as u64,
-                state.config.limits.delivered_expiry_seconds,
-                state.config.limits.pickup_round_robin,
-            )
-            .await?;
+        // All the parsing is done, lets attempt to retrieve messages. Nothing
+        // is recorded here: what the reply carries is stamped delivered and
+        // reported once the reply is written (`handed_over`, R1.1).
+        let messages = crate::after_write::fetch_for_handover(
+            state,
+            &session.session_id,
+            &recipient_did_hash,
+            &FetchOptions {
+                limit,
+                ..Default::default()
+            },
+        )
+        .await?;
         debug!("msgs fetched: {}", messages.success.len());
-        let channel = crate::monitor::current_channel();
+
+        // Only messages with a body are attached, and only up to the byte
+        // budget; the rest stay queued for the next request.
+        let budget = delivery_byte_budget(state.limits().message_size);
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut handed_over = crate::after_write::HandedOver::new(&recipient_did_hash);
+        let mut used = 0usize;
         for element in &messages.success {
-            state.monitor.delivered_element(element, channel);
+            let Some(body) = element.msg.as_deref() else {
+                continue;
+            };
+            if !attachments.is_empty() && used.saturating_add(body.len()) > budget {
+                debug!(
+                    "delivery byte budget ({budget}) reached after {} message(s); the rest stay queued",
+                    attachments.len()
+                );
+                break;
+            }
+            used = used.saturating_add(body.len());
+            attachments.push(
+                Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode(body))
+                    .id(element.msg_id.clone())
+                    .finalize(),
+            );
+            handed_over
+                .messages
+                .push(crate::after_write::HandedOverMessage::of(element));
         }
 
-        if !messages.success.is_empty() {
+        if !attachments.is_empty() {
             let response_msg = Message::build(
                 Uuid::new_v4().to_string(),
                 "https://didcomm.org/messagepickup/3.0/delivery".to_string(),
@@ -400,16 +475,6 @@ pub(crate) async fn delivery_request(
             )
             .thid(thid.clone());
 
-            let mut attachments: Vec<Attachment> = Vec::new();
-
-            for element in messages.success {
-                if let Some(msg) = element.msg {
-                    let attachment =
-                        Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode(msg)).id(element.msg_id);
-
-                    attachments.push(attachment.finalize())
-                }
-            }
             let now = state.clock.unix_secs();
 
             let response_msg = response_msg
@@ -427,9 +492,19 @@ pub(crate) async fn delivery_request(
                 force_live_delivery: false,
                 data: crate::messages::WrapperType::Message(Box::new(response_msg)),
                 forward_message: false,
+                handed_over: Some(handed_over),
             })
         } else {
-            generate_status_reply(state, session, &recipient_did_hash, &thid, false, None).await
+            generate_status_reply(
+                state,
+                session,
+                &recipient_did_hash,
+                &recipient_did,
+                &thid,
+                false,
+                None,
+            )
+            .await
         }
     }
     .instrument(_span)
@@ -455,6 +530,26 @@ pub(crate) async fn messages_received(
 
         // Pull messages ids list from message body
         let message_id_list: Vec<String> = _parse_message_received_body(session, msg)?;
+        if message_id_list.len() > MAX_RECEIVED_IDS {
+            return Err(MediatorError::problem_with_log(
+                53,
+                &session.session_id,
+                Some(msg.id.clone()),
+                ProblemReportSorter::Warning,
+                ProblemReportScope::Message,
+                "protocol.pickup.messages_received.limit",
+                "message_id_list may name at most {1} messages. Received ({2})",
+                vec![
+                    MAX_RECEIVED_IDS.to_string(),
+                    message_id_list.len().to_string(),
+                ],
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "message_id_list may name at most {MAX_RECEIVED_IDS} messages. Received ({})",
+                    message_id_list.len()
+                ),
+            ));
+        }
 
         debug!("Messages Id list: {:?}", message_id_list);
 
@@ -470,37 +565,41 @@ pub(crate) async fn messages_received(
             )
             .await,
         );
+        // A member's standing is read once per request, not once per id.
+        let mut member_allowed: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        // The owners whose messages this acknowledged.
+        let mut acknowledged_for: Vec<String> = Vec::new();
         for msg_id in &message_id_list {
-            debug!("getting message with id: {}", msg_id);
             // The store authorises the delete itself; try each owner this
             // session may delete for until one is accepted, those whose copy
             // was handed over first (a principal and a member may both hold
-            // the same bytes; the one acknowledged is the one delivered).
+            // the same bytes; the one acknowledged is the one delivered). The
+            // delete reports the copy it removed, so nothing is read first.
             let mut deleted = false;
             let ordered =
                 crate::messages::client_delete::ack_order(&*state.database, &owners, msg_id).await;
             for owner_hash in &ordered {
-                let msg = match state.database.get_message(owner_hash, msg_id).await {
-                    Ok(Some(m)) => Some(m),
-                    Ok(None) => continue,
-                    Err(err) => {
-                        warn!("Error getting message: {:?}", err);
+                // A mux member's message is deleted only while the member's
+                // own account still stands.
+                if *owner_hash != session.did_hash {
+                    let allowed = match member_allowed.get(owner_hash) {
+                        Some(allowed) => *allowed,
+                        None => {
+                            let allowed = crate::mux::connection::allows(
+                                state,
+                                &session.session_id,
+                                owner_hash,
+                                affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
+                            )
+                            .await;
+                            member_allowed.insert(owner_hash.clone(), allowed);
+                            allowed
+                        }
+                    };
+                    if !allowed {
                         continue;
                     }
-                };
-                // A mux member's message is deleted only while the member's
-                // own account still stands; checked for the member this id
-                // belongs to, not for every member the connection carries.
-                if *owner_hash != session.did_hash
-                    && !crate::mux::connection::allows(
-                        state,
-                        &session.session_id,
-                        owner_hash,
-                        affinidi_messaging_mediator_common::store::mux::MuxCapability::Delete,
-                    )
-                    .await
-                {
-                    continue;
                 }
                 debug!("Deleting message: {}", msg_id);
                 match state
@@ -516,21 +615,22 @@ pub(crate) async fn messages_received(
                     )
                     .await
                 {
-                    Ok(_) => {
-                        let (from, to) = msg
-                            .as_ref()
-                            .map(|m| (m.from_address.clone(), m.to_address.clone()))
-                            .unwrap_or_default();
-                        let body = msg.as_ref().and_then(|m| m.msg.clone());
-                        state.monitor.deleted(
-                            msg_id,
-                            owner_hash,
-                            from.as_deref(),
-                            to.as_deref(),
-                            crate::monitor::current_channel(),
-                            body.as_deref(),
-                        );
+                    Ok(copies) => {
+                        for copy in &copies {
+                            state.monitor.deleted(
+                                msg_id,
+                                owner_hash,
+                                copy.from_did_hash.as_deref(),
+                                Some(copy.to_did_hash.as_str()),
+                                crate::monitor::current_channel(),
+                                // Not read just to classify the event.
+                                None,
+                            );
+                        }
                         info!("Deleted message: {}", msg_id);
+                        if !acknowledged_for.contains(owner_hash) {
+                            acknowledged_for.push(owner_hash.clone());
+                        }
                         deleted = true;
                         break;
                     }
@@ -544,7 +644,34 @@ pub(crate) async fn messages_received(
             }
         }
 
-        generate_status_reply(state, session, &session.did_hash, &thid, false, None).await
+        // The status answered is the account whose messages were acknowledged:
+        // a mux member's when they were all that member's, else the session's.
+        if let [member_hash] = acknowledged_for.as_slice()
+            && *member_hash != session.did_hash
+            && let Some(member_did) =
+                crate::mux::connection::member_did(state, &session.session_id, member_hash).await
+        {
+            return generate_status_reply(
+                state,
+                session,
+                member_hash,
+                &member_did,
+                &thid,
+                false,
+                None,
+            )
+            .await;
+        }
+        generate_status_reply(
+            state,
+            session,
+            &session.did_hash,
+            &session.did,
+            &thid,
+            false,
+            None,
+        )
+        .await
     }
     .instrument(_span)
     .await
@@ -644,84 +771,11 @@ fn _validate_msg(
     state: &SharedData,
     session: &Session,
 ) -> Result<(), MediatorError> {
-    let now = state.clock.unix_secs();
-
-    if let Some(expires) = msg.expires_time
-        && expires <= now
-    {
-        debug!(
-            "Message expired at ({}) now({}) seconds_ago({})",
-            expires,
-            now,
-            now - expires
-        );
-        return Err(MediatorError::problem_with_log(
-            31,
-            "",
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "message.expired",
-            "Message has expired: {1}",
-            vec![expires.to_string()],
-            StatusCode::BAD_REQUEST,
-            "Message has expired",
-        ));
-    }
-
-    // Ensure to: exists and is valid
-    let to: String = if let Some(to) = &msg.to {
-        if let Some(first) = to.first() {
-            first.to_owned()
-        } else {
-            return Err(MediatorError::problem(
-                51,
-                &session.session_id,
-                Some(msg.id.clone()),
-                ProblemReportSorter::Warning,
-                ProblemReportScope::Message,
-                "message.to",
-                "Invalid to: header, couldn't get first DID from the field.",
-                vec![],
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-    } else {
-        return Err(MediatorError::problem(
-            51,
-            &session.session_id,
-            Some(msg.id.clone()),
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "message.to",
-            "Missing to: header in message",
-            vec![],
-            StatusCode::BAD_REQUEST,
-        ));
-    };
+    // Expiry is checked for every message before it reaches a protocol
+    // handler (`MessageHandler::process`), so it is not repeated here.
 
     // Must be addressed to Mediator
-    if !affinidi_messaging_mediator_common::did_identity::same_account(
-        &to,
-        &state.config.mediator_did,
-    ) {
-        debug!(
-            "to: ({}) doesn't match Mediator DID ({})",
-            to, state.config.mediator_did
-        );
-        return Err(MediatorError::problem_with_log(
-            51,
-            &session.session_id,
-            Some(msg.id.clone()),
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "message.to",
-            "Message Pickup messages must be addressed to the Mediator DID. Received to: {1}",
-            vec![to.to_string()],
-            StatusCode::BAD_REQUEST,
-            "Message Pickup messages must be addressed to the Mediator DID",
-        ));
-    }
+    super::addressed_to_mediator(msg, &state.config.mediator_did, session, "Message Pickup")?;
 
     // Message can not be anonymous
     if msg.from.is_none() {
@@ -774,4 +828,15 @@ fn _validate_msg(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivery_byte_budget;
+
+    #[test]
+    fn the_delivery_budget_is_a_few_message_sizes_and_never_overflows() {
+        assert_eq!(delivery_byte_budget(1_048_576), 4 * 1_048_576);
+        assert_eq!(delivery_byte_budget(usize::MAX), usize::MAX);
+    }
 }

@@ -290,6 +290,7 @@ async fn deliver_v1_forward(
     // pickup client tells it apart from a v2 envelope the same way this handler
     // did — see `is_didcomm_v1`.
     let data = ProcessMessageResponse {
+        handed_over: None,
         store_message: true,
         force_live_delivery: false,
         forward_message: false,

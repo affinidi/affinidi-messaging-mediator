@@ -40,35 +40,12 @@ pub(crate) fn process(
         ));
     }
 
-    let to = if let Some(to) = &msg.to {
-        if let Some(first) = to.first() {
-            first.to_owned()
-        } else {
-            return Err(MediatorError::problem(
-                51,
-                session.session_id.to_string(),
-                Some(msg.id.clone()),
-                ProblemReportSorter::Warning,
-                ProblemReportScope::Message,
-                "message.to",
-                "Invalid to: header, couldn't get first DID from the field.",
-                vec![],
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-    } else {
-        return Err(MediatorError::problem(
-            51,
-            session.session_id.to_string(),
-            Some(msg.id.clone()),
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "message.to",
-            "Missing to: header in message",
-            vec![],
-            StatusCode::BAD_REQUEST,
-        ));
-    };
+    let to = super::addressed_to_mediator(
+        msg,
+        &state.config.mediator_did,
+        session,
+        "Discover Features",
+    )?;
 
     let from = if let Some(from) = &msg.from {
         from.to_owned()
@@ -115,6 +92,7 @@ pub(crate) fn process(
     debug!("response_msg: {:?}", response_msg);
 
     Ok(ProcessMessageResponse {
+        handed_over: None,
         store_message: true,
         force_live_delivery: false,
         data: WrapperType::Message(Box::new(response_msg)),

@@ -192,6 +192,7 @@ pub(crate) async fn process(
     .finalize();
 
     Ok(ProcessMessageResponse {
+        handed_over: None,
         store_message: !push_only,
         force_live_delivery: push_only,
         data: WrapperType::Message(Box::new(response_msg)),
@@ -1007,8 +1008,8 @@ async fn consume_account_update(
                 session,
                 is_admin,
                 (
-                    limits.send_queue_limit.map(|v| v as i32),
-                    limits.receive_queue_limit.map(|v| v as i32),
+                    wire_queue_limit(limits.send_queue_limit, "send_queue_limit", session)?,
+                    wire_queue_limit(limits.receive_queue_limit, "receive_queue_limit", session)?,
                 ),
                 (
                     state.limits().queued_send_messages_hard,
@@ -1019,6 +1020,12 @@ async fn consume_account_update(
         .transpose()?;
 
     // ---- Apply: capabilities, then queue limits, then the role. ----
+    //
+    // Three writes, not one transaction: the store has no compound update.
+    // Every refusal was decided above, so only a store failure can stop this
+    // part-way; when it does after an earlier write landed, that is audited
+    // as a partial update before the error goes back.
+    let mut applied: Vec<&'static str> = Vec::new();
 
     if let Some(acl_value) = acl_value {
         let base = state
@@ -1028,6 +1035,7 @@ async fn consume_account_update(
             .unwrap_or_default();
         let merged = merge_wire_acl(acl_value, base)?;
         let stored = state.database.set_did_acl(&target_hash, &merged).await?;
+        applied.push("acl");
         record_audit(
             state,
             session,
@@ -1043,10 +1051,15 @@ async fn consume_account_update(
     }
 
     if let Some((send_queue_limit, receive_queue_limit)) = queue_limits {
-        state
+        if let Err(e) = state
             .database
             .account_change_queue_limits(&target_hash, send_queue_limit, receive_queue_limit)
-            .await?;
+            .await
+        {
+            audit_partial_update(state, session, &target_hash, &applied, "queue limits", &e).await;
+            return Err(e);
+        }
+        applied.push("queue limits");
         record_audit(
             state,
             session,
@@ -1060,37 +1073,13 @@ async fn consume_account_update(
     if let Some(new_type) = new_type {
         // A faithful port of the legacy admin-set transitions (promote / demote /
         // switch); the guards above already authorized the change.
+        if current._type != new_type
+            && let Err(e) = apply_role_change(state, &target_hash, &current, new_type).await
+        {
+            audit_partial_update(state, session, &target_hash, &applied, "role", &e).await;
+            return Err(e);
+        }
         if current._type != new_type {
-            if current._type.is_admin() && !new_type.is_admin() {
-                // Demotion — strip admin rights first, then set the plain role.
-                state
-                    .database
-                    .strip_admin_accounts(vec![target_hash.clone()])
-                    .await?;
-                state
-                    .database
-                    .account_set_role(&target_hash, &new_type)
-                    .await?;
-            } else if !current._type.is_admin() && new_type.is_admin() {
-                // Promotion — add admin rights, carrying the account's current ACL
-                // set (re-read so an `acl` member in this same update is honoured).
-                let acls = state
-                    .database
-                    .account_get(&target_hash)
-                    .await?
-                    .map(|a| a.acls)
-                    .unwrap_or(current.acls);
-                state
-                    .database
-                    .setup_admin_account(&target_hash, new_type, &MediatorACLSet::from_u64(acls))
-                    .await?;
-            } else {
-                // Switching between admin roles is a plain set-role.
-                state
-                    .database
-                    .account_set_role(&target_hash, &new_type)
-                    .await?;
-            }
             record_audit(
                 state,
                 session,
@@ -1120,6 +1109,74 @@ async fn consume_account_update(
     )?;
     let response_doc = typed.respond_with(Uuid::new_v4().to_string(), response);
     serde_json::to_value(&response_doc).map_err(serialize_err)
+}
+
+/// Change `target_hash`'s role from `current`'s to `new_type`: a faithful port
+/// of the legacy admin-set transitions (promote / demote / switch).
+async fn apply_role_change(
+    state: &SharedData,
+    target_hash: &str,
+    current: &Account,
+    new_type: AccountType,
+) -> Result<(), MediatorError> {
+    if current._type.is_admin() && !new_type.is_admin() {
+        // Demotion — strip admin rights first, then set the plain role.
+        state
+            .database
+            .strip_admin_accounts(vec![target_hash.to_string()])
+            .await?;
+        state
+            .database
+            .account_set_role(target_hash, &new_type)
+            .await?;
+    } else if !current._type.is_admin() && new_type.is_admin() {
+        // Promotion — add admin rights, carrying the account's current ACL
+        // set (re-read so an `acl` member in this same update is honoured).
+        let acls = state
+            .database
+            .account_get(target_hash)
+            .await?
+            .map(|a| a.acls)
+            .unwrap_or(current.acls);
+        state
+            .database
+            .setup_admin_account(target_hash, new_type, &MediatorACLSet::from_u64(acls))
+            .await?;
+    } else {
+        // Switching between admin roles is a plain set-role.
+        state
+            .database
+            .account_set_role(target_hash, &new_type)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Audit an `account/update` that a store failure stopped after `applied`
+/// had already been written: the record says the update is partial and what
+/// did and did not land. Nothing is recorded when nothing was applied.
+async fn audit_partial_update(
+    state: &SharedData,
+    session: &Session,
+    target_hash: &str,
+    applied: &[&str],
+    failed: &str,
+    error: &MediatorError,
+) {
+    if applied.is_empty() {
+        return;
+    }
+    record_audit(
+        state,
+        session,
+        target_hash,
+        AuditAction::SetAcl,
+        format!(
+            "outcome partial: account/update applied {} but its {failed} failed: {error}",
+            applied.join(", ")
+        ),
+    )
+    .await;
 }
 
 /// The stored `(send, receive)` queue limits for a `(requested send, requested
@@ -1206,6 +1263,49 @@ fn gate_self_managed_limit(
         limit if hard >= 0 && limit > hard => Ok(Some(hard)),
         limit => Ok(Some(limit)),
     }
+}
+
+/// A queue limit from the wire (i64) as the store holds it (i32): `-1`
+/// (unlimited), `-2` (reset to the default) or `0` and more. A value outside
+/// that — any other negative, or one past `i32` — is refused rather than
+/// wrapped or stored with no meaning, whoever asks.
+fn wire_queue_limit(
+    requested: Option<i64>,
+    limit_name: &str,
+    session: &Session,
+) -> Result<Option<i32>, MediatorError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    match i32::try_from(requested) {
+        Ok(limit) if limit >= RESET_QUEUE_LIMIT_TO_DEFAULT => Ok(Some(limit)),
+        _ => Err(tt_problem(
+            session,
+            "message.trust_task.malformed",
+            format!(
+                "`{limit_name}` must be -1 (unlimited), {RESET_QUEUE_LIMIT_TO_DEFAULT} (reset to \
+                 the default) or a limit from 0 to {}; got {requested}",
+                i32::MAX
+            ),
+            StatusCode::BAD_REQUEST,
+        )),
+    }
+}
+
+/// Most DIDs one `messaging/acl/get` may name: the store's batch read limit.
+const ACL_GET_MAX_DIDS: usize = 100;
+
+/// The transport protocols this build serves, as a Trust Task ping reports
+/// them: never one it was built without.
+fn served_protocols() -> Vec<String> {
+    let mut protocols = Vec::new();
+    if cfg!(feature = "didcomm") {
+        protocols.push("didcomm".to_string());
+    }
+    if cfg!(feature = "tsp") {
+        protocols.push("tsp".to_string());
+    }
+    protocols
 }
 
 /// The queue-limit sentinel meaning "drop this account's override and fall back to
@@ -1504,6 +1604,19 @@ async fn consume_acl_get(
     })?;
 
     let dids: Vec<String> = typed.payload.dids.iter().map(|v| v.to_string()).collect();
+    // Bounded here because the pinned schema does not bound it (no
+    // `maxItems` on `dids`): every DID is a store read.
+    if dids.len() > ACL_GET_MAX_DIDS {
+        return Err(tt_problem(
+            session,
+            "message.trust_task.malformed",
+            format!(
+                "`dids` may name at most {ACL_GET_MAX_DIDS} accounts; this request names {}",
+                dids.len()
+            ),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
     if !check_permissions(
         session,
         &dids,
@@ -1518,14 +1631,23 @@ async fn consume_acl_get(
         ));
     }
 
+    // One batched read for every requested DID, not one round trip each.
+    let found: std::collections::HashMap<String, MediatorACLSet> = state
+        .database
+        .get_did_acls(&dids, state.config.security.mediator_acl_mode.clone())
+        .await?
+        .acl_response
+        .into_iter()
+        .map(|entry| (entry.did_hash, entry.acls))
+        .collect();
     let mut entries = Vec::new();
     let mut unknown = Vec::new();
     for did in &dids {
         let vid = Vid::from_str(did).expect("a requested DID is a valid Vid");
-        match state.database.get_did_acl(did).await? {
+        match found.get(did) {
             Some(aclset) => entries.push(build(
                 Entry::builder()
-                    .acl(to_wire_acl::<acl::get::v0_1::MediatorAcl>(&aclset))
+                    .acl(to_wire_acl::<acl::get::v0_1::MediatorAcl>(aclset))
                     .did(vid),
             )?),
             None => unknown.push(vid),
@@ -1710,9 +1832,15 @@ async fn consume_access_list_update(
     let target_hash = typed.payload.did.to_string();
     authorize_access_list(state, session, sender_kid, &target_hash, true).await?;
 
+    // Up to three writes (clear, add, remove), not one transaction. Each
+    // audits itself once it lands; a store failure after an earlier one
+    // landed is audited as a partial update before the error goes back.
+    let mut applied: Vec<&'static str> = Vec::new();
+
     // 1. `clear` empties the list before any additions.
     if typed.payload.clear == Some(true) {
         state.database.access_list_clear(&target_hash).await?;
+        applied.push("clear");
         record_audit(
             state,
             session,
@@ -1727,10 +1855,18 @@ async fn consume_access_list_update(
     let mut added: Vec<Vid> = Vec::new();
     if !typed.payload.add.is_empty() {
         let hashes: Vec<String> = typed.payload.add.iter().map(|v| v.to_string()).collect();
-        let result = state
+        let result = match state
             .database
             .access_list_add(state.limits().access_list_limit, &target_hash, &hashes)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                audit_partial_access_list(state, session, &target_hash, &applied, "add", &e).await;
+                return Err(e);
+            }
+        };
+        applied.push("add");
         record_audit(
             state,
             session,
@@ -1750,15 +1886,26 @@ async fn consume_access_list_update(
     let mut removed: Vec<Vid> = Vec::new();
     if !typed.payload.remove.is_empty() {
         let hashes: Vec<String> = typed.payload.remove.iter().map(|v| v.to_string()).collect();
-        let present = state
-            .database
-            .access_list_get(&target_hash, &hashes)
-            .await?
-            .did_hashes;
-        state
-            .database
-            .access_list_remove(&target_hash, &hashes)
-            .await?;
+        let removal = async {
+            let present = state
+                .database
+                .access_list_get(&target_hash, &hashes)
+                .await?
+                .did_hashes;
+            state
+                .database
+                .access_list_remove(&target_hash, &hashes)
+                .await?;
+            Ok::<_, MediatorError>(present)
+        };
+        let present = match removal.await {
+            Ok(present) => present,
+            Err(e) => {
+                audit_partial_access_list(state, session, &target_hash, &applied, "remove", &e)
+                    .await;
+                return Err(e);
+            }
+        };
         record_audit(
             state,
             session,
@@ -1782,6 +1929,36 @@ async fn consume_access_list_update(
     )?;
     serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
         .map_err(serialize_err)
+}
+
+/// Audit an `access-list/update` that a store failure stopped after `applied`
+/// had already been written. Nothing is recorded when nothing was applied.
+async fn audit_partial_access_list(
+    state: &SharedData,
+    session: &Session,
+    target_hash: &str,
+    applied: &[&str],
+    failed: &str,
+    error: &MediatorError,
+) {
+    if applied.is_empty() {
+        return;
+    }
+    record_audit(
+        state,
+        session,
+        target_hash,
+        if failed == "add" {
+            AuditAction::AccessListAdd
+        } else {
+            AuditAction::AccessListRemove
+        },
+        format!(
+            "outcome partial: access-list update applied {} but its {failed} failed: {error}",
+            applied.join(", ")
+        ),
+    )
+    .await;
 }
 
 /// Handle `messaging/access-list/list`: self-or-admin, read-only, cursor-paged.
@@ -3003,7 +3180,7 @@ async fn consume_ping(
             // four are set on the next four lines.
             let response: ping::v0_1::Response = ping::v0_1::Response::builder()
                 .nonce(req.payload.nonce.clone())
-                .protocols(vec!["didcomm".to_string(), "tsp".to_string()])
+                .protocols(served_protocols())
                 .server_time(now)
                 .status(ping::v0_1::ResponseStatus::Ok)
                 .try_into()
@@ -3441,5 +3618,22 @@ mod config_show_tests {
         let text = out[0].1.as_str().unwrap().to_string();
         assert!(!text.contains("pw"), "{text}");
         assert!(text.contains("***@a.example"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod served_protocols_tests {
+    /// A Trust Task ping advertises only the protocols this build serves.
+    #[test]
+    fn ping_advertises_only_the_protocols_built_in() {
+        let protocols = super::served_protocols();
+        assert_eq!(
+            protocols.contains(&"didcomm".to_string()),
+            cfg!(feature = "didcomm")
+        );
+        assert_eq!(
+            protocols.contains(&"tsp".to_string()),
+            cfg!(feature = "tsp")
+        );
     }
 }

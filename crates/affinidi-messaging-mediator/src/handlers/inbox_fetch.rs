@@ -1,18 +1,24 @@
 use crate::{
     SharedData,
+    after_write::{AfterWrite, HandedOver, HandedOverMessage, fetch_for_handover, respond_then},
     common::authz::{self, Capability},
     common::session::Session,
 };
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
+use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
+use affinidi_messaging_sdk::messages::FetchDeletePolicy;
 use affinidi_messaging_sdk::messages::{
-    GetMessagesResponse,
     fetch::FetchOptions,
     problem_report::{ProblemReportScope, ProblemReportSorter},
 };
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::State,
+    response::{IntoResponse, Response},
+};
 use http::StatusCode;
 use regex::Regex;
-use tracing::{Instrument, Level, span};
+use tracing::{Instrument, Level, span, warn};
 
 /// Fetches available messages from the inbox
 /// ACL_MODE: Rquires LOCAL access
@@ -21,11 +27,17 @@ use tracing::{Instrument, Level, span};
 /// - `session`: Session information
 /// - `folder`: Folder to retrieve messages from
 /// - `did_hash`: sha256 hash of the DID we are checking
+///
+/// What the response carries is stamped delivered and reported `delivered` —
+/// and, under `FetchDeletePolicy::Optimistic`, deleted — only once the
+/// response body has been written (R1.1). A response that is never fully
+/// written leaves every message queued and unreported. A delete that fails
+/// after the write is logged; `delete_errors` is always empty.
 pub async fn inbox_fetch_handler(
     session: Session,
     State(state): State<SharedData>,
     Json(body): Json<FetchOptions>,
-) -> Result<(StatusCode, Json<SuccessResponse<GetMessagesResponse>>), AppError> {
+) -> Result<Response, AppError> {
     let _span = span!(
         Level::DEBUG,
         "inbox_fetch_handler",
@@ -79,8 +91,8 @@ pub async fn inbox_fetch_handler(
                 .into());
             }
 
-        // Fetch messages if possible
-        let mut results = state.database.fetch_messages_delivering(&session.session_id, &session.did_hash, &body, state.clock.unix_millis() as u64, state.config.limits.delivered_expiry_seconds, state.config.limits.pickup_round_robin).await.map_err(|e| {MediatorError::problem_with_log(
+        // Fetch messages if possible. Nothing is stamped or deleted yet.
+        let mut results = fetch_for_handover(&state, &session.session_id, &session.did_hash, &body).await.map_err(|e| {MediatorError::problem_with_log(
             14, session.session_id.clone(), None,
             ProblemReportSorter::Error, ProblemReportScope::Protocol,
             "me.res.storage.error",
@@ -95,18 +107,41 @@ pub async fn inbox_fetch_handler(
             .success
             .iter_mut()
             .for_each(|m| m.detect_protocol_in_place());
-        for m in &results.success {
-            state.monitor.delivered(
-                &m.msg_id,
-                m.from_address.as_deref(),
-                m.to_address.as_deref(),
-                m.size,
-                crate::monitor::Channel::Rest,
-                m.msg.as_deref(),
-            );
+
+        let after = AfterWrite::default();
+        let ids: Vec<String> = results.success.iter().map(|m| m.msg_id.clone()).collect();
+        if matches!(body.delete_policy, FetchDeletePolicy::Optimistic) {
+            // Deleted once written; stamping a message about to be deleted
+            // would only resurrect its metadata on Redis.
+            let reported: Vec<HandedOverMessage> = results.success.iter().map(HandedOverMessage::of).collect();
+            let state = state.clone();
+            let owner = session.did_hash.clone();
+            after.push_completion(Box::pin(async move {
+                for (msg_id, m) in ids.iter().zip(&reported) {
+                    state.monitor.delivered_as(
+                        &m.msg_id, m.from.as_deref(), m.to.as_deref(), m.size,
+                        crate::monitor::Channel::Rest, m.protocol,
+                    );
+                    if let Err(e) = state
+                        .database
+                        .delete_message_in(
+                            msg_id,
+                            MessageScope::Recipient(&owner),
+                            DeletionAuthority::Owner { did_hash: owner.clone() },
+                        )
+                        .await
+                    {
+                        warn!(%msg_id, "optimistic delete after a written fetch failed: {e}");
+                    }
+                }
+            }));
+        } else {
+            let mut handed_over = HandedOver::new(&session.did_hash);
+            handed_over.messages = results.success.iter().map(HandedOverMessage::of).collect();
+            after.push_completion(handed_over.completion(&state, crate::monitor::Channel::Rest));
         }
 
-        Ok((
+        let response = (
             StatusCode::OK,
             Json(SuccessResponse {
                 session_id: session.session_id,
@@ -116,7 +151,9 @@ pub async fn inbox_fetch_handler(
                 message: "Success".to_string(),
                 data: Some(results),
             }),
-        ))
+        )
+            .into_response();
+        Ok(respond_then(response, after))
     }
     .instrument(_span)
     .await

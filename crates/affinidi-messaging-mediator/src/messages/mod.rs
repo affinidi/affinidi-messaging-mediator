@@ -154,7 +154,12 @@ impl MessageType {
         metadata: &UnpackMetadata,
     ) -> Result<ProcessMessageResponse, MediatorError> {
         match self.0 {
-            SDKMessageType::TrustPing => ping::process(message, session, state.clock.unix_secs()),
+            SDKMessageType::TrustPing => ping::process(
+                message,
+                session,
+                &state.config.mediator_did,
+                state.clock.unix_secs(),
+            ),
             SDKMessageType::TrustTaskEnvelope => {
                 trust_tasks::process(message, state, session, metadata).await
             }
@@ -259,11 +264,17 @@ pub enum WrapperType {
     None,
 }
 #[derive(Debug, Default)]
+#[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
 pub(crate) struct ProcessMessageResponse {
     pub store_message: bool,
     pub force_live_delivery: bool, // Will force a live delivery attempt.
     pub forward_message: bool, // Set to true if the message was forwarded. Means we don't need to store it.
     pub data: WrapperType,
+    /// Stored messages this reply hands to their recipient (a Message Pickup
+    /// `delivery`). Recorded — stamped delivered, reported `delivered` — only
+    /// once the reply is packed and handed to a transport, never by the
+    /// handler that built it (R1.1); see [`crate::after_write`].
+    pub handed_over: Option<crate::after_write::HandedOver>,
 }
 
 /// Options for packing a message
