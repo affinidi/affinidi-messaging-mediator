@@ -495,6 +495,9 @@ fn vault_backend_url(config: &WizardConfig) -> String {
     if config.secret_vault_insecure {
         params.push("insecure=1".to_string());
     }
+    if !config.secret_vault_ca_cert.is_empty() {
+        params.push(format!("ca_cert={}", config.secret_vault_ca_cert));
+    }
     if !params.is_empty() {
         url.push('?');
         url.push_str(&params.join("&"));

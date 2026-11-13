@@ -31,7 +31,11 @@ pub(crate) fn open(url: BackendUrl) -> Result<DynSecretStore> {
             "internal error: aws backend received non-aws URL".into(),
         ));
     };
-    Ok(std::sync::Arc::new(AwsStore { region, namespace }))
+    Ok(std::sync::Arc::new(AwsStore {
+        region,
+        namespace,
+        client: tokio::sync::OnceCell::new(),
+    }))
 }
 
 #[cfg(not(feature = "secrets-aws"))]
@@ -48,6 +52,10 @@ pub(crate) fn open(_url: BackendUrl) -> Result<DynSecretStore> {
 pub struct AwsStore {
     region: String,
     namespace: String,
+    /// Built on first use and kept: loading the config runs the credential
+    /// provider chain (IMDS / STS on IRSA and ECS roles), and the client
+    /// owns the connection pool and credential cache.
+    client: tokio::sync::OnceCell<aws_sdk_secretsmanager::Client>,
 }
 
 #[cfg(feature = "secrets-aws")]
@@ -56,14 +64,20 @@ impl AwsStore {
         format!("{}{}", self.namespace, key)
     }
 
+    /// The shared client (cheap to clone: internally `Arc`-wrapped).
     async fn client(&self) -> aws_sdk_secretsmanager::Client {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_sdk_secretsmanager::config::Region::new(
-                self.region.clone(),
-            ))
-            .load()
-            .await;
-        aws_sdk_secretsmanager::Client::new(&config)
+        self.client
+            .get_or_init(|| async {
+                let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(aws_sdk_secretsmanager::config::Region::new(
+                        self.region.clone(),
+                    ))
+                    .load()
+                    .await;
+                aws_sdk_secretsmanager::Client::new(&config)
+            })
+            .await
+            .clone()
     }
 }
 
@@ -377,6 +391,32 @@ mod policy_tests {
 
     fn classify(msg: &'static str) -> Retryable {
         AwsRetryPolicy.classify(&StubErr::new(msg))
+    }
+
+    #[tokio::test]
+    async fn the_client_is_built_once_and_reused() {
+        // Loading the config does no network I/O (credentials resolve
+        // lazily), so this runs offline.
+        let store = AwsStore {
+            region: "us-east-1".into(),
+            namespace: String::new(),
+            client: tokio::sync::OnceCell::new(),
+        };
+        assert!(!store.client.initialized());
+        let first = store.client().await;
+        assert!(store.client.initialized());
+        let cached = store.client.get().unwrap() as *const _;
+        let second = store.client().await;
+        assert_eq!(
+            store.client.get().unwrap() as *const _,
+            cached,
+            "the second call reuses the cached client"
+        );
+        assert_eq!(
+            first.config().region().map(|r| r.as_ref().to_string()),
+            Some("us-east-1".to_string())
+        );
+        drop(second);
     }
 
     #[test]

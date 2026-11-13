@@ -91,8 +91,12 @@ pub enum BackendUrl {
         /// Vault Enterprise namespace (`X-Vault-Namespace` header), from
         /// `?namespace=`. Distinct from the per-key path namespace.
         enterprise_namespace: Option<String>,
-        /// Skip TLS verification (`?insecure=1`) — dev/test only.
+        /// Skip TLS verification (`?insecure=1`) — dev/test only. Refused
+        /// at open in a release build unless `MEDIATOR_ALLOW_INSECURE_VAULT=1`.
         insecure: bool,
+        /// PEM CA bundle to trust for the Vault server (`?ca_cert=<path>`),
+        /// the supported route for a private CA.
+        ca_cert: Option<String>,
     },
     Kubernetes {
         /// Explicit namespace, or `None` to resolve from the in-pod
@@ -101,6 +105,19 @@ pub enum BackendUrl {
         /// Name of the `Secret` object holding every mediator key.
         secret_name: String,
     },
+}
+
+impl BackendUrl {
+    /// A `file://` store without `?encrypt=1`: secrets are plaintext on disk.
+    pub fn is_plaintext_file(&self) -> bool {
+        matches!(
+            self,
+            BackendUrl::File {
+                encrypted: false,
+                ..
+            }
+        )
+    }
 }
 
 /// Parse a backend URL. Returns a structured [`BackendUrl`] or an
@@ -169,11 +186,40 @@ fn parse_keyring(rest: &str, raw: &str) -> Result<BackendUrl> {
     })
 }
 
+/// Parse a boolean query value: `1|true|yes|on` or `0|false|no|off`, any
+/// case. Anything else is an error rather than a silent `false` — for
+/// `encrypt` that would mean writing secrets in plaintext.
+fn parse_flag(raw: &str, scheme: &str, name: &str, value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(SecretStoreError::InvalidUrl {
+            url: raw.to_string(),
+            reason: format!(
+                "unrecognised value '{value}' for '{name}' on {scheme}:// URL — use 1/true/yes/on \
+                 or 0/false/no/off"
+            ),
+        }),
+    }
+}
+
 fn parse_file(raw: &str) -> Result<BackendUrl> {
     let url = Url::parse(raw).map_err(|e| SecretStoreError::InvalidUrl {
         url: raw.to_string(),
         reason: format!("malformed file:// URL: {e}"),
     })?;
+    // `file://conf/secrets.json` parses as host `conf`, path
+    // `/secrets.json` — a file at the filesystem root, not the relative
+    // path the operator meant. Relative paths aren't supported at all.
+    if let Some(host) = url.host_str().filter(|h| !h.is_empty()) {
+        return Err(SecretStoreError::InvalidUrl {
+            url: raw.to_string(),
+            reason: format!(
+                "file:// URL names host '{host}'; the path must be absolute — use three \
+                 slashes for an absolute path, e.g. file:///var/lib/mediator/secrets.json"
+            ),
+        });
+    }
     let path = url.path();
     if path.is_empty() || path == "/" {
         return Err(SecretStoreError::InvalidUrl {
@@ -186,7 +232,7 @@ fn parse_file(raw: &str) -> Result<BackendUrl> {
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
             "encrypt" => {
-                encrypted = matches!(v.as_ref(), "1" | "true" | "yes" | "on");
+                encrypted = parse_flag(raw, "file", "encrypt", &v)?;
             }
             _ => {
                 return Err(SecretStoreError::InvalidUrl {
@@ -296,7 +342,9 @@ fn parse_azure(rest: &str, raw: &str) -> Result<BackendUrl> {
 ///     (default `/var/run/secrets/kubernetes.io/serviceaccount/token`).
 ///   - `approle_mount=<mount>` — AppRole auth mount (default `approle`).
 ///   - `namespace=<ns>` — Vault Enterprise namespace header.
-///   - `insecure=1` — skip TLS verification (dev/test only).
+///   - `insecure=1` — skip TLS verification (dev/test only; refused at
+///     open in a release build unless `MEDIATOR_ALLOW_INSECURE_VAULT=1`).
+///   - `ca_cert=<path>` — PEM CA bundle to trust for the Vault server.
 ///
 /// No auth *secret* is accepted here: the token comes from `VAULT_TOKEN`
 /// and AppRole credentials from `VAULT_ROLE_ID` / `VAULT_SECRET_ID`.
@@ -329,6 +377,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
     let mut approle_mount = VAULT_DEFAULT_APPROLE_MOUNT.to_string();
     let mut enterprise_namespace: Option<String> = None;
     let mut insecure = false;
+    let mut ca_cert: Option<String> = None;
 
     if let Some(query) = query {
         for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -342,7 +391,16 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
                 "namespace" => {
                     enterprise_namespace = (!v.is_empty()).then(|| v.to_string());
                 }
-                "insecure" => insecure = matches!(v, "1" | "true" | "yes" | "on"),
+                "insecure" => insecure = parse_flag(raw, "vault", "insecure", v)?,
+                "ca_cert" => {
+                    if v.is_empty() {
+                        return Err(SecretStoreError::InvalidUrl {
+                            url: raw.to_string(),
+                            reason: "vault:// 'ca_cert' needs a path to a PEM CA bundle".into(),
+                        });
+                    }
+                    ca_cert = Some(v.to_string());
+                }
                 other => {
                     return Err(SecretStoreError::InvalidUrl {
                         url: raw.to_string(),
@@ -387,6 +445,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
         auth,
         enterprise_namespace,
         insecure,
+        ca_cert,
     })
 }
 
@@ -488,8 +547,84 @@ mod tests {
     }
 
     #[test]
+    fn only_an_unencrypted_file_url_is_plaintext() {
+        assert!(parse_url("file:///s.json").unwrap().is_plaintext_file());
+        assert!(
+            parse_url("file:///s.json?encrypt=0")
+                .unwrap()
+                .is_plaintext_file()
+        );
+        assert!(
+            !parse_url("file:///s.json?encrypt=1")
+                .unwrap()
+                .is_plaintext_file()
+        );
+        assert!(!parse_url("k8s://ns/s").unwrap().is_plaintext_file());
+    }
+
+    #[test]
     fn file_missing_path_errors() {
         assert!(parse_url("file:///").is_err());
+    }
+
+    #[test]
+    fn file_encrypt_values_are_case_insensitive() {
+        for on in ["1", "true", "TRUE", "True", "yes", "On"] {
+            let url = parse_url(&format!("file:///tmp/m.json?encrypt={on}")).unwrap();
+            assert!(
+                matches!(
+                    url,
+                    BackendUrl::File {
+                        encrypted: true,
+                        ..
+                    }
+                ),
+                "{on}"
+            );
+        }
+        for off in ["0", "false", "FALSE", "no", "off"] {
+            let url = parse_url(&format!("file:///tmp/m.json?encrypt={off}")).unwrap();
+            assert!(
+                matches!(
+                    url,
+                    BackendUrl::File {
+                        encrypted: false,
+                        ..
+                    }
+                ),
+                "{off}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_unknown_encrypt_value_is_rejected_not_plaintext() {
+        for bad in ["enabled", "2", "", "y"] {
+            let err = parse_url(&format!("file:///tmp/m.json?encrypt={bad}")).unwrap_err();
+            match err {
+                SecretStoreError::InvalidUrl { reason, .. } => {
+                    assert!(reason.contains("encrypt"), "{bad}: {reason}")
+                }
+                other => panic!("{bad}: wrong error {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn file_with_a_host_is_rejected() {
+        // `file://conf/secrets.json` would otherwise mean `/secrets.json`.
+        for raw in [
+            "file://conf/secrets.json",
+            "file://./conf/secrets.json",
+            "file://example.com/var/secrets.json",
+        ] {
+            match parse_url(raw).unwrap_err() {
+                SecretStoreError::InvalidUrl { reason, .. } => {
+                    assert!(reason.contains("three slashes"), "{raw}: {reason}")
+                }
+                other => panic!("{raw}: wrong error {other}"),
+            }
+        }
     }
 
     #[test]
@@ -628,6 +763,7 @@ mod tests {
                 auth: VaultAuth::Token,
                 enterprise_namespace: None,
                 insecure: false,
+                ca_cert: None,
             }
         );
     }
@@ -657,6 +793,7 @@ mod tests {
                 },
                 enterprise_namespace: None,
                 insecure: false,
+                ca_cert: None,
             }
         );
     }
@@ -717,6 +854,29 @@ mod tests {
             }
             other => panic!("expected Vault, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn vault_insecure_value_must_be_recognised() {
+        assert!(parse_url("vault://vault.internal/secret?insecure=maybe").is_err());
+        match parse_url("vault://vault.internal/secret?insecure=0").unwrap() {
+            BackendUrl::Vault { insecure, .. } => assert!(!insecure),
+            other => panic!("expected Vault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_ca_cert() {
+        match parse_url("vault://vault.internal/secret?ca_cert=/etc/vault/ca.pem").unwrap() {
+            BackendUrl::Vault {
+                ca_cert, insecure, ..
+            } => {
+                assert_eq!(ca_cert.as_deref(), Some("/etc/vault/ca.pem"));
+                assert!(!insecure);
+            }
+            other => panic!("expected Vault, got {other:?}"),
+        }
+        assert!(parse_url("vault://vault.internal/secret?ca_cert=").is_err());
     }
 
     #[test]

@@ -59,6 +59,7 @@ pub(crate) fn open(url: BackendUrl) -> Result<DynSecretStore> {
     Ok(std::sync::Arc::new(K8sStore {
         namespace,
         secret_name,
+        api: tokio::sync::OnceCell::new(),
     }))
 }
 
@@ -78,6 +79,10 @@ pub struct K8sStore {
     namespace: Option<String>,
     /// Name of the `Secret` object holding every mediator key.
     secret_name: String,
+    /// Built on first successful use and kept, so each operation doesn't
+    /// re-read the kubeconfig / ServiceAccount and open a new connection
+    /// pool. A failed build is not cached; the next call tries again.
+    api: tokio::sync::OnceCell<Api<Secret>>,
 }
 
 /// Whether a `kube` error is a 409 Conflict (optimistic-concurrency clash).
@@ -111,21 +116,28 @@ fn kube_error(secret_name: &str, context: &str, err: KubeError) -> SecretStoreEr
 
 #[cfg(feature = "secrets-k8s")]
 impl K8sStore {
-    /// Build a namespaced `Secret` API handle, resolving the namespace and
-    /// loading credentials from the in-cluster SA or local kubeconfig.
+    /// The namespaced `Secret` API handle, built on first use: resolves the
+    /// namespace and loads credentials from the in-cluster SA or local
+    /// kubeconfig. The client refreshes a rotated ServiceAccount token on
+    /// its own.
     async fn api(&self) -> Result<Api<Secret>> {
-        let client = Client::try_default().await.map_err(|e| {
-            kube_error(
-                &self.secret_name,
-                "failed to initialise Kubernetes client",
-                e,
-            )
-        })?;
-        let namespace = self
-            .namespace
-            .clone()
-            .unwrap_or_else(|| client.default_namespace().to_string());
-        Ok(Api::namespaced(client, &namespace))
+        self.api
+            .get_or_try_init(|| async {
+                let client = Client::try_default().await.map_err(|e| {
+                    kube_error(
+                        &self.secret_name,
+                        "failed to initialise Kubernetes client",
+                        e,
+                    )
+                })?;
+                let namespace = self
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| client.default_namespace().to_string());
+                Ok(Api::namespaced(client, &namespace))
+            })
+            .await
+            .cloned()
     }
 }
 

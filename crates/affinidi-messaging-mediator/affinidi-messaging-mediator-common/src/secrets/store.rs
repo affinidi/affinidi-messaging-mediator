@@ -177,6 +177,14 @@ pub fn open_store(url: &str) -> Result<DynSecretStore> {
     }
 }
 
+/// [`open_store`] on tokio's blocking pool. Opening can block for a long
+/// time — the encrypted `file://` backend runs Argon2id (64 MiB) and reads
+/// its file — so async callers should use this rather than stall a worker.
+pub async fn open_store_async(url: &str) -> Result<DynSecretStore> {
+    let url = url.to_string();
+    backends::run_blocking("secrets", move || open_store(&url)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
