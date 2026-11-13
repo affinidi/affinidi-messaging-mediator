@@ -43,8 +43,11 @@ env:
   # affinidi-tdk-rs (#940). Set via the profile rather than RUSTFLAGS so every
   # job keeps the same RUSTFLAGS fingerprint.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  # Native deps, installed per job: libdbus (keyring), libssl (aws-lc /
-  # native-tls paths), libchafa (mediator-tui image rendering), pkg-config.
+  # Native deps come from .github/actions/native-deps in every job.
+  #
+  # Caches: rust-cache SAVES only on main (PR runs restore main's cache and
+  # save nothing, so a PR does not add ~30 caches against the repository's
+  # cache quota), and the `cargo check`-only matrices share one key.
 
 jobs:
   fmt:
@@ -53,6 +56,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
@@ -65,14 +70,41 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  clippy-all-features:
+    # The `clippy` job lints the default feature set only, so code behind
+    # didcomm-v1, the non-default storage backends, every secrets-* backend,
+    # test-hooks and test-clock was never linted. One --all-features pass
+    # covers all of it; tsp-only below covers the build without didcomm, and
+    # the check matrices cover each backend on its own.
+    name: cargo clippy (all features)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: all-features
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     # The workspace suite with default features, which includes the
@@ -96,12 +128,15 @@ jobs:
       REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       # `--locked`: Cargo.lock must match the manifests exactly, so a
       # transitive bump cannot land quietly through the test job.
       - run: cargo test --workspace --locked
@@ -113,12 +148,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: cargo doc --workspace --no-deps --locked
 
   deny:
@@ -127,6 +165,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
@@ -162,6 +202,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           # The base commit, for "RELEASE never moves backwards".
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -202,14 +243,16 @@ jobs:
       CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: publish-dry-run
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: cargo publish --workspace --dry-run --locked
 
   semver:
@@ -230,6 +273,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
@@ -237,8 +281,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: semver
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -263,9 +307,6 @@ jobs:
     name: ${{ matrix.backend.short }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Catching missing cfg gates is the point, not lint cleanliness.
-      RUSTFLAGS: "--cfg tracing_unstable"
     strategy:
       fail-fast: false
       matrix:
@@ -278,14 +319,16 @@ jobs:
             test_module: fjall_store
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: storage-${{ matrix.backend.short }}
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: cargo check --no-default-features --features didcomm,${{ matrix.backend.feature }}
         run: |
           cargo check \
@@ -310,8 +353,6 @@ jobs:
     name: ${{ matrix.combo.short }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     strategy:
       fail-fast: false
       matrix:
@@ -330,14 +371,16 @@ jobs:
             secret: secrets-azure
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: storage-secrets-${{ matrix.combo.storage }}-${{ matrix.combo.secret }}
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          shared-key: check-matrix
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: cargo check --features didcomm,${{ matrix.combo.storage }},${{ matrix.combo.secret }}
         run: |
           cargo check \
@@ -352,8 +395,6 @@ jobs:
     name: redis conformance
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 45
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     services:
       redis:
         image: redis:7
@@ -366,14 +407,16 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: redis-conformance
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: cargo test store_conformance against Redis
         env:
           REDIS_URL: redis://localhost:6379
@@ -417,18 +460,18 @@ jobs:
     name: redis conformance (valkey cluster)
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 45
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: redis-conformance-cluster
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: Start a single-node Valkey cluster
         run: |
           docker run -d --name valkey -p 7000:7000 valkey/valkey:9.0 \
@@ -481,18 +524,18 @@ jobs:
     name: test-mediator (fjall)
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 60
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: test-mediator-fjall
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: cargo test -p affinidi-messaging-test-mediator --features fjall-backend --tests --locked
 
   test-mediator-tsp:
@@ -511,18 +554,18 @@ jobs:
     name: test-mediator (tsp) + didcomm-service (tsp)
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 60
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: test-mediator-tsp
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: didcomm-service (tsp) against a live mediator
         run: |
           cargo test -p affinidi-messaging-test-mediator --features tsp --locked \
@@ -542,18 +585,18 @@ jobs:
     name: test-mediator (didcomm-v1)
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 60
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: test-mediator-didcomm-v1
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: cargo test -p affinidi-messaging-test-mediator --features didcomm-v1 --tests --locked
 
   all-backends-compile:
@@ -562,18 +605,18 @@ jobs:
     name: all-backends compile
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: all-backends-compile
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          shared-key: check-matrix
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - run: |
           cargo check \
             -p affinidi-messaging-mediator \
@@ -588,14 +631,14 @@ jobs:
     name: tsp-only / ${{ matrix.backend }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      RUSTFLAGS: "--cfg tracing_unstable"
     strategy:
       fail-fast: false
       matrix:
         backend: [memory-backend, fjall-backend, redis-backend]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
@@ -603,8 +646,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: tsp-only-${{ matrix.backend }}
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: cargo clippy --no-default-features --features tsp,${{ matrix.backend }}
         run: |
           cargo clippy \
@@ -631,10 +674,6 @@ jobs:
     name: ${{ matrix.crate.short }} / ${{ matrix.backend }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # The wizard has pre-existing dead_code lints; this matrix's job is
-      # missing `cfg(feature = "secrets-*")` gates, not lint cleanliness.
-      RUSTFLAGS: "--cfg tracing_unstable"
     strategy:
       fail-fast: false
       matrix:
@@ -652,14 +691,16 @@ jobs:
             extra_features: ""
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: features-${{ matrix.crate.short }}-${{ matrix.backend }}
-      - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
+          shared-key: check-matrix
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native-deps
       - name: cargo check -p ${{ matrix.crate.package }} --features ${{ matrix.crate.extra_features }}secrets-${{ matrix.backend }}
         run: |
           cargo check \
