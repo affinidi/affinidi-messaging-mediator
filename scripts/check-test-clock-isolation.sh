@@ -15,7 +15,9 @@ set -euo pipefail
 
 echo "Checking that 'test-clock' is not enabled for the mediator binary..."
 
-graph=$(cargo tree -p affinidi-messaging-mediator -f '{p} {f}' 2>/dev/null)
+# stderr is left alone: if the resolve fails, `set -e` stops here and the
+# reason is in the log instead of an unexplained non-zero exit.
+graph=$(cargo tree -p affinidi-messaging-mediator -f '{p} {f}')
 
 # Lines for mediator-common carry its activated feature list as the last field.
 offenders=$(echo "$graph" | grep 'affinidi-messaging-mediator-common' | grep 'test-clock' || true)
