@@ -1,11 +1,20 @@
 ### Mediator Configuration
 ###
-### Every setting can be overridden by an environment variable.
-### The env var name is shown in the "Env:" line above each field.
-### Environment variables take priority over values in this file.
+### A setting with an "Env:" line can be overridden by the environment
+### variable it names; environment variables take priority over this file.
+### Settings without an "Env:" line (the optional [didcomm_v1] section, see
+### docs/didcomm-protocols.md) are read from this file only. Where a label
+### names two variables, the first wins when both are set; the second is an
+### older name kept so existing deployments keep working.
+###
+### Values are checked when the mediator starts and on config/reload: a value
+### that is not what the setting takes (a typo such as "5O" for a number, or an
+### unknown mode) stops the mediator with an error naming the setting, rather
+### than quietly running on a built-in default.
 
-### log_level: trace debug info warn error
-### NOTE: RUST_LOG environment variable can also override this setting
+### Env: MEDIATOR_LOG_LEVEL (or LOG_LEVEL)
+### One of: trace debug info warn error. Anything else refuses to start.
+### NOTE: RUST_LOG, when set, takes over log filtering entirely.
 log_level = "info"
 
 ### Env: LOG_JSON
@@ -35,18 +44,31 @@ mediator_did = ""
 ### signing key, operating keys, VTA cache — lives under one backend.
 ### Pick the `backend` URL and everything is automatic from there.
 ###
+### There is NO default: choose one below and uncomment it (mediator-setup
+### does this for you). The mediator refuses to start until `backend` is set,
+### and the error lists these choices.
+###
 ### Supported backends:
-###   keyring://<service>                   OS keyring (macOS Keychain,
-###                                         Linux Secret Service, Windows
-###                                         Credential Manager).
-###   file:///<absolute-path>[?encrypt=1]   Local JSON file (plaintext by
-###                                         default — DEV/TEST ONLY).
 ###   aws_secrets://<region>/<prefix>       AWS Secrets Manager.
 ###   gcp_secrets://<project>/<prefix>      GCP Secret Manager.
-###   azure_keyvault://<vault>              Azure Key Vault.
 ###   vault://<endpoint>/<mount>[/<prefix>][?auth=…]
 ###                                         HashiCorp Vault (KV v2).
 ###   k8s://[<namespace>/]<secret-name>     Kubernetes Secret.
+###   file:///<absolute-path>?encrypt=1     Passphrase-encrypted local file.
+###   file:///<absolute-path>               Plaintext local file — DEV/TEST ONLY.
+###   keyring://<service>                   OS keychain. macOS: the login
+###                                         Keychain. Linux: the KERNEL keyring
+###                                         (keyutils), which does NOT survive
+###                                         a reboot — the JWT key, admin
+###                                         credential and operating keys are
+###                                         lost and the mediator then refuses
+###                                         to start. Desktop development only
+###                                         on Linux; the mediator warns at
+###                                         startup. No Windows store.
+###   azure_keyvault://<vault>              Azure Key Vault. Authenticates only
+###                                         with the Azure CLI login
+###                                         (`az login`): wizard / development
+###                                         use only, not a server deployment.
 ###
 ### Only file:// is built in by default; every other backend needs its cargo
 ### feature (secrets-keyring, secrets-aws, secrets-gcp, secrets-azure,
@@ -55,7 +77,7 @@ mediator_did = ""
 ### Env: MEDIATOR_SECRETS_BACKEND
 ### ****************************************************************************************************************************
 [secrets]
-backend = "keyring://affinidi-mediator"
+# backend = "aws_secrets://us-east-1/prod/mediator/"
 
 ### Env: MEDIATOR_SECRETS_CACHE_TTL
 ### Maximum age for the cached VTA bundle (humantime format). `0` means
@@ -66,7 +88,7 @@ backend = "keyring://affinidi-mediator"
 ### Server configuration
 ### ****************************************************************************************************************************
 [server]
-### Env: LISTEN_ADDRESS
+### Env: MEDIATOR_LISTEN_ADDRESS (or LISTEN_ADDRESS)
 ### <ip_address>:<tcp_port> that this service will listen on
 listen_address = "0.0.0.0:7037"
 
@@ -82,7 +104,8 @@ api_prefix = "/mediator/v1/"
 ### Must be a different DID from mediator_did: the mediator refuses to start
 ### when both name the same DID, as its operating keys would then hold the
 ### root-admin role. mediator-setup generates a separate admin did:key.
-### NOTE: You can add additional admin DIDs after startup via the DIDComm admin protocol
+### Further admin accounts are added at runtime by a root admin with the
+### messaging/account Trust Tasks (see docs/acls.md, "Administration").
 ### Empty in this template: mediator-setup fills it in, or set ADMIN_DID.
 ### Startup fails while it is empty.
 ### A release build refuses to start when mediator_did, admin_did, an
@@ -120,17 +143,22 @@ trust_xff_cidrs = []
 # metrics_bearer_token = "change-me"
 
 ### Env: DID_WEB_SELF_HOSTED
-### Path to the self-hosted DID Document
+### The self-hosted DID document (did:web) or did:webvh log (did.jsonl).
 ### Supported formats:
-###   file://<path>
+###   file://<path>     a relative path is relative to this file's directory
+###                     (set by DID_WEB_SELF_HOSTED: to the working directory)
 ###   aws_parameter_store://<parameter_name>[?region=<region>]
+###   s3://<bucket>/<key>[?region=<region>]
+### A did:webvh log may hold any number of entries, one JSON object per line;
+### the chain is verified at startup, /.well-known/did.json serves the last
+### entry's document and /.well-known/did.jsonl the log exactly as stored.
 ### When enabled, adds a did:web route at /.well-known/did.json.
 ### Inactive by default — uncomment only when this mediator should
 ### serve its own DID document/log (e.g. did:webvh self-hosted at
 ### the same domain as the public URL). The setup wizard activates
 ### this line automatically when the public URL host and the DID's
 ### host match; otherwise it leaves it commented out.
-# did_web_self_hosted = "file://./conf/did.jsonl"
+# did_web_self_hosted = "file://did.jsonl"
 
 ### Public service URL(s) at which this mediator is reachable. The
 ### Routing 2.0 forward handler uses these (plus `listen_address`) to
@@ -159,7 +187,7 @@ trust_xff_cidrs = []
 ### Path to the database functions file
 functions_file = "./atm-functions.lua"
 
-### Env: DATABASE_URL
+### Env: MEDIATOR_DATABASE_URL (or DATABASE_URL)
 ### URL of the Redis compatible database
 ### Supported schemes:
 ###   redis://127.0.0.1/                    — local, no auth (dev only)
@@ -172,7 +200,7 @@ functions_file = "./atm-functions.lua"
 database_url = "redis://127.0.0.1/"
 
 ### Env: DATABASE_TIMEOUT
-### Timeout for database operations in seconds
+### Timeout for database operations in whole seconds
 database_timeout = "2"
 
 ### Env: DATABASE_CLUSTER_MODE
@@ -208,9 +236,11 @@ cluster_mode = "false"
 ###
 ### In explicit_deny mode, `global_acl_default` is the setting that controls
 ### what an arbitrary self-registered DID may do. See docs/acls.md.
+### Case-insensitive; any other value refuses to start (a typo must not open a
+### mediator its operator believes is closed).
 mediator_acl_mode = "explicit_deny"
 
-### Env: GLOBAL_DEFAULT_ACL
+### Env: GLOBAL_ACL_DEFAULT (or the older GLOBAL_DEFAULT_ACL)
 ### Default ACL applied to new/unknown DIDs. THIS is the real access control
 ### for a public mediator: it decides what every self-registered DID may do,
 ### and seeds each DID's own access-list mode.
@@ -229,17 +259,18 @@ local_direct_delivery_allowed = "true"
 local_direct_delivery_allow_anon = "false"
 
 ### NOTE: `mediator_secrets` was removed. Operating keys now live in the
-### unified `[secrets]` backend at well-known keys
-### (`mediator/operating/signing`, `mediator/operating/key_agreement`) —
-### or are fetched from the VTA at startup when VTA integration is enabled
-### (indicated by the presence of `mediator/admin/credential`).
+### unified `[secrets]` backend under the well-known key
+### `mediator_operating_secrets`, or are fetched from the VTA at startup when
+### VTA integration is enabled (indicated by a VTA-linked
+### `mediator_admin_credential` in the backend).
 
-### Env: USE_SSL
+### Env: MEDIATOR_USE_SSL (or USE_SSL)
 ### If true, SSL is enabled. Set to false only if TLS is terminated externally
 use_ssl = "false"
 
 ### Env: SSL_CERTIFICATE_FILE
-### Path to the SSL certificate file
+### Path to the SSL certificate file. A relative path is relative to this
+### file's directory (set by SSL_CERTIFICATE_FILE: to the working directory).
 ssl_certificate_file = "keys/end.cert"
 
 ### Env: SSL_KEY_FILE
@@ -247,11 +278,12 @@ ssl_certificate_file = "keys/end.cert"
 ssl_key_file = "keys/end.key"
 
 ### JWT signing key is no longer a config field — it lives in the unified
-### `[secrets]` backend under the well-known key `mediator/jwt/secret` and
-### is provisioned by the setup wizard or `mediator rotate-jwt`.
+### `[secrets]` backend under the well-known key `mediator_jwt_secret` and
+### is provisioned by the setup wizard (`mediator-setup`).
 
 ### Env: JWT_ACCESS_EXPIRY
-### Expiry time in seconds for JWT access tokens (minimum: 10)
+### Expiry time in seconds for JWT access tokens. At least 10, and less than
+### jwt_refresh_expiry; startup fails otherwise.
 jwt_access_expiry = "900"
 
 ### Env: JWT_REFRESH_EXPIRY
@@ -261,6 +293,12 @@ jwt_refresh_expiry = "86400"
 ### Env: CORS_ALLOW_ORIGIN
 ### Controls cross-origin browser access on the REST endpoints. Leave
 ### unset (the default) to disable cross-origin access entirely.
+###
+### Each entry is checked at startup: an exact origin must be
+### scheme://host[:port] with no path and no trailing slash (an entry such as
+### "app.example.com" or "https://app.example.com/" could never match a browser
+### Origin, so it refuses to start, naming the entry). Scheme and host are
+### compared case-insensitively.
 ###
 ### Accepts either:
 ###   - a comma-separated allowlist whose entries are each one of:
@@ -401,9 +439,11 @@ network_limit = "100"
 [limits]
 ### These are OPERATIONAL limits — tune them to your deployment; the defaults are
 ### NOT protocol constants. They suit a small-to-medium single-node mediator.
-### Every value is overridable at runtime via the listed `Env:` variable (env
+### Every value can be overridden at startup by the listed `Env:` variable (env
 ### wins over this file). Each entry notes what it protects and a `Scale:` hint
-### for when to raise or lower it.
+### for when to raise or lower it. Every value is a whole number (or
+### "true"/"false" where noted); queue limits also take -1 for no limit, and
+### no other negative number.
 
 ### Env: LIMIT_ATTACHMENTS_MAX_COUNT
 ### Maximum attachments accepted on a single message.
@@ -431,8 +471,9 @@ forward_task_queue = "50000"
 
 ### Env: LIMIT_HTTP_SIZE
 ### Maximum HTTP request payload in bytes (10MB).
-### Scale: raise for large-attachment use cases; keep >= message_size; higher =
-### more memory buffered per in-flight request.
+### Scale: raise for large-attachment use cases; must be >= message_size
+### (startup fails otherwise); higher = more memory buffered per in-flight
+### request.
 http_size = "10485760"
 
 ### Env: LIMIT_LISTED_MESSAGES
@@ -512,8 +553,9 @@ pickup_round_robin = "true"
 
 ### Env: LIMIT_MESSAGE_SIZE
 ### Maximum message size in bytes (1MB).
-### Scale: raise for large-payload workloads; keep <= http_size and ws_size;
-### higher = more memory per message and per queued copy.
+### Scale: raise for large-payload workloads; must be at least 1 and no more
+### than http_size and ws_size (startup fails otherwise); higher = more memory
+### per message and per queued copy.
 message_size = "1048576"
 
 ### Env: LIMIT_QUEUED_SEND_MESSAGES_PER_PEER
@@ -539,8 +581,9 @@ queued_send_messages_soft = "2000"
 ### Env: LIMIT_QUEUED_SEND_MESSAGES_HARD
 ### Maximum outbound queue limit settable by non-admin (-1 = no limit).
 ### Scale: per-DID outbound ceiling; raise for high-throughput senders. MUST be
-### >= queued_send_messages_soft, which is the default every account starts on —
-### a hard below soft means the default exceeds the maximum an account may set.
+### >= queued_send_messages_soft (startup fails otherwise), which is the default
+### every account starts on — a hard below soft means the default exceeds the
+### maximum an account may set.
 ### Headroom here is what lets a large community raise its own limit: with soft
 ### at 2000, a community with more than 2000 members awaiting collection needs
 ### to.
@@ -552,7 +595,8 @@ queued_send_messages_hard = "10000"
 queued_receive_messages_soft = "200"
 
 ### Env: LIMIT_QUEUED_RECEIVE_MESSAGES_HARD
-### Maximum inbound queue limit settable by non-admin (-1 = no limit).
+### Maximum inbound queue limit settable by non-admin (-1 = no limit). Must be
+### >= queued_receive_messages_soft (startup fails otherwise).
 ### Scale: per-DID inbox cap; raise for offline-heavy clients. Bounds worst-case
 ### backend storage per DID (this x message_size).
 queued_receive_messages_hard = "1000"
@@ -578,7 +622,7 @@ queued_receive_messages_hard = "1000"
 ### override and go back to the mediator default, so it never diverges from
 ### the hard limit.)
 
-### Env: LIMIT_TO_KEYS_PER_DID
+### Env: LIMIT_TO_KEYS_PER_RECIPIENT (or the older LIMIT_TO_KEYS_PER_DID)
 ### Maximum keys per recipient DID (DoS protection).
 ### Scale: rarely needs changing; only raise for recipients that legitimately
 ### publish many key-agreement keys.
@@ -592,17 +636,17 @@ to_recipients = "100"
 
 ### Env: LIMIT_WS_SIZE
 ### Maximum WebSocket payload in bytes (10MB).
-### Scale: mirror http_size; raise for large streamed payloads. Higher = more
-### memory buffered per WebSocket frame.
+### Scale: mirror http_size; raise for large streamed payloads; must be >=
+### message_size. Higher = more memory buffered per WebSocket frame.
 ws_size = "10485760"
 
-### Env: ACCESS_LIST_LIMIT
+### Env: LIMIT_ACCESS_LIST_LIMIT (or the older ACCESS_LIST_LIMIT)
 ### Maximum access list entries per DID.
 ### Scale: raise for DIDs with large allow/deny lists (companion to
 ### local_max_acl); each entry is one stored set member.
 access_list_limit = "1000"
 
-### Env: OOB_INVITE_TTL
+### Env: LIMIT_OOB_INVITE_TTL (or the older OOB_INVITE_TTL)
 ### TTL in seconds for OOB invites (24h).
 ### Scale: lower for tighter, short-lived invite windows; raise if invites are
 ### distributed out-of-band slowly (e.g. printed/QR onboarding).
@@ -739,8 +783,7 @@ oob_invite_ttl = "86400"
 ### Refusals: `relay_connections_refused_total`. Must be > 0. Default 10.
 # relay_connections_per_ip = "10"
 
-### Env: LIMIT_RELAY_FRAMES_PER_SECOND / LIMIT_RELAY_FRAME_BURST /
-### LIMIT_RELAY_BYTES_PER_SECOND
+### Env: LIMIT_RELAY_FRAMES_PER_SECOND, LIMIT_RELAY_FRAME_BURST, LIMIT_RELAY_BYTES_PER_SECOND
 ### Inbound budget for each relay WebSocket: frames per second, the burst above
 ### it, and bytes per second (the byte burst is never below ws_size). A frame
 ### over budget gets a negative relay-ack (code 429) and the relaying mediator
@@ -773,8 +816,8 @@ oob_invite_ttl = "86400"
 ### within ws_pong_timeout_secs of its last frame. Catches a client that went
 ### away without closing (lost network, suspended device) long before TCP
 ### would. Time the mediator spends not reading (sending a large backlog, a slow
-### message) does not count against the client. Raised to at least twice
-### ws_ping_interval_secs.
+### message) does not count against the client. Must be at least twice
+### ws_ping_interval_secs; startup fails otherwise.
 ### Clients answer pings automatically only while they read their socket: a
 ### client must keep reading (a TSP stream must be read continuously) to stay
 ### connected.
@@ -802,9 +845,9 @@ oob_invite_ttl = "86400"
 ### with a stored, signed grant. Design:
 ### design-docs/mediator-did-multiplexing-design.md
 ###
-### OFF unless enabled here. Absent, empty, or any value other than "true"
-### leaves it off. Needs [streaming] enabled; the mediator refuses to start
-### otherwise. DIDComm clients open a mux connection with the `didcomm-mux`
+### OFF unless enabled here. Absent or empty leaves it off; "true" turns it
+### on; any value other than "true"/"false" refuses to start. Needs
+### [streaming] enabled; the mediator refuses to start otherwise. DIDComm clients open a mux connection with the `didcomm-mux`
 ### WebSocket subprotocol (the provisional `affinidi-mux` is still accepted);
 ### raw-TSP clients offer `tsp`, `tsp-ack`, `tsp-mux`, in that order.
 ### Several instances behind one Redis: a revoke handled by one instance
@@ -820,15 +863,19 @@ oob_invite_ttl = "86400"
 # max_grants_per_did = "16"
 ### Env: LIMIT_MUX_MAX_GRANT_LIFETIME_SECS — 30 days
 # max_grant_lifetime_secs = "2592000"
+### Env: LIMIT_MUX_MAX_ATTACH_LIFETIME_SECS
 # max_attach_lifetime_secs = "86400"
+### Env: LIMIT_MUX_REVALIDATE_INTERVAL_SECS
 # revalidate_interval_secs = "900"
+### Env: LIMIT_MUX_MAX_CHANNEL_SLOTS
 ### Send-queue depth of one mux connection, across all its DIDs. Each DID on
 ### the connection may hold at most 8 queued frames (as a direct socket does),
 ### and the socket writes round-robin across DIDs with frames waiting, so one
 ### busy DID cannot starve the rest; a connection queues at most
 ### min(8 x DIDs, max_channel_slots). Bytes stay bounded by ws_send_buffer.
-### Clamped to 8..65536.
+### Must be 8..65536; startup fails otherwise.
 # max_channel_slots = "512"
+### Env: LIMIT_MUX_DEAD_RETENTION_SECS
 # dead_retention_secs = "604800"
 
 ### ****************************************************************************************************************************
@@ -861,7 +908,10 @@ report_errors = "true"
 ### Env: PROCESSOR_FORWARDING_BLOCKED_DIDS
 ### Additional DIDs to block forwarding to (JSON array). A forward relayed to
 ### one of these DIDs or to an endpoint in its document is refused.
-### Always includes the mediator's own DID and endpoints
+### Always includes the mediator's own DID and endpoints. A DID that cannot be
+### resolved at startup is blocked by its DID at once and does not stop the
+### mediator: a warning is logged and its endpoints are added once it resolves
+### (retried in the background).
 blocked_forwarding_dids = "[]"
 
 ### Env: PROCESSOR_FORWARDING_RATE_WINDOW
@@ -945,6 +995,12 @@ consumer_group = "forwarding"
 ### re-wrap layers.
 max_hops = "10"
 
+### Env: PROCESSOR_FORWARDING_ACCEPT_INVALID_CERTS
+### Accept a next hop's TLS certificate even when it does not verify. Default
+### "false". TEST ONLY: with it on, anyone on the network path can read and
+### alter forwarded messages.
+# accept_invalid_certs = "false"
+
 ### Env: PROCESSOR_FORWARDING_RELAY_MODE
 ### How to relay a forward whose next hop is a *remote* mediator:
 ###   "blind"  (default) — relay the inner envelope unchanged. The inner
@@ -983,7 +1039,9 @@ enabled = "true"
 ###
 ### See docs/memory-tuning.md for the full memory model and how these interact.
 # [storage]
-### Env: STORAGE_BACKEND — "redis" (default) or "fjall"
+### Env: STORAGE_BACKEND — "redis" (default) or "fjall". Setting it creates
+### this section when the file has none; the other STORAGE_* variables only
+### apply when the section exists (the mediator warns when they are ignored).
 # backend = "fjall"
 ### Env: STORAGE_DATA_DIR — required when backend = "fjall"
 # data_dir = "/var/lib/mediator/data"
@@ -1040,5 +1098,5 @@ enabled = "true"
 ###               concurrent writes share syncs. Choose this when an accepted
 ###               message must never be lost, e.g. on hosts without a
 ###               battery-backed write cache.
-### An unrecognised value is treated as "sync". Shutdown always syncs.
+### Any other value refuses to start. Shutdown always syncs.
 # durability = "buffered"

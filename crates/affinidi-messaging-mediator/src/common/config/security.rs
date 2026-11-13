@@ -3,7 +3,7 @@ use affinidi_messaging_mediator_common::{MediatorSecrets, errors::MediatorError}
 // conversion to the runtime `SecurityConfig` stays here as an extension trait
 // (inherent impls must live in the type's crate, but this conversion loads
 // secrets and builds runtime objects the schema crate avoids).
-use affinidi_messaging_mediator_config::SecurityConfigRaw;
+use affinidi_messaging_mediator_config::{SecurityConfigRaw, values};
 use affinidi_messaging_sdk::protocols::mediator::acls::{AccessListModeType, MediatorACLSet};
 use affinidi_secrets_resolver::{SecretsResolver, ThreadedSecretsResolver, secrets::Secret};
 use async_trait::async_trait;
@@ -488,14 +488,39 @@ impl SecurityConfig {
     }
 }
 
+/// Every `[security]` value that is read from the file alone (no secrets), each
+/// read strictly. Produced by [`SecurityConfigRawExt::values`] at startup and
+/// on `config/reload`, so a value that does not read fails both.
+pub(crate) struct SecurityValues {
+    pub mediator_acl_mode: AccessListModeType,
+    pub global_acl_default: MediatorACLSet,
+    pub local_direct_delivery_allowed: bool,
+    pub local_direct_delivery_allow_anon: bool,
+    pub use_ssl: bool,
+    pub jwt_access_expiry: u64,
+    pub jwt_refresh_expiry: u64,
+    pub cors: Option<CorsOriginPolicy>,
+    pub block_anonymous_outer_envelope: bool,
+    pub force_session_did_match: bool,
+    pub block_remote_admin_msgs: bool,
+    pub enable_inter_mediator_relay: bool,
+    pub trust_task_verification: TrustTaskVerification,
+    pub tsp_auth_accept_unbound_until: Option<u64>,
+}
+
+/// The legal `security.mediator_acl_mode` values.
+const ACL_MODES: &[&str] = &["explicit_allow", "explicit_deny"];
+
 /// Conversion + parsing helpers for the (now foreign) [`SecurityConfigRaw`].
 /// An extension trait because inherent impls must live in the type's crate, but
 /// this logic loads secrets and builds runtime objects the schema crate avoids.
-/// Method bodies are unchanged from the former inherent impl.
 #[async_trait]
 pub(crate) trait SecurityConfigRawExt {
     fn parse_cors_origins(cors_allow_origin: &str) -> Result<CorsOriginPolicy, MediatorError>;
     fn parse_origin_matcher(token: &str) -> Result<OriginMatcher, MediatorError>;
+    /// Read every file-only `[security]` value strictly, and check the ones
+    /// that must agree.
+    fn values(&self) -> Result<SecurityValues, MediatorError>;
     async fn convert(
         &self,
         secrets_resolver: Arc<ThreadedSecretsResolver>,
@@ -556,13 +581,35 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     fn parse_origin_matcher(token: &str) -> Result<OriginMatcher, MediatorError> {
         let config_err = |msg: String| MediatorError::ConfigError(12, "NA".into(), msg);
 
-        // Fast path: no '*' ⇒ exact origin, parsed verbatim (unchanged
-        // legacy behaviour — scheme requirement is enforced by the
-        // wizard, not here, so we don't reject pre-existing configs).
+        // No '*' ⇒ an exact origin. It must be what a browser sends in
+        // `Origin` — `scheme://host[:port]`, nothing after it — or it could
+        // never match, and nothing would say why (an entry such as
+        // `app.example.com` or `https://app.example.com/` used to be taken
+        // and then silently refuse every browser). Scheme and host are
+        // lowercased, as browsers send them.
         if !token.contains('*') {
-            let value = token
-                .parse::<HeaderValue>()
-                .map_err(|err| config_err(format!("Invalid CORS origin '{token}': {err}")))?;
+            let parsed = ParsedOrigin::parse(token)
+                .filter(|o| {
+                    o.scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                })
+                .ok_or_else(|| {
+                    config_err(format!(
+                        "security.cors_allow_origin entry '{token}' is not an origin: write \
+                         it as scheme://host[:port], with no path or trailing slash (e.g. \
+                         'https://app.example.com')"
+                    ))
+                })?;
+            let normalised = match parsed.port {
+                Some(port) => format!("{}://{}:{port}", parsed.scheme, parsed.host),
+                None => format!("{}://{}", parsed.scheme, parsed.host),
+            };
+            let value = normalised.parse::<HeaderValue>().map_err(|err| {
+                config_err(format!(
+                    "security.cors_allow_origin entry '{token}' is not valid: {err}"
+                ))
+            })?;
             return Ok(OriginMatcher::Exact(value));
         }
 
@@ -616,6 +663,108 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         })
     }
 
+    fn values(&self) -> Result<SecurityValues, MediatorError> {
+        let err = |e: affinidi_messaging_mediator_config::ConfigError| {
+            let msg = e.to_string();
+            tracing::error!("{msg}");
+            MediatorError::ConfigError(12, "NA".into(), msg)
+        };
+        let msg_err = |msg: String| {
+            tracing::error!("{msg}");
+            MediatorError::ConfigError(12, "NA".into(), msg)
+        };
+        let flag = |field: &str, value: &str| {
+            values::boolean(&format!("security.{field}"), value).map_err(err)
+        };
+
+        // A typo here used to select `explicit_deny`, the OPEN mode, so a
+        // mediator its operator believed closed accepted any DID (#105).
+        let mediator_acl_mode = match values::one_of(
+            "security.mediator_acl_mode",
+            &self.mediator_acl_mode,
+            ACL_MODES,
+        )
+        .map_err(err)?
+        {
+            "explicit_allow" => AccessListModeType::ExplicitAllow,
+            _ => AccessListModeType::ExplicitDeny,
+        };
+
+        let global_acl_default = MediatorACLSet::from_string_ruleset(&self.global_acl_default)
+            .map_err(|e| {
+                msg_err(format!(
+                    "security.global_acl_default = {:?} is not valid: {e}",
+                    self.global_acl_default
+                ))
+            })?;
+
+        let jwt_access_expiry =
+            values::number("security.jwt_access_expiry", &self.jwt_access_expiry).map_err(err)?;
+        let jwt_refresh_expiry =
+            values::number("security.jwt_refresh_expiry", &self.jwt_refresh_expiry).map_err(err)?;
+        affinidi_messaging_mediator_config::validate::check_jwt_expiry(
+            jwt_access_expiry,
+            jwt_refresh_expiry,
+        )
+        .map_err(msg_err)?;
+
+        let block_anonymous_outer_envelope = flag(
+            "block_anonymous_outer_envelope",
+            &self.block_anonymous_outer_envelope,
+        )?;
+        let force_session_did_match =
+            flag("force_session_did_match", &self.force_session_did_match)?;
+        if !block_anonymous_outer_envelope && force_session_did_match {
+            return Err(msg_err(
+                "Conflicting configuration: security.force_session_did_match can not be true \
+                 when security.block_anonymous_outer_envelope is false"
+                    .into(),
+            ));
+        }
+
+        let cors = match &self.cors_allow_origin {
+            Some(cors_allow_origin) => Some(Self::parse_cors_origins(cors_allow_origin)?),
+            None => None,
+        };
+
+        Ok(SecurityValues {
+            mediator_acl_mode,
+            global_acl_default,
+            local_direct_delivery_allowed: flag(
+                "local_direct_delivery_allowed",
+                &self.local_direct_delivery_allowed,
+            )?,
+            local_direct_delivery_allow_anon: flag(
+                "local_direct_delivery_allow_anon",
+                &self.local_direct_delivery_allow_anon,
+            )?,
+            use_ssl: flag("use_ssl", &self.use_ssl)?,
+            jwt_access_expiry,
+            jwt_refresh_expiry,
+            cors,
+            block_anonymous_outer_envelope,
+            force_session_did_match,
+            block_remote_admin_msgs: flag(
+                "block_remote_admin_msgs",
+                &self.block_remote_admin_msgs,
+            )?,
+            // Absent (configs that predate it) is false.
+            enable_inter_mediator_relay: values::boolean_or(
+                "security.enable_inter_mediator_relay",
+                &self.enable_inter_mediator_relay,
+                false,
+            )
+            .map_err(err)?,
+            // A security setting that doesn't parse is a hard error, not a
+            // silent default — a typo must not quietly pick the weaker mode.
+            trust_task_verification: self.trust_task_verification.parse().map_err(msg_err)?,
+            // Also a hard error: a deadline that doesn't parse must not
+            // quietly become "no deadline" or "accept for ever".
+            tsp_auth_accept_unbound_until: parse_accept_until(&self.tsp_auth_accept_unbound_until)
+                .map_err(msg_err)?,
+        })
+    }
+
     /// Build the runtime `SecurityConfig` from the raw TOML values.
     ///
     /// Operating keys and the JWT signing secret are loaded from the
@@ -637,137 +786,27 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         secrets: &MediatorSecrets,
         vta_bundle: Option<&[OperatingSecret]>,
     ) -> Result<SecurityConfig, MediatorError> {
-        let warn_default = |field: &str, value: &str, default: &str| {
-            tracing::warn!(
-                "Could not parse security.{field} value '{value}', using default: {default}"
-            );
-        };
-
+        let values = self.values()?;
         let mut config = SecurityConfig {
-            mediator_acl_mode: match self.mediator_acl_mode.as_str() {
-                "explicit_allow" => AccessListModeType::ExplicitAllow,
-                "explicit_deny" => AccessListModeType::ExplicitDeny,
-                _ => AccessListModeType::ExplicitDeny,
-            },
-            local_direct_delivery_allowed: self
-                .local_direct_delivery_allowed
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default(
-                        "local_direct_delivery_allowed",
-                        &self.local_direct_delivery_allowed,
-                        "false",
-                    );
-                    false
-                }),
-            local_direct_delivery_allow_anon: self
-                .local_direct_delivery_allow_anon
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default(
-                        "local_direct_delivery_allow_anon",
-                        &self.local_direct_delivery_allow_anon,
-                        "false",
-                    );
-                    false
-                }),
-            use_ssl: self.use_ssl.parse().unwrap_or_else(|_| {
-                warn_default("use_ssl", &self.use_ssl, "true");
-                true
-            }),
+            mediator_acl_mode: values.mediator_acl_mode,
+            global_acl_default: values.global_acl_default,
+            local_direct_delivery_allowed: values.local_direct_delivery_allowed,
+            local_direct_delivery_allow_anon: values.local_direct_delivery_allow_anon,
+            use_ssl: values.use_ssl,
             ssl_certificate_file: self.ssl_certificate_file.clone(),
             ssl_key_file: self.ssl_key_file.clone(),
-            jwt_access_expiry: self.jwt_access_expiry.parse().unwrap_or_else(|_| {
-                warn_default("jwt_access_expiry", &self.jwt_access_expiry, "900");
-                900
-            }),
-            jwt_refresh_expiry: self.jwt_refresh_expiry.parse().unwrap_or_else(|_| {
-                warn_default("jwt_refresh_expiry", &self.jwt_refresh_expiry, "86400");
-                86_400
-            }),
-            block_anonymous_outer_envelope: self
-                .block_anonymous_outer_envelope
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default(
-                        "block_anonymous_outer_envelope",
-                        &self.block_anonymous_outer_envelope,
-                        "true",
-                    );
-                    true
-                }),
-            force_session_did_match: self.force_session_did_match.parse().unwrap_or_else(|_| {
-                warn_default(
-                    "force_session_did_match",
-                    &self.force_session_did_match,
-                    "true",
-                );
-                true
-            }),
-            block_remote_admin_msgs: self.block_remote_admin_msgs.parse().unwrap_or_else(|_| {
-                warn_default(
-                    "block_remote_admin_msgs",
-                    &self.block_remote_admin_msgs,
-                    "true",
-                );
-                true
-            }),
-            // Absent (legacy configs) → false silently; a non-empty but
-            // unparseable value is a typo worth warning about.
-            enable_inter_mediator_relay: if self.enable_inter_mediator_relay.is_empty() {
-                false
-            } else {
-                self.enable_inter_mediator_relay
-                    .parse()
-                    .unwrap_or_else(|_| {
-                        warn_default(
-                            "enable_inter_mediator_relay",
-                            &self.enable_inter_mediator_relay,
-                            "false",
-                        );
-                        false
-                    })
-            },
-            // A security setting that doesn't parse is a hard error, not a
-            // silent default — a typo must not quietly pick the weaker mode.
-            trust_task_verification: self.trust_task_verification.parse().map_err(
-                |e: String| {
-                    tracing::error!("{e}");
-                    MediatorError::ConfigError(12, "NA".into(), e)
-                },
-            )?,
-            // Also a hard error: a deadline that doesn't parse must not
-            // quietly become "no deadline" or "accept for ever".
-            tsp_auth_accept_unbound_until: parse_accept_until(&self.tsp_auth_accept_unbound_until)
-                .map_err(|e| {
-                    tracing::error!("{e}");
-                    MediatorError::ConfigError(12, "NA".into(), e)
-                })?,
+            jwt_access_expiry: values.jwt_access_expiry,
+            jwt_refresh_expiry: values.jwt_refresh_expiry,
+            block_anonymous_outer_envelope: values.block_anonymous_outer_envelope,
+            force_session_did_match: values.force_session_did_match,
+            block_remote_admin_msgs: values.block_remote_admin_msgs,
+            enable_inter_mediator_relay: values.enable_inter_mediator_relay,
+            trust_task_verification: values.trust_task_verification,
+            tsp_auth_accept_unbound_until: values.tsp_auth_accept_unbound_until,
             ..SecurityConfig::default(secrets_resolver)
         };
 
-        if !config.block_anonymous_outer_envelope && config.force_session_did_match {
-            tracing::error!(
-                "Conflicting configuration: security.force_session_did_match can not be true when security.block_anonymous_outer_envelope is false"
-            );
-            return Err(MediatorError::ConfigError(12,
-                "NA".into(),
-                "Conflicting configuration: security.force_session_did_match can not be true when security.block_anonymous_outer_envelope is false".into(),
-            ));
-        }
-
-        config.global_acl_default = MediatorACLSet::from_string_ruleset(&self.global_acl_default)
-            .map_err(|err| {
-            tracing::error!("Couldn't parse global_acl_default config parameter. Reason: {err}");
-            MediatorError::ConfigError(
-                12,
-                "NA".into(),
-                format!("Couldn't parse global_acl_default config parameter. Reason: {err}"),
-            )
-        })?;
-
-        if let Some(cors_allow_origin) = &self.cors_allow_origin {
-            let policy = Self::parse_cors_origins(cors_allow_origin)?;
+        if let Some(policy) = values.cors {
             config.cors_allow_origin = build_cors_layer(&policy);
             config.cors_origins = policy;
         }
@@ -839,10 +878,12 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                     return Err(MediatorError::ConfigError(
                         12,
                         "NA".into(),
-                        "No operating secrets found. In self-hosted mode, the backend must \
-                         contain an entry at 'mediator/operating/secrets'. Run \
-                         `mediator-setup` to provision, or enable VTA integration."
-                            .into(),
+                        format!(
+                            "No operating secrets found. In self-hosted mode, the backend must \
+                             contain the well-known entry '{}'. Run `mediator-setup` to \
+                             provision, or enable VTA integration.",
+                            affinidi_messaging_mediator_common::OPERATING_SECRETS
+                        ),
                     ));
                 }
                 Err(err) => {
@@ -1098,6 +1139,30 @@ mod tests {
         assert!(!allows(spec, "https://other.com"));
     }
 
+    /// Issue #146: an exact entry that could never match a browser `Origin`
+    /// is refused at startup, naming the entry.
+    #[test]
+    fn an_exact_entry_that_is_not_an_origin_is_refused() {
+        for bad in [
+            "app.example.com",
+            "https://app.example.com/",
+            "https://app.example.com/path",
+            "https://",
+            "null",
+            "https://user@app.example.com",
+        ] {
+            let err = SecurityConfigRaw::parse_cors_origins(bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("security.cors_allow_origin"), "{bad}: {err}");
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
+        // Scheme and host are lowercased, so the entry matches what a browser
+        // sends.
+        assert!(allows("HTTPS://App.Example.com", "https://app.example.com"));
+        assert!(allows("http://localhost:3000", "http://localhost:3000"));
+    }
+
     #[test]
     fn invalid_entries_are_rejected_at_parse_time() {
         // Wildcard not in the leftmost-label position.
@@ -1156,6 +1221,84 @@ mod tests {
         let origin = HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
         note_refused_origin(&seen, &origin);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    fn raw_security(acl_mode: &str) -> SecurityConfigRaw {
+        SecurityConfigRaw {
+            mediator_acl_mode: acl_mode.into(),
+            global_acl_default: "DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES".into(),
+            local_direct_delivery_allowed: "true".into(),
+            local_direct_delivery_allow_anon: "false".into(),
+            use_ssl: "false".into(),
+            ssl_certificate_file: None,
+            ssl_key_file: None,
+            jwt_access_expiry: "900".into(),
+            jwt_refresh_expiry: "86400".into(),
+            cors_allow_origin: None,
+            block_anonymous_outer_envelope: "true".into(),
+            block_remote_admin_msgs: "true".into(),
+            force_session_did_match: "true".into(),
+            enable_inter_mediator_relay: String::new(),
+            trust_task_verification: String::new(),
+            tsp_auth_accept_unbound_until: String::new(),
+        }
+    }
+
+    /// Issue #105: an unrecognised `mediator_acl_mode` used to select the OPEN
+    /// mode. It is now refused, naming the legal values; case and surrounding
+    /// whitespace are ignored.
+    #[test]
+    fn an_unknown_acl_mode_is_refused_not_opened() {
+        use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
+        for (given, mode) in [
+            ("explicit_allow", AccessListModeType::ExplicitAllow),
+            ("EXPLICIT_ALLOW", AccessListModeType::ExplicitAllow),
+            ("explicit_allow ", AccessListModeType::ExplicitAllow),
+            (" Explicit_Deny", AccessListModeType::ExplicitDeny),
+        ] {
+            let values = raw_security(given).values().expect(given);
+            assert_eq!(values.mediator_acl_mode, mode, "{given:?}");
+        }
+        for bad in ["explicit-allow", "ExplicitAllow", "allow", "", "closed"] {
+            let err = raw_security(bad).values().err().expect(bad).to_string();
+            assert!(err.contains("security.mediator_acl_mode"), "{bad}: {err}");
+            assert!(
+                err.contains("\"explicit_allow\", \"explicit_deny\""),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// Issue #112: a `[security]` boolean or number that does not read is
+    /// refused, naming the key — `use_ssl = "ture"` used to quietly mean true.
+    #[test]
+    fn an_unreadable_security_value_is_refused() {
+        type Set = fn(&mut SecurityConfigRaw);
+        let cases: [(&str, Set); 6] = [
+            ("security.use_ssl", |r| r.use_ssl = "ture".into()),
+            ("security.jwt_access_expiry", |r| {
+                r.jwt_access_expiry = "15m".into()
+            }),
+            ("security.jwt_access_expiry", |r| {
+                r.jwt_access_expiry = "5".into()
+            }),
+            ("security.block_remote_admin_msgs", |r| {
+                r.block_remote_admin_msgs = "1".into()
+            }),
+            ("security.enable_inter_mediator_relay", |r| {
+                r.enable_inter_mediator_relay = "yes".into()
+            }),
+            ("security.global_acl_default", |r| {
+                r.global_acl_default = "ALLOW_EVERYTHING".into()
+            }),
+        ];
+        for (key, set) in cases {
+            let mut raw = raw_security("explicit_deny");
+            set(&mut raw);
+            let err = raw.values().err().expect(key).to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+        assert!(raw_security("explicit_deny").values().is_ok());
     }
 
     /// The older TSP login form is accepted only under an explicit, dated

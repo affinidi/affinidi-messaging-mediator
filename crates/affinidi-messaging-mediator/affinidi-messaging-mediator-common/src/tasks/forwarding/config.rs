@@ -11,6 +11,7 @@
 
 use ahash::AHashSet as HashSet;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 
 /// How a mediator relays a forward whose next hop is a *remote* mediator.
 ///
@@ -120,6 +121,14 @@ pub struct ForwardingConfig {
     /// `security.local_direct_delivery_allowed` and
     /// `security.enable_inter_mediator_relay`.
     pub relay_trusted_mediators: HashSet<String>,
+    /// Forwarding block-list entries learnt after startup: the service
+    /// endpoints of a blocked DID that did not resolve when the mediator
+    /// started, added by a background retry once it does. Same form as
+    /// [`blocked_forwarding`](Self::blocked_forwarding); a lookup consults
+    /// both. Shared by every clone of this config, so the retry reaches the
+    /// copy the request path reads. Never serialised.
+    #[serde(skip)]
+    pub blocked_forwarding_late: Arc<RwLock<HashSet<String>>>,
 }
 
 fn default_max_concurrent_endpoints() -> usize {
@@ -157,6 +166,7 @@ impl Default for ForwardingConfig {
             max_hops: 10,
             relay_mode: RelayMode::Blind,
             relay_trusted_mediators: HashSet::new(),
+            blocked_forwarding_late: Arc::default(),
         }
     }
 }

@@ -1567,10 +1567,12 @@ pub(crate) fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, Mediator
 
 /// `config/patch` — change mediator limits at runtime. rootAdmin only.
 ///
-/// Each key is checked on its own (see
-/// [`overrides::with_override`](crate::common::config::overrides::with_override));
-/// a bad one is reported under `rejected` and does not stop the rest. The
-/// accepted keys are stored as overrides, so they survive a restart, and then:
+/// Each key is checked on its own, then the patch is laid over the stored
+/// overrides and coherence is checked over the result (see
+/// [`overrides::plan_patch`](crate::common::config::overrides::plan_patch)),
+/// so both keys of a soft/hard pair can be lowered in one patch. A bad key is
+/// reported under `rejected` and does not stop the rest. The accepted keys are
+/// stored as overrides, so they survive a restart, and then:
 ///
 /// - a **live** key takes effect now and is reported `applied`;
 /// - a **restart** key applies from the next start and is reported
@@ -1586,7 +1588,7 @@ pub(crate) async fn consume_config_patch(
     now: DateTime<Utc>,
 ) -> Result<Value, MediatorError> {
     use crate::common::config::overrides::{
-        self, KeyClass, class_of, parse_stored, with_fields_from, with_override,
+        KeyClass, PatchPlan, parse_stored, plan_patch, with_fields_from,
     };
 
     validate_tt_basic(&typed, session, mediator_did, now)?;
@@ -1615,42 +1617,21 @@ pub(crate) async fn consume_config_patch(
         .config_overrides_get()
         .await
         .map_err(storage_err)?;
-    let mut stored = parse_stored(stored.as_deref());
+    let stored = parse_stored(stored.as_deref());
 
     // What the configuration should become: the baseline with every stored
-    // override, then this patch's keys in turn.
+    // override and this patch's keys laid over it.
     let baseline = (*state.live_limits.baseline()).clone();
-    let desired_from = |stored: &serde_json::Map<String, Value>| {
-        let mut limits = baseline.clone();
-        overrides::overlay(&mut limits, stored);
-        limits
-    };
-    let mut desired = desired_from(&stored);
-
-    let mut accepted: Vec<(String, KeyClass, Value)> = Vec::new();
-    let mut rejected: Vec<Value> = Vec::new();
-    for (key, value) in &typed.payload.overrides {
-        let Some(class) = class_of(key) else {
-            rejected.push(json!({ "key": key, "reason": "not a patchable configuration key" }));
-            continue;
-        };
-        if value.is_null() {
-            let mut without = stored.clone();
-            without.remove(key);
-            desired = desired_from(&without);
-            stored = without;
-            accepted.push((key.clone(), class, Value::Null));
-            continue;
-        }
-        match with_override(&desired, &baseline, key, value) {
-            Ok(next) => {
-                desired = next;
-                stored.insert(key.clone(), value.clone());
-                accepted.push((key.clone(), class, value.clone()));
-            }
-            Err(reason) => rejected.push(json!({ "key": key, "reason": reason })),
-        }
-    }
+    let PatchPlan {
+        desired,
+        stored,
+        accepted,
+        rejected,
+    } = plan_patch(&baseline, &stored, &typed.payload.overrides);
+    let rejected: Vec<Value> = rejected
+        .into_iter()
+        .map(|(key, reason)| json!({ "key": key, "reason": reason }))
+        .collect();
 
     if !accepted.is_empty() {
         state
@@ -1762,9 +1743,10 @@ pub(crate) async fn consume_config_reload(
     };
     let raw = affinidi_messaging_mediator_config::env::read_config_file(path)
         .map_err(|e| config_err(e.to_string()))?;
-    let baseline: LimitsConfig = raw
-        .limits
-        .try_into()
+    // The same checks as at startup, over every setting the file holds (not
+    // only `[limits]`): a value that does not read, or breaks a documented
+    // invariant, fails the reload and nothing changes.
+    let baseline: LimitsConfig = crate::common::config::validate_raw(&raw)
         .map_err(|e: MediatorError| config_err(e.to_string()))?;
 
     let _one_at_a_time = state.live_limits.lock_for_patch().await;

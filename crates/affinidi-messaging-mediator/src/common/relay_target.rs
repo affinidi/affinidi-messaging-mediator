@@ -34,16 +34,42 @@ pub fn canonical_relay_target(raw: &str) -> String {
     canonical_url(trimmed).unwrap_or_else(|| trimmed.to_string())
 }
 
+/// A forwarding block list: holds [`canonical_relay_target`] forms.
+pub trait BlockList {
+    /// Whether `canonical` (a [`canonical_relay_target`] form) is listed.
+    fn contains_target(&self, canonical: &str) -> bool;
+}
+
+impl BlockList for AHashSet<String> {
+    fn contains_target(&self, canonical: &str) -> bool {
+        self.contains(canonical)
+    }
+}
+
+/// The configured block list and the entries learnt after startup (the
+/// endpoints of a blocked DID that resolved late; see
+/// `load_forwarding_protection_blocks`).
+impl BlockList for affinidi_messaging_mediator_common::tasks::forwarding::ForwardingConfig {
+    fn contains_target(&self, canonical: &str) -> bool {
+        self.blocked_forwarding.contains(canonical)
+            || self
+                .blocked_forwarding_late
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(canonical)
+    }
+}
+
 /// True when any of `candidates` is on `blocked`. `blocked` must hold
 /// [`canonical_relay_target`] forms (see
 /// `load_forwarding_protection_blocks`).
 pub fn relay_target_blocked<'a>(
-    blocked: &AHashSet<String>,
+    blocked: &(impl BlockList + ?Sized),
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> bool {
     candidates
         .into_iter()
-        .any(|candidate| blocked.contains(&canonical_relay_target(candidate)))
+        .any(|candidate| blocked.contains_target(&canonical_relay_target(candidate)))
 }
 
 fn canonical_did(did: &str) -> String {

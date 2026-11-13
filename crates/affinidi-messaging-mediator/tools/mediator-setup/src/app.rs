@@ -2822,7 +2822,7 @@ impl WizardApp {
                     }
                 } else if self.security_phase == Some(SecurityPhase::JwtMode) {
                     match self.selection_index {
-                        0 => "The wizard generates a 32-byte Ed25519 PKCS8 keypair and writes it into the unified secret backend at the well-known key `mediator/jwt/secret`. The mediator picks it up at startup with no further config.".into(),
+                        0 => "The wizard generates a 32-byte Ed25519 PKCS8 keypair and writes it into the unified secret backend at the well-known key `mediator_jwt_secret`. The mediator picks it up at startup with no further config.".into(),
                         1 => "The wizard records your choice but does NOT generate or prompt for a key. Before starting the mediator, set MEDIATOR_JWT_SECRET (raw PKCS8 bytes, base64-encoded) or pass --jwt-secret-file <path>. Choose this when CI/CD already issues JWT keys or when an HSM holds them.".into(),
                         _ => String::new(),
                     }
