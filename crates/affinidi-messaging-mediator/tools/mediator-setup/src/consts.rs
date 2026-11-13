@@ -50,6 +50,19 @@ pub const NETWORK_MODE_CLOSED: &str = "closed";
 /// switch in the Security step.
 pub const DEFAULT_NETWORK_MODE: &str = NETWORK_MODE_OPEN;
 
+/// The network posture a deployment type starts from. A local development
+/// mediator stays open (any DID may message any other), but a server or a
+/// container is a production deployment and starts from the shipped
+/// template's restrictive posture: every cross-DID exchange needs an
+/// explicit ACL grant. Either can be overridden (TUI Security step, recipe
+/// `[security].network_mode`, `--set security.network_mode=…`).
+pub fn default_network_mode_for(deployment_type: &str) -> &'static str {
+    match deployment_type {
+        DEPLOYMENT_SERVER | DEPLOYMENT_CONTAINER => NETWORK_MODE_CLOSED,
+        _ => NETWORK_MODE_OPEN,
+    }
+}
+
 /// JWT secret provisioning mode. `generate` (default) tells the wizard to
 /// mint a fresh Ed25519 PKCS8 key and push it into the unified secret
 /// backend at `mediator/jwt/secret`. `provide` records the operator's
@@ -189,3 +202,12 @@ pub const DEFAULT_VAULT_ENDPOINT: &str = "";
 pub const DEFAULT_VAULT_MOUNT: &str = "secret/mediator";
 /// Default name of the `Secret` object for the `k8s://` backend.
 pub const DEFAULT_K8S_SECRET_NAME: &str = "mediator-secrets";
+
+/// Secret-backend entry holding a locally generated did:webvh's log-update
+/// key and its pre-rotation (next) key. Kept apart from the operating
+/// secrets: the mediator never needs it at runtime, only an operator who
+/// updates or rotates the DID does.
+pub const WEBVH_UPDATE_KEYS: &str = "mediator_webvh_update_keys";
+
+/// Envelope kind of the [`WEBVH_UPDATE_KEYS`] entry.
+pub const KIND_WEBVH_UPDATE_KEYS: &str = "webvh-update-keys";
