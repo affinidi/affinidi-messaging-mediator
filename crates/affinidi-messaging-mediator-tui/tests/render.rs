@@ -292,6 +292,20 @@ async fn a_named_account_gets_room_beside_the_monitor() {
     // change roles), so the first row is anonReceive.
     app.handle_key(key(KeyCode::Char(' ')));
     app.handle_key(key(KeyCode::Char('s')));
+    // Nothing is sent before the change is shown and confirmed.
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let confirm = screen(&terminal);
+    println!("{confirm}");
+    assert!(confirm.contains("Change an account"), "{confirm}");
+    assert!(
+        confirm.contains("anonReceive: "),
+        "the change listed:\n{confirm}"
+    );
+    assert!(
+        !confirm.contains("lock"),
+        "not the console's own account:\n{confirm}"
+    );
+    app.handle_key(key(KeyCode::Char('y')));
     // Saved, and the reloaded account shows the flag flipped.
     let after = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
         s.contains("account updated") && s.contains("✓anonReceive") != anon_before
@@ -688,4 +702,101 @@ async fn an_admin_revokes_marked_grants_and_sees_a_protected_one_refused() {
     })
     .await;
     assert!(after.contains("member epoch 0: 1 · 1 marked"), "{after}");
+}
+
+/// The header shows the connection as the SDK reports it, every drop and
+/// recovery is written into the monitor, Esc never quits, `?` lists the keys,
+/// and a delete names what it deletes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_is_shown_and_destructive_prompts_name_their_target() {
+    use affinidi_messaging_mediator_admin::ConnState;
+
+    let env = TestEnvironment::spawn_with_direct_delivery().await.unwrap();
+    let alice = env.add_user("alice").await.unwrap();
+    let bob = env.add_user("bob").await.unwrap();
+    let op = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&op.did_hash(), &AccountType::Admin)
+        .await
+        .unwrap();
+    send(&env, &alice, &bob).await;
+
+    let console = MediatorConsole::connect(Identity {
+        alias: "operator".into(),
+        did: op.did.clone(),
+        secrets: op.secrets.clone(),
+        mediator_did: Some(env.mediator.did().to_string()),
+    })
+    .await
+    .unwrap();
+    let mut app = App::new(console).with_color_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(90, 32)).unwrap();
+
+    let up = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("● connected") && s.contains("Queue pressure")
+    })
+    .await;
+    println!("{up}");
+    assert!(up.contains("● connected"), "the connection badge:\n{up}");
+    // The footer fits the width and points at the rest.
+    assert!(up.contains("… ? for more"), "{up}");
+
+    // Esc on its own does nothing; `?` lists every key, Esc closes it.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), Control::Continue);
+    app.handle_key(key(KeyCode::Char('?')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let help = screen(&terminal);
+    assert!(
+        help.contains("Keys") && help.contains("Everywhere"),
+        "{help}"
+    );
+    assert!(help.contains("never quits"), "{help}");
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), Control::Continue);
+
+    // A drop, as the SDK reports it: in the header at once, and as a line
+    // in the monitor; then the recovery.
+    app.handle_key(key(KeyCode::Char('m')));
+    app.apply(Update::Connection(ConnState::Disconnected));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let down = screen(&terminal);
+    println!("{down}");
+    assert!(down.contains("✗ disconnected"), "header:\n{down}");
+    assert!(
+        down.contains("connection to the mediator lost"),
+        "monitor and footer:\n{down}"
+    );
+    app.apply(Update::Connection(ConnState::Connected));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let back = screen(&terminal);
+    assert!(back.contains("● connected"), "{back}");
+    assert!(back.contains("reconnected to the mediator"), "{back}");
+    app.handle_key(key(KeyCode::Char('m')));
+
+    // Bob's message, selected for deletion: the prompt says whose, which
+    // queue, which message and from whom.
+    app.open_account(Some(bob.did_hash()));
+    let bob_short = format!("{}…", &bob.did_hash()[..8]);
+    let listed = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("Receive queue — 1 messages")
+    })
+    .await;
+    assert!(listed.contains("Receive queue — 1 messages"), "{listed}");
+    app.handle_key(key(KeyCode::Char('d')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let confirm = screen(&terminal);
+    println!("{confirm}");
+    assert!(
+        confirm.contains(&format!("Account  {bob_short}")),
+        "{confirm}"
+    );
+    assert!(confirm.contains("Queue    receive"), "{confirm}");
+    assert!(
+        confirm.contains(&format!("From     {}…", &alice.did_hash()[..8])),
+        "{confirm}"
+    );
+    // Anything but y cancels.
+    app.handle_key(key(KeyCode::Char('n')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    assert!(screen(&terminal).contains("cancelled"));
 }

@@ -4,8 +4,21 @@
 //! `live_stream_next` reader, and it routes each `messaging/monitor/event`
 //! batch to the feed its subscription belongs to. Request/response calls are
 //! unaffected — the SDK hands a reply to the call waiting on it before any
-//! `next` reader sees it. Anything else pushed to the console (it is not a
-//! mail client) is left in the queue, untouched.
+//! `next` reader sees it.
+//!
+//! **Anything else pushed to the console's DID is taken off the SDK's live
+//! cache too.** The SDK has no receive filtered by type, so the reader pops
+//! every live message for its profile. The mediator keeps its stored copy (the
+//! reader never deletes), but locally the message is gone: on a private SDK
+//! instance ([`MediatorConsole::connect`](crate::MediatorConsole::connect))
+//! that is harmless, while an application sharing its SDK instance and DID
+//! must take those messages from the `unclaimed` channel of
+//! [`MediatorConsole::connect_with_unclaimed`](crate::MediatorConsole::connect_with_unclaimed),
+//! or it loses them until a later pickup redelivers them.
+//!
+//! Every drop and reconnect of the connection is logged (`warn` / `info`) and
+//! reported to each feed as [`MonitorUpdate::Disconnected`] /
+//! [`MonitorUpdate::Reconnected`] (R6.2).
 //!
 //! Feeds subscribe with `messaging/monitor/subscribe` 0.2, which can add mux
 //! membership events, and read every batch as `messaging/monitor/event` 0.3.
@@ -17,14 +30,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use affinidi_messaging_core::ConnState;
+use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_sdk::errors::ATMError;
+use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::protocols::trust_tasks::{
     MonitorSubscription, decode_monitor_event_v0_3,
 };
 use affinidi_messaging_sdk::tasks::messaging::monitor;
 use affinidi_messaging_sdk::{ATM, profiles::ATMProfile};
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{ConsoleError, Result};
@@ -55,6 +71,7 @@ const FEED_BUFFER: usize = 64;
 
 /// What a monitor feed yields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MonitorUpdate {
     /// A batch of events, and how many the mediator dropped since the last
     /// one (rate ceiling, or this console briefly offline).
@@ -75,6 +92,34 @@ pub enum MonitorUpdate {
     Heartbeat,
     /// The subscription ended — lease renewal failed, or it was cancelled.
     Ended(String),
+    /// The connection to the mediator dropped. Nothing arrives until
+    /// [`MonitorUpdate::Reconnected`]; what the mediator could not deliver
+    /// meanwhile shows up as `dropped` or a [`MonitorUpdate::Gap`] after it.
+    Disconnected,
+    /// The connection came back after a [`MonitorUpdate::Disconnected`].
+    Reconnected,
+}
+
+/// A message pushed to the console's DID that is not a monitor batch, with
+/// what the SDK learned unpacking it. See
+/// [`MediatorConsole::connect_with_unclaimed`](crate::MediatorConsole::connect_with_unclaimed).
+pub type Unclaimed = (Message, Box<UnpackMetadata>);
+
+/// What a change of connection state means to a reader that last saw
+/// `*down`: a drop, a recovery, or nothing new. `Connecting` (no connection
+/// made yet) is neither.
+pub(crate) fn link_change(down: &mut bool, state: ConnState) -> Option<MonitorUpdate> {
+    match state {
+        ConnState::Disconnected if !*down => {
+            *down = true;
+            Some(MonitorUpdate::Disconnected)
+        }
+        ConnState::Connected if *down => {
+            *down = false;
+            Some(MonitorUpdate::Reconnected)
+        }
+        _ => None,
+    }
 }
 
 type Payload = monitor::event::v0_3::Payload;
@@ -185,12 +230,39 @@ pub(crate) struct LiveStream {
     feeds: Arc<Mutex<HashMap<String, mpsc::Sender<Payload>>>>,
     stop: Arc<AtomicBool>,
     task: JoinHandle<()>,
+    /// Logs each drop and reconnect.
+    watcher: Option<JoinHandle<()>>,
+    conn: Option<watch::Receiver<ConnState>>,
 }
 
 impl LiveStream {
-    pub(crate) fn start(atm: ATM, profile: Arc<ATMProfile>) -> Self {
+    /// Start the single reader. `unclaimed` receives every pushed message
+    /// that is not a monitor batch; without it they are discarded locally
+    /// (the mediator keeps its copy). `conn` is the connection's state, when
+    /// the SDK runs a websocket for the profile.
+    pub(crate) fn start(
+        atm: ATM,
+        profile: Arc<ATMProfile>,
+        unclaimed: Option<mpsc::Sender<Unclaimed>>,
+        conn: Option<watch::Receiver<ConnState>>,
+    ) -> Self {
         let feeds: Arc<Mutex<HashMap<String, mpsc::Sender<Payload>>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
+        let watcher = conn.clone().map(|mut rx| {
+            tokio::spawn(async move {
+                let mut down = matches!(*rx.borrow_and_update(), ConnState::Disconnected);
+                while rx.changed().await.is_ok() {
+                    let state = *rx.borrow_and_update();
+                    match link_change(&mut down, state) {
+                        Some(MonitorUpdate::Disconnected) => {
+                            tracing::warn!("console connection to the mediator lost; reconnecting")
+                        }
+                        Some(_) => tracing::info!("console connection to the mediator restored"),
+                        None => {}
+                    }
+                }
+            })
+        });
         let task = tokio::spawn({
             let feeds = feeds.clone();
             let stop = stop.clone();
@@ -201,11 +273,14 @@ impl LiveStream {
                         .live_stream_next(&profile, Some(Duration::from_millis(500)), false)
                         .await;
                     match next {
-                        Ok(Some((message, _))) => {
+                        Ok(Some((message, meta))) => {
                             // Every batch version reads as 0.3; one from a 0.1
                             // subscription simply has no membership in it.
                             let Some(batch) = decode_monitor_event_v0_3(&message) else {
-                                // Not a monitor batch: leave it in the queue.
+                                // Not a monitor batch. It has left the SDK's
+                                // live cache either way; the mediator keeps
+                                // its stored copy (nothing here deletes it).
+                                hand_on(unclaimed.as_ref(), message, meta);
                                 continue;
                             };
                             let id = batch.payload.subscription_id.to_string();
@@ -217,19 +292,28 @@ impl LiveStream {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            tracing::debug!("live stream read failed, retrying: {e}");
+                            tracing::warn!("console live stream read failed, retrying: {e}");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
             }
         });
-        Self { feeds, stop, task }
+        Self {
+            feeds,
+            stop,
+            task,
+            watcher,
+            conn,
+        }
     }
 
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.task.abort();
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
     }
 
     /// Subscribe and return a feed that renews itself.
@@ -319,12 +403,18 @@ impl LiveStream {
             }
         });
 
+        let mut conn = self.conn.clone();
+        let link_down = conn
+            .as_mut()
+            .is_some_and(|rx| matches!(*rx.borrow_and_update(), ConnState::Disconnected));
         Ok(MonitorFeed {
             id,
             filter: granted.filter,
             membership: granted.membership,
             batches: batch_rx,
             ended: end_rx,
+            conn,
+            link_down,
             pending: VecDeque::new(),
             last_seq: 0,
             renew,
@@ -332,6 +422,34 @@ impl LiveStream {
             atm: atm.clone(),
             profile: profile.clone(),
         })
+    }
+}
+
+/// Give a message that is not a monitor batch to the embedding application,
+/// when it asked for them. A full channel drops it here; the mediator still
+/// holds it, so a later pickup redelivers it.
+fn hand_on(
+    unclaimed: Option<&mpsc::Sender<Unclaimed>>,
+    message: Message,
+    meta: Box<UnpackMetadata>,
+) {
+    let id = message.id.clone();
+    let Some(tx) = unclaimed else {
+        tracing::debug!(
+            "console live stream: set aside non-monitor message {id} (the mediator keeps it)"
+        );
+        return;
+    };
+    match tx.try_send((message, meta)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+            "console live stream: the unclaimed-message channel is full; message {id} \
+             is left for a later pickup"
+        ),
+        Err(mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
+            "console live stream: the unclaimed-message channel is closed; message {id} \
+             is left for a later pickup"
+        ),
     }
 }
 
@@ -375,6 +493,10 @@ pub struct MonitorFeed {
     membership: Option<MembershipFilter>,
     batches: mpsc::Receiver<Payload>,
     ended: mpsc::Receiver<String>,
+    /// The connection's state, to report drops as they happen.
+    conn: Option<watch::Receiver<ConnState>>,
+    /// Whether the last state reported was a drop.
+    link_down: bool,
     pending: VecDeque<MonitorUpdate>,
     last_seq: u64,
     renew: JoinHandle<()>,
@@ -402,19 +524,65 @@ impl MonitorFeed {
     }
 
     /// The next update. `None` once the feed has ended and been drained.
+    ///
+    /// A drop of the connection is reported at once, as
+    /// [`MonitorUpdate::Disconnected`], and its recovery as
+    /// [`MonitorUpdate::Reconnected`]: a reader never has to infer either
+    /// from silence.
     pub async fn next(&mut self) -> Option<MonitorUpdate> {
-        if let Some(update) = self.pending.pop_front() {
-            return Some(update);
-        }
-        tokio::select! {
-            batch = self.batches.recv() => {
-                let batch = batch?;
-                let updates = sequence(&mut self.last_seq, batch);
-                self.pending.extend(updates);
-                self.pending.pop_front()
+        loop {
+            if let Some(update) = self.pending.pop_front() {
+                return Some(update);
             }
-            reason = self.ended.recv() => reason.map(MonitorUpdate::Ended),
+            match next_input(&mut self.batches, &mut self.ended, &mut self.conn).await {
+                Input::Batch(batch) => {
+                    let updates = sequence(&mut self.last_seq, batch?);
+                    self.pending.extend(updates);
+                }
+                Input::Ended(reason) => return reason.map(MonitorUpdate::Ended),
+                Input::Link(state) => {
+                    if let Some(update) = link_change(&mut self.link_down, state) {
+                        return Some(update);
+                    }
+                }
+                // The transport is gone for good: no more state to watch.
+                Input::LinkClosed => self.conn = None,
+            }
         }
+    }
+}
+
+/// What a feed waits on.
+enum Input {
+    /// A batch, or `None` when the reader has gone.
+    Batch(Option<Payload>),
+    /// The subscription ended, and why.
+    Ended(Option<String>),
+    /// The connection's new state.
+    Link(ConnState),
+    /// The connection's state can no longer change.
+    LinkClosed,
+}
+
+/// The next thing a feed has to act on.
+async fn next_input(
+    batches: &mut mpsc::Receiver<Payload>,
+    ended: &mut mpsc::Receiver<String>,
+    conn: &mut Option<watch::Receiver<ConnState>>,
+) -> Input {
+    let link = async {
+        match conn.as_mut() {
+            Some(rx) => match rx.changed().await {
+                Ok(()) => Input::Link(*rx.borrow_and_update()),
+                Err(_) => Input::LinkClosed,
+            },
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        batch = batches.recv() => Input::Batch(batch),
+        reason = ended.recv() => Input::Ended(reason),
+        input = link => input,
     }
 }
 
@@ -507,6 +675,43 @@ mod tests {
             "membership": membership, "membershipDropped": dropped,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_drop_and_its_recovery_are_each_reported_once() {
+        let mut down = false;
+        // Still connecting at start: nothing to report.
+        assert!(link_change(&mut down, ConnState::Connecting).is_none());
+        assert!(link_change(&mut down, ConnState::Connected).is_none());
+        assert!(matches!(
+            link_change(&mut down, ConnState::Disconnected),
+            Some(MonitorUpdate::Disconnected)
+        ));
+        // Another drop notice while down is the same drop.
+        assert!(link_change(&mut down, ConnState::Disconnected).is_none());
+        assert!(matches!(
+            link_change(&mut down, ConnState::Connected),
+            Some(MonitorUpdate::Reconnected)
+        ));
+        assert!(link_change(&mut down, ConnState::Connected).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_feed_hears_of_a_drop_without_waiting_for_a_batch() {
+        let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+        let (_batch_tx, mut batches) = mpsc::channel(1);
+        let (_end_tx, mut ended) = mpsc::channel(1);
+        let mut conn = Some(state_rx);
+        state_tx.send(ConnState::Disconnected).unwrap();
+        assert!(matches!(
+            next_input(&mut batches, &mut ended, &mut conn).await,
+            Input::Link(ConnState::Disconnected)
+        ));
+        drop(state_tx);
+        assert!(matches!(
+            next_input(&mut batches, &mut ended, &mut conn).await,
+            Input::LinkClosed
+        ));
     }
 
     #[test]
