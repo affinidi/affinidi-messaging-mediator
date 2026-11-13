@@ -1273,10 +1273,14 @@ async fn handle_inbound_didcomm(
         // path runs on the innermost envelope. In the default `Blind` mode this is
         // skipped entirely, so existing behaviour is unchanged.
         let peeled;
+        // The innermost envelope as the peel already unpacked it, so the path
+        // below does not decrypt the same message a second time (#198).
+        let mut pre_unpacked = None;
         let (message, hop_floor): (&str, u32) =
             if state.config.processors.forwarding.relay_mode == RelayMode::Rewrap {
                 let floor;
-                (peeled, floor) = peel_relay_rewrap_layers(state, session, message.to_string()).await?;
+                (peeled, floor, pre_unpacked) =
+                    peel_relay_rewrap_layers(state, session, message.to_string()).await?;
                 (&peeled, floor)
             } else {
                 (message, 0)
@@ -1307,13 +1311,18 @@ async fn handle_inbound_didcomm(
             Some(to_did) => {
                 if to_did == &state.config.mediator_did {
                     // Message is to the mediator
-                    let (msg, metadata) = match envelope
-                        .unpack(
-                            &state.did_resolver,
-                            &*state.config.security.mediator_secrets,
-                        )
-                        .await
-                    {
+                    let unpacked = match pre_unpacked.take() {
+                        Some(unpacked) => Ok(unpacked),
+                        None => {
+                            envelope
+                                .unpack(
+                                    &state.did_resolver,
+                                    &*state.config.security.mediator_secrets,
+                                )
+                                .await
+                        }
+                    };
+                    let (msg, metadata) = match unpacked {
                         Ok(ok) => ok,
                         Err(e) => {
                             return Err(MediatorError::problem_with_log(
@@ -1616,15 +1625,17 @@ async fn handle_inbound_didcomm(
 /// no longer a re-wrap layer. Bounded by `max_hops` to stop relay loops.
 ///
 /// Any decrypt/unpack failure here is *not* fatal: the message is handed back
-/// unchanged so the normal inbound path produces the canonical error. The cost
-/// is one extra unpack of the outer layer on a rewrap-mode mediator; acceptable
-/// for an opt-in relay posture.
+/// unchanged so the normal inbound path produces the canonical error.
+///
+/// The third value is the returned envelope already unpacked, when it was
+/// addressed to this mediator and unpacked cleanly but is not a re-wrap layer:
+/// the caller uses it rather than decrypting the same envelope again.
 #[cfg(feature = "didcomm")]
 async fn peel_relay_rewrap_layers(
     state: &SharedData,
     session: &Session,
     message: String,
-) -> Result<(String, u32), MediatorError> {
+) -> Result<(String, u32, Option<PeeledUnpack>), MediatorError> {
     let mut current = message;
     let mut depth: u32 = 0;
     // The hop count the authenticated peers carried, at least one per layer
@@ -1633,10 +1644,10 @@ async fn peel_relay_rewrap_layers(
     loop {
         let envelope = match MetaEnvelope::new(&current, &state.did_resolver).await {
             Ok(e) => e,
-            Err(_) => return Ok((current, floor)),
+            Err(_) => return Ok((current, floor, None)),
         };
         if envelope.to_did.as_deref() != Some(state.config.mediator_did.as_str()) {
-            return Ok((current, floor));
+            return Ok((current, floor, None));
         }
         let (msg, meta) = match envelope
             .unpack(
@@ -1646,10 +1657,10 @@ async fn peel_relay_rewrap_layers(
             .await
         {
             Ok(ok) => ok,
-            Err(_) => return Ok((current, floor)),
+            Err(_) => return Ok((current, floor, None)),
         };
         let Some(inner) = rewrap_inner_attachment(&state.config.mediator_did, &msg) else {
-            return Ok((current, floor));
+            return Ok((current, floor, Some((msg, meta))));
         };
 
         // Authenticate the relaying peer mediator before peeling its layer:
@@ -1698,6 +1709,13 @@ async fn peel_relay_rewrap_layers(
         current = inner;
     }
 }
+
+/// An envelope [`peel_relay_rewrap_layers`] unpacked and handed back.
+#[cfg(feature = "didcomm")]
+type PeeledUnpack = (
+    affinidi_messaging_didcomm::message::Message,
+    affinidi_messaging_sdk::messages::compat::UnpackMetadata,
+);
 
 /// Whether `msg` is a `routing/2.0/forward`: the one message to the mediator a
 /// mux member's `send` scope admits on the principal's connection.
