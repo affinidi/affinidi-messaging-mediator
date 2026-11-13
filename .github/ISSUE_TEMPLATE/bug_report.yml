@@ -1,0 +1,51 @@
+name: Bug report
+description: The mediator, its admin client, console, setup wizard or test mediator does something wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Security issues go to security@affinidi.com, not here (see SECURITY.md).
+        Remove keys, tokens and DIDs you do not want public from anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, config excerpts (redacted) and the client side (SDK version, protocol).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Crate version, or image tag/digest (`ghcr.io/affinidi/messaging-mediator:...`).
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How it runs
+      options:
+        - Container image
+        - Built from source / cargo install
+        - Embedded (MediatorBuilder)
+        - Test mediator
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Storage backend and features
+      description: e.g. redis (cluster mode), fjall, memory; didcomm, tsp, secrets-aws.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log lines (redacted).
+      render: text
