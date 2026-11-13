@@ -3,13 +3,12 @@
 
 use tui_input::{Input, InputRequest};
 
-use crate::consts::*;
+use crate::app::{DidMethod, VtaMode};
 use crate::vta::VtaIntent;
 
 use super::{
     DEPLOYMENT_CHOICES, DatabasePhase, DidPhase, FocusPanel, InputMode, KEY_STORAGE_CHOICES,
     SSL_CHOICES, SslField, VTA_INTENT_CHOICES, VtaStepPhase, WizardApp, WizardStep, index_of,
-    index_of_str,
 };
 
 impl WizardApp {
@@ -167,7 +166,7 @@ impl WizardApp {
     /// DID during provision-integration (FullSetup — TemplateBootstrap
     /// reply) or exported a pre-provisioned one via `vta contexts
     /// reprovision` (OfflineExport — ContextProvision reply). Either
-    /// way `apply_vta_defaults` already pinned `did_method = DID_VTA`
+    /// way `apply_vta_defaults` already pinned `did_method = DidMethod::Vta`
     /// and the mediator DID + doc + keys + did.jsonl ride on
     /// `vta_session`. Operators can still reach this step via the
     /// progress-panel jump if they want to inspect it.
@@ -175,7 +174,7 @@ impl WizardApp {
         match self.current_step {
             WizardStep::Did => {
                 self.config.use_vta
-                    && self.config.did_method == DID_VTA
+                    && self.config.did_method == Some(DidMethod::Vta)
                     && self.vta_session.as_ref().is_some_and(|s| {
                         // Either provisioning shape carries a minted
                         // integration DID. AdminOnly has neither
@@ -264,7 +263,9 @@ impl WizardApp {
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.public_url.clone());
                 }
-                Some(DidPhase::SaveDidWebChoice) if self.config.did_method == DID_WEBVH => {
+                Some(DidPhase::SaveDidWebChoice)
+                    if self.config.did_method == Some(DidMethod::Webvh) =>
+                {
                     // Back from the did:web pick → the identity-form pick.
                     self.enter_identity_form_choice();
                 }
@@ -477,9 +478,9 @@ impl WizardApp {
             WizardStep::Vta => {
                 let intent = if !self.config.use_vta {
                     None
-                } else if self.config.vta_mode == VTA_MODE_EXPORT {
+                } else if self.config.vta_mode == Some(VtaMode::SealedExport) {
                     Some(VtaIntent::OfflineExport)
-                } else if self.config.did_method != DID_VTA && !self.config.did_method.is_empty() {
+                } else if self.config.did_method.is_some_and(|m| m != DidMethod::Vta) {
                     Some(VtaIntent::AdminOnly)
                 } else {
                     Some(VtaIntent::FullSetup)
@@ -487,22 +488,32 @@ impl WizardApp {
                 index_of(&VTA_INTENT_CHOICES, intent).unwrap_or(0)
             }
             WizardStep::Protocol => 0, // Start at DIDComm toggle
-            WizardStep::Did => {
-                index_of_str(&self.did_choices(), self.config.did_method.as_str()).unwrap_or(0)
-            }
-            WizardStep::KeyStorage => {
-                index_of_str(&KEY_STORAGE_CHOICES, self.config.secret_storage.as_str()).unwrap_or(0)
-            }
-            WizardStep::Security => {
-                index_of_str(&SSL_CHOICES, self.config.ssl_mode.as_str()).unwrap_or(0)
-            }
-            WizardStep::Deployment => {
-                index_of_str(&DEPLOYMENT_CHOICES, self.config.deployment_type.as_str()).unwrap_or(0)
-            }
+            WizardStep::Did => self
+                .config
+                .did_method
+                .and_then(|v| index_of(&self.did_choices(), v))
+                .unwrap_or(0),
+            WizardStep::KeyStorage => self
+                .config
+                .secret_storage
+                .and_then(|v| index_of(&KEY_STORAGE_CHOICES, v))
+                .unwrap_or(0),
+            WizardStep::Security => self
+                .config
+                .ssl_mode
+                .and_then(|v| index_of(&SSL_CHOICES, v))
+                .unwrap_or(0),
+            WizardStep::Deployment => self
+                .config
+                .deployment_type
+                .and_then(|v| index_of(&DEPLOYMENT_CHOICES, v))
+                .unwrap_or(0),
             WizardStep::Admin => {
-                // An `ADMIN_VTA` stored for a flow that no longer offers it
+                // An `AdminMode::Vta` stored for a flow that no longer offers it
                 // (e.g. OfflineExport) falls back to generating a did:key.
-                index_of_str(&self.admin_choices(), self.config.admin_did_mode.as_str())
+                self.config
+                    .admin_did_mode
+                    .and_then(|v| index_of(&self.admin_choices(), v))
                     .unwrap_or(0)
             }
             _ => 0,

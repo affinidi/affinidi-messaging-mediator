@@ -1,5 +1,6 @@
 use super::config::MEDIATOR_DEFAULT_FEATURES;
 use super::*;
+use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
 use crate::consts::*;
 use crate::vta::{ConnectPhase, VtaIntent, VtaSession};
 
@@ -190,7 +191,7 @@ fn explicit_feature_lists_keep_vta_and_jemalloc() {
             ..Default::default()
         },
         WizardConfig {
-            secret_storage: "aws_secrets://".into(),
+            secret_storage: Some(SecretScheme::Aws),
             ..Default::default()
         },
         WizardConfig {
@@ -231,7 +232,7 @@ fn cargo_features_redis_with_secret_backend_keeps_redis() {
     // fix re-asserts `redis-backend` explicitly when secrets-X is
     // set, so the binary still has its backend.
     let cfg = WizardConfig {
-        secret_storage: "aws_secrets://".into(),
+        secret_storage: Some(SecretScheme::Aws),
         ..Default::default()
     };
     assert_eq!(
@@ -252,7 +253,7 @@ fn cargo_features_redis_with_secret_backend_keeps_redis() {
 fn cargo_features_fjall_with_secret_backend_uses_fjall() {
     let cfg = WizardConfig {
         storage_backend: "fjall".into(),
-        secret_storage: "vault://".into(),
+        secret_storage: Some(SecretScheme::Vault),
         ..Default::default()
     };
     assert_eq!(
@@ -576,7 +577,7 @@ fn local_webvh_url_confirm_enters_did_web_choice() {
     app.mode = InputMode::Selecting;
     app.selection_index = 0; // "Generate did:webvh"
     app.select_current();
-    assert_eq!(app.config.did_method, DID_WEBVH);
+    assert_eq!(app.config.did_method, Some(DidMethod::Webvh));
     assert_eq!(app.mode, InputMode::TextInput);
 
     app.text_input = tui_input::Input::new("https://mediator.example.com".into());
@@ -791,7 +792,7 @@ fn move_up_down_bounds() {
 #[test]
 fn protocol_toggle_prevents_deselecting_both() {
     let mut app = WizardApp::new("test.toml".into());
-    app.config.deployment_type = DEPLOYMENT_LOCAL.into();
+    app.config.deployment_type = Some(Deployment::Local);
     advance_to(&mut app, WizardStep::Protocol);
     assert!(app.current_step.is_multi_select());
 
@@ -817,7 +818,7 @@ fn protocol_toggle_prevents_deselecting_both() {
 #[test]
 fn protocol_multi_select_space_toggle_plus_enter_advance() {
     let mut app = WizardApp::new("test.toml".into());
-    app.config.deployment_type = DEPLOYMENT_LOCAL.into();
+    app.config.deployment_type = Some(Deployment::Local);
     advance_to(&mut app, WizardStep::Protocol);
 
     // TSP is on by default; Space turns it off and on again.
@@ -853,10 +854,10 @@ fn deployment_defaults_set_correctly() {
     app.selection_index = 0;
     app.select_current();
 
-    assert_eq!(app.config.deployment_type, DEPLOYMENT_LOCAL);
+    assert_eq!(app.config.deployment_type, Some(Deployment::Local));
     assert!(app.config.use_vta);
     assert!(app.config.didcomm_enabled);
-    assert_eq!(app.config.ssl_mode, SSL_NONE);
+    assert_eq!(app.config.ssl_mode, Some(SslMode::None));
     assert_eq!(app.config.database_url, DEFAULT_REDIS_URL);
 }
 
@@ -930,7 +931,7 @@ fn keystorage_file_backend_walks_gate_then_path_then_encrypt_choice() {
     // string:// were dropped from the selection list.
     app.selection_index = 6; // file:// (k8s inserted at 5)
     app.select_current();
-    assert_eq!(app.config.secret_storage, STORAGE_FILE);
+    assert_eq!(app.config.secret_storage, Some(SecretScheme::File));
     assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::FileGate));
     assert_eq!(app.mode, InputMode::TextInput);
 
@@ -1105,7 +1106,7 @@ fn keystorage_file_backend_gate_rejection_clears_choice() {
     app.text_input = Input::new("yes".into());
     app.confirm_text_input();
 
-    assert!(app.config.secret_storage.is_empty());
+    assert!(app.config.secret_storage.is_none());
     assert!(!app.in_key_storage_subflow());
     assert_eq!(app.current_step, WizardStep::KeyStorage);
 }
@@ -1146,7 +1147,7 @@ fn keystorage_k8s_backend_walks_namespace_then_secret_name() {
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 5; // Kubernetes Secrets (k8s://)
     app.select_current();
-    assert_eq!(app.config.secret_storage, STORAGE_K8S);
+    assert_eq!(app.config.secret_storage, Some(SecretScheme::K8s));
     assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::K8sNamespace));
 
     app.text_input = Input::new("affinidi".into());
@@ -1267,7 +1268,7 @@ fn keystorage_gcp_enters_project_then_namespace_subflow() {
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 2; // GCP
     app.select_current();
-    assert_eq!(app.config.secret_storage, STORAGE_GCP);
+    assert_eq!(app.config.secret_storage, Some(SecretScheme::Gcp));
     assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::GcpProject));
 
     app.text_input = Input::new("my-prod-project".into());
@@ -1291,7 +1292,7 @@ fn keystorage_azure_enters_single_vault_subflow() {
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 3; // Azure
     app.select_current();
-    assert_eq!(app.config.secret_storage, STORAGE_AZURE);
+    assert_eq!(app.config.secret_storage, Some(SecretScheme::Azure));
     assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::AzureVault));
 
     app.text_input = Input::new("my-vault".into());
@@ -1311,7 +1312,7 @@ fn keystorage_vault_enters_endpoint_then_mount_subflow() {
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 4; // Vault
     app.select_current();
-    assert_eq!(app.config.secret_storage, STORAGE_VAULT);
+    assert_eq!(app.config.secret_storage, Some(SecretScheme::Vault));
     assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::VaultEndpoint));
 
     app.text_input = Input::new("vault.internal:8200".into());
@@ -1764,11 +1765,11 @@ fn vta_yes_then_online_enters_subflow() {
     assert_eq!(app.vta_phase(), Some(&ConnectPhase::EnterDid));
     assert_eq!(app.mode, InputMode::TextInput);
     assert!(app.config.use_vta);
-    assert_eq!(app.config.vta_mode, VTA_MODE_ONLINE);
-    assert_eq!(app.config.did_method, DID_VTA);
+    assert_eq!(app.config.vta_mode, Some(VtaMode::Online));
+    assert_eq!(app.config.did_method, Some(DidMethod::Vta));
     // `secret_storage` is owned by the earlier KeyStorage step — the Vta
     // step deliberately doesn't override whatever was chosen there.
-    assert_eq!(app.config.admin_did_mode, ADMIN_VTA);
+    assert_eq!(app.config.admin_did_mode, Some(AdminMode::Vta));
 }
 
 #[test]
@@ -2009,12 +2010,13 @@ fn vta_sealed_handoff_sets_defaults_and_enters_subflow() {
     pick_admin_only_sealed(&mut app);
     assert_eq!(app.current_step, WizardStep::Vta);
     assert!(app.config.use_vta);
-    assert_eq!(app.config.vta_mode, VTA_MODE_SEALED);
+    assert_eq!(app.config.vta_mode, Some(VtaMode::SealedMint));
     assert_ne!(
-        app.config.did_method, DID_VTA,
+        app.config.did_method,
+        Some(DidMethod::Vta),
         "AdminOnly keeps operator's own DID choice (not forced to VTA)",
     );
-    assert_eq!(app.config.admin_did_mode, ADMIN_VTA);
+    assert_eq!(app.config.admin_did_mode, Some(AdminMode::Vta));
     assert!(app.in_sealed_handoff_subflow());
 }
 
@@ -2024,7 +2026,7 @@ fn vta_no_clears_vta_options() {
     app.selection_index = 0;
     app.select_current(); // Deployment → KeyStorage (sets VTA defaults)
     advance_to(&mut app, WizardStep::Vta);
-    assert_eq!(app.config.did_method, DID_VTA);
+    assert_eq!(app.config.did_method, Some(DidMethod::Vta));
 
     // Select "No VTA" (index 3 — order: FullSetup, AdminOnly,
     // OfflineExport, No VTA).
@@ -2035,8 +2037,8 @@ fn vta_no_clears_vta_options() {
     // apply_vta_defaults should have switched the DID method + admin
     // mode to non-VTA; `secret_storage` is now chosen in the earlier
     // KeyStorage step and intentionally not touched by Vta.
-    assert_eq!(app.config.did_method, DID_PEER);
-    assert!(app.config.vta_mode.is_empty());
+    assert_eq!(app.config.did_method, Some(DidMethod::Peer));
+    assert!(app.config.vta_mode.is_none());
 }
 
 #[test]
@@ -2051,13 +2053,13 @@ fn did_options_exclude_vta_when_disabled() {
 #[test]
 fn did_options_include_vta_when_full_setup_intent_chosen() {
     // The "Configure via VTA" option only appears for the
-    // FullSetup intent, signalled by `did_method == DID_VTA`
+    // FullSetup intent, signalled by `did_method == DidMethod::Vta`
     // after `apply_vta_defaults` ran. AdminOnly keeps
     // `use_vta == true` but clears `did_method` so the operator
     // picks a local DID method.
     let mut app = WizardApp::new("test.toml".into());
     app.config.use_vta = true;
-    app.config.did_method = DID_VTA.into();
+    app.config.did_method = Some(DidMethod::Vta);
     app.current_step = WizardStep::Did;
     let opts = app.current_options();
     assert_eq!(opts.len(), 3); // VTA, webvh, peer (no import: #173)
@@ -2067,7 +2069,7 @@ fn did_options_include_vta_when_full_setup_intent_chosen() {
 fn did_options_hide_vta_when_admin_only_intent_chosen() {
     let mut app = WizardApp::new("test.toml".into());
     app.config.use_vta = true;
-    app.config.did_method = DID_PEER.into();
+    app.config.did_method = Some(DidMethod::Peer);
     app.current_step = WizardStep::Did;
     let opts = app.current_options();
     // AdminOnly — operator picks their own DID method; the
@@ -2096,7 +2098,7 @@ fn vta_intent_offline_export_skips_transport_phase() {
     app.selection_index = 2; // OfflineExport
     app.select_current();
     assert_eq!(app.vta_intent_choice, Some(VtaIntent::OfflineExport));
-    assert_eq!(app.config.vta_mode, VTA_MODE_EXPORT);
+    assert_eq!(app.config.vta_mode, Some(VtaMode::SealedExport));
     assert!(app.config.use_vta);
     // SelectTransport is bypassed.
     assert_eq!(app.vta_step_phase, VtaStepPhase::SelectIntent);
@@ -2156,7 +2158,7 @@ fn vta_full_setup_offline_enters_sealed_subflow_with_correct_intent() {
         crate::sealed_handoff::SealedPhase::CollectContext
     );
     assert!(app.vta_stub_notice.is_none());
-    assert_eq!(app.config.vta_mode, VTA_MODE_SEALED);
+    assert_eq!(app.config.vta_mode, Some(VtaMode::SealedMint));
 }
 
 #[test]
@@ -2177,7 +2179,7 @@ fn vta_admin_only_online_enters_vta_subflow_with_correct_intent() {
     let st = app.vta_connect.as_ref().unwrap();
     assert_eq!(st.intent, VtaIntent::AdminOnly);
     assert_eq!(st.phase, ConnectPhase::EnterDid);
-    assert_eq!(app.config.vta_mode, VTA_MODE_ONLINE);
+    assert_eq!(app.config.vta_mode, Some(VtaMode::Online));
 }
 
 #[test]
@@ -2404,7 +2406,7 @@ async fn webvh_path_back_nav_returns_to_picker_without_losing_path() {
 /// Drive the wizard to the point where online FullSetup has
 /// received a synthetic `Connected` event with a full provision
 /// reply. Leaves `current_step == Vta`, phase `Connected`,
-/// `vta_session` populated, `did_method = DID_VTA`. Callers
+/// `vta_session` populated, `did_method = DidMethod::Vta`. Callers
 /// typically immediately `select_current()` to advance past the
 /// Vta step.
 fn prime_full_setup_connected() -> WizardApp {
@@ -2439,7 +2441,7 @@ fn prime_full_setup_connected() -> WizardApp {
 async fn did_step_auto_skipped_on_full_setup_online() {
     // After VTA FullSetup provisions the DID, the Did step has
     // nothing left for the operator to decide — apply_vta_defaults
-    // already pinned did_method = DID_VTA and vta_session carries
+    // already pinned did_method = DidMethod::Vta and vta_session carries
     // the rendered DID doc + keys. `advance` should jump straight
     // from Protocol to Security (the step after Did).
     let mut app = prime_full_setup_connected();
@@ -2460,12 +2462,12 @@ fn admin_options_exclude_vta_on_offline_export() {
     // key across two trust scopes, so the "Generate admin DID
     // from VTA" option must NOT appear in the Admin step
     // picker for this intent — and the default mode must be
-    // ADMIN_GENERATE, not ADMIN_VTA.
+    // AdminMode::Generate, not AdminMode::Vta.
     let mut app = WizardApp::new("test.toml".into());
     app.config.use_vta = true;
     app.vta_intent_choice = Some(VtaIntent::OfflineExport);
     app.apply_vta_defaults();
-    assert_eq!(app.config.admin_did_mode, ADMIN_GENERATE);
+    assert_eq!(app.config.admin_did_mode, Some(AdminMode::Generate));
 
     assert!(!app.admin_options_include_vta());
 
@@ -2484,7 +2486,7 @@ fn admin_options_include_vta_on_full_setup() {
     app.config.use_vta = true;
     app.vta_intent_choice = Some(VtaIntent::FullSetup);
     app.apply_vta_defaults();
-    assert_eq!(app.config.admin_did_mode, ADMIN_VTA);
+    assert_eq!(app.config.admin_did_mode, Some(AdminMode::Vta));
     assert!(app.admin_options_include_vta());
 
     app.current_step = WizardStep::Admin;
@@ -2532,7 +2534,7 @@ fn did_step_auto_skipped_on_offline_export() {
 
     let mut app = WizardApp::new("test.toml".into());
     app.config.use_vta = true;
-    app.config.did_method = DID_VTA.into();
+    app.config.did_method = Some(DidMethod::Vta);
     app.vta_session = Some(VtaSession::context_export("mediator-local".into(), bundle));
 
     // Predicate must fire with the ContextExport shape too —
@@ -2541,7 +2543,7 @@ fn did_step_auto_skipped_on_offline_export() {
     app.current_step = WizardStep::Did;
     assert!(
         app.should_auto_skip_step(),
-        "OfflineExport session with did_method=DID_VTA must auto-skip the Did step"
+        "OfflineExport session with did_method=Some(DidMethod::Vta) must auto-skip the Did step"
     );
 }
 
@@ -2560,7 +2562,7 @@ async fn did_step_back_nav_skips_past_on_full_setup_online() {
 #[test]
 fn did_step_not_skipped_without_vta_session() {
     // Sanity: the skip predicate requires all three of
-    // `use_vta`, `did_method == DID_VTA`, and a Full provision
+    // `use_vta`, `did_method == DidMethod::Vta`, and a Full provision
     // reply on `vta_session`. Without a VTA session (e.g. No-VTA
     // path, or mid-flow before provisioning succeeds) the Did
     // step must still appear.
@@ -2580,16 +2582,16 @@ fn every_table_entry_round_trips_through_its_default_index() {
         app.current_step = WizardStep::KeyStorage;
         app.selection_index = i;
         app.select_current();
-        assert_eq!(app.config.secret_storage, choice.value);
+        assert_eq!(app.config.secret_storage, Some(choice.value));
         app.current_step = WizardStep::KeyStorage;
-        assert_eq!(app.default_selection_index(), i, "{}", choice.value);
+        assert_eq!(app.default_selection_index(), i, "{:?}", choice.value);
         assert_eq!(app.current_options()[i].label, choice.label);
     }
     for (i, choice) in DEPLOYMENT_CHOICES.iter().enumerate() {
         let mut app = WizardApp::new("test.toml".into());
         app.selection_index = i;
         app.select_current();
-        assert_eq!(app.config.deployment_type, choice.value);
+        assert_eq!(app.config.deployment_type, Some(choice.value));
         app.current_step = WizardStep::Deployment;
         assert_eq!(app.default_selection_index(), i);
     }
@@ -2598,21 +2600,21 @@ fn every_table_entry_round_trips_through_its_default_index() {
         app.current_step = WizardStep::Security;
         app.selection_index = i;
         app.select_current();
-        assert_eq!(app.config.ssl_mode, choice.value);
+        assert_eq!(app.config.ssl_mode, Some(choice.value));
         assert_eq!(app.default_selection_index(), i);
     }
     for use_vta in [false, true] {
         let mut app = WizardApp::new("test.toml".into());
         app.config.use_vta = use_vta;
-        app.config.did_method = DID_VTA.into();
+        app.config.did_method = Some(DidMethod::Vta);
         for (i, choice) in app.did_choices().iter().enumerate() {
             let mut app = WizardApp::new("test.toml".into());
             app.config.use_vta = use_vta;
-            app.config.did_method = DID_VTA.into();
+            app.config.did_method = Some(DidMethod::Vta);
             app.current_step = WizardStep::Did;
             app.selection_index = i;
             app.select_current();
-            assert_eq!(app.config.did_method, choice.value);
+            assert_eq!(app.config.did_method, Some(choice.value));
             app.current_step = WizardStep::Did;
             // The highlight lands on the chosen method (the VTA row
             // itself comes and goes with it).
@@ -2625,7 +2627,7 @@ fn every_table_entry_round_trips_through_its_default_index() {
             a.current_step = WizardStep::Admin;
             a.selection_index = i;
             a.select_current();
-            assert_eq!(a.config.admin_did_mode, choice.value);
+            assert_eq!(a.config.admin_did_mode, Some(choice.value));
             a.current_step = WizardStep::Admin;
             assert_eq!(a.default_selection_index(), i);
         }
@@ -2637,10 +2639,10 @@ fn returning_to_key_storage_after_file_highlights_file_not_k8s() {
     // Regression: the default-index table had `file:// => 5`, the
     // Kubernetes row; Enter there switched the backend.
     let mut app = WizardApp::new("test.toml".into());
-    app.config.secret_storage = STORAGE_FILE.into();
+    app.config.secret_storage = Some(SecretScheme::File);
     app.current_step = WizardStep::KeyStorage;
     let idx = app.default_selection_index();
-    assert_eq!(KEY_STORAGE_CHOICES[idx].value, STORAGE_FILE);
+    assert_eq!(KEY_STORAGE_CHOICES[idx].value, SecretScheme::File);
 }
 
 #[test]
@@ -2658,7 +2660,7 @@ fn no_vta_is_highlighted_for_a_non_vta_setup() {
 fn re_editing_the_certificate_path_does_not_overwrite_the_key() {
     let mut app = WizardApp::new("test.toml".into());
     app.current_step = WizardStep::Security;
-    app.selection_index = index_of_str(&SSL_CHOICES, SSL_EXISTING).unwrap();
+    app.selection_index = index_of(&SSL_CHOICES, SslMode::Existing).unwrap();
     app.select_current();
     app.text_input = Input::new("/tls/a.pem".into());
     app.confirm_text_input();
@@ -2668,7 +2670,7 @@ fn re_editing_the_certificate_path_does_not_overwrite_the_key() {
 
     // Back on the SSL list, re-pick "existing" and change the cert.
     app.security_phase = None;
-    app.selection_index = index_of_str(&SSL_CHOICES, SSL_EXISTING).unwrap();
+    app.selection_index = index_of(&SSL_CHOICES, SslMode::Existing).unwrap();
     app.select_current();
     app.text_input = Input::new("/tls/b.pem".into());
     app.confirm_text_input();
@@ -2685,7 +2687,7 @@ fn re_editing_the_certificate_path_does_not_overwrite_the_key() {
 fn empty_required_inputs_say_why() {
     let mut app = WizardApp::new("test.toml".into());
     app.current_step = WizardStep::KeyStorage;
-    app.config.secret_storage = STORAGE_GCP.into();
+    app.config.secret_storage = Some(SecretScheme::Gcp);
     app.enter_key_storage_phase(KeyStoragePhase::GcpProject);
     app.text_input = Input::new(String::new());
     app.confirm_text_input();
@@ -2754,7 +2756,7 @@ fn deployment_info_matches_the_applied_defaults() {
 fn pasting_an_admin_did_is_a_real_prompt() {
     let mut app = WizardApp::new("test.toml".into());
     app.current_step = WizardStep::Admin;
-    app.selection_index = index_of_str(&app.admin_choices(), ADMIN_PASTE).unwrap();
+    app.selection_index = index_of(&app.admin_choices(), AdminMode::Paste).unwrap();
     app.select_current();
     assert_eq!(app.mode, InputMode::TextInput);
     assert_eq!(app.current_step, WizardStep::Admin);
@@ -2767,18 +2769,8 @@ fn pasting_an_admin_did_is_a_real_prompt() {
     app.text_input = Input::new("did:key:z6MkPasted".into());
     app.confirm_text_input();
     assert_eq!(app.config.admin_did, "did:key:z6MkPasted");
-    assert_eq!(app.config.admin_did_mode, ADMIN_PASTE);
+    assert_eq!(app.config.admin_did_mode, Some(AdminMode::Paste));
     assert_eq!(app.current_step, WizardStep::Output);
-}
-
-#[test]
-fn did_import_is_not_offered() {
-    for use_vta in [false, true] {
-        let mut app = WizardApp::new("test.toml".into());
-        app.config.use_vta = use_vta;
-        app.config.did_method = DID_VTA.into();
-        assert!(app.did_choices().iter().all(|c| c.value != DID_IMPORT));
-    }
 }
 
 // ── #158: quitting with a session, Esc during a flight ────────────
@@ -2851,7 +2843,7 @@ async fn key_storage_checks_the_backend_before_moving_on() {
     let mut app = WizardApp::new("test.toml".into());
     app.live_backend = true;
     app.current_step = WizardStep::KeyStorage;
-    app.config.secret_storage = STORAGE_FILE.into();
+    app.config.secret_storage = Some(SecretScheme::File);
     app.config.secret_file_path = secrets.to_string_lossy().into_owned();
     app.advance();
     assert!(app.backend_check_running());
@@ -2883,16 +2875,16 @@ async fn key_storage_checks_the_backend_before_moving_on() {
 #[test]
 fn every_secret_backend_maps_to_its_build_feature() {
     for (scheme, feature) in [
-        (STORAGE_KEYRING, Some("secrets-keyring")),
-        (STORAGE_AWS, Some("secrets-aws")),
-        (STORAGE_GCP, Some("secrets-gcp")),
-        (STORAGE_AZURE, Some("secrets-azure")),
-        (STORAGE_VAULT, Some("secrets-vault")),
-        (STORAGE_K8S, Some("secrets-k8s")),
-        (STORAGE_FILE, None),
+        (SecretScheme::Keyring, Some("secrets-keyring")),
+        (SecretScheme::Aws, Some("secrets-aws")),
+        (SecretScheme::Gcp, Some("secrets-gcp")),
+        (SecretScheme::Azure, Some("secrets-azure")),
+        (SecretScheme::Vault, Some("secrets-vault")),
+        (SecretScheme::K8s, Some("secrets-k8s")),
+        (SecretScheme::File, None),
     ] {
         let config = WizardConfig {
-            secret_storage: scheme.into(),
+            secret_storage: Some(scheme),
             ..WizardConfig::default()
         };
         let features = config.cargo_features();
@@ -2901,22 +2893,22 @@ fn every_secret_backend_maps_to_its_build_feature() {
             .filter(|f| f.starts_with("secrets-"))
             .collect();
         match feature {
-            Some(f) => assert_eq!(secret_features, vec![&f], "{scheme}"),
-            None => assert!(secret_features.is_empty(), "{scheme}"),
+            Some(f) => assert_eq!(secret_features, vec![&f], "{scheme:?}"),
+            None => assert!(secret_features.is_empty(), "{scheme:?}"),
         }
     }
     // And the table offers no backend the mapping misses.
     for choice in KEY_STORAGE_CHOICES {
         assert!(
-            choice.value == STORAGE_FILE
+            choice.value == SecretScheme::File
                 || WizardConfig {
-                    secret_storage: choice.value.into(),
+                    secret_storage: Some(choice.value),
                     ..WizardConfig::default()
                 }
                 .cargo_features()
                 .iter()
                 .any(|f| f.starts_with("secrets-")),
-            "{} has no build feature",
+            "{:?} has no build feature",
             choice.value
         );
     }
@@ -2925,9 +2917,9 @@ fn every_secret_backend_maps_to_its_build_feature() {
 #[test]
 fn keyring_is_flagged_for_containers() {
     let mut app = WizardApp::new("test.toml".into());
-    app.config.deployment_type = DEPLOYMENT_CONTAINER.into();
+    app.config.deployment_type = Some(Deployment::Container);
     app.current_step = WizardStep::KeyStorage;
-    let idx = index_of_str(&KEY_STORAGE_CHOICES, STORAGE_KEYRING).unwrap();
+    let idx = index_of(&KEY_STORAGE_CHOICES, SecretScheme::Keyring).unwrap();
     assert!(
         app.current_options()[idx]
             .label

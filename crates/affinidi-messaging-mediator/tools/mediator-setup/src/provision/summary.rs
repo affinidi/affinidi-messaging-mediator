@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::app;
-use crate::consts::*;
+use crate::app::{AdminMode, SecretScheme, SslMode};
 use crate::provision::MintedArtefacts;
 use crate::{config_writer, vta};
 
@@ -31,7 +31,7 @@ pub(crate) fn print_completion_summary(
         out!("  \x1b[32m\u{2714}\x1b[0m Admin DID: \x1b[36m{did}\x1b[0m");
         let key = match (&artefacts.admin_secret, vta_session) {
             (Some(secret), _) => secret.get_private_keymultibase().ok(),
-            (None, Some(session)) if config.admin_did_mode == ADMIN_VTA => {
+            (None, Some(session)) if config.admin_did_mode == Some(AdminMode::Vta) => {
                 Some(session.admin_private_key_mb().to_string())
             }
             _ => None,
@@ -41,14 +41,14 @@ pub(crate) fn print_completion_summary(
         }
     }
 
-    if config.secret_storage == STORAGE_FILE {
+    if config.secret_storage == Some(SecretScheme::File) {
         out!(
             "  \x1b[32m\u{2714}\x1b[0m Secrets: \x1b[1m{}\x1b[0m",
             config.secret_file_path
         );
     }
 
-    if config.ssl_mode == SSL_SELF_SIGNED {
+    if config.ssl_mode == Some(SslMode::SelfSigned) {
         out!(
             "  \x1b[32m\u{2714}\x1b[0m SSL certificates: {}",
             conf_dir.join("keys").display()

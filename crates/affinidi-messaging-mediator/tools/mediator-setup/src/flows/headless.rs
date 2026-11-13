@@ -4,24 +4,26 @@
 use std::path::Path;
 
 use crate::app::WizardConfig;
+use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
 use crate::cli::Args;
 use crate::consts::*;
 use crate::flows::print_banner;
 use crate::install::{install_or_print_commands, print_final_summary};
 use crate::provision::{GenerateOptions, generate_and_write_with};
+use crate::ui::labels::label_of;
 use crate::{bootstrap_headless, config_writer, exit, headless, recipe, secret_backend, vta};
 
 /// A human description of what the admin choice will produce.
 pub(crate) fn admin_summary(config: &WizardConfig) -> String {
-    match config.admin_did_mode.as_str() {
-        ADMIN_SKIP => "Skip (no admin DID)".into(),
-        ADMIN_PASTE => format!("Existing DID {}", config.admin_did),
-        ADMIN_VTA => "VTA-issued credential (also the mediator↔VTA credential)".into(),
-        ADMIN_GENERATE if config.use_vta => {
+    match config.admin_did_mode {
+        Some(AdminMode::Skip) => "Skip (no admin DID)".into(),
+        Some(AdminMode::Paste) => format!("Existing DID {}", config.admin_did),
+        Some(AdminMode::Vta) => "VTA-issued credential (also the mediator↔VTA credential)".into(),
+        Some(AdminMode::Generate) if config.use_vta => {
             "Generate did:key (separate from the VTA credential)".into()
         }
-        ADMIN_GENERATE => "Generate did:key".into(),
-        _ => "None".into(),
+        Some(AdminMode::Generate) => "Generate did:key".into(),
+        None => "None".into(),
     }
 }
 
@@ -39,24 +41,33 @@ pub(crate) fn network_summary(config: &WizardConfig) -> String {
 /// Print the shared "what we're about to generate" summary used by every
 /// headless entry point, so they stay consistent.
 pub(crate) fn print_config_summary(config: &WizardConfig) {
-    out!("  Deployment:   {}", config.deployment_type);
+    out!(
+        "  Deployment:   {}",
+        label_of(config.deployment_type, Deployment::label)
+    );
     out!(
         "  VTA:          {}",
         if config.use_vta {
-            format!("Enabled ({})", config.vta_mode)
+            format!("Enabled ({})", label_of(config.vta_mode, VtaMode::as_str))
         } else {
             "Disabled".into()
         }
     );
     out!("  Protocol:     {}", config.protocol_display());
-    out!("  DID method:   {}", config.did_method);
+    out!(
+        "  DID method:   {}",
+        label_of(config.did_method, DidMethod::label)
+    );
     out!(
         "  Key storage:  {}",
         affinidi_messaging_mediator_common::redact::redact_url(&config_writer::build_backend_url(
             config
         ))
     );
-    out!("  SSL/TLS:      {}", config.ssl_mode);
+    out!(
+        "  SSL/TLS:      {}",
+        label_of(config.ssl_mode, SslMode::label)
+    );
     if config.storage_backend == STORAGE_BACKEND_FJALL {
         out!("  Storage:      fjall ({})", config.fjall_data_dir);
     } else {
@@ -101,7 +112,9 @@ pub(crate) fn apply_database_url_env(config: &mut WizardConfig) -> anyhow::Resul
 /// Warnings about choices that are legal but likely wrong for the
 /// deployment type.
 pub(crate) fn print_deployment_warnings(config: &WizardConfig) {
-    if config.deployment_type == DEPLOYMENT_CONTAINER && config.secret_storage == STORAGE_KEYRING {
+    if config.deployment_type == Some(Deployment::Container)
+        && config.secret_storage == Some(SecretScheme::Keyring)
+    {
         err!(
             "  \x1b[33mWarning:\x1b[0m keyring:// is the OS keyring of the machine running \
              the wizard; a container has none. The mediator in the container will not find \
@@ -137,11 +150,7 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
     out!();
 
     let force_reprovision = args.force_reprovision;
-    let sealed = config.use_vta
-        && matches!(
-            config.vta_mode.as_str(),
-            VTA_MODE_SEALED_MINT | VTA_MODE_SEALED_EXPORT
-        );
+    let sealed = config.use_vta && config.vta_mode.is_some_and(VtaMode::is_sealed);
     if args.bundle.is_some() && !sealed {
         anyhow::bail!(
             "--bundle is phase 2 of a sealed handoff, but this recipe is not a sealed one \
@@ -156,10 +165,13 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
                  handoff. Use a recipe with vta_mode = \"sealed-mint\" (or \"sealed-export\"), \
                  the --setup-key-out / --setup-key-file pair (admin credential only, with \
                  --did-method peer|webvh), or the interactive wizard.",
-                if config.did_method == DID_VTA {
+                if config.did_method == Some(DidMethod::Vta) {
                     "A VTA-managed mediator DID".to_string()
                 } else {
-                    format!("vta_mode = \"{}\"", config.vta_mode)
+                    format!(
+                        "vta_mode = \"{}\"",
+                        label_of(config.vta_mode, VtaMode::as_str)
+                    )
                 }
             ),
         ));
@@ -246,7 +258,7 @@ pub(crate) async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow
     // flag mistake costs nothing on the VTA side.
     let built = headless::build(args, headless::Mode::SetupKey)?;
     let mut config = recipe::to_wizard_config(&built.recipe)?;
-    if config.did_method == DID_VTA {
+    if config.did_method == Some(DidMethod::Vta) {
         return Err(exit::error(
             exit::NO_VTA_SESSION,
             "--setup-key-file obtains an admin credential only; the mediator brings its own \
@@ -255,7 +267,7 @@ pub(crate) async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow
         ));
     }
     config.use_vta = true;
-    config.vta_mode = VTA_MODE_ONLINE.into();
+    config.vta_mode = Some(VtaMode::Online);
     if let Some(ctx) = &args.vta_context {
         config.vta_context = ctx.clone();
     }

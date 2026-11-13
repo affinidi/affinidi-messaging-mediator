@@ -14,7 +14,7 @@ use ratatui::crossterm::{
 };
 
 use crate::app::{self, WizardConfig};
-use crate::consts::*;
+use crate::app::{Deployment, DidMethod, SecretScheme, SslMode};
 use crate::flows::headless::network_summary;
 use crate::{config_writer, reprovision};
 
@@ -435,7 +435,7 @@ pub(crate) fn print_final_summary(config: &app::WizardConfig, recipe_saved: bool
         );
     }
 
-    if config.secret_storage == STORAGE_FILE {
+    if config.secret_storage == Some(SecretScheme::File) {
         // The unified backend writes to the operator's configured
         // `[secrets].storage` path — show that, not a hard-coded
         // `<config_dir>/secrets.json`.
@@ -445,12 +445,12 @@ pub(crate) fn print_final_summary(config: &app::WizardConfig, recipe_saved: bool
         );
     }
 
-    if config.ssl_mode == SSL_SELF_SIGNED {
+    if config.ssl_mode == Some(SslMode::SelfSigned) {
         out!("    \x1b[36mkeys/end.cert\x1b[0m  — SSL certificate (beside mediator.toml)");
         out!("    \x1b[36mkeys/end.key\x1b[0m   — SSL private key (beside mediator.toml)");
     }
 
-    if config.did_method == DID_WEBVH {
+    if config.did_method == Some(DidMethod::Webvh) {
         let did_log_path = config_dir.join("did.jsonl");
         out!(
             "    \x1b[36m{}\x1b[0m  — did:webvh log entry",
@@ -458,7 +458,7 @@ pub(crate) fn print_final_summary(config: &app::WizardConfig, recipe_saved: bool
         );
     }
 
-    if config.deployment_type == DEPLOYMENT_CONTAINER {
+    if config.deployment_type == Some(Deployment::Container) {
         out!(
             "    \x1b[36m{}\x1b[0m  — container build file",
             config_dir.join("Dockerfile").display()
@@ -474,7 +474,7 @@ pub(crate) fn print_final_summary(config: &app::WizardConfig, recipe_saved: bool
     );
 
     // Key information
-    if config.secret_storage != STORAGE_FILE {
+    if config.secret_storage != Some(SecretScheme::File) {
         out!();
         out!("  \x1b[1mSecrets:\x1b[0m");
         out!(

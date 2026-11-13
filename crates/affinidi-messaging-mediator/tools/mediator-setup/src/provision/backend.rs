@@ -198,7 +198,7 @@ pub(crate) async fn provision_secret_backend(
         artefacts.admin_did.as_ref(),
         artefacts.admin_secret.as_ref(),
     ) {
-        // Self-hosted ADMIN_GENERATE: persist the generated admin key under
+        // Self-hosted AdminMode::Generate: persist the generated admin key under
         // the same well-known entry VTA-linked runs use, with vta_did /
         // vta_url left `None` so the mediator skips its VTA integration.
         let privkey = secret

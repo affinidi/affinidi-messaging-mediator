@@ -340,7 +340,7 @@ impl WizardApp {
         let _state = self.sealed_handoff.take();
         self.discard_vta_session();
         self.config.use_vta = false;
-        self.config.vta_mode = String::new();
+        self.config.vta_mode = None;
         self.mode = InputMode::Selecting;
         self.text_input = Input::default();
     }

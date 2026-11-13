@@ -3,6 +3,7 @@
 
 use tui_input::Input;
 
+use crate::app::{AdminMode, DidMethod, SecretScheme, SslMode, VtaMode};
 use crate::consts::*;
 use crate::vta::{VtaIntent, VtaTransport};
 
@@ -23,7 +24,7 @@ impl WizardApp {
                 let Some(choice) = DEPLOYMENT_CHOICES.get(self.selection_index) else {
                     return;
                 };
-                self.config.deployment_type = choice.value.into();
+                self.config.deployment_type = Some(choice.value);
                 self.apply_deployment_defaults();
                 self.advance();
             }
@@ -55,7 +56,7 @@ impl WizardApp {
                                 // question is skipped.
                                 self.vta_intent_choice = Some(VtaIntent::OfflineExport);
                                 self.config.use_vta = true;
-                                self.config.vta_mode = VTA_MODE_EXPORT.into();
+                                self.config.vta_mode = Some(VtaMode::SealedExport);
                                 self.apply_vta_defaults();
                                 self.enter_sealed_handoff_subflow(VtaIntent::OfflineExport);
                             }
@@ -63,7 +64,7 @@ impl WizardApp {
                                 self.vta_intent_choice = None;
                                 self.discard_vta_session();
                                 self.config.use_vta = false;
-                                self.config.vta_mode = String::new();
+                                self.config.vta_mode = None;
                                 self.apply_vta_defaults();
                                 self.advance();
                             }
@@ -87,7 +88,7 @@ impl WizardApp {
                                 // authenticates then runs the VP
                                 // round-trip.
                                 self.config.use_vta = true;
-                                self.config.vta_mode = VTA_MODE_ONLINE.into();
+                                self.config.vta_mode = Some(VtaMode::Online);
                                 self.apply_vta_defaults();
                                 self.enter_vta_subflow(VtaIntent::FullSetup);
                             }
@@ -97,7 +98,7 @@ impl WizardApp {
                                 // bundle; wizard extracts fallback admin
                                 // fields.
                                 self.config.use_vta = true;
-                                self.config.vta_mode = VTA_MODE_SEALED.into();
+                                self.config.vta_mode = Some(VtaMode::SealedMint);
                                 self.apply_vta_defaults();
                                 self.enter_sealed_handoff_subflow(VtaIntent::AdminOnly);
                             }
@@ -109,7 +110,7 @@ impl WizardApp {
                                 // that the wizard projects onto a full
                                 // `ProvisionResultV2`.
                                 self.config.use_vta = true;
-                                self.config.vta_mode = VTA_MODE_SEALED.into();
+                                self.config.vta_mode = Some(VtaMode::SealedMint);
                                 self.apply_vta_defaults();
                                 self.enter_sealed_handoff_subflow(VtaIntent::FullSetup);
                             }
@@ -123,7 +124,7 @@ impl WizardApp {
                                 // admin credential (no rotation, no
                                 // provision-integration).
                                 self.config.use_vta = true;
-                                self.config.vta_mode = VTA_MODE_ONLINE.into();
+                                self.config.vta_mode = Some(VtaMode::Online);
                                 self.apply_vta_defaults();
                                 self.enter_vta_subflow(VtaIntent::AdminOnly);
                             }
@@ -179,14 +180,16 @@ impl WizardApp {
                 let Some(choice) = self.did_choices().get(self.selection_index).copied() else {
                     return;
                 };
-                self.config.did_method = choice.value.into();
+                self.config.did_method = Some(choice.value);
                 // did:webvh and a VTA-managed DID both need the mediator URL
                 // for the DID document's service endpoints. Skip the prompt
                 // when a VTA sub-flow already captured it — the mediator DID
                 // has been minted from that value.
                 let url_already_captured =
                     self.vta_session.is_some() && !self.config.public_url.is_empty();
-                if (choice.value == DID_VTA && !url_already_captured) || choice.value == DID_WEBVH {
+                if (choice.value == DidMethod::Vta && !url_already_captured)
+                    || choice.value == DidMethod::Webvh
+                {
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.public_url.clone());
                     return;
@@ -243,16 +246,11 @@ impl WizardApp {
                 let Some(choice) = KEY_STORAGE_CHOICES.get(self.selection_index) else {
                     return;
                 };
-                self.config.secret_storage = choice.value.into();
+                self.config.secret_storage = Some(choice.value);
                 // A new pick clears a failed backend check.
                 self.backend_check = None;
-                // Backend with extra config → enter sub-flow. No extra
-                // config → advance straight away.
-                if let Some(phase) = KeyStoragePhase::first_for(&self.config.secret_storage) {
-                    self.enter_key_storage_phase(phase);
-                } else {
-                    self.advance();
-                }
+                // Every backend has settings to confirm: enter its sub-flow.
+                self.enter_key_storage_phase(KeyStoragePhase::first_for(choice.value));
             }
             WizardStep::Security => {
                 // Four-phase step: SSL → JWT mode → Network mode → CORS
@@ -306,10 +304,10 @@ impl WizardApp {
                 let Some(choice) = SSL_CHOICES.get(self.selection_index) else {
                     return;
                 };
-                self.config.ssl_mode = choice.value.into();
+                self.config.ssl_mode = Some(choice.value);
                 // For existing certs, collect file paths first (certificate,
                 // then key); the JWT phase runs once both are saved.
-                if choice.value == SSL_EXISTING {
+                if choice.value == SslMode::Existing {
                     self.ssl_field = Some(SslField::Cert);
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.ssl_cert_path.clone());
@@ -379,8 +377,8 @@ impl WizardApp {
                 let Some(choice) = self.admin_choices().get(self.selection_index).copied() else {
                     return;
                 };
-                self.config.admin_did_mode = choice.value.into();
-                if choice.value == ADMIN_PASTE {
+                self.config.admin_did_mode = Some(choice.value);
+                if choice.value == AdminMode::Paste {
                     // A real prompt for the DID; `confirm_text_input`
                     // validates it and advances.
                     self.mode = InputMode::TextInput;
@@ -458,7 +456,7 @@ impl WizardApp {
                 // picker entirely — there's no choice left for the
                 // operator to make. did:webvh / import / sealed-handoff
                 // fall through to the straight advance below.
-                if self.config.did_method == DID_VTA && self.vta_session.is_some() {
+                if self.config.did_method == Some(DidMethod::Vta) && self.vta_session.is_some() {
                     self.mode = InputMode::Selecting;
                     self.advance();
                     return;
@@ -467,7 +465,7 @@ impl WizardApp {
                 // before advancing. (VTA-managed webvh DIDs are minted in
                 // the Vta sub-flow above and never reach this prompt; pass
                 // --save-did-web for those.)
-                if self.config.did_method == DID_WEBVH {
+                if self.config.did_method == Some(DidMethod::Webvh) {
                     self.enter_identity_form_choice();
                     return;
                 }
@@ -582,27 +580,24 @@ impl WizardApp {
 
     /// Apply sensible defaults based on deployment type selection.
     pub(super) fn apply_deployment_defaults(&mut self) {
-        match self.config.deployment_type.as_str() {
-            DEPLOYMENT_LOCAL | DEPLOYMENT_SERVER | DEPLOYMENT_CONTAINER => {
-                self.config.use_vta = true;
-                self.config.vta_mode = VTA_MODE_ONLINE.into();
-                self.config.didcomm_enabled = true;
-                self.config.tsp_enabled = true;
-                self.config.did_method = DID_VTA.into();
-                // The unified secret backend is independent of VTA mode —
-                // pick a sensible default per platform; the operator
-                // refines it on the KeyStorage step.
-                self.config.secret_storage = STORAGE_KEYRING.into();
-                self.config.ssl_mode = SSL_NONE.into();
-                self.config.database_url = DEFAULT_REDIS_URL.into();
-                self.config.admin_did_mode = ADMIN_GENERATE.into();
-                // A production deployment starts from the template's
-                // restrictive posture (explicit ACL grants); local stays open.
-                self.config.network_mode =
-                    default_network_mode_for(&self.config.deployment_type).into();
-            }
-            _ => {}
-        }
+        let Some(deployment) = self.config.deployment_type else {
+            return;
+        };
+        self.config.use_vta = true;
+        self.config.vta_mode = Some(VtaMode::Online);
+        self.config.didcomm_enabled = true;
+        self.config.tsp_enabled = true;
+        self.config.did_method = Some(DidMethod::Vta);
+        // The unified secret backend is independent of VTA mode —
+        // pick a sensible default per platform; the operator
+        // refines it on the KeyStorage step.
+        self.config.secret_storage = Some(SecretScheme::Keyring);
+        self.config.ssl_mode = Some(SslMode::None);
+        self.config.database_url = DEFAULT_REDIS_URL.into();
+        self.config.admin_did_mode = Some(AdminMode::Generate);
+        // A production deployment starts from the template's
+        // restrictive posture (explicit ACL grants); local stays open.
+        self.config.network_mode = default_network_mode_for(Some(deployment)).into();
     }
 
     /// Apply or clear VTA-dependent defaults when toggling VTA integration.
@@ -620,15 +615,15 @@ impl WizardApp {
                     // FullSetup deliberately mints a fresh admin DID
                     // as part of `provision_integration`'s admin-DID
                     // rollover — that DID is the intended mediator
-                    // admin handoff, so `ADMIN_VTA` is the correct
+                    // admin handoff, so `AdminMode::Vta` is the correct
                     // default.
                     //
                     // `None` shouldn't happen while `use_vta` is
                     // `true` under the two-question picker, but
                     // fall through to the legacy "VTA supplies
                     // everything" defaults for safety.
-                    self.config.did_method = DID_VTA.into();
-                    self.config.admin_did_mode = ADMIN_VTA.into();
+                    self.config.did_method = Some(DidMethod::Vta);
+                    self.config.admin_did_mode = Some(AdminMode::Vta);
                 }
                 Some(VtaIntent::OfflineExport) => {
                     // OfflineExport mints an admin credential as a
@@ -641,37 +636,37 @@ impl WizardApp {
                     // overloads one key across two scopes.
                     //
                     // Default the mediator's admin-API identity to
-                    // `ADMIN_GENERATE` (fresh did:key) so the two
+                    // `AdminMode::Generate` (fresh did:key) so the two
                     // roles stay separate by default. Operator can
                     // still override at the Admin step if their
                     // deployment warrants reusing the VTA credential.
-                    self.config.did_method = DID_VTA.into();
-                    self.config.admin_did_mode = ADMIN_GENERATE.into();
+                    self.config.did_method = Some(DidMethod::Vta);
+                    self.config.admin_did_mode = Some(AdminMode::Generate);
                 }
                 Some(VtaIntent::AdminOnly) => {
                     // Mediator's integration DID is chosen locally
                     // in the Did step; the VTA only supplies an
-                    // admin credential. Drop any stale DID_VTA
+                    // admin credential. Drop any stale DidMethod::Vta
                     // carry-over from an earlier FullSetup attempt
                     // so the Did step surfaces the real picker.
                     //
-                    // AdminOnly keeps `ADMIN_VTA` because that IS
+                    // AdminOnly keeps `AdminMode::Vta` because that IS
                     // the point of the intent — the VTA is explicitly
                     // asked to supply the mediator's admin identity.
-                    if self.config.did_method == DID_VTA {
-                        self.config.did_method = DID_PEER.into();
+                    if self.config.did_method == Some(DidMethod::Vta) {
+                        self.config.did_method = Some(DidMethod::Peer);
                     }
-                    self.config.admin_did_mode = ADMIN_VTA.into();
+                    self.config.admin_did_mode = Some(AdminMode::Vta);
                 }
             }
         } else {
-            if self.config.did_method == DID_VTA {
-                self.config.did_method = DID_PEER.into();
+            if self.config.did_method == Some(DidMethod::Vta) {
+                self.config.did_method = Some(DidMethod::Peer);
             }
-            if self.config.admin_did_mode == ADMIN_VTA {
-                self.config.admin_did_mode = ADMIN_GENERATE.into();
+            if self.config.admin_did_mode == Some(AdminMode::Vta) {
+                self.config.admin_did_mode = Some(AdminMode::Generate);
             }
-            self.config.vta_mode = String::new();
+            self.config.vta_mode = None;
         }
     }
 }

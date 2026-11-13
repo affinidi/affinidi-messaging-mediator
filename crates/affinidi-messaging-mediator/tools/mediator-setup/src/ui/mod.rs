@@ -2,6 +2,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod info_box;
 pub mod instructions;
+pub mod labels;
 pub mod progress;
 pub mod prompt;
 pub mod recovery;
@@ -15,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
+use crate::app::DidMethod;
 use crate::app::{InputMode, WizardApp};
 
 /// Draw a gradient border around a rect, with colors fading from purple to blue.
@@ -978,8 +980,10 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
             // endpoints. Route both through the compact prompt widget.
             if app.current_step == crate::app::WizardStep::Did
                 && app.did_phase.is_none()
-                && (app.config.did_method == crate::consts::DID_WEBVH
-                    || app.config.did_method == crate::consts::DID_VTA)
+                && matches!(
+                    app.config.did_method,
+                    Some(DidMethod::Webvh | DidMethod::Vta)
+                )
             {
                 prompt::render_prompt(
                     frame,

@@ -2,7 +2,7 @@
 //! its label and help line, and the info-box text.
 
 use super::WizardApp;
-use crate::consts::*;
+use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode};
 use crate::ui::selection::SelectionOption;
 use crate::vta::VtaIntent;
 
@@ -32,14 +32,9 @@ pub fn index_of<T: Copy + PartialEq + 'static>(choices: &[Choice<T>], value: T) 
     choices.iter().position(|c| c.value == value)
 }
 
-/// [`index_of`] for the string-valued tables, comparing with any `&str`.
-pub fn index_of_str(choices: &[Choice<&'static str>], value: &str) -> Option<usize> {
-    choices.iter().position(|c| c.value == value)
-}
-
-pub const DEPLOYMENT_CHOICES: [Choice<&str>; 3] = [
+pub const DEPLOYMENT_CHOICES: [Choice<Deployment>; 3] = [
     Choice {
-        value: DEPLOYMENT_LOCAL,
+        value: Deployment::Local,
         label: "Local development",
         help: "Desktop, quick start — ideal for testing",
         info: "Starts from: VTA online, OS keyring for secrets, no SSL, local Redis, and an \
@@ -47,7 +42,7 @@ pub const DEPLOYMENT_CHOICES: [Choice<&str>; 3] = [
                the following screens.",
     },
     Choice {
-        value: DEPLOYMENT_SERVER,
+        value: Deployment::Server,
         label: "Headless server",
         help: "Production deployment on cloud or bare metal",
         info: "Starts from: VTA online, OS keyring for secrets, no SSL (TLS proxy), local \
@@ -55,7 +50,7 @@ pub const DEPLOYMENT_CHOICES: [Choice<&str>; 3] = [
                grant. Every choice can be changed on the following screens.",
     },
     Choice {
-        value: DEPLOYMENT_CONTAINER,
+        value: Deployment::Container,
         label: "Container",
         help: "Docker image for container orchestration",
         info: "Same defaults as a server (including the closed network), plus a Dockerfile and docker-compose.yml next to \
@@ -65,23 +60,23 @@ pub const DEPLOYMENT_CHOICES: [Choice<&str>; 3] = [
     },
 ];
 
-pub const KEY_STORAGE_CHOICES: [Choice<&str>; 7] = [
+pub const KEY_STORAGE_CHOICES: [Choice<SecretScheme>; 7] = [
     Choice {
-        value: STORAGE_KEYRING,
+        value: SecretScheme::Keyring,
         label: "OS Keyring (keyring://) [recommended for desktop]",
         help: "macOS Keychain, Linux Secret Service, Windows Credential Manager",
         info: "Uses the OS keyring (macOS Keychain, Linux Secret Service, Windows Credential \
                Manager). Good for desktop development and single-host servers.",
     },
     Choice {
-        value: STORAGE_AWS,
+        value: SecretScheme::Aws,
         label: "AWS Secrets Manager (aws_secrets://)",
         help: "AWS cloud production",
         info: "Store secrets in AWS Secrets Manager. Requires AWS credentials configured. \
                Suitable for AWS production.",
     },
     Choice {
-        value: STORAGE_GCP,
+        value: SecretScheme::Gcp,
         label: "Google Cloud Secret Manager (gcp_secrets://)",
         help: "GCP cloud production",
         info: "Store secrets in Google Cloud Secret Manager. Auth via Application Default \
@@ -89,7 +84,7 @@ pub const KEY_STORAGE_CHOICES: [Choice<&str>; 7] = [
                login` / GKE workload identity).",
     },
     Choice {
-        value: STORAGE_AZURE,
+        value: SecretScheme::Azure,
         label: "Azure Key Vault (azure_keyvault://)",
         help: "Azure cloud production",
         info: "Store secrets in Azure Key Vault. Auth via Azure CLI / azd developer \
@@ -97,21 +92,21 @@ pub const KEY_STORAGE_CHOICES: [Choice<&str>; 7] = [
                field.",
     },
     Choice {
-        value: STORAGE_VAULT,
+        value: SecretScheme::Vault,
         label: "HashiCorp Vault (vault://)",
         help: "Enterprise / multi-cloud (KV v2 only); token / Kubernetes / AppRole auth",
         info: "Store secrets in HashiCorp Vault (KV v2): token (VAULT_TOKEN), Kubernetes or \
                AppRole auth. The mount point must already exist on the server.",
     },
     Choice {
-        value: STORAGE_K8S,
+        value: SecretScheme::K8s,
         label: "Kubernetes Secrets (k8s://)",
         help: "Native Secret object via the K8s API (in-cluster ServiceAccount)",
         info: "Store every key in one Kubernetes Secret, through the API with the pod's \
                ServiceAccount (or kubeconfig). The namespace defaults to the ServiceAccount's.",
     },
     Choice {
-        value: STORAGE_FILE,
+        value: SecretScheme::File,
         label: "Local file (file://)",
         help: "Stored in secrets.json — DEV ONLY, requires explicit confirmation",
         info: "Secrets written to a local JSON file, optionally passphrase-encrypted. \
@@ -159,22 +154,22 @@ pub const VTA_INTENT_CHOICES: [Choice<Option<VtaIntent>>; 4] = [
     },
 ];
 
-pub const SSL_CHOICES: [Choice<&str>; 3] = [
+pub const SSL_CHOICES: [Choice<SslMode>; 3] = [
     Choice {
-        value: SSL_NONE,
+        value: SslMode::None,
         label: "No SSL (use TLS-terminating proxy)",
         help: "Recommended: nginx, Caddy, AWS ALB handle TLS",
         info: "Run the mediator behind a reverse proxy (nginx, Caddy, AWS ALB) that terminates \
                TLS. The mediator runs plain HTTP. This is the recommended approach.",
     },
     Choice {
-        value: SSL_EXISTING,
+        value: SslMode::Existing,
         label: "Provide existing certificates",
         help: "Use your own SSL certificate and key files",
         info: "Provide paths to existing SSL certificate and key files.",
     },
     Choice {
-        value: SSL_SELF_SIGNED,
+        value: SslMode::SelfSigned,
         label: "Generate self-signed certificates",
         help: "Local development only — not for production",
         info: "Generate self-signed certificates for local development. Browsers will show \
@@ -182,8 +177,8 @@ pub const SSL_CHOICES: [Choice<&str>; 3] = [
     },
 ];
 
-const DID_CHOICE_VTA: Choice<&str> = Choice {
-    value: DID_VTA,
+const DID_CHOICE_VTA: Choice<DidMethod> = Choice {
+    value: DidMethod::Vta,
     label: "Configure via VTA (recommended)",
     help: "Centralized key management — VTA creates and hosts your DID",
     info: "VTA creates and manages the mediator's DID and keys centrally. Uses the built-in \
@@ -191,8 +186,8 @@ const DID_CHOICE_VTA: Choice<&str> = Choice {
            > custom.json`, edit, then upload under the same name — context/global scope \
            shadows the built-in automatically.",
 };
-const DID_CHOICE_WEBVH: Choice<&str> = Choice {
-    value: DID_WEBVH,
+const DID_CHOICE_WEBVH: Choice<DidMethod> = Choice {
+    value: DidMethod::Webvh,
     label: "Generate did:webvh",
     help: "Production — generates keys you manage yourself; you host did.jsonl",
     info: "did:webvh requires a webvh server (or the mediator itself) to host the DID log. \
@@ -200,38 +195,38 @@ const DID_CHOICE_WEBVH: Choice<&str> = Choice {
            pre-rotation keys are stored in the secret backend so the DID can be updated \
            later.",
 };
-const DID_CHOICE_PEER: Choice<&str> = Choice {
-    value: DID_PEER,
+const DID_CHOICE_PEER: Choice<DidMethod> = Choice {
+    value: DidMethod::Peer,
     label: "Generate did:peer",
     help: "Quick start — generates random keys, no hosting required",
     info: "did:peer is self-contained — no hosting required. Generates random keys that you \
            must back up and manage yourself. Best for local dev and testing.",
 };
 
-const ADMIN_CHOICE_GENERATE: Choice<&str> = Choice {
-    value: ADMIN_GENERATE,
+const ADMIN_CHOICE_GENERATE: Choice<AdminMode> = Choice {
+    value: AdminMode::Generate,
     label: "Generate a new admin did:key",
     help: "A fresh Ed25519 key, separate from any VTA credential",
     info: "Generates a new Ed25519 did:key for the mediator's admin API. Its key is stored in \
            admin-monitor.json (and, without a VTA, in the secret backend). In a VTA setup it \
            is separate from the VTA credential, which stays the mediator↔VTA identity.",
 };
-const ADMIN_CHOICE_PASTE: Choice<&str> = Choice {
-    value: ADMIN_PASTE,
+const ADMIN_CHOICE_PASTE: Choice<AdminMode> = Choice {
+    value: AdminMode::Paste,
     label: "Use an existing admin DID",
     help: "Paste a DID you control (any method)",
     info: "Paste any DID (did:key, did:peer, did:webvh, …) that will administer the \
            mediator. The wizard holds no key for it.",
 };
-const ADMIN_CHOICE_VTA: Choice<&str> = Choice {
-    value: ADMIN_VTA,
+const ADMIN_CHOICE_VTA: Choice<AdminMode> = Choice {
+    value: AdminMode::Vta,
     label: "Use the VTA-issued credential",
     help: "One key for both the VTA credential and the mediator's admin API",
     info: "Reuses the admin DID the VTA issued for this mediator as the admin-API identity. \
            Simpler, but one key then serves two trust scopes (VTA admin and mediator admin).",
 };
-const ADMIN_CHOICE_SKIP: Choice<&str> = Choice {
-    value: ADMIN_SKIP,
+const ADMIN_CHOICE_SKIP: Choice<AdminMode> = Choice {
+    value: AdminMode::Skip,
     label: "Skip for now",
     help: "Configure admin later",
     info: "You can configure the admin DID later by editing mediator.toml or via the admin \
@@ -243,7 +238,7 @@ impl WizardApp {
     /// picked `FullSetup` on the Vta step (the intent where the VTA mints
     /// the integration DID). Importing an existing DID is not offered — the
     /// wizard cannot provision one.
-    pub fn did_choices(&self) -> Vec<Choice<&'static str>> {
+    pub fn did_choices(&self) -> Vec<Choice<DidMethod>> {
         let mut choices = Vec::with_capacity(3);
         if self.config.use_vta && self.shows_vta_did_option() {
             choices.push(DID_CHOICE_VTA);
@@ -254,7 +249,7 @@ impl WizardApp {
 
     /// The Admin step's options, the VTA-credential entry only where the VTA
     /// intends to issue one for the mediator.
-    pub fn admin_choices(&self) -> Vec<Choice<&'static str>> {
+    pub fn admin_choices(&self) -> Vec<Choice<AdminMode>> {
         let mut choices = vec![ADMIN_CHOICE_GENERATE, ADMIN_CHOICE_PASTE];
         if self.admin_options_include_vta() {
             choices.push(ADMIN_CHOICE_VTA);
@@ -285,8 +280,8 @@ impl WizardApp {
     /// from the persisted `did_method` (set by `apply_vta_defaults`
     /// for FullSetup) plus the session state when present.
     pub(super) fn shows_vta_did_option(&self) -> bool {
-        // `did_method == DID_VTA` is the FullSetup signal — AdminOnly
+        // `did_method == DidMethod::Vta` is the FullSetup signal — AdminOnly
         // clears it in `apply_vta_defaults`. `No VTA` also clears it.
-        self.config.did_method == DID_VTA
+        self.config.did_method == Some(DidMethod::Vta)
     }
 }

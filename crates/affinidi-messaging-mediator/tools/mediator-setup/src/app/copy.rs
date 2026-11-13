@@ -1,7 +1,7 @@
 //! Screens and copy: the title, options and info text for the step and
 //! sub-phase on screen.
 
-use crate::consts::*;
+use crate::app::{Deployment, SecretScheme};
 use crate::ui::selection::SelectionOption;
 use crate::vta::{ConnectPhase, VtaIntent};
 
@@ -419,8 +419,8 @@ impl WizardApp {
                 KEY_STORAGE_CHOICES
                     .iter()
                     .map(|c| {
-                        if c.value == STORAGE_KEYRING
-                            && self.config.deployment_type == DEPLOYMENT_CONTAINER
+                        if c.value == SecretScheme::Keyring
+                            && self.config.deployment_type == Some(Deployment::Container)
                         {
                             SelectionOption::new(
                                 "OS Keyring (keyring://) — not available inside a container",

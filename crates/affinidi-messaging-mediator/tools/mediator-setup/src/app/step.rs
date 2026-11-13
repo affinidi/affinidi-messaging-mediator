@@ -1,7 +1,7 @@
 //! The wizard's state machine vocabulary: the steps in order, the input
 //! mode and focus, and each step's sub-phases.
 
-use crate::consts::*;
+use crate::app::SecretScheme;
 
 /// All wizard steps in order.
 ///
@@ -248,7 +248,7 @@ pub enum KeyStoragePhase {
 /// Stored as a constant so tests and the prompt rendering stay in sync.
 pub const FILE_GATE_PHRASE: &str = "I understand";
 
-/// Sub-phases of the `Did` step when `DID_VTA` is selected. After the
+/// Sub-phases of the `Did` step when `DidMethod::Vta` is selected. After the
 /// mediator URL is captured, the wizard asks the operator where the
 /// VTA should publish the DID — pick a registered webvh hosting
 /// service, self-host at the mediator URL, or self-host at a
@@ -332,21 +332,20 @@ pub enum VtaStepPhase {
 }
 
 impl KeyStoragePhase {
-    /// First config phase for the given scheme. `None` means the scheme
-    /// needs no extra config and can advance immediately.
-    pub fn first_for(scheme: &str) -> Option<Self> {
+    /// First config phase for the given scheme. Every backend has at
+    /// least one setting to confirm.
+    pub fn first_for(scheme: SecretScheme) -> Self {
         match scheme {
             // file:// always starts at the hard-gate, never directly at
             // FilePath. This is intentional: skipping the gate means
             // skipping the dev-only acknowledgement.
-            STORAGE_FILE => Some(Self::FileGate),
-            STORAGE_KEYRING => Some(Self::KeyringService),
-            STORAGE_AWS => Some(Self::AwsRegion),
-            STORAGE_GCP => Some(Self::GcpProject),
-            STORAGE_AZURE => Some(Self::AzureVault),
-            STORAGE_VAULT => Some(Self::VaultEndpoint),
-            STORAGE_K8S => Some(Self::K8sNamespace),
-            _ => None,
+            SecretScheme::File => Self::FileGate,
+            SecretScheme::Keyring => Self::KeyringService,
+            SecretScheme::Aws => Self::AwsRegion,
+            SecretScheme::Gcp => Self::GcpProject,
+            SecretScheme::Azure => Self::AzureVault,
+            SecretScheme::Vault => Self::VaultEndpoint,
+            SecretScheme::K8s => Self::K8sNamespace,
         }
     }
 }

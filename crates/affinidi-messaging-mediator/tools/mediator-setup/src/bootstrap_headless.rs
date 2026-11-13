@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::consts::{VTA_MODE_ONLINE, VTA_MODE_SEALED_EXPORT, VTA_MODE_SEALED_MINT};
+use crate::app::VtaMode;
 use crate::sealed_handoff::{SealedHandoffState, SealedPhase};
 use crate::vta::{VtaIntent, VtaSession};
 
@@ -275,7 +275,7 @@ async fn phase1_emit_request(
         );
     }
 
-    let intent = intent_for_mode(&config.vta_mode)?;
+    let intent = intent_for_mode(config.vta_mode)?;
     let mut state = SealedHandoffState::new(
         intent,
         Some(format!("mediator setup — {}", config.vta_context)),
@@ -364,7 +364,7 @@ async fn phase2_apply(
              throwaway dev setup only, --allow-bundle-without-digest skips the check."
         );
     }
-    let intent = intent_for_mode(&config.vta_mode)?;
+    let intent = intent_for_mode(config.vta_mode)?;
 
     let armored = std::fs::read_to_string(bundle_path)
         .map_err(|e| anyhow::anyhow!("could not read bundle '{}': {e}", bundle_path.display()))?;
@@ -440,7 +440,7 @@ async fn phase2_apply(
     // Probe the bundle_id-keyed request filename next to the bundle.
     // Best-effort — we only use this to clean up after a successful
     // apply.
-    let request_path = probe_request_path(bundle_path, &config.vta_mode);
+    let request_path = probe_request_path(bundle_path, config.vta_mode);
 
     info!(
         bundle_id = %bundle_id_hex,
@@ -500,37 +500,33 @@ pub fn cleanup_artifacts(artifacts: &BootstrapArtifacts) {
     }
 }
 
-fn intent_for_mode(vta_mode: &str) -> anyhow::Result<VtaIntent> {
+fn intent_for_mode(vta_mode: Option<VtaMode>) -> anyhow::Result<VtaIntent> {
     match vta_mode {
-        VTA_MODE_SEALED_MINT => Ok(VtaIntent::FullSetup),
-        VTA_MODE_SEALED_EXPORT => Ok(VtaIntent::OfflineExport),
-        VTA_MODE_ONLINE => anyhow::bail!(
+        Some(VtaMode::SealedMint) => Ok(VtaIntent::FullSetup),
+        Some(VtaMode::SealedExport) => Ok(VtaIntent::OfflineExport),
+        Some(VtaMode::Online) => anyhow::bail!(
             "vta_mode = \"online\" is not supported by `--from` yet — the live DIDComm \
              setup requires the `pnm acl create` step which is operator-gated. Use the \
              interactive TUI (`mediator-setup` with no `--from`) for online VTA setup."
         ),
-        "" => anyhow::bail!(
+        None => anyhow::bail!(
             "recipe has use_vta = true but no vta_mode — set deployment.vta_mode to one of \
              \"sealed-mint\", \"sealed-export\", or \"online\""
-        ),
-        other => anyhow::bail!(
-            "unsupported vta_mode '{other}' — expected \"sealed-mint\" or \"sealed-export\" \
-             for headless setup"
         ),
     }
 }
 
-fn default_request_filename(vta_mode: &str) -> &'static str {
+fn default_request_filename(vta_mode: Option<VtaMode>) -> &'static str {
     match vta_mode {
         // sealed-mint produces a VP-framed request (signed VP
         // structure); sealed-export produces the simpler v1 shape.
         // File names match the TUI's convention in `finalize_request`.
-        VTA_MODE_SEALED_MINT => "bootstrap-request-vp.json",
+        Some(VtaMode::SealedMint) => "bootstrap-request-vp.json",
         _ => "bootstrap-request.json",
     }
 }
 
-fn probe_request_path(bundle_path: &Path, vta_mode: &str) -> Option<PathBuf> {
+fn probe_request_path(bundle_path: &Path, vta_mode: Option<VtaMode>) -> Option<PathBuf> {
     let filename = default_request_filename(vta_mode);
     let candidates = [
         bundle_path
@@ -572,34 +568,31 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use crate::app::{SecretScheme, VtaMode};
 
     #[test]
     fn intent_for_mode_maps_canonical_values() {
         assert_eq!(
-            intent_for_mode(VTA_MODE_SEALED_MINT).unwrap(),
+            intent_for_mode(Some(VtaMode::SealedMint)).unwrap(),
             VtaIntent::FullSetup
         );
         assert_eq!(
-            intent_for_mode(VTA_MODE_SEALED_EXPORT).unwrap(),
+            intent_for_mode(Some(VtaMode::SealedExport)).unwrap(),
             VtaIntent::OfflineExport
         );
     }
 
     #[test]
     fn intent_for_mode_rejects_online_with_pointer_at_tui() {
-        let err = intent_for_mode(VTA_MODE_ONLINE).unwrap_err().to_string();
+        let err = intent_for_mode(Some(VtaMode::Online))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("interactive TUI"));
     }
 
     #[test]
-    fn intent_for_mode_rejects_unknown() {
-        let err = intent_for_mode("carrier-pigeon").unwrap_err().to_string();
-        assert!(err.contains("unsupported vta_mode"));
-    }
-
-    #[test]
     fn intent_for_mode_rejects_empty_with_help() {
-        let err = intent_for_mode("").unwrap_err().to_string();
+        let err = intent_for_mode(None).unwrap_err().to_string();
         assert!(err.contains("no vta_mode"));
     }
 
@@ -681,9 +674,9 @@ mod tests {
         let secrets_path = dir.join("secrets.json");
         crate::app::WizardConfig {
             use_vta: true,
-            vta_mode: VTA_MODE_SEALED_EXPORT.into(),
+            vta_mode: Some(VtaMode::SealedExport),
             vta_context: context.into(),
-            secret_storage: crate::consts::STORAGE_FILE.into(),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: secrets_path.to_string_lossy().into_owned(),
             secret_file_encrypted: false,
             ..crate::app::WizardConfig::default()

@@ -4,6 +4,7 @@ use affinidi_secrets_resolver::secrets::Secret;
 use toml_edit::DocumentMut;
 
 use crate::app::WizardConfig;
+use crate::app::{Deployment, SecretScheme, SslMode};
 use crate::consts::*;
 
 /// Generated cryptographic material from the wizard generators.
@@ -68,7 +69,7 @@ fn absolute(path: &Path) -> std::path::PathBuf {
 /// it there).
 pub fn runtime_path(config: &WizardConfig, host_path: &Path) -> String {
     let host = absolute(host_path);
-    if config.deployment_type != DEPLOYMENT_CONTAINER {
+    if config.deployment_type != Some(Deployment::Container) {
         return host.to_string_lossy().into_owned();
     }
     let conf_dir = absolute(&config_dir(config));
@@ -90,7 +91,7 @@ pub fn runtime_file_url(config: &WizardConfig, host_path: &Path) -> String {
 
 /// The host path of the `file://` secrets file, when that is the backend.
 pub fn file_backend_host_path(config: &WizardConfig) -> Option<std::path::PathBuf> {
-    if config.secret_storage != STORAGE_FILE {
+    if config.secret_storage != Some(SecretScheme::File) {
         return None;
     }
     let raw = config.secret_file_path.trim();
@@ -105,7 +106,7 @@ pub fn file_backend_host_path(config: &WizardConfig) -> Option<std::path::PathBu
 /// mounts the secrets file at.
 pub fn runtime_backend_url(config: &WizardConfig) -> String {
     match file_backend_host_path(config) {
-        Some(host) if config.deployment_type == DEPLOYMENT_CONTAINER => {
+        Some(host) if config.deployment_type == Some(Deployment::Container) => {
             let url = format!("file://{}", runtime_path(config, &host));
             if config.secret_file_encrypted {
                 format!("{url}?encrypt=1")
@@ -305,16 +306,16 @@ fn generate_toml(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::
         // `warn` here.
         sec["trust_task_verification"] = toml_edit::value("enforce");
         // SSL
-        match config.ssl_mode.as_str() {
-            SSL_NONE => {
+        match config.ssl_mode {
+            None | Some(SslMode::None) => {
                 sec["use_ssl"] = toml_edit::value("false");
             }
-            SSL_EXISTING => {
+            Some(SslMode::Existing) => {
                 sec["use_ssl"] = toml_edit::value("true");
                 sec["ssl_certificate_file"] = toml_edit::value(&config.ssl_cert_path);
                 sec["ssl_key_file"] = toml_edit::value(&config.ssl_key_path);
             }
-            SSL_SELF_SIGNED => {
+            Some(SslMode::SelfSigned) => {
                 sec["use_ssl"] = toml_edit::value("true");
                 let cert = generated
                     .ssl_cert_path
@@ -323,9 +324,6 @@ fn generate_toml(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::
                 let key = generated.ssl_key_path.as_deref().unwrap_or("keys/end.key");
                 sec["ssl_certificate_file"] = toml_edit::value(cert);
                 sec["ssl_key_file"] = toml_edit::value(key);
-            }
-            _ => {
-                sec["use_ssl"] = toml_edit::value("false");
             }
         }
 
@@ -498,20 +496,27 @@ fn file_backend_url(raw_path: &str, encrypted: bool) -> String {
 /// file — that way provisioning failures surface to the operator rather
 /// than only being discovered when the mediator next boots.
 pub fn build_backend_url(config: &WizardConfig) -> String {
-    match config.secret_storage.as_str() {
-        STORAGE_FILE => file_backend_url(&config.secret_file_path, config.secret_file_encrypted),
-        STORAGE_KEYRING => format!("keyring://{}", config.secret_keyring_service),
-        STORAGE_AWS => format!(
+    let Some(scheme) = config.secret_storage else {
+        // Not chosen yet (a TUI summary before the Key Storage step): the
+        // keyring default the deployment defaults pick.
+        return format!("keyring://{DEFAULT_KEYRING_SERVICE}");
+    };
+    match scheme {
+        SecretScheme::File => {
+            file_backend_url(&config.secret_file_path, config.secret_file_encrypted)
+        }
+        SecretScheme::Keyring => format!("keyring://{}", config.secret_keyring_service),
+        SecretScheme::Aws => format!(
             "aws_secrets://{}/{}",
             config.secret_aws_region, config.secret_aws_namespace
         ),
-        STORAGE_GCP => format!(
+        SecretScheme::Gcp => format!(
             "gcp_secrets://{}/{}",
             config.secret_gcp_project, config.secret_gcp_namespace
         ),
-        STORAGE_AZURE => format!("azure_keyvault://{}", config.secret_azure_vault),
-        STORAGE_VAULT => vault_backend_url(config),
-        STORAGE_K8S => {
+        SecretScheme::Azure => format!("azure_keyvault://{}", config.secret_azure_vault),
+        SecretScheme::Vault => vault_backend_url(config),
+        SecretScheme::K8s => {
             if config.secret_k8s_namespace.is_empty() {
                 format!("k8s://{}", config.secret_k8s_secret_name)
             } else {
@@ -521,13 +526,6 @@ pub fn build_backend_url(config: &WizardConfig) -> String {
                 )
             }
         }
-        // string:// is no longer supported by the mediator's SecretStore
-        // URL parser; fall back to a keyring default and warn in stdout
-        // during `generate_and_write`. The wildcard catches any future
-        // legacy variant that lands here without a dedicated arm —
-        // STORAGE_STRING / STORAGE_VTA are listed explicitly because
-        // they have callers today.
-        _ => "keyring://affinidi-mediator".to_string(),
     }
 }
 
@@ -594,6 +592,7 @@ fn vault_backend_url(config: &WizardConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
 
     // ── build_backend_url parametric coverage ─────────────────────────
     //
@@ -608,7 +607,7 @@ mod tests {
         // three-slash `file:///<abs>` URL — a bare `file://conf/secrets.json`
         // is RFC-malformed (authority=`conf`) and opens `/secrets.json` (#350).
         let cfg = WizardConfig {
-            secret_storage: STORAGE_FILE.into(),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: "conf/secrets.json".into(),
             secret_file_encrypted: false,
             ..WizardConfig::default()
@@ -629,7 +628,7 @@ mod tests {
     #[test]
     fn build_backend_url_file_absolute_passes_through() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_FILE.into(),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: "/var/lib/mediator/secrets.json".into(),
             secret_file_encrypted: false,
             ..WizardConfig::default()
@@ -645,7 +644,7 @@ mod tests {
         // An operator who pastes a full `file://` URL into the path prompt
         // must not get a double-prefixed `file://file:///…`.
         let cfg = WizardConfig {
-            secret_storage: STORAGE_FILE.into(),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: "file:///var/lib/mediator/secrets.json".into(),
             secret_file_encrypted: false,
             ..WizardConfig::default()
@@ -659,7 +658,7 @@ mod tests {
     #[test]
     fn build_backend_url_file_encrypted_appends_query() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_FILE.into(),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: "/var/lib/mediator/secrets.json".into(),
             secret_file_encrypted: true,
             ..WizardConfig::default()
@@ -673,7 +672,7 @@ mod tests {
     #[test]
     fn build_backend_url_keyring() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_KEYRING.into(),
+            secret_storage: Some(SecretScheme::Keyring),
             secret_keyring_service: "affinidi-mediator-prod".into(),
             ..WizardConfig::default()
         };
@@ -683,7 +682,7 @@ mod tests {
     #[test]
     fn build_backend_url_aws_concatenates_region_and_namespace() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_AWS.into(),
+            secret_storage: Some(SecretScheme::Aws),
             secret_aws_region: "us-east-1".into(),
             secret_aws_namespace: "mediator/prod".into(),
             ..WizardConfig::default()
@@ -697,7 +696,7 @@ mod tests {
     #[test]
     fn build_backend_url_gcp_concatenates_project_and_namespace() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_GCP.into(),
+            secret_storage: Some(SecretScheme::Gcp),
             secret_gcp_project: "affinidi-prod".into(),
             secret_gcp_namespace: "mediator-keys".into(),
             ..WizardConfig::default()
@@ -711,7 +710,7 @@ mod tests {
     #[test]
     fn build_backend_url_azure_uses_vault_field() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_AZURE.into(),
+            secret_storage: Some(SecretScheme::Azure),
             secret_azure_vault: "mediator.vault.azure.net".into(),
             ..WizardConfig::default()
         };
@@ -724,7 +723,7 @@ mod tests {
     #[test]
     fn build_backend_url_vault_concatenates_endpoint_and_mount() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.example.com:8200".into(),
             secret_vault_mount: "secret/mediator".into(),
             ..WizardConfig::default()
@@ -740,7 +739,7 @@ mod tests {
         // Explicit token auth (or empty) renders the same compact URL as
         // before — no `?auth=token`.
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.internal".into(),
             secret_vault_mount: "secret/mediator".into(),
             secret_vault_auth: "token".into(),
@@ -755,7 +754,7 @@ mod tests {
     #[test]
     fn build_backend_url_vault_kubernetes_auth() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.internal".into(),
             secret_vault_mount: "secret/mediator".into(),
             secret_vault_auth: "kubernetes".into(),
@@ -774,7 +773,7 @@ mod tests {
     #[test]
     fn build_backend_url_vault_kubernetes_custom_mount_and_insecure() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.internal".into(),
             secret_vault_mount: "secret/mediator".into(),
             secret_vault_auth: "kubernetes".into(),
@@ -792,7 +791,7 @@ mod tests {
     #[test]
     fn build_backend_url_vault_approle_auth() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.internal".into(),
             secret_vault_mount: "secret/mediator".into(),
             secret_vault_auth: "approle".into(),
@@ -808,7 +807,7 @@ mod tests {
     #[test]
     fn build_backend_url_k8s_with_namespace() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_K8S.into(),
+            secret_storage: Some(SecretScheme::K8s),
             secret_k8s_namespace: "affinidi".into(),
             secret_k8s_secret_name: "mediator-secrets".into(),
             ..WizardConfig::default()
@@ -819,7 +818,7 @@ mod tests {
     #[test]
     fn build_backend_url_k8s_without_namespace() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_K8S.into(),
+            secret_storage: Some(SecretScheme::K8s),
             secret_k8s_namespace: String::new(),
             secret_k8s_secret_name: "mediator-secrets".into(),
             ..WizardConfig::default()
@@ -832,7 +831,7 @@ mod tests {
     #[test]
     fn vault_kubernetes_url_round_trips_through_recipe() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_VAULT.into(),
+            secret_storage: Some(SecretScheme::Vault),
             secret_vault_endpoint: "vault.internal".into(),
             secret_vault_mount: "secret/mediator".into(),
             secret_vault_auth: "kubernetes".into(),
@@ -850,7 +849,7 @@ mod tests {
     #[test]
     fn k8s_url_round_trips_through_recipe() {
         let cfg = WizardConfig {
-            secret_storage: STORAGE_K8S.into(),
+            secret_storage: Some(SecretScheme::K8s),
             secret_k8s_namespace: "affinidi".into(),
             secret_k8s_secret_name: "mediator-secrets".into(),
             ..WizardConfig::default()
@@ -862,36 +861,13 @@ mod tests {
     }
 
     #[test]
-    fn build_backend_url_rejects_unsafe_string_scheme_with_keyring_fallback() {
-        // `string://` was the legacy "inline plaintext" backend —
-        // dropped because the mediator runtime no longer accepts it.
-        // The wizard could in theory still see a stale recipe with
-        // it, so the writer falls back to a sane keyring URL rather
-        // than emitting the unsafe one.
+    fn build_backend_url_unset_scheme_is_the_keyring_default() {
+        // Before the Key Storage step has run there is no scheme; the
+        // writer names the keyring default the deployment defaults pick.
+        // (`string://`, `vta://` and unknown schemes no longer reach a
+        // `WizardConfig`: the recipe loader refuses them.)
         let cfg = WizardConfig {
-            secret_storage: STORAGE_STRING.into(),
-            ..WizardConfig::default()
-        };
-        assert_eq!(build_backend_url(&cfg), "keyring://affinidi-mediator");
-    }
-
-    #[test]
-    fn build_backend_url_rejects_vta_scheme_with_keyring_fallback() {
-        // `vta://` was never a backend (the VTA is a key *source*,
-        // not a store). Same fallback as `string://`.
-        let cfg = WizardConfig {
-            secret_storage: STORAGE_VTA.into(),
-            ..WizardConfig::default()
-        };
-        assert_eq!(build_backend_url(&cfg), "keyring://affinidi-mediator");
-    }
-
-    #[test]
-    fn build_backend_url_unknown_scheme_falls_back_to_keyring() {
-        // Defensive: a typo'd scheme (e.g. `key-ring:`) lands on
-        // the same safe default rather than emitting a malformed URL.
-        let cfg = WizardConfig {
-            secret_storage: "totally-not-a-real-scheme://".into(),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         assert_eq!(build_backend_url(&cfg), "keyring://affinidi-mediator");
@@ -1041,13 +1017,13 @@ mod tests {
     fn didcomm_v1_section_is_written_only_when_enabled() {
         let base = WizardConfig {
             config_path: "conf/mediator.toml".into(),
-            deployment_type: "Local development".into(),
+            deployment_type: Some(Deployment::Local),
             didcomm_enabled: true,
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
-            ssl_mode: SSL_NONE.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
+            ssl_mode: Some(SslMode::None),
             database_url: DEFAULT_REDIS_URL.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             ..WizardConfig::default()
         };
@@ -1080,19 +1056,19 @@ mod tests {
     fn test_generate_toml_preserves_all_fields() {
         let config = WizardConfig {
             config_path: "conf/mediator.toml".into(),
-            deployment_type: "Local development".into(),
+            deployment_type: Some(Deployment::Local),
             use_vta: false,
-            vta_mode: String::new(),
+            vta_mode: None,
             didcomm_enabled: true,
             tsp_enabled: false,
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             public_url: String::new(),
-            secret_storage: STORAGE_STRING.into(),
-            ssl_mode: SSL_NONE.into(),
+            secret_storage: None,
+            ssl_mode: Some(SslMode::None),
             ssl_cert_path: String::new(),
             ssl_key_path: String::new(),
             database_url: DEFAULT_REDIS_URL.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             ..WizardConfig::default()
         };
@@ -1143,7 +1119,7 @@ mod tests {
                 "open / redis / string-backend",
                 WizardConfig {
                     network_mode: consts::NETWORK_MODE_OPEN.into(),
-                    secret_storage: consts::STORAGE_STRING.into(),
+                    secret_storage: None,
                     database_url: consts::DEFAULT_REDIS_URL.into(),
                     listen_address: consts::DEFAULT_LISTEN_ADDR.into(),
                     ..WizardConfig::default()
@@ -1164,9 +1140,9 @@ mod tests {
                 "vta-online",
                 WizardConfig {
                     use_vta: true,
-                    vta_mode: consts::VTA_MODE_ONLINE.into(),
-                    did_method: consts::DID_VTA.into(),
-                    secret_storage: consts::STORAGE_VTA.into(),
+                    vta_mode: Some(VtaMode::Online),
+                    did_method: Some(DidMethod::Vta),
+                    secret_storage: None,
                     ..WizardConfig::default()
                 },
             ),
@@ -1248,19 +1224,19 @@ admin = "generate"
     fn test_generate_toml_vta() {
         let config = WizardConfig {
             config_path: "conf/mediator.toml".into(),
-            deployment_type: "Headless server".into(),
+            deployment_type: Some(Deployment::Server),
             use_vta: true,
-            vta_mode: VTA_MODE_ONLINE.into(),
+            vta_mode: Some(VtaMode::Online),
             didcomm_enabled: true,
             tsp_enabled: false,
-            did_method: DID_VTA.into(),
+            did_method: Some(DidMethod::Vta),
             public_url: String::new(),
-            secret_storage: STORAGE_VTA.into(),
-            ssl_mode: SSL_NONE.into(),
+            secret_storage: None,
+            ssl_mode: Some(SslMode::None),
             ssl_cert_path: String::new(),
             ssl_key_path: String::new(),
             database_url: "redis://redis.example.com/".into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             ..WizardConfig::default()
         };
@@ -1287,9 +1263,9 @@ admin = "generate"
     #[test]
     fn test_ssl_self_signed() {
         let config = WizardConfig {
-            ssl_mode: SSL_SELF_SIGNED.into(),
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
+            ssl_mode: Some(SslMode::SelfSigned),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         let generated = GeneratedValues {
@@ -1306,11 +1282,11 @@ admin = "generate"
     #[test]
     fn test_ssl_existing_certificates() {
         let config = WizardConfig {
-            ssl_mode: SSL_EXISTING.into(),
+            ssl_mode: Some(SslMode::Existing),
             ssl_cert_path: "/etc/ssl/cert.pem".into(),
             ssl_key_path: "/etc/ssl/key.pem".into(),
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         let toml = generate_toml(&config, &test_generated()).unwrap();
@@ -1322,9 +1298,9 @@ admin = "generate"
     #[test]
     fn test_no_admin_did_removes_field() {
         let config = WizardConfig {
-            admin_did_mode: ADMIN_SKIP.into(),
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
+            admin_did_mode: Some(AdminMode::Skip),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         let generated = GeneratedValues {
@@ -1368,8 +1344,8 @@ admin = "generate"
         // `did_web_self_hosted` so the mediator serves
         // `/.well-known/did.jsonl` for its own DID.
         let config = WizardConfig {
-            did_method: DID_WEBVH.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Webvh),
+            secret_storage: None,
             public_url: "https://mediator.example.com".into(),
             ..WizardConfig::default()
         };
@@ -1392,8 +1368,8 @@ admin = "generate"
         // whole point of the shared target grammar: the string the wizard
         // writes is the string the runtime reads, with no hand-editing.
         let config = WizardConfig {
-            did_method: DID_WEBVH.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Webvh),
+            secret_storage: None,
             public_url: "https://mediator.example.com".into(),
             did_log_target: Some("s3://my-bucket/mediator/did.jsonl?region=eu-west-1".into()),
             ..WizardConfig::default()
@@ -1422,8 +1398,8 @@ admin = "generate"
         // host doesn't match the public URL, this mediator is not the
         // authority for the log no matter where it was published.
         let config = WizardConfig {
-            did_method: DID_VTA.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Vta),
+            secret_storage: None,
             public_url: "https://mediator.example.com".into(),
             did_log_target: Some("s3://my-bucket/mediator/did.jsonl".into()),
             ..WizardConfig::default()
@@ -1445,8 +1421,8 @@ admin = "generate"
         // authority — leaving the line commented protects against
         // serving stale content for someone else's DID.
         let config = WizardConfig {
-            did_method: DID_VTA.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Vta),
+            secret_storage: None,
             public_url: "https://mediator.example.com".into(),
             ..WizardConfig::default()
         };
@@ -1467,8 +1443,8 @@ admin = "generate"
         // Defensive: domain-match alone isn't enough — there has to
         // be a did.jsonl on disk for the line to point at.
         let config = WizardConfig {
-            did_method: DID_VTA.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Vta),
+            secret_storage: None,
             public_url: "https://mediator.example.com".into(),
             ..WizardConfig::default()
         };
@@ -1486,8 +1462,8 @@ admin = "generate"
         // `public_url` may be unset (e.g. minimal recipe). Without
         // both sides we fail closed and leave the line commented.
         let config = WizardConfig {
-            did_method: DID_WEBVH.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Webvh),
+            secret_storage: None,
             public_url: String::new(),
             ..WizardConfig::default()
         };
@@ -1505,8 +1481,8 @@ admin = "generate"
         // DNS hosts are case-insensitive; bind ports on the public URL
         // shouldn't break the equality check.
         let config = WizardConfig {
-            did_method: DID_WEBVH.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Webvh),
+            secret_storage: None,
             public_url: "https://Mediator.Example.com:7037".into(),
             ..WizardConfig::default()
         };
@@ -1522,8 +1498,8 @@ admin = "generate"
     #[test]
     fn test_non_webvh_removes_self_hosted() {
         let config = WizardConfig {
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         let toml = generate_toml(&config, &test_generated()).unwrap();
@@ -1669,20 +1645,21 @@ admin = "generate"
                 .display()
         );
         let cases = [
-            (STORAGE_FILE, file_backend.as_str()),
-            (STORAGE_KEYRING, "keyring://affinidi-mediator"),
-            (STORAGE_AWS, "aws_secrets://us-east-1/mediator/"),
+            (SecretScheme::File, file_backend.as_str()),
+            (SecretScheme::Keyring, "keyring://affinidi-mediator"),
+            (SecretScheme::Aws, "aws_secrets://us-east-1/mediator/"),
         ];
         for (storage, expected_backend) in cases {
             let config = WizardConfig {
-                did_method: DID_PEER.into(),
-                secret_storage: storage.into(),
+                did_method: Some(DidMethod::Peer),
+                secret_storage: Some(storage),
                 ..WizardConfig::default()
             };
             let toml = generate_toml(&config, &test_generated()).unwrap();
             assert!(
                 toml.contains(&format!("backend = \"{expected_backend}\"")),
-                "storage={storage}: expected backend=\"{expected_backend}\" in output"
+                "storage={}: expected backend=\"{expected_backend}\" in output",
+                storage.prefix()
             );
         }
     }
@@ -1691,8 +1668,8 @@ admin = "generate"
     fn test_listen_address_set() {
         let config = WizardConfig {
             listen_address: "127.0.0.1:9090".into(),
-            did_method: DID_PEER.into(),
-            secret_storage: STORAGE_STRING.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: None,
             ..WizardConfig::default()
         };
         let toml = generate_toml(&config, &test_generated()).unwrap();

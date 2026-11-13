@@ -51,7 +51,7 @@ pub(crate) struct MintedArtefacts {
     /// `jwt_mode = provide` — the runtime expects
     /// `MEDIATOR_JWT_SECRET` / `--jwt-secret-file` at boot.
     jwt_secret: Option<Vec<u8>>,
-    /// The mediator's admin-API DID. `None` under `ADMIN_SKIP`.
+    /// The mediator's admin-API DID. `None` under `AdminMode::Skip`.
     admin_did: Option<String>,
     /// Secret material of a *generated* admin DID. `None` when the admin
     /// DID is the VTA credential (its key is in the session), a pasted DID
@@ -172,6 +172,7 @@ pub(crate) async fn generate_and_write_with(
 #[cfg(test)]
 mod generate_and_write_tests {
     use super::*;
+    use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
     use crate::consts::*;
     use crate::{config_writer, recipe, reprovision};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -238,16 +239,16 @@ mod generate_and_write_tests {
                 .join("mediator.toml")
                 .to_string_lossy()
                 .into_owned(),
-            deployment_type: DEPLOYMENT_LOCAL.into(),
+            deployment_type: Some(Deployment::Local),
             didcomm_enabled: true,
             tsp_enabled: false,
-            did_method: DID_PEER.into(),
-            secret_storage: crate::consts::STORAGE_FILE.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: secrets_path.to_string_lossy().into_owned(),
             secret_file_encrypted: false,
-            ssl_mode: SSL_NONE.into(),
+            ssl_mode: Some(SslMode::None),
             jwt_mode: JWT_MODE_GENERATE.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             public_url: "http://localhost:7037".into(),
             ..app::WizardConfig::default()
         }
@@ -372,7 +373,7 @@ mod generate_and_write_tests {
         // Phase: admin-monitor.json — TDKProfile-shaped JSON for
         // `mediator-console --profile`. Emitted by
         // `write_config_artefacts` whenever the wizard has the admin
-        // DID's secret material in memory (i.e., ADMIN_GENERATE).
+        // DID's secret material in memory (i.e., AdminMode::Generate).
         let monitor_profile = dir.join("conf").join("admin-monitor.json");
         assert!(
             monitor_profile.exists(),
@@ -415,7 +416,7 @@ mod generate_and_write_tests {
         assert_eq!(
             monitor_secrets.len(),
             1,
-            "ADMIN_GENERATE produces exactly one Ed25519 admin secret",
+            "Some(AdminMode::Generate) produces exactly one Ed25519 admin secret",
         );
 
         // Phase: recipe write (save_recipe=true).
@@ -485,16 +486,16 @@ mod generate_and_write_tests {
                 .join("mediator.toml")
                 .to_string_lossy()
                 .into_owned(),
-            deployment_type: DEPLOYMENT_LOCAL.into(),
+            deployment_type: Some(Deployment::Local),
             didcomm_enabled: true,
-            did_method: DID_PEER.into(),
-            secret_storage: crate::consts::STORAGE_FILE.into(),
+            did_method: Some(DidMethod::Peer),
+            secret_storage: Some(SecretScheme::File),
             // Collides with the legacy writer's hard-coded target.
             secret_file_path: secrets_path.to_string_lossy().into_owned(),
             secret_file_encrypted: false,
-            ssl_mode: SSL_NONE.into(),
+            ssl_mode: Some(SslMode::None),
             jwt_mode: JWT_MODE_GENERATE.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             ..app::WizardConfig::default()
         };
 
@@ -537,14 +538,14 @@ mod generate_and_write_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial_test::serial]
     async fn generate_and_write_admin_skip_omits_admin_did_field() {
-        // ADMIN_SKIP path: no admin DID generated, no admin
+        // AdminMode::Skip path: no admin DID generated, no admin
         // credential in the unified backend, and `[server].admin_did`
         // is absent from mediator.toml. Lock down so a refactor
         // doesn't accidentally always-mint an admin DID.
         let cwd = CwdGuard::new();
         let dir = cwd.dir().to_path_buf();
         let mut config = did_peer_config(&dir);
-        config.admin_did_mode = ADMIN_SKIP.into();
+        config.admin_did_mode = Some(AdminMode::Skip);
 
         generate_and_write(
             &config,
@@ -553,14 +554,14 @@ mod generate_and_write_tests {
             secret_backend::ProvisionProbe::ReadWrite,
         )
         .await
-        .expect("generate_and_write with ADMIN_SKIP");
+        .expect("generate_and_write with Some(AdminMode::Skip)");
 
         let toml_text = std::fs::read_to_string(dir.join("conf").join("mediator.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&toml_text).unwrap();
         let server = parsed.get("server").expect("[server] section");
         assert!(
             server.get("admin_did").is_none(),
-            "admin_did must be absent under ADMIN_SKIP — got: {server:?}"
+            "admin_did must be absent under Some(AdminMode::Skip) — got: {server:?}"
         );
     }
 
@@ -571,7 +572,7 @@ mod generate_and_write_tests {
         // counterpart to `provision_secret_backend` /
         // `write_config_artefacts`. This test runs it inside a
         // CWD-isolated tempdir so a regression that sneaks a file
-        // write back in (the prior structure had one in the DID_VTA
+        // write back in (the prior structure had one in the DidMethod::Vta
         // arm — now deferred to write_config_artefacts) shows up as
         // a stray artefact in the tempdir.
         let cwd = CwdGuard::new();
@@ -581,9 +582,9 @@ mod generate_and_write_tests {
             .collect();
 
         let config = app::WizardConfig {
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             jwt_mode: JWT_MODE_GENERATE.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             ..app::WizardConfig::default()
         };
         let artefacts = mint_artefacts(&config, None)
@@ -628,14 +629,14 @@ mod generate_and_write_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn mint_artefacts_admin_skip_returns_no_admin_did() {
-        // Lock down the ADMIN_SKIP branch at the unit level — the
+        // Lock down the AdminMode::Skip branch at the unit level — the
         // integration test covers the same path end-to-end, but
         // this one runs in microseconds and surfaces the precise
         // value contract.
         let config = app::WizardConfig {
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             jwt_mode: JWT_MODE_GENERATE.into(),
-            admin_did_mode: ADMIN_SKIP.into(),
+            admin_did_mode: Some(AdminMode::Skip),
             ..app::WizardConfig::default()
         };
         let artefacts = mint_artefacts(&config, None).await.unwrap();
@@ -646,9 +647,9 @@ mod generate_and_write_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn mint_artefacts_jwt_provide_returns_none_jwt_secret() {
         let config = app::WizardConfig {
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             jwt_mode: JWT_MODE_PROVIDE.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             ..app::WizardConfig::default()
         };
         let artefacts = mint_artefacts(&config, None).await.unwrap();
@@ -801,19 +802,19 @@ mod generate_and_write_tests {
         let session = admin_only_session();
         let mut config = did_peer_config(dir.path());
 
-        config.admin_did_mode = ADMIN_GENERATE.into();
+        config.admin_did_mode = Some(AdminMode::Generate);
         let a = mint_artefacts(&config, Some(&session)).await.unwrap();
         let admin = a.admin_did.unwrap();
         assert!(admin.starts_with("did:key:"));
         assert_ne!(admin, session.admin_did());
         assert!(a.admin_secret.is_some());
 
-        config.admin_did_mode = ADMIN_VTA.into();
+        config.admin_did_mode = Some(AdminMode::Vta);
         let a = mint_artefacts(&config, Some(&session)).await.unwrap();
         assert_eq!(a.admin_did.as_deref(), Some(session.admin_did()));
         assert!(a.admin_secret.is_none());
 
-        config.admin_did_mode = ADMIN_PASTE.into();
+        config.admin_did_mode = Some(AdminMode::Paste);
         config.admin_did = "did:web:admin.example.com".into();
         let a = mint_artefacts(&config, Some(&session)).await.unwrap();
         assert_eq!(a.admin_did.as_deref(), Some("did:web:admin.example.com"));
@@ -823,7 +824,7 @@ mod generate_and_write_tests {
         let err = mint_artefacts(&config, Some(&session)).await.err().unwrap();
         assert_eq!(exit::code_of(&err), exit::IMPORT_WITHOUT_DATA);
 
-        config.admin_did_mode = ADMIN_VTA.into();
+        config.admin_did_mode = Some(AdminMode::Vta);
         let err = mint_artefacts(&config, None).await.err().unwrap();
         assert_eq!(exit::code_of(&err), exit::NO_VTA_SESSION);
     }
@@ -835,7 +836,7 @@ mod generate_and_write_tests {
         let dir = cwd.dir().to_path_buf();
         let mut config = did_peer_config(&dir);
         config.use_vta = true;
-        config.vta_mode = VTA_MODE_ONLINE.into();
+        config.vta_mode = Some(VtaMode::Online);
         let session = admin_only_session();
         generate_and_write(
             &config,
@@ -864,11 +865,11 @@ mod generate_and_write_tests {
     async fn vta_did_without_a_session_is_a_hard_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = did_peer_config(dir.path());
-        config.did_method = DID_VTA.into();
+        config.did_method = Some(DidMethod::Vta);
         let err = mint_artefacts(&config, None).await.err().unwrap();
         assert_eq!(exit::code_of(&err), exit::NO_VTA_SESSION);
 
-        config.did_method = DID_IMPORT.into();
+        config.did_method = None;
         let err = mint_artefacts(&config, None).await.err().unwrap();
         assert_eq!(exit::code_of(&err), exit::IMPORT_WITHOUT_DATA);
     }
@@ -881,7 +882,7 @@ mod generate_and_write_tests {
         let cwd = CwdGuard::new();
         let dir = cwd.dir().to_path_buf();
         let mut config = did_peer_config(&dir);
-        config.did_method = DID_WEBVH.into();
+        config.did_method = Some(DidMethod::Webvh);
         config.public_url = "https://localhost:7037".into();
         generate_and_write(
             &config,
@@ -933,7 +934,7 @@ mod generate_and_write_tests {
         let cwd = CwdGuard::new();
         let dir = cwd.dir().to_path_buf();
         let mut config = did_peer_config(&dir);
-        config.did_method = DID_WEBVH.into();
+        config.did_method = Some(DidMethod::Webvh);
         config.public_url = "https://localhost:7037".into();
         // A directory where did.jsonl should go makes its write fail.
         std::fs::create_dir_all(dir.join("conf").join("did.jsonl")).unwrap();

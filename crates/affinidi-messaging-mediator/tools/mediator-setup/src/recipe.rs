@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::app::WizardConfig;
+use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
 use crate::consts::*;
+use crate::ui::labels::label_of;
 
 /// Top-level build recipe.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -447,21 +449,21 @@ pub struct InstallSection {
 /// values the wizard code uses ([`VTA_MODE_ONLINE`] /
 /// [`VTA_MODE_SEALED_MINT`] / [`VTA_MODE_SEALED_EXPORT`]).
 ///
-/// `None` and empty strings return `""` — `to_wizard_config` then runs
+/// `None` and empty strings return `None` — `to_wizard_config` then runs
 /// its legacy auto-detect path (did_method=vta → ONLINE). A deprecated
 /// `"sealed"` is silently rewritten to `sealed-mint` because every
 /// pre-split recipe used the single value for the mint case.
-fn normalise_vta_mode(raw: Option<&str>) -> anyhow::Result<String> {
+fn normalise_vta_mode(raw: Option<&str>) -> anyhow::Result<Option<VtaMode>> {
     let trimmed = raw.unwrap_or("").trim();
     Ok(match trimmed {
-        "" => String::new(),
-        VTA_MODE_ONLINE => VTA_MODE_ONLINE.into(),
-        VTA_MODE_SEALED_MINT => VTA_MODE_SEALED_MINT.into(),
-        VTA_MODE_SEALED_EXPORT => VTA_MODE_SEALED_EXPORT.into(),
+        "" => None,
+        VTA_MODE_ONLINE => Some(VtaMode::Online),
+        VTA_MODE_SEALED_MINT => Some(VtaMode::SealedMint),
+        VTA_MODE_SEALED_EXPORT => Some(VtaMode::SealedExport),
         // Backward compat: pre-split recipes wrote `"sealed"` to
         // mean what's now `"sealed-mint"`. Accept silently —
         // nobody's written `"sealed"` to mean anything else.
-        VTA_MODE_SEALED_LEGACY => VTA_MODE_SEALED_MINT.into(),
+        VTA_MODE_SEALED_LEGACY => Some(VtaMode::SealedMint),
         other => anyhow::bail!(
             "Invalid deployment.vta_mode '{other}': expected one of '{VTA_MODE_ONLINE}', '{VTA_MODE_SEALED_MINT}', '{VTA_MODE_SEALED_EXPORT}' \
              (or legacy '{VTA_MODE_SEALED_LEGACY}' which maps to '{VTA_MODE_SEALED_MINT}')",
@@ -498,9 +500,9 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     // does not trip `clippy::field_reassign_with_default` on the very
     // first assignment.
     let deployment_type = match recipe.deployment.deployment_type.as_str() {
-        "local" => DEPLOYMENT_LOCAL.into(),
-        "server" => DEPLOYMENT_SERVER.into(),
-        "container" => DEPLOYMENT_CONTAINER.into(),
+        "local" => Some(Deployment::Local),
+        "server" => Some(Deployment::Server),
+        "container" => Some(Deployment::Container),
         other => anyhow::bail!(
             "Invalid deployment.type '{other}': expected 'local', 'server', or 'container'"
         ),
@@ -519,8 +521,8 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     // recognised — VTA is a *source* of keys, not a storage backend.
     if !config.use_vta && recipe.identity.did_method == "vta" {
         config.use_vta = true;
-        if config.vta_mode.is_empty() {
-            config.vta_mode = VTA_MODE_ONLINE.into();
+        if config.vta_mode.is_none() {
+            config.vta_mode = Some(VtaMode::Online);
         }
     }
 
@@ -538,7 +540,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     // VTA whose template requires a `URL` — identity.public_url must
     // therefore be present.
     if config.use_vta
-        && config.vta_mode == VTA_MODE_SEALED_MINT
+        && config.vta_mode == Some(VtaMode::SealedMint)
         && recipe
             .identity
             .public_url
@@ -586,9 +588,9 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
 
     // DID method
     config.did_method = match recipe.identity.did_method.as_str() {
-        "vta" => DID_VTA.into(),
-        "did:peer" | "peer" => DID_PEER.into(),
-        "did:webvh" | "webvh" => DID_WEBVH.into(),
+        "vta" => Some(DidMethod::Vta),
+        "did:peer" | "peer" => Some(DidMethod::Peer),
+        "did:webvh" | "webvh" => Some(DidMethod::Webvh),
         "import" => {
             return Err(crate::exit::error(
                 crate::exit::IMPORT_WITHOUT_DATA,
@@ -602,7 +604,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         ),
     };
 
-    if config.did_method == DID_WEBVH {
+    if config.did_method == Some(DidMethod::Webvh) {
         config.public_url = recipe
             .identity
             .public_url
@@ -623,7 +625,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         }
     };
     config.scid_also_known_as = recipe.identity.scid_also_known_as.unwrap_or(true);
-    if config.present_as_scid && config.did_method != DID_WEBVH {
+    if config.present_as_scid && config.did_method != Some(DidMethod::Webvh) {
         anyhow::bail!(
             "identity.present_as = 'scid' applies to did_method = 'did:webvh' (a locally \
              generated log)"
@@ -647,8 +649,8 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
 
     // Security
     config.ssl_mode = match recipe.security.ssl.as_str() {
-        "none" => SSL_NONE.into(),
-        "self-signed" | "self_signed" => SSL_SELF_SIGNED.into(),
+        "none" => Some(SslMode::None),
+        "self-signed" | "self_signed" => Some(SslMode::SelfSigned),
         "existing" => {
             config.ssl_cert_path = recipe.security.ssl_cert.clone().ok_or_else(|| {
                 anyhow::anyhow!("security.ssl_cert is required when ssl = 'existing'")
@@ -656,7 +658,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
             config.ssl_key_path = recipe.security.ssl_key.clone().ok_or_else(|| {
                 anyhow::anyhow!("security.ssl_key is required when ssl = 'existing'")
             })?;
-            SSL_EXISTING.into()
+            Some(SslMode::Existing)
         }
         other => anyhow::bail!(
             "Invalid security.ssl '{other}': expected 'none', 'self-signed', or 'existing'"
@@ -664,8 +666,8 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     };
 
     config.admin_did_mode = match recipe.security.admin.as_str() {
-        "generate" => ADMIN_GENERATE.into(),
-        "skip" => ADMIN_SKIP.into(),
+        "generate" => Some(AdminMode::Generate),
+        "skip" => Some(AdminMode::Skip),
         "vta" => {
             if !config.use_vta {
                 anyhow::bail!(
@@ -673,7 +675,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
                      VTA deployment (deployment.use_vta = true)"
                 );
             }
-            ADMIN_VTA.into()
+            Some(AdminMode::Vta)
         }
         "import" => {
             let did = recipe
@@ -695,13 +697,13 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
                 );
             }
             config.admin_did = did.to_string();
-            ADMIN_PASTE.into()
+            Some(AdminMode::Paste)
         }
         other => anyhow::bail!(
             "Invalid security.admin '{other}': expected 'generate', 'vta', 'import', or 'skip'"
         ),
     };
-    if config.admin_did_mode != ADMIN_PASTE && recipe.security.admin_did.is_some() {
+    if config.admin_did_mode != Some(AdminMode::Paste) && recipe.security.admin_did.is_some() {
         anyhow::bail!(
             "security.admin_did is only read with security.admin = \"import\" (admin is \"{}\")",
             recipe.security.admin
@@ -717,7 +719,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     };
 
     config.network_mode = match recipe.security.network_mode.as_deref() {
-        None | Some("") => default_network_mode_for(&config.deployment_type).into(),
+        None | Some("") => default_network_mode_for(config.deployment_type).into(),
         Some(NETWORK_MODE_OPEN) => NETWORK_MODE_OPEN.into(),
         Some(NETWORK_MODE_CLOSED) => NETWORK_MODE_CLOSED.into(),
         Some(other) => {
@@ -803,14 +805,14 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
 /// usable default and would otherwise produce `gcp_secrets:///mediator-`
 /// and friends.
 pub(crate) fn check_backend_settings(config: &WizardConfig) -> anyhow::Result<()> {
-    let missing = match config.secret_storage.as_str() {
-        STORAGE_GCP if config.secret_gcp_project.trim().is_empty() => {
+    let missing = match config.secret_storage {
+        Some(SecretScheme::Gcp) if config.secret_gcp_project.trim().is_empty() => {
             Some(("a GCP project", "gcp_secrets://<project>/mediator-"))
         }
-        STORAGE_AZURE if config.secret_azure_vault.trim().is_empty() => {
+        Some(SecretScheme::Azure) if config.secret_azure_vault.trim().is_empty() => {
             Some(("an Azure Key Vault name", "azure_keyvault://<vault-name>"))
         }
-        STORAGE_VAULT if config.secret_vault_endpoint.trim().is_empty() => {
+        Some(SecretScheme::Vault) if config.secret_vault_endpoint.trim().is_empty() => {
             Some(("a Vault endpoint", "vault://<host:port>/secret/mediator"))
         }
         _ => None,
@@ -819,7 +821,7 @@ pub(crate) fn check_backend_settings(config: &WizardConfig) -> anyhow::Result<()
         anyhow::bail!(
             "secrets.storage = \"{}\" needs {what}, which has no default. Give the full URL: \
              `--set secrets.storage={example}` or `storage = \"{example}\"` in the recipe.",
-            config.secret_storage
+            label_of(config.secret_storage, SecretScheme::prefix)
         );
     }
     Ok(())
@@ -829,9 +831,9 @@ pub(crate) fn check_backend_settings(config: &WizardConfig) -> anyhow::Result<()
 /// a plaintext `file://` store; a headless run needs the same explicit
 /// opt-in outside a local deployment.
 pub(crate) fn check_plaintext_file(config: &WizardConfig) -> anyhow::Result<()> {
-    if config.secret_storage == STORAGE_FILE
+    if config.secret_storage == Some(SecretScheme::File)
         && !config.secret_file_encrypted
-        && config.deployment_type != DEPLOYMENT_LOCAL
+        && config.deployment_type != Some(Deployment::Local)
         && !config.allow_plaintext_file
     {
         anyhow::bail!(
@@ -840,7 +842,7 @@ pub(crate) fn check_plaintext_file(config: &WizardConfig) -> anyhow::Result<()> 
              (file://…?encrypt=1 with MEDIATOR_FILE_BACKEND_PASSPHRASE, or a secret manager), \
              or accept it explicitly: `allow_plaintext_file = true` under [secrets] \
              (--allow-plaintext-file).",
-            config.deployment_type.to_lowercase()
+            label_of(config.deployment_type, Deployment::label).to_lowercase()
         );
     }
     Ok(())
@@ -879,7 +881,7 @@ pub fn needs_database_credentials(url: &str) -> bool {
 /// it (usually relative) rather than resolved against this host's working
 /// directory, so the recipe reproduces the setup elsewhere.
 fn recipe_storage_url(config: &WizardConfig) -> String {
-    if config.secret_storage == STORAGE_FILE {
+    if config.secret_storage == Some(SecretScheme::File) {
         let path = config.secret_file_path.trim();
         let path = path.strip_prefix("file://").unwrap_or(path);
         if config.secret_file_encrypted {
@@ -895,11 +897,9 @@ fn recipe_storage_url(config: &WizardConfig) -> String {
 /// Project a wizard configuration onto the recipe schema — the inverse of
 /// [`to_wizard_config`] for every value a recipe can carry.
 pub fn to_recipe(config: &WizardConfig) -> BuildRecipe {
-    let deployment_type = match config.deployment_type.as_str() {
-        DEPLOYMENT_SERVER => "server",
-        DEPLOYMENT_CONTAINER => "container",
-        _ => "local",
-    };
+    let deployment_type = config
+        .deployment_type
+        .map_or("local", Deployment::recipe_value);
     let mut protocols = Vec::new();
     if config.didcomm_enabled {
         protocols.push("didcomm".to_string());
@@ -922,23 +922,11 @@ pub fn to_recipe(config: &WizardConfig) -> BuildRecipe {
         VtaSection::default()
     };
 
-    let did_method = match config.did_method.as_str() {
-        DID_PEER => "did:peer",
-        DID_WEBVH => "did:webvh",
-        _ => "vta",
-    };
-
-    let ssl = match config.ssl_mode.as_str() {
-        SSL_SELF_SIGNED => "self-signed",
-        SSL_EXISTING => "existing",
-        _ => "none",
-    };
-    let admin = match config.admin_did_mode.as_str() {
-        ADMIN_SKIP => "skip",
-        ADMIN_PASTE => "import",
-        ADMIN_VTA => "vta",
-        _ => "generate",
-    };
+    let did_method = config.did_method.map_or("vta", DidMethod::recipe_value);
+    let ssl = config.ssl_mode.map_or("none", SslMode::recipe_value);
+    let admin = config
+        .admin_did_mode
+        .map_or("generate", AdminMode::recipe_value);
     let cors = match config.cors_mode.as_str() {
         CORS_MODE_ANY => CORS_MODE_ANY,
         CORS_MODE_LIST => CORS_MODE_LIST,
@@ -954,8 +942,10 @@ pub fn to_recipe(config: &WizardConfig) -> BuildRecipe {
             deployment_type: deployment_type.into(),
             protocols,
             use_vta: config.use_vta,
-            vta_mode: (config.use_vta && !config.vta_mode.is_empty())
-                .then(|| config.vta_mode.clone()),
+            vta_mode: config
+                .vta_mode
+                .filter(|_| config.use_vta)
+                .map(|mode| mode.as_str().to_string()),
             didcomm_v1_allow_unauthenticated_forwards: config.didcomm_v1_enabled
                 && config.didcomm_v1_allow_unauthenticated_forwards,
         },
@@ -969,7 +959,7 @@ pub fn to_recipe(config: &WizardConfig) -> BuildRecipe {
         },
         secrets: SecretsSection {
             storage: recipe_storage_url(config),
-            allow_plaintext_file: config.secret_storage == STORAGE_FILE
+            allow_plaintext_file: config.secret_storage == Some(SecretScheme::File)
                 && !config.secret_file_encrypted
                 && config.allow_plaintext_file,
         },
@@ -1058,16 +1048,16 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
     // their wizard defaults. Operators upgrading from older recipes
     // see no surprise change.
     let bare_schemes = [
-        STORAGE_FILE,
-        STORAGE_KEYRING,
-        STORAGE_AWS,
-        STORAGE_GCP,
-        STORAGE_AZURE,
-        STORAGE_VAULT,
-        STORAGE_K8S,
+        SecretScheme::File,
+        SecretScheme::Keyring,
+        SecretScheme::Aws,
+        SecretScheme::Gcp,
+        SecretScheme::Azure,
+        SecretScheme::Vault,
+        SecretScheme::K8s,
     ];
-    if let Some(&scheme) = bare_schemes.iter().find(|&&s| raw == s) {
-        config.secret_storage = scheme.into();
+    if let Some(&scheme) = bare_schemes.iter().find(|s| raw == s.prefix()) {
+        config.secret_storage = Some(scheme);
         return Ok(());
     }
 
@@ -1090,7 +1080,7 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
                 ),
             }
         }
-        config.secret_storage = STORAGE_FILE.into();
+        config.secret_storage = Some(SecretScheme::File);
         config.secret_file_path = path.to_string();
         config.secret_file_encrypted = encrypted;
         return Ok(());
@@ -1121,26 +1111,26 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
     })?;
     match parsed {
         BackendUrl::File { path, encrypted } => {
-            config.secret_storage = STORAGE_FILE.into();
+            config.secret_storage = Some(SecretScheme::File);
             config.secret_file_path = path;
             config.secret_file_encrypted = encrypted;
         }
         BackendUrl::Keyring { service } => {
-            config.secret_storage = STORAGE_KEYRING.into();
+            config.secret_storage = Some(SecretScheme::Keyring);
             config.secret_keyring_service = service;
         }
         BackendUrl::Aws { region, namespace } => {
-            config.secret_storage = STORAGE_AWS.into();
+            config.secret_storage = Some(SecretScheme::Aws);
             config.secret_aws_region = region;
             config.secret_aws_namespace = namespace;
         }
         BackendUrl::Gcp { project, namespace } => {
-            config.secret_storage = STORAGE_GCP.into();
+            config.secret_storage = Some(SecretScheme::Gcp);
             config.secret_gcp_project = project;
             config.secret_gcp_namespace = namespace;
         }
         BackendUrl::Azure { vault } => {
-            config.secret_storage = STORAGE_AZURE.into();
+            config.secret_storage = Some(SecretScheme::Azure);
             // The mediator-common parser canonicalises bare names to
             // `https://<name>.vault.azure.net`. Round-tripping the full
             // URL is fine — it stays canonical when re-parsed.
@@ -1154,7 +1144,7 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
             insecure,
             ca_cert,
         } => {
-            config.secret_storage = STORAGE_VAULT.into();
+            config.secret_storage = Some(SecretScheme::Vault);
             config.secret_vault_endpoint = endpoint;
             config.secret_vault_mount = path;
             match auth {
@@ -1182,7 +1172,7 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
             namespace,
             secret_name,
         } => {
-            config.secret_storage = STORAGE_K8S.into();
+            config.secret_storage = Some(SecretScheme::K8s);
             config.secret_k8s_namespace = namespace.unwrap_or_default();
             config.secret_k8s_secret_name = secret_name;
         }
@@ -1279,20 +1269,20 @@ mod tests {
     #[test]
     fn test_valid_recipe_converts() {
         let config = to_wizard_config(&minimal_recipe()).unwrap();
-        assert_eq!(config.deployment_type, DEPLOYMENT_LOCAL);
+        assert_eq!(config.deployment_type, Some(Deployment::Local));
         assert!(config.didcomm_enabled);
         assert!(!config.tsp_enabled);
-        assert_eq!(config.did_method, DID_VTA);
+        assert_eq!(config.did_method, Some(DidMethod::Vta));
         // Default backend is now keyring:// (vta:// rejected as a store).
-        assert_eq!(config.secret_storage, STORAGE_KEYRING);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Keyring));
     }
 
     #[test]
     fn test_all_deployment_types() {
         for (input, expected) in [
-            ("local", DEPLOYMENT_LOCAL),
-            ("server", DEPLOYMENT_SERVER),
-            ("container", DEPLOYMENT_CONTAINER),
+            ("local", Some(Deployment::Local)),
+            ("server", Some(Deployment::Server)),
+            ("container", Some(Deployment::Container)),
         ] {
             let mut recipe = minimal_recipe();
             recipe.deployment.deployment_type = input.into();
@@ -1572,15 +1562,15 @@ ssl = "none"
     #[test]
     fn test_all_did_methods() {
         for (input, expected) in [
-            ("vta", DID_VTA),
-            ("did:peer", DID_PEER),
-            ("peer", DID_PEER),
-            ("did:webvh", DID_WEBVH),
-            ("webvh", DID_WEBVH),
+            ("vta", Some(DidMethod::Vta)),
+            ("did:peer", Some(DidMethod::Peer)),
+            ("peer", Some(DidMethod::Peer)),
+            ("did:webvh", Some(DidMethod::Webvh)),
+            ("webvh", Some(DidMethod::Webvh)),
         ] {
             let mut recipe = minimal_recipe();
             recipe.identity.did_method = input.into();
-            if expected == DID_WEBVH {
+            if expected == Some(DidMethod::Webvh) {
                 recipe.identity.public_url = Some("https://example.com".into());
             }
             let config = to_wizard_config(&recipe).unwrap();
@@ -1610,11 +1600,16 @@ ssl = "none"
         // Accepted schemes only — `string://` and `vta://` are rejected
         // by the recipe loader (covered separately in
         // `test_legacy_secret_storage_schemes_rejected`).
-        for scheme in [STORAGE_FILE, STORAGE_KEYRING, STORAGE_AWS, STORAGE_K8S] {
+        for scheme in [
+            SecretScheme::File,
+            SecretScheme::Keyring,
+            SecretScheme::Aws,
+            SecretScheme::K8s,
+        ] {
             let mut recipe = minimal_recipe();
-            recipe.secrets.storage = scheme.into();
+            recipe.secrets.storage = scheme.prefix().into();
             let config = to_wizard_config(&recipe).unwrap();
-            assert_eq!(config.secret_storage, scheme);
+            assert_eq!(config.secret_storage, Some(scheme));
         }
         // #193: these have no usable default and used to produce
         // `gcp_secrets:///mediator-`, `azure_keyvault://`, `vault:///secret/…`.
@@ -1658,19 +1653,19 @@ ssl = "none"
         let mut recipe = minimal_recipe();
         recipe.secrets.storage = "aws_secrets://eu-west-2/prod/mediator/".into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_AWS);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Aws));
         assert_eq!(config.secret_aws_region, "eu-west-2");
         assert_eq!(config.secret_aws_namespace, "prod/mediator/");
 
         recipe.secrets.storage = "gcp_secrets://my-prod-proj/svc-".into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_GCP);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Gcp));
         assert_eq!(config.secret_gcp_project, "my-prod-proj");
         assert_eq!(config.secret_gcp_namespace, "svc-");
 
         recipe.secrets.storage = "azure_keyvault://my-prod-vault".into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_AZURE);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Azure));
         // Bare names canonicalise to the full URL via mediator-common's
         // parser — round-tripping through the recipe preserves the
         // canonical form.
@@ -1681,7 +1676,7 @@ ssl = "none"
 
         recipe.secrets.storage = "vault://vault.internal:8200/secret/prod-mediator".into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_VAULT);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Vault));
         assert_eq!(config.secret_vault_endpoint, "vault.internal:8200");
         assert_eq!(config.secret_vault_mount, "secret/prod-mediator");
     }
@@ -1694,7 +1689,7 @@ ssl = "none"
         let mut recipe = minimal_recipe();
         recipe.secrets.storage = STORAGE_AWS.into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_AWS);
+        assert_eq!(config.secret_storage, Some(SecretScheme::Aws));
         assert_eq!(config.secret_aws_region, DEFAULT_AWS_REGION);
         assert_eq!(config.secret_aws_namespace, DEFAULT_AWS_SECRET_NAMESPACE);
     }
@@ -1763,19 +1758,19 @@ ssl = "none"
     fn test_recipe_round_trip() {
         let original = WizardConfig {
             config_path: "conf/mediator.toml".into(),
-            deployment_type: DEPLOYMENT_SERVER.into(),
+            deployment_type: Some(Deployment::Server),
             use_vta: false,
-            vta_mode: String::new(),
+            vta_mode: None,
             didcomm_enabled: true,
             tsp_enabled: true,
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             public_url: String::new(),
-            secret_storage: STORAGE_KEYRING.into(),
-            ssl_mode: SSL_NONE.into(),
+            secret_storage: Some(SecretScheme::Keyring),
+            ssl_mode: Some(SslMode::None),
             ssl_cert_path: String::new(),
             ssl_key_path: String::new(),
             database_url: "redis://127.0.0.1/3".into(),
-            admin_did_mode: ADMIN_SKIP.into(),
+            admin_did_mode: Some(AdminMode::Skip),
             listen_address: "0.0.0.0:8080".into(),
             ..WizardConfig::default()
         };
@@ -1806,16 +1801,17 @@ ssl = "none"
         recipe.deployment.use_vta = true;
         recipe.identity.public_url = Some("https://mediator.example.com".into());
 
-        for raw in ["sealed-mint", "sealed-export", "online"] {
-            recipe.deployment.vta_mode = Some(raw.into());
+        for mode in [VtaMode::SealedMint, VtaMode::SealedExport, VtaMode::Online] {
+            recipe.deployment.vta_mode = Some(mode.as_str().into());
             let cfg = to_wizard_config(&recipe).unwrap();
-            assert_eq!(cfg.vta_mode, raw);
+            assert_eq!(cfg.vta_mode, Some(mode));
         }
 
         recipe.deployment.vta_mode = Some("sealed".into());
         let cfg = to_wizard_config(&recipe).unwrap();
         assert_eq!(
-            cfg.vta_mode, VTA_MODE_SEALED_MINT,
+            cfg.vta_mode,
+            Some(VtaMode::SealedMint),
             "legacy `sealed` normalises to `sealed-mint`"
         );
 
@@ -1841,7 +1837,7 @@ ssl = "none"
         // public_url present → accepted
         recipe.identity.public_url = Some("https://mediator.example.com".into());
         let cfg = to_wizard_config(&recipe).unwrap();
-        assert_eq!(cfg.vta_mode, VTA_MODE_SEALED_MINT);
+        assert_eq!(cfg.vta_mode, Some(VtaMode::SealedMint));
     }
 
     #[test]
@@ -1852,12 +1848,12 @@ ssl = "none"
         // stays lean.
         let original = WizardConfig {
             use_vta: true,
-            vta_mode: VTA_MODE_SEALED_MINT.into(),
+            vta_mode: Some(VtaMode::SealedMint),
             vta_context: "prod-mediator".into(),
-            did_method: DID_VTA.into(),
+            did_method: Some(DidMethod::Vta),
             public_url: "https://mediator.example.com".into(),
-            secret_storage: STORAGE_KEYRING.into(),
-            admin_did_mode: ADMIN_VTA.into(),
+            secret_storage: Some(SecretScheme::Keyring),
+            admin_did_mode: Some(AdminMode::Vta),
             vta_webvh_server_id: Some("prod-1".into()),
             vta_webvh_path: Some("mediator/v1".into()),
             ..WizardConfig::default()
@@ -1882,8 +1878,8 @@ ssl = "none"
         // output, keeping the TOML small for the common case.
         let original = WizardConfig {
             use_vta: true,
-            vta_mode: VTA_MODE_ONLINE.into(),
-            did_method: DID_VTA.into(),
+            vta_mode: Some(VtaMode::Online),
+            did_method: Some(DidMethod::Vta),
             ..WizardConfig::default()
         };
         let recipe_toml = from_wizard_config(&original);
@@ -1897,10 +1893,10 @@ ssl = "none"
         // the new shape: VTA for *identity*, unified backend for *keys*.
         let original = WizardConfig {
             use_vta: true,
-            vta_mode: VTA_MODE_ONLINE.into(),
-            did_method: DID_VTA.into(),
-            secret_storage: STORAGE_KEYRING.into(),
-            admin_did_mode: ADMIN_VTA.into(),
+            vta_mode: Some(VtaMode::Online),
+            did_method: Some(DidMethod::Vta),
+            secret_storage: Some(SecretScheme::Keyring),
+            admin_did_mode: Some(AdminMode::Vta),
             ..WizardConfig::default()
         };
 
@@ -1912,9 +1908,9 @@ ssl = "none"
         let restored = to_wizard_config(&parsed).unwrap();
 
         assert!(restored.use_vta);
-        assert_eq!(restored.vta_mode, VTA_MODE_ONLINE);
-        assert_eq!(restored.did_method, DID_VTA);
-        assert_eq!(restored.secret_storage, STORAGE_KEYRING);
+        assert_eq!(restored.vta_mode, Some(VtaMode::Online));
+        assert_eq!(restored.did_method, Some(DidMethod::Vta));
+        assert_eq!(restored.secret_storage, Some(SecretScheme::Keyring));
     }
 
     #[test]
@@ -1926,7 +1922,7 @@ ssl = "none"
         recipe.identity.did_method = "vta".into();
         let config = to_wizard_config(&recipe).unwrap();
         assert!(config.use_vta, "should auto-detect VTA from did_method");
-        assert_eq!(config.vta_mode, VTA_MODE_ONLINE);
+        assert_eq!(config.vta_mode, Some(VtaMode::Online));
     }
 
     // ── #191: the saved recipe reproduces the run ──────────────────────
@@ -2054,18 +2050,18 @@ ssl = "self-signed"
 
     #[test]
     fn tui_admin_vta_is_not_saved_as_generate() {
-        // `ADMIN_VTA` used to fall through to "generate" in the saved
+        // `AdminMode::Vta` used to fall through to "generate" in the saved
         // recipe, so the replay minted a different admin.
         let config = WizardConfig {
-            deployment_type: DEPLOYMENT_LOCAL.into(),
+            deployment_type: Some(Deployment::Local),
             use_vta: true,
-            vta_mode: VTA_MODE_SEALED_EXPORT.into(),
-            did_method: DID_VTA.into(),
-            secret_storage: STORAGE_KEYRING.into(),
-            admin_did_mode: ADMIN_VTA.into(),
+            vta_mode: Some(VtaMode::SealedExport),
+            did_method: Some(DidMethod::Vta),
+            secret_storage: Some(SecretScheme::Keyring),
+            admin_did_mode: Some(AdminMode::Vta),
             ..WizardConfig::default()
         };
-        assert_eq!(round_trip(&config).admin_did_mode, ADMIN_VTA);
+        assert_eq!(round_trip(&config).admin_did_mode, Some(AdminMode::Vta));
     }
 
     fn manifest_dir() -> std::path::PathBuf {
@@ -2134,7 +2130,7 @@ ssl = "self-signed"
 
         recipe.security.admin_did = Some("did:web:admin.example.com".into());
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.admin_did_mode, ADMIN_PASTE);
+        assert_eq!(config.admin_did_mode, Some(AdminMode::Paste));
         assert_eq!(config.admin_did, "did:web:admin.example.com");
     }
 

@@ -2,6 +2,7 @@
 //! the JWT secret, as values; no I/O.
 
 use crate::app;
+use crate::app::{AdminMode, DidMethod};
 use crate::consts::*;
 use crate::provision::MintedArtefacts;
 use crate::provision::backend::validate_operating_secrets;
@@ -256,14 +257,14 @@ pub(crate) async fn mint_artefacts(
     // ── Admin DID ─────────────────────────────────────────────────────
     // The admin-API identity is what the operator chose. In a VTA flow the
     // VTA-issued credential is the mediator↔VTA identity; it doubles as the
-    // admin-API identity only when explicitly asked for (`ADMIN_VTA`), so a
+    // admin-API identity only when explicitly asked for (`AdminMode::Vta`), so a
     // generated admin stays a separate key by default.
-    let (admin_did, admin_secret) = match config.admin_did_mode.as_str() {
-        ADMIN_GENERATE => {
+    let (admin_did, admin_secret) = match config.admin_did_mode {
+        Some(AdminMode::Generate) => {
             let (did, secret) = generators::did_key::generate_admin_did_key()?;
             (Some(did), Some(secret))
         }
-        ADMIN_VTA => {
+        Some(AdminMode::Vta) => {
             let session = vta_session.ok_or_else(|| {
                 exit::error(
                     exit::NO_VTA_SESSION,
@@ -276,7 +277,7 @@ pub(crate) async fn mint_artefacts(
             );
             (Some(session.admin_did().to_string()), None)
         }
-        ADMIN_PASTE => {
+        Some(AdminMode::Paste) => {
             let did = config.admin_did.trim();
             if did.is_empty() {
                 return Err(exit::error(
@@ -289,8 +290,7 @@ pub(crate) async fn mint_artefacts(
             }
             (Some(did.to_string()), None)
         }
-        // ADMIN_SKIP, or no choice recorded.
-        _ => (None, None),
+        Some(AdminMode::Skip) | None => (None, None),
     };
     // The admin is a separate identity from the mediator; the mediator
     // refuses to start otherwise, so stop here rather than write that config.
@@ -329,8 +329,8 @@ pub(crate) async fn mint_did_material(
     vta_session: Option<&vta::VtaSession>,
 ) -> anyhow::Result<MintedDid> {
     let mut webvh_update_keys = None;
-    let (did, secrets, did_log, authorization_vc) = match config.did_method.as_str() {
-        DID_PEER => {
+    let (did, secrets, did_log, authorization_vc) = match config.did_method {
+        Some(DidMethod::Peer) => {
             let service_uri = did_peer_service_url(&config.public_url, &config.api_prefix);
             let (did, secrets) = generators::did_peer::generate_did_peer(
                 service_uri,
@@ -339,7 +339,7 @@ pub(crate) async fn mint_did_material(
             )?;
             (did, secrets, None, None)
         }
-        DID_WEBVH => {
+        Some(DidMethod::Webvh) => {
             // The DID identifier should encode the host only (`example.com`)
             // so the resolver fetches `<host>/.well-known/did.jsonl`. The
             // template's URL variable, by contrast, needs the *full* URL
@@ -367,7 +367,7 @@ pub(crate) async fn mint_did_material(
             webvh_update_keys = Some(result.update_keys);
             (result.did, result.secrets, Some(result.did_doc), None)
         }
-        DID_VTA => {
+        Some(DidMethod::Vta) => {
             // VTA-managed DID: two reply shapes carry it.
             // - `Full(ProvisionResultV2)` — fresh template render
             //   (online / offline-mint paths, FullSetup intent).
@@ -450,14 +450,11 @@ pub(crate) async fn mint_did_material(
                 ));
             }
         }
-        other => {
+        None => {
             return Err(exit::error(
                 exit::IMPORT_WITHOUT_DATA,
-                format!(
-                    "DID method '{other}' cannot be set up by the wizard (importing an \
-                     existing mediator DID is not supported). Choose did:peer, did:webvh or \
-                     a VTA-managed DID."
-                ),
+                "no DID method was chosen, and the wizard cannot import an existing mediator \
+                 DID. Choose did:peer, did:webvh or a VTA-managed DID.",
             ));
         }
     };

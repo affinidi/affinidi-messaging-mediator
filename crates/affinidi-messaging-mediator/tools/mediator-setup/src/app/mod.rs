@@ -28,9 +28,8 @@ mod vta_flow;
 
 pub use choices::{
     Choice, DEPLOYMENT_CHOICES, KEY_STORAGE_CHOICES, SSL_CHOICES, VTA_INTENT_CHOICES, index_of,
-    index_of_str,
 };
-pub use config::WizardConfig;
+pub use config::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode, WizardConfig};
 pub use step::{
     DatabasePhase, DidPhase, FILE_GATE_PHRASE, FocusPanel, InputMode, KeyStoragePhase,
     SecurityPhase, StepData, VtaStepPhase, WizardStep,
@@ -72,7 +71,7 @@ pub struct WizardApp {
     /// backend-specific URL/path via the text-input widget.
     pub database_phase: Option<DatabasePhase>,
     /// Sub-phase tracker for the `Did` step. Only ever populated when
-    /// the operator picked `DID_VTA` and we have an online VTA
+    /// the operator picked `DidMethod::Vta` and we have an online VTA
     /// session — the wizard then walks the webvh-host selection
     /// screens before advancing to Security.
     pub did_phase: Option<DidPhase>,

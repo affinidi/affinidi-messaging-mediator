@@ -81,7 +81,7 @@ impl WizardApp {
                     self.input_error = None;
                     self.enter_key_storage_phase(KeyStoragePhase::FilePath);
                 } else {
-                    self.config.secret_storage = String::new();
+                    self.config.secret_storage = None;
                     self.exit_key_storage_subflow();
                     self.input_error = Some(format!(
                         "file:// not selected: the confirmation must be \"{FILE_GATE_PHRASE}\"."

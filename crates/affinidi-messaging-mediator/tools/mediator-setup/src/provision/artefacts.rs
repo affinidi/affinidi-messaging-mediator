@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::app;
-use crate::consts::*;
+use crate::app::{Deployment, SecretScheme, SslMode};
 use crate::provision::MintedArtefacts;
 use crate::{
     admin_monitor_profile, config_writer, docker, generators, publish, recipe, reprovision,
@@ -178,7 +178,7 @@ pub(crate) fn write_config_artefacts(
     // Self-signed SSL (when requested). The files go in `keys/` **beside
     // `mediator.toml`**, and the paths written into it are relative to that
     // file — the rule the mediator resolves every configured path by.
-    let (ssl_cert_path, ssl_key_path) = if config.ssl_mode == SSL_SELF_SIGNED {
+    let (ssl_cert_path, ssl_key_path) = if config.ssl_mode == Some(SslMode::SelfSigned) {
         let keys_dir = conf_dir.join("keys");
         let (cert, key) = generators::ssl::generate_self_signed_cert(&keys_dir.to_string_lossy())?;
         written.push(PathBuf::from(cert));
@@ -246,7 +246,7 @@ pub(crate) fn write_config_artefacts(
         }
     }
 
-    // Authorization VC archive (DID_VTA Full path only). Short-lived
+    // Authorization VC archive (DidMethod::Vta Full path only). Short-lived
     // (~1h validity) audit trail; a failure is reported but not fatal.
     if let Some(ref vc_text) = artefacts.authorization_vc {
         let vc_path = conf_dir.join("authorization.jsonld");
@@ -300,12 +300,12 @@ pub(crate) fn write_config_artefacts(
     }
 
     // Docker files for container deployments, next to the config.
-    if config.deployment_type == DEPLOYMENT_CONTAINER {
+    if config.deployment_type == Some(Deployment::Container) {
         written.extend(docker::generate_dockerfile(config, &conf_dir)?);
     }
 
     // The file backend's secrets file, so uninstall can find it.
-    if config.secret_storage == STORAGE_FILE {
+    if config.secret_storage == Some(SecretScheme::File) {
         let url = config_writer::build_backend_url(config);
         if let Ok(affinidi_messaging_mediator_common::secrets::BackendUrl::File { path, .. }) =
             affinidi_messaging_mediator_common::secrets::parse_url(&url)

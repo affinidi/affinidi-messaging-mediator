@@ -3,9 +3,9 @@
 
 use std::{io, path::Path};
 
+use crate::app::{AdminMode, VtaMode};
 use crate::app::{WizardApp, WizardConfig};
 use crate::cli::{self, Args};
-use crate::consts::*;
 use crate::flows::print_banner;
 use crate::install::offer_build_and_guidance;
 use crate::provision::{GenerateOptions, generate_and_write_with};
@@ -106,7 +106,7 @@ pub(crate) fn save_resume_recipe(config: &WizardConfig, had_vta_session: bool) {
                 "\n  Your answers were saved to \x1b[1m{}\x1b[0m.",
                 path.display()
             );
-            if config.use_vta && config.vta_mode == VTA_MODE_ONLINE {
+            if config.use_vta && config.vta_mode == Some(VtaMode::Online) {
                 err!(
                     "  An online VTA session cannot be replayed from a recipe. {}Re-run \
                      `mediator-setup` to finish; pass --force-reprovision if the backend now \
@@ -134,7 +134,7 @@ pub(crate) fn save_resume_recipe(config: &WizardConfig, had_vta_session: bool) {
 /// Apply CLI arguments to the interactive wizard as pre-filled defaults.
 pub(crate) fn apply_tui_prefill(args: &Args, config: &mut WizardConfig) {
     if let Some(ref deployment) = args.deployment {
-        config.deployment_type = deployment.to_string();
+        config.deployment_type = Some((*deployment).into());
     }
     if let Some(ref protocol) = args.protocol {
         match protocol {
@@ -150,7 +150,7 @@ pub(crate) fn apply_tui_prefill(args: &Args, config: &mut WizardConfig) {
         }
     }
     if let Some(ref did_method) = args.did_method {
-        config.did_method = did_method.to_string();
+        config.did_method = Some((*did_method).into());
     }
     if let Some(ref public_url) = args.public_url {
         config.public_url = public_url.clone();
@@ -168,24 +168,19 @@ pub(crate) fn apply_tui_prefill(args: &Args, config: &mut WizardConfig) {
         config.key_suite = args.key_suite.clone();
     }
     if let Some(ref secret_storage) = args.secret_storage {
-        config.secret_storage = secret_storage.to_string();
+        config.secret_storage = Some((*secret_storage).into());
     }
     if let Some(ref ssl) = args.ssl {
-        config.ssl_mode = ssl.to_string();
+        config.ssl_mode = Some((*ssl).into());
     }
     if let Some(ref database_url) = args.database_url {
         config.database_url = database_url.clone();
     }
     if let Some(admin) = args.admin {
-        config.admin_did_mode = match admin {
-            cli::AdminMode::Generate => ADMIN_GENERATE,
-            cli::AdminMode::Vta => ADMIN_VTA,
-            cli::AdminMode::Skip => ADMIN_SKIP,
-        }
-        .into();
+        config.admin_did_mode = Some(admin.into());
     }
     if let Some(ref did) = args.admin_did {
-        config.admin_did_mode = ADMIN_PASTE.into();
+        config.admin_did_mode = Some(AdminMode::Paste);
         config.admin_did = did.clone();
     }
     if let Some(ref listen_address) = args.listen_address {

@@ -246,16 +246,6 @@ pub enum DeploymentType {
     Container,
 }
 
-impl std::fmt::Display for DeploymentType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Local => write!(f, "Local development"),
-            Self::Server => write!(f, "Headless server"),
-            Self::Container => write!(f, "Container"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Protocol {
     /// DIDComm v2 only (TSP off)
@@ -281,16 +271,6 @@ pub enum DidMethod {
     Webvh,
     /// Configure via VTA
     Vta,
-}
-
-impl std::fmt::Display for DidMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Peer => write!(f, "did:peer"),
-            Self::Webvh => write!(f, "did:webvh"),
-            Self::Vta => write!(f, "VTA managed"),
-        }
-    }
 }
 
 /// Optional extra key suites layered on top of the always-present Ed25519 +
@@ -345,35 +325,12 @@ pub enum SecretStorage {
     K8s,
 }
 
-impl std::fmt::Display for SecretStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::File => write!(f, "file://"),
-            Self::Keyring => write!(f, "keyring://"),
-            Self::Aws => write!(f, "aws_secrets://"),
-            Self::Gcp => write!(f, "gcp_secrets://"),
-            Self::Azure => write!(f, "azure_keyvault://"),
-            Self::Vault => write!(f, "vault://"),
-            Self::K8s => write!(f, "k8s://"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SslMode {
     /// No SSL — use a TLS-terminating proxy
     None,
     /// Generate self-signed certificates (local dev only)
     SelfSigned,
-}
-
-impl std::fmt::Display for SslMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => write!(f, "No SSL (TLS proxy)"),
-            Self::SelfSigned => write!(f, "Self-signed"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -386,17 +343,6 @@ pub enum AdminMode {
     Skip,
 }
 
-impl AdminMode {
-    /// The recipe's `security.admin` value.
-    pub fn recipe_value(self) -> &'static str {
-        match self {
-            Self::Generate => "generate",
-            Self::Vta => "vta",
-            Self::Skip => "skip",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,15 +350,16 @@ mod tests {
     #[test]
     fn secret_storage_renders_url_prefix_for_each_variant() {
         // The flag value becomes the recipe's `secrets.storage` scheme via
-        // this Display impl. Each variant must render exactly the URL
+        // `SecretScheme::prefix`. Each variant must render exactly the URL
         // prefix the recipe parser and the config writer match on.
-        assert_eq!(SecretStorage::File.to_string(), "file://");
-        assert_eq!(SecretStorage::Keyring.to_string(), "keyring://");
-        assert_eq!(SecretStorage::Aws.to_string(), "aws_secrets://");
-        assert_eq!(SecretStorage::Gcp.to_string(), "gcp_secrets://");
-        assert_eq!(SecretStorage::Azure.to_string(), "azure_keyvault://");
-        assert_eq!(SecretStorage::Vault.to_string(), "vault://");
-        assert_eq!(SecretStorage::K8s.to_string(), "k8s://");
+        let prefix = |s: SecretStorage| crate::app::SecretScheme::from(s).prefix();
+        assert_eq!(prefix(SecretStorage::File), "file://");
+        assert_eq!(prefix(SecretStorage::Keyring), "keyring://");
+        assert_eq!(prefix(SecretStorage::Aws), "aws_secrets://");
+        assert_eq!(prefix(SecretStorage::Gcp), "gcp_secrets://");
+        assert_eq!(prefix(SecretStorage::Azure), "azure_keyvault://");
+        assert_eq!(prefix(SecretStorage::Vault), "vault://");
+        assert_eq!(prefix(SecretStorage::K8s), "k8s://");
     }
 
     #[test]

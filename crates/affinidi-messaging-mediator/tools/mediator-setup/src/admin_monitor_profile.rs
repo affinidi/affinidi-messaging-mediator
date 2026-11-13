@@ -4,7 +4,7 @@
 //! shape, e.g. the mediator-administration helper).
 //!
 //! Written only when the wizard has the admin DID's secret material
-//! in memory — i.e., the `ADMIN_GENERATE` path where the wizard
+//! in memory — i.e., the `AdminMode::Generate` path where the wizard
 //! freshly minted a `did:key:z6Mk…` admin and holds its Ed25519
 //! private key in `MintedArtefacts.admin_secret`.
 //!
