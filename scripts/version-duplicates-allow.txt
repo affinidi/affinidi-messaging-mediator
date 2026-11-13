@@ -1,0 +1,20 @@
+# Ecosystem crates knowingly resolved at more than one version
+# (second half of scripts/check-workspace-duplicates.sh).
+#
+# One entry per line: <crate> <review-by YYYY-MM-DD> <reason>
+#
+# Every entry is a debt marker, not a resolution: the binary compiles and links
+# two copies of the crate, and the two copies' types do not match. The guard
+# fails once an entry's review-by date has passed: clear the duplicate, or
+# re-date the entry with what changed. It prints entries that match nothing as
+# stale; delete those.
+#
+# The four below share one cause: vta-sdk 0.77 (the mediator's default `vta`
+# feature, and mediator-setup) depends on affinidi-tdk 0.36, which brings
+# affinidi-messaging-sdk 0.44 and trust-tasks 0.36 beside the direct
+# requirements (sdk 0.46, tdk 0.43, trust-tasks 0.38). Cleared by a vta-sdk
+# release on affinidi-tdk 0.43 and a bump of the `vta-sdk` requirement here.
+affinidi-messaging-sdk 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> sdk 0.44
+affinidi-tdk 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36
+trust-tasks-proof 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> trust-tasks 0.36
+trust-tasks-rs 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> trust-tasks 0.36
