@@ -174,7 +174,7 @@ fn parse_owner(row: &str) -> Option<(&str, bool)> {
 
 impl Database {
     /// Drop this instance's registrations left from a previous run. One
-    /// script call clears at most [`CLEAN_START_BATCH`] (so one call never
+    /// script call clears at most 500 (so one call never
     /// blocks the server for long); this calls it until a batch comes back
     /// short, so an instance that had more connected clients than that
     /// leaves none of them registered as live here.

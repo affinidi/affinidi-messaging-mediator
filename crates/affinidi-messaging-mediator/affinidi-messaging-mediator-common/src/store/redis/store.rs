@@ -414,11 +414,14 @@ impl RedisStore {
             .arg(1)
             .query_async(con)
             .await?;
-        let live: bool = redis::cmd("HEXISTS")
+        // Live delivery: a registration with live mode on (`<uuid>:TRUE`),
+        // as the library's `get_status_reply` reads it.
+        let owner: Option<String> = redis::cmd("HGET")
             .arg(keys.global_streaming())
             .arg(did_hash)
             .query_async(con)
             .await?;
+        let live = owner.is_some_and(|owner| owner.ends_with(":TRUE"));
 
         let text = |s: String| Value::BulkString(s.into_bytes());
         let first_id = |entries: Entries| {
