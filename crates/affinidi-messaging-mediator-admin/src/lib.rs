@@ -31,7 +31,7 @@ pub use console::{
     MediatorConsole, Mode, OPERATIONS_SINCE, Target,
 };
 pub use error::{ConsoleError, Result};
-pub use grants::{GrantSelection, revoke_summary};
+pub use grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection, revoke_summary};
 pub use identity::{Identity, IdentityChoice, IdentitySource, ProfileFileSource, StaticIdentities};
 pub use live::{
     MembershipEvent, MembershipFilter, MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate,

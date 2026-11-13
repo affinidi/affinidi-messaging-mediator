@@ -584,3 +584,108 @@ async fn an_admin_looks_up_revokes_and_bumps_mux_grants() {
     );
     assert!(revoked.contains("member epoch 1: 0 "), "{revoked}");
 }
+
+/// The Grants tab's marks: mark every grant listed, revoke them in one
+/// confirmation, and see which one the mediator refused — a rootAdmin
+/// principal's — while the other is revoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_revokes_marked_grants_and_sees_a_protected_one_refused() {
+    use affinidi_messaging_sdk::protocols::mux::{MuxCapability, sign_grant};
+    use affinidi_messaging_test_mediator::TestMediator;
+
+    let mediator = TestMediator::builder()
+        .mux_enabled(true)
+        .local_direct_delivery(true, false)
+        .spawn()
+        .await
+        .unwrap();
+    let env = TestEnvironment::new(mediator).await.unwrap();
+    let op = env.add_user("operator").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&op.did_hash(), &AccountType::Admin)
+        .await
+        .unwrap();
+    let root = env.add_user("root").await.unwrap();
+    env.mediator
+        .store()
+        .account_set_role(&root.did_hash(), &AccountType::RootAdmin)
+        .await
+        .unwrap();
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    for principal in [&device, &root] {
+        env.atm.profile_add(&principal.profile, true).await.unwrap();
+        let (g, _) = sign_grant(
+            &env.atm,
+            &work.did,
+            &principal.did,
+            env.mediator.did(),
+            &[MuxCapability::Receive],
+            0,
+            3600,
+        )
+        .await
+        .unwrap();
+        env.atm
+            .trust_tasks()
+            .mux_grant(&principal.profile, vec![g])
+            .await
+            .expect("grant stored");
+    }
+
+    let console = MediatorConsole::connect(Identity {
+        alias: "operator".into(),
+        did: op.did.clone(),
+        secrets: op.secrets.clone(),
+        mediator_did: Some(env.mediator.did().to_string()),
+    })
+    .await
+    .unwrap();
+    let mut app = App::new(console).with_color_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+    app.open_grants_of(None, Some(work.did.clone()));
+    let listed = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("member epoch 0: 2 ")
+    })
+    .await;
+    assert!(listed.contains("member epoch 0: 2 "), "{listed}");
+
+    // Space marks the grant under the cursor; c clears; a marks them all.
+    app.handle_key(key(KeyCode::Char(' ')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let one = screen(&terminal);
+    assert!(one.contains("· 1 marked") && one.contains('●'), "{one}");
+    app.handle_key(key(KeyCode::Char('c')));
+    app.handle_key(key(KeyCode::Char('a')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    assert!(screen(&terminal).contains("· 2 marked"));
+
+    // One confirmation for both.
+    app.handle_key(key(KeyCode::Char('d')));
+    terminal.draw(|f| app.render(f, f.area())).unwrap();
+    let confirm = screen(&terminal);
+    assert!(
+        confirm.contains("Revoke 2 marked grant(s) of 1 member(s)?"),
+        "{confirm}"
+    );
+    app.handle_key(key(KeyCode::Char('y')));
+    let reported = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("Not every grant was revoked")
+    })
+    .await;
+    println!("{reported}");
+    assert!(
+        reported.contains("revoked 1 of 2 grant(s); 1 refused"),
+        "{reported}"
+    );
+    assert!(reported.contains("only a rootAdmin"), "{reported}");
+    // The refused grant stays listed and marked.
+    app.handle_key(key(KeyCode::Char('x')));
+    let after = settle_until(&mut app, &mut terminal, STEP_WAIT, |s| {
+        s.contains("member epoch 0: 1 ")
+    })
+    .await;
+    assert!(after.contains("member epoch 0: 1 · 1 marked"), "{after}");
+}

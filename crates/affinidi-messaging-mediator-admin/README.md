@@ -145,7 +145,7 @@ An administrator can list, revoke and void the stored grants of DID
 multiplexing (mediator 0.52.0 and later):
 
 ```rust
-use affinidi_messaging_mediator_admin::{GrantSelection, revoke_summary};
+use affinidi_messaging_mediator_admin::{GrantKey, GrantSelection, revoke_summary};
 
 // A member's grants, a page at a time; `epoch` is the member's current one.
 let page = console.mux_grants(None, Some(&member_did), None, Some(100)).await?;
@@ -156,6 +156,15 @@ let outcome = console
     .mux_revoke(&GrantSelection::grants(&member_did, vec![grant_id]))
     .await?;
 println!("{}", revoke_summary(&outcome)); // "revoked 1 grant(s); none remain"
+
+// Revoke several chosen grants, one request each, and hear about each:
+// a refusal (a rootAdmin party's grant is protected) doesn't stop the rest,
+// and a grant counts as revoked only when the mediator's answer lists it.
+let bulk = console
+    .mux_revoke_each(&[GrantKey::new(&member_did, grant_a), GrantKey::new(&other_did, grant_b)])
+    .await?;
+println!("{}", bulk.summary()); // "revoked 1 of 2 grant(s); 1 refused"
+for line in bulk.failures() { println!("{line}"); }
 
 // Void every grant a member gave: read its epoch, confirm, then name it.
 let epoch = console.mux_epoch(&member_did).await?;

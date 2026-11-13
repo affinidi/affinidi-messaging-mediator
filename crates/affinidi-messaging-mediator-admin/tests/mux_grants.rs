@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use affinidi_messaging_mediator_admin::{
-    ConsoleError, GrantSelection, Identity, MediatorConsole, MembershipEvent, MonitorFilter,
-    MonitorUpdate, revoke_summary,
+    ConsoleError, GrantKey, GrantRevokeResult, GrantSelection, Identity, MediatorConsole,
+    MembershipEvent, MonitorFilter, MonitorUpdate, revoke_summary,
 };
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_sdk::protocols::mux::{MuxCapability, sign_grant};
@@ -276,4 +276,90 @@ async fn a_standard_account_cannot_administer_grants_and_a_root_admin_s_are_prot
         "{refused}"
     );
     assert!(refused.explain().contains("only a rootAdmin"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bulk_revocation_reports_each_grant_and_a_protected_one_does_not_stop_the_rest() {
+    let env = env().await;
+    let root = env.add_user("root").await.unwrap();
+    promote(&env, &root, AccountType::RootAdmin).await;
+    let op = env.add_user("operator").await.unwrap();
+    promote(&env, &op, AccountType::Admin).await;
+    let device = env.add_user("device").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let home = env.add_user("home").await.unwrap();
+    for principal in [&device, &root] {
+        env.atm
+            .profile_add(&principal.profile, true)
+            .await
+            .expect("principal websocket");
+    }
+    let work_on_device = grant(&env, &work, &device).await;
+    let home_on_device = grant(&env, &home, &device).await;
+    // The principal is a rootAdmin: only a rootAdmin may revoke this one.
+    let home_on_root = grant(&env, &home, &root).await;
+    // Signed but never stored.
+    let (_, never_stored) = sign_grant(
+        &env.atm,
+        &work.did,
+        &device.did,
+        env.mediator.did(),
+        &[MuxCapability::Receive],
+        0,
+        3600,
+    )
+    .await
+    .unwrap();
+
+    let console = MediatorConsole::connect(identity(&env, &op))
+        .await
+        .expect("operator connects");
+    let asked = [
+        GrantKey::new(&work.did, &work_on_device),
+        GrantKey::new(&home.did, &home_on_root),
+        GrantKey::new(&work.did, &never_stored),
+        GrantKey::new(&home.did, &home_on_device),
+    ];
+    let outcome = console.mux_revoke_each(&asked).await.expect("bulk revoke");
+    let results: Vec<_> = outcome
+        .results
+        .iter()
+        .map(|(k, r)| (k.clone(), r))
+        .collect();
+    assert_eq!(
+        results.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        asked,
+        "every grant reported, in order"
+    );
+    assert!(results[0].1.is_revoked(), "{outcome:?}");
+    assert!(
+        matches!(results[1].1, GrantRevokeResult::Refused(e)
+            if e.refusal_code().is_some_and(|c| c.ends_with(":protectedAccount"))),
+        "{outcome:?}"
+    );
+    assert!(
+        matches!(results[2].1, GrantRevokeResult::NotStored),
+        "{outcome:?}"
+    );
+    assert!(
+        results[3].1.is_revoked(),
+        "the refusal did not stop the rest"
+    );
+    assert_eq!(
+        outcome.summary(),
+        "revoked 2 of 4 grant(s); 1 no longer stored, 1 refused"
+    );
+    assert!(outcome.failures()[0].contains("only a rootAdmin"));
+
+    // The mediator agrees: the device's grants are gone, the root's stays.
+    let device_left = console
+        .mux_grants(Some(&device.did), None, None, None)
+        .await
+        .unwrap();
+    assert!(device_left.grants.is_empty(), "{device_left:?}");
+    let root_left = console
+        .mux_grants(Some(&root.did), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(root_left.grants.len(), 1, "{root_left:?}");
 }
