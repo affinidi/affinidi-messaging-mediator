@@ -37,7 +37,7 @@ affinidi-messaging-mediator-common = { version = "0.52.0", path = "../affinidi-m
 affinidi-messaging-didcomm = "0.15"
 uuid = { version = "1", features = ["v4"] }
 ## Signs the mux grants the Grants tab lists.
-affinidi-messaging-sdk = "0.46.2"
+affinidi-messaging-sdk = "0.46.3"
 
 [lints]
 workspace = true

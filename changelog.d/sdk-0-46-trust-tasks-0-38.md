@@ -42,9 +42,9 @@
   0.44 and `trust-tasks-rs` 0.36, as before. Nothing passes their types
   across.
 
-### Breaking — the console reads typed refusals; `ConsoleError::Refused` gains `current_epoch` (sdk 0.46.2)
+### Breaking — the console reads typed refusals; `ConsoleError::Refused` gains `current_epoch` (sdk 0.46.3)
 
-- The workspace requires `affinidi-messaging-sdk` 0.46.2. Every Trust Task
+- The workspace requires `affinidi-messaging-sdk` 0.46.3 (0.46.2 asks for documents; 0.46.3 also collects a reply sent over REST). Every Trust Task
   it sends now asks to be refused with a `trust-task-error` document. A
   mediator that serves that answers with one; others keep answering with
   problem reports.
