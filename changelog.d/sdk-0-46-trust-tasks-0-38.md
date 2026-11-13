@@ -31,13 +31,14 @@
   - Their documents carry no `@context`.
   - The mediator keeps its own replay record.
   - The `type` check applies only to `ping`, which both versions pass.
-- **DID host policy.** The proof backend's new refusal of DIDs naming
-  `localhost` or a private IP literal is kept when the mediator resolves DIDs
-  itself (local mode). Its own resolver already refused those hosts there.
-  With `[did_resolver] address` set (network mode), the resolver service
-  fetches the documents under its own host policy. The proof backend's check
-  is lifted there, so a local-dev stack whose VTA is
-  `did:webvh:{SCID}:localhost%3A3000` keeps working as it did on 0.37.
+- **DID host policy.** A proof or mux statement whose signing key is on a DID
+  naming `localhost` or a loopback, private-network or link-local IP literal
+  is now refused before resolution, in both resolver modes. In local mode the
+  mediator's resolver already refused those hosts. In network mode
+  (`[did_resolver] address` set) this is new: 0.37 passed such DIDs to the
+  resolver service. A deployment whose clients sign with DIDs on private
+  hosts (e.g. a local-dev VTA at `did:webvh:{SCID}:localhost%3A3000`) behind
+  a resolver service is refused; no stack in this repo or VTI does this.
 - `vta-sdk` (the `vta` feature) still brings its own `affinidi-messaging-sdk`
   0.44 and `trust-tasks-rs` 0.36, as before. Nothing passes their types
   across.

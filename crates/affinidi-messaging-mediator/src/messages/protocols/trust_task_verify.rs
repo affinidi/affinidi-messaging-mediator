@@ -318,21 +318,14 @@ fn retention_end(doc: &TrustTask<Value>, policy: SpecPolicy, now: DateTime<Utc>)
 ///
 /// `trust-tasks-proof` 0.38's [`CachedDidResolver`] refuses, before calling
 /// `client`, a DID naming `localhost` or a loopback, private-network or
-/// link-local IP literal. That guards this process against resolving a DID
-/// from its own network (SSRF), and in **local mode** it repeats what the
-/// mediator's `DIDCacheClient` already enforces (its `HostPolicy::PublicOnly`
-/// default, which the mediator never loosens), so it stays on.
-///
-/// In **network mode** (`[did_resolver] address` set) this process does not
-/// fetch DID documents at all: the resolver service does, under its own host
-/// policy. The filter would then refuse, from a stricter policy than the one
-/// that resolves, DIDs the service is configured to serve (a local-dev stack
-/// whose VTA is `did:webvh:{SCID}:localhost%3A3000`), which `trust-tasks-proof`
-/// 0.37 accepted. So it is lifted there, and only there, leaving host policy
-/// to the service that applies it.
+/// link-local IP literal. That guards against resolving a DID from an
+/// internal network (SSRF). It stays on in both resolver modes: in local mode
+/// it repeats the `DIDCacheClient`'s own `HostPolicy::PublicOnly`, and in
+/// network mode (`[did_resolver] address` set) it keeps the mediator from
+/// asking the resolver service to fetch an internal host on an attacker's
+/// behalf, whatever that service's own host policy is.
 pub(crate) fn signing_key_resolver(client: DIDCacheClient) -> CachedDidResolver {
-    let remote = client.network_health().is_some();
-    CachedDidResolver::new(Arc::new(client)).allow_private_hosts(remote)
+    CachedDidResolver::new(Arc::new(client))
 }
 
 /// The proof verifier: `eddsa` suites only, over keys the issuer's DID
@@ -556,10 +549,10 @@ mod tests {
         ));
     }
 
-    /// A DID on a private host is refused before resolution in local mode,
-    /// and left to the resolver service in network mode.
+    /// A DID on a private host is refused before resolution, in local and
+    /// in network mode alike: the resolver service is never asked for it.
     #[tokio::test]
-    async fn private_did_hosts_are_left_to_a_resolver_service() {
+    async fn private_did_hosts_are_refused_in_either_resolver_mode() {
         const VM: &str = "did:webvh:QmScid:localhost%3A3000#key-0";
         const REFUSED: &str = "names a host this resolver does not contact";
 
@@ -572,8 +565,6 @@ mod tests {
             .expect_err("local mode refuses a localhost DID");
         assert!(err.to_string().contains(REFUSED), "{err}");
 
-        // Nothing listens on this address: resolution fails, but at the
-        // service, not at the host policy.
         let remote = DIDCacheClient::new(
             DIDCacheConfigBuilder::default()
                 .with_network_mode("ws://127.0.0.1:9/did/v1/ws")
@@ -585,8 +576,8 @@ mod tests {
         let err = signing_key_resolver(remote)
             .resolve_vm_for_purpose(VM, ProofPurpose::Authentication)
             .await
-            .expect_err("nothing serves it");
-        assert!(!err.to_string().contains(REFUSED), "{err}");
+            .expect_err("network mode refuses it too");
+        assert!(err.to_string().contains(REFUSED), "{err}");
     }
 
     #[tokio::test]
