@@ -3816,6 +3816,7 @@ mod tests {
                     GrantRevokeResult::Refused(ConsoleError::Refused {
                         code: "e.p.messaging/mux/admin-revoke:protectedAccount".into(),
                         comment: "rootAdmin".into(),
+                        current_epoch: None,
                     }),
                 ),
                 (

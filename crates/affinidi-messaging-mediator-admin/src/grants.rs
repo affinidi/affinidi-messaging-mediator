@@ -388,6 +388,7 @@ mod tests {
         ConsoleError::Refused {
             code: code.into(),
             comment: "no".into(),
+            current_epoch: None,
         }
     }
 
