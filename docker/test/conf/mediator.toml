@@ -1,11 +1,16 @@
-### Mediator Configuration
+### Mediator Configuration — TEST DEPLOYMENT (docker-compose.test.yml)
 ###
-### Every setting can be overridden by an environment variable.
-### The env var name is shown in the "Env:" line above each field.
-### Environment variables take priority over values in this file.
+### A copy of the annotated template (crates/affinidi-messaging-mediator/conf/
+### mediator.toml) with a fixed test identity, a test file secrets backend and
+### the Redis host of the compose file. Its [limits] are held equal to the
+### template's by mediator-config's tests/container_config.rs.
+###
+### A setting with an "Env:" line can be overridden by the environment
+### variable it names; environment variables take priority over this file.
+### Values are checked at startup: one that does not read stops the mediator.
 
-### log_level: trace debug info warn error
-### NOTE: RUST_LOG environment variable can also override this setting
+### Env: MEDIATOR_LOG_LEVEL (or LOG_LEVEL)
+### One of: trace debug info warn error. RUST_LOG, when set, takes over.
 log_level = "info"
 
 ### Env: LOG_JSON
@@ -29,16 +34,17 @@ mediator_did = "did://did:peer:2.Vz6Mksfa1ijceFf8yFmTSdRha6Ha2Lzzfuc68UyRAdpsC5p
 ### signing key, operating keys, VTA cache — lives under one backend.
 ### Pick the `backend` URL and everything is automatic from there.
 ###
-### Supported backends:
-###   keyring://<service>                   OS keyring (macOS Keychain,
-###                                         Linux Secret Service, Windows
-###                                         Credential Manager).
+### Supported backends (see the template and docs/secrets-backend.md):
+###   aws_secrets://<region>/<prefix>       AWS Secrets Manager.
+###   gcp_secrets://<project>/<prefix>      GCP Secret Manager.
+###   vault://<endpoint>/<mount>[/<prefix>] HashiCorp Vault (KV v2).
+###   k8s://[<namespace>/]<secret-name>     Kubernetes Secret.
 ###   file:///<absolute-path>[?encrypt=1]   Local JSON file (plaintext by
 ###                                         default — DEV/TEST ONLY).
-###   aws_secrets://<region>/<prefix>       AWS Secrets Manager.
-###   gcp_secrets://<project>/<prefix>      GCP Secret Manager (coming soon).
-###   azure_keyvault://<vault>              Azure Key Vault (coming soon).
-###   vault://<host[:port]>/<kv-path>       HashiCorp Vault (coming soon).
+###   keyring://<service>                   OS keychain; on Linux the kernel
+###                                         keyring, lost on reboot.
+###   azure_keyvault://<vault>              Azure Key Vault via the Azure CLI
+###                                         login: wizard/development only.
 ###
 ### Env: MEDIATOR_SECRETS_BACKEND
 ### ****************************************************************************************************************************
@@ -56,7 +62,7 @@ backend = "file:///etc/mediator/conf/secrets.json"
 ### Server configuration
 ### ****************************************************************************************************************************
 [server]
-### Env: LISTEN_ADDRESS
+### Env: MEDIATOR_LISTEN_ADDRESS (or LISTEN_ADDRESS)
 ### <ip_address>:<tcp_port> that this service will listen on
 listen_address = "0.0.0.0:7037"
 
@@ -69,23 +75,26 @@ api_prefix = "/mediator/v1/"
 
 ### Env: ADMIN_DID
 ### DID of the admin (REQUIRED)
-### NOTE: It is strongly recommended to NOT use the same DID as the mediator!
-###       This causes more use cases where the secrets of the mediator itself can be exposed in administration tasks.
-### NOTE: You can add additional admin DIDs after startup via the DIDComm admin protocol
+### Must be a different DID from mediator_did: the mediator refuses to start
+### when both name the same DID.
+### Further admin accounts are added at runtime by a root admin with the
+### messaging/account Trust Tasks (see docs/acls.md, "Administration").
 admin_did = "did://did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
 
 ### Env: DID_WEB_SELF_HOSTED
 ### Path to the self-hosted DID Document
 ### Supported formats:
-###   file://<path>
-###   aws_parameter_store://<parameter_name>
+###   file://<path>     a relative path is relative to this file's directory
+###   aws_parameter_store://<parameter_name>[?region=<region>]
+###   s3://<bucket>/<key>[?region=<region>]
+### A did:webvh log may hold any number of entries, one per line.
 ### When enabled, adds a did:web route at /.well-known/did.json.
 ### Inactive by default — uncomment only when this mediator should
 ### serve its own DID document/log (e.g. did:webvh self-hosted at
 ### the same domain as the public URL). The setup wizard activates
 ### this line automatically when the public URL host and the DID's
 ### host match; otherwise it leaves it commented out.
-# did_web_self_hosted = "file://./conf/did.jsonl"
+# did_web_self_hosted = "file://did.jsonl"
 
 ### Public service URL(s) at which this mediator is reachable. The
 ### Routing 2.0 forward handler uses these (plus `listen_address`) to
@@ -106,6 +115,10 @@ admin_did = "did://did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
 ### an empty value clears the list.
 # local_endpoints = ["https://mediator.example.com", "https://mediator.example.com:7037"]
 
+### Env: TRUST_XFF_CIDRS — comma-separated (the TOML form is an array).
+### CIDR ranges of reverse proxies trusted to provide X-Forwarded-For.
+trust_xff_cidrs = []
+
 ### ****************************************************************************************************************************
 ### Database configuration
 ### ****************************************************************************************************************************
@@ -114,7 +127,7 @@ admin_did = "did://did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
 ### Unset: the mediator loads the stored-function library built into it.
 # functions_file = "./conf/atm-functions.lua"
 
-### Env: DATABASE_URL
+### Env: MEDIATOR_DATABASE_URL (or DATABASE_URL)
 ### URL of the Redis compatible database
 ### Supported schemes:
 ###   redis://127.0.0.1/                    — local, no auth (dev only)
@@ -130,15 +143,20 @@ database_url = "redis://redis:6379/"
 ### Timeout for database operations in seconds
 database_timeout = "2"
 
+### Env: DATABASE_CLUSTER_MODE
+### "true" when the database runs in cluster mode. See the template.
+cluster_mode = "false"
+
 ### ****************************************************************************************************************************
 ### Security configuration
 ### ****************************************************************************************************************************
 [security]
 ### Env: MEDIATOR_ACL_MODE
-### ACL logic mode: explicit_deny | explicit_allow
+### explicit_deny (OPEN: any DID may authenticate) or explicit_allow (CLOSED:
+### only pre-registered DIDs). Any other value refuses to start.
 mediator_acl_mode = "explicit_deny"
 
-### Env: GLOBAL_DEFAULT_ACL
+### Env: GLOBAL_ACL_DEFAULT (or the older GLOBAL_DEFAULT_ACL)
 ### Default ACL applied to new/unknown DIDs
 ### NOTE: ALLOW_ALL or DENY_ALL must always be first, followed by comma-separated flags
 ### Flags: LOCAL, SEND_MESSAGES, RECEIVE_MESSAGES, SEND_FORWARDED, RECEIVE_FORWARDED,
@@ -155,12 +173,12 @@ local_direct_delivery_allowed = "true"
 local_direct_delivery_allow_anon = "false"
 
 ### NOTE: `mediator_secrets` was removed. Operating keys now live in the
-### unified `[secrets]` backend at well-known keys
-### (`mediator/operating/signing`, `mediator/operating/key_agreement`) —
-### or are fetched from the VTA at startup when VTA integration is enabled
-### (indicated by the presence of `mediator/admin/credential`).
+### unified `[secrets]` backend under the well-known key
+### `mediator_operating_secrets`, or are fetched from the VTA at startup when
+### VTA integration is enabled (indicated by a VTA-linked
+### `mediator_admin_credential` in the backend).
 
-### Env: USE_SSL
+### Env: MEDIATOR_USE_SSL (or USE_SSL)
 ### If true, SSL is enabled. Set to false only if TLS is terminated externally
 use_ssl = "false"
 
@@ -173,11 +191,12 @@ ssl_certificate_file = "conf/keys/end.cert"
 ssl_key_file = "conf/keys/end.key"
 
 ### JWT signing key is no longer a config field — it lives in the unified
-### `[secrets]` backend under the well-known key `mediator/jwt/secret` and
-### is provisioned by the setup wizard or `mediator rotate-jwt`.
+### `[secrets]` backend under the well-known key `mediator_jwt_secret` and
+### is provisioned by the setup wizard (`mediator-setup`).
 
 ### Env: JWT_ACCESS_EXPIRY
-### Expiry time in seconds for JWT access tokens (minimum: 10)
+### Expiry time in seconds for JWT access tokens. At least 10, and less than
+### jwt_refresh_expiry; startup fails otherwise.
 jwt_access_expiry = "900"
 
 ### Env: JWT_REFRESH_EXPIRY
@@ -211,10 +230,14 @@ jwt_refresh_expiry = "86400"
 ###     page still needs a valid token, so "*" does not create CSRF
 ###     exposure. `allow_credentials` is never set.
 ###
+### Each exact entry must be scheme://host[:port] with no path or trailing
+### slash; anything else refuses to start, naming the entry.
+###
 ### The mediator also applies this allowlist as a defence-in-depth
-### `Origin` check on the WebSocket upgrade (/ws): browser upgrades
-### from non-allowlisted origins are refused (header-less native
-### clients are unaffected — for them the JWT is the gate).
+### `Origin` check on the WebSocket upgrade (/ws): an upgrade carrying a
+### non-allowlisted Origin is refused. A client sending NO Origin is
+### admitted — for it the JWT is the gate. React Native's WebSocket sends an
+### Origin; see docs/cors-and-origin.md.
 ###
 ### Operational note: with the browser WebSocket auth path the JWT
 ### travels in the `Sec-WebSocket-Protocol` request header. Over wss://
@@ -237,6 +260,11 @@ force_session_did_match = "true"
 ### Env: BLOCK_REMOTE_ADMIN_MSGS
 ### If true, admin messages must be delivered directly (not via another mediator)
 block_remote_admin_msgs = "true"
+
+### Env: TRUST_TASK_VERIFICATION
+### "warn" or "enforce": what to do with a Trust Task that fails its
+### acceptance checks. See the template.
+trust_task_verification = "warn"
 
 ### Env: ENABLE_INTER_MEDIATOR_RELAY
 ### Explicitly act as an inter-mediator relay (accept anonymous /inbound
@@ -347,17 +375,22 @@ message_expiry_seconds = "604800"
 ### higher = more memory per message and per queued copy.
 message_size = "1048576"
 
+### Env: LIMIT_QUEUED_SEND_MESSAGES_PER_PEER
+### How many messages one sender may have queued for one SPECIFIC recipient
+### (-1 = no limit). See the template.
+queued_send_messages_per_peer = "50"
+
 ### Env: LIMIT_QUEUED_SEND_MESSAGES_SOFT
 ### Default outbound queue limit per DID (-1 = no limit).
 ### Scale: the default ceiling a DID gets; raise for senders that burst while a
 ### recipient is offline. `soft` is the default, `hard` (below) is the max.
-queued_send_messages_soft = "200"
+queued_send_messages_soft = "2000"
 
 ### Env: LIMIT_QUEUED_SEND_MESSAGES_HARD
 ### Maximum outbound queue limit settable by non-admin (-1 = no limit).
 ### Scale: per-DID outbound ceiling; raise for high-throughput senders. Bounds
 ### worst-case backend storage per DID (this x message_size).
-queued_send_messages_hard = "1000"
+queued_send_messages_hard = "10000"
 
 ### Env: LIMIT_QUEUED_RECEIVE_MESSAGES_SOFT
 ### Default inbound queue limit per DID (-1 = no limit).
@@ -370,7 +403,7 @@ queued_receive_messages_soft = "200"
 ### backend storage per DID (this x message_size).
 queued_receive_messages_hard = "1000"
 
-### Env: LIMIT_TO_KEYS_PER_DID
+### Env: LIMIT_TO_KEYS_PER_RECIPIENT (or the older LIMIT_TO_KEYS_PER_DID)
 ### Maximum keys per recipient DID (DoS protection).
 ### Scale: rarely needs changing; only raise for recipients that legitimately
 ### publish many key-agreement keys.
@@ -388,13 +421,13 @@ to_recipients = "100"
 ### memory buffered per WebSocket frame.
 ws_size = "10485760"
 
-### Env: ACCESS_LIST_LIMIT
+### Env: LIMIT_ACCESS_LIST_LIMIT (or the older ACCESS_LIST_LIMIT)
 ### Maximum access list entries per DID.
 ### Scale: raise for DIDs with large allow/deny lists (companion to
 ### local_max_acl); each entry is one stored set member.
 access_list_limit = "1000"
 
-### Env: OOB_INVITE_TTL
+### Env: LIMIT_OOB_INVITE_TTL (or the older OOB_INVITE_TTL)
 ### TTL in seconds for OOB invites (24h).
 ### Scale: lower for tighter, short-lived invite windows; raise if invites are
 ### distributed out-of-band slowly (e.g. printed/QR onboarding).

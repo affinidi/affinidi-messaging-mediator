@@ -31,11 +31,6 @@ use affinidi_secrets_resolver::SecretsResolver;
 use aws_config::{Region, SdkConfig};
 #[cfg(feature = "aws")]
 use aws_sdk_ssm::types::ParameterType;
-use std::{
-    fs::File,
-    io::{self, BufRead},
-    path::Path,
-};
 use tracing::{error, info, warn};
 
 use super::AwsConfig;
@@ -162,7 +157,10 @@ pub(crate) fn get_hostname(host_name: &str) -> Result<String, MediatorError> {
         Err(MediatorError::ConfigError(
             12,
             "NA".into(),
-            "Invalid hostname format!".into(),
+            format!(
+                "streaming.uuid = {host_name:?} is not valid: expected \"hostname://\" or \
+                 \"string://<id>\""
+            ),
         ))
     }
 }
@@ -309,49 +307,27 @@ pub(crate) async fn aws_s3(target: &str, aws_config: &SdkConfig) -> Result<Strin
     })
 }
 
-/// Reads a file and returns a vector of strings, one for each line in the file.
-/// Strips lines starting with `#` (comments). Used by the runtime document /
-/// DID-resolution helpers below; the config-loading copy lives in the
-/// `affinidi-messaging-mediator-config` crate.
-fn read_file_lines<P>(file_name: P) -> Result<Vec<String>, MediatorError>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(file_name.as_ref()).map_err(|err| {
-        error!(
-            "Could not open file({}). {}",
-            file_name.as_ref().display(),
-            err
-        );
-        MediatorError::ConfigError(
-            12,
-            "NA".into(),
-            format!(
-                "Could not open file({}). {}",
-                file_name.as_ref().display(),
-                err
-            ),
-        )
-    })?;
-
-    let mut lines = Vec::new();
-    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.starts_with('#') {
-            lines.push(line);
-        }
-    }
-
-    Ok(lines)
-}
-
-/// Reads document from `file://`, `aws_parameter_store://`, or `s3://`.
+/// Reads the self-hosted DID document or log (`server.did_web_self_hosted`)
+/// from `file://`, `aws_parameter_store://`, or `s3://`, exactly as stored.
+///
+/// A `file://` source is read verbatim: it used to be read line by line and
+/// the lines joined with nothing between them, which turned a did:webvh log of
+/// more than one entry into one unparseable line, and cut the file off at the
+/// first line that was not UTF-8.
 pub(crate) async fn read_document(
     document_path: &str,
     #[cfg_attr(not(feature = "aws"), allow(unused_variables))] aws_config: &Option<AwsConfig>,
 ) -> Result<String, MediatorError> {
-    let (scheme, path) = parse_scheme(document_path, "document_path")?;
+    let (scheme, path) = parse_scheme(document_path, "server.did_web_self_hosted")?;
     let content: String = match scheme {
-        "file" => read_file_lines(path)?.concat(),
+        "file" => std::fs::read_to_string(path).map_err(|err| {
+            error!("Could not read server.did_web_self_hosted ({path}): {err}");
+            MediatorError::ConfigError(
+                12,
+                "NA".into(),
+                format!("Could not read server.did_web_self_hosted ({path}): {err}"),
+            )
+        })?,
         PARAMETER_STORE_SCHEME => {
             #[cfg(feature = "aws")]
             {
@@ -389,8 +365,10 @@ pub(crate) async fn read_document(
             return Err(MediatorError::ConfigError(
                 12,
                 "NA".into(),
-                "Invalid document_path format! Expecting file://, aws_parameter_store://, or s3:// ..."
-                    .into(),
+                format!(
+                    "server.did_web_self_hosted = {document_path:?} is not valid: expected \
+                     file://, aws_parameter_store://, or s3://"
+                ),
             ));
         }
     };
@@ -533,85 +511,150 @@ pub(crate) async fn assert_operating_secrets_cover_key_agreement(
     ))
 }
 
+/// `processors.forwarding.blocked_forwarding_dids`: a JSON array of DIDs.
+pub(crate) fn parse_blocked_forwarding_dids(raw: &str) -> Result<Vec<String>, MediatorError> {
+    serde_json::from_str(raw).map_err(|err| {
+        error!("Could not parse processors.forwarding.blocked_forwarding_dids. Reason: {err}");
+        MediatorError::ConfigError(
+            12,
+            "NA".into(),
+            format!(
+                "processors.forwarding.blocked_forwarding_dids = {raw:?} is not valid: expected \
+                 a JSON array of DIDs ({err})"
+            ),
+        )
+    })
+}
+
+/// The service endpoints a DID document publishes, in
+/// [`canonical_relay_target`] form.
+fn service_endpoints(did: &str, doc: &Document) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    for service in doc.service.iter() {
+        match &service.service_endpoint {
+            Endpoint::Url(uri) => endpoints.push(canonical_relay_target(uri.as_ref())),
+            Endpoint::Map(map) => {
+                if let Some(entries) = map.as_array() {
+                    for endpoint in entries {
+                        if let Some(uri) = endpoint.get("uri") {
+                            if let Some(uri) = uri.as_str() {
+                                endpoints.push(canonical_relay_target(uri));
+                            } else {
+                                warn!("Couldn't parse URI as a string: {uri:#?}");
+                            }
+                        } else {
+                            warn!(
+                                "Service endpoint map does not contain a URI. DID ({did}), Service ({service:#?}), Endpoint ({endpoint:#?})"
+                            );
+                        }
+                    }
+                } else if let Some(uri) = map.get("uri") {
+                    if let Some(uri) = uri.as_str() {
+                        endpoints.push(canonical_relay_target(uri));
+                    } else {
+                        warn!("Couldn't parse URI as a string: {uri:#?}");
+                    }
+                } else {
+                    warn!(
+                        "Service endpoint map does not contain a URI. DID ({did}), Service ({service:#?}), Endpoint ({map:#?})"
+                    );
+                }
+            }
+            // `Endpoint` is `#[non_exhaustive]`; ignore unknown shapes.
+            _ => {}
+        }
+    }
+    endpoints
+}
+
+/// First and longest pause between background attempts to resolve a blocked
+/// DID that did not resolve at startup.
+const BLOCKED_DID_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+const BLOCKED_DID_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Creates a set of URI's that can be used to detect if forwarding loopbacks to the mediator could occur.
 /// Entries are stored in their [`canonical_relay_target`] form, which is the form
 /// every lookup compares against.
+///
+/// Every DID (the operator's `blocked_forwarding_dids` and this mediator's own)
+/// is blocked by its DID at once. Its endpoints come from its document; a DID
+/// that does not resolve now does **not** stop the mediator starting — a third
+/// party's DID host being down must not (#146). It is logged, and a background
+/// task keeps resolving it (backing off from 30 s to 10 min) and adds its
+/// endpoints to [`ForwardingConfig::blocked_forwarding_late`] once it does. The
+/// task ends when every pending DID has resolved, or when the configuration it
+/// serves is dropped.
 pub(crate) async fn load_forwarding_protection_blocks(
     did_resolver: &DIDCacheClient,
     forwarding_config: &mut ForwardingConfig,
     mediator_did: &str,
     blocked_dids: &str,
 ) -> Result<(), MediatorError> {
-    let mut blocked_dids: Vec<String> = match serde_json::from_str(blocked_dids) {
-        Ok(dids) => dids,
-        Err(err) => {
-            error!("Could not parse blocked_forwarding_dids. Reason: {err}");
-            return Err(MediatorError::ConfigError(
-                12,
-                "NA".into(),
-                format!("Could not parse blocked_forwarding_dids. Reason: {err}"),
-            ));
-        }
-    };
-
+    let mut blocked_dids = parse_blocked_forwarding_dids(blocked_dids)?;
     blocked_dids.push(mediator_did.into());
 
+    let mut pending = Vec::new();
     for did in blocked_dids {
-        let doc = did_resolver.resolve(&did).await.map_err(|err| {
-            MediatorError::DIDError(
-                12,
-                "NA".into(),
-                did.clone(),
-                format!("Couldn't resolve DID. Reason: {err}"),
-            )
-        })?;
-
         forwarding_config
             .blocked_forwarding
             .insert(canonical_relay_target(&did));
-
-        for service in doc.doc.service.iter() {
-            match &service.service_endpoint {
-                Endpoint::Url(uri) => {
-                    forwarding_config
-                        .blocked_forwarding
-                        .insert(canonical_relay_target(uri.as_ref()));
-                }
-                Endpoint::Map(map) => {
-                    if let Some(endpoints) = map.as_array() {
-                        for endpoint in endpoints {
-                            if let Some(uri) = endpoint.get("uri") {
-                                if let Some(uri) = uri.as_str() {
-                                    forwarding_config
-                                        .blocked_forwarding
-                                        .insert(canonical_relay_target(uri));
-                                } else {
-                                    warn!("Couldn't parse URI as a string: {uri:#?}");
-                                }
-                            } else {
-                                warn!(
-                                    "Service endpoint map does not contain a URI. DID ({did}), Service ({service:#?}), Endpoint ({endpoint:#?})"
-                                );
-                            }
-                        }
-                    } else if let Some(uri) = map.get("uri") {
-                        if let Some(uri) = uri.as_str() {
-                            forwarding_config
-                                .blocked_forwarding
-                                .insert(canonical_relay_target(uri));
-                        } else {
-                            warn!("Couldn't parse URI as a string: {uri:#?}");
-                        }
-                    } else {
-                        warn!(
-                            "Service endpoint map does not contain a URI. DID ({did}), Service ({service:#?}), Endpoint ({map:#?})"
-                        );
-                    }
-                }
-                // `Endpoint` is `#[non_exhaustive]`; ignore unknown shapes.
-                _ => {}
+        match did_resolver.resolve(&did).await {
+            Ok(doc) => forwarding_config
+                .blocked_forwarding
+                .extend(service_endpoints(&did, &doc.doc)),
+            Err(err) => {
+                warn!(
+                    did = %did,
+                    error = %err,
+                    "processors.forwarding.blocked_forwarding_dids: couldn't resolve this DID at \
+                     startup. It is blocked by its DID now; its service endpoints are added once \
+                     it resolves (retried in the background). Until then a forward relayed to \
+                     one of its endpoints under another DID is not refused."
+                );
+                pending.push(did);
             }
         }
+    }
+
+    if !pending.is_empty() {
+        let late = std::sync::Arc::downgrade(&forwarding_config.blocked_forwarding_late);
+        let resolver = did_resolver.clone();
+        tokio::spawn(async move {
+            let mut pause = BLOCKED_DID_RETRY_FIRST;
+            while !pending.is_empty() {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(BLOCKED_DID_RETRY_MAX);
+                let Some(late) = late.upgrade() else {
+                    return;
+                };
+                let mut still_pending = Vec::new();
+                for did in pending {
+                    match resolver.resolve(&did).await {
+                        Ok(doc) => {
+                            let endpoints = service_endpoints(&did, &doc.doc);
+                            info!(
+                                did = %did,
+                                endpoints = endpoints.len(),
+                                "blocked forwarding DID resolved; its endpoints are now blocked"
+                            );
+                            late.write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extend(endpoints);
+                        }
+                        Err(err) => {
+                            warn!(
+                                did = %did,
+                                error = %err,
+                                retry_in_secs = pause.as_secs(),
+                                "blocked forwarding DID still doesn't resolve"
+                            );
+                            still_pending.push(did);
+                        }
+                    }
+                }
+                pending = still_pending;
+            }
+        });
     }
 
     Ok(())
@@ -620,6 +663,71 @@ pub(crate) async fn load_forwarding_protection_blocks(
 #[cfg(test)]
 mod tests {
     use super::{join_api_path, normalize_api_prefix, read_did_config, read_document};
+
+    /// Issue #146: a blocked DID that does not resolve no longer stops the
+    /// mediator starting. It is blocked by its DID at once.
+    #[tokio::test]
+    async fn an_unresolvable_blocked_did_does_not_stop_startup() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let mut forwarding = super::ForwardingConfig::default();
+        super::load_forwarding_protection_blocks(
+            &resolver,
+            &mut forwarding,
+            "did:key:z6MkiToqovww7vYtxm1xNM15u9JzqzUFZ1k7s7MazYJUyAxv",
+            r#"["did:nosuchmethod:abc"]"#,
+        )
+        .await
+        .expect("an unresolvable blocked DID is a warning, not a startup failure");
+        assert!(
+            forwarding
+                .blocked_forwarding
+                .contains("did:nosuchmethod:abc")
+        );
+        assert!(
+            forwarding
+                .blocked_forwarding
+                .contains("did:key:z6MkiToqovww7vYtxm1xNM15u9JzqzUFZ1k7s7MazYJUyAxv")
+        );
+    }
+
+    /// A malformed list is still an error, and names the setting.
+    #[tokio::test]
+    async fn a_malformed_blocked_did_list_names_the_setting() {
+        let err = super::parse_blocked_forwarding_dids("did:example:a")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("processors.forwarding.blocked_forwarding_dids"),
+            "{err}"
+        );
+    }
+
+    /// Issue #146: the error for a bad `streaming.uuid` names the key and the
+    /// value (it used to read "Invalid hostname format!").
+    #[test]
+    fn a_bad_streaming_uuid_names_the_key() {
+        let err = super::get_hostname("myhost").unwrap_err().to_string();
+        assert!(err.contains("streaming.uuid"), "{err}");
+        assert!(err.contains("myhost"), "{err}");
+        assert_eq!(super::get_hostname("string://abc").unwrap(), "abc");
+    }
+
+    /// A `file://` source is read exactly as stored, line breaks included.
+    #[tokio::test]
+    async fn a_file_document_is_read_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("did.jsonl");
+        let body = "{\"a\":1}\n# not a comment\n{\"b\":2}\n";
+        std::fs::write(&path, body).unwrap();
+        let read = read_document(&format!("file://{}", path.display()), &None)
+            .await
+            .unwrap();
+        assert_eq!(read, body);
+    }
 
     /// The runtime document reader accepts `file://`, `aws_parameter_store://`,
     /// and `s3://`. An unknown scheme must fail with a message that names all
@@ -635,6 +743,10 @@ mod tests {
                 && msg.contains("aws_parameter_store://")
                 && msg.contains("s3://"),
             "error should name the accepted schemes, got: {msg}"
+        );
+        assert!(
+            msg.contains("server.did_web_self_hosted") && msg.contains("gs://bucket/obj"),
+            "error should name the setting and the value, got: {msg}"
         );
     }
 

@@ -2,7 +2,7 @@
 ### Container profile — this is the config baked into the published image.
 ###
 ### It differs from the annotated template (crates/affinidi-messaging-mediator/conf/mediator.toml)
-### in exactly three ways, all of them deliberate:
+### in these ways, all of them deliberate:
 ###
 ###   1. No identity is baked in. `mediator_did` and `admin_did` are empty: a
 ###      published image must not ship a usable (or sample) DID. Supply them at
@@ -13,16 +13,25 @@
 ###      an OS secret service that does not exist in a container, and naming a
 ###      backend the binary was not compiled with makes it hard-fail at startup.
 ###      Cloud deployments override this with MEDIATOR_SECRETS_BACKEND.
-###   3. Container-shaped defaults: bind on 0.0.0.0, Redis at the `redis` host.
+###   3. Container-shaped defaults: bind on 0.0.0.0, Redis at the `redis` host,
+###      JSON logs, TLS terminated in front of the container.
+###   4. It is short. Optional settings the template documents (the rest of
+###      [processors.forwarding], [limits.mux], [storage], trust_task_verification,
+###      cluster_mode, the commented-out limits, …) are left out and take their
+###      defaults; the [limits] it does set are held equal to the template's.
+###      There is no [storage] section: STORAGE_BACKEND=fjall (with
+###      STORAGE_DATA_DIR) creates one, otherwise the mediator uses Redis.
 ###
-### Every field below is env-overridable — see the `### Env:` markers in the
-### template for the full list, and mediator-config's `env.rs` for the mapping.
+### Every setting the template labels `### Env:` can be set from the
+### environment, whether or not it appears here — see the template for the
+### full list, and mediator-config's `env.rs` for the mapping. Values are
+### checked at startup: one that does not read stops the mediator.
 ###
 ### Minimum to boot:
 ###   docker run \
 ###     -e MEDIATOR_DID=did://did:peer:2.Vz6...       \
 ###     -e ADMIN_DID=did://did:peer:2.Vz6...          \
-###     -e DATABASE_URL=redis://<host>:6379/          \
+###     -e MEDIATOR_DATABASE_URL=redis://<host>:6379/ \
 ###     -e MEDIATOR_SECRETS_BACKEND=aws_secrets://us-east-1/prod/mediator/ \
 ###     ghcr.io/affinidi/messaging-mediator:<version>
 ###
@@ -30,9 +39,11 @@
 ### secrets file at /etc/mediator/secrets.json (plaintext on disk — the mediator
 ### warns; prefer a cloud backend for anything real).
 ###
-### This file is parsed as `ConfigRaw` by a unit test in mediator-config
-### (`golden::container_mediator_toml_parses`), so a new required field cannot
-### silently rot the shipped image.
+### This file is parsed as `ConfigRaw` by mediator-config's
+### `tests/container_config.rs` (`container_mediator_toml_parses`,
+### `container_limits_match_template`) and checked with the mediator's startup
+### validation (`validate_raw_tests`), so a new required field or a value the
+### mediator would refuse cannot silently rot the shipped image.
 ### ****************************************************************************************************************************
 
 log_level = "info"
@@ -57,7 +68,7 @@ trust_xff_cidrs = []
 
 [database]
 functions_file = "./conf/atm-functions.lua"
-### Overridden by DATABASE_URL.
+### Overridden by MEDIATOR_DATABASE_URL (or DATABASE_URL).
 database_url = "redis://redis:6379/"
 database_timeout = "2"
 

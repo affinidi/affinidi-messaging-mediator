@@ -152,10 +152,10 @@ See [docs/secrets-backend.md](docs/secrets-backend.md#which-backends-are-compile
 | Feature | Backend URL |
 |---|---|
 | (built in) | `file://`, optionally `?encrypt=1` (AES-256-GCM, Argon2id) |
-| `secrets-keyring` | `keyring://` (macOS Keychain, Windows Credential Manager, Linux Secret Service) |
+| `secrets-keyring` | `keyring://` (macOS login Keychain; on Linux the kernel keyring, which is lost on reboot — desktop development only) |
 | `secrets-aws` | `aws_secrets://` |
 | `secrets-gcp` | `gcp_secrets://` |
-| `secrets-azure` | `azure_keyvault://` |
+| `secrets-azure` | `azure_keyvault://` (Azure CLI login only: wizard / development use) |
 | `secrets-vault` | `vault://` (token, Kubernetes, or AppRole auth) |
 | `secrets-k8s` | `k8s://` (one Kubernetes `Secret`) |
 
@@ -232,7 +232,7 @@ and VTA cache in one secret backend, named by a URL:
 
 ```toml
 [secrets]
-backend = "keyring://affinidi-mediator"   # or aws_secrets://, file://, ...
+backend = "aws_secrets://us-east-1/prod/mediator/"   # no default: pick one, see below
 cache_ttl = "30d"                          # optional, humantime
 ```
 

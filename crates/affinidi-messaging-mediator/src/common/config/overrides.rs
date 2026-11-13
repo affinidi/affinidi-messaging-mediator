@@ -173,18 +173,35 @@ fn field_value(limits: &LimitsConfig, key: &str) -> Option<i64> {
     serde_json::to_value(limits).ok()?.get(field)?.as_i64()
 }
 
+/// Keys whose configured `0` means "unlimited" or "off" rather than a limit
+/// of zero. For these, and for any key configured at `-1`, the ceiling of a
+/// patch is the key's absolute cap. Any other configured value is the ceiling
+/// as written, even when it is below the key's floor: a patch must never be
+/// able to raise a limit the operator set low.
+const ZERO_IS_UNLIMITED: &[&str] = &[
+    "limits.ws_messages_per_second",
+    "limits.ws_message_throttle_close_secs",
+    "limits.max_websocket_connections",
+    "limits.max_websocket_connections_per_did",
+    "limits.rate_limit_per_ip",
+    "limits.rate_limit_burst",
+    "limits.did_rate_limit_per_second",
+    "limits.did_rate_limit_burst",
+];
+
 /// Check `value` against `key`'s floor and ceiling, where the ceiling is the
-/// operator's configured value in `baseline` unless that is unlimited (below
-/// the floor), when it is the key's absolute cap.
+/// operator's configured value in `baseline` unless that is unlimited (see
+/// [`ZERO_IS_UNLIMITED`]), when it is the key's absolute cap.
 fn check_bounds(p: &Patchable, value: &Value, baseline: &LimitsConfig) -> Result<(), String> {
     let n = value
         .as_i64()
         .ok_or_else(|| "invalid value: expected a whole number".to_string())?;
     let configured = field_value(baseline, p.key).unwrap_or(p.cap);
-    let ceiling = if configured >= p.floor {
-        configured.min(p.cap)
-    } else {
+    let unlimited = configured < 0 || (configured == 0 && ZERO_IS_UNLIMITED.contains(&p.key));
+    let ceiling = if unlimited {
         p.cap
+    } else {
+        configured.min(p.cap)
     };
     if n < p.floor {
         return Err(format!(
@@ -205,12 +222,10 @@ fn check_bounds(p: &Patchable, value: &Value, baseline: &LimitsConfig) -> Result
     Ok(())
 }
 
-/// `limits` with `key` (a [`PATCHABLE`] key) set to `value`, checked: the
-/// value must be a whole number within the key's bounds against `baseline` (the
-/// operator's configuration, see the module docs), have the field's type, and
-/// keep the queue limits coherent (a soft limit no higher than its hard limit).
-/// The error is the reason to report.
-pub fn with_override(
+/// `limits` with `key` set to `value`, checked on its own: a [`PATCHABLE`]
+/// key, a whole number within the key's bounds against `baseline`, and of the
+/// field's type. Coherence with other keys is not checked here.
+fn set_checked(
     limits: &LimitsConfig,
     baseline: &LimitsConfig,
     key: &str,
@@ -223,54 +238,213 @@ pub fn with_override(
     let field = key.strip_prefix("limits.").unwrap_or(key);
     let mut object = serde_json::to_value(limits).map_err(|e| e.to_string())?;
     object[field] = value.clone();
-    let candidate: LimitsConfig =
-        serde_json::from_value(object).map_err(|e| format!("invalid value: {e}"))?;
+    serde_json::from_value(object).map_err(|e| format!("invalid value: {e}"))
+}
+
+/// `limits` with `key` (a [`PATCHABLE`] key) set to `value`, checked: the
+/// value must be a whole number within the key's bounds against `baseline` (the
+/// operator's configuration, see the module docs), have the field's type, and
+/// keep the queue limits coherent (a soft limit no higher than its hard limit).
+/// The error is the reason to report.
+pub fn with_override(
+    limits: &LimitsConfig,
+    baseline: &LimitsConfig,
+    key: &str,
+    value: &Value,
+) -> Result<LimitsConfig, String> {
+    let candidate = set_checked(limits, baseline, key, value)?;
     check_coherent(&candidate)?;
     Ok(candidate)
 }
 
-/// The cross-field rules a patch must not break. A negative queue limit means
-/// "unlimited", so it is exempt.
-fn check_coherent(limits: &LimitsConfig) -> Result<(), String> {
-    let pairs = [
-        (
-            "queued_send_messages_soft",
-            limits.queued_send_messages_soft,
-            "queued_send_messages_hard",
-            limits.queued_send_messages_hard,
-        ),
-        (
-            "queued_receive_messages_soft",
-            limits.queued_receive_messages_soft,
-            "queued_receive_messages_hard",
-            limits.queued_receive_messages_hard,
-        ),
-    ];
-    for (soft_name, soft, hard_name, hard) in pairs {
-        if soft >= 0 && hard >= 0 && soft > hard {
-            return Err(format!(
-                "{soft_name} ({soft}) would exceed {hard_name} ({hard})"
-            ));
-        }
-    }
-    Ok(())
+/// The soft/hard pairs a configuration must keep ordered.
+const COHERENT_PAIRS: [(&str, &str); 2] = [
+    (
+        "limits.queued_send_messages_soft",
+        "limits.queued_send_messages_hard",
+    ),
+    (
+        "limits.queued_receive_messages_soft",
+        "limits.queued_receive_messages_hard",
+    ),
+];
+
+/// The first soft/hard pair `limits` has out of order, with the reason.
+fn incoherent_pair(limits: &LimitsConfig) -> Option<((&'static str, &'static str), String)> {
+    COHERENT_PAIRS.into_iter().find_map(|(soft_key, hard_key)| {
+        let soft = field_value(limits, soft_key)?;
+        let hard = field_value(limits, hard_key)?;
+        (soft >= 0 && hard >= 0 && soft > hard).then(|| {
+            (
+                (soft_key, hard_key),
+                format!(
+                    "{} ({soft}) would exceed {} ({hard})",
+                    soft_key.trim_start_matches("limits."),
+                    hard_key.trim_start_matches("limits."),
+                ),
+            )
+        })
+    })
 }
 
-/// Apply stored `overrides` onto `limits` at startup. An override that no
-/// longer applies (an unknown key, a bad value) is skipped and returned with
+/// The cross-field rules a configuration must not break: a soft queue limit no
+/// higher than its hard limit. A negative queue limit means "unlimited", so it
+/// is exempt. Checked on the file baseline at load
+/// ([`LimitsConfig::check_invariants`]), on every patch, and once over the
+/// result of laying the stored overrides over the baseline ([`overlay`]).
+pub(crate) fn check_coherent(limits: &LimitsConfig) -> Result<(), String> {
+    match incoherent_pair(limits) {
+        Some((_, reason)) => Err(reason),
+        None => Ok(()),
+    }
+}
+
+/// Apply stored `overrides` onto `limits` (the baseline) at startup or reload.
+///
+/// Each override is checked on its own against the baseline (a patchable key,
+/// within its bounds, of the field's type) and laid onto one candidate; the
+/// soft ≤ hard rule is checked **once**, over the result. Checking it after
+/// each key instead made the outcome depend on the keys' (alphabetical)
+/// order: with both keys of a pair lowered, `…_hard` was laid first against
+/// the baseline `…_soft`, failed, and was skipped — silently reverting a
+/// tightened hard limit (#107).
+///
+/// An override that no longer applies (an unknown key, a bad value, or a pair
+/// that is out of order once everything is laid) is skipped and returned with
 /// its reason so the caller can log it: a stale override must not stop the
-/// mediator starting.
+/// mediator starting. A pair out of order is returned to its baseline values,
+/// which are coherent.
 pub fn overlay(limits: &mut LimitsConfig, overrides: &Map<String, Value>) -> Vec<(String, String)> {
     // Bounded by the configuration the overrides are layered over.
     let baseline = limits.clone();
     let mut skipped = Vec::new();
+    let mut applied: Vec<String> = Vec::new();
     for (key, value) in overrides {
-        match with_override(limits, &baseline, key, value) {
-            Ok(next) => *limits = next,
+        match set_checked(limits, &baseline, key, value) {
+            Ok(next) => {
+                *limits = next;
+                applied.push(key.clone());
+            }
             Err(reason) => skipped.push((key.clone(), reason)),
         }
     }
+    while let Some(((soft_key, hard_key), reason)) = incoherent_pair(limits) {
+        let reverted: Vec<String> = applied
+            .iter()
+            .filter(|key| key.as_str() == soft_key || key.as_str() == hard_key)
+            .cloned()
+            .collect();
+        if reverted.is_empty() {
+            // The baseline itself is out of order; it is checked at load, so
+            // this is a `LimitsConfig` built in code. Nothing here to undo.
+            break;
+        }
+        *limits = with_fields_from(limits, &baseline, &reverted);
+        applied.retain(|key| !reverted.contains(key));
+        skipped.extend(reverted.into_iter().map(|key| (key, reason.clone())));
+    }
     skipped
+}
+
+/// What a `config/patch` does, worked out without side effects.
+pub struct PatchPlan {
+    /// The limits the baseline and the new stored overrides give.
+    pub desired: LimitsConfig,
+    /// The stored overrides to write back.
+    pub stored: Map<String, Value>,
+    /// The patch's keys that were taken, with when each applies and its value
+    /// (`null` for a reset).
+    pub accepted: Vec<(String, KeyClass, Value)>,
+    /// The patch's keys that were refused, with why.
+    pub rejected: Vec<(String, String)>,
+}
+
+/// Plan a `config/patch` of `patch` over the `stored` overrides and the
+/// file/env `baseline`.
+///
+/// Each key is checked on its own (bounds and type), then the whole patch is
+/// laid over the stored overrides and coherence is checked over the result,
+/// as at startup ([`overlay`]) — so lowering both keys of a soft/hard pair in
+/// one patch works whatever order they come in. A patch key that leaves a pair
+/// out of order is refused and its previous stored value kept; so is a reset
+/// (`null`) that would leave a stored partner out of order, which would
+/// otherwise drop that partner's override and loosen the limit.
+pub fn plan_patch<'a>(
+    baseline: &LimitsConfig,
+    stored: &Map<String, Value>,
+    patch: impl IntoIterator<Item = (&'a String, &'a Value)>,
+) -> PatchPlan {
+    let original = stored.clone();
+    let not_applying = |stored: &Map<String, Value>| -> Vec<(String, String)> {
+        let mut desired = baseline.clone();
+        overlay(&mut desired, stored)
+    };
+    let skipped_before: Vec<String> = not_applying(&original)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+
+    let mut stored = original.clone();
+    let mut accepted: Vec<(String, KeyClass, Value)> = Vec::new();
+    let mut rejected: Vec<(String, String)> = Vec::new();
+    for (key, value) in patch {
+        let Some(class) = class_of(key) else {
+            rejected.push((key.clone(), "not a patchable configuration key".into()));
+            continue;
+        };
+        if value.is_null() {
+            stored.remove(key);
+            accepted.push((key.clone(), class, Value::Null));
+            continue;
+        }
+        if let Err(reason) = set_checked(baseline, baseline, key, value) {
+            rejected.push((key.clone(), reason));
+            continue;
+        }
+        stored.insert(key.clone(), value.clone());
+        accepted.push((key.clone(), class, value.clone()));
+    }
+
+    loop {
+        let newly_skipped: Vec<(String, String)> = not_applying(&stored)
+            .into_iter()
+            .filter(|(key, _)| !skipped_before.contains(key))
+            .collect();
+        // The patch keys responsible: a newly skipped key the patch set, or
+        // the patch keys in the same pair as a newly skipped stored key.
+        let mut refuse: Vec<(String, String)> = Vec::new();
+        for (key, reason) in &newly_skipped {
+            let pair = COHERENT_PAIRS
+                .iter()
+                .find(|(soft, hard)| key == soft || key == hard);
+            for (patched, ..) in &accepted {
+                let same_pair = pair.is_some_and(|(soft, hard)| patched == soft || patched == hard);
+                if (patched == key || same_pair) && !refuse.iter().any(|(k, _)| k == patched) {
+                    refuse.push((patched.clone(), reason.clone()));
+                }
+            }
+        }
+        if refuse.is_empty() {
+            break;
+        }
+        for (key, reason) in refuse {
+            match original.get(&key) {
+                Some(previous) => stored.insert(key.clone(), previous.clone()),
+                None => stored.remove(&key),
+            };
+            accepted.retain(|(k, ..)| *k != key);
+            rejected.push((key, reason));
+        }
+    }
+
+    let mut desired = baseline.clone();
+    overlay(&mut desired, &stored);
+    PatchPlan {
+        desired,
+        stored,
+        accepted,
+        rejected,
+    }
 }
 
 /// Parse the stored overrides document; an absent or malformed one is empty.
@@ -549,6 +723,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("would exceed"), "{err}");
+    }
+
+    /// Issue #107: both keys of a pair lowered below the baseline soft. Laid
+    /// one at a time in (alphabetical) key order, `…_hard` came first, failed
+    /// against the baseline `…_soft`, and was skipped — the tightened hard
+    /// limit silently reverted on the next start.
+    #[test]
+    fn both_keys_of_a_pair_lowered_survive_a_restart() {
+        let baseline = LimitsConfig::default(); // send 2000/10000, receive 200/1000
+        let stored = parse_stored(Some(
+            r#"{"limits.queued_send_messages_soft": 500,
+                "limits.queued_send_messages_hard": 1000,
+                "limits.queued_receive_messages_soft": 50,
+                "limits.queued_receive_messages_hard": 100}"#,
+        ));
+        let mut limits = baseline.clone();
+        let skipped = overlay(&mut limits, &stored);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(limits.queued_send_messages_soft, 500);
+        assert_eq!(limits.queued_send_messages_hard, 1000);
+        assert_eq!(limits.queued_receive_messages_soft, 50);
+        assert_eq!(limits.queued_receive_messages_hard, 100);
+
+        // The same through a reload.
+        let plan = reload_plan(&baseline, &baseline, &stored);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        assert_eq!(plan.live.queued_send_messages_hard, 1000);
+        assert_eq!(plan.live.queued_receive_messages_hard, 100);
+    }
+
+    /// A pair that is out of order once every override is laid goes back to
+    /// its baseline values (which are coherent), and both keys are reported.
+    #[test]
+    fn an_incoherent_stored_pair_returns_to_the_baseline() {
+        let baseline = LimitsConfig::default();
+        // hard 100 is below the baseline soft 2000, and nothing lowers soft.
+        let stored = parse_stored(Some(r#"{"limits.queued_send_messages_hard": 100}"#));
+        let mut limits = baseline.clone();
+        let skipped = overlay(&mut limits, &stored);
+        assert_eq!(limits.queued_send_messages_hard, 10_000);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].1.contains("would exceed"), "{skipped:?}");
+    }
+
+    /// The same in one `config/patch`: both keys of a pair lowered together are
+    /// both taken, whatever order they arrive in.
+    #[test]
+    fn a_patch_lowering_both_keys_of_a_pair_is_taken() {
+        let baseline = LimitsConfig::default();
+        let patch = parse_stored(Some(
+            r#"{"limits.queued_send_messages_hard": 1000, "limits.queued_send_messages_soft": 500}"#,
+        ));
+        let plan = plan_patch(&baseline, &Map::new(), &patch);
+        assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);
+        assert_eq!(plan.accepted.len(), 2);
+        assert_eq!(plan.desired.queued_send_messages_soft, 500);
+        assert_eq!(plan.desired.queued_send_messages_hard, 1000);
+        assert_eq!(plan.stored.len(), 2);
+    }
+
+    /// A patch key that leaves its pair out of order is refused and the
+    /// previously stored value kept; the rest of the patch still applies.
+    #[test]
+    fn a_patch_key_that_breaks_its_pair_is_refused_and_the_old_value_kept() {
+        let baseline = LimitsConfig::default();
+        let stored = parse_stored(Some(r#"{"limits.queued_send_messages_hard": 5000}"#));
+        let patch = parse_stored(Some(
+            r#"{"limits.queued_send_messages_hard": 100, "limits.listed_messages": 10}"#,
+        ));
+        let plan = plan_patch(&baseline, &stored, &patch);
+        assert_eq!(plan.rejected.len(), 1, "{:?}", plan.rejected);
+        assert_eq!(plan.rejected[0].0, "limits.queued_send_messages_hard");
+        assert!(plan.rejected[0].1.contains("would exceed"));
+        assert_eq!(plan.desired.queued_send_messages_hard, 5000);
+        assert_eq!(
+            plan.stored.get("limits.queued_send_messages_hard"),
+            Some(&serde_json::json!(5000))
+        );
+        assert_eq!(plan.desired.listed_messages, 10);
+        assert_eq!(plan.accepted.len(), 1);
+    }
+
+    /// Resetting the soft override of a lowered pair would leave the stored
+    /// hard below the baseline soft and drop it — loosening the hard limit. The
+    /// reset is refused instead.
+    #[test]
+    fn a_reset_that_would_drop_a_stored_partner_is_refused() {
+        let baseline = LimitsConfig::default();
+        let stored = parse_stored(Some(
+            r#"{"limits.queued_send_messages_soft": 500, "limits.queued_send_messages_hard": 1000}"#,
+        ));
+        let patch = parse_stored(Some(r#"{"limits.queued_send_messages_soft": null}"#));
+        let plan = plan_patch(&baseline, &stored, &patch);
+        assert_eq!(plan.rejected.len(), 1, "{:?}", plan.rejected);
+        assert_eq!(plan.desired.queued_send_messages_hard, 1000);
+        assert_eq!(plan.desired.queued_send_messages_soft, 500);
+        assert_eq!(plan.stored, stored);
+    }
+
+    /// A configured value below a key's floor is still its ceiling: a patch
+    /// can never raise a limit the operator set low.
+    #[test]
+    fn a_low_configured_value_is_not_read_as_unlimited() {
+        let base = LimitsConfig {
+            message_expiry_seconds: 60, // below the one-hour floor
+            ..LimitsConfig::default()
+        };
+        assert!(
+            with_override(&base, &base, "limits.message_expiry_seconds", &json!(YEAR)).is_err()
+        );
     }
 
     #[test]

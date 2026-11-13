@@ -181,15 +181,84 @@ pub fn check_did_syntax(field: &str, did: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// JWT access tokens must expire before refresh tokens, otherwise refresh
-/// is pointless and the access token outlives its refresh window.
+/// The least `security.jwt_access_expiry` accepted, in seconds. A shorter
+/// token expires before a client can use it.
+pub const MIN_JWT_ACCESS_EXPIRY_SECS: u64 = 10;
+
+/// JWT access tokens must last at least [`MIN_JWT_ACCESS_EXPIRY_SECS`] and
+/// expire before refresh tokens, otherwise refresh is pointless and the access
+/// token outlives its refresh window.
 pub fn check_jwt_expiry(access: u64, refresh: u64) -> Result<(), String> {
+    if access < MIN_JWT_ACCESS_EXPIRY_SECS {
+        return Err(format!(
+            "security.jwt_access_expiry ({access}s) must be at least \
+             {MIN_JWT_ACCESS_EXPIRY_SECS}s"
+        ));
+    }
     if access >= refresh {
         return Err(format!(
             "jwt_access_expiry ({access}s) must be less than jwt_refresh_expiry ({refresh}s)"
         ));
     }
     Ok(())
+}
+
+/// The secret backends `[secrets] backend` may name, with what each is for.
+/// Shown when none is set, so the operator chooses rather than inheriting a
+/// default that may not survive their platform (`keyring://` on Linux does
+/// not survive a reboot).
+pub const SECRETS_BACKEND_CHOICES: &[(&str, &str)] = &[
+    (
+        "aws_secrets://<region>/<prefix>",
+        "AWS Secrets Manager (feature secrets-aws)",
+    ),
+    (
+        "gcp_secrets://<project>/<prefix>",
+        "GCP Secret Manager (feature secrets-gcp)",
+    ),
+    (
+        "vault://<endpoint>/<mount>[/<prefix>]",
+        "HashiCorp Vault KV v2 (feature secrets-vault)",
+    ),
+    (
+        "k8s://[<namespace>/]<secret-name>",
+        "Kubernetes Secret (feature secrets-k8s)",
+    ),
+    (
+        "file:///<absolute-path>?encrypt=1",
+        "passphrase-encrypted file (built in)",
+    ),
+    (
+        "file:///<absolute-path>",
+        "plaintext file, development only (built in)",
+    ),
+    (
+        "keyring://<service>",
+        "OS keychain; on Linux the kernel keyring, lost on reboot (feature secrets-keyring)",
+    ),
+    (
+        "azure_keyvault://<vault>",
+        "Azure Key Vault via the Azure CLI login: wizard/development only (feature secrets-azure)",
+    ),
+];
+
+/// `[secrets] backend` must be set. The shipped template leaves it commented
+/// out so that every deployment picks its own; the error lists the choices.
+pub fn check_secrets_backend(backend: &str) -> Result<(), String> {
+    if !backend.trim().is_empty() {
+        return Ok(());
+    }
+    let choices = SECRETS_BACKEND_CHOICES
+        .iter()
+        .map(|(url, what)| format!("  {url}  — {what}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "no secrets backend is configured: set [secrets] backend in the configuration \
+         file (or MEDIATOR_SECRETS_BACKEND). The template leaves it unset on purpose so \
+         that you choose one; `mediator-setup` sets it for you. Choices:\n{choices}\n\
+         See docs/secrets-backend.md."
+    ))
 }
 
 /// When `use_ssl` is set, both the certificate and key must be configured
@@ -415,6 +484,28 @@ mod tests {
                 check_did_syntax("admin_did", bad).is_err(),
                 "{bad:?} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn the_secrets_backend_must_be_chosen() {
+        assert!(check_secrets_backend("file:///var/lib/m/secrets.json").is_ok());
+        for unset in ["", "   "] {
+            let err = check_secrets_backend(unset).unwrap_err();
+            assert!(err.contains("[secrets] backend"), "{err}");
+            assert!(err.contains("MEDIATOR_SECRETS_BACKEND"), "{err}");
+            for (url, _) in SECRETS_BACKEND_CHOICES {
+                assert!(err.contains(url), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_jwt_access_expiry_below_the_minimum_is_refused() {
+        assert!(check_jwt_expiry(10, 86_400).is_ok());
+        for short in [0, 9] {
+            let err = check_jwt_expiry(short, 86_400).unwrap_err();
+            assert!(err.contains("jwt_access_expiry"), "{err}");
         }
     }
 
