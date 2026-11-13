@@ -100,7 +100,62 @@ A name you save wins over one the application supplies, so an embedding
 application can pre-fill names (every DID it manages, say) without writing
 over yours.
 
-## Destructive operations are two-step
+## Errors, timeouts and cancelling
+
+Every call waits a bounded time for its answer. `ConsoleOptions` sets how
+long: `connect_timeout` for the whole of `connect` (resolving the DID,
+authenticating, reading the account) and `request_timeout` for each call
+after (both default to 30 s). To bound one call differently, wrap it in
+`with_deadline`; to cancel one, drop its future.
+
+```rust
+use std::time::Duration;
+use affinidi_messaging_mediator_admin::{ConsoleOptions, MediatorConsole, with_deadline};
+
+let console = MediatorConsole::connect_with_options(
+    identity,
+    ConsoleOptions::default().with_request_timeout(Duration::from_secs(10)),
+)
+.await?;
+let stats = with_deadline("stats", Duration::from_secs(2), console.stats()).await?;
+```
+
+Through an existing SDK instance, `connect_exclusive_with_options` and
+`connect_with_unclaimed_options` take the same options as
+`connect_exclusive` and `connect_with_unclaimed`.
+
+A `ConsoleError` says what to do next, and `is_transient()` says it in one
+call:
+
+| Error | Meaning | Try again? |
+|---|---|---|
+| `Transport` | The request or its answer was lost in transit: the connection dropped, the mediator was unreachable, or it answered `408`, `429` or `5xx`. | Yes |
+| `Timeout` | No answer in time. The request may still have reached the mediator. | Yes, after reading the state: a change may have been made |
+| `Connect` | The connection could not be set up; `source()` has the cause. | Yes |
+| `Refused` | The mediator said no, with its code (`refusal_code()`) and reason. `explain()` puts the known ones in plain words. | Only `…:contended` and rate limits |
+| `NotPermitted` | The console knows the mediator would refuse, so nothing was sent. | No |
+| `Identity`, `NoMediator`, `Invalid`, `Unexpected`, `Sdk` | Something to fix on this side. | No |
+
+## Accounts, access lists and configuration
+
+An administrator adds and removes accounts (`add_account`,
+`remove_account`; a privileged role needs a rootAdmin), reads ACLs
+(`acls`), and reads and changes any account's access list (`access_list`,
+which also checks membership, and `update_access_list`). Any account may
+read its own access list, and change it when its ACL has `selfManageList`.
+A rootAdmin changes limits at runtime (`patch_config`) or re-reads them from
+the configuration file (`reload_config`).
+
+An account's own mux grants have calls of their own: `mux_grant` stores
+signed grant statements, `mux_own_grants` lists them, `mux_revoke_own` and
+`mux_revoke_all_own` revoke them (mediator 0.52.0).
+
+## Purges are two-step
+
+A purge is counted before it runs. The other changes — `delete`,
+`update_account`, `patch_config`, the access-list and grant calls — are
+single calls: a front end shows what will change and asks before it sends
+one.
 
 ```rust
 use affinidi_messaging_mediator_admin::PurgeRequest;
@@ -122,9 +177,10 @@ let done = console.purge(plan).await?;
 `purge` is pinned to the moment of the preview: it never removes a message
 that arrived after the preview, or one that was not yet old enough then. It
 can remove **fewer** than `plan.matched`, when messages were delivered or
-deleted in between (and, because the pin is in whole seconds, it can leave out
-what arrived in the second before the preview). Report `purged`, not
-`matched`, as what was removed.
+deleted in between, and because the pin keeps a safety margin for the
+request's transit (`PURGE_TRANSIT_MARGIN_SECS`, 30 s) and is in whole
+seconds, it also leaves out what arrived in that window before the preview.
+Report `purged`, not `matched`, as what was removed.
 
 The mediator's `queue/purge` has no "as of" member yet, so the pin is an age
 (`olderThanSeconds`) the console computes from the preview time.
