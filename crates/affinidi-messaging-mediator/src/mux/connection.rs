@@ -912,7 +912,7 @@ pub fn grant_leave_reason(
         Some(g) => match g.state_at(now) {
             S::Active => None,
             S::Suspended => Some(LeaveReason::SuspendedUnknownKey),
-            S::EpochRevoked => Some(LeaveReason::EpochBumped),
+            S::EpochRevoked => Some(LeaveReason::voided(g)),
             S::StaleKey => Some(LeaveReason::KeyRotated),
             S::Expired => Some(LeaveReason::Expired),
         },

@@ -481,6 +481,7 @@ mod tests {
             noticed: false,
             key_agreement_fps: Vec::new(),
             expiring_noticed: false,
+            voided_by: None,
         }
     }
 
@@ -590,6 +591,17 @@ mod tests {
         put(&store, Some(&voided)).await;
         b.hear(&store, &[MuxChange::of(&g, false)]).await;
         assert_eq!(b.left().await, vec![LeaveReason::EpochBumped]);
+
+        // An administrator's advance reads as `admin` from the record alone,
+        // with no hint (a resync, or a record from an older instance).
+        let g = grant("g3", 3);
+        let (store, _a, b) = both_carrying(&g).await;
+        let mut voided = g.clone();
+        voided.state = MuxGrantState::EpochRevoked;
+        voided.voided_by = Some(mux::MuxVoidedBy::Admin);
+        put(&store, Some(&voided)).await;
+        b.hear(&store, &[MuxChange::of(&g, false)]).await;
+        assert_eq!(b.left().await, vec![LeaveReason::Admin]);
     }
 
     #[tokio::test]

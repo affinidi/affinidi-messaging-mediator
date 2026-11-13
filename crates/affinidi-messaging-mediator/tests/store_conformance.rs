@@ -3040,6 +3040,7 @@ fn mux_grant(
         noticed: false,
         key_agreement_fps: Vec::new(),
         expiring_noticed: false,
+        voided_by: None,
     }
 }
 
@@ -3236,7 +3237,7 @@ async fn check_mux_grant_flows(store: Arc<dyn MediatorStore>) {
 
     // Revoke-all bumps the epoch; an old-epoch grant is then refused.
     let (epoch, _) = mux::modify(&*store, member, &limits, now + 2, None, |rec, _| {
-        Ok(mux::revoke_all(rec, now + 2))
+        Ok(mux::revoke_all(rec, now + 2, mux::MuxVoidedBy::Member))
     })
     .await
     .unwrap();

@@ -278,6 +278,7 @@ impl StatementVerifier {
             noticed: false,
             key_agreement_fps,
             expiring_noticed: false,
+            voided_by: None,
         })
     }
 

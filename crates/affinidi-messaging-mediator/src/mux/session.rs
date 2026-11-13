@@ -129,6 +129,19 @@ impl LeaveReason {
         }
     }
 
+    /// Why the members admitted by `EpochRevoked` grant `g` left, from who
+    /// voided it: `admin` for an administrator's `admin-revoke-all`,
+    /// otherwise (the member's own `revoke-all`, or a record that predates
+    /// [`MuxGrant::voided_by`](affinidi_messaging_mediator_common::store::mux::MuxGrant::voided_by))
+    /// `epochBumped`.
+    pub fn voided(g: &affinidi_messaging_mediator_common::store::mux::MuxGrant) -> Self {
+        use affinidi_messaging_mediator_common::store::mux::MuxVoidedBy;
+        match g.voided_by {
+            Some(MuxVoidedBy::Admin) => LeaveReason::Admin,
+            Some(MuxVoidedBy::Member | MuxVoidedBy::Unknown) | None => LeaveReason::EpochBumped,
+        }
+    }
+
     /// The reason a grant removal or epoch advance carried across instances
     /// ([`MuxChange::reason`](affinidi_messaging_mediator_common::store::mux::MuxChange::reason)),
     /// read back. Only the reasons that end a grant from outside the
