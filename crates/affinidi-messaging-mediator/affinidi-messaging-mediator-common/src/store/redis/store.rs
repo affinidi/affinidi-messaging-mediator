@@ -103,6 +103,17 @@ const MUX_CHANGES_CHANNEL: &str = "MUX_CHANGES";
 /// behind sees `Lagged` and re-checks its connections in full.
 const MUX_CHANGES_CAPACITY: usize = 1024;
 
+/// The pub/sub channel one mediator's instances share traffic-monitor records
+/// on: `scope` names the mediator, so deployments sharing a server (pub/sub
+/// ignores the database index) never hear each other's monitor events.
+fn monitor_fanout_channel(scope: &str) -> String {
+    format!("MONITOR_FANOUT:{scope}")
+}
+
+/// Slots in the local broadcast ring bridging a monitor fan-out channel. A
+/// receiver that falls further behind sees `Lagged` and counts the loss.
+const MONITOR_FANOUT_CAPACITY: usize = 4096;
+
 /// The two field names one counted message touches: the totals and the
 /// per-protocol split. `None` for a direction this store does not keep.
 fn stats_fields(delta: AccountStatsDelta) -> Option<(&'static str, &'static str, String)> {
@@ -182,6 +193,8 @@ pub struct RedisStore {
     /// The bridge from [`MUX_CHANGES_CHANNEL`] to local subscribers, keyed by
     /// channel name so it retires the same way as the delivery bridges.
     mux_channels: Arc<Mutex<HashMap<String, broadcast::Sender<mux::MuxChangeRecord>>>>,
+    /// The bridges from monitor fan-out channels to local subscribers.
+    monitor_channels: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
 }
 
 impl RedisStore {
@@ -207,6 +220,7 @@ impl RedisStore {
             broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
             pubsub_capacity: PUBSUB_BROADCAST_CAPACITY,
             mux_channels: Arc::new(Mutex::new(HashMap::new())),
+            monitor_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1582,6 +1596,74 @@ impl MediatorStore for RedisStore {
         });
 
         channels.insert(MUX_CHANGES_CHANNEL.to_string(), sender);
+        Ok(Some(receiver))
+    }
+
+    async fn monitor_fanout_publish(
+        &self,
+        scope: &str,
+        payload: &str,
+    ) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("PUBLISH")
+            .arg(monitor_fanout_channel(scope))
+            .arg(payload)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("monitor_fanout_publish: {e}"),
+                )
+            })
+    }
+
+    async fn monitor_fanout_subscribe(
+        &self,
+        scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        // As `mux_changes_subscribe`: one Redis subscription per process and
+        // channel, retired when its connection drops.
+        let channel = monitor_fanout_channel(scope);
+        let mut channels = self.monitor_channels.lock().await;
+        if let Some(sender) = channels.get(&channel) {
+            return Ok(Some(sender.subscribe()));
+        }
+        let (sender, receiver) = broadcast::channel(MONITOR_FANOUT_CAPACITY);
+        let mut pubsub = self.handler.get_pubsub_connection().await?;
+        pubsub.subscribe(&channel).await.map_err(|err| {
+            MediatorError::database_from_redis(
+                14,
+                "NA".into(),
+                &err,
+                format!("monitor_fanout_subscribe SUBSCRIBE failed: {err}"),
+            )
+        })?;
+        debug!("RedisStore: opened pubsub bridge for channel {channel}");
+
+        let inner_sender = sender.clone();
+        let bridge_channels = self.monitor_channels.clone();
+        let bridge_channel = channel.clone();
+        tokio::spawn(async move {
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = stream.next().await {
+                match msg.get_payload::<String>() {
+                    Ok(payload) => {
+                        let _ = inner_sender.send(payload);
+                    }
+                    Err(e) => warn!("RedisStore monitor fan-out bridge: unreadable payload: {e}"),
+                }
+            }
+            retire_bridge(&bridge_channels, &bridge_channel, &inner_sender).await;
+            drop(inner_sender);
+            warn!(
+                "RedisStore monitor fan-out bridge lost its connection; subscribers will resubscribe"
+            );
+        });
+
+        channels.insert(channel, sender);
         Ok(Some(receiver))
     }
 

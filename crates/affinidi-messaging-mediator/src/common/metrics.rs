@@ -179,6 +179,18 @@ pub mod names {
     /// be marked so in the store. A key found stale is not a failure: it is
     /// counted in [`MUX_DETACH_TOTAL`] as `keyRotated`.
     pub const MUX_GRANT_REVALIDATE_FAILURES_TOTAL: &str = "mux_grant_revalidate_failures_total";
+    /// counter: Mux membership events this instance did not share with the
+    /// other instances' monitor subscribers (label `cause`): `overflow` when
+    /// the bounded hand-off to the publishing task was full, `publish` when
+    /// the store refused the publish (Redis down), `lagged` when this
+    /// instance fell behind reading the channel (counted in records, so an
+    /// upper bound). Local subscribers still see
+    /// every one of them. Normally 0; a steady rate means other instances'
+    /// monitors miss changes made here.
+    pub const MONITOR_FANOUT_DROPPED_TOTAL: &str = "monitor_fanout_dropped_total";
+    /// counter: Mux membership events this instance received from another
+    /// instance for its own monitor subscribers.
+    pub const MONITOR_FANOUT_RECEIVED_TOTAL: &str = "monitor_fanout_received_total";
     /// counter: Live-streaming entries this instance claimed back for a
     /// socket it carries, each followed by an inbox redelivery when the
     /// socket wants live delivery. Labels: `kind` (`direct` or `mux`) and
