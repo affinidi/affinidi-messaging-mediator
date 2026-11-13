@@ -136,25 +136,24 @@ impl MuxConn {
         // connection holds the member's traffic.
         self.inactive.lock().await.remove(&member.did_hash);
         let session_id = self.session.lock().await.session_id.clone();
+        // One command, and one store write, whether or not the member wants
+        // live delivery: a `live` registration is its own `Start` (#128).
         let _ = streaming
             .channel
             .send(StreamingUpdate {
                 did_hash: member.did_hash.clone(),
                 state: StreamingUpdateState::Register {
                     channel: self.tx.clone(),
-                    session_id: session_id.clone(),
+                    session_id,
                     did: member.did.clone(),
                     resync: self.resync.clone(),
                     kind: EntryKind::Mux,
                     slots: self.slots.clone(),
                     wake_only: false,
+                    live: wants_live(&member.scope),
                 },
             })
             .await;
-        if wants_live(&member.scope) {
-            self.set_live(streaming, &member.did_hash, session_id, true)
-                .await;
-        }
     }
 
     /// Bring the streaming task in step with `member` after it was admitted
@@ -836,6 +835,7 @@ mod tests {
         let mut out = Vec::new();
         while let Ok(u) = rx.try_recv() {
             out.push(match u.state {
+                StreamingUpdateState::Register { live: true, .. } => "register+live",
                 StreamingUpdateState::Register { .. } => "register",
                 StreamingUpdateState::Start { .. } => "start",
                 StreamingUpdateState::Stop { .. } => "stop",
@@ -912,7 +912,8 @@ mod tests {
             1_000,
         );
         conn.reconcile_member(Some(&streaming), &member, None).await;
-        assert_eq!(sent(&mut rx), ["register", "start"]);
+        // One command: a live registration is its own `Start` (#128).
+        assert_eq!(sent(&mut rx), ["register+live"]);
         conn.reconcile_member(Some(&streaming), &member, Some(true))
             .await;
         assert!(sent(&mut rx).is_empty(), "a renewal is not a registration");

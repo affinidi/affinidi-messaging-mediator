@@ -73,6 +73,18 @@ const CHURN_WINDOW: Duration = Duration::from_secs(5);
 /// hand-off (A replaced by B, B replaced by A); three or more is a duel.
 const CHURN_REFUSE_STREAK: u32 = 3;
 
+/// Slots in the streaming task's control channel. See `spawn_supervised`.
+const CONTROL_CHANNEL_CAPACITY: usize = 1024;
+
+/// Inbox redeliveries that may read the store at once, across every DID.
+///
+/// A mux connection opening with a thousand live members starts a thousand
+/// drains, each a page fetch and a delivered-mark; unbounded, they all hit
+/// the store together. A drain waiting for a permit has already claimed its
+/// DID (`Redeliveries`), so a newer socket asking meanwhile still hands it
+/// over rather than starting a second one (#128).
+const REDELIVERY_CONCURRENCY: usize = 32;
+
 /// Page size for the inbox-redelivery drain.
 const REDELIVERY_PAGE: usize = 50;
 
@@ -221,6 +233,12 @@ pub enum MemberChange {
 struct ClientEntry {
     /// Channel to the per-connection websocket handler.
     tx: mpsc::Sender<QueuedCommand>,
+    /// Set once a notification for this inactive entry has corrected the
+    /// store's state to not-live, and cleared by the next activation change.
+    /// Every notification still in flight from before the correction would
+    /// otherwise issue the same store write again, inline on the loop that
+    /// serves every DID (#128).
+    store_demoted: bool,
     /// Session id of the owning websocket (used for churn/diagnostic logs).
     session_id: String,
     /// Whether live delivery is currently active for this client.
@@ -317,11 +335,22 @@ struct DrainTarget {
 /// runs is not skipped: it is left for the running drain, which hands itself
 /// over to the newest socket and starts the inbox again for it. Whoever holds
 /// the DID's slot last is the one the drain finishes on.
-#[derive(Default)]
 pub(crate) struct Redeliveries {
     /// DIDs with a drain running, each with the newer socket it should move
     /// to, if one asked meanwhile.
     running: DashMap<String, Option<DrainTarget>>,
+    /// Bounds the drains reading the store at once
+    /// ([`REDELIVERY_CONCURRENCY`]).
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Redeliveries {
+    fn default() -> Self {
+        Self {
+            running: DashMap::new(),
+            permits: Arc::new(tokio::sync::Semaphore::new(REDELIVERY_CONCURRENCY)),
+        }
+    }
 }
 
 impl Redeliveries {
@@ -403,6 +432,13 @@ pub enum StreamingUpdateState {
         /// The socket drains the DID's stored inbox itself on any
         /// notification (raw TSP). See `ClientEntry::wake_only`.
         wake_only: bool,
+        /// Register with live delivery already on: the same as `Register`
+        /// followed by a [`Start`](Self::Start) for the same session, in one
+        /// command and **one** store write rather than two. A mux connection
+        /// admitting many members at once sends this, so a connect with a
+        /// thousand grants is a thousand writes on the streaming loop, not two
+        /// thousand (#128).
+        live: bool,
     },
     /// Enable live delivery for the socket owned by `session_id`.
     ///
@@ -810,9 +846,11 @@ impl StreamingTask {
         liveness: StreamingLiveness,
     ) -> Self {
         // Control-plane channel (register/start/stop/deregister). Carries no
-        // message bodies — a handful of small structs — so a slot count is the
-        // right bound here and 10 is plenty.
-        let (tx, rx) = mpsc::channel(10);
+        // message bodies, only small structs, so a slot count is the right
+        // bound. Sized for a mux connection opening or closing with its whole
+        // member set (`max_dids_per_connection`, 1000 by default) without each
+        // send waiting on the loop in turn (#128).
+        let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let task = StreamingTask {
             channel: tx,
             uuid: mediator_uuid.to_string(),
@@ -1050,10 +1088,15 @@ impl StreamingTask {
                             report,
                         );
                     }
+                } else if entry.store_demoted {
+                    // Already corrected once since the entry last went
+                    // inactive: a notification in flight from before the
+                    // correction landed, not a reason for another write.
+                    debug!("pub/sub msg received for did_hash({did_hash}) but it is not active");
                 } else {
                     debug!("pub/sub msg received for did_hash({did_hash}) but it is not active");
                     let kind = entry.kind;
-                    if let Err(err) = database
+                    match database
                         .streaming_claim(
                             &did_hash,
                             &self.uuid,
@@ -1063,7 +1106,14 @@ impl StreamingTask {
                         )
                         .await
                     {
-                        error!("Error stopping streaming for client ({did_hash}): {err}");
+                        Ok(_) => {
+                            if let Some(entry) = clients.get_mut(&did_hash) {
+                                entry.store_demoted = true;
+                            }
+                        }
+                        Err(err) => {
+                            error!("Error stopping streaming for client ({did_hash}): {err}");
+                        }
                     }
                 }
             }
@@ -1122,6 +1172,8 @@ impl StreamingTask {
         let (target, kind, was_active) = match clients.get_mut(did_hash) {
             Some(entry) if entry.session_id == session_id => {
                 let was_active = std::mem::replace(&mut entry.active, active);
+                // This change writes the store's state itself.
+                entry.store_demoted = false;
                 (entry.drain_target(), entry.kind, was_active)
             }
             Some(entry) => {
@@ -1313,6 +1365,7 @@ impl StreamingTask {
             kind,
             slots: client_slots,
             wake_only,
+            live: start_live,
         } = &value.state
         else {
             // Only `Register` updates reach this helper.
@@ -1341,8 +1394,10 @@ impl StreamingTask {
 
         let new_entry = |churn_streak| ClientEntry {
             tx: client_tx.clone(),
+            store_demoted: false,
             session_id: new_session_id.to_string(),
-            active: false,
+            // A `live` registration is its own `Start`.
+            active: *start_live,
             registered_at: Instant::now(),
             resync: client_resync.clone(),
             churn_streak,
@@ -1369,6 +1424,18 @@ impl StreamingTask {
                 session = new_session_id,
                 "re-registration of the live entry; updated in place"
             );
+            if *start_live {
+                self._handle_activation(
+                    database,
+                    clients,
+                    standby,
+                    replay_in_progress,
+                    &value.did_hash,
+                    new_session_id,
+                    true,
+                )
+                .await;
+            }
             return;
         }
         if let Some(waiting) = standby.get_mut(&value.did_hash).and_then(|v| {
@@ -1379,6 +1446,9 @@ impl StreamingTask {
             waiting.kind = *kind;
             waiting.slots = client_slots.clone();
             waiting.wake_only = *wake_only;
+            if *start_live {
+                waiting.active = true;
+            }
             // Still behind another socket: say so again, since a
             // registration is the connection's cue to forget it was.
             tell_member(
@@ -1551,7 +1621,9 @@ impl StreamingTask {
             replay_in_progress,
             &value.did_hash,
             new_entry(churn_streak),
-            replacing,
+            // A `live` registration redelivers what queued before it, as its
+            // `Start` would have.
+            replacing || *start_live,
         )
         .await;
     }
@@ -2149,6 +2221,9 @@ fn spawn_inbox_redelivery(
     redeliveries: Arc<Redeliveries>,
 ) {
     tokio::spawn(async move {
+        // Held for the whole drain, handovers included. The semaphore is
+        // never closed, so acquiring cannot fail.
+        let _permit = Arc::clone(&redeliveries.permits).acquire_owned().await;
         let mut target = first;
         loop {
             match drain_inbox(&database, &target, &budget, &did_hash, &redeliveries).await {
@@ -2363,6 +2438,7 @@ mod tests {
         clients.insert(
             did_hash.to_string(),
             ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: session_id.to_string(),
                 active,
@@ -2389,6 +2465,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
         let resync = Arc::new(AtomicBool::new(false));
         let entry = ClientEntry {
+            store_demoted: false,
             tx: tx.clone(),
             session_id: "S".to_string(),
             active: true,
@@ -2441,6 +2518,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<QueuedCommand>(slots.channel_capacity());
         let resync = Arc::new(AtomicBool::new(false));
         let entry = || ClientEntry {
+            store_demoted: false,
             tx: tx.clone(),
             session_id: "S".to_string(),
             active: true,
@@ -2509,6 +2587,7 @@ mod tests {
         let mut clients = HashMap::from([(
             "bob".to_string(),
             ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: "S".to_string(),
                 active: true,
@@ -2628,6 +2707,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<QueuedCommand>(1);
         let resync = Arc::new(AtomicBool::new(false));
         let entry = ClientEntry {
+            store_demoted: false,
             tx,
             session_id: "S".to_string(),
             active: true,
@@ -2867,6 +2947,7 @@ mod tests {
         clients.insert(
             did_hash.clone(),
             ClientEntry {
+                store_demoted: false,
                 tx: a_tx,
                 session_id: "A".to_string(),
                 active: true,
@@ -2884,6 +2965,7 @@ mod tests {
         let update = StreamingUpdate {
             did_hash: did_hash.clone(),
             state: StreamingUpdateState::Register {
+                live: false,
                 channel: b_tx.clone(),
                 session_id: "B".to_string(),
                 did: did.to_string(),
@@ -2957,6 +3039,7 @@ mod tests {
         clients.insert(
             did_hash.clone(),
             ClientEntry {
+                store_demoted: false,
                 tx: a_tx,
                 session_id: "A".to_string(),
                 active: true,
@@ -3105,6 +3188,7 @@ mod tests {
         clients.insert(
             did_hash.clone(),
             ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: "A".to_string(),
                 active: false,
@@ -3141,6 +3225,146 @@ mod tests {
         }
     }
 
+    /// A `live` registration (#128) is its own `Start`: the entry is live,
+    /// the store says so after one write, and what queued before it is
+    /// redelivered, as the separate `Start` would have done.
+    #[tokio::test]
+    async fn a_live_registration_activates_and_redelivers_in_one_command() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:dave";
+        let did_hash = digest(did);
+        let stored = "queued-before-registration";
+        database
+            .store_message("sess-store", stored, &did_hash, None, 0, 1000)
+            .await
+            .expect("store message");
+
+        let task = streaming_task();
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
+        let (tx, mut rx) = mpsc::channel(5);
+        let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            &StreamingUpdate {
+                did_hash: did_hash.clone(),
+                state: StreamingUpdateState::Register {
+                    channel: tx,
+                    session_id: "M".to_string(),
+                    did: did.to_string(),
+                    resync: Arc::new(AtomicBool::new(false)),
+                    kind: EntryKind::Mux,
+                    slots: None,
+                    wake_only: false,
+                    live: true,
+                },
+            },
+        )
+        .await;
+
+        assert!(clients.get(&did_hash).is_some_and(|e| e.active));
+        assert_eq!(
+            database.streaming_is_client_live(&did_hash, false).await,
+            Some(task.uuid.clone()),
+            "the store records the DID live without a separate Start"
+        );
+        match timeout(StdDuration::from_secs(2), rx.recv())
+            .await
+            .expect("the queued message is pushed on registration")
+        {
+            Some(QueuedCommand {
+                cmd: WebSocketCommands::Message(msg),
+                ..
+            }) => assert_eq!(msg, stored),
+            _ => panic!("expected the queued message to be redelivered"),
+        }
+    }
+
+    /// A notification for a registered-but-inactive DID corrects the store's
+    /// state once; further notifications in flight do not write again until
+    /// the entry's live state changes (#128).
+    #[tokio::test]
+    async fn an_inactive_entry_is_demoted_in_the_store_once() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:erin");
+        let task = streaming_task();
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
+        let (tx, _rx) = mpsc::channel(5);
+        let mut clients: HashMap<String, ClientEntry> = HashMap::new();
+        clients.insert(
+            did_hash.clone(),
+            ClientEntry {
+                store_demoted: false,
+                tx,
+                session_id: "A".to_string(),
+                active: false,
+                registered_at: Instant::now(),
+                resync: Arc::new(AtomicBool::new(false)),
+                churn_streak: 0,
+                kind: EntryKind::Direct,
+                slots: None,
+                wake_only: false,
+            },
+        );
+        let record = || PubSubRecord {
+            did_hash: did_hash.clone(),
+            message: "m".to_string(),
+            force_delivery: false,
+            verbatim: false,
+            stored: None,
+        };
+        task.dispatch_payload(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            record(),
+        )
+        .await;
+        assert!(clients[&did_hash].store_demoted);
+
+        // Something else marks it live behind the entry's back; a second
+        // notification must not write (the flag holds) ...
+        database
+            .streaming_set_state(
+                &did_hash,
+                &task.uuid,
+                affinidi_messaging_mediator_common::store::StreamingClientState::Live,
+            )
+            .await
+            .expect("set");
+        task.dispatch_payload(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            record(),
+        )
+        .await;
+        assert!(
+            database
+                .streaming_is_client_live(&did_hash, false)
+                .await
+                .is_some(),
+            "no second demotion write while the flag is set"
+        );
+
+        // ... and an activation change clears it.
+        task._handle_activation(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replay_in_progress,
+            &did_hash,
+            "A",
+            false,
+        )
+        .await;
+        assert!(!clients[&did_hash].store_demoted);
+    }
+
     /// A handoff that never arrives is caught by the periodic recheck: a mux
     /// entry whose DID the store now gives to another instance stands by
     /// (`superseded`), and one standing by for a DID nobody holds takes it
@@ -3156,6 +3380,7 @@ mod tests {
         let mut clients = HashMap::from([(
             did.to_string(),
             ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: "M".to_string(),
                 active: true,
@@ -3234,6 +3459,7 @@ mod tests {
         let task = streaming_task();
         let replay: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let entry = |tx: mpsc::Sender<QueuedCommand>| ClientEntry {
+            store_demoted: false,
             tx,
             session_id: "D".to_string(),
             active: true,
@@ -3334,6 +3560,7 @@ mod tests {
             let mut clients = HashMap::from([(
                 did_hash.clone(),
                 ClientEntry {
+                    store_demoted: false,
                     tx,
                     session_id: "A".to_string(),
                     active: false,
@@ -3397,6 +3624,7 @@ mod tests {
         clients.insert(
             did_hash.clone(),
             ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: "A".to_string(),
                 active: true,
@@ -3449,6 +3677,7 @@ mod tests {
         let update = StreamingUpdate {
             did_hash: did_hash.clone(),
             state: StreamingUpdateState::Register {
+                live: false,
                 channel: b_tx.clone(),
                 session_id: "B".to_string(),
                 did: did.to_string(),
@@ -3498,6 +3727,7 @@ mod tests {
         let register = |session: &str, tx: mpsc::Sender<QueuedCommand>| StreamingUpdate {
             did_hash: did_hash.clone(),
             state: StreamingUpdateState::Register {
+                live: false,
                 channel: tx,
                 session_id: session.to_string(),
                 did: did.to_string(),
@@ -3599,6 +3829,7 @@ mod tests {
         clients.insert(
             did_hash.clone(),
             ClientEntry {
+                store_demoted: false,
                 tx: dead_tx,
                 session_id: "ghost".to_string(),
                 active: true,
@@ -3615,6 +3846,7 @@ mod tests {
         let update = StreamingUpdate {
             did_hash: did_hash.clone(),
             state: StreamingUpdateState::Register {
+                live: false,
                 channel: tx,
                 session_id: "live".to_string(),
                 did: did.to_string(),
@@ -3651,6 +3883,7 @@ mod tests {
         StreamingUpdate {
             did_hash: digest(did),
             state: StreamingUpdateState::Register {
+                live: false,
                 channel: tx,
                 session_id: session.to_string(),
                 did: did.to_string(),
@@ -3823,6 +4056,7 @@ mod tests {
         standby.insert(
             "h".into(),
             vec![ClientEntry {
+                store_demoted: false,
                 tx,
                 session_id: "mux".into(),
                 active: false,
@@ -3904,6 +4138,7 @@ mod tests {
         resync: Arc<AtomicBool>,
     ) -> ClientEntry {
         ClientEntry {
+            store_demoted: false,
             tx,
             session_id: session_id.to_string(),
             active: false,

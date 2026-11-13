@@ -1321,6 +1321,7 @@ async fn handle_socket(
                     wake_only: tsp_mode,
                     #[cfg(not(feature = "tsp"))]
                     wake_only: false,
+                    live: false,
                 },
             };
             match streaming.channel.send(start).await {
