@@ -8,7 +8,7 @@ use crate::{
             init,
         },
         did_rate_limiter::DidRateLimiter,
-        error_codes,
+        error_codes, http_server,
         metrics::{
             self, MetricsAccess, metrics_access, metrics_handler,
             names::WS_SEND_BUFFER_AVAILABLE_BYTES,
@@ -38,7 +38,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::{self, TraceLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -848,7 +848,7 @@ pub async fn serve_internal(
 
     let shared_state = SharedData {
         live_limits,
-        config: config.clone(),
+        config: Arc::new(config.clone()),
         service_start_timestamp: chrono::Utc::now(),
         did_resolver,
         database: store,
@@ -994,10 +994,16 @@ pub async fn serve_internal(
             crate::common::request_metrics::track_request,
         ))
         .layer(config.security.cors_allow_origin.clone())
+        // A span per request, so whatever a handler logs carries the request
+        // id, method and path. It logs nothing itself: the access log is
+        // `track_request`'s one line, and failures are logged where they
+        // happen. The query string is left out (see `request_span`).
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+                .make_span_with(request_span)
+                .on_request(())
+                .on_response(())
+                .on_failure(()),
         )
         .layer(RequestBodyLimitLayer::new(config.limits.http_size))
         .layer(rate_limit_layer)
@@ -1109,14 +1115,17 @@ pub async fn serve_internal(
             // `axum_server::from_tcp` returns `io::Result<Server>` —
             // wrap the std listener now (errors here mean the listener
             // we just bound is somehow unusable, which would be a bug).
-            let server = axum_server::from_tcp(std_listener).map_err(|e| {
-                error!("Failed to wrap TCP listener: {e}");
-                MediatorError::InternalError(
-                    error_codes::INTERNAL_ERROR,
-                    "NA".into(),
-                    format!("Failed to wrap TCP listener: {e}"),
-                )
-            })?;
+            let mut server = axum_server::from_tcp(std_listener)
+                .map_err(|e| {
+                    error!("Failed to wrap TCP listener: {e}");
+                    MediatorError::InternalError(
+                        error_codes::INTERNAL_ERROR,
+                        "NA".into(),
+                        format!("Failed to wrap TCP listener: {e}"),
+                    )
+                })?
+                .map(|plain| connection_limit(plain, &config.limits));
+            http_server::configure(server.http_builder(), &config.limits);
             let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
                 server
                     .handle(server_handle)
@@ -1136,15 +1145,19 @@ pub async fn serve_internal(
             (task, "http", "ws")
         }
         TlsMode::Rustls(rustls_config) => {
-            let server =
-                axum_server::from_tcp_rustls(std_listener, rustls_config).map_err(|e| {
+            // The cap wraps TLS, so a connection over it is closed before a
+            // handshake is spent on it.
+            let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)
+                .map_err(|e| {
                     error!("Failed to wrap TCP listener with TLS: {e}");
                     MediatorError::InternalError(
                         error_codes::INTERNAL_ERROR,
                         "NA".into(),
                         format!("Failed to wrap TCP listener with TLS: {e}"),
                     )
-                })?;
+                })?
+                .map(|tls| connection_limit(tls, &config.limits));
+            http_server::configure(server.http_builder(), &config.limits);
             let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
                 server
                     .handle(server_handle)
@@ -1290,6 +1303,36 @@ fn print_banner() {
         r#" d8'          `8b  88       88     88  88       88  88   `"8bbdP"Y8  88     88     `8'     88   `"Ybbd8"'   `"8bbdP"Y8  88  `"8bbdP"Y8    "Y888  `"YbbdP"'   88"#
     );
     println!();
+}
+
+/// The listener's connection cap and first-bytes deadline (`limits`), around
+/// `inner`.
+fn connection_limit<A>(inner: A, limits: &LimitsConfig) -> http_server::ConnectionLimit<A> {
+    http_server::ConnectionLimit::new(
+        inner,
+        limits.max_http_connections,
+        Duration::from_secs(limits.http_header_read_timeout_secs),
+    )
+}
+
+/// The tracing span for one HTTP request: method, path and request id.
+///
+/// The query string is deliberately left out. `GET /oob?_oobid=<id>` carries
+/// an invitation id that is all it takes to fetch the invitation, and the
+/// default span recorded the whole URI at INFO.
+fn request_span<B>(request: &http::Request<B>) -> tracing::Span {
+    let request_id = request
+        .extensions()
+        .get::<crate::common::request_id::RequestId>()
+        .map(|id| id.0.as_str())
+        .unwrap_or_default();
+    tracing::span!(
+        Level::INFO,
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        request_id = %request_id,
+    )
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).

@@ -78,7 +78,7 @@ pub async fn message_outbound_handler(
             debug!("getting message with id: {}", msg_id);
             match state.database.get_message(&session.did_hash, msg_id).await {
                 Ok(Some(mut msg)) => {
-                    debug!("Got message: {:?}", msg);
+                    debug!(msg_id = %msg.msg_id, size = msg.size, "Got message");
                     // Tag the message's wire protocol so the client can route it.
                     msg.detect_protocol_in_place();
                     state

@@ -255,7 +255,11 @@ ssl_key_file = "keys/end.key"
 jwt_access_expiry = "900"
 
 ### Env: JWT_REFRESH_EXPIRY
-### Expiry time in seconds for JWT refresh tokens
+### Sets the lifetime of JWT refresh tokens, less the access-token lifetime: a
+### refresh token is valid for jwt_refresh_expiry - jwt_access_expiry seconds
+### from when it is issued (85500 s, about 23.75 hours, with these values).
+### Each refresh issues a new refresh token with that same lifetime. Must be
+### greater than jwt_access_expiry.
 jwt_refresh_expiry = "86400"
 
 ### Env: CORS_ALLOW_ORIGIN
@@ -794,6 +798,39 @@ oob_invite_ttl = "86400"
 ### inbox; frames queued behind it stay in the inbox too.
 ### Minimum 1. Counted in `ws_write_timeouts_total`.
 # ws_write_timeout_secs = "30"
+
+### ─── HTTP server ────────────────────────────────────────────────────────────
+### These bound slow and idle clients in the mediator itself, so it does not
+### depend on a fronting proxy for them. A proxy with tighter limits still
+### applies its own. A value that cannot be read refuses to start.
+
+### Env: LIMIT_HTTP_HEADER_READ_TIMEOUT_SECS
+### Seconds an HTTP/1 client has to send a request's headers (30). The clock
+### starts when the connection is ready for its next request, so this is also
+### how long an idle keep-alive connection is held open, and how long a new
+### connection may stay silent before its first bytes. HTTP/2 connections are
+### pinged every 20 s and closed when a ping goes unanswered for 20 s.
+### Minimum 1.
+# http_header_read_timeout_secs = "30"
+
+### Env: LIMIT_HTTP_REQUEST_TIMEOUT_SECS
+### Seconds one HTTP request may take, reading its body included (60). Past
+### this the mediator answers 408 and drops the request's work; a message whose
+### request timed out may or may not have been stored, as with any dropped
+### connection. Not applied to /ws: an upgraded WebSocket is bounded by the
+### ws_* settings above instead.
+### Scale: raise if clients upload messages near http_size over slow links.
+### Minimum 1.
+# http_request_timeout_secs = "60"
+
+### Env: LIMIT_MAX_HTTP_CONNECTIONS
+### Concurrent TCP connections the HTTP listener holds, WebSockets included
+### (0 = unlimited). A connection over the cap is closed as soon as it is
+### accepted, before TLS, and counted in `http_connections_refused_total`.
+### Scale: keep above max_websocket_connections, with room for REST traffic,
+### and below the process file-descriptor limit (ulimit -n), less the
+### descriptors storage and outbound connections need.
+# max_http_connections = "20000"
 
 ### ─── DID multiplexing ───────────────────────────────────────────────────────
 ### One authenticated WebSocket (the "principal") carrying live delivery and

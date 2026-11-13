@@ -16,6 +16,10 @@ pub use config::{ForwardingConfig, RelayMode};
 pub mod relay_ack;
 pub use relay_ack::{RELAY_ACK_SUBPROTOCOL, RELAY_ACK_TYPE, RelayAck, frame_id};
 
+// What a peer mediator sends back (a refusal body, a relay-ack reason) is
+// read bounded and escaped before it is logged or kept.
+pub mod peer_text;
+
 // The mediator's own outbound packing, injected rather than implemented
 // here — see the module docs for why this crate can't pack for itself.
 pub mod packer;

@@ -19,8 +19,15 @@ use tracing::{Level, event};
 pub mod names {
     // ── HTTP ────────────────────────────────────────────────────────────────
 
-    /// counter: Total HTTP requests received (all endpoints)
+    /// counter: Total HTTP requests received (all endpoints). The `status`
+    /// label is the response status, or `cancelled` for a request dropped
+    /// before it had one (its client went away).
     pub const HTTP_REQUESTS_TOTAL: &str = "http_requests_total";
+    /// gauge: TCP connections the HTTP listener holds now, WebSockets included
+    pub const HTTP_CONNECTIONS_OPEN: &str = "http_connections_open";
+    /// counter: TCP connections closed on accept because
+    /// `limits.max_http_connections` were already open
+    pub const HTTP_CONNECTIONS_REFUSED_TOTAL: &str = "http_connections_refused_total";
     /// gauge: HTTP requests currently being processed
     pub const HTTP_REQUESTS_IN_FLIGHT: &str = "http_requests_in_flight";
     /// histogram: HTTP request processing duration in seconds

@@ -149,6 +149,22 @@ pub struct LimitsConfig {
     /// mediator closes the connection with 1001. At least 1.
     #[serde(default = "default_ws_write_timeout_secs")]
     pub ws_write_timeout_secs: u64,
+    /// Seconds an HTTP/1 client has to send a request's headers, counted from
+    /// when the connection is ready for its next request: it bounds a slow
+    /// client's headers and how long an idle keep-alive connection is held.
+    /// It also bounds the wait for a new connection's first bytes. At least 1.
+    #[serde(default = "defaults::http_header_read_timeout_secs")]
+    pub http_header_read_timeout_secs: u64,
+    /// Seconds one HTTP request may take, reading its body included, before
+    /// the mediator answers 408. Not applied to `/ws`: an upgraded socket has
+    /// its own liveness limits. At least 1.
+    #[serde(default = "defaults::http_request_timeout_secs")]
+    pub http_request_timeout_secs: u64,
+    /// Concurrent TCP connections the HTTP listener holds, WebSockets
+    /// included; a connection over the cap is closed as soon as it is
+    /// accepted. 0 = unlimited.
+    #[serde(default = "defaults::max_http_connections")]
+    pub max_http_connections: usize,
     /// `[limits.mux]` — DID multiplexing. Off unless an operator enables it.
     #[serde(default)]
     pub mux: MuxConfig,
@@ -182,6 +198,15 @@ mod defaults {
     }
     pub(super) fn ws_message_throttle_close_secs() -> u64 {
         10
+    }
+    pub(super) fn http_header_read_timeout_secs() -> u64 {
+        30
+    }
+    pub(super) fn http_request_timeout_secs() -> u64 {
+        60
+    }
+    pub(super) fn max_http_connections() -> usize {
+        20_000
     }
 }
 
@@ -414,6 +439,9 @@ impl Default for LimitsConfig {
             ws_ping_interval_secs: DEFAULT_WS_PING_INTERVAL_SECS,
             ws_pong_timeout_secs: DEFAULT_WS_PONG_TIMEOUT_SECS,
             ws_write_timeout_secs: DEFAULT_WS_WRITE_TIMEOUT_SECS,
+            http_header_read_timeout_secs: defaults::http_header_read_timeout_secs(),
+            http_request_timeout_secs: defaults::http_request_timeout_secs(),
+            max_http_connections: defaults::max_http_connections(),
             mux: MuxConfig::default(),
         }
     }
@@ -452,6 +480,36 @@ where
         default
     });
     if parsed == T::default() {
+        return Err(MediatorError::ConfigError(
+            crate::common::error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("limits.{field} must be greater than 0"),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a whole number that cannot be guessed at: a value that does not read
+/// refuses to start, naming the key. `note` says what the value means.
+fn whole_number<T: std::str::FromStr>(
+    field: &str,
+    value: &str,
+    note: &str,
+) -> Result<T, MediatorError> {
+    let value = value.trim();
+    value.parse().map_err(|_| {
+        MediatorError::ConfigError(
+            crate::common::error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("limits.{field} must be a whole number ({note}); got {value:?}"),
+        )
+    })
+}
+
+/// As [`whole_number`], and 0 is refused too: these have no "off" setting.
+fn positive_strict(field: &str, value: &str) -> Result<u64, MediatorError> {
+    let parsed: u64 = whole_number(field, value, "at least 1")?;
+    if parsed == 0 {
         return Err(MediatorError::ConfigError(
             crate::common::error_codes::CONFIG_ERROR,
             "NA".into(),
@@ -764,6 +822,19 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
             ws_ping_interval_secs,
             ws_pong_timeout_secs,
             ws_write_timeout_secs,
+            http_header_read_timeout_secs: positive_strict(
+                "http_header_read_timeout_secs",
+                &raw.http_header_read_timeout_secs,
+            )?,
+            http_request_timeout_secs: positive_strict(
+                "http_request_timeout_secs",
+                &raw.http_request_timeout_secs,
+            )?,
+            max_http_connections: whole_number(
+                "max_http_connections",
+                &raw.max_http_connections,
+                "0 = unlimited",
+            )?,
             mux: MuxConfig::from(raw.mux),
         })
     }
@@ -908,6 +979,9 @@ mod tests {
             ws_ping_interval_secs: "20".to_string(),
             ws_pong_timeout_secs: "50".to_string(),
             ws_write_timeout_secs: "15".to_string(),
+            http_header_read_timeout_secs: "12".to_string(),
+            http_request_timeout_secs: "45".to_string(),
+            max_http_connections: "0".to_string(),
             mux: MuxConfigRaw::default(),
         };
         // No "unlimited" setting for the relay and metrics bounds: 0 is refused.
@@ -957,6 +1031,9 @@ mod tests {
         assert_eq!(limits.ws_ping_interval_secs, 20);
         assert_eq!(limits.ws_pong_timeout_secs, 50);
         assert_eq!(limits.ws_write_timeout_secs, 15);
+        assert_eq!(limits.http_header_read_timeout_secs, 12);
+        assert_eq!(limits.http_request_timeout_secs, 45);
+        assert_eq!(limits.max_http_connections, 0);
         assert_eq!(limits.attachments_max_count, 5);
         assert_eq!(limits.crypto_operations_per_message, 500);
         assert_eq!(limits.deleted_messages, 75);
@@ -1026,6 +1103,9 @@ mod tests {
             ws_ping_interval_secs: "soon".to_string(),
             ws_pong_timeout_secs: "30".to_string(),
             ws_write_timeout_secs: "-1".to_string(),
+            http_header_read_timeout_secs: "30".to_string(),
+            http_request_timeout_secs: "60".to_string(),
+            max_http_connections: "20000".to_string(),
             mux: MuxConfigRaw::default(),
         };
         let limits = LimitsConfig::try_from(raw).unwrap();
@@ -1186,6 +1266,66 @@ mod tests {
         assert_eq!(limits.ws_messages_per_second, 100);
         assert_eq!(limits.ws_message_burst, 50);
         assert_eq!(limits.ws_message_throttle_close_secs, 10);
+        // And the HTTP server limits: on, at their defaults.
+        assert_eq!(limits.http_header_read_timeout_secs, 30);
+        assert_eq!(limits.http_request_timeout_secs, 60);
+        assert_eq!(limits.max_http_connections, 20_000);
+        assert_eq!(
+            (
+                LimitsConfig::default().http_header_read_timeout_secs,
+                LimitsConfig::default().http_request_timeout_secs,
+                LimitsConfig::default().max_http_connections,
+            ),
+            (30, 60, 20_000)
+        );
+    }
+
+    /// The HTTP server limits are never guessed at: an unreadable value, or a
+    /// 0 timeout (there is no "off"), refuses to start, naming the key.
+    #[test]
+    fn an_unreadable_http_server_limit_refuses_to_start() {
+        let base = toml::from_str::<LimitsConfigRaw>(
+            r#"
+                attachments_max_count = "20"
+                crypto_operations_per_message = "1000"
+                deleted_messages = "100"
+                forward_task_queue = "50000"
+                http_size = "10485760"
+                listed_messages = "100"
+                local_max_acl = "1000"
+                message_expiry_seconds = "604800"
+                message_size = "1048576"
+                queued_send_messages_soft = "2000"
+                queued_send_messages_hard = "10000"
+                queued_receive_messages_soft = "200"
+                queued_receive_messages_hard = "1000"
+                to_keys_per_recipient = "100"
+                to_recipients = "100"
+                ws_size = "10485760"
+                access_list_limit = "1000"
+                oob_invite_ttl = "86400"
+                "#,
+        )
+        .unwrap();
+        assert!(LimitsConfig::try_from(base.clone()).is_ok());
+        for (field, bad) in [
+            ("http_header_read_timeout_secs", "0"),
+            ("http_header_read_timeout_secs", "soon"),
+            ("http_request_timeout_secs", "0"),
+            ("http_request_timeout_secs", "-5"),
+            ("max_http_connections", "lots"),
+        ] {
+            let mut raw = base.clone();
+            match field {
+                "http_header_read_timeout_secs" => {
+                    raw.http_header_read_timeout_secs = bad.to_string()
+                }
+                "http_request_timeout_secs" => raw.http_request_timeout_secs = bad.to_string(),
+                _ => raw.max_http_connections = bad.to_string(),
+            }
+            let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
+            assert!(err.contains(field), "{field}={bad}: {err}");
+        }
     }
 
     #[test]

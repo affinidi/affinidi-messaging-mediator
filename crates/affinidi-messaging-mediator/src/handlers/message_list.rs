@@ -40,7 +40,7 @@ pub async fn message_list_handler(
         Level::DEBUG,
         "message_list_handler",
         session = session.session_id,
-        session_did = session.did,
+        session_did_hash = session.did_hash,
         did_hash = did_hash,
         folder = folder.to_string()
     );

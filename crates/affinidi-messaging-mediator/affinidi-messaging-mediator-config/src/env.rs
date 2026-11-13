@@ -240,6 +240,18 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.limits.ws_write_timeout_secs,
         "LIMIT_WS_WRITE_TIMEOUT_SECS"
     );
+    env_override!(
+        config.limits.http_header_read_timeout_secs,
+        "LIMIT_HTTP_HEADER_READ_TIMEOUT_SECS"
+    );
+    env_override!(
+        config.limits.http_request_timeout_secs,
+        "LIMIT_HTTP_REQUEST_TIMEOUT_SECS"
+    );
+    env_override!(
+        config.limits.max_http_connections,
+        "LIMIT_MAX_HTTP_CONNECTIONS"
+    );
     env_override!(config.limits.mux.enabled, "LIMIT_MUX_ENABLED");
     env_override!(
         config.limits.mux.max_dids_per_connection,

@@ -46,7 +46,7 @@ sha256 = "1"
 toml = "1"
 
 # ── Async runtime + observability ────────────────────────────────────────
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = { version = "0.1", features = ["valuable"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

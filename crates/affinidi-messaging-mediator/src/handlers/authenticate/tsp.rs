@@ -392,7 +392,7 @@ pub async fn tsp_authentication_response(
 
         if form == Form::Unbound {
             warn!(
-                did = %session.did,
+                did_hash = %session.did_hash,
                 "TSP login accepted in the older form (signature over the challenge alone) \
                  under security.tsp_auth_accept_unbound_until; this client should move to \
                  affinidi-messaging-sdk 0.45.16 or later"
@@ -431,8 +431,7 @@ pub async fn tsp_authentication_response(
             now,
             state.config.security.jwt_encoding_key(),
         )?;
-        let refresh_expiry =
-            state.config.security.jwt_refresh_expiry - state.config.security.jwt_access_expiry;
+        let refresh_expiry = state.config.security.refresh_token_lifetime();
         let (refresh_token, refresh_expires_at, refresh_token_hash) = _create_refresh_token(
             &session.did,
             &session.session_id,
@@ -453,7 +452,7 @@ pub async fn tsp_authentication_response(
             // Unauthenticated: say nothing of storage capacity.
             .map_err(MediatorError::opaque_storage)?;
 
-        debug!("TSP client authenticated: {}", session.did);
+        debug!(did_hash = %session.did_hash, "TSP client authenticated");
         crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;
         state
             .activity

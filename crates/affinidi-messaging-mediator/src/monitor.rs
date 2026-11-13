@@ -588,9 +588,9 @@ impl TrafficMonitor {
 
     /// A message was stored for `to`.
     ///
-    /// Its live delivery, if any, is reported separately by the streaming task
-    /// once the notification is queued to the recipient's socket — not here,
-    /// where a publish can still be dropped (R1.1).
+    /// Its live delivery, if any, is reported separately, by the socket loop
+    /// once the frame is written to the recipient's socket — not here, where
+    /// a publish can still be dropped, nor when the frame is queued (R1.1).
     pub(crate) fn stored(&self, msg_id: &str, from: Option<&str>, to: &str, body: &str) {
         let protocol = Protocol::detect(body);
         self.emit(|| TrafficEvent {

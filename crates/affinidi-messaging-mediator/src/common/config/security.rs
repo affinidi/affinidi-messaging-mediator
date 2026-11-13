@@ -289,6 +289,8 @@ pub struct SecurityConfig {
     #[serde(skip_serializing)]
     jwt_decoding_key: DecodingKey,
     pub jwt_access_expiry: u64,
+    /// A refresh token is valid for `jwt_refresh_expiry - jwt_access_expiry`
+    /// seconds from when it is issued, not `jwt_refresh_expiry`.
     pub jwt_refresh_expiry: u64,
     #[serde(skip_serializing)]
     pub cors_allow_origin: CorsLayer,
@@ -411,7 +413,20 @@ impl Debug for SecurityConfig {
     }
 }
 
+/// See [`SecurityConfig::refresh_token_lifetime`].
+fn refresh_token_lifetime(jwt_access_expiry: u64, jwt_refresh_expiry: u64) -> u64 {
+    jwt_refresh_expiry.saturating_sub(jwt_access_expiry)
+}
+
 impl SecurityConfig {
+    /// Seconds a refresh token is valid for from when it is issued:
+    /// `jwt_refresh_expiry - jwt_access_expiry`, which is what
+    /// `conf/mediator.toml` documents. Startup validation keeps
+    /// `jwt_refresh_expiry` above `jwt_access_expiry`.
+    pub fn refresh_token_lifetime(&self) -> u64 {
+        refresh_token_lifetime(self.jwt_access_expiry, self.jwt_refresh_expiry)
+    }
+
     /// Derive and install the JWT signing and verification keys from an Ed25519
     /// **PKCS#8** document — the same bytes the production path reads from the
     /// `JWT_SECRET` well-known entry.
@@ -933,6 +948,13 @@ mod tests {
     /// Does `spec`'s allowlist admit request origin `origin`?
     fn allows(spec: &str, origin: &str) -> bool {
         origin_matches(&matchers(spec), &hv(origin))
+    }
+
+    /// `jwt_refresh_expiry` is documented (conf/mediator.toml) as the refresh
+    /// lifetime less the access lifetime, which is what is issued.
+    #[test]
+    fn a_refresh_token_lives_refresh_expiry_less_access_expiry() {
+        assert_eq!(super::refresh_token_lifetime(900, 86_400), 85_500);
     }
 
     /// The default JWT key signs tokens that verify with its own public key,

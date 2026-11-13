@@ -131,15 +131,6 @@ where
         .collect()
 }
 
-/// Whether a WebSocket upgrade carrying this `Origin` header is allowed
-/// by the configured CORS policy.
-///
-/// WebSocket upgrades aren't subject to CORS preflight, but browsers
-/// still send an `Origin` header on them. This mirrors the REST CORS
-/// allowlist ([`CorsOriginPolicy`]) as defence-in-depth: a browser from
-/// a non-allowlisted origin is refused even if it somehow holds a valid
-/// token. Native clients send no `Origin` header and are always allowed
-/// — for them the JWT is the only (and sufficient) gate.
 /// Shortest gap between two resync `status` messages on one socket.
 ///
 /// Sending one is not free — it costs an inbox read, a DID resolution and a
@@ -168,6 +159,15 @@ fn resync_due(raised: bool, since_last: Duration) -> bool {
     raised && since_last >= MIN_RESYNC_INTERVAL
 }
 
+/// Whether a WebSocket upgrade carrying this `Origin` header is allowed
+/// by the configured CORS policy.
+///
+/// WebSocket upgrades aren't subject to CORS preflight, but browsers
+/// still send an `Origin` header on them. This mirrors the REST CORS
+/// allowlist ([`CorsOriginPolicy`]) as defence-in-depth: a browser from
+/// a non-allowlisted origin is refused even if it somehow holds a valid
+/// token. Native clients send no `Origin` header and are always allowed
+/// — for them the JWT is the only (and sufficient) gate.
 fn ws_origin_allowed(policy: &CorsOriginPolicy, origin: Option<&HeaderValue>) -> bool {
     match origin {
         // No Origin ⇒ not a browser cross-origin context (native client).
