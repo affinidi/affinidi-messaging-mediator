@@ -2,7 +2,7 @@
 ###
 ### A setting with an "Env:" line can be overridden by the environment
 ### variable it names; environment variables take priority over this file.
-### Settings without an "Env:" line (the optional [didcomm_v1] section, see
+### Settings without an "Env:" line (the optional didcomm_v1 section, see
 ### docs/didcomm-protocols.md) are read from this file only. Where a label
 ### names two variables, the first wins when both are set; the second is an
 ### older name kept so existing deployments keep working.
