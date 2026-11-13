@@ -44,7 +44,7 @@
 //! to a subscription that did not ask. A 0.1 subscription is served exactly as
 //! before: event 0.2 batches, traffic only. Unlike traffic, membership is
 //! not per instance behind a shared Redis: every instance's changes reach
-//! every instance's opted-in subscribers (see [`fanout`]), under the same
+//! every instance's opted-in subscribers (see the `fanout` module), under the same
 //! filters and standing checks as local ones.
 //!
 //! # What a subscription reveals
@@ -950,7 +950,7 @@ impl TrafficMonitor {
     /// change is made (`crate::mux::connection`).
     ///
     /// Also offered, without waiting, to the fan-out task while another
-    /// instance has a membership subscriber (see [`fanout`]); never awaited,
+    /// instance has a membership subscriber (see the `fanout` module); never awaited,
     /// so the connection path it is called from is not slowed by the store.
     pub fn emit_membership(&self, build: impl FnOnce() -> MembershipEvent) {
         let local = self.membership_tx.receiver_count() > 0;
