@@ -10,7 +10,7 @@
 //!   the body is written, and only what it carried (#181).
 //! - `/outbound` with `delete` deletes once the response is written (#135).
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
