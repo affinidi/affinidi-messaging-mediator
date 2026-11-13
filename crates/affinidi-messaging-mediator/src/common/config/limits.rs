@@ -561,10 +561,55 @@ pub(crate) fn websocket_liveness(
     ((ping_interval, pong_timeout, write_timeout), notes)
 }
 
+/// Refuse a queue limit below `-1`. `-1` means unlimited and `0` and more is a
+/// limit; any other negative value has no meaning, and the gates would
+/// otherwise have to guess one for it.
+fn check_queue_limits(limits: &LimitsConfig) -> Result<(), MediatorError> {
+    for (field, value) in [
+        (
+            "queued_send_messages_per_peer",
+            limits.queued_send_messages_per_peer,
+        ),
+        (
+            "queued_send_messages_soft",
+            limits.queued_send_messages_soft,
+        ),
+        (
+            "queued_send_messages_hard",
+            limits.queued_send_messages_hard,
+        ),
+        (
+            "queued_receive_messages_soft",
+            limits.queued_receive_messages_soft,
+        ),
+        (
+            "queued_receive_messages_hard",
+            limits.queued_receive_messages_hard,
+        ),
+    ] {
+        if value < -1 {
+            return Err(MediatorError::ConfigError(
+                crate::common::error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("limits.{field} must be -1 (unlimited) or 0 and more; got {value}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
     type Error = MediatorError;
 
     fn try_from(raw: LimitsConfigRaw) -> Result<Self, Self::Error> {
+        let limits = Self::parse(raw)?;
+        check_queue_limits(&limits)?;
+        Ok(limits)
+    }
+}
+
+impl LimitsConfig {
+    fn parse(raw: LimitsConfigRaw) -> Result<Self, MediatorError> {
         let warn_default = |field: &str, default: &str| {
             eprintln!(
                 "WARN: Could not parse limits.{field} config value, using default: {default}"
@@ -1144,6 +1189,45 @@ mod tests {
             }
             let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
             assert!(err.contains(field), "{field}={bad}: {err}");
+        }
+    }
+
+    /// A queue limit below -1 means nothing, so it refuses to start rather
+    /// than the gates guessing (it used to cast to about four billion).
+    #[test]
+    fn a_queue_limit_below_minus_one_refuses_to_start() {
+        let base: LimitsConfigRaw = toml::from_str(
+            r#"
+            queued_send_messages_per_peer = "50"
+            queued_send_messages_soft = "2000"
+            queued_send_messages_hard = "10000"
+            queued_receive_messages_soft = "200"
+            queued_receive_messages_hard = "1000"
+            "#,
+        )
+        .unwrap();
+        assert!(LimitsConfig::try_from(base.clone()).is_ok());
+        let mut unlimited = base.clone();
+        unlimited.queued_send_messages_per_peer = "-1".to_string();
+        assert!(LimitsConfig::try_from(unlimited).is_ok(), "-1 is unlimited");
+        for field in [
+            "queued_send_messages_per_peer",
+            "queued_send_messages_soft",
+            "queued_send_messages_hard",
+            "queued_receive_messages_soft",
+            "queued_receive_messages_hard",
+        ] {
+            let mut raw = base.clone();
+            let bad = "-2".to_string();
+            match field {
+                "queued_send_messages_per_peer" => raw.queued_send_messages_per_peer = bad,
+                "queued_send_messages_soft" => raw.queued_send_messages_soft = bad,
+                "queued_send_messages_hard" => raw.queued_send_messages_hard = bad,
+                "queued_receive_messages_soft" => raw.queued_receive_messages_soft = bad,
+                _ => raw.queued_receive_messages_hard = bad,
+            }
+            let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
+            assert!(err.contains(field), "{field}: {err}");
         }
     }
 

@@ -387,6 +387,10 @@ async fn peer_breakdown(
 const MESSAGE_LIST_DEFAULT_LIMIT: u32 = 100;
 const MESSAGE_LIST_MAX_LIMIT: u32 = 500;
 const MESSAGE_LIST_MAX_SCAN: u32 = 5_000;
+/// Entries read per store call while listing. Fixed, so a small `limit` with
+/// a `peer` filter that skips most entries does not turn one call into
+/// thousands of one-entry reads.
+const MESSAGE_LIST_SCAN_CHUNK: u32 = 500;
 
 /// The largest stored message `messaging/message/get` returns (10 MiB, the
 /// spec's `message` bound).
@@ -498,14 +502,14 @@ pub(crate) async fn consume_message_list(
     let mut scanned = 0u32;
     let mut last_seen: Option<String> = None;
     let mut exhausted = false;
-    while (kept.len() as u32) < limit && scanned < MESSAGE_LIST_MAX_SCAN {
-        let batch = limit.min(MESSAGE_LIST_MAX_SCAN - scanned);
+    'scan: while (kept.len() as u32) < limit && scanned < MESSAGE_LIST_MAX_SCAN {
+        let batch = MESSAGE_LIST_SCAN_CHUNK.min(MESSAGE_LIST_MAX_SCAN - scanned);
         let page = state
             .database
             .list_messages(&target, folder.clone(), Some((&start, "+")), batch)
             .await?;
         let got = page.len() as u32;
-        for m in page {
+        for (index, m) in page.into_iter().enumerate() {
             scanned += 1;
             let stream_id = if receive {
                 m.receive_id.clone()
@@ -526,7 +530,11 @@ pub(crate) async fn consume_message_list(
             if wanted {
                 kept.push(m);
                 if kept.len() as u32 == limit {
-                    break;
+                    // The page is full. The queue is known to be exhausted
+                    // only if this was the last entry of a short read; any
+                    // entry left unread on this page is for the next cursor.
+                    exhausted = index as u32 + 1 == got && got < batch;
+                    break 'scan;
                 }
             }
         }
@@ -556,11 +564,9 @@ pub(crate) async fn consume_message_list(
             MessageRef::new(to, m.msg_id.clone())
         })
         .collect();
-    let states = state
-        .database
-        .delivery_states(&records)
-        .await
-        .unwrap_or_default();
+    // A store error is the caller's to see, not an answer quietly missing
+    // its delivery state.
+    let states = state.database.delivery_states(&records).await?;
     let queue_name = if receive { "receive" } else { "send" };
     let messages: Vec<Value> = kept
         .iter()
@@ -1172,6 +1178,11 @@ pub(crate) async fn consume_message_delete(
 
     let mut results = Vec::with_capacity(payload.msg_ids.len());
     let mut deleted_ids = Vec::new();
+    // Ids a store error left undecided: reported per item (the item says
+    // only `deleted: false`, as the pinned schema has no reason for it; the
+    // ids are named under `ext`), never by abandoning the ids after them —
+    // which would leave deletes already done unreported and unaudited.
+    let mut failed_ids: Vec<String> = Vec::new();
     for id in &payload.msg_ids {
         let id = id.to_string();
         // Only messages the target account sends or receives are in scope;
@@ -1181,9 +1192,18 @@ pub(crate) async fn consume_message_delete(
         // not send, even when an admin is acting. This is an explicit queue
         // operation, not an acknowledgement (those delete the recipient's own
         // copy only), so withdrawing the target's sent copies is intended.
-        let Some(stored) = state.database.get_message(&target, &id).await? else {
-            results.push(json!({ "msgId": id, "deleted": false, "reason": "notFound" }));
-            continue;
+        let stored = match state.database.get_message(&target, &id).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                results.push(json!({ "msgId": id, "deleted": false, "reason": "notFound" }));
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(msg_id = %id, target = %target, "message/delete: lookup failed: {e}");
+                results.push(json!({ "msgId": id, "deleted": false }));
+                failed_ids.push(id);
+                continue;
+            }
         };
         match state
             .database
@@ -1211,26 +1231,46 @@ pub(crate) async fn consume_message_delete(
             Err(e) if ops::is_delete_not_found(&e) => {
                 results.push(json!({ "msgId": id, "deleted": false, "reason": "notFound" }));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!(msg_id = %id, target = %target, "message/delete: delete failed: {e}");
+                results.push(json!({ "msgId": id, "deleted": false }));
+                failed_ids.push(id);
+            }
         }
     }
 
-    if !own && !deleted_ids.is_empty() {
+    if !own && (!deleted_ids.is_empty() || !failed_ids.is_empty()) {
         record_audit(
             state,
             session,
             &target,
             AuditAction::MessageDelete,
-            format!(
-                "deleted {} message(s): {}",
-                deleted_ids.len(),
-                abbreviate(&deleted_ids)
-            ),
+            if failed_ids.is_empty() {
+                format!(
+                    "deleted {} message(s): {}",
+                    deleted_ids.len(),
+                    abbreviate(&deleted_ids)
+                )
+            } else {
+                format!(
+                    "outcome partial: deleted {} message(s): {}; {} failed with a store error: {}",
+                    deleted_ids.len(),
+                    abbreviate(&deleted_ids),
+                    failed_ids.len(),
+                    abbreviate(&failed_ids)
+                )
+            },
         )
         .await;
     }
 
-    let response: message::delete::v0_1::Response = from_json(json!({ "results": results }))?;
+    let mut response = json!({ "results": results });
+    if !failed_ids.is_empty() {
+        response["ext"] = json!({
+            "com.affinidi.mediator": { "failed": failed_ids, "reason": "storageError" }
+        });
+    }
+    let response: message::delete::v0_1::Response = from_json(response)?;
     serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
         .map_err(serialize_err)
 }
@@ -1315,20 +1355,47 @@ pub(crate) async fn consume_queue_purge(
         state
             .database
             .purge_folder_filtered_by(&target, folder.clone(), &filter, by)
-            .await?
+            .await
     } else {
-        let (count, bytes) = state
+        state
             .database
             .purge_folder_by(&session.session_id, &target, folder.clone(), by)
-            .await?;
-        PurgeReport {
-            count,
-            bytes,
-            scanned: count,
-            failed: 0,
-            truncated: false,
-        }
+            .await
+            .map(|(count, bytes)| PurgeReport {
+                count,
+                bytes,
+                scanned: count,
+                failed: 0,
+                truncated: false,
+            })
     };
+    let report =
+        match report {
+            Ok(report) => report,
+            Err(e) => {
+                // A purge that failed part-way may have removed some messages
+                // already; the store cannot say how many. The audit records the
+                // attempt and that its outcome is unknown, before the error goes
+                // back.
+                if !dry_run {
+                    record_audit(
+                    state,
+                    session,
+                    &target,
+                    AuditAction::QueuePurge,
+                    format!(
+                        "outcome partial: purge of the {} queue failed and may have removed some \
+                         messages (peer: {}, older than: {}s): {e}",
+                        if matches!(folder, Folder::Outbox) { "send" } else { "receive" },
+                        peer.as_deref().unwrap_or("any"),
+                        older_than.map_or_else(|| "any".to_string(), |s| s.to_string()),
+                    ),
+                )
+                .await;
+                }
+                return Err(e);
+            }
+        };
 
     let queue_name = if matches!(folder, Folder::Outbox) {
         "send"

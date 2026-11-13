@@ -56,6 +56,66 @@ fn relay_sender_acls(global_acl_default: &MediatorACLSet) -> MediatorACLSet {
     acls
 }
 
+/// A forward's `delay_milli`: absent is 0; otherwise a whole number of
+/// milliseconds in `0..=limit_ms`. Anything else is `Err`.
+fn parse_delay_milli(value: Option<&serde_json::Value>, limit_ms: i64) -> Result<i64, ()> {
+    match value {
+        None => Ok(0),
+        Some(v) => match v.as_i64() {
+            Some(ms) if (0..=limit_ms).contains(&ms) => Ok(ms),
+            _ => Err(()),
+        },
+    }
+}
+
+/// An ephemeral forward whose recipient has no live stream: not delivered,
+/// and not queued either.
+fn recipient_not_live(session: &Session, msg_id: &str) -> MediatorError {
+    MediatorError::problem(
+        99,
+        &session.session_id,
+        Some(msg_id.to_string()),
+        ProblemReportSorter::Warning,
+        ProblemReportScope::Message,
+        "delivery.not_live",
+        "Message not delivered: recipient not live (an ephemeral message is never queued)",
+        vec![],
+        StatusCode::NOT_FOUND,
+    )
+}
+
+tokio::task_local! {
+    /// The hop count an authenticated peer mediator carried on the re-wrap
+    /// layers peeled off the message being handled (see
+    /// `peel_relay_rewrap_layers`).
+    static RELAY_HOP_FLOOR: u32;
+}
+
+/// Run `f` with `floor` as the hop count of the relay that delivered the
+/// message it handles. Only a peer mediator authenticated on a re-wrap layer
+/// sets one; everything else runs at 0.
+///
+/// A forward's own `hop_count` is never read: it is set by its sender, who
+/// could set it low to defeat loop detection. In `Blind` relay mode nothing
+/// carries the count between mediators, so loop detection across mediators
+/// needs `Rewrap` mode.
+pub(crate) async fn with_relay_hop_floor<F: std::future::Future>(floor: u32, f: F) -> F::Output {
+    RELAY_HOP_FLOOR.scope(floor, f).await
+}
+
+fn relay_hop_floor() -> u32 {
+    RELAY_HOP_FLOOR.try_with(|f| *f).unwrap_or(0)
+}
+
+/// The `hop_count` a peer mediator's re-wrap layer carries, saturated to
+/// `u32`: never wrapped, so a huge count stays huge.
+pub(crate) fn layer_hop_count(msg: &Message) -> u32 {
+    msg.extra
+        .get("hop_count")
+        .and_then(|v| v.as_u64())
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// Re-wrap an inner forward envelope for relay to a remote peer mediator
 /// ([`RelayMode::Rewrap`]).
 ///
@@ -364,16 +424,18 @@ async fn deliver_forward(
     if ephemeral {
         // Live stream only: an ephemeral message is never stored, so it is
         // accepted only when it is actually handed to a live stream.
+        //
+        // A recipient with no live stream is answered with its own outcome,
+        // not the uniform `delivery.refused`: the recipient has passed every
+        // check above, so the sender may send to it, and what it needs to know
+        // is that this message was not delivered and is not queued — retrying
+        // later, or sending it non-ephemeral, may succeed.
         let Some(stream_uuid) = state
             .database
             .streaming_is_client_live(next_did_hash, false)
             .await
         else {
-            return Err(crate::messages::delivery_refused(
-                session,
-                Some(msg.id.to_string()),
-                "ephemeral message for a recipient with no live stream",
-            ));
+            return Err(recipient_not_live(session, &msg.id));
         };
         if let Err(e) = state
             .database
@@ -402,12 +464,11 @@ async fn deliver_forward(
         {
             // Remote destination — enqueue to FORWARD_Q for the forwarding processor
 
-            // Check hop count for loop detection
-            let hop_count = msg
-                .extra
-                .get("hop_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            // Hop count for loop detection. Only an authenticated peer
+            // mediator's count is trusted, and only as a floor: the sender's
+            // own `hop_count` is its to choose, so a sender that set it low
+            // would defeat loop detection. See `with_relay_hop_floor`.
+            let hop_count = relay_hop_floor();
 
             if hop_count >= state.config.processors.forwarding.max_hops {
                 metrics::counter!(crate::common::metrics::names::FORWARD_LOOP_DETECTED_TOTAL)
@@ -445,7 +506,8 @@ async fn deliver_forward(
             let relay_message = match state.config.processors.forwarding.relay_mode {
                 RelayMode::Blind => data.to_string(),
                 RelayMode::Rewrap => {
-                    rewrap_for_relay(state, session, data, &relay_to, hop_count + 1).await?
+                    rewrap_for_relay(state, session, data, &relay_to, hop_count.saturating_add(1))
+                        .await?
                 }
             };
 
@@ -461,7 +523,7 @@ async fn deliver_forward(
                 delay_milli,
                 expires_at,
                 retry_count: 0,
-                hop_count: hop_count + 1,
+                hop_count: hop_count.saturating_add(1),
                 not_before_ms: 0,
             };
 
@@ -892,7 +954,7 @@ pub(crate) async fn process(
         let next = parse_next_did(msg, session)?;
         let next_did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&next);
 
-        let attachments = if let Some(attachments) = &msg.attachments {
+        let attachments = if let Some(attachments) = msg.attachments.as_ref().filter(|a| !a.is_empty()) {
             attachments.to_owned()
         } else {
             return Err(MediatorError::problem(
@@ -907,6 +969,27 @@ pub(crate) async fn process(
                 StatusCode::BAD_REQUEST,
             ));
         };
+        // A forward carries exactly one attachment: the message for `next`.
+        // Only that one would be delivered, so a forward with more is refused
+        // rather than answered `Forwarded` with the rest silently dropped.
+        // Checked before the queue gates, which charge per attachment.
+        if attachments.len() != 1 {
+            return Err(MediatorError::problem_with_log(
+                63,
+                &session.session_id,
+                Some(msg.id.to_string()),
+                ProblemReportSorter::Warning,
+                ProblemReportScope::Message,
+                "protocol.forwarding.attachments.too_many",
+                "A forward carries exactly one attachment; this one has {1}",
+                vec![attachments.len().to_string()],
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "A forward carries exactly one attachment; this one has {}",
+                    attachments.len()
+                ),
+            ));
+        }
         let attachments_bytes = attachments
             .iter()
             .map(|a| a.byte_count.unwrap_or(0))
@@ -918,8 +1001,9 @@ pub(crate) async fn process(
         );
 
         // ****************************************************
-        // Determine who the from did is
-        // If message is anonymous, then use the session DID
+        // Determine who the from did is. An anonymous forward has no sender
+        // account: it runs under a synthetic account with an empty DID hash
+        // and the configured default ACLs (`resolve_forward_sender`).
 
         let sender = resolve_forward_sender(state, session, msg, metadata).await?;
         let from_account = sender.account;
@@ -940,32 +1024,6 @@ pub(crate) async fn process(
         )
         .await?;
         validate_sender_queue_limit(Some(msg.id.as_str()), &from_account, attachments.len(), ephemeral, state, session)?;
-
-        if attachments.len() > state.limits().attachments_max_count {
-            warn!(
-                "Too many attachments in message, limit is {}",
-                state.limits().attachments_max_count
-            );
-            return Err(MediatorError::problem_with_log(
-                63,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Warning,
-                ProblemReportScope::Message,
-                "protocol.forwarding.attachments.too_many",
-                "Forwarded message has too many attachments ({1}). Limit is ({2})",
-                vec![
-                    attachments.len().to_string(),
-                    state.limits().attachments_max_count.to_string(),
-                ],
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Forwarded message has too many attachments ({}). Limit is ({})",
-                    attachments.len(),
-                    state.limits().attachments_max_count
-                ),
-            ));
-        }
 
         if !ephemeral
             && with_storage_timeout(
@@ -997,36 +1055,34 @@ pub(crate) async fn process(
             ));
         }
 
-        // Check if a delay has been specified and if so, is it longer than we allow?
-        let delay_milli = if let Some(delay_milli) = msg.extra.get("delay_milli") {
-            debug!("forward delay requested: ({:?})", delay_milli);
-            delay_milli.as_i64().unwrap_or(0)
-        } else {
-            0
-        };
-
-        if delay_milli.abs() > (state.config.processors.forwarding.future_time_limit as i64 * 1000)
-        {
-            warn!(
-                "Forwarding delay is too long, limit is {}",
-                state.config.processors.forwarding.future_time_limit
-            );
-            return Err(MediatorError::problem_with_log(
-                65,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Warning,
-                ProblemReportScope::Message,
-                "protocol.forwarding.delay_milli",
-                "Forward delay_milli field isn't valid. Max field value: {1}",
-                vec![(state.config.processors.forwarding.future_time_limit * 1000).to_string()],
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Forward delay_milli field isn't valid. Max field value: {}",
-                    state.config.processors.forwarding.future_time_limit * 1000
-                ),
-            ));
-        }
+        // A delay, when given, is a whole number of milliseconds from 0 to the
+        // configured limit. Anything else — negative, fractional, a string, past
+        // the limit — is refused rather than read as 0 or as its magnitude.
+        let delay_limit_ms =
+            i64::try_from(state.config.processors.forwarding.future_time_limit)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000);
+        let delay_milli = parse_delay_milli(msg.extra.get("delay_milli"), delay_limit_ms)
+            .map_err(|()| {
+                warn!(
+                    "Forward delay_milli is not a whole number in 0..={delay_limit_ms}: {:?}",
+                    msg.extra.get("delay_milli")
+                );
+                MediatorError::problem_with_log(
+                    65,
+                    &session.session_id,
+                    Some(msg.id.to_string()),
+                    ProblemReportSorter::Warning,
+                    ProblemReportScope::Message,
+                    "protocol.forwarding.delay_milli",
+                    "Forward delay_milli field isn't valid. It must be a whole number from 0 to {1}",
+                    vec![delay_limit_ms.to_string()],
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Forward delay_milli field isn't valid. It must be a whole number from 0 to {delay_limit_ms}"
+                    ),
+                )
+            })?;
 
         // ****************************************************
         // Local or remote next hop? This resolves `next` (and possibly its
@@ -1106,6 +1162,7 @@ pub(crate) async fn process(
         .await?;
 
         Ok(ProcessMessageResponse {
+            handed_over: None,
             store_message: false,
             force_live_delivery: false,
             forward_message: true,
@@ -1334,7 +1391,8 @@ async fn service_endpoint_for_remote(
 mod tests {
     use super::{
         EndpointHop, RemoteHop, blocked_relay, classify_endpoint, didcomm_endpoints,
-        parse_next_did, relay_sender_acls, rewrap_inner_attachment, uri_points_at_self,
+        layer_hop_count, parse_delay_milli, parse_next_did, recipient_not_live, relay_hop_floor,
+        relay_sender_acls, rewrap_inner_attachment, uri_points_at_self, with_relay_hop_floor,
     };
     use crate::common::session::Session;
     use crate::server::{compute_self_authorities_from, normalize_host};
@@ -1868,5 +1926,79 @@ mod tests {
         }))
         .expect("test DID document should deserialize");
         assert!(didcomm_endpoints(&doc).is_empty());
+    }
+
+    /// `delay_milli` is a whole number of milliseconds within the limit;
+    /// negatives, fractions, strings and anything past the limit are refused
+    /// rather than read as 0 or as their magnitude (`i64::MIN.abs()` used to
+    /// overflow).
+    #[test]
+    fn delay_milli_is_a_whole_number_within_the_limit() {
+        use serde_json::json;
+        assert_eq!(parse_delay_milli(None, 1_000), Ok(0));
+        assert_eq!(parse_delay_milli(Some(&json!(0)), 1_000), Ok(0));
+        assert_eq!(parse_delay_milli(Some(&json!(1_000)), 1_000), Ok(1_000));
+        for bad in [
+            json!(1_001),
+            json!(-1),
+            json!(i64::MIN),
+            json!(1.5),
+            json!("10"),
+            json!(null),
+            json!(u64::MAX),
+        ] {
+            assert_eq!(parse_delay_milli(Some(&bad), 1_000), Err(()), "{bad}");
+        }
+    }
+
+    /// A peer's hop count saturates instead of wrapping to a small number.
+    #[test]
+    fn a_layer_hop_count_saturates() {
+        let mut msg = Message::build(
+            "id".to_string(),
+            "https://didcomm.org/routing/2.0/forward".to_string(),
+            serde_json::json!({}),
+        )
+        .finalize();
+        assert_eq!(layer_hop_count(&msg), 0);
+        msg.extra.insert("hop_count".into(), serde_json::json!(3));
+        assert_eq!(layer_hop_count(&msg), 3);
+        msg.extra.insert(
+            "hop_count".into(),
+            serde_json::json!(u64::from(u32::MAX) + 5),
+        );
+        assert_eq!(layer_hop_count(&msg), u32::MAX);
+        msg.extra.insert("hop_count".into(), serde_json::json!(-3));
+        assert_eq!(layer_hop_count(&msg), 0);
+    }
+
+    /// Outside a relay scope the floor is 0, whatever the forward claims;
+    /// inside one it is the authenticated peer's count.
+    #[tokio::test]
+    async fn the_hop_floor_comes_only_from_the_relay_scope() {
+        assert_eq!(relay_hop_floor(), 0);
+        assert_eq!(
+            with_relay_hop_floor(7, async { relay_hop_floor() }).await,
+            7
+        );
+        assert_eq!(relay_hop_floor(), 0);
+    }
+
+    /// An ephemeral forward to a recipient with no live stream has its own
+    /// outcome, distinct from the uniform `delivery.refused`.
+    #[test]
+    fn a_recipient_not_live_is_not_a_refusal() {
+        let session = Session {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let not_live = format!("{:?}", recipient_not_live(&session, "m-1"));
+        let refused = format!(
+            "{:?}",
+            crate::messages::delivery_refused(&session, Some("m-1".into()), "x")
+        );
+        assert!(not_live.contains("delivery.not_live"), "{not_live}");
+        assert!(!refused.contains("delivery.not_live"));
+        assert_ne!(not_live, refused);
     }
 }

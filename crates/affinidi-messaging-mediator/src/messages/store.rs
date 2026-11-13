@@ -103,6 +103,7 @@ pub(crate) async fn store_system_message(
 /// - session: Session
 /// - response: ProcessMessageResponse
 /// - metadata: UnpackMetadata
+#[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
 pub(crate) async fn store_message(
     state: &SharedData,
     session: &Session,
@@ -176,6 +177,11 @@ pub(crate) async fn store_message(
                         state.clock.unix_secs() + state.limits().message_expiry_seconds
                     };
 
+                    // A reply to several recipients answers with what was
+                    // stored and the per-recipient failures; one stored
+                    // nowhere is a failure, not a success with a list of
+                    // errors the sender has to dig out (R1.1).
+                    let mut first_error: Option<MediatorError> = None;
                     for recipient in to_dids {
                         let (packed, _): (String, PackEncryptedMetadata) = message
                             .pack(
@@ -220,56 +226,30 @@ pub(crate) async fn store_message(
                                 stored_messages
                                     .errors
                                     .push((recipient.to_string(), e.to_string()));
+                                first_error.get_or_insert(e);
                             }
                         }
                     }
+                    if stored_messages.messages.is_empty()
+                        && let Some(e) = first_error
+                    {
+                        return Err(e);
+                    }
                 }
                 WrapperType::Envelope(to_did, message, expiry) => {
-                    // Message is already packed, likely a direct delivery from a client
-                    //
-                    // Queue gates apply here and NOT to the `Message` arm
-                    // above, whose sender is the mediator itself: those are the
-                    // replies that tell a client its queue is full, so gating
-                    // them would make a full inbox an unreportable one. This
-                    // arm is client traffic, and before this it reached the
-                    // store with no depth limit at all — the hole that let a
-                    // direct sender fill any inbox without bound, and that the
-                    // per-relationship gate for VTI-29 did not reach.
-                    let to_hash =
-                        affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
-                    crate::messages::queue_limits::validate_store_queue_limits(
+                    // Message is already packed, likely a direct delivery from
+                    // a client. Its sender is the session's DID.
+                    let msg_id = store_envelope(
                         state,
                         session,
-                        None,
+                        to_did,
                         &session.did_hash,
-                        &to_hash,
+                        message,
+                        *expiry,
+                        response.force_live_delivery,
                     )
                     .await?;
-                    match _store_message(
-                        state,
-                        &session.session_id,
-                        response.force_live_delivery,
-                        message,
-                        &to_hash,
-                        Some(&session.did_hash),
-                        *expiry,
-                    )
-                    .await
-                    {
-                        Ok(msg_id) => {
-                            debug!(
-                                "message id({}) stored successfully recipient({})",
-                                msg_id, to_did
-                            );
-                            stored_messages.messages.push((to_did.to_string(), msg_id));
-                        }
-                        Err(e) => {
-                            warn!("error storing message recipient({}): {:?}", to_did, e);
-                            stored_messages
-                                .errors
-                                .push((to_did.to_string(), e.to_string()));
-                        }
-                    }
+                    stored_messages.messages.push((to_did.to_string(), msg_id));
                 }
             }
 
@@ -296,17 +276,32 @@ pub(crate) async fn store_message(
             trace!("Ephemeral message packed (meta):\n{:#?}", meta);
             trace!("Ephemeral message (msg):\n{:#?}", packed);
             // Live stream the message?
-            if let Some(stream_uuid) = state
+            let pushed = match state
                 .database
                 .streaming_is_client_live(&session.did_hash, response.force_live_delivery)
                 .await
             {
-                _live_stream(
-                    &state.database,
-                    &session.did_hash,
-                    &stream_uuid,
-                    &packed,
-                    response.force_live_delivery,
+                Some(stream_uuid) => {
+                    _live_stream(
+                        &state.database,
+                        &session.did_hash,
+                        &stream_uuid,
+                        &packed,
+                        response.force_live_delivery,
+                    )
+                    .await
+                }
+                None => false,
+            };
+            // The reply is packed; what it hands over is recorded once it is
+            // written: with the REST body when it came over REST, else now
+            // if the live stream took it, else not at all (R1.1).
+            if let Some(handed_over) = &response.handed_over {
+                crate::after_write::defer_or_run(
+                    handed_over
+                        .clone()
+                        .completion(state, crate::monitor::current_channel()),
+                    pushed,
                 )
                 .await;
             }
@@ -328,6 +323,85 @@ pub(crate) async fn store_message(
     }
     .instrument(_span)
     .await
+}
+
+/// Store an already-packed message (a direct delivery, a TSP or bridged
+/// message) from `from_did_hash` for `to_did`, through the queue gates.
+/// Returns the stored message's id; a store failure is the caller's error,
+/// never a success with the failure inside it (R1.1).
+///
+/// Queue gates apply here and NOT to mediator replies ([`store_message`]'s
+/// `Message` arm, `store_mediator_reply`), whose sender is the mediator
+/// itself: those are the replies that tell a client its queue is full, so
+/// gating them would make a full inbox an unreportable one. This is client
+/// traffic, and before the gates it reached the store with no depth limit at
+/// all — the hole that let a direct sender fill any inbox without bound, and
+/// that the per-relationship gate for VTI-29 did not reach.
+///
+/// `from_did_hash` is the sender the caller vouches for: the session's DID for
+/// a direct delivery, the verified sender for a relayed TSP message (whose
+/// session may be an anonymous relay with no DID at all).
+pub(crate) async fn store_envelope(
+    state: &SharedData,
+    session: &Session,
+    to_did: &str,
+    from_did_hash: &str,
+    message: &str,
+    expiry: u64,
+    force_live_delivery: bool,
+) -> Result<String, MediatorError> {
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
+    crate::messages::queue_limits::validate_store_queue_limits(
+        state,
+        session,
+        None,
+        from_did_hash,
+        &to_hash,
+    )
+    .await?;
+    match _store_message(
+        state,
+        &session.session_id,
+        force_live_delivery,
+        message,
+        &to_hash,
+        Some(from_did_hash),
+        expiry,
+    )
+    .await
+    {
+        Ok(msg_id) => {
+            debug!(
+                "message id({}) stored successfully recipient({})",
+                msg_id, to_did
+            );
+            Ok(msg_id)
+        }
+        Err(e) => {
+            warn!("error storing message recipient({}): {:?}", to_did, e);
+            Err(e)
+        }
+    }
+}
+
+/// Store a reply the mediator authored (a Trust Task answer sealed over TSP)
+/// for `to_did`: sent by the mediator's own account, with no queue or
+/// access-list gate — the same standing the DIDComm path gives its replies.
+/// The request it answers has already run, so a gate here would refuse the
+/// answer to work that was done, and a retry would then meet the
+/// duplicate-execution record. A store failure is an error.
+#[cfg(feature = "tsp")]
+pub(crate) async fn store_mediator_reply(
+    state: &SharedData,
+    to_did: &str,
+    data: &str,
+    expiry: u64,
+) -> Result<InboundMessageResponse, MediatorError> {
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
+    let msg_id = store_system_message(state, data, &to_hash, expiry).await?;
+    let mut stored = InboundMessageList::default();
+    stored.messages.push((to_did.to_string(), msg_id));
+    Ok(InboundMessageResponse::Stored(stored))
 }
 
 /// Publish the live notification for a message. A failure loses nothing — the

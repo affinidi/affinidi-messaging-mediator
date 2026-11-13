@@ -46,10 +46,16 @@ fn count_refusal(gate: &'static str) {
 }
 
 /// Whether adding `incoming` messages to a queue already holding `queued`
-/// would meet or exceed `limit`. `-1` means "unlimited"; `ephemeral`
-/// forwards (live-stream only) never count against a queue.
+/// would take it past `limit`: a limit of N admits N messages. `-1` means
+/// "unlimited"; any other negative limit admits nothing (configuration refuses
+/// one at load, so only a stored per-account override can carry it).
+/// `ephemeral` forwards (live-stream only) never count against a queue.
 pub(crate) fn queue_at_capacity(queued: u32, incoming: usize, limit: i32, ephemeral: bool) -> bool {
-    limit != -1 && !ephemeral && queued + incoming as u32 >= limit as u32
+    if limit == -1 || ephemeral {
+        return false;
+    }
+    let limit = u64::try_from(limit).unwrap_or(0);
+    u64::from(queued).saturating_add(incoming as u64) > limit
 }
 
 /// Reject the forward when the sender already has too many messages queued
@@ -266,10 +272,20 @@ mod tests {
         // Ephemeral (live-stream) forwards bypass queue accounting entirely.
         assert!(!queue_at_capacity(1_000, 1_000, 10, true));
         // Strictly under the limit.
-        assert!(!queue_at_capacity(5, 4, 10, false)); // 9 < 10
-        // At the limit (>=) is rejected.
-        assert!(queue_at_capacity(5, 5, 10, false)); // 10 >= 10
+        assert!(!queue_at_capacity(5, 4, 10, false)); // 9 <= 10
+        // Reaching the limit exactly is admitted: a limit of N admits N.
+        assert!(!queue_at_capacity(5, 5, 10, false)); // 10 <= 10
+        assert!(!queue_at_capacity(0, 1, 1, false)); // a limit of 1 admits one
+        assert!(queue_at_capacity(1, 1, 1, false)); // ...and not a second
         // Over the limit.
-        assert!(queue_at_capacity(20, 1, 10, false)); // 21 >= 10
+        assert!(queue_at_capacity(20, 1, 10, false)); // 21 > 10
+        assert!(queue_at_capacity(10, 1, 10, false)); // 11 > 10
+        // A limit of 0 admits nothing.
+        assert!(queue_at_capacity(0, 1, 0, false));
+        // A negative limit other than -1 admits nothing, rather than casting
+        // to about four billion.
+        assert!(queue_at_capacity(0, 1, -5, false));
+        // No overflow at the top of the range.
+        assert!(queue_at_capacity(u32::MAX, usize::MAX, i32::MAX, false));
     }
 }
