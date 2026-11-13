@@ -98,6 +98,128 @@ pub async fn open_and_probe_secret_backend(
     Ok(store)
 }
 
+/// Every well-known entry whose presence means "a mediator was already
+/// provisioned into this backend". The re-run guard refuses to write over
+/// any of them without `--force-reprovision`; uninstall deletes each one.
+pub const WELL_KNOWN_KEYS: &[&str] = &[
+    affinidi_messaging_mediator_common::ADMIN_CREDENTIAL,
+    affinidi_messaging_mediator_common::JWT_SECRET,
+    affinidi_messaging_mediator_common::OPERATING_SECRETS,
+    affinidi_messaging_mediator_common::OPERATING_DID_DOCUMENT,
+    affinidi_messaging_mediator_common::VTA_LAST_KNOWN_BUNDLE,
+    crate::consts::WEBVH_UPDATE_KEYS,
+];
+
+/// The well-known entries `store` already holds, in [`WELL_KNOWN_KEYS`]
+/// order.
+///
+/// A read error is returned, not treated as "absent": a guard that cannot
+/// tell whether live keys are there must refuse rather than overwrite them.
+/// On per-key backends every entry lives in one bundled secret that the
+/// store caches, so this is a single backend read (one Keychain prompt on
+/// macOS), not one per key.
+pub async fn provisioned_well_known_keys(
+    store: &MediatorSecrets,
+) -> anyhow::Result<Vec<&'static str>> {
+    let mut found = Vec::new();
+    for key in WELL_KNOWN_KEYS {
+        match store.store().get(key).await {
+            Ok(Some(_)) => found.push(*key),
+            Ok(None) => {}
+            Err(e) => anyhow::bail!(
+                "could not read `{key}` to check for an existing mediator setup: {e}. \
+                 Refusing to write over entries whose presence cannot be checked"
+            ),
+        }
+    }
+    Ok(found)
+}
+
+/// What [`store_vta_session`] wrote, for the caller to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredVtaSession {
+    /// `false` when the session carried no VTA DID, so the admin
+    /// credential was stored self-hosted (no VTA linkage).
+    pub vta_linked: bool,
+    /// Number of keys seeded into the VTA fallback cache; `None` for an
+    /// admin-only session, which has no VTA-provisioned DID to cache.
+    pub cached_keys: Option<usize>,
+}
+
+/// Persist what a VTA session produced: the mediator↔VTA admin credential
+/// (`mediator_admin_credential`) and, when the VTA provisioned the mediator
+/// DID, the fallback cache the mediator boots from when the VTA is
+/// unreachable (`mediator_vta_last_known_bundle`).
+///
+/// Shared by the final provisioning pass and the TUI, which persists the
+/// session as soon as it connects so a later failure or quit does not lose
+/// a DID the VTA has already minted. Idempotent: writing the same session
+/// twice stores the same values.
+pub async fn store_vta_session(
+    store: &MediatorSecrets,
+    session: &crate::vta::VtaSession,
+) -> anyhow::Result<StoredVtaSession> {
+    // Both VTA fields are normalised through `non_empty`. A sealed context
+    // export whose bundle omitted `vta_did` reaches us as an empty string
+    // (`VtaSession::context_export` uses `unwrap_or_default`), and an empty
+    // `vta_url` is equally meaningless — storing either verbatim fails the
+    // credential's shape validation. `vta_url: None` is a supported shape:
+    // the mediator resolves the VTA endpoint from its DID document.
+    let non_empty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let vta_did = non_empty(Some(session.vta_did.clone()));
+    // A URL with no DID is not a VTA linkage — there is nothing to
+    // authenticate against — so it is dropped rather than stored.
+    let vta_url = vta_did
+        .as_ref()
+        .and_then(|_| non_empty(session.rest_url.clone()));
+    let vta_linked = vta_did.is_some();
+    let cred = affinidi_messaging_mediator_common::AdminCredential {
+        did: session.admin_did().to_string(),
+        private_key_multibase: session.admin_private_key_mb().to_string(),
+        vta_did,
+        vta_url,
+        context: session.context_id.clone(),
+    };
+    store
+        .store_admin_credential(&cred)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to store admin credential: {e}"))?;
+
+    // Seed the VTA fallback cache. The mediator's boot calls
+    // `vta_sdk::integration::startup()`, which tries a live fetch and falls
+    // back to this cache on any failure, so first boot survives VTA
+    // unavailability. TTL `0` = no expiry: the runtime overwrites it with a
+    // fresh snapshot on every successful VTA contact.
+    let cached_keys = match crate::build_did_secrets_bundle(session) {
+        Some(bundle) => {
+            let json = serde_json::to_value(&bundle)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize cached VTA bundle: {e}"))?;
+            store
+                .store_vta_cached_bundle(json, 0)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to seed VTA cache: {e}"))?;
+            Some(bundle.secrets.len())
+        }
+        None => None,
+    };
+    Ok(StoredVtaSession {
+        vta_linked,
+        cached_keys,
+    })
+}
+
+/// Whether `store` already holds exactly this session's admin credential —
+/// i.e. the entries the re-run guard finds were written by this same run
+/// (the TUI persists a session as soon as it connects), not by an earlier
+/// mediator.
+pub async fn holds_session(store: &MediatorSecrets, session: &crate::vta::VtaSession) -> bool {
+    matches!(
+        store.load_admin_credential().await,
+        Ok(Some(cred)) if cred.did == session.admin_did()
+            && cred.private_key_multibase == session.admin_private_key_mb()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

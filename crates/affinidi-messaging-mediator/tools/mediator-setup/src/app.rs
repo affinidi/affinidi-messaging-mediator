@@ -504,6 +504,16 @@ pub struct WizardConfig {
     /// when `storage_backend == crate::consts::STORAGE_BACKEND_FJALL`.
     pub fjall_data_dir: String,
     pub admin_did_mode: String,
+    /// The operator's own admin DID when `admin_did_mode == ADMIN_PASTE`
+    /// (TUI paste prompt, recipe `[security] admin = "import"` +
+    /// `admin_did`). Written to `[server].admin_did`; the wizard holds no
+    /// key for it. Empty otherwise.
+    pub admin_did: String,
+    /// The operator explicitly accepted an unencrypted `file://` secret
+    /// store (TUI: typing the file-gate phrase and choosing "No
+    /// encryption"; recipe `[secrets] allow_plaintext_file = true`; or
+    /// `--allow-plaintext-file`). Required outside local deployments.
+    pub allow_plaintext_file: bool,
     pub listen_address: String,
     /// HTTP prefix all mediator routes nest under (e.g. `/mediator/v1/`).
     /// Written verbatim to `[server] api_prefix` and combined with
@@ -668,6 +678,8 @@ impl Default for WizardConfig {
             storage_backend: crate::consts::DEFAULT_STORAGE_BACKEND.into(),
             fjall_data_dir: crate::consts::DEFAULT_FJALL_DATA_DIR.into(),
             admin_did_mode: String::new(),
+            admin_did: String::new(),
+            allow_plaintext_file: false,
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             api_prefix: DEFAULT_API_PREFIX.into(),
             trust_xff_cidrs: Vec::new(),

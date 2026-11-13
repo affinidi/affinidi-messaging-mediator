@@ -23,6 +23,9 @@ pub(crate) fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[macro_use]
+mod style;
+
 mod admin_monitor_profile;
 mod app;
 mod bootstrap_headless;
@@ -1611,60 +1614,22 @@ async fn provision_secret_backend(
     // `vta_url: None` is a supported shape: the mediator resolves the
     // VTA endpoint from its DID document.
     if let Some(session) = vta_session {
-        let non_empty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
-        let vta_did = non_empty(Some(session.vta_did.clone()));
-        // A URL with no DID is not a VTA linkage — there is nothing to
-        // authenticate against — so it is dropped rather than stored.
-        let vta_url = vta_did
-            .as_ref()
-            .and_then(|_| non_empty(session.rest_url.clone()));
-        let vta_linked = vta_did.is_some();
-        let cred = affinidi_messaging_mediator_common::AdminCredential {
-            did: session.admin_did().to_string(),
-            private_key_multibase: session.admin_private_key_mb().to_string(),
-            vta_did,
-            vta_url,
-            context: session.context_id.clone(),
-        };
-        mediator_secrets_store
-            .store_admin_credential(&cred)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to store admin credential: {e}"))?;
+        let stored = secret_backend::store_vta_session(&mediator_secrets_store, session).await?;
         println!(
             "    \x1b[32m\u{2714}\x1b[0m {}{}",
             affinidi_messaging_mediator_common::ADMIN_CREDENTIAL,
-            if vta_linked {
+            if stored.vta_linked {
                 ""
             } else {
                 " (self-hosted — session carried no VTA DID)"
             }
         );
-
-        // Seed the VTA fallback cache with the bundle we just
-        // provisioned. The mediator's runtime boot calls
-        // `vta_sdk::integration::startup()`, which tries a live fetch
-        // and falls back to this cache on *any* failure — network
-        // timeout, auth rejection, or VTA-side validation error
-        // (see `integration/mod.rs::startup` match arms). Pre-populating
-        // here means first-boot survives VTA unavailability and, as
-        // a side effect, unblocks the "context has no DID assigned"
-        // validation failure until the VTA service auto-binds the
-        // provisioned DID to the context row. TTL `0` = no expiry:
-        // the runtime overwrites this with a fresh snapshot on every
-        // successful VTA contact, so staleness is self-healing.
-        // AdminOnly sessions return `None` — the mediator brought its
-        // own DID and there's nothing to cache.
-        if let Some(bundle) = build_did_secrets_bundle(session) {
-            let json = serde_json::to_value(&bundle)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize cached VTA bundle: {e}"))?;
-            mediator_secrets_store
-                .store_vta_cached_bundle(json, 0)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to seed VTA cache: {e}"))?;
+        if let Some(count) = stored.cached_keys {
             println!(
-                "    \x1b[32m\u{2714}\x1b[0m mediator/vta/last_known_bundle ({} key{})",
-                bundle.secrets.len(),
-                if bundle.secrets.len() == 1 { "" } else { "s" }
+                "    \x1b[32m\u{2714}\x1b[0m {} ({} key{})",
+                affinidi_messaging_mediator_common::VTA_LAST_KNOWN_BUNDLE,
+                count,
+                if count == 1 { "" } else { "s" }
             );
         }
     } else if let (Some(did), Some(secret)) = (
