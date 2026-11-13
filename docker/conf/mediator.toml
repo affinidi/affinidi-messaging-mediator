@@ -67,7 +67,8 @@ admin_did = ""
 trust_xff_cidrs = []
 
 [database]
-functions_file = "./conf/atm-functions.lua"
+### functions_file is unset: the Redis stored-function library built into the
+### mediator is loaded (the image ships no atm-functions.lua).
 ### Overridden by MEDIATOR_DATABASE_URL (or DATABASE_URL).
 database_url = "redis://redis:6379/"
 database_timeout = "2"
