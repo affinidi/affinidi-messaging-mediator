@@ -26,6 +26,8 @@ mod live;
 mod purge;
 
 pub use address_book::{AddressBook, AddressEntry, account_hash};
+/// The connection signal [`MediatorConsole::connection_state`] reports.
+pub use affinidi_messaging_core::ConnState;
 pub use console::{
     CONFIG_PATCH_SINCE, Capabilities, InspectedMessage, MUX_ADMIN_SINCE, MUX_REVOKE_MAX_ROUNDS,
     MediatorConsole, Mode, OPERATIONS_SINCE, Target,
@@ -35,6 +37,7 @@ pub use grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection,
 pub use identity::{Identity, IdentityChoice, IdentitySource, ProfileFileSource, StaticIdentities};
 pub use live::{
     MembershipEvent, MembershipFilter, MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate,
+    Unclaimed,
 };
 pub use purge::{PurgePlan, PurgeRequest};
 
