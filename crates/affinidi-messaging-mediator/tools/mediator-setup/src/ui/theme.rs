@@ -55,6 +55,14 @@ pub fn success_style() -> Style {
     Style::default().fg(SUCCESS)
 }
 
+/// A refused input or a failed check. Bold as well as coloured, so it still
+/// stands out under `NO_COLOR`.
+pub fn warning_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn info_style() -> Style {
     Style::default().fg(PRIMARY)
 }

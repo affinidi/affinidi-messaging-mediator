@@ -1,19 +1,26 @@
 //! Build recipe — a declarative TOML file that drives the setup wizard
-//! non-interactively. See `examples/mediator-build.toml` for the full schema.
+//! non-interactively. See `examples/mediator-build.toml` for an annotated
+//! example and `docs/setup-guide.md` for the full schema.
 //!
-//! **Security:** build recipes never contain secrets. Credentials embedded in
-//! URLs (e.g. Redis passwords) are stripped when saving. When replaying a
-//! recipe that needs credentials, the user is prompted at runtime or can
-//! supply them via environment variables.
+//! The recipe is the headless interface: `--from <recipe>` loads one,
+//! `--set section.key=value` overrides any value, and the per-option CLI
+//! flags (`--did-method`, `--secret-storage`, …) are shorthands for recipe
+//! keys (see `crate::headless`).
+//!
+//! **Security:** build recipes never contain secrets. Credentials embedded
+//! in URLs (e.g. Redis passwords) are stripped when saving; supply them at
+//! runtime through the `DATABASE_URL` environment variable. A recipe does
+//! name the secret backend (region, vault, endpoint), so treat it as
+//! internal rather than public.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::app::WizardConfig;
 use crate::consts::*;
 
 /// Top-level build recipe.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildRecipe {
     pub deployment: DeploymentSection,
@@ -41,7 +48,7 @@ pub struct BuildRecipe {
     /// individual fields are mode-gated at validation time (e.g.
     /// `context` is required for every sealed mode, `webvh_server`
     /// only for `sealed-mint`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "VtaSection::is_empty")]
     pub vta: VtaSection,
 }
 
@@ -49,34 +56,40 @@ pub struct BuildRecipe {
 /// of `DeploymentSection` because a growing recipe with VTA-specific
 /// fields reads more naturally as its own table than a widening
 /// `[deployment]`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VtaSection {
     /// VTA context ID this mediator lives in. Defaults to `"mediator"`
-    /// via `apply_vta_defaults` when absent; operators with multiple
-    /// mediators against one VTA should set this explicitly.
-    #[serde(default)]
+    /// when absent; operators with multiple mediators against one VTA
+    /// should set this explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     /// Optional webvh server id the VTA should pin the minted DID's
     /// `did.jsonl` log to. Only honoured for `vta_mode =
-    /// "sealed-mint"`; ignored for `sealed-export` (nothing is being
-    /// minted) and for `online` (the TUI collects it interactively).
-    #[serde(default)]
+    /// "sealed-mint"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webvh_server: Option<String>,
     /// Optional webvh path / mnemonic the VTA forwards to the chosen
     /// webvh server's `request_uri` call. Pairs with `webvh_server`;
     /// both are sealed-mint-only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webvh_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+impl VtaSection {
+    fn is_empty(&self) -> bool {
+        self.context.is_none() && self.webvh_server.is_none() && self.webvh_path.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentSection {
     /// `local`, `server`, or `container`
     #[serde(rename = "type")]
     pub deployment_type: String,
-    /// `["didcomm"]`, `["tsp"]`, or `["didcomm", "tsp"]`
+    /// Any of `"didcomm"`, `"tsp"`, `"didcomm-v1"`. Default
+    /// `["didcomm", "tsp"]`.
     #[serde(default = "default_protocols")]
     pub protocols: Vec<String>,
     /// Whether VTA integration is enabled
@@ -84,25 +97,25 @@ pub struct DeploymentSection {
     pub use_vta: bool,
     /// VTA connectivity mode:
     ///
-    /// - `"online"` — live REST/DIDComm round-trip from the mediator
-    ///   to a running VTA. Only supported via the interactive TUI
-    ///   today because the `pnm acl create` step is inherently
-    ///   operator-gated; recipe-driven `--from` for `online` is
-    ///   rejected with a pointer at the TUI.
     /// - `"sealed-mint"` — air-gapped sealed handoff where the VTA
-    ///   mints a *fresh* mediator DID + keys on the VTA side and
-    ///   returns a `TemplateBootstrap` bundle. Use for greenfield
-    ///   deployments.
+    ///   mints a *fresh* mediator DID + keys and returns a
+    ///   `TemplateBootstrap` bundle. Use for greenfield deployments.
     /// - `"sealed-export"` — air-gapped export of state the VTA has
-    ///   already provisioned (ran a prior `sealed-mint` or online
-    ///   setup). VTA admin runs `vta contexts reprovision` and
-    ///   returns a `ContextProvision` bundle. Use for migrations
-    ///   and restores.
-    /// - `"sealed"` — **deprecated** alias for `"sealed-mint"`,
-    ///   accepted for backward compatibility with recipes written
-    ///   before the split. Emits a warning on load.
-    #[serde(default)]
+    ///   already provisioned. Use for migrations and restores.
+    /// - `"online"` — live round-trip to a running VTA. Interactive TUI
+    ///   only (or the `--setup-key-out` / `--setup-key-file` pair for an
+    ///   admin-only credential); `--from` rejects it.
+    /// - `"sealed"` — **deprecated** alias for `"sealed-mint"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vta_mode: Option<String>,
+    /// With `"didcomm-v1"` in `protocols`: accept DIDComm v1 forwards
+    /// without an authenticated session (stock Credo wallets need it).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub didcomm_v1_allow_unauthenticated_forwards: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_protocols() -> Vec<String> {
@@ -111,32 +124,35 @@ fn default_protocols() -> Vec<String> {
     vec!["didcomm".into(), "tsp".into()]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentitySection {
-    /// `vta`, `did:peer`, `did:webvh`, or `import`
+    /// `vta`, `did:peer`, or `did:webvh`. (`import` is rejected: importing
+    /// an existing mediator DID is not supported.)
     #[serde(default = "default_did_method")]
     pub did_method: String,
-    /// Required when `did_method = "did:webvh"`
+    /// Required when `did_method = "did:webvh"` or `vta_mode =
+    /// "sealed-mint"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
     /// Also write a did:web copy of the generated DID document to
     /// `did-web.json`. Only meaningful for did:webvh / VTA-managed webvh
     /// DIDs; ignored otherwise.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub save_did_web: bool,
     /// The identity a locally generated did:webvh log is presented as:
     /// `webvh` (default) or `scid`, its did:scid:vh:1 DID. Only meaningful
     /// for `did_method = "did:webvh"`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_as: Option<String>,
     /// List the did:scid alias in the generated log's `alsoKnownAs`. Default
     /// `true`; `false` is refused with `present_as = "scid"`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scid_also_known_as: Option<bool>,
     /// Extra key suites to mint alongside the mandatory Ed25519 + X25519
     /// pair, e.g. `["p256"]`. Empty by default (Curve25519 only). Applies
     /// to the local `did:peer` / `did:webvh` generators.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_key_suites: Vec<String>,
 }
 
@@ -173,16 +189,22 @@ impl Default for IdentitySection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsSection {
     /// One of: `file://`, `keyring://`, `aws_secrets://`,
-    /// `gcp_secrets://`, `azure_keyvault://`, `vault://`. Note:
-    /// `string://` (inline) and `vta://` are no longer accepted —
-    /// `vta://` was never a backend (the VTA is a key *source*) and
-    /// `string://` is unsafe even for CI.
+    /// `gcp_secrets://`, `azure_keyvault://`, `vault://`, `k8s://` — a bare
+    /// scheme takes that backend's defaults, a full URL sets them. Note:
+    /// `string://` (inline) and `vta://` are not accepted — `vta://` was
+    /// never a backend (the VTA is a key *source*) and `string://` is
+    /// unsafe even for CI.
     #[serde(default = "default_storage")]
     pub storage: String,
+    /// Accept an unencrypted `file://` store outside a `local`
+    /// deployment. Without it such a recipe is refused: the keys would sit
+    /// in plaintext on a server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_plaintext_file: bool,
 }
 
 fn default_storage() -> String {
@@ -193,25 +215,33 @@ impl Default for SecretsSection {
     fn default() -> Self {
         Self {
             storage: default_storage(),
+            allow_plaintext_file: false,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecuritySection {
     /// `none`, `self-signed`, or `existing`
     #[serde(default = "default_ssl")]
     pub ssl: String,
     /// Path to existing SSL certificate (when `ssl = "existing"`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssl_cert: Option<String>,
     /// Path to existing SSL key (when `ssl = "existing"`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssl_key: Option<String>,
-    /// `generate`, `skip`, or `import`
+    /// The mediator's admin-API identity:
+    /// - `generate` (default) — a fresh did:key, separate from any VTA
+    ///   credential (the VTA credential stays the mediator↔VTA identity);
+    /// - `vta` — reuse the VTA-issued credential's DID (VTA flows only);
+    /// - `import` — an existing DID you hold the key for (`admin_did`);
+    /// - `skip` — configure later.
     #[serde(default = "default_admin")]
     pub admin: String,
-    /// Pre-existing admin DID (when `admin = "import"`)
-    #[allow(dead_code)] // will be used when admin DID import is implemented
+    /// The existing admin DID when `admin = "import"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_did: Option<String>,
     /// JWT signing-secret provisioning mode: `generate` (default) or
     /// `provide`. With `provide`, the wizard records the choice but does
@@ -219,21 +249,20 @@ pub struct SecuritySection {
     /// `MEDIATOR_JWT_SECRET` / `--jwt-secret-file` at startup.
     #[serde(default = "default_jwt_mode")]
     pub jwt_mode: String,
-    /// Network posture: `open` (default) or `closed`. See
-    /// [`crate::consts::NETWORK_MODE_OPEN`] / `_CLOSED` for the
-    /// per-mode `[security]` flag trio that gets emitted into
-    /// `mediator.toml`.
-    #[serde(default = "default_network_mode")]
-    pub network_mode: String,
+    /// Network posture: `open` or `closed`. Defaults to `open` for a
+    /// `local` deployment and `closed` (the shipped template's restrictive
+    /// posture) for `server` and `container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mode: Option<String>,
     /// Browser CORS policy: `none` (default — deny all cross-origin),
-    /// `any` (`*`), or `list` (allow [`Self::cors_domains`]). Drives the
-    /// `[security].cors_allow_origin` value the writer emits.
+    /// `any` (`*`), or `list` (allow [`Self::cors_domains`]).
     #[serde(default = "default_cors")]
     pub cors: String,
     /// Comma-separated CORS origin allowlist, required when `cors =
     /// "list"`. Entries are exact, scheme-qualified origins
     /// (`https://app.affinidi.com`) or leftmost-label sub-domain
     /// wildcards (`https://*.affinidi.com`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors_domains: Option<String>,
 }
 
@@ -249,10 +278,6 @@ fn default_jwt_mode() -> String {
     "generate".into()
 }
 
-fn default_network_mode() -> String {
-    crate::consts::DEFAULT_NETWORK_MODE.into()
-}
-
 fn default_cors() -> String {
     crate::consts::DEFAULT_CORS_MODE.into()
 }
@@ -266,14 +291,14 @@ impl Default for SecuritySection {
             admin: default_admin(),
             admin_did: None,
             jwt_mode: default_jwt_mode(),
-            network_mode: default_network_mode(),
+            network_mode: None,
             cors: default_cors(),
             cors_domains: None,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseSection {
     #[serde(default = "default_database_url")]
@@ -294,13 +319,11 @@ impl Default for DatabaseSection {
 
 /// Optional `[storage]` section in the recipe — selects the mediator's
 /// storage backend. When omitted, falls back to the legacy `[database]`
-/// section (Redis). The wizard-generated `mediator.toml` mirrors the
-/// shape: a `[storage]` section with `backend = "redis" | "fjall"`,
-/// plus a backend-specific configuration.
+/// section (Redis).
 ///
 /// Memory backend is intentionally absent — it's a tests-only backend
 /// and shouldn't appear in operator-facing config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageSection {
     /// `"redis"` or `"fjall"`. Defaults to `"redis"` so existing
@@ -331,7 +354,7 @@ impl Default for StorageSection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputSection {
     /// Path for the generated mediator.toml
@@ -350,7 +373,7 @@ pub struct OutputSection {
     /// Reverse-proxy / load-balancer CIDR ranges whose `X-Forwarded-For` the
     /// mediator trusts for per-IP rate limiting (`[server] trust_xff_cidrs`).
     /// Empty (default) = header ignored.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trust_xff_cidrs: Vec<String>,
     /// Optional target to publish the minted public DID string to after
     /// provisioning (`aws_parameter_store://<name>[?region=<region>]` or
@@ -362,7 +385,7 @@ pub struct OutputSection {
     /// file, so a `file://` target serves out-of-band consumers (a relying
     /// party, a CI step, an operator) — to use its contents in `mediator.toml`,
     /// paste the DID itself as `did://<did>`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub did_target: Option<String>,
     /// Optional target to publish the minted did:webvh log document
     /// (`did.jsonl` content) to after provisioning
@@ -374,13 +397,13 @@ pub struct OutputSection {
     /// which reads a DID *document* (`read_document`) — and when the
     /// deployment self-hosts its log, the generated mediator.toml points
     /// `did_web_self_hosted` at this same target automatically, so the
-    /// runtime reads the published copy rather than the local
-    /// `./conf/did.jsonl` that dies with a one-shot setup task. `s3://` is
-    /// the intended target for a self-hosted mediator on ephemeral compute:
-    /// the log grows with each key rotation (did:webvh v1.0 embeds the full
-    /// document per entry — no JSON Patch), so it can outgrow Parameter
-    /// Store's value-size limit; S3 has no such ceiling.
-    #[serde(default)]
+    /// runtime reads the published copy rather than the local `did.jsonl`
+    /// that dies with a one-shot setup task. `s3://` is the intended target
+    /// for a self-hosted mediator on ephemeral compute: the log grows with
+    /// each key rotation (did:webvh v1.0 embeds the full document per entry
+    /// — no JSON Patch), so it can outgrow Parameter Store's value-size
+    /// limit; S3 has no such ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub did_log_target: Option<String>,
 }
 
@@ -409,13 +432,14 @@ impl Default for OutputSection {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct InstallSection {
     /// Whether to run `cargo install` after generating config
     #[serde(default)]
     pub enabled: bool,
     /// Custom install root (passed as `cargo install --root <path>`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
 
@@ -446,6 +470,7 @@ fn normalise_vta_mode(raw: Option<&str>) -> anyhow::Result<String> {
 }
 
 /// Load a build recipe from a TOML file.
+#[cfg(test)]
 pub fn load(path: &str) -> anyhow::Result<BuildRecipe> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read build recipe '{path}': {e}"))?;
@@ -454,14 +479,24 @@ pub fn load(path: &str) -> anyhow::Result<BuildRecipe> {
     Ok(recipe)
 }
 
+/// Whether `did` has the `did:<method>:<id>` shape.
+pub fn looks_like_did(did: &str) -> bool {
+    let mut parts = did.splitn(3, ':');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some("did"), Some(method), Some(id))
+            if !method.is_empty()
+                && method.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && !id.is_empty()
+                && !id.chars().any(char::is_whitespace)
+    )
+}
+
 /// Convert a build recipe into a WizardConfig.
 pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     // Initialise `deployment_type` via struct-update so the function
     // does not trip `clippy::field_reassign_with_default` on the very
-    // first assignment. Subsequent fields are still mutated below;
-    // the lint only fires on the *first* post-default reassignment,
-    // and refactoring the entire 100+-field mapping into one literal
-    // would just shuffle the same cognitive load around.
+    // first assignment.
     let deployment_type = match recipe.deployment.deployment_type.as_str() {
         "local" => DEPLOYMENT_LOCAL.into(),
         "server" => DEPLOYMENT_SERVER.into(),
@@ -489,32 +524,19 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         }
     }
 
-    // [vta] section — operator inputs previously collected
-    // interactively. `context` defaults to `DEFAULT_VTA_CONTEXT`
-    // (`"mediator"`) when absent; webvh_server / webvh_path stay
-    // `None` when absent (meaningful only for sealed-mint and
-    // auto-routed by `apply_vta_defaults` equivalents in the
-    // non-interactive path).
+    // [vta] section — `context` defaults to `DEFAULT_VTA_CONTEXT`
+    // (`"mediator"`) when absent; webvh_server / webvh_path stay `None`.
     config.vta_context = recipe
         .vta
         .context
         .clone()
         .unwrap_or_else(|| DEFAULT_VTA_CONTEXT.into());
-    // Reuse the existing `vta_webvh_server_id` / `vta_webvh_path`
-    // fields on `WizardConfig` — they were originally populated by
-    // the TUI's online-VTA webvh picker and have the right shape for
-    // the recipe-driven sealed-mint flow too. `WEBVH_PATH` on the
-    // VTA template maps to `vta_webvh_path`.
     config.vta_webvh_server_id = recipe.vta.webvh_server.clone();
     config.vta_webvh_path = recipe.vta.webvh_path.clone();
 
     // Mode-specific validation: `sealed-mint` mints a new DID on the
     // VTA whose template requires a `URL` — identity.public_url must
-    // therefore be present. `sealed-export` pulls back an existing
-    // DID (URL already baked in), so `public_url` is informational.
-    // `online` uses the live DIDComm round-trip; the TUI collects
-    // the URL interactively when missing — recipe-driven `online` is
-    // rejected separately in `run_from_recipe`.
+    // therefore be present.
     if config.use_vta
         && config.vta_mode == VTA_MODE_SEALED_MINT
         && recipe
@@ -553,22 +575,42 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     if !config.didcomm_enabled && !config.tsp_enabled {
         anyhow::bail!("At least one protocol must be enabled (didcomm or tsp)");
     }
+    if recipe.deployment.didcomm_v1_allow_unauthenticated_forwards && !config.didcomm_v1_enabled {
+        anyhow::bail!(
+            "deployment.didcomm_v1_allow_unauthenticated_forwards needs \"didcomm-v1\" in \
+             deployment.protocols"
+        );
+    }
+    config.didcomm_v1_allow_unauthenticated_forwards =
+        recipe.deployment.didcomm_v1_allow_unauthenticated_forwards;
 
     // DID method
     config.did_method = match recipe.identity.did_method.as_str() {
         "vta" => DID_VTA.into(),
         "did:peer" | "peer" => DID_PEER.into(),
         "did:webvh" | "webvh" => DID_WEBVH.into(),
-        "import" => DID_IMPORT.into(),
+        "import" => {
+            return Err(crate::exit::error(
+                crate::exit::IMPORT_WITHOUT_DATA,
+                "identity.did_method = \"import\" is not supported: the wizard cannot import \
+                 an existing mediator DID and its keys. Use \"did:peer\", \"did:webvh\", or \
+                 \"vta\" (with a sealed-export recipe to pick up a DID the VTA already holds).",
+            ));
+        }
         other => anyhow::bail!(
-            "Invalid identity.did_method '{other}': expected 'vta', 'did:peer', 'did:webvh', or 'import'"
+            "Invalid identity.did_method '{other}': expected 'vta', 'did:peer', or 'did:webvh'"
         ),
     };
 
     if config.did_method == DID_WEBVH {
-        config.public_url = recipe.identity.public_url.clone().ok_or_else(|| {
-            anyhow::anyhow!("identity.public_url is required when did_method = 'did:webvh'")
-        })?;
+        config.public_url = recipe
+            .identity
+            .public_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("identity.public_url is required when did_method = 'did:webvh'")
+            })?;
     } else if let Some(ref url) = recipe.identity.public_url {
         config.public_url = url.clone();
     }
@@ -595,12 +637,13 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     }
     config.key_suite = parse_extra_key_suites(&recipe.identity.extra_key_suites)?;
 
-    // Secrets — accept either the bare scheme (backward compat with
-    // pre-cloud-config recipes) or a fully-formed URL. A full URL gets
-    // parsed into per-backend fields so re-running the wizard from a
-    // recipe restores region / project / vault / endpoint without the
-    // operator re-typing them. `string://` and `vta://` are rejected.
+    // Secrets — accept either the bare scheme or a fully-formed URL. A full
+    // URL gets parsed into per-backend fields so re-running the wizard from
+    // a recipe restores region / project / vault / endpoint.
     apply_secrets_storage(&recipe.secrets.storage, &mut config)?;
+    check_backend_settings(&config)?;
+    config.allow_plaintext_file = recipe.secrets.allow_plaintext_file;
+    check_plaintext_file(&config)?;
 
     // Security
     config.ssl_mode = match recipe.security.ssl.as_str() {
@@ -623,14 +666,47 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     config.admin_did_mode = match recipe.security.admin.as_str() {
         "generate" => ADMIN_GENERATE.into(),
         "skip" => ADMIN_SKIP.into(),
+        "vta" => {
+            if !config.use_vta {
+                anyhow::bail!(
+                    "security.admin = \"vta\" reuses the VTA-issued credential, so it needs a \
+                     VTA deployment (deployment.use_vta = true)"
+                );
+            }
+            ADMIN_VTA.into()
+        }
         "import" => {
-            // TODO: handle imported admin DID
+            let did = recipe
+                .security
+                .admin_did
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .ok_or_else(|| {
+                    crate::exit::error(
+                        crate::exit::IMPORT_WITHOUT_DATA,
+                        "security.admin = \"import\" needs security.admin_did — the DID that \
+                         will administer the mediator (--admin-did on the command line)",
+                    )
+                })?;
+            if !looks_like_did(did) {
+                anyhow::bail!(
+                    "security.admin_did '{did}' is not a DID (expected did:<method>:<id>)"
+                );
+            }
+            config.admin_did = did.to_string();
             ADMIN_PASTE.into()
         }
         other => anyhow::bail!(
-            "Invalid security.admin '{other}': expected 'generate', 'skip', or 'import'"
+            "Invalid security.admin '{other}': expected 'generate', 'vta', 'import', or 'skip'"
         ),
     };
+    if config.admin_did_mode != ADMIN_PASTE && recipe.security.admin_did.is_some() {
+        anyhow::bail!(
+            "security.admin_did is only read with security.admin = \"import\" (admin is \"{}\")",
+            recipe.security.admin
+        );
+    }
 
     config.jwt_mode = match recipe.security.jwt_mode.as_str() {
         "generate" | "" => JWT_MODE_GENERATE.into(),
@@ -640,18 +716,19 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
         }
     };
 
-    config.network_mode = match recipe.security.network_mode.as_str() {
-        crate::consts::NETWORK_MODE_OPEN | "" => crate::consts::NETWORK_MODE_OPEN.into(),
-        crate::consts::NETWORK_MODE_CLOSED => crate::consts::NETWORK_MODE_CLOSED.into(),
-        other => {
+    config.network_mode = match recipe.security.network_mode.as_deref() {
+        None | Some("") => default_network_mode_for(&config.deployment_type).into(),
+        Some(NETWORK_MODE_OPEN) => NETWORK_MODE_OPEN.into(),
+        Some(NETWORK_MODE_CLOSED) => NETWORK_MODE_CLOSED.into(),
+        Some(other) => {
             anyhow::bail!("Invalid security.network_mode '{other}': expected 'open' or 'closed'")
         }
     };
 
     config.cors_mode = match recipe.security.cors.as_str() {
-        crate::consts::CORS_MODE_NONE | "" => crate::consts::CORS_MODE_NONE.into(),
-        crate::consts::CORS_MODE_ANY => crate::consts::CORS_MODE_ANY.into(),
-        crate::consts::CORS_MODE_LIST => {
+        CORS_MODE_NONE | "" => CORS_MODE_NONE.into(),
+        CORS_MODE_ANY => CORS_MODE_ANY.into(),
+        CORS_MODE_LIST => {
             // `list` is only meaningful with an allowlist — validate it
             // here (same syntax the TUI enforces) so a bad recipe fails
             // fast rather than emitting a config the mediator rejects.
@@ -660,7 +737,7 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
             })?;
             config.cors_domains = crate::app::validate_cors_domains(&domains)
                 .map_err(|e| anyhow::anyhow!("Invalid security.cors_domains: {e}"))?;
-            crate::consts::CORS_MODE_LIST.into()
+            CORS_MODE_LIST.into()
         }
         other => {
             anyhow::bail!("Invalid security.cors '{other}': expected 'none', 'any', or 'list'")
@@ -721,6 +798,54 @@ pub fn to_wizard_config(recipe: &BuildRecipe) -> anyhow::Result<WizardConfig> {
     Ok(config)
 }
 
+/// Refuse backend URLs whose required setting is still empty — the bare
+/// `gcp_secrets://`, `azure_keyvault://` and `vault://` schemes have no
+/// usable default and would otherwise produce `gcp_secrets:///mediator-`
+/// and friends.
+pub(crate) fn check_backend_settings(config: &WizardConfig) -> anyhow::Result<()> {
+    let missing = match config.secret_storage.as_str() {
+        STORAGE_GCP if config.secret_gcp_project.trim().is_empty() => {
+            Some(("a GCP project", "gcp_secrets://<project>/mediator-"))
+        }
+        STORAGE_AZURE if config.secret_azure_vault.trim().is_empty() => {
+            Some(("an Azure Key Vault name", "azure_keyvault://<vault-name>"))
+        }
+        STORAGE_VAULT if config.secret_vault_endpoint.trim().is_empty() => {
+            Some(("a Vault endpoint", "vault://<host:port>/secret/mediator"))
+        }
+        _ => None,
+    };
+    if let Some((what, example)) = missing {
+        anyhow::bail!(
+            "secrets.storage = \"{}\" needs {what}, which has no default. Give the full URL: \
+             `--set secrets.storage={example}` or `storage = \"{example}\"` in the recipe.",
+            config.secret_storage
+        );
+    }
+    Ok(())
+}
+
+/// The TUI makes an operator type a confirmation phrase before keys go into
+/// a plaintext `file://` store; a headless run needs the same explicit
+/// opt-in outside a local deployment.
+pub(crate) fn check_plaintext_file(config: &WizardConfig) -> anyhow::Result<()> {
+    if config.secret_storage == STORAGE_FILE
+        && !config.secret_file_encrypted
+        && config.deployment_type != DEPLOYMENT_LOCAL
+        && !config.allow_plaintext_file
+    {
+        anyhow::bail!(
+            "secrets.storage = \"file://…\" without ?encrypt=1 keeps every mediator key in \
+             plaintext on disk, and this is a {} deployment. Use an encrypted store \
+             (file://…?encrypt=1 with MEDIATOR_FILE_BACKEND_PASSPHRASE, or a secret manager), \
+             or accept it explicitly: `allow_plaintext_file = true` under [secrets] \
+             (--allow-plaintext-file).",
+            config.deployment_type.to_lowercase()
+        );
+    }
+    Ok(())
+}
+
 /// Strip credentials from a URL, replacing them with a placeholder.
 /// Returns the redacted URL and whether any credentials were found.
 ///
@@ -749,180 +874,169 @@ pub fn needs_database_credentials(url: &str) -> bool {
     url.contains("<") || url.contains("${") || url.contains("$DATABASE")
 }
 
-/// Generate a build recipe TOML string from the wizard config.
-/// This allows reproducing the same build by running `mediator-setup --from <file>`.
+/// The recipe's `secrets.storage` value for `config`. The same URL the
+/// mediator gets, except that a `file://` path is kept as the operator gave
+/// it (usually relative) rather than resolved against this host's working
+/// directory, so the recipe reproduces the setup elsewhere.
+fn recipe_storage_url(config: &WizardConfig) -> String {
+    if config.secret_storage == STORAGE_FILE {
+        let path = config.secret_file_path.trim();
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        if config.secret_file_encrypted {
+            format!("file://{path}?encrypt=1")
+        } else {
+            format!("file://{path}")
+        }
+    } else {
+        crate::config_writer::build_backend_url(config)
+    }
+}
+
+/// Project a wizard configuration onto the recipe schema — the inverse of
+/// [`to_wizard_config`] for every value a recipe can carry.
+pub fn to_recipe(config: &WizardConfig) -> BuildRecipe {
+    let deployment_type = match config.deployment_type.as_str() {
+        DEPLOYMENT_SERVER => "server",
+        DEPLOYMENT_CONTAINER => "container",
+        _ => "local",
+    };
+    let mut protocols = Vec::new();
+    if config.didcomm_enabled {
+        protocols.push("didcomm".to_string());
+    }
+    if config.tsp_enabled {
+        protocols.push("tsp".to_string());
+    }
+    if config.didcomm_v1_enabled {
+        protocols.push("didcomm-v1".to_string());
+    }
+
+    let vta = if config.use_vta {
+        VtaSection {
+            context: (!config.vta_context.is_empty() && config.vta_context != DEFAULT_VTA_CONTEXT)
+                .then(|| config.vta_context.clone()),
+            webvh_server: config.vta_webvh_server_id.clone(),
+            webvh_path: config.vta_webvh_path.clone(),
+        }
+    } else {
+        VtaSection::default()
+    };
+
+    let did_method = match config.did_method.as_str() {
+        DID_PEER => "did:peer",
+        DID_WEBVH => "did:webvh",
+        _ => "vta",
+    };
+
+    let ssl = match config.ssl_mode.as_str() {
+        SSL_SELF_SIGNED => "self-signed",
+        SSL_EXISTING => "existing",
+        _ => "none",
+    };
+    let admin = match config.admin_did_mode.as_str() {
+        ADMIN_SKIP => "skip",
+        ADMIN_PASTE => "import",
+        ADMIN_VTA => "vta",
+        _ => "generate",
+    };
+    let cors = match config.cors_mode.as_str() {
+        CORS_MODE_ANY => CORS_MODE_ANY,
+        CORS_MODE_LIST => CORS_MODE_LIST,
+        _ => CORS_MODE_NONE,
+    };
+    let network_mode = match config.network_mode.as_str() {
+        NETWORK_MODE_CLOSED => NETWORK_MODE_CLOSED,
+        _ => NETWORK_MODE_OPEN,
+    };
+
+    BuildRecipe {
+        deployment: DeploymentSection {
+            deployment_type: deployment_type.into(),
+            protocols,
+            use_vta: config.use_vta,
+            vta_mode: (config.use_vta && !config.vta_mode.is_empty())
+                .then(|| config.vta_mode.clone()),
+            didcomm_v1_allow_unauthenticated_forwards: config.didcomm_v1_enabled
+                && config.didcomm_v1_allow_unauthenticated_forwards,
+        },
+        identity: IdentitySection {
+            did_method: did_method.into(),
+            public_url: (!config.public_url.is_empty()).then(|| config.public_url.clone()),
+            save_did_web: config.save_did_web,
+            present_as: config.present_as_scid.then(|| "scid".to_string()),
+            scid_also_known_as: (!config.scid_also_known_as).then_some(false),
+            extra_key_suites: config.key_suite.iter().map(|s| s.to_string()).collect(),
+        },
+        secrets: SecretsSection {
+            storage: recipe_storage_url(config),
+            allow_plaintext_file: config.secret_storage == STORAGE_FILE
+                && !config.secret_file_encrypted
+                && config.allow_plaintext_file,
+        },
+        security: SecuritySection {
+            ssl: ssl.into(),
+            ssl_cert: (ssl == "existing").then(|| config.ssl_cert_path.clone()),
+            ssl_key: (ssl == "existing").then(|| config.ssl_key_path.clone()),
+            admin: admin.into(),
+            admin_did: (admin == "import").then(|| config.admin_did.clone()),
+            jwt_mode: if config.jwt_mode == JWT_MODE_PROVIDE {
+                "provide".into()
+            } else {
+                "generate".into()
+            },
+            network_mode: Some(network_mode.into()),
+            cors: cors.into(),
+            cors_domains: (cors == CORS_MODE_LIST).then(|| config.cors_domains.clone()),
+        },
+        database: DatabaseSection {
+            url: redact_url(&config.database_url).0,
+        },
+        storage: StorageSection {
+            backend: if config.storage_backend == STORAGE_BACKEND_FJALL {
+                STORAGE_BACKEND_FJALL.into()
+            } else {
+                STORAGE_BACKEND_REDIS.into()
+            },
+            data_dir: config.fjall_data_dir.clone(),
+        },
+        output: OutputSection {
+            config_path: config.config_path.clone(),
+            listen_address: config.listen_address.clone(),
+            api_prefix: config.api_prefix.clone(),
+            trust_xff_cidrs: config.trust_xff_cidrs.clone(),
+            did_target: config.did_target.clone(),
+            did_log_target: config.did_log_target.clone(),
+        },
+        install: InstallSection::default(),
+        vta,
+    }
+}
+
+/// Generate a build recipe TOML string from the wizard config, so
+/// `mediator-setup --from <file>` reproduces the same setup.
 ///
-/// **Security:** credentials are stripped from URLs. The recipe is safe to
-/// commit to version control.
+/// Serialised from the same [`BuildRecipe`] structs `--from` parses, so a
+/// saved recipe always loads, and values are TOML-escaped. Credentials are
+/// stripped from URLs.
 pub fn from_wizard_config(config: &WizardConfig) -> String {
     let mut out = String::new();
     out.push_str("# Mediator Build Recipe\n");
     out.push_str("# Generated by mediator-setup — rerun with: mediator-setup --from <this-file>\n");
     out.push_str("#\n");
-    out.push_str("# This file is safe to commit to version control.\n");
-    out.push_str("# No secrets, passwords, or private keys are stored here.\n\n");
-
-    // Deployment
-    out.push_str("[deployment]\n");
-    let deployment_type = match config.deployment_type.as_str() {
-        DEPLOYMENT_LOCAL => "local",
-        DEPLOYMENT_SERVER => "server",
-        DEPLOYMENT_CONTAINER => "container",
-        _ => "local",
-    };
-    out.push_str(&format!("type = \"{deployment_type}\"\n"));
-
-    let mut protocols = Vec::new();
-    if config.didcomm_enabled {
-        protocols.push("\"didcomm\"");
-    }
-    if config.tsp_enabled {
-        protocols.push("\"tsp\"");
-    }
-    if config.didcomm_v1_enabled {
-        protocols.push("\"didcomm-v1\"");
-    }
-    out.push_str(&format!("protocols = [{}]\n", protocols.join(", ")));
-    out.push_str(&format!("use_vta = {}\n", config.use_vta));
-    if config.use_vta && !config.vta_mode.is_empty() {
-        out.push_str(&format!("vta_mode = \"{}\"\n", config.vta_mode));
+    out.push_str("# No secrets, passwords, or private keys are stored here. It does name the\n");
+    out.push_str("# secret backend (region / vault / endpoint), so keep it internal.\n");
+    if redact_url(&config.database_url).1 {
+        out.push_str("#\n");
+        out.push_str("# NOTE: Credentials were stripped from [database].url for security.\n");
+        out.push_str("# Set the DATABASE_URL env var or update that value before running.\n");
     }
     out.push('\n');
-
-    // [vta] — only emit when VTA is enabled and at least one field
-    // has a non-default value. Keeping an empty section out of the
-    // written recipe means the rendered TOML stays small for the
-    // common case where the operator didn't customise webvh
-    // hosting.
-    if config.use_vta {
-        let has_nondefault_context =
-            !config.vta_context.is_empty() && config.vta_context != DEFAULT_VTA_CONTEXT;
-        let has_webvh_server = config.vta_webvh_server_id.is_some();
-        let has_webvh_path = config.vta_webvh_path.is_some();
-        if has_nondefault_context || has_webvh_server || has_webvh_path {
-            out.push_str("[vta]\n");
-            if has_nondefault_context {
-                out.push_str(&format!("context = \"{}\"\n", config.vta_context));
-            }
-            if let Some(ref s) = config.vta_webvh_server_id {
-                out.push_str(&format!("webvh_server = \"{s}\"\n"));
-            }
-            if let Some(ref p) = config.vta_webvh_path {
-                out.push_str(&format!("webvh_path = \"{p}\"\n"));
-            }
-            out.push('\n');
-        }
+    match toml::to_string(&to_recipe(config)) {
+        Ok(body) => out.push_str(&body),
+        // The recipe types are plain strings, bools and lists; serialising
+        // them cannot fail. Keep the header rather than panic if it ever does.
+        Err(e) => out.push_str(&format!("# could not serialise the recipe: {e}\n")),
     }
-
-    // Identity
-    out.push_str("[identity]\n");
-    let did_method = match config.did_method.as_str() {
-        DID_VTA => "vta",
-        DID_PEER => "did:peer",
-        DID_WEBVH => "did:webvh",
-        DID_IMPORT => "import",
-        _ => "vta",
-    };
-    out.push_str(&format!("did_method = \"{did_method}\"\n"));
-    if !config.public_url.is_empty() {
-        out.push_str(&format!("public_url = \"{}\"\n", config.public_url));
-    }
-    if config.present_as_scid {
-        out.push_str("present_as = \"scid\"\n");
-    }
-    if !config.scid_also_known_as {
-        out.push_str("scid_also_known_as = false\n");
-    }
-    out.push('\n');
-
-    // Secrets — emit the fully-assembled backend URL so a recipe replay
-    // restores per-backend config (region / project / vault / endpoint)
-    // without the operator re-typing them. The URL is constructed by
-    // `build_backend_url`, the same routine the wizard writes into the
-    // mediator's `[secrets].backend` field.
-    out.push_str("[secrets]\n");
-    let storage_url = crate::config_writer::build_backend_url(config);
-    out.push_str(&format!("storage = \"{storage_url}\"\n\n"));
-
-    // Security
-    out.push_str("[security]\n");
-    let ssl = match config.ssl_mode.as_str() {
-        SSL_NONE => "none",
-        SSL_SELF_SIGNED => "self-signed",
-        SSL_EXISTING => "existing",
-        _ => "none",
-    };
-    out.push_str(&format!("ssl = \"{ssl}\"\n"));
-    if ssl == "existing" {
-        out.push_str(&format!("ssl_cert = \"{}\"\n", config.ssl_cert_path));
-        out.push_str(&format!("ssl_key = \"{}\"\n", config.ssl_key_path));
-    }
-    let admin = match config.admin_did_mode.as_str() {
-        ADMIN_GENERATE => "generate",
-        ADMIN_SKIP => "skip",
-        ADMIN_PASTE => "import",
-        _ => "generate",
-    };
-    out.push_str(&format!("admin = \"{admin}\"\n"));
-    let jwt_mode = match config.jwt_mode.as_str() {
-        JWT_MODE_PROVIDE => "provide",
-        _ => "generate",
-    };
-    out.push_str(&format!("jwt_mode = \"{jwt_mode}\"\n"));
-    let network_mode = match config.network_mode.as_str() {
-        crate::consts::NETWORK_MODE_CLOSED => crate::consts::NETWORK_MODE_CLOSED,
-        // Anything else (including unset / typo) round-trips as the
-        // wizard's default `open` posture.
-        _ => crate::consts::NETWORK_MODE_OPEN,
-    };
-    out.push_str(&format!("network_mode = \"{network_mode}\"\n"));
-    let cors = match config.cors_mode.as_str() {
-        crate::consts::CORS_MODE_ANY => crate::consts::CORS_MODE_ANY,
-        crate::consts::CORS_MODE_LIST => crate::consts::CORS_MODE_LIST,
-        // Anything else (including unset / typo) round-trips as the
-        // default-closed `none` posture.
-        _ => crate::consts::CORS_MODE_NONE,
-    };
-    out.push_str(&format!("cors = \"{cors}\"\n"));
-    if cors == crate::consts::CORS_MODE_LIST {
-        out.push_str(&format!("cors_domains = \"{}\"\n", config.cors_domains));
-    }
-    out.push('\n');
-
-    // Database — strip any embedded credentials
-    out.push_str("[database]\n");
-    let (redacted_url, had_credentials) = redact_url(&config.database_url);
-    if had_credentials {
-        out.push_str("# NOTE: Credentials were stripped from this URL for security.\n");
-        out.push_str("# Set DATABASE_URL env var or update this value before running.\n");
-    }
-    out.push_str(&format!("url = \"{redacted_url}\"\n\n"));
-
-    // Output
-    out.push_str("[output]\n");
-    out.push_str(&format!("config_path = \"{}\"\n", config.config_path));
-    out.push_str(&format!("listen_address = \"{}\"\n", config.listen_address));
-    out.push_str(&format!("api_prefix = \"{}\"\n", config.api_prefix));
-    if !config.trust_xff_cidrs.is_empty() {
-        let list: Vec<String> = config
-            .trust_xff_cidrs
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect();
-        out.push_str(&format!("trust_xff_cidrs = [{}]\n", list.join(", ")));
-    }
-    if let Some(target) = &config.did_target {
-        out.push_str(&format!("did_target = \"{target}\"\n"));
-    }
-    if let Some(target) = &config.did_log_target {
-        out.push_str(&format!("did_log_target = \"{target}\"\n"));
-    }
-    out.push('\n');
-
-    // Install (default: not enabled in recipe — user can enable manually)
-    out.push_str("[install]\n");
-    out.push_str("enabled = false\n");
-
     out
 }
 
@@ -954,6 +1068,31 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
     ];
     if let Some(&scheme) = bare_schemes.iter().find(|&&s| raw == s) {
         config.secret_storage = scheme.into();
+        return Ok(());
+    }
+
+    // A relative `file://` path (`file://conf/secrets.json`) — what a saved
+    // recipe holds, so it reproduces on another host. The shared URL parser
+    // only takes absolute paths (it would read `conf` as a host); the
+    // wizard resolves a relative path against its working directory.
+    if let Some(rest) = raw.strip_prefix(STORAGE_FILE)
+        && !rest.is_empty()
+        && !rest.starts_with('/')
+    {
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let mut encrypted = false;
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            match pair.split_once('=') {
+                Some(("encrypt", v)) => encrypted = matches!(v, "1" | "true" | "yes" | "on"),
+                _ => anyhow::bail!(
+                    "Invalid secrets.storage '{raw}': unknown query parameter '{pair}' on file:// \
+                     (only ?encrypt=1)"
+                ),
+            }
+        }
+        config.secret_storage = STORAGE_FILE.into();
+        config.secret_file_path = path.to_string();
+        config.secret_file_encrypted = encrypted;
         return Ok(());
     }
 
@@ -1122,6 +1261,7 @@ mod tests {
                 protocols: vec!["didcomm".into()],
                 use_vta: false,
                 vta_mode: None,
+                didcomm_v1_allow_unauthenticated_forwards: false,
             },
             identity: IdentitySection::default(),
             secrets: SecretsSection::default(),
@@ -1183,31 +1323,29 @@ mod tests {
     }
 
     #[test]
-    fn network_mode_defaults_to_open_when_unspecified() {
-        // Recipes that pre-date the network_mode field must land on
-        // the new wizard default rather than the historical posture.
-        let recipe_toml = r#"
-[deployment]
-type = "server"
-protocols = ["didcomm"]
-use_vta = false
-
-[identity]
-did_method = "did:peer"
-"#;
-        let parsed: BuildRecipe = toml::from_str(recipe_toml).unwrap();
-        assert_eq!(
-            parsed.security.network_mode,
-            crate::consts::NETWORK_MODE_OPEN
-        );
-        let config = to_wizard_config(&parsed).unwrap();
-        assert_eq!(config.network_mode, crate::consts::NETWORK_MODE_OPEN);
+    fn network_mode_default_follows_the_deployment_type() {
+        // An unset network_mode is open for local development and the
+        // template's restrictive (closed) posture for production types.
+        for (ty, expected) in [
+            ("local", crate::consts::NETWORK_MODE_OPEN),
+            ("server", crate::consts::NETWORK_MODE_CLOSED),
+            ("container", crate::consts::NETWORK_MODE_CLOSED),
+        ] {
+            let recipe_toml = format!(
+                "[deployment]\ntype = \"{ty}\"\nprotocols = [\"didcomm\"]\n\n\
+                 [identity]\ndid_method = \"did:peer\"\n"
+            );
+            let parsed: BuildRecipe = toml::from_str(&recipe_toml).unwrap();
+            assert_eq!(parsed.security.network_mode, None);
+            let config = to_wizard_config(&parsed).unwrap();
+            assert_eq!(config.network_mode, expected, "{ty}");
+        }
     }
 
     #[test]
     fn network_mode_closed_round_trips() {
         let mut recipe = minimal_recipe();
-        recipe.security.network_mode = crate::consts::NETWORK_MODE_CLOSED.into();
+        recipe.security.network_mode = Some(crate::consts::NETWORK_MODE_CLOSED.into());
         let config = to_wizard_config(&recipe).unwrap();
         assert_eq!(config.network_mode, crate::consts::NETWORK_MODE_CLOSED);
 
@@ -1333,7 +1471,7 @@ ssl = "none"
     #[test]
     fn network_mode_invalid_value_errors() {
         let mut recipe = minimal_recipe();
-        recipe.security.network_mode = "invitation-only".into();
+        recipe.security.network_mode = Some("invitation-only".into());
         let err = to_wizard_config(&recipe).unwrap_err();
         assert!(err.to_string().contains("network_mode"));
     }
@@ -1437,7 +1575,6 @@ ssl = "none"
             ("peer", DID_PEER),
             ("did:webvh", DID_WEBVH),
             ("webvh", DID_WEBVH),
-            ("import", DID_IMPORT),
         ] {
             let mut recipe = minimal_recipe();
             recipe.identity.did_method = input.into();
@@ -1447,6 +1584,15 @@ ssl = "none"
             let config = to_wizard_config(&recipe).unwrap();
             assert_eq!(config.did_method, expected, "input: {input}");
         }
+    }
+
+    #[test]
+    fn did_import_is_rejected_with_its_exit_code() {
+        // #173: `import` used to write a placeholder DID and exit 0.
+        let mut recipe = minimal_recipe();
+        recipe.identity.did_method = "import".into();
+        let err = to_wizard_config(&recipe).unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), crate::exit::IMPORT_WITHOUT_DATA);
     }
 
     #[test]
@@ -1462,18 +1608,19 @@ ssl = "none"
         // Accepted schemes only — `string://` and `vta://` are rejected
         // by the recipe loader (covered separately in
         // `test_legacy_secret_storage_schemes_rejected`).
-        for scheme in [
-            STORAGE_FILE,
-            STORAGE_KEYRING,
-            STORAGE_AWS,
-            STORAGE_GCP,
-            STORAGE_AZURE,
-            STORAGE_VAULT,
-        ] {
+        for scheme in [STORAGE_FILE, STORAGE_KEYRING, STORAGE_AWS, STORAGE_K8S] {
             let mut recipe = minimal_recipe();
             recipe.secrets.storage = scheme.into();
             let config = to_wizard_config(&recipe).unwrap();
             assert_eq!(config.secret_storage, scheme);
+        }
+        // #193: these have no usable default and used to produce
+        // `gcp_secrets:///mediator-`, `azure_keyvault://`, `vault:///secret/…`.
+        for scheme in [STORAGE_GCP, STORAGE_AZURE, STORAGE_VAULT] {
+            let mut recipe = minimal_recipe();
+            recipe.secrets.storage = scheme.into();
+            let err = to_wizard_config(&recipe).unwrap_err().to_string();
+            assert!(err.contains("--set secrets.storage="), "{scheme}: {err}");
         }
     }
 
@@ -1540,14 +1687,14 @@ ssl = "none"
     #[test]
     fn test_bare_scheme_keeps_defaults_for_backward_compat() {
         // Pre-cloud-config recipes wrote just the bare scheme. Loading
-        // those still works — the per-backend fields keep their
-        // wizard defaults rather than failing the parse.
+        // those still works for backends with usable defaults — the
+        // per-backend fields keep their wizard defaults.
         let mut recipe = minimal_recipe();
-        recipe.secrets.storage = STORAGE_GCP.into();
+        recipe.secrets.storage = STORAGE_AWS.into();
         let config = to_wizard_config(&recipe).unwrap();
-        assert_eq!(config.secret_storage, STORAGE_GCP);
-        assert_eq!(config.secret_gcp_project, DEFAULT_GCP_PROJECT);
-        assert_eq!(config.secret_gcp_namespace, DEFAULT_GCP_SECRET_NAMESPACE);
+        assert_eq!(config.secret_storage, STORAGE_AWS);
+        assert_eq!(config.secret_aws_region, DEFAULT_AWS_REGION);
+        assert_eq!(config.secret_aws_namespace, DEFAULT_AWS_SECRET_NAMESPACE);
     }
 
     #[test]
@@ -1778,5 +1925,272 @@ ssl = "none"
         let config = to_wizard_config(&recipe).unwrap();
         assert!(config.use_vta, "should auto-detect VTA from did_method");
         assert_eq!(config.vta_mode, VTA_MODE_ONLINE);
+    }
+
+    // ── #191: the saved recipe reproduces the run ──────────────────────
+
+    fn round_trip(config: &WizardConfig) -> WizardConfig {
+        let text = from_wizard_config(config);
+        let parsed: BuildRecipe = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("saved recipe must parse: {e}\n{text}"));
+        to_wizard_config(&parsed).unwrap_or_else(|e| panic!("saved recipe must load: {e}\n{text}"))
+    }
+
+    /// A configuration exercising every value a recipe can carry,
+    /// canonicalised by loading it once.
+    fn rich_configs() -> Vec<WizardConfig> {
+        let recipes = [
+            r#"
+[deployment]
+type = "server"
+protocols = ["didcomm", "tsp", "didcomm-v1"]
+didcomm_v1_allow_unauthenticated_forwards = true
+
+[identity]
+did_method = "did:webvh"
+public_url = "https://mediator.example.com/a \"quoted\" \\ path"
+save_did_web = true
+present_as = "scid"
+extra_key_suites = ["p256", "secp256k1"]
+
+[secrets]
+storage = "file://conf/secrets.json"
+allow_plaintext_file = true
+
+[security]
+ssl = "existing"
+ssl_cert = "/etc/tls/cert.pem"
+ssl_key = "/etc/tls/key.pem"
+admin = "import"
+admin_did = "did:key:z6MkAdminImported"
+jwt_mode = "provide"
+network_mode = "open"
+cors = "list"
+cors_domains = "https://app.example.com,https://*.example.com"
+
+[storage]
+backend = "fjall"
+data_dir = "/var/lib/mediator"
+
+[output]
+config_path = "deploy/mediator.toml"
+listen_address = "127.0.0.1:9000"
+api_prefix = "/m/"
+trust_xff_cidrs = ["10.0.0.0/8"]
+did_target = "aws_parameter_store:///mediator/did?region=eu-west-1"
+did_log_target = "s3://bucket/mediator/did.jsonl?region=eu-west-1"
+"#,
+            r#"
+[deployment]
+type = "container"
+use_vta = true
+vta_mode = "sealed-mint"
+
+[vta]
+context = "prod-mediator"
+webvh_server = "prod-1"
+webvh_path = "mediator/v1"
+
+[identity]
+did_method = "vta"
+public_url = "https://mediator.example.com"
+
+[secrets]
+storage = "vault://vault.internal:8200/secret/mediator"
+
+[security]
+admin = "vta"
+network_mode = "closed"
+cors = "any"
+"#,
+            r#"
+[deployment]
+type = "local"
+protocols = ["tsp"]
+
+[identity]
+did_method = "did:peer"
+scid_also_known_as = false
+
+[secrets]
+storage = "file://conf/secrets.json?encrypt=1"
+
+[security]
+admin = "skip"
+ssl = "self-signed"
+"#,
+        ];
+        recipes
+            .iter()
+            .map(|text| to_wizard_config(&toml::from_str(text).unwrap()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn saved_recipe_round_trips_every_value() {
+        for config in rich_configs() {
+            assert_eq!(round_trip(&config), config);
+        }
+    }
+
+    #[test]
+    fn saved_recipe_keeps_a_relative_file_backend_path() {
+        // The header says the recipe reproduces the setup elsewhere; an
+        // absolute host path would not.
+        let config = &rich_configs()[0];
+        let text = from_wizard_config(config);
+        let parsed: BuildRecipe = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.secrets.storage, "file://conf/secrets.json", "{text}");
+    }
+
+    #[test]
+    fn saved_recipe_escapes_toml_specials() {
+        let text = from_wizard_config(&rich_configs()[0]);
+        // A quote in a value must not end the TOML string early.
+        assert!(toml::from_str::<BuildRecipe>(&text).is_ok());
+    }
+
+    #[test]
+    fn tui_admin_vta_is_not_saved_as_generate() {
+        // `ADMIN_VTA` used to fall through to "generate" in the saved
+        // recipe, so the replay minted a different admin.
+        let config = WizardConfig {
+            deployment_type: DEPLOYMENT_LOCAL.into(),
+            use_vta: true,
+            vta_mode: VTA_MODE_SEALED_EXPORT.into(),
+            did_method: DID_VTA.into(),
+            secret_storage: STORAGE_KEYRING.into(),
+            admin_did_mode: ADMIN_VTA.into(),
+            ..WizardConfig::default()
+        };
+        assert_eq!(round_trip(&config).admin_did_mode, ADMIN_VTA);
+    }
+
+    fn manifest_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn shipped_example_recipes_load() {
+        let mut files: Vec<_> = std::fs::read_dir(manifest_dir().join("examples"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        // The test stack's recipe is a shipped recipe too.
+        files.push(manifest_dir().join("../../../../docker/test/mediator-build.toml"));
+        assert!(files.len() >= 2);
+        for path in files {
+            let recipe =
+                load(path.to_str().unwrap()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            to_wizard_config(&recipe).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+    }
+
+    #[test]
+    fn every_recipe_in_the_setup_guide_loads() {
+        let guide =
+            std::fs::read_to_string(manifest_dir().join("../../docs/setup-guide.md")).unwrap();
+        let mut blocks = Vec::new();
+        let mut current: Option<String> = None;
+        for line in guide.lines() {
+            match (&mut current, line.trim_start()) {
+                (None, l) if l.starts_with("```toml") => current = Some(String::new()),
+                (Some(_), l) if l.starts_with("```") => blocks.push(current.take().unwrap()),
+                (Some(block), _) => {
+                    block.push_str(line);
+                    block.push('\n');
+                }
+                _ => {}
+            }
+        }
+        // Recipe blocks are the ones with a `[deployment]` table; the guide
+        // also shows mediator.toml excerpts.
+        let recipes: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.contains("[deployment]"))
+            .collect();
+        assert!(!recipes.is_empty(), "no recipe blocks found in the guide");
+        for block in recipes {
+            let recipe: BuildRecipe =
+                toml::from_str(block).unwrap_or_else(|e| panic!("guide recipe: {e}\n{block}"));
+            to_wizard_config(&recipe).unwrap_or_else(|e| panic!("guide recipe: {e}\n{block}"));
+        }
+    }
+
+    // ── #173: admin identity ───────────────────────────────────────────
+
+    #[test]
+    fn admin_import_needs_a_did_and_has_its_exit_code() {
+        let mut recipe = minimal_recipe();
+        recipe.security.admin = "import".into();
+        let err = to_wizard_config(&recipe).unwrap_err();
+        assert_eq!(crate::exit::code_of(&err), crate::exit::IMPORT_WITHOUT_DATA);
+
+        recipe.security.admin_did = Some("not a did".into());
+        assert!(to_wizard_config(&recipe).is_err());
+
+        recipe.security.admin_did = Some("did:web:admin.example.com".into());
+        let config = to_wizard_config(&recipe).unwrap();
+        assert_eq!(config.admin_did_mode, ADMIN_PASTE);
+        assert_eq!(config.admin_did, "did:web:admin.example.com");
+    }
+
+    #[test]
+    fn admin_did_without_import_is_refused() {
+        let mut recipe = minimal_recipe();
+        recipe.security.admin_did = Some("did:web:admin.example.com".into());
+        assert!(to_wizard_config(&recipe).is_err());
+    }
+
+    #[test]
+    fn admin_vta_needs_a_vta_deployment() {
+        let mut recipe = minimal_recipe();
+        recipe.identity.did_method = "did:peer".into();
+        recipe.security.admin = "vta".into();
+        assert!(to_wizard_config(&recipe).is_err());
+    }
+
+    // ── #193: plaintext file:// needs an explicit opt-in ──────────────
+
+    #[test]
+    fn plaintext_file_backend_needs_opt_in_outside_local() {
+        let mut recipe = minimal_recipe();
+        recipe.deployment.deployment_type = "server".into();
+        recipe.identity.did_method = "did:peer".into();
+        recipe.secrets.storage = "file://conf/secrets.json".into();
+        let err = to_wizard_config(&recipe).unwrap_err().to_string();
+        assert!(err.contains("allow_plaintext_file"), "{err}");
+
+        // Encrypted is fine.
+        recipe.secrets.storage = "file://conf/secrets.json?encrypt=1".into();
+        assert!(to_wizard_config(&recipe).is_ok());
+
+        // So is an explicit opt-in.
+        recipe.secrets.storage = "file://conf/secrets.json".into();
+        recipe.secrets.allow_plaintext_file = true;
+        assert!(to_wizard_config(&recipe).is_ok());
+
+        // And a local deployment needs none.
+        recipe.secrets.allow_plaintext_file = false;
+        recipe.deployment.deployment_type = "local".into();
+        assert!(to_wizard_config(&recipe).is_ok());
+    }
+
+    #[test]
+    fn looks_like_did_accepts_dids_only() {
+        assert!(looks_like_did("did:key:z6Mk123"));
+        assert!(looks_like_did("did:webvh:scid:example.com"));
+        for bad in [
+            "",
+            "did:",
+            "did:key",
+            "did::x",
+            "did:Key:x",
+            "notdid:key:x",
+            "did:key:a b",
+        ] {
+            assert!(!looks_like_did(bad), "{bad}");
+        }
     }
 }

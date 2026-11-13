@@ -7,6 +7,9 @@ pub const DEPLOYMENT_CONTAINER: &str = "Container";
 pub const DID_VTA: &str = "VTA managed";
 pub const DID_WEBVH: &str = "did:webvh";
 pub const DID_PEER: &str = "did:peer";
+/// The retired "Import existing DID" choice: no longer offered (the wizard
+/// cannot provision an imported mediator DID) and refused if it arrives.
+#[cfg(test)]
 pub const DID_IMPORT: &str = "Import existing";
 
 /// Secret storage schemes

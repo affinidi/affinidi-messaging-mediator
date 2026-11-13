@@ -35,8 +35,10 @@ mod config_writer;
 mod consts;
 mod discovery;
 mod docker;
+mod exit;
 mod exit_recap;
 mod generators;
+mod headless;
 mod publish;
 mod recipe;
 mod reprovision;
@@ -77,190 +79,183 @@ use consts::*;
 const RENDERING_TICK_RATE: Duration = Duration::from_millis(250);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     let args = Args::parse();
+    match run(args).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let code = exit::code_of(&e);
+            err!("\n\x1b[31mError:\x1b[0m {e:#}");
+            std::process::ExitCode::from(code)
+        }
+    }
+}
 
+async fn run(args: Args) -> anyhow::Result<()> {
     // Headless modes write to a plain terminal or a CI log, so their
     // `tracing` diagnostics (sweep and cleanup failures, the trust
     // posture of a sealed bundle) go to stderr. The TUI gets no
     // subscriber: output there would draw over the alternate screen.
-    if args.from.is_some()
+    let headless = args.from.is_some()
         || args.non_interactive
         || args.uninstall
         || args.setup_key_out.is_some()
-        || args.setup_key_file.is_some()
-    {
+        || args.setup_key_file.is_some();
+    if headless {
         init_headless_logging();
     }
 
-    // `--uninstall` is mutually exclusive with every other mode. Run it
-    // up-front so flag combinations like `--uninstall --from recipe.toml`
-    // can't accidentally re-provision after teardown.
+    // `--uninstall` is mutually exclusive with every other mode (clap
+    // enforces it), so flag combinations can't re-provision after teardown.
     if args.uninstall {
-        return reprovision::run_uninstall(&args.config).await;
+        return reprovision::run_uninstall(&args.config_path()).await;
     }
 
-    // Online-VTA connection phases take precedence over every other entry
-    // point: they are self-contained and exit without touching the wizard
-    // config pipeline.
+    // Two-phase online admin-only VTA setup.
     if let Some(path) = args.setup_key_out.as_ref() {
         return vta::cli::run_phase1_init(
             path,
             args.vta_did.as_deref(),
             args.vta_context.as_deref(),
+            args.mediator_url.as_deref(),
+            args.did_method,
         )
         .await;
     }
     if let Some(path) = args.setup_key_file.as_ref() {
-        let vta_did = vta::cli::validate_phase2_args(&args.vta_did)?;
-        let mediator_url = args.mediator_url.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--mediator-url is required for --setup-key-file (Phase 2). The VTA's \
-                 didcomm-mediator template renders the mediator DID using this URL."
-            )
-        })?;
-        // Phase 2's headless flow returns a structured failure
-        // shape (transport-by-transport reasons + a kind) so we
-        // can map cleanly to documented exit codes:
-        //   0 → success
-        //   2 → no transport worked (NoTransport)
-        //   3 → VTA accepted the auth handshake but rejected the
-        //        request body (PostAuthFailed)
-        match vta::cli::run_phase2_connect(
-            path,
-            vta_did,
-            args.vta_context.as_deref(),
-            mediator_url,
-            args.wait_for_acl,
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                eprintln!("\n{err}");
-                let code = match err.kind {
-                    vta::cli::HeadlessFailureKind::NoTransport => 2,
-                    vta::cli::HeadlessFailureKind::PostAuthFailed => 3,
-                };
-                std::process::exit(code);
-            }
-        }
+        return run_setup_key_phase2(&args, path).await;
     }
 
-    if let Some(ref recipe_path) = args.from {
-        return run_from_recipe(
-            recipe_path,
-            args.force_reprovision,
-            args.bundle.as_deref(),
-            args.digest.as_deref(),
-            args.allow_bundle_without_digest,
-        )
-        .await;
-    } else if args.bundle.is_some() {
+    if args.from.is_some() || args.non_interactive {
+        return run_headless(&args).await;
+    }
+    if !args.set.is_empty() {
         anyhow::bail!(
-            "--bundle requires --from <recipe.toml>. The recipe tells the wizard \
-             the deployment type, secret backend, and VTA mode the bundle belongs to."
+            "--set overrides a recipe value, so it applies to headless runs only \
+             (--from <recipe> or --non-interactive)"
         );
     }
+    run_tui(&args).await
+}
 
-    if args.non_interactive {
-        return run_non_interactive(args).await;
+/// The interactive wizard.
+async fn run_tui(args: &Args) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(exit::error(
+            exit::NOT_A_TERMINAL,
+            "the interactive wizard needs a terminal (stdin and stdout). For scripted \
+             setups describe the mediator in a recipe and run `mediator-setup --from \
+             <recipe.toml>`, or pass `--non-interactive --did-method <peer|webvh>` with the \
+             other options as flags. See docs/setup-guide.md.",
+        ));
     }
 
-    // Check for existing config — refuse to silently rotate live keys
-    // unless the operator explicitly opts in with `--force-reprovision`.
-    // The unified backend stores the JWT signing key, the admin
-    // credential, and the operating keys; rotating any of them while a
-    // mediator is running invalidates active sessions.
-    //
-    // `inspect_existing()` scans every well-known key on the backend —
-    // on keyring that's N reads, each of which can trigger a macOS
-    // Keychain unlock prompt when the binary's ACL identity differs
-    // from the last write (common across `cargo build` rebuilds).
-    // When the operator has already opted in via `--force-reprovision`
-    // the scan result is only used for the listing in
-    // `refuse_overwrite`, which we skip — so skip the scan too. The
-    // file-level backup below still runs from `mediator.toml` alone.
-    let config_path = args.config.clone();
-    let config_path_obj = std::path::Path::new(&config_path);
-    guard_existing_setup(config_path_obj, args.force_reprovision).await?;
-    if config_path_obj.exists() {
-        // Operator opted in (or there were no provisioned keys —
-        // e.g. backend was wiped manually). Back up the existing
-        // mediator.toml before generating the new one so the
-        // previous configuration is recoverable.
-        std::fs::copy(&config_path, format!("{config_path}.bak"))?;
-        eprintln!("Existing {config_path} backed up to {config_path}.bak before re-provisioning.");
-    }
+    // Early, friendly re-run check against the existing config's backend,
+    // before the operator spends time in the wizard. The binding check runs
+    // again against the backend actually chosen, right before anything is
+    // written (`open_guarded_backend`).
+    let config_path = args.config_path();
+    guard_existing_setup(Path::new(&config_path), args.force_reprovision).await?;
 
     let mut app = WizardApp::new(config_path);
-
-    // Apply CLI-provided options to pre-fill wizard
-    apply_cli_args(&args, &mut app.config);
+    apply_tui_prefill(args, &mut app.config);
     app.vta_did_prefill = args.vta_did.clone();
     app.vta_context_prefill = args.vta_context.clone();
+    app.force_reprovision = args.force_reprovision;
+    app.live_backend = true;
 
     let mut terminal = setup_terminal()?;
-
     let result = run_event_loop(&mut terminal, &mut app).await;
-
     restore_terminal(&mut terminal)?;
+    result?;
 
-    match result {
-        Ok(()) => {
-            if app.write_config {
-                print_banner();
-
-                // Config file location was collected inside the TUI
-                // (WizardStep::Output) — no stdin prompt here.
-
-                println!("  Generating cryptographic material...\n");
-                match generate_and_write(
-                    &app.config,
-                    app.vta_session.as_ref(),
-                    true,
-                    secret_backend::ProvisionProbe::ReadWrite,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // Clean up the sealed-handoff request / seed
-                        // files if the setup went through that flow.
-                        // Same contract as the non-interactive path:
-                        // only material the mediator needs to start
-                        // survives. No-op when the interactive flow
-                        // didn't hit sealed-handoff (e.g. online VTA
-                        // or non-VTA deployments).
-                        if let Some(ref artefacts) = app.tui_bootstrap_artifacts {
-                            bootstrap_headless::cleanup_artifacts(artefacts);
-                        }
-                        offer_build_and_guidance(&app.config);
-                        // Print the structured recap to normal stdout
-                        // (alt-screen has been left by `restore_terminal`
-                        // above) so the operator can scroll back and
-                        // mouse-select DIDs / paths / commands. Suppressed
-                        // for `--non-interactive` / `--from <recipe>` runs
-                        // — those have their own structured stdout that
-                        // CI scripts parse, and a recap would corrupt
-                        // the format.
-                        exit_recap::print_exit_recap(&app.config, app.vta_session.as_ref());
-                    }
-                    Err(e) => {
-                        eprintln!("\n\x1b[31mError: {e}\x1b[0m");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                println!("\n\x1b[33mSetup cancelled.\x1b[0m");
-            }
-            Ok(())
+    if !app.write_config {
+        out!("\n\x1b[33mSetup cancelled.\x1b[0m");
+        if app.vta_session.is_some() {
+            out!(
+                "  The VTA session's admin credential was stored in the secret backend when it \
+                 connected; the VTA-side state (minted DID, used setup ACL) remains."
+            );
         }
-        Err(e) => Err(e),
+        return Ok(());
+    }
+
+    print_banner();
+    out!("  Generating cryptographic material...\n");
+    let options = GenerateOptions {
+        save_recipe: true,
+        probe: secret_backend::ProvisionProbe::ReadWrite,
+        force_reprovision: args.force_reprovision,
+        show_admin_key: args.show_admin_key,
+    };
+    match generate_and_write_with(&app.config, app.vta_session.as_ref(), &options).await {
+        Ok(completed) => {
+            // Clean up the sealed-handoff request file if the setup went
+            // through that flow. No-op otherwise.
+            if let Some(ref artefacts) = app.tui_bootstrap_artifacts {
+                bootstrap_headless::cleanup_artifacts(artefacts);
+            }
+            offer_build_and_guidance(&app.config);
+            // The structured recap goes to normal stdout (the alt-screen
+            // has been left) so the operator can scroll back and select
+            // DIDs / paths / commands.
+            exit_recap::print_exit_recap(&app.config, app.vta_session.as_ref());
+            completed.into_result()
+        }
+        Err(e) => {
+            save_resume_recipe(&app.config, app.vta_session.is_some());
+            Err(e)
+        }
     }
 }
 
-/// Apply CLI arguments to the wizard config as pre-filled defaults.
-fn apply_cli_args(args: &Args, config: &mut WizardConfig) {
+/// After a failure past the TUI, keep the operator's answers: write them as
+/// a recipe and say how to resume, so nothing has to be re-entered.
+fn save_resume_recipe(config: &WizardConfig, had_vta_session: bool) {
+    let name = "mediator-build.resume.toml";
+    let in_config_dir = config_writer::config_dir(config).join(name);
+    let body = recipe::from_wizard_config(config);
+    let written = secure_fs::create_private_dir_all(&config_writer::config_dir(config))
+        .and_then(|()| secure_fs::write_sensitive(&in_config_dir, &body))
+        .map(|()| in_config_dir)
+        .or_else(|_| {
+            let fallback = std::env::temp_dir().join(name);
+            secure_fs::write_sensitive(&fallback, &body).map(|()| fallback)
+        });
+    match written {
+        Ok(path) => {
+            err!(
+                "\n  Your answers were saved to \x1b[1m{}\x1b[0m.",
+                path.display()
+            );
+            if config.use_vta && config.vta_mode == VTA_MODE_ONLINE {
+                err!(
+                    "  An online VTA session cannot be replayed from a recipe. {}Re-run \
+                     `mediator-setup` to finish; pass --force-reprovision if the backend now \
+                     holds this run's entries.",
+                    if had_vta_session {
+                        "Its admin credential was stored in the secret backend when it \
+                         connected. "
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                err!(
+                    "  Fix the problem above, then resume with:\n    \x1b[36mmediator-setup \
+                     --from {} --force-reprovision\x1b[0m\n  (--force-reprovision is needed \
+                     only if the backend already received this run's entries.)",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => err!("  Could not save your answers as a recipe: {e}"),
+    }
+}
+
+/// Apply CLI arguments to the interactive wizard as pre-filled defaults.
+fn apply_tui_prefill(args: &Args, config: &mut WizardConfig) {
     if let Some(ref deployment) = args.deployment {
         config.deployment_type = deployment.to_string();
     }
@@ -304,76 +299,73 @@ fn apply_cli_args(args: &Args, config: &mut WizardConfig) {
     if let Some(ref database_url) = args.database_url {
         config.database_url = database_url.clone();
     }
-    if let Some(ref admin) = args.admin {
-        config.admin_did_mode = admin.to_string();
+    if let Some(admin) = args.admin {
+        config.admin_did_mode = match admin {
+            cli::AdminMode::Generate => ADMIN_GENERATE,
+            cli::AdminMode::Vta => ADMIN_VTA,
+            cli::AdminMode::Skip => ADMIN_SKIP,
+        }
+        .into();
+    }
+    if let Some(ref did) = args.admin_did {
+        config.admin_did_mode = ADMIN_PASTE.into();
+        config.admin_did = did.clone();
     }
     if let Some(ref listen_address) = args.listen_address {
         config.listen_address = listen_address.clone();
     }
 }
 
-/// Refuse to overwrite an existing *provisioned* setup unless
-/// `--force-reprovision` is set — shared by the interactive, non-interactive,
-/// and recipe flows so none can silently rotate live keys (the unified backend
-/// holds the JWT key, admin credential, and operating keys). When the operator
-/// has opted in, the keyring scan is skipped (it can trigger one macOS Keychain
-/// prompt per well-known key). Diverges (process exit) when it refuses.
-async fn guard_existing_setup(
-    config_path: &std::path::Path,
-    force_reprovision: bool,
-) -> anyhow::Result<()> {
-    if !force_reprovision
-        && let Some(setup) = reprovision::inspect_existing(config_path).await?
+/// Early re-run check for the interactive wizard: refuse when the backend
+/// named by the existing `mediator.toml` already holds a provisioned
+/// mediator, unless `--force-reprovision` is set. Skipped when the operator
+/// has already opted in (the scan can trigger a macOS Keychain prompt).
+async fn guard_existing_setup(config_path: &Path, force_reprovision: bool) -> anyhow::Result<()> {
+    if force_reprovision {
+        return Ok(());
+    }
+    if let Some(setup) = reprovision::inspect_existing(config_path).await?
         && setup.is_provisioned()
     {
-        reprovision::refuse_overwrite(config_path, &setup);
+        return Err(reprovision::refusal(
+            &setup.backend_url,
+            &setup.provisioned_keys,
+            Some(config_path),
+        ));
     }
     Ok(())
 }
 
-/// Build a [`WizardConfig`] from CLI args layered over deployment defaults — the
-/// non-interactive (`--non-interactive`) path's config source. Extracted so the
-/// CLI-args path is unit-testable and can be checked for equivalence against the
-/// recipe path's [`recipe::to_wizard_config`].
-pub(crate) fn build_config_from_args(args: &Args) -> anyhow::Result<WizardConfig> {
-    let deployment = args.deployment.unwrap_or(cli::DeploymentType::Local);
-
-    let mut config = WizardConfig::default();
-    config.config_path = args.config.clone();
-
-    // Apply deployment defaults (identical across all deployment types)
-    config.deployment_type = deployment.to_string();
-    config.use_vta = true;
-    config.vta_mode = VTA_MODE_ONLINE.into();
-    config.didcomm_enabled = true;
-    config.did_method = DID_VTA.into();
-    config.secret_storage = STORAGE_KEYRING.into();
-    config.ssl_mode = SSL_NONE.into();
-    config.database_url = DEFAULT_REDIS_URL.into();
-    config.admin_did_mode = ADMIN_GENERATE.into();
-
-    // Override with any explicit CLI args
-    apply_cli_args(args, &mut config);
-
-    // Validate required fields for did:webvh
-    if config.did_method == DID_WEBVH && config.public_url.is_empty() {
-        anyhow::bail!("--public-url is required when using did:webvh in non-interactive mode");
+/// A human description of what the admin choice will produce.
+fn admin_summary(config: &WizardConfig) -> String {
+    match config.admin_did_mode.as_str() {
+        ADMIN_SKIP => "Skip (no admin DID)".into(),
+        ADMIN_PASTE => format!("Existing DID {}", config.admin_did),
+        ADMIN_VTA => "VTA-issued credential (also the mediator↔VTA credential)".into(),
+        ADMIN_GENERATE if config.use_vta => {
+            "Generate did:key (separate from the VTA credential)".into()
+        }
+        ADMIN_GENERATE => "Generate did:key".into(),
+        _ => "None".into(),
     }
-    if config.present_as_scid && config.did_method != DID_WEBVH {
-        anyhow::bail!(
-            "--present-as-scid applies to a locally generated did:webvh (--did-method webvh)"
-        );
-    }
-
-    Ok(config)
 }
 
-/// Print the shared "what we're about to generate" summary used by both
-/// non-interactive entry points (`--non-interactive` and `--from <recipe>`),
-/// so the two stay consistent.
+/// The network posture, spelled out — it decides who can message whom.
+fn network_summary(config: &WizardConfig) -> String {
+    if config.network_mode == NETWORK_MODE_CLOSED {
+        "\x1b[1mCLOSED\x1b[0m — DIDs exchange messages only with an explicit ACL grant".into()
+    } else {
+        "\x1b[1;33mOPEN\x1b[0m — any DID can message any other DID (ACL deny-list); use \
+         `--set security.network_mode=closed` for an allow-list"
+            .into()
+    }
+}
+
+/// Print the shared "what we're about to generate" summary used by every
+/// headless entry point, so they stay consistent.
 fn print_config_summary(config: &WizardConfig) {
-    println!("  Deployment:   {}", config.deployment_type);
-    println!(
+    out!("  Deployment:   {}", config.deployment_type);
+    out!(
         "  VTA:          {}",
         if config.use_vta {
             format!("Enabled ({})", config.vta_mode)
@@ -381,97 +373,142 @@ fn print_config_summary(config: &WizardConfig) {
             "Disabled".into()
         }
     );
-    println!("  Protocol:     {}", config.protocol_display());
-    println!("  DID method:   {}", config.did_method);
-    println!("  Key storage:  {}", config.secret_storage);
-    println!("  SSL/TLS:      {}", config.ssl_mode);
-    println!("  Database:     {}", config.database_url);
-    println!("  Admin:        {}", config.admin_did_mode);
-    println!("  Config file:  {}", config.config_path);
-    println!("  Listen:       {}", config.listen_address);
+    out!("  Protocol:     {}", config.protocol_display());
+    out!("  DID method:   {}", config.did_method);
+    out!(
+        "  Key storage:  {}",
+        affinidi_messaging_mediator_common::redact::redact_url(&config_writer::build_backend_url(
+            config
+        ))
+    );
+    out!("  SSL/TLS:      {}", config.ssl_mode);
+    if config.storage_backend == STORAGE_BACKEND_FJALL {
+        out!("  Storage:      fjall ({})", config.fjall_data_dir);
+    } else {
+        out!(
+            "  Database:     {}",
+            affinidi_messaging_mediator_common::redact::redact_url(&config.database_url)
+        );
+    }
+    out!("  Admin:        {}", admin_summary(config));
+    out!("  Network:      {}", network_summary(config));
+    out!("  Config file:  {}", config.config_path);
+    out!("  Listen:       {}", config.listen_address);
 }
 
-/// Non-interactive mode: build config from CLI args + deployment defaults, then generate.
-async fn run_non_interactive(args: Args) -> anyhow::Result<()> {
-    // Same re-run safety story as the interactive flow — refuse to
-    // overwrite an existing setup unless `--force-reprovision` is set.
-    guard_existing_setup(std::path::Path::new(&args.config), args.force_reprovision).await?;
-
-    let config = build_config_from_args(&args)?;
-
-    println!("Mediator Setup (non-interactive)");
-    print_config_summary(&config);
-    println!();
-    println!("Generating cryptographic material...");
-
-    // Non-interactive / recipe paths don't run the online-VTA sub-flow, so
-    // there's no captured session — VTA-managed DID creation isn't
-    // supported from `--from` / `--non-interactive` yet. Headless flows
-    // *request* a read-only backend probe; it takes effect only for
-    // `aws_secrets://`, where the entries are pre-created out-of-band (e.g. by
-    // CDK) so setup only overwrites them — matching the runtime, which also
-    // probes read-only. Every other backend is narrowed back to a write
-    // round-trip in `open_and_probe_secret_backend`.
-    generate_and_write(
-        &config,
-        None,
-        true,
-        secret_backend::ProvisionProbe::ReadOnly,
-    )
-    .await?;
-    offer_build_and_guidance(&config);
-
+/// `DATABASE_URL` from the environment overrides the recipe's Redis URL —
+/// the way to supply credentials a recipe never stores. Reported either
+/// way; ignored (and said so) for a Fjall setup.
+fn apply_database_url_env(config: &mut WizardConfig) -> anyhow::Result<()> {
+    match std::env::var("DATABASE_URL") {
+        Ok(env_url) if config.storage_backend == STORAGE_BACKEND_FJALL => {
+            let _ = env_url;
+            out!("  \x1b[2mignored: DATABASE_URL (storage.backend = fjall)\x1b[0m");
+        }
+        Ok(env_url) => {
+            config.database_url = env_url;
+            out!("  \x1b[2moverride: database.url from DATABASE_URL\x1b[0m");
+        }
+        Err(_)
+            if config.storage_backend != STORAGE_BACKEND_FJALL
+                && recipe::needs_database_credentials(&config.database_url) =>
+        {
+            anyhow::bail!(
+                "The database URL in the recipe needs credentials. Set the DATABASE_URL \
+                 environment variable or update the recipe."
+            );
+        }
+        Err(_) => {}
+    }
     Ok(())
 }
 
-/// Run from a declarative build recipe TOML file (fully non-interactive).
-async fn run_from_recipe(
-    recipe_path: &str,
-    force_reprovision: bool,
-    bundle_path: Option<&std::path::Path>,
-    digest: Option<&str>,
-    allow_bundle_without_digest: bool,
-) -> anyhow::Result<()> {
-    let recipe = recipe::load(recipe_path)?;
-    let mut config = recipe::to_wizard_config(&recipe)?;
-
-    // Re-run safety: refuse to overwrite an existing provisioned setup
-    // unless the operator opts in. This matches the interactive flow so
-    // recipe-driven CI can't silently rotate live keys.
-    guard_existing_setup(std::path::Path::new(&config.config_path), force_reprovision).await?;
-
-    // Check if database URL needs credentials — allow env var override
-    if let Ok(env_url) = std::env::var("DATABASE_URL") {
-        config.database_url = env_url;
-    } else if recipe::needs_database_credentials(&config.database_url) {
-        eprintln!("The database URL in the recipe needs credentials.");
-        eprintln!("Set DATABASE_URL environment variable or update the recipe.");
-        anyhow::bail!("Database credentials required but not provided");
+/// Warnings about choices that are legal but likely wrong for the
+/// deployment type.
+fn print_deployment_warnings(config: &WizardConfig) {
+    if config.deployment_type == DEPLOYMENT_CONTAINER && config.secret_storage == STORAGE_KEYRING {
+        err!(
+            "  \x1b[33mWarning:\x1b[0m keyring:// is the OS keyring of the machine running \
+             the wizard; a container has none. The mediator in the container will not find \
+             its keys — pick a secret manager or k8s:// instead."
+        );
     }
+}
+
+/// `--from <recipe>` and `--non-interactive`: build the recipe from the
+/// file, the shorthand flags and `--set`, then run the same pipeline the
+/// TUI does. Never prompts and never reads stdin.
+async fn run_headless(args: &Args) -> anyhow::Result<()> {
+    let mode = if args.from.is_some() {
+        headless::Mode::Recipe
+    } else {
+        headless::Mode::Flags
+    };
+    let built = headless::build(args, mode)?;
+    let mut config = recipe::to_wizard_config(&built.recipe)?;
 
     print_banner();
-    println!("  \x1b[2mFrom recipe: {recipe_path}\x1b[0m\n");
+    match &args.from {
+        Some(path) => out!("  \x1b[2mFrom recipe: {path}\x1b[0m"),
+        None => out!("  \x1b[2mNon-interactive: flags only\x1b[0m"),
+    }
+    for note in &built.notes {
+        out!("  \x1b[2m{note}\x1b[0m");
+    }
+    apply_database_url_env(&mut config)?;
+    out!();
     print_config_summary(&config);
-    println!();
+    print_deployment_warnings(&config);
+    out!();
 
-    // Sealed-handoff dispatch:
-    //   use_vta + vta_mode sealed-* → phase 1 (no --bundle) or phase 2
-    //     (with --bundle). Phase 1 emits request and exits early;
-    //     phase 2 produces a `VtaSession` that feeds `generate_and_write`.
-    //   use_vta + vta_mode online    → rejected (see intent_for_mode)
-    //   use_vta = false OR no vta_mode → legacy no-VTA generation path.
-    let vta_session = if config.use_vta
+    let force_reprovision = args.force_reprovision;
+    let sealed = config.use_vta
         && matches!(
             config.vta_mode.as_str(),
-            consts::VTA_MODE_SEALED_MINT | consts::VTA_MODE_SEALED_EXPORT | consts::VTA_MODE_ONLINE
-        ) {
+            VTA_MODE_SEALED_MINT | VTA_MODE_SEALED_EXPORT
+        );
+    if args.bundle.is_some() && !sealed {
+        anyhow::bail!(
+            "--bundle is phase 2 of a sealed handoff, but this recipe is not a sealed one \
+             (deployment.use_vta = true with vta_mode = \"sealed-mint\" or \"sealed-export\")"
+        );
+    }
+    if config.use_vta && !sealed {
+        return Err(exit::error(
+            exit::NO_VTA_SESSION,
+            format!(
+                "{} needs a VTA session, which a headless run can only get from a sealed \
+                 handoff. Use a recipe with vta_mode = \"sealed-mint\" (or \"sealed-export\"), \
+                 the --setup-key-out / --setup-key-file pair (admin credential only, with \
+                 --did-method peer|webvh), or the interactive wizard.",
+                if config.did_method == DID_VTA {
+                    "A VTA-managed mediator DID".to_string()
+                } else {
+                    format!("vta_mode = \"{}\"", config.vta_mode)
+                }
+            ),
+        ));
+    }
+
+    let options = GenerateOptions {
+        // Never overwrite the recipe this run was given.
+        save_recipe: args.from.is_none(),
+        // Headless flows request a read-only probe; it takes effect only for
+        // `aws_secrets://` (entries pre-created out-of-band), see
+        // `open_and_probe_secret_backend`.
+        probe: secret_backend::ProvisionProbe::ReadOnly,
+        force_reprovision,
+        show_admin_key: args.show_admin_key,
+    };
+
+    let completed = if sealed {
         use bootstrap_headless::HeadlessOutcome;
         let outcome = bootstrap_headless::dispatch(
             &config,
-            bundle_path,
+            args.bundle.as_deref(),
             bootstrap_headless::DispatchOptions {
-                digest,
-                allow_without_digest: allow_bundle_without_digest,
+                digest: args.digest.as_deref(),
+                allow_without_digest: args.allow_bundle_without_digest,
                 force_reprovision,
             },
         )
@@ -484,7 +521,7 @@ async fn run_from_recipe(
                 pnm_command,
             } => {
                 print_phase1_next_steps(
-                    recipe_path,
+                    args.from.as_deref().unwrap_or("<recipe.toml>"),
                     &request_path,
                     &bundle_id_hex,
                     &producer_command,
@@ -493,88 +530,123 @@ async fn run_from_recipe(
                 return Ok(());
             }
             HeadlessOutcome::Applied { session, artifacts } => {
-                println!("  Generating cryptographic material...\n");
-                generate_and_write(
-                    &config,
-                    Some(&session),
-                    false,
-                    secret_backend::ProvisionProbe::ReadOnly,
-                )
-                .await?;
-                bootstrap_headless::cleanup_artifacts(&artifacts);
-                println!(
-                    "  \x1b[32m\u{2714}\x1b[0m Setup artefacts removed — \
-                     the mediator has everything it needs in the \
-                     configured secret backend.\n"
+                out!("  Generating cryptographic material...\n");
+                let completed = generate_and_write_with(&config, Some(&session), &options).await?;
+                // Only now that everything is written is the ephemeral seed
+                // (and the request file) disposable.
+                bootstrap_headless::finish_applied(&config, &artifacts).await;
+                out!(
+                    "  \x1b[32m\u{2714}\x1b[0m Setup artefacts removed — the mediator has \
+                     everything it needs in the configured secret backend.\n"
                 );
-                Some(session)
+                completed
             }
         }
     } else {
-        println!("  Generating cryptographic material...\n");
-        generate_and_write(
-            &config,
-            None,
-            false,
-            secret_backend::ProvisionProbe::ReadOnly,
-        )
-        .await?;
-        None
+        out!("  Generating cryptographic material...\n");
+        generate_and_write_with(&config, None, &options).await?
     };
 
-    // `vta_session` is intentionally dropped here — it already fed
-    // `generate_and_write` above, and the install step below doesn't
-    // need it. Consuming it keeps the variable live for the compiler
-    // without leaving a dangling binding.
-    drop(vta_session);
+    install_or_print_commands(
+        &config,
+        built.recipe.install.enabled,
+        built.recipe.install.path.as_deref(),
+    )?;
+    print_final_summary(&config, options.save_recipe);
+    completed.into_result()
+}
 
+/// `--setup-key-file`: authenticate to the VTA with the phase-1 did:key,
+/// then provision the mediator with the resulting admin-only session.
+async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow::Result<()> {
+    let vta_did = vta::cli::validate_phase2_args(&args.vta_did)?;
+    let mediator_url = args.mediator_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--mediator-url is required for --setup-key-file: it is the public URL the \
+             mediator serves at."
+        )
+    })?;
+
+    // Build and validate the configuration before contacting the VTA, so a
+    // flag mistake costs nothing on the VTA side.
+    let built = headless::build(args, headless::Mode::SetupKey)?;
+    let mut config = recipe::to_wizard_config(&built.recipe)?;
+    if config.did_method == DID_VTA {
+        return Err(exit::error(
+            exit::NO_VTA_SESSION,
+            "--setup-key-file obtains an admin credential only; the mediator brings its own \
+             DID. Pass --did-method peer or webvh (a VTA-minted DID needs a sealed-mint \
+             recipe or the interactive wizard).",
+        ));
+    }
+    config.use_vta = true;
+    config.vta_mode = VTA_MODE_ONLINE.into();
+    if let Some(ctx) = &args.vta_context {
+        config.vta_context = ctx.clone();
+    }
+    for note in &built.notes {
+        out!("  \x1b[2m{note}\x1b[0m");
+    }
+    apply_database_url_env(&mut config)?;
+    out!();
+    print_config_summary(&config);
+    print_deployment_warnings(&config);
+
+    let session = vta::cli::run_phase2_connect(
+        key_path,
+        vta_did,
+        Some(&config.vta_context),
+        mediator_url,
+        args.wait_for_acl,
+    )
+    .await
+    .map_err(|e| {
+        let code = match e.kind {
+            vta::cli::HeadlessFailureKind::NoTransport => exit::VTA_NO_TRANSPORT,
+            vta::cli::HeadlessFailureKind::PostAuthFailed => exit::VTA_POST_AUTH,
+        };
+        exit::error(code, e.to_string())
+    })?;
+
+    out!("\n  Generating cryptographic material...\n");
+    let options = GenerateOptions {
+        save_recipe: args.from.is_none(),
+        probe: secret_backend::ProvisionProbe::ReadOnly,
+        force_reprovision: args.force_reprovision,
+        show_admin_key: args.show_admin_key,
+    };
+    let completed = generate_and_write_with(&config, Some(&session), &options).await?;
+
+    // The setup did:key is now the long-term admin credential, stored in
+    // the secret backend; the plaintext copy in the key file must go.
+    match std::fs::remove_file(key_path) {
+        Ok(()) => out!(
+            "  \x1b[32m\u{2714}\x1b[0m Removed the setup key file {} (the credential now lives \
+             in the secret backend).",
+            key_path.display()
+        ),
+        Err(e) => err!(
+            "  \x1b[33mWarning:\x1b[0m could not remove the setup key file {}: {e}. It holds \
+             the mediator's VTA admin key — delete it by hand.",
+            key_path.display()
+        ),
+    }
+    install_or_print_commands(&config, false, None)?;
+    print_final_summary(&config, options.save_recipe);
+    completed.into_result()
+}
+
+/// Run `cargo install` when the recipe asks for it, otherwise print the
+/// install and build commands. Never prompts.
+fn install_or_print_commands(
+    config: &WizardConfig,
+    install: bool,
+    install_root: Option<&str>,
+) -> anyhow::Result<()> {
     let features = config.cargo_features();
     let needs_explicit = config.needs_explicit_features();
 
-    // Auto-install if recipe says so
-    if recipe.install.enabled {
-        let install_root = recipe.install.path.as_deref();
-        let install_args = build_install_args(&features, needs_explicit, install_root);
-        let install_cmd = format!("cargo {}", install_args.join(" "));
-
-        let workspace_root = find_workspace_root();
-        let build_dir = workspace_root
-            .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root for cargo install"))?;
-
-        let install_location = install_root.map(|r| format!("{r}/bin")).unwrap_or_else(|| {
-            let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".into());
-            format!("{cargo_home}/bin")
-        });
-
-        println!("  \x1b[1mInstall command:\x1b[0m");
-        println!(
-            "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
-            build_dir.display()
-        );
-        println!("    \x1b[36m{install_cmd}\x1b[0m\n");
-        println!(
-            "  \x1b[38;5;69mInstalling mediator to {install_location} \
-             (this may take a few minutes)...\x1b[0m\n"
-        );
-
-        let status = Command::new("cargo")
-            .args(&install_args)
-            .current_dir(&build_dir)
-            .status();
-
-        match status {
-            Ok(exit) if exit.success() => {
-                println!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
-                print_run_command(&config.config_path, &install_location);
-            }
-            Ok(exit) => {
-                anyhow::bail!("cargo install failed with exit code: {exit}");
-            }
-            Err(e) => {
-                anyhow::bail!("Failed to run cargo: {e}");
-            }
-        }
-    } else {
+    if !install {
         let install_cmd = format!(
             "cargo {}",
             build_install_args(&features, needs_explicit, None).join(" ")
@@ -583,13 +655,45 @@ async fn run_from_recipe(
             "cargo {}",
             build_cargo_args(&features, needs_explicit).join(" ")
         );
-        println!("  \x1b[1mTo install:\x1b[0m\n    \x1b[36m{install_cmd}\x1b[0m\n");
-        println!("  \x1b[1mTo build from source:\x1b[0m\n    \x1b[36m{build_cmd}\x1b[0m\n");
+        out!("  \x1b[1mTo install:\x1b[0m\n    \x1b[36m{install_cmd}\x1b[0m\n");
+        out!("  \x1b[1mTo build from source:\x1b[0m\n    \x1b[36m{build_cmd}\x1b[0m\n");
+        return Ok(());
     }
 
-    print_final_summary(&config);
+    let install_args = build_install_args(&features, needs_explicit, install_root);
+    let install_cmd = format!("cargo {}", install_args.join(" "));
+    let build_dir = find_workspace_root()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root for cargo install"))?;
+    let install_location = install_root.map(|r| format!("{r}/bin")).unwrap_or_else(|| {
+        let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".into());
+        format!("{cargo_home}/bin")
+    });
 
-    Ok(())
+    out!("  \x1b[1mInstall command:\x1b[0m");
+    out!(
+        "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
+        build_dir.display()
+    );
+    out!("    \x1b[36m{install_cmd}\x1b[0m\n");
+    out!(
+        "  \x1b[38;5;69mInstalling mediator to {install_location} \
+         (this may take a few minutes)...\x1b[0m\n"
+    );
+
+    let status = Command::new("cargo")
+        .args(&install_args)
+        .current_dir(&build_dir)
+        .status();
+
+    match status {
+        Ok(exit) if exit.success() => {
+            out!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
+            print_run_command(&config.config_path, &install_location);
+            Ok(())
+        }
+        Ok(exit) => anyhow::bail!("cargo install failed with exit code: {exit}"),
+        Err(e) => anyhow::bail!("Failed to run cargo: {e}"),
+    }
 }
 
 async fn run_event_loop(
@@ -610,6 +714,9 @@ async fn run_event_loop(
                 // discovery: result lands on a tokio mpsc and the
                 // wizard transitions Loading → Loaded / Failed.
                 app.drain_discovery_events();
+                // The KeyStorage backend check and the VTA-session
+                // persistence run on spawned tasks too.
+                app.drain_background();
             }
             maybe_event = crossterm_events.next() => match maybe_event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -636,11 +743,19 @@ async fn run_event_loop(
 }
 
 fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: KeyModifiers) {
-    // F10 or Ctrl+C quits immediately
-    if code == KeyCode::F(10)
-        || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
-    {
-        app.should_quit = true;
+    let quit_key = code == KeyCode::F(10)
+        || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL));
+
+    // The quit confirmation (a VTA session exists) takes the next key:
+    // `y` — or a second Ctrl+C / F10 — quits, anything else stays.
+    if app.quit_confirm_pending() {
+        app.answer_quit_confirm(quit_key || matches!(code, KeyCode::Char('y' | 'Y')));
+        return;
+    }
+
+    // F10 or Ctrl+C quits — at once, unless a VTA session would be lost.
+    if quit_key {
+        app.request_quit();
         return;
     }
 
@@ -1028,12 +1143,10 @@ fn build_did_secrets_bundle(
     None
 }
 
-/// Write a `did.jsonl` log entry next to the mediator's config file
-/// and print a green tick / yellow warning in the same style as the
-/// rest of `generate_and_write`. Centralises the CWD-versus-config-dir
-/// logic that was duplicated between the FullSetup and OfflineExport
-/// branches.
-fn write_did_jsonl(config_path: &str, log_content: &str) {
+/// Write a `did.jsonl` log entry next to the mediator's config file.
+/// Fatal on failure: `mediator.toml` points `did_web_self_hosted` at this
+/// file, and a mediator whose DID log is missing cannot serve its DID.
+fn write_did_jsonl(config_path: &str, log_content: &str) -> anyhow::Result<PathBuf> {
     let did_jsonl_path = std::path::Path::new(config_path)
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -1048,16 +1161,13 @@ fn write_did_jsonl(config_path: &str, log_content: &str) {
     // depth — a public-readable log isn't a confidentiality break,
     // but a co-tenant who can't read the file can't subtly mutate
     // it either if they ever get write access.
-    match crate::secure_fs::write_sensitive(&did_jsonl_path, normalised) {
-        Ok(()) => println!(
-            "  \x1b[32m\u{2714}\x1b[0m Saved DID log: \x1b[36m{}\x1b[0m",
-            did_jsonl_path.display()
-        ),
-        Err(e) => eprintln!(
-            "  \x1b[33mWarning:\x1b[0m could not write {}: {e}",
-            did_jsonl_path.display()
-        ),
-    }
+    crate::secure_fs::write_sensitive(&did_jsonl_path, normalised)
+        .with_context(|| format!("could not write the DID log {}", did_jsonl_path.display()))?;
+    out!(
+        "  \x1b[32m\u{2714}\x1b[0m Saved DID log: \x1b[36m{}\x1b[0m",
+        did_jsonl_path.display()
+    );
+    Ok(did_jsonl_path)
 }
 
 /// Convert the mediator's did:webvh log entry to a did:web DID document
@@ -1067,12 +1177,12 @@ fn write_did_jsonl(config_path: &str, log_content: &str) {
 /// filename deliberately differs from the runtime-served `did.json`.
 /// Failures are surfaced but non-fatal: a bad conversion shouldn't roll
 /// back an otherwise-good setup.
-fn write_did_web_json(config_path: &str, log_content: &str, webvh_did: &str) {
+fn write_did_web_json(config_path: &str, log_content: &str, webvh_did: &str) -> Option<PathBuf> {
     let (web_did, doc) = match generators::did_webvh::webvh_log_to_did_web(log_content, webvh_did) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("  \x1b[33mWarning:\x1b[0m could not derive did:web document: {e}");
-            return;
+            err!("  \x1b[33mWarning:\x1b[0m could not derive did:web document: {e}");
+            return None;
         }
     };
     let did_web_path = std::path::Path::new(config_path)
@@ -1084,15 +1194,21 @@ fn write_did_web_json(config_path: &str, log_content: &str, webvh_did: &str) {
     // of did.jsonl for defence in depth until the operator copies it out.
     let body = format!("{}\n", doc.trim_end_matches('\n'));
     match crate::secure_fs::write_sensitive(&did_web_path, body) {
-        Ok(()) => println!(
-            "  \x1b[32m\u{2714}\x1b[0m Saved did:web document (\x1b[36m{web_did}\x1b[0m): \
-             \x1b[36m{}\x1b[0m",
-            did_web_path.display()
-        ),
-        Err(e) => eprintln!(
-            "  \x1b[33mWarning:\x1b[0m could not write {}: {e}",
-            did_web_path.display()
-        ),
+        Ok(()) => {
+            out!(
+                "  \x1b[32m\u{2714}\x1b[0m Saved did:web document (\x1b[36m{web_did}\x1b[0m): \
+                 \x1b[36m{}\x1b[0m",
+                did_web_path.display()
+            );
+            Some(did_web_path)
+        }
+        Err(e) => {
+            err!(
+                "  \x1b[33mWarning:\x1b[0m could not write {}: {e}",
+                did_web_path.display()
+            );
+            None
+        }
     }
 }
 
@@ -1182,8 +1298,8 @@ mod did_peer_service_url_tests {
 }
 
 /// Bag of artefacts the mint phase produces and the later phases
-/// consume. Keeps the four `generate_and_write` phases coupled by an
-/// explicit value type rather than the prior soup of mutable locals.
+/// consume. Keeps the `generate_and_write` phases coupled by an
+/// explicit value type rather than a soup of mutable locals.
 ///
 /// Pure-ish: every field is a value, not a handle to a backend or
 /// open file. Side effects (file writes, network calls, stdout) live
@@ -1201,6 +1317,10 @@ struct MintedArtefacts {
     /// `write_config_artefacts` writes to `did.jsonl`. `None` when
     /// the deployment uses no self-hosted DID log.
     did_doc: Option<String>,
+    /// The log-update and pre-rotation keys of a locally generated
+    /// did:webvh, stored apart from the operating secrets. `None` for
+    /// every other DID method.
+    webvh_update_keys: Option<generators::did_webvh::WebvhUpdateKeys>,
     /// Authorization credential JSON the VTA returned with the
     /// minted DID. Archived alongside the config in
     /// `write_config_artefacts`. `None` for non-VTA / OfflineExport
@@ -1210,86 +1330,220 @@ struct MintedArtefacts {
     /// `jwt_mode = provide` — the runtime expects
     /// `MEDIATOR_JWT_SECRET` / `--jwt-secret-file` at boot.
     jwt_secret: Option<Vec<u8>>,
-    /// Operator's admin DID. `None` under `ADMIN_SKIP`.
+    /// The mediator's admin-API DID. `None` under `ADMIN_SKIP`.
     admin_did: Option<String>,
-    /// Admin DID's secret material. `None` when the admin DID came
-    /// from a VTA session (the rotated credential is in the session
-    /// already) or under `ADMIN_SKIP`.
+    /// Secret material of a *generated* admin DID. `None` when the admin
+    /// DID is the VTA credential (its key is in the session), a pasted DID
+    /// (the wizard holds no key) or skipped.
     admin_secret: Option<affinidi_secrets_resolver::secrets::Secret>,
 }
 
-/// Run all generators and write configuration files.
-/// When `save_recipe` is true, a `mediator-build.toml` recipe is saved alongside
-/// the config for reproducibility. Set to false when running from `--from` to
-/// avoid overwriting the input recipe.
-///
-/// Orchestrator — delegates to four phase functions in order. Each
-/// phase has a distinct concern:
-///
-/// 1. [`mint_artefacts`] — pure-ish value computation (DID + JWT +
-///    admin DID). No file IO; no network; the only side effect is
-///    progress `println!` calls that report which branch ran.
-/// 2. [`provision_secret_backend`] — opens the unified
-///    `MediatorSecrets` store, probes it (catches typos / missing
-///    AWS creds / dead Vault tokens here, not at first mediator
-///    boot), and pushes every well-known entry the runtime expects.
-/// 3. [`write_config_artefacts`] — file IO: SSL gen, `mediator.toml`
-///    plus Lua, `did.jsonl`, authorization VC archive, recipe,
-///    Dockerfile.
-/// 4. [`print_completion_summary`] — operator-facing terminal output:
-///    paths written plus admin-key echo with the UNSAFE banner.
-///
-/// The split exists so `mint_artefacts` is unit-testable (no IO),
-/// the IO phases can be tested with a tempdir + file:// backend, and
-/// each branch of the (`did_method` × `vta_session` ×
-/// `admin_did_mode`) matrix lives in its own arm of one phase rather
-/// than being interleaved with side effects. Integration coverage in
-/// `generate_and_write_tests` locks the end-to-end behaviour against
-/// regressions across the split.
+/// How a `generate_and_write` run behaves.
+pub(crate) struct GenerateOptions {
+    /// Save a `mediator-build.toml` recipe next to the config. Off for
+    /// `--from` runs, so the input recipe is never overwritten.
+    pub save_recipe: bool,
+    /// Which liveness probe to run on the secret backend.
+    pub probe: secret_backend::ProvisionProbe,
+    /// Write over a backend that already holds a provisioned mediator.
+    pub force_reprovision: bool,
+    /// Print the generated admin private key (terminal only).
+    pub show_admin_key: bool,
+}
+
+impl GenerateOptions {
+    #[cfg(test)]
+    fn for_tests(save_recipe: bool, probe: secret_backend::ProvisionProbe) -> Self {
+        Self {
+            save_recipe,
+            probe,
+            force_reprovision: false,
+            show_admin_key: false,
+        }
+    }
+}
+
+/// A finished setup. Publishing runs last, after every local write, so its
+/// failure does not undo a complete setup; it is reported here instead.
+#[must_use]
+pub(crate) struct Completed {
+    publish_failure: Option<String>,
+}
+
+impl Completed {
+    /// `Ok` when everything — publishing included — succeeded; otherwise the
+    /// "setup complete, publish failed" error with its own exit code.
+    pub(crate) fn into_result(self) -> anyhow::Result<()> {
+        match self.publish_failure {
+            None => Ok(()),
+            Some(msg) => Err(exit::error(exit::PUBLISH_FAILED, msg)),
+        }
+    }
+}
+
+/// [`generate_and_write_with`] with the default options; the shape the
+/// end-to-end tests drive.
+#[cfg(test)]
 async fn generate_and_write(
     config: &app::WizardConfig,
     vta_session: Option<&vta::VtaSession>,
     save_recipe: bool,
     probe: secret_backend::ProvisionProbe,
 ) -> anyhow::Result<()> {
+    generate_and_write_with(
+        config,
+        vta_session,
+        &GenerateOptions::for_tests(save_recipe, probe),
+    )
+    .await?
+    .into_result()
+}
+
+/// Run all generators and write configuration files.
+///
+/// Phases, in order — each has one concern, and the order is what makes a
+/// failure part-way through recoverable:
+///
+/// 1. [`open_guarded_backend`] — open and probe the secret backend, and
+///    refuse (exit 4) if it already holds a provisioned mediator, *before*
+///    anything is minted. Catches typos, missing cloud credentials and dead
+///    Vault tokens here, not at first mediator boot.
+/// 2. [`mint_artefacts`] — pure-ish value computation (DID + JWT + admin
+///    DID). No file IO; no network.
+/// 3. [`provision_secret_backend`] — push every well-known entry the
+///    runtime expects. Before the config, so `mediator.toml` never names
+///    secrets that are not there.
+/// 4. [`write_config_artefacts`] — file IO: SSL, `did.jsonl` (before the
+///    config that references it), `mediator.toml` (after a timestamped
+///    backup of the one it replaces) plus Lua, the authorization VC
+///    archive, the admin monitor profile, the recipe, the Docker files and
+///    the uninstall manifest. Every write is temp + fsync + rename.
+/// 5. [`print_completion_summary`] — operator-facing output.
+/// 6. Publishing to `[output].did_target` / `did_log_target`, last: the
+///    setup is complete whether or not it succeeds (see [`Completed`]).
+async fn generate_and_write_with(
+    config: &app::WizardConfig,
+    vta_session: Option<&vta::VtaSession>,
+    options: &GenerateOptions,
+) -> anyhow::Result<Completed> {
+    let store = open_guarded_backend(config, vta_session, options).await?;
     let artefacts = mint_artefacts(config, vta_session).await?;
-    provision_secret_backend(config, &artefacts, vta_session, probe).await?;
-    write_config_artefacts(config, &artefacts, save_recipe)?;
-    // Optional: publish the minted DID + its did:webvh log to the recipe's
-    // `[output].did_target` / `[output].did_log_target`. No-op unless a target
-    // is configured.
-    publish::publish_did_artefacts(&artefacts.mediator_did, config.did_target.as_deref()).await?;
-    publish::publish_did_log_artefacts(
+    provision_secret_backend(&store, config, &artefacts, vta_session).await?;
+    write_config_artefacts(config, &artefacts, options.save_recipe)?;
+    print_completion_summary(config, &artefacts, vta_session, options.show_admin_key);
+    Ok(Completed {
+        publish_failure: publish_minted(config, &artefacts).await,
+    })
+}
+
+/// Publish the DID and its log to the recipe's targets. Returns the
+/// operator-facing failure message, or `None` when there was nothing to
+/// publish or it all succeeded.
+async fn publish_minted(config: &app::WizardConfig, artefacts: &MintedArtefacts) -> Option<String> {
+    let mut failures = Vec::new();
+    if let Err(e) =
+        publish::publish_did_artefacts(&artefacts.mediator_did, config.did_target.as_deref()).await
+        && let Some(target) = &config.did_target
+    {
+        failures.push(format!(
+            "  did_target {target}: {e:#}\n    retry by publishing the DID by hand, e.g. for \
+             SSM: aws ssm put-parameter --overwrite --type String --name <name> --value \
+             {}",
+            artefacts.mediator_did
+        ));
+    }
+    if let Err(e) = publish::publish_did_log_artefacts(
         artefacts.did_doc.as_deref(),
         config.did_log_target.as_deref(),
     )
-    .await?;
-    print_completion_summary(config, &artefacts, vta_session);
-    Ok(())
+    .await
+        && let Some(target) = &config.did_log_target
+    {
+        let log = config_writer::config_dir(config).join("did.jsonl");
+        failures.push(format!(
+            "  did_log_target {target}: {e:#}\n    retry by uploading {} by hand, e.g. aws s3 \
+             cp {} <s3-url>",
+            log.display(),
+            log.display()
+        ));
+    }
+    (!failures.is_empty()).then(|| {
+        format!(
+            "Setup complete — the configuration and secrets are written — but publishing \
+             failed:\n{}\nThe mediator reads the published DID log at boot when \
+             did_log_target is set, so publish it before starting the mediator.",
+            failures.join("\n")
+        )
+    })
 }
 
-/// Phase 1 — pure-ish value computation. Branches on `did_method`,
+/// Phase 1 — open the secret backend the config names, probe it, and run
+/// the re-run guard against *that* backend: refuse when it already holds a
+/// provisioned mediator, unless `--force-reprovision`.
+///
+/// Entries that this same run already wrote are not "existing": the TUI
+/// persists a VTA session's credential as soon as it connects, and those
+/// match the session being provisioned now.
+async fn open_guarded_backend(
+    config: &app::WizardConfig,
+    vta_session: Option<&vta::VtaSession>,
+    options: &GenerateOptions,
+) -> anyhow::Result<affinidi_messaging_mediator_common::MediatorSecrets> {
+    let backend_url = config_writer::build_backend_url(config);
+    let shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
+    out!("  Secret backend: {shown}");
+    // macOS Keychain prompts once per keychain item the first time a
+    // given binary (code-signature ACL) accesses it, and each `cargo
+    // build` produces a new binary. Say so up-front.
+    if backend_url.starts_with("keyring://") {
+        out!(
+            "    \x1b[2mNote: macOS may prompt the Keychain on first access. Click \"Always \
+             Allow\" to grant this binary permanent access.\x1b[0m"
+        );
+    }
+    // A file backend's directory is created owner-only before its probe
+    // can create it with the default mode. (The config directory is created
+    // the same way when the files are written.)
+    if let Some(parent) = config_writer::file_backend_host_path(config)
+        .as_deref()
+        .and_then(Path::parent)
+    {
+        secure_fs::create_private_dir_all(parent)?;
+    }
+    let store = secret_backend::open_and_probe_secret_backend(&backend_url, options.probe).await?;
+
+    if !options.force_reprovision {
+        let mut found = secret_backend::provisioned_well_known_keys(&store)
+            .await
+            .map_err(|e| exit::error(exit::REFUSED_EXISTING, format!("{e:#}")))?;
+        if let Some(session) = vta_session
+            && secret_backend::holds_session(&store, session).await
+        {
+            found.retain(|k| {
+                *k != affinidi_messaging_mediator_common::ADMIN_CREDENTIAL
+                    && *k != affinidi_messaging_mediator_common::VTA_LAST_KNOWN_BUNDLE
+            });
+        }
+        if !found.is_empty() {
+            return Err(reprovision::refusal(&backend_url, &found, None));
+        }
+    }
+    Ok(store)
+}
+
+/// Phase 2 — pure-ish value computation. Branches on `did_method`,
 /// `jwt_mode`, and `admin_did_mode` to determine what the wizard will
 /// stamp into the config; produces no file or network side effects.
-/// `println!` progress messages stay inline so the operator sees the
-/// streaming UX they're used to (which-branch-ran), but no writes
-/// happen here.
-///
-/// The `authorization_vc` field used to be written mid-mint inside
-/// the `DID_VTA` branch — that file write is now deferred to
-/// [`write_config_artefacts`] so this phase is genuinely pure for
-/// IO purposes.
 async fn mint_artefacts(
     config: &app::WizardConfig,
     vta_session: Option<&vta::VtaSession>,
 ) -> anyhow::Result<MintedArtefacts> {
     // ── DID + operating secrets + (optional) DID log + (optional) VC ──
-    let (mediator_did, mediator_secrets, did_doc, authorization_vc) =
-        mint_did_material(config, vta_session).await?;
+    let minted = mint_did_material(config, vta_session).await?;
 
     // ── JWT secret ────────────────────────────────────────────────────
     let jwt_secret: Option<Vec<u8>> = if config.jwt_mode == JWT_MODE_PROVIDE {
-        println!(
+        out!(
             "  JWT secret: provide mode — wizard will NOT generate or store a key. \
              Set MEDIATOR_JWT_SECRET or pass --jwt-secret-file <path> when starting \
              the mediator."
@@ -1300,63 +1554,81 @@ async fn mint_artefacts(
     };
 
     // ── Admin DID ─────────────────────────────────────────────────────
-    // If the operator went through the online-VTA sub-flow, the setup
-    // did:key they pasted into the ACL has already been rotated to a
-    // fresh admin identity by the SDK — prefer that over a freshly-minted
-    // local did:key so the mediator has a single canonical admin DID
-    // that also exists in the VTA's ACL.
-    let (admin_did, admin_secret) = match (vta_session, config.admin_did_mode.as_str()) {
-        (Some(session), _) => {
-            println!(
-                "  Using rotated admin DID from VTA session: {}",
+    // The admin-API identity is what the operator chose. In a VTA flow the
+    // VTA-issued credential is the mediator↔VTA identity; it doubles as the
+    // admin-API identity only when explicitly asked for (`ADMIN_VTA`), so a
+    // generated admin stays a separate key by default.
+    let (admin_did, admin_secret) = match config.admin_did_mode.as_str() {
+        ADMIN_GENERATE => {
+            let (did, secret) = generators::did_key::generate_admin_did_key()?;
+            (Some(did), Some(secret))
+        }
+        ADMIN_VTA => {
+            let session = vta_session.ok_or_else(|| {
+                exit::error(
+                    exit::NO_VTA_SESSION,
+                    "admin = VTA-issued credential, but this run has no VTA session",
+                )
+            })?;
+            out!(
+                "  Admin DID: the VTA-issued credential {}",
                 session.admin_did()
             );
             (Some(session.admin_did().to_string()), None)
         }
-        (None, ADMIN_GENERATE) => {
-            let (did, secret) = generators::did_key::generate_admin_did_key()?;
-            (Some(did), Some(secret))
+        ADMIN_PASTE => {
+            let did = config.admin_did.trim();
+            if did.is_empty() {
+                return Err(exit::error(
+                    exit::IMPORT_WITHOUT_DATA,
+                    "admin = existing DID, but no admin DID was given",
+                ));
+            }
+            if !recipe::looks_like_did(did) {
+                anyhow::bail!("admin DID '{did}' is not a DID (expected did:<method>:<id>)");
+            }
+            (Some(did.to_string()), None)
         }
-        (None, ADMIN_SKIP) => (None, None),
-        (None, _) => (None, None),
+        // ADMIN_SKIP, or no choice recorded.
+        _ => (None, None),
     };
     // The admin is a separate identity from the mediator; the mediator
     // refuses to start otherwise, so stop here rather than write that config.
     if let Some(admin) = admin_did.as_deref() {
-        affinidi_messaging_mediator_config::validate::check_admin_not_mediator(
-            admin,
-            &mediator_did,
-        )
-        .map_err(|msg| anyhow::anyhow!(msg))?;
+        affinidi_messaging_mediator_config::validate::check_admin_not_mediator(admin, &minted.did)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
     }
 
     Ok(MintedArtefacts {
-        mediator_did,
-        mediator_secrets,
-        did_doc,
-        authorization_vc,
+        mediator_did: minted.did,
+        mediator_secrets: minted.secrets,
+        did_doc: minted.did_log,
+        webvh_update_keys: minted.webvh_update_keys,
+        authorization_vc: minted.authorization_vc,
         jwt_secret,
         admin_did,
         admin_secret,
     })
 }
 
-/// Mint the mediator's DID + operating secrets per `did_method`.
-/// Returns `(did, secrets, did_log, authorization_vc)` — the last two
-/// are `None` for non-webvh / non-VTA deployments.
-///
-/// Used to live as a `match` block inside `mint_artefacts`; extracted
-/// because the four-tuple was getting dense and the VTA arm in
-/// particular was 50 lines that benefit from sitting alone.
+/// What [`mint_did_material`] produces.
+struct MintedDid {
+    did: String,
+    secrets: Vec<affinidi_secrets_resolver::secrets::Secret>,
+    did_log: Option<String>,
+    webvh_update_keys: Option<generators::did_webvh::WebvhUpdateKeys>,
+    authorization_vc: Option<String>,
+}
+
+/// Mint the mediator's DID + operating secrets per `did_method`. The DID
+/// log is `None` for non-webvh / non-VTA deployments, the update keys for
+/// anything but a locally generated did:webvh, and the authorization VC
+/// for anything but a VTA full setup.
 async fn mint_did_material(
     config: &app::WizardConfig,
     vta_session: Option<&vta::VtaSession>,
-) -> anyhow::Result<(
-    String,
-    Vec<affinidi_secrets_resolver::secrets::Secret>,
-    Option<String>,
-    Option<String>,
-)> {
+) -> anyhow::Result<MintedDid> {
+    let mut webvh_update_keys = None;
     let (did, secrets, did_log, authorization_vc) = match config.did_method.as_str() {
         DID_PEER => {
             let service_uri = did_peer_service_url(&config.public_url, &config.api_prefix);
@@ -1392,6 +1664,7 @@ async fn mint_did_material(
                 },
             )
             .await?;
+            webvh_update_keys = Some(result.update_keys);
             (result.did, result.secrets, Some(result.did_doc), None)
         }
         DID_VTA => {
@@ -1414,7 +1687,7 @@ async fn mint_did_material(
                         )
                     })?
                     .to_string();
-                println!("  VTA-minted mediator DID: {integration_did}");
+                out!("  VTA-minted mediator DID: {integration_did}");
 
                 // Persist the integration DID's private keys as `Secret`
                 // values — the mediator's runtime secrets loader reads
@@ -1452,27 +1725,40 @@ async fn mint_did_material(
                     )
                 })?;
                 let integration_did = did_view.id.clone();
-                println!("  VTA-exported mediator DID: {integration_did}");
+                out!("  VTA-exported mediator DID: {integration_did}");
 
                 let secrets = secret_entries_to_secrets(&did_view.secrets)?;
                 let log_entry = did_view.log_entry.clone();
                 (integration_did, secrets, log_entry, None)
             } else {
-                eprintln!(
-                    "  Note: VTA-managed DID selected but no provisioned session \
-                     was captured. Falling back to placeholder — edit mediator.toml \
-                     manually before starting the mediator."
-                );
-                ("vta://mediator".into(), vec![], None, None)
+                // Never write a placeholder DID: the mediator cannot boot
+                // with one, and exit 0 would report a broken setup as done.
+                return Err(exit::error(
+                    exit::NO_VTA_SESSION,
+                    match vta_session {
+                        Some(_) => {
+                            "a VTA-managed mediator DID was requested, but the VTA session \
+                             carries no mediator DID (it is an admin-credential-only \
+                             session). Choose did:peer or did:webvh for the mediator."
+                        }
+                        None => {
+                            "a VTA-managed mediator DID was requested, but there is no VTA \
+                             session to take it from. Use a sealed-mint recipe, the \
+                             interactive wizard, or did:peer / did:webvh."
+                        }
+                    },
+                ));
             }
         }
-        _ => {
-            // Import existing — user will need to provide details
-            eprintln!(
-                "  Note: {} requires manual DID configuration.",
-                config.did_method
-            );
-            ("PLACEHOLDER_DID".into(), vec![], None, None)
+        other => {
+            return Err(exit::error(
+                exit::IMPORT_WITHOUT_DATA,
+                format!(
+                    "DID method '{other}' cannot be set up by the wizard (importing an \
+                     existing mediator DID is not supported). Choose did:peer, did:webvh or \
+                     a VTA-managed DID."
+                ),
+            ));
         }
     };
 
@@ -1481,7 +1767,13 @@ async fn mint_did_material(
     let admin_did = vta_session.map(|s| s.admin_did().to_string());
     validate_operating_secrets(&did, &secrets, admin_did.as_deref())?;
 
-    Ok((did, secrets, did_log, authorization_vc))
+    Ok(MintedDid {
+        did,
+        secrets,
+        did_log,
+        webvh_update_keys,
+        authorization_vc,
+    })
 }
 
 /// Provision-time invariant: every operating secret must be a verification
@@ -1527,55 +1819,33 @@ fn validate_operating_secrets(
     Ok(())
 }
 
-/// Phase 2 — open the unified secret backend, probe it, push every
-/// well-known entry the mediator runtime expects at startup. Async
-/// because every backend (keyring, AWS, GCP, Azure, Vault, file) is
-/// async at the trait level.
+/// Phase 3 — push every well-known entry the mediator runtime expects at
+/// startup into the backend [`open_guarded_backend`] opened.
 ///
-/// Self-hosted (did:peer / did:webvh): operating keys + JWT.
-/// VTA-managed: admin credential (so the mediator can authenticate to
-/// the VTA at boot) + JWT. Operating keys come from the VTA.
+/// Self-hosted (did:peer / did:webvh): operating keys + JWT + the generated
+/// admin credential (+ the did:webvh update keys).
+/// VTA-linked: the VTA admin credential + VTA fallback cache + JWT.
 async fn provision_secret_backend(
+    store: &affinidi_messaging_mediator_common::MediatorSecrets,
     config: &app::WizardConfig,
     artefacts: &MintedArtefacts,
     vta_session: Option<&vta::VtaSession>,
-    probe: secret_backend::ProvisionProbe,
 ) -> anyhow::Result<()> {
-    let backend_url = config_writer::build_backend_url(config);
-    println!(
-        "  Provisioning unified secret backend: {}",
-        affinidi_messaging_mediator_common::redact::redact_url(&backend_url)
-    );
-    // macOS Keychain prompts once per keychain item the first time a
-    // given binary (code-signature ACL) accesses it. Each `cargo
-    // build` produces a new binary — so operators rebuilding the
-    // wizard during development see fresh prompts on every run. Tell
-    // them up-front so they know to click "Always Allow" once per
-    // item, and that subsequent re-runs from the same binary won't
-    // re-prompt.
-    if backend_url.starts_with("keyring://") {
-        println!(
-            "    \x1b[2mNote: macOS may prompt the Keychain once per item on first \
-             access. Click \"Always Allow\" to grant this binary permanent access; \
-             subsequent re-runs of the same binary won't re-prompt.\x1b[0m"
-        );
-    }
-    let mediator_secrets_store =
-        secret_backend::open_and_probe_secret_backend(&backend_url, probe).await?;
+    out!("  Provisioning the secret backend:");
 
     // JWT signing key — only when generated. Provide-mode skips this
     // and relies on the boot-time env-var/flag path.
     if let Some(ref bytes) = artefacts.jwt_secret {
-        mediator_secrets_store
+        store
             .store_jwt_secret(bytes)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store JWT secret: {e}"))?;
-        println!(
+        out!(
             "    \x1b[32m\u{2714}\x1b[0m {}",
             affinidi_messaging_mediator_common::JWT_SECRET
         );
     } else {
-        println!(
+        out!(
             "    \x1b[33m\u{26A0}\x1b[0m {} (deferred to boot — provide mode)",
             affinidi_messaging_mediator_common::JWT_SECRET
         );
@@ -1584,7 +1854,7 @@ async fn provision_secret_backend(
     // Operating keys — only when the wizard generated them locally
     // (peer/webvh). VTA-managed deployments fetch them at startup.
     if !artefacts.mediator_secrets.is_empty() {
-        mediator_secrets_store
+        store
             .store_entry(
                 affinidi_messaging_mediator_common::OPERATING_SECRETS,
                 "operating-secrets",
@@ -1593,7 +1863,7 @@ async fn provision_secret_backend(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store operating secrets: {e}"))?;
         let count = artefacts.mediator_secrets.len();
-        println!(
+        out!(
             "    \x1b[32m\u{2714}\x1b[0m {} ({} key{})",
             affinidi_messaging_mediator_common::OPERATING_SECRETS,
             count,
@@ -1601,100 +1871,143 @@ async fn provision_secret_backend(
         );
     }
 
-    // Admin credential — VTA-linked path. The session captures the
-    // rotated admin did:key + the VTA DID/URL that minted it.
-    //
-    // Both VTA fields are normalised through `non_empty`. A sealed
-    // context export whose bundle omitted `vta_did` reaches us as an
-    // empty string (`VtaSession::context_export` uses
-    // `unwrap_or_default`), and an empty `vta_url` is equally
-    // meaningless — storing either verbatim fails the credential's
-    // shape validation at the last step of setup, after the JWT and
-    // operating secrets have already been written to the backend.
-    // `vta_url: None` is a supported shape: the mediator resolves the
-    // VTA endpoint from its DID document.
+    // did:webvh log-update + pre-rotation keys — a separate entry, never
+    // loaded by the mediator; what an operator needs to update the DID.
+    if let Some(ref keys) = artefacts.webvh_update_keys {
+        store
+            .store_entry(WEBVH_UPDATE_KEYS, KIND_WEBVH_UPDATE_KEYS, keys)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store the did:webvh update keys: {e}"))?;
+        out!("    \x1b[32m\u{2714}\x1b[0m {WEBVH_UPDATE_KEYS} (update + pre-rotation key)");
+    }
+
     if let Some(session) = vta_session {
-        let stored = secret_backend::store_vta_session(&mediator_secrets_store, session).await?;
-        println!(
+        // VTA-linked: the session's credential is the mediator↔VTA
+        // identity and goes into `mediator_admin_credential`.
+        let stored = secret_backend::store_vta_session(store, session).await?;
+        out!(
             "    \x1b[32m\u{2714}\x1b[0m {}{}",
             affinidi_messaging_mediator_common::ADMIN_CREDENTIAL,
             if stored.vta_linked {
-                ""
+                " (VTA credential)"
             } else {
                 " (self-hosted — session carried no VTA DID)"
             }
         );
         if let Some(count) = stored.cached_keys {
-            println!(
+            out!(
                 "    \x1b[32m\u{2714}\x1b[0m {} ({} key{})",
                 affinidi_messaging_mediator_common::VTA_LAST_KNOWN_BUNDLE,
                 count,
                 if count == 1 { "" } else { "s" }
             );
         }
+        if artefacts.admin_secret.is_some() {
+            out!(
+                "    \x1b[2mThe generated admin-API did:key is separate from the VTA \
+                 credential; its key goes to admin-monitor.json.\x1b[0m"
+            );
+        }
     } else if let (Some(did), Some(secret)) = (
         artefacts.admin_did.as_ref(),
         artefacts.admin_secret.as_ref(),
     ) {
-        // Self-hosted ADMIN_GENERATE: the wizard minted the admin DID
-        // locally (no VTA session), so the only place the private key
-        // exists outside this process is the operator's terminal
-        // buffer. Persist it into the configured backend under the
-        // same well-known key VTA-linked runs use, with vta_did /
-        // vta_url left `None` so the mediator's config loader skips
-        // the VTA integration branch for this deployment.
-        if let Ok(privkey) = secret.get_private_keymultibase() {
-            let cred = affinidi_messaging_mediator_common::AdminCredential {
-                did: did.clone(),
-                private_key_multibase: privkey,
-                vta_did: None,
-                vta_url: None,
-                context: "mediator".into(),
-            };
-            mediator_secrets_store
-                .store_admin_credential(&cred)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to store admin credential: {e}"))?;
-            println!(
-                "    \x1b[32m\u{2714}\x1b[0m {} (self-hosted)",
-                affinidi_messaging_mediator_common::ADMIN_CREDENTIAL
-            );
-        }
+        // Self-hosted ADMIN_GENERATE: persist the generated admin key under
+        // the same well-known entry VTA-linked runs use, with vta_did /
+        // vta_url left `None` so the mediator skips its VTA integration.
+        let privkey = secret
+            .get_private_keymultibase()
+            .map_err(|e| anyhow::anyhow!("Failed to encode the admin key: {e}"))?;
+        let cred = affinidi_messaging_mediator_common::AdminCredential {
+            did: did.clone(),
+            private_key_multibase: privkey,
+            vta_did: None,
+            vta_url: None,
+            context: config.vta_context.clone(),
+        };
+        store
+            .store_admin_credential(&cred)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store admin credential: {e}"))?;
+        out!(
+            "    \x1b[32m\u{2714}\x1b[0m {} (self-hosted)",
+            affinidi_messaging_mediator_common::ADMIN_CREDENTIAL
+        );
     }
 
     Ok(())
 }
 
-/// Phase 3 — file IO. Generates self-signed SSL (when requested),
-/// writes `mediator.toml` + `atm-functions.lua` (via
-/// `config_writer::write_config`), the did.jsonl log envelope, the
-/// authorization VC archive, the build recipe (when requested), and
-/// the Docker artefacts (when requested).
-///
-/// SSL generation lives here rather than in `mint_artefacts` because
-/// it's a side effect — `generators::ssl::generate_self_signed_cert`
-/// writes the `.cert` / `.key` pair to disk before returning the
-/// paths. Keeping the call here matches the "no IO in mint" rule.
+/// Copy `path` aside as `<name>.bak.<UTC timestamp>` before it is replaced.
+/// Returns the backup's path, or `None` when there was nothing to back up.
+fn backup_existing(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".bak.{stamp}"));
+    let backup = path.with_file_name(name);
+    let contents = std::fs::read(path)
+        .with_context(|| format!("could not read {} to back it up", path.display()))?;
+    secure_fs::write_sensitive(&backup, contents).with_context(|| {
+        format!(
+            "could not back up {} to {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    out!(
+        "  \x1b[32m\u{2714}\x1b[0m Previous {} backed up to \x1b[36m{}\x1b[0m",
+        path.display(),
+        backup.display()
+    );
+    Ok(Some(backup))
+}
+
+/// Phase 4 — file IO. Self-signed SSL (when requested), `did.jsonl`, the
+/// timestamped backup of the config being replaced, `mediator.toml` +
+/// `atm-functions.lua`, the authorization VC archive, the admin monitor
+/// profile, the build recipe (when requested), the Docker files (container
+/// deployments) and, last, the uninstall manifest listing all of them.
 fn write_config_artefacts(
     config: &app::WizardConfig,
     artefacts: &MintedArtefacts,
     save_recipe: bool,
 ) -> anyhow::Result<()> {
+    let conf_dir = config_writer::config_dir(config);
+    secure_fs::create_private_dir_all(&conf_dir)
+        .with_context(|| format!("could not create {}", conf_dir.display()))?;
+    let mut written: Vec<PathBuf> = Vec::new();
+
     // Self-signed SSL (when requested). The files go in `keys/` **beside
     // `mediator.toml`**, and the paths written into it are relative to that
-    // file — the rule the mediator now resolves every configured path by
-    // (Keyring VTI-07). Generating into a working-directory-relative
-    // `conf/keys` put the key wherever the wizard happened to run, and left a
-    // config that only worked when started from that same directory.
+    // file — the rule the mediator resolves every configured path by.
     let (ssl_cert_path, ssl_key_path) = if config.ssl_mode == SSL_SELF_SIGNED {
-        let keys_dir = config_writer::config_dir(config).join("keys");
-        generators::ssl::generate_self_signed_cert(&keys_dir.to_string_lossy())?;
+        let keys_dir = conf_dir.join("keys");
+        let (cert, key) = generators::ssl::generate_self_signed_cert(&keys_dir.to_string_lossy())?;
+        written.push(PathBuf::from(cert));
+        written.push(PathBuf::from(key));
         (
             Some("keys/end.cert".to_string()),
             Some("keys/end.key".to_string()),
         )
     } else {
         (None, None)
+    };
+
+    // The did:webvh log entry, *before* the config that points at it: a
+    // failure here is fatal and leaves the previous config in place.
+    let did_log_path = match artefacts.did_doc {
+        Some(ref doc) => {
+            let path = write_did_jsonl(&config.config_path, doc)?;
+            written.push(path.clone());
+            Some(path)
+        }
+        None => None,
     };
 
     let generated = config_writer::GeneratedValues {
@@ -1704,265 +2017,258 @@ fn write_config_artefacts(
         admin_secret: artefacts.admin_secret.clone(),
         ssl_cert_path,
         ssl_key_path,
-        // The post-match write below mirrors this flag — they're set
-        // off the same `did_doc` Option so `did_web_self_hosted` is
-        // wired into `mediator.toml` exactly when there's a `did.jsonl`
-        // on disk for the loader to read.
-        did_log_jsonl_written: artefacts.did_doc.is_some(),
+        did_log_path: did_log_path
+            .as_deref()
+            .map(|p| config_writer::runtime_file_url(config, p)),
     };
 
-    config_writer::write_config(config, &generated)?;
+    let config_path = Path::new(&config.config_path);
+    if let Some(backup) = backup_existing(config_path)? {
+        written.push(backup);
+    }
+    written.extend(config_writer::write_config(config, &generated)?);
 
-    // Write the did:webvh log entry to `did.jsonl` so the mediator's
-    // `/.well-known/did.jsonl` route can serve it. Source is either the
-    // self-host generator (DID_WEBVH branch) or the VTA's
-    // `provision.webvh_log()` / `did_view.log_entry` (DID_VTA branches);
-    // both return the canonical log-entry JSON envelope.
-    // `write_did_jsonl` adds the trailing newline strict JSONL requires.
-    if let Some(ref doc) = artefacts.did_doc {
-        write_did_jsonl(&config.config_path, doc);
-
-        // Optional did:web export. When the operator asked for it and the
-        // minted DID is a did:webvh (local generator or VTA-managed webvh
-        // log), rewrite the resolved DID document to its did:web form and
-        // drop it next to the config as `did-web.json` for hosting under
-        // did:web. Non-webvh DIDs (did:peer, VTA-managed did:web/did:key)
-        // have no scid to drop, so we skip with a note rather than emit a
-        // misleading file.
-        if config.save_did_web {
-            // A did:scid mediator's log is still a did:webvh log; bridge
-            // from the log's own did:webvh DID.
-            let webvh_did = if artefacts.mediator_did.starts_with("did:webvh:") {
-                Some(artefacts.mediator_did.clone())
-            } else if artefacts.mediator_did.starts_with("did:scid:") {
-                generators::did_webvh::log_webvh_did(doc)
-            } else {
-                None
-            };
-            if let Some(webvh_did) = webvh_did {
-                write_did_web_json(&config.config_path, doc, &webvh_did);
-            } else {
-                eprintln!(
-                    "  \x1b[33mNote:\x1b[0m --save-did-web requested but the mediator DID \
-                     is not a did:webvh ({}); skipping did:web export.",
-                    artefacts.mediator_did
-                );
-            }
+    // Optional did:web export. When the operator asked for it and the
+    // minted DID is a did:webvh (local generator or VTA-managed webvh
+    // log), rewrite the resolved DID document to its did:web form.
+    if let Some(ref doc) = artefacts.did_doc
+        && config.save_did_web
+    {
+        // A did:scid mediator's log is still a did:webvh log; bridge
+        // from the log's own did:webvh DID.
+        let webvh_did = if artefacts.mediator_did.starts_with("did:webvh:") {
+            Some(artefacts.mediator_did.clone())
+        } else if artefacts.mediator_did.starts_with("did:scid:") {
+            generators::did_webvh::log_webvh_did(doc)
+        } else {
+            None
+        };
+        if let Some(webvh_did) = webvh_did {
+            written.extend(write_did_web_json(&config.config_path, doc, &webvh_did));
+        } else {
+            err!(
+                "  \x1b[33mNote:\x1b[0m --save-did-web requested but the mediator DID \
+                 is not a did:webvh ({}); skipping did:web export.",
+                artefacts.mediator_did
+            );
         }
     }
 
-    // Authorization VC archive (DID_VTA Full path only). Pre-serialised
-    // in `mint_did_material` so this phase is pure file IO. Short-lived
-    // (~1h validity) but useful for operator audit trails. Owner-only
-    // on Unix — VC is a signed authorization credential and a co-tenant
-    // shouldn't be able to read the operator's audit trail.
+    // Authorization VC archive (DID_VTA Full path only). Short-lived
+    // (~1h validity) audit trail; a failure is reported but not fatal.
     if let Some(ref vc_text) = artefacts.authorization_vc {
-        let vc_path = std::path::Path::new(&config.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("authorization.jsonld");
+        let vc_path = conf_dir.join("authorization.jsonld");
         match crate::secure_fs::write_sensitive(&vc_path, vc_text) {
-            Ok(()) => println!(
-                "  \x1b[32m\u{2714}\x1b[0m Archived authorization VC: \x1b[36m{}\x1b[0m",
-                vc_path.display()
-            ),
-            Err(e) => eprintln!(
+            Ok(()) => {
+                out!(
+                    "  \x1b[32m\u{2714}\x1b[0m Archived authorization VC: \x1b[36m{}\x1b[0m",
+                    vc_path.display()
+                );
+                written.push(vc_path);
+            }
+            Err(e) => err!(
                 "  \x1b[33mWarning:\x1b[0m could not write {}: {e}",
                 vc_path.display()
             ),
         }
     }
 
-    // Admin monitor profile (`admin-monitor.json`). Emitted only when the
-    // wizard has the admin DID's secret material in memory — i.e., the
-    // `ADMIN_GENERATE` path. This is the file `mediator-console
-    // --profile <path>` consumes. For VTA-managed admins the
-    // secret material lives in the configured secret backend; we don't
-    // re-derive a flat-file profile here (often the backend is cloud-
-    // hosted specifically to keep secrets off disk).
-    //
-    // Only `(Some, Some)` triggers the write: `mint_artefacts` sets
-    // `admin_secret = None` for the VTA path (credential is in the
-    // session) and for `ADMIN_SKIP` (no admin at all).
+    // Admin monitor profile (`admin-monitor.json`) — the file
+    // `mediator-console --profile <path>` consumes. Written whenever the
+    // wizard generated the admin key. Fatal: in a VTA flow it is the only
+    // copy of the generated admin key.
     if let (Some(admin_did), Some(admin_secret)) = (&artefacts.admin_did, &artefacts.admin_secret) {
-        match admin_monitor_profile::write(
+        let path = admin_monitor_profile::write(
             &config.config_path,
             &artefacts.mediator_did,
             admin_did,
             admin_secret,
-        ) {
-            Ok(path) => println!(
-                "  \x1b[32m\u{2714}\x1b[0m Admin monitor profile: \x1b[1m{}\x1b[0m\n    \
-                 \x1b[2mUse with: \x1b[36mmediator-console --profile {}\x1b[0m",
-                path.display(),
-                path.display(),
-            ),
-            // Non-fatal — the wizard's primary job is the mediator
-            // config; a failed monitor profile shouldn't roll back
-            // an otherwise good setup. Surface it loudly so the
-            // operator knows to construct it manually if they
-            // wanted monitor.
-            Err(e) => eprintln!(
-                "  \x1b[33mWarning:\x1b[0m could not write admin monitor profile: {e}\n    \
-                 mediator-console --profile won't have a ready-made file; \
-                 reconstruct manually if needed."
-            ),
-        }
+        )
+        .context("could not write the admin monitor profile")?;
+        out!(
+            "  \x1b[32m\u{2714}\x1b[0m Admin monitor profile: \x1b[1m{}\x1b[0m\n    \
+             \x1b[2mUse with: \x1b[36mmediator-console --profile {}\x1b[0m",
+            path.display(),
+            path.display(),
+        );
+        written.push(path);
     }
 
     // Save build recipe for reproducibility (skip when running from --from).
     if save_recipe {
-        let recipe_path = std::path::Path::new(&config.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("mediator-build.toml");
+        let recipe_path = conf_dir.join("mediator-build.toml");
         let recipe_content = recipe::from_wizard_config(config);
-        // Recipe is "designed to not contain secrets" (URLs are
-        // redacted by `redact_url`), but it does carry the resolved
-        // secret-backend URL — vault endpoint, AWS region/namespace,
-        // azure vault id, etc. — which is enough to mount a targeted
-        // attack on the mediator's secret store. Owner-only on Unix.
+        // Carries the secret-backend location; owner-only on Unix.
         crate::secure_fs::write_sensitive(&recipe_path, &recipe_content)?;
-        println!(
+        out!(
             "  \x1b[32m\u{2714}\x1b[0m Build recipe:  \x1b[1m{}\x1b[0m",
             recipe_path.display()
         );
+        written.push(recipe_path);
     }
 
-    // Generate Docker files for container deployments.
+    // Docker files for container deployments, next to the config.
     if config.deployment_type == DEPLOYMENT_CONTAINER {
-        docker::generate_dockerfile(config, ".")?;
+        written.extend(docker::generate_dockerfile(config, &conf_dir)?);
     }
 
+    // The file backend's secrets file, so uninstall can find it.
+    if config.secret_storage == STORAGE_FILE {
+        let url = config_writer::build_backend_url(config);
+        if let Ok(affinidi_messaging_mediator_common::secrets::BackendUrl::File { path, .. }) =
+            affinidi_messaging_mediator_common::secrets::parse_url(&url)
+        {
+            written.push(PathBuf::from(path));
+        }
+    }
+
+    reprovision::write_manifest(config_path, &written)?;
     Ok(())
 }
 
-/// Phase 4 — operator-facing terminal output. No file or network IO;
-/// just the streaming progress messages + admin-key echo with the
-/// UNSAFE banner. Kept separate from `write_config_artefacts` so the
-/// IO phase doesn't have to share its termination point with the
-/// final summary banner — easier to keep both readable.
+/// Phase 5 — operator-facing terminal output. The admin private key is
+/// never printed unless asked for with `--show-admin-key` on a terminal:
+/// it is already in the secret backend or `admin-monitor.json`, and stdout
+/// often ends up in CI logs or the journal.
 fn print_completion_summary(
     config: &app::WizardConfig,
     artefacts: &MintedArtefacts,
     vta_session: Option<&vta::VtaSession>,
+    show_admin_key: bool,
 ) {
-    let conf_dir = std::path::Path::new(&config.config_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    println!(
+    let conf_dir = config_writer::config_dir(config);
+    out!(
         "  \x1b[32m\u{2714}\x1b[0m Configuration: \x1b[1m{}\x1b[0m",
         config.config_path
     );
-    println!(
+    out!(
         "  \x1b[32m\u{2714}\x1b[0m Lua functions: \x1b[1m{}\x1b[0m",
         conf_dir.join("atm-functions.lua").display()
     );
 
     if let Some(ref did) = artefacts.admin_did {
-        println!("  \x1b[32m\u{2714}\x1b[0m Admin DID: \x1b[36m{did}\x1b[0m");
-        if let Some(ref secret) = artefacts.admin_secret {
-            if let Ok(privkey) = secret.get_private_keymultibase() {
-                print_admin_key_echo(&privkey, None);
+        out!("  \x1b[32m\u{2714}\x1b[0m Admin DID: \x1b[36m{did}\x1b[0m");
+        let key = match (&artefacts.admin_secret, vta_session) {
+            (Some(secret), _) => secret.get_private_keymultibase().ok(),
+            (None, Some(session)) if config.admin_did_mode == ADMIN_VTA => {
+                Some(session.admin_private_key_mb().to_string())
             }
-        } else if let Some(session) = vta_session {
-            // VTA-session rotation case: the credential is already in
-            // the backend (stored by `provision_secret_backend`). The
-            // stdout echo is a convenience so operators can copy the
-            // key for offline storage — same UNSAFE warning applies.
-            print_admin_key_echo(
-                session.admin_private_key_mb(),
-                Some((session.vta_did.as_str(), session.context_id.as_str())),
-            );
+            _ => None,
+        };
+        if let Some(key) = key {
+            print_admin_key(&key, show_admin_key);
         }
     }
 
     if config.secret_storage == STORAGE_FILE {
-        // Report the operator's actual backend path, not a hard-coded
-        // `conf/secrets.json` — the unified backend writes wherever
-        // `[secrets].storage` points.
-        println!(
+        out!(
             "  \x1b[32m\u{2714}\x1b[0m Secrets: \x1b[1m{}\x1b[0m",
             config.secret_file_path
         );
     }
 
     if config.ssl_mode == SSL_SELF_SIGNED {
-        println!("  \x1b[32m\u{2714}\x1b[0m SSL certificates: conf/keys/");
+        out!(
+            "  \x1b[32m\u{2714}\x1b[0m SSL certificates: {}",
+            conf_dir.join("keys").display()
+        );
     }
 }
 
-/// Print the admin private key to stdout alongside an UNSAFE banner.
-/// Used for both the self-hosted ADMIN_GENERATE path and the VTA
-/// rotation path — in both cases the key is ALREADY safely stored in
-/// the configured secret backend, so the stdout echo is a courtesy
-/// that the operator can copy to offline storage. The banner makes
-/// the trust posture explicit: anything that tails this output
-/// (systemd-journal, CI logs, shoulder-surfers) gets the key.
-///
-/// `vta_context`, when supplied, prints the VTA DID + context the
-/// credential was minted against. It doesn't change the warning.
-fn print_admin_key_echo(privkey_multibase: &str, vta_context: Option<(&str, &str)>) {
-    println!();
-    // Red-background bold ` UNSAFE ` badge, then a white-bold
-    // explanation. Copying exact escape sequences from the spec.
-    println!(
-        "  \x1b[41;97m UNSAFE \x1b[0m \x1b[1mAdmin private key printed below for operator \
-         bookkeeping.\x1b[0m"
-    );
-    println!(
-        "  \x1b[2mThis key is already stored in the configured secret backend — copy it to \
-         an offline store now and clear your terminal scrollback if you care about \
-         confidentiality.\x1b[0m"
-    );
-    println!("  \x1b[2mPrivate key (multibase): {privkey_multibase}\x1b[0m");
-    if let Some((vta_did, context)) = vta_context {
-        println!("  \x1b[2mVTA DID: {vta_did}   Context: {context}\x1b[0m");
+/// Where the admin key is, and — only with `--show-admin-key` on a
+/// terminal — the key itself.
+fn print_admin_key(privkey_multibase: &str, show_admin_key: bool) {
+    use std::io::IsTerminal;
+    if !show_admin_key {
+        out!(
+            "    \x1b[2mThe admin private key is stored in the secret backend / \
+             admin-monitor.json; it is not printed (--show-admin-key prints it on a \
+             terminal).\x1b[0m"
+        );
+        return;
     }
+    if !io::stdout().is_terminal() {
+        err!(
+            "  \x1b[33mNote:\x1b[0m --show-admin-key is ignored: stdout is not a terminal, and \
+             the key would land in a log."
+        );
+        return;
+    }
+    out!();
+    out!(
+        "  \x1b[41;97m UNSAFE \x1b[0m \x1b[1mAdmin private key printed below (--show-admin-key).\x1b[0m"
+    );
+    out!("  \x1b[2mCopy it to an offline store now and clear your terminal scrollback.\x1b[0m");
+    out!("  \x1b[2mPrivate key (multibase): {privkey_multibase}\x1b[0m");
 }
 
 fn print_banner() {
     // Gradient from purple (141) → blue (69) → cyan (43) across rows
     let r = "\x1b[0m";
 
-    println!();
-    println!("  \x1b[38;5;141m    ___    _________       _     ___ {r}");
-    println!("  \x1b[38;5;135m   /   |  / __/ __(_)___  (_)___/ (_){r}");
-    println!("  \x1b[38;5;105m  / /| | / /_/ /_/ / __ \\/ / __  / / {r}");
-    println!("  \x1b[38;5;69m / ___ |/ __/ __/ / / / / / /_/ / /  {r}");
-    println!("  \x1b[38;5;33m/_/  |_/_/ /_/ /_/_/ /_/_/\\__,_/_/   {r}");
-    println!();
-    println!(
-        "  \x1b[38;5;43m\u{2501}\u{2501}\u{2501}\x1b[0m \x1b[1;38;5;255mMediator Setup\x1b[0m"
+    out!();
+    out!("  \x1b[38;5;141m    ___    _________       _     ___ {r}");
+    out!("  \x1b[38;5;135m   /   |  / __/ __(_)___  (_)___/ (_){r}");
+    out!("  \x1b[38;5;105m  / /| | / /_/ /_/ / __ \\/ / __  / / {r}");
+    out!("  \x1b[38;5;69m / ___ |/ __/ __/ / / / / / /_/ / /  {r}");
+    out!("  \x1b[38;5;33m/_/  |_/_/ /_/ /_/_/ /_/_/\\__,_/_/   {r}");
+    out!();
+    out!("  \x1b[38;5;43m\u{2501}\u{2501}\u{2501}\x1b[0m \x1b[1;38;5;255mMediator Setup\x1b[0m");
+    out!("  \x1b[2mSecure, scalable DIDComm & TSP messaging infrastructure\x1b[0m");
+    out!();
+}
+
+/// Put the terminal back the way the wizard found it: raw mode off, main
+/// screen, bracketed paste off, cursor shown. Best-effort and idempotent,
+/// so the panic hook and the normal exit path can both call it.
+fn reset_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        ratatui::crossterm::cursor::Show
     );
-    println!("  \x1b[2mSecure, scalable DIDComm & TSP messaging infrastructure\x1b[0m");
-    println!();
 }
 
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
+    // A panic anywhere in the TUI must not leave the shell in raw mode on
+    // the alternate screen with the message hidden: restore first, then
+    // let the previous hook print the panic.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        reset_terminal();
+        previous(info);
+    }));
+
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     // Bracketed paste lets the terminal deliver a multi-char paste as a
     // single `Event::Paste(String)` instead of a flood of individual Key
     // events. Without it, pasting a 30-char DID triggers 30 redraws and
     // feels sluggish.
-    execute!(
+    if let Err(e) = execute!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
         DisableMouseCapture
-    )?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    ) {
+        // Raw mode is already on: undo it before reporting.
+        reset_terminal();
+        return Err(e.into());
+    }
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(e) => {
+            reset_terminal();
+            Err(e.into())
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    reset_terminal();
     Ok(terminal.show_cursor()?)
 }
 
@@ -2033,11 +2339,13 @@ fn inline_select(prompt: &str, options: &[&str], default: usize) -> Option<usize
     let mut selected = default;
 
     // Print the prompt
-    println!("  {prompt}\n");
+    out!("  {prompt}\n");
 
-    // Enter raw mode for key capture
+    // Enter raw mode for key capture. Without a terminal there is no
+    // answer: report "no choice" rather than act on the default (which
+    // used to start a multi-minute `cargo install` unprompted).
     if enable_raw_mode().is_err() {
-        return Some(default);
+        return None;
     }
 
     loop {
@@ -2050,7 +2358,7 @@ fn inline_select(prompt: &str, options: &[&str], default: usize) -> Option<usize
                 print!("\r  \x1b[2m  {option}\x1b[0m\x1b[K");
             }
             if i < options.len() - 1 {
-                println!();
+                out!();
             }
         }
         let _ = io::stdout().flush();
@@ -2069,17 +2377,17 @@ fn inline_select(prompt: &str, options: &[&str], default: usize) -> Option<usize
                 }
                 KeyCode::Enter => {
                     let _ = disable_raw_mode();
-                    println!();
+                    out!();
                     return Some(selected);
                 }
                 KeyCode::Esc => {
                     let _ = disable_raw_mode();
-                    println!();
+                    out!();
                     return None;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let _ = disable_raw_mode();
-                    println!();
+                    out!();
                     return None;
                 }
                 _ => {}
@@ -2143,14 +2451,14 @@ fn print_phase1_next_steps(
     producer_command: &str,
     pnm_command: &str,
 ) {
-    println!("  \x1b[32m\u{2714}\x1b[0m Phase 1 complete — bootstrap request written.");
-    println!();
-    println!(
+    out!("  \x1b[32m\u{2714}\x1b[0m Phase 1 complete — bootstrap request written.");
+    out!();
+    out!(
         "  \x1b[1mRequest file:\x1b[0m  \x1b[36m{}\x1b[0m",
         request_path.display()
     );
-    println!("  \x1b[1mBundle ID:\x1b[0m     \x1b[36m{bundle_id_hex}\x1b[0m");
-    println!();
+    out!("  \x1b[1mBundle ID:\x1b[0m     \x1b[36m{bundle_id_hex}\x1b[0m");
+    out!();
     // `AdminOnly` intent has the same `pnm contexts bootstrap …` shape
     // for both the offline and live-API flavours, so an "unseal first"
     // note doesn't apply — show the single command and move on.
@@ -2164,34 +2472,34 @@ fn print_phase1_next_steps(
     // is shown as an escape hatch for operators who already have a
     // pnm session against an operational VTA.
     if producer_command == pnm_command {
-        println!("  \x1b[1mNext — on the VTA host, run:\x1b[0m");
-        println!("    \x1b[36m{producer_command}\x1b[0m");
+        out!("  \x1b[1mNext — on the VTA host, run:\x1b[0m");
+        out!("    \x1b[36m{producer_command}\x1b[0m");
     } else {
-        println!("  \x1b[1mNext — on the VTA host, run:\x1b[0m");
-        println!("    \x1b[36m{producer_command}\x1b[0m");
-        println!();
-        println!(
+        out!("  \x1b[1mNext — on the VTA host, run:\x1b[0m");
+        out!("    \x1b[36m{producer_command}\x1b[0m");
+        out!();
+        out!(
             "  \x1b[2mIf the VTA is sealed (default state after install or after\n  \
              `vta bootstrap-admin`), the command above errors with\n  \
              \"VTA is sealed (… Offline CLI commands are disabled)\".\n  \
              Unseal first (challenge-response with your super-admin key),\n  \
              then re-run the command above:\x1b[0m"
         );
-        println!("    \x1b[36mvta unseal\x1b[0m");
-        println!();
-        println!(
+        out!("    \x1b[36mvta unseal\x1b[0m");
+        out!();
+        out!(
             "  \x1b[2mAlternatively, if you have a `pnm` session authenticated\n  \
              against this VTA, the live-API form skips the unseal step:\x1b[0m"
         );
-        println!("    \x1b[36m{pnm_command}\x1b[0m");
+        out!("    \x1b[36m{pnm_command}\x1b[0m");
     }
-    println!();
-    println!("  \x1b[1mThen — back on this host, run:\x1b[0m");
-    println!(
+    out!();
+    out!("  \x1b[1mThen — back on this host, run:\x1b[0m");
+    out!(
         "    \x1b[36mmediator-setup --from {recipe_path} --bundle bundle.armor \\\n     --digest <sha256>\x1b[0m"
     );
-    println!();
-    println!(
+    out!();
+    out!(
         "  \x1b[2mThe --digest is required — paste the SHA-256 the VTA admin\n  \
          prints, received over a separate channel from the bundle.\x1b[0m"
     );
@@ -2199,14 +2507,14 @@ fn print_phase1_next_steps(
 
 fn print_run_command(config_path: &str, install_location: &str) {
     let abs_config = resolve_config_path(config_path);
-    println!("  \x1b[1mTo start the mediator:\x1b[0m");
+    out!("  \x1b[1mTo start the mediator:\x1b[0m");
     if abs_config == "conf/mediator.toml" || abs_config.ends_with("/conf/mediator.toml") {
-        println!("    \x1b[36mmediator\x1b[0m");
+        out!("    \x1b[36mmediator\x1b[0m");
     } else {
-        println!("    \x1b[36mmediator -c {abs_config}\x1b[0m");
+        out!("    \x1b[36mmediator -c {abs_config}\x1b[0m");
     }
-    println!();
-    println!("  \x1b[2mThe mediator binary is installed at {install_location}/mediator\x1b[0m");
+    out!();
+    out!("  \x1b[2mThe mediator binary is installed at {install_location}/mediator\x1b[0m");
 }
 
 /// Offer to install the mediator after configuration.
@@ -2219,9 +2527,7 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
     // Try to find workspace root
     let workspace_root = find_workspace_root();
 
-    println!(
-        "\n  \x1b[38;5;69m\u{2501}\u{2501}\u{2501} Next Steps \u{2501}\u{2501}\u{2501}\x1b[0m\n"
-    );
+    out!("\n  \x1b[38;5;69m\u{2501}\u{2501}\u{2501} Next Steps \u{2501}\u{2501}\u{2501}\x1b[0m\n");
 
     // Determine build directory first — we need it for both install and manual instructions
     let build_dir = if let Some(root) = workspace_root {
@@ -2231,9 +2537,9 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
             "cargo {}",
             build_install_args(&features, needs_explicit, None).join(" ")
         );
-        println!("  \x1b[33mCannot find workspace root.\x1b[0m");
+        out!("  \x1b[33mCannot find workspace root.\x1b[0m");
         print_manual_instructions(&install_cmd, &build_cmd, config);
-        print_final_summary(config);
+        print_final_summary(config, true);
         return;
     };
 
@@ -2254,11 +2560,11 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
                 build_install_args(&features, needs_explicit, None).join(" ")
             );
             print_manual_instructions(&install_cmd, &build_cmd, config);
-            print_final_summary(config);
+            print_final_summary(config, true);
             return;
         }
         Some(2) | None => {
-            print_final_summary(config);
+            print_final_summary(config, true);
             return;
         }
         _ => {} // Install now (0)
@@ -2268,7 +2574,7 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".to_string());
     let default_bin = format!("{cargo_home}/bin");
 
-    println!();
+    out!();
     print!("  \x1b[1mInstall location\x1b[0m [{default_bin}]: ");
     let _ = io::stdout().flush();
 
@@ -2278,7 +2584,7 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
         if trimmed.is_empty() || trimmed == default_bin {
             None
         } else {
-            println!(
+            out!(
                 "\n  \x1b[33mNote: installing to a custom path may require elevated \
                  permissions (sudo).\x1b[0m"
             );
@@ -2302,14 +2608,14 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
     // the build succeeds, so a "retry with different flags" or
     // "inspect why this rebuilt everything" follow-up doesn't need
     // them to chase the recipe or memo the feature set.
-    println!("\n  \x1b[1mInstall command:\x1b[0m");
-    println!(
+    out!("\n  \x1b[1mInstall command:\x1b[0m");
+    out!(
         "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
         build_dir.display()
     );
-    println!("    \x1b[36m{install_cmd}\x1b[0m\n");
+    out!("    \x1b[36m{install_cmd}\x1b[0m\n");
 
-    println!(
+    out!(
         "  \x1b[38;5;69mInstalling mediator to {install_location} \
          (this may take a few minutes)...\x1b[0m\n"
     );
@@ -2321,22 +2627,22 @@ fn offer_build_and_guidance(config: &app::WizardConfig) {
 
     match status {
         Ok(exit) if exit.success() => {
-            println!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
+            out!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
             print_run_command(&config.config_path, &install_location);
         }
         Ok(exit) => {
-            eprintln!("\n  \x1b[31m\u{2718} Install failed (exit code: {exit})\x1b[0m");
-            eprintln!("  Check the output above for errors. You can retry with:");
-            eprintln!("    cd {} && {}", build_dir.display(), install_cmd);
+            err!("\n  \x1b[31m\u{2718} Install failed (exit code: {exit})\x1b[0m");
+            err!("  Check the output above for errors. You can retry with:");
+            err!("    cd {} && {}", build_dir.display(), install_cmd);
         }
         Err(e) => {
-            eprintln!("\n  \x1b[31mFailed to run cargo: {e}\x1b[0m");
-            eprintln!("  Is cargo installed and in your PATH?");
+            err!("\n  \x1b[31mFailed to run cargo: {e}\x1b[0m");
+            err!("  Is cargo installed and in your PATH?");
             print_manual_instructions(&install_cmd, &build_cmd, config);
         }
     }
 
-    print_final_summary(config);
+    print_final_summary(config, true);
 }
 
 /// Print manual build/run instructions when auto-install is skipped or fails.
@@ -2351,84 +2657,107 @@ fn print_manual_instructions(install_cmd: &str, build_cmd: &str, config: &app::W
         String::new()
     };
 
-    println!("  \x1b[1mOption 1 — Install (recommended):\x1b[0m");
-    println!("    \x1b[36m{install_cmd}\x1b[0m");
-    println!("    \x1b[36mmediator -c {abs_config}\x1b[0m");
-    println!();
-    println!("  \x1b[1mOption 2 — Build and run from source:\x1b[0m");
-    println!("    \x1b[36m{build_cmd}\x1b[0m");
-    println!(
+    out!("  \x1b[1mOption 1 — Install (recommended):\x1b[0m");
+    out!("    \x1b[36m{install_cmd}\x1b[0m");
+    out!("    \x1b[36mmediator -c {abs_config}\x1b[0m");
+    out!();
+    out!("  \x1b[1mOption 2 — Build and run from source:\x1b[0m");
+    out!("    \x1b[36m{build_cmd}\x1b[0m");
+    out!(
         "    \x1b[36mcargo run --release -p affinidi-messaging-mediator{run_features_flag} -- -c {abs_config}\x1b[0m"
     );
 }
 
 /// Print a final summary of everything that was created and what to do next.
-fn print_final_summary(config: &app::WizardConfig) {
+/// `recipe_saved` is false for `--from` runs, which do not write a recipe.
+fn print_final_summary(config: &app::WizardConfig, recipe_saved: bool) {
     let abs_config = resolve_config_path(&config.config_path);
-    let config_dir = std::path::Path::new(&config.config_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
+    let config_dir = config_writer::config_dir(config);
 
-    println!("\n  \x1b[38;5;69m\u{2501}\u{2501}\u{2501} Summary \u{2501}\u{2501}\u{2501}\x1b[0m\n");
+    out!("\n  \x1b[38;5;69m\u{2501}\u{2501}\u{2501} Summary \u{2501}\u{2501}\u{2501}\x1b[0m\n");
 
     // Files created
-    println!("  \x1b[1mFiles created:\x1b[0m");
-    println!("    \x1b[36m{abs_config}\x1b[0m  — mediator configuration");
-    println!(
+    out!("  \x1b[1mFiles created:\x1b[0m");
+    out!("    \x1b[36m{abs_config}\x1b[0m  — mediator configuration");
+    out!(
         "    \x1b[36m{}\x1b[0m  — Redis Lua functions",
         config_dir.join("atm-functions.lua").display()
     );
 
     let recipe_path = config_dir.join("mediator-build.toml");
-    println!(
-        "    \x1b[36m{}\x1b[0m  — build recipe (reproducible setup)",
-        recipe_path.display()
-    );
+    if recipe_saved {
+        out!(
+            "    \x1b[36m{}\x1b[0m  — build recipe (reproducible setup)",
+            recipe_path.display()
+        );
+    }
 
     if config.secret_storage == STORAGE_FILE {
         // The unified backend writes to the operator's configured
         // `[secrets].storage` path — show that, not a hard-coded
         // `<config_dir>/secrets.json`.
-        println!(
+        out!(
             "    \x1b[36m{}\x1b[0m  — \x1b[33mprivate keys (keep secure!)\x1b[0m",
             config.secret_file_path
         );
     }
 
     if config.ssl_mode == SSL_SELF_SIGNED {
-        println!("    \x1b[36mkeys/end.cert\x1b[0m  — SSL certificate (beside mediator.toml)");
-        println!("    \x1b[36mkeys/end.key\x1b[0m   — SSL private key (beside mediator.toml)");
+        out!("    \x1b[36mkeys/end.cert\x1b[0m  — SSL certificate (beside mediator.toml)");
+        out!("    \x1b[36mkeys/end.key\x1b[0m   — SSL private key (beside mediator.toml)");
     }
 
     if config.did_method == DID_WEBVH {
         let did_log_path = config_dir.join("did.jsonl");
-        println!(
+        out!(
             "    \x1b[36m{}\x1b[0m  — did:webvh log entry",
             did_log_path.display()
         );
     }
 
     if config.deployment_type == DEPLOYMENT_CONTAINER {
-        println!("    \x1b[36mDockerfile\x1b[0m  — container build file");
-        println!("    \x1b[36mdocker-compose.yml\x1b[0m  — mediator + Redis self-contained stack");
+        out!(
+            "    \x1b[36m{}\x1b[0m  — container build file",
+            config_dir.join("Dockerfile").display()
+        );
+        out!(
+            "    \x1b[36m{}\x1b[0m  — mediator + Redis stack",
+            config_dir.join("docker-compose.yml").display()
+        );
     }
+    out!(
+        "    \x1b[36m{}\x1b[0m  — list of these files, for --uninstall",
+        reprovision::manifest_path(Path::new(&config.config_path)).display()
+    );
 
     // Key information
     if config.secret_storage != STORAGE_FILE {
-        println!();
-        println!("  \x1b[1mSecrets:\x1b[0m");
-        println!("    Stored in: \x1b[36m{}\x1b[0m", config.secret_storage);
+        out!();
+        out!("  \x1b[1mSecrets:\x1b[0m");
+        out!(
+            "    Stored in: \x1b[36m{}\x1b[0m",
+            affinidi_messaging_mediator_common::redact::redact_url(
+                &config_writer::build_backend_url(config)
+            )
+        );
     }
 
-    // Reproduce
-    println!();
-    println!("  \x1b[1mReproduce this setup:\x1b[0m");
-    println!(
-        "    \x1b[36mmediator-setup --from {}\x1b[0m",
-        recipe_path.display()
+    out!();
+    out!(
+        "  \x1b[1mNetwork posture:\x1b[0m {}",
+        network_summary(config)
     );
 
-    println!();
+    if recipe_saved {
+        out!();
+        out!("  \x1b[1mReproduce this setup:\x1b[0m");
+        out!(
+            "    \x1b[36mmediator-setup --from {}\x1b[0m",
+            recipe_path.display()
+        );
+    }
+
+    out!();
 }
 
 /// stderr logging for the headless modes. `RUST_LOG` overrides the
@@ -3170,5 +3499,292 @@ mod generate_and_write_tests {
         // independent of jwt_mode.
         assert!(unified_text.contains(affinidi_messaging_mediator_common::OPERATING_SECRETS));
         assert!(unified_text.contains(affinidi_messaging_mediator_common::ADMIN_CREDENTIAL));
+    }
+
+    fn admin_only_session() -> vta::VtaSession {
+        vta::VtaSession::admin_only(
+            "mediator".into(),
+            "did:webvh:vta.example.com".into(),
+            None,
+            None,
+            "did:key:z6MkVtaCredential".into(),
+            "zVtaCredentialPrivate".into(),
+        )
+    }
+
+    // ── #154: the re-run guard keys on the backend being written ──────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn a_second_setup_into_the_same_backend_is_refused() {
+        // A different config path used to bypass the guard and silently
+        // replace the live mediator's keys.
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let first = did_peer_config(&dir);
+        generate_and_write(
+            &first,
+            None,
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap();
+        let before = std::fs::read(dir.join("unified-secrets.json")).unwrap();
+
+        let mut second = did_peer_config(&dir);
+        second.config_path = dir
+            .join("other")
+            .join("mediator.toml")
+            .to_string_lossy()
+            .into_owned();
+        let err = generate_and_write(
+            &second,
+            None,
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(exit::code_of(&err), exit::REFUSED_EXISTING, "{err:#}");
+        assert!(!dir.join("other").join("mediator.toml").exists());
+        assert_eq!(
+            std::fs::read(dir.join("unified-secrets.json")).unwrap(),
+            before,
+            "the refused run must not touch the backend"
+        );
+
+        // --force-reprovision proceeds, and the replaced config is backed up.
+        let mut options =
+            GenerateOptions::for_tests(false, secret_backend::ProvisionProbe::ReadWrite);
+        options.force_reprovision = true;
+        generate_and_write_with(&first, None, &options)
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let backups: Vec<_> = std::fs::read_dir(dir.join("conf"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("mediator.toml.bak.")
+            })
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "one timestamped backup of the replaced config"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn entries_this_run_already_persisted_do_not_trip_the_guard() {
+        // The TUI stores a VTA session's credential as soon as it connects;
+        // the final pass must recognise those entries as its own.
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let config = did_peer_config(&dir);
+        let session = admin_only_session();
+        let url = config_writer::build_backend_url(&config);
+        let store = secret_backend::open_secret_backend(&url).unwrap();
+        secret_backend::store_vta_session(&store, &session)
+            .await
+            .unwrap();
+        generate_and_write(
+            &config,
+            Some(&session),
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap();
+    }
+
+    // ── #173: the admin choice is honoured with a VTA session ─────────
+
+    #[tokio::test]
+    async fn generated_admin_is_separate_from_the_vta_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = admin_only_session();
+        let mut config = did_peer_config(dir.path());
+
+        config.admin_did_mode = ADMIN_GENERATE.into();
+        let a = mint_artefacts(&config, Some(&session)).await.unwrap();
+        let admin = a.admin_did.unwrap();
+        assert!(admin.starts_with("did:key:"));
+        assert_ne!(admin, session.admin_did());
+        assert!(a.admin_secret.is_some());
+
+        config.admin_did_mode = ADMIN_VTA.into();
+        let a = mint_artefacts(&config, Some(&session)).await.unwrap();
+        assert_eq!(a.admin_did.as_deref(), Some(session.admin_did()));
+        assert!(a.admin_secret.is_none());
+
+        config.admin_did_mode = ADMIN_PASTE.into();
+        config.admin_did = "did:web:admin.example.com".into();
+        let a = mint_artefacts(&config, Some(&session)).await.unwrap();
+        assert_eq!(a.admin_did.as_deref(), Some("did:web:admin.example.com"));
+        assert!(a.admin_secret.is_none());
+
+        config.admin_did = String::new();
+        let err = mint_artefacts(&config, Some(&session)).await.err().unwrap();
+        assert_eq!(exit::code_of(&err), exit::IMPORT_WITHOUT_DATA);
+
+        config.admin_did_mode = ADMIN_VTA.into();
+        let err = mint_artefacts(&config, None).await.err().unwrap();
+        assert_eq!(exit::code_of(&err), exit::NO_VTA_SESSION);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn vta_flow_with_generated_admin_writes_the_separate_admin() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let mut config = did_peer_config(&dir);
+        config.use_vta = true;
+        config.vta_mode = VTA_MODE_ONLINE.into();
+        let session = admin_only_session();
+        generate_and_write(
+            &config,
+            Some(&session),
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap();
+
+        // The backend's admin credential is the VTA credential…
+        let store = secret_backend::open_secret_backend(&config_writer::build_backend_url(&config))
+            .unwrap();
+        let cred = store.load_admin_credential().await.unwrap().unwrap();
+        assert_eq!(cred.did, session.admin_did());
+        // …while mediator.toml's admin_did is the generated one, whose key
+        // is in admin-monitor.json.
+        let toml = std::fs::read_to_string(dir.join("conf").join("mediator.toml")).unwrap();
+        assert!(!toml.contains(session.admin_did()), "{toml}");
+        assert!(dir.join("conf").join("admin-monitor.json").exists());
+    }
+
+    // ── #166: no placeholder DIDs ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn vta_did_without_a_session_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = did_peer_config(dir.path());
+        config.did_method = DID_VTA.into();
+        let err = mint_artefacts(&config, None).await.err().unwrap();
+        assert_eq!(exit::code_of(&err), exit::NO_VTA_SESSION);
+
+        config.did_method = DID_IMPORT.into();
+        let err = mint_artefacts(&config, None).await.err().unwrap();
+        assert_eq!(exit::code_of(&err), exit::IMPORT_WITHOUT_DATA);
+    }
+
+    // ── #150 / #176 / #185: did:webvh artefacts, paths, manifest ──────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn webvh_setup_stores_update_keys_and_points_at_the_written_log() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let mut config = did_peer_config(&dir);
+        config.did_method = DID_WEBVH.into();
+        config.public_url = "https://localhost:7037".into();
+        generate_and_write(
+            &config,
+            None,
+            true,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap();
+
+        // The update + pre-rotation keys are in their own backend entry.
+        let store = secret_backend::open_secret_backend(&config_writer::build_backend_url(&config))
+            .unwrap();
+        let keys: generators::did_webvh::WebvhUpdateKeys = store
+            .load_entry(WEBVH_UPDATE_KEYS, KIND_WEBVH_UPDATE_KEYS)
+            .await
+            .unwrap()
+            .expect("update keys stored");
+        let log = std::fs::read_to_string(dir.join("conf").join("did.jsonl")).unwrap();
+        assert!(log.contains(&keys.update_key.get_public_keymultibase().unwrap()));
+
+        // did_web_self_hosted names the file actually written, absolutely.
+        let toml = std::fs::read_to_string(dir.join("conf").join("mediator.toml")).unwrap();
+        let expected = format!("file://{}", dir.join("conf").join("did.jsonl").display());
+        assert!(
+            toml.contains(&format!("did_web_self_hosted = \"{expected}\"")),
+            "{toml}"
+        );
+
+        // The manifest lists what uninstall must remove.
+        let manifest =
+            std::fs::read_to_string(dir.join("conf").join(reprovision::MANIFEST_FILE)).unwrap();
+        for name in [
+            "mediator.toml",
+            "did.jsonl",
+            "admin-monitor.json",
+            "mediator-build.toml",
+        ] {
+            assert!(manifest.contains(name), "{name} missing from {manifest}");
+        }
+        assert!(manifest.contains("unified-secrets.json"));
+    }
+
+    // ── #162: ordering and partial failure ────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn a_failed_did_log_write_is_fatal_and_leaves_no_config() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let mut config = did_peer_config(&dir);
+        config.did_method = DID_WEBVH.into();
+        config.public_url = "https://localhost:7037".into();
+        // A directory where did.jsonl should go makes its write fail.
+        std::fs::create_dir_all(dir.join("conf").join("did.jsonl")).unwrap();
+        let err = generate_and_write(
+            &config,
+            None,
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("did.jsonl"), "{err:#}");
+        assert!(
+            !dir.join("conf").join("mediator.toml").exists(),
+            "no config may reference a DID log that was not written"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn a_publish_failure_reports_a_complete_setup_with_its_exit_code() {
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let mut config = did_peer_config(&dir);
+        // The target's parent is a file, so publishing cannot create it.
+        std::fs::write(dir.join("blocker"), "").unwrap();
+        config.did_target = Some(format!(
+            "file://{}",
+            dir.join("blocker").join("did.txt").display()
+        ));
+        let err = generate_and_write(
+            &config,
+            None,
+            false,
+            secret_backend::ProvisionProbe::ReadWrite,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(exit::code_of(&err), exit::PUBLISH_FAILED);
+        assert!(err.to_string().contains("Setup complete"), "{err}");
+        // Everything local was written first.
+        assert!(dir.join("conf").join("mediator.toml").exists());
     }
 }
