@@ -25,6 +25,7 @@ use affinidi_messaging_mediator_common::store::{PurgeFilter, PurgeReport, ops};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_mediator_common::types::audit::AuditAction;
 use affinidi_messaging_mediator_common::types::messages::{Folder, MessageProtocol};
+use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde::de::DeserializeOwned;
@@ -643,13 +644,20 @@ pub(crate) async fn consume_message_get(
         ));
     };
     if stored.size > MESSAGE_GET_MAX_BYTES {
-        return Err(tt_problem(
-            session,
+        // The size is also the first argument, which a `trust-task-error`
+        // carries as `details.size`.
+        return Err(MediatorError::problem(
+            37,
+            &session.session_id,
+            None,
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
             "messaging/message/get:messageTooLarge",
-            format!(
+            &format!(
                 "message {msg_id} is {} bytes; the limit is {MESSAGE_GET_MAX_BYTES}",
                 stored.size
             ),
+            vec![stored.size.to_string()],
             StatusCode::PAYLOAD_TOO_LARGE,
         ));
     }

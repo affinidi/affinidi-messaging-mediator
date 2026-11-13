@@ -14,6 +14,7 @@ pub mod message_pickup;
 pub mod ping;
 #[cfg(feature = "didcomm")]
 pub mod routing;
+pub(crate) mod trust_task_error;
 pub(crate) mod trust_task_sign;
 pub(crate) mod trust_task_verify;
 pub(crate) mod trust_task_versions;

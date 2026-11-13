@@ -547,7 +547,7 @@ pub(crate) async fn handle_inbound_tsp(
 }
 
 #[cfg(feature = "tsp")]
-use crate::mux::tasks::ACK_RESPONSE_TYPE as MUX_ACK_RESPONSE_TYPE;
+use crate::messages::protocols::trust_task_error;
 
 /// Answer a management Trust Task that arrived over TSP.
 ///
@@ -583,7 +583,12 @@ async fn dispatch_tsp_trust_task(
 
     // The sender VID is the framework identity; TSP VIDs carry no key fragment,
     // so it is already the shape `consume` wants.
-    let Some(response) = trust_tasks::consume(
+    let request_type = doc.type_uri.to_string();
+    // A request that asks to be refused with a `trust-task-error` document
+    // is answered with one, sealed back like a response, in place of the
+    // problem report.
+    let refusing = trust_task_error::Refusing::asked_by(&doc);
+    let consumed = trust_tasks::consume(
         doc,
         raw,
         state,
@@ -592,13 +597,25 @@ async fn dispatch_tsp_trust_task(
         now_secs,
         trust_tasks::TaskTransport::Tsp,
     )
-    .await
-    .map_err(|e| e.threaded_to(&task_id))?
-    else {
+    .await;
+    let response = match consumed {
+        Ok(Some(response)) => response,
         // A ping identity mismatch emits nothing — same as the DIDComm path.
-        return Ok(InboundMessageResponse::Stored(
-            affinidi_messaging_sdk::messages::sending::InboundMessageList::default(),
-        ));
+        Ok(None) => {
+            return Ok(InboundMessageResponse::Stored(
+                affinidi_messaging_sdk::messages::sending::InboundMessageList::default(),
+            ));
+        }
+        Err(e) => {
+            let document = match &refusing {
+                Some(r) => r.document(&e, sender_vid, state).await,
+                None => None,
+            };
+            match document {
+                Some(doc) => doc,
+                None => return Err(e.threaded_to(&task_id)),
+            }
+        }
     };
 
     let identity = state.tsp_identity().await?;
@@ -637,11 +654,11 @@ async fn dispatch_tsp_trust_task(
         )
     })?;
 
-    // The answer to `messaging/mux/ack` is pushed to the connection only, not
-    // stored: acknowledging is idempotent, so a lost answer is recovered by
+    // The answer to `messaging/mux/ack`, or its refusal, is pushed to the
+    // connection only, not stored: acknowledging is idempotent, so a lost answer is recovered by
     // asking again, while a stored one would itself need acknowledging, and
     // the answer to that, without end (spec, consumer rule 4).
-    if response.get("type").and_then(serde_json::Value::as_str) == Some(MUX_ACK_RESPONSE_TYPE) {
+    if crate::mux::tasks::answer_is_pushed(&response, &request_type) {
         use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
         match state
             .database
