@@ -11,7 +11,7 @@
 //!
 //! **Cancellation:** a request whose client goes away before the response is
 //! ready has its future dropped mid-flight. The accounting lives in a drop
-//! guard ([`InFlight`]), so the in-flight gauge is always given back, and the
+//! guard (`InFlight`), so the in-flight gauge is always given back, and the
 //! request is still counted and logged, with the outcome `cancelled` in place
 //! of a status code.
 //!
