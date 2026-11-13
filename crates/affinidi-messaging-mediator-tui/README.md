@@ -84,7 +84,7 @@ is reported plainly.
 | `5` | **Accounts** *(admin)* | Every account on the mediator: name, hash, role (coloured), receive and send depth, bytes queued, access-list size. The mediator and administrators come first, then accounts you've named, then the rest. `⏎` opens one. Works on older mediators too. |
 | `6` | **Config** *(admin)* | The mediator's configuration: key, value, source (`override` when a patch set it) and whether a change applies live or at restart. A **rootAdmin** can change a `limits.*` value (`⏎`) or reset an override (`x`); a patch can tighten a limit, not loosen it past the configuration. |
 | `7` | **Mux** *(admin)* | Live mux connections and the member DIDs each carries. `g` lists the selected connection's stored grants. |
-| `8` | **Grants** *(admin)* | Stored mux grants of a principal or member DID (`/` to look one up): member, principal, state, scope, expiry, the epoch each was signed under, and the member's current epoch. `d` revokes the selected grant, `D` every grant listed, `E` advances the member's epoch (voiding every grant it gave). Each asks for confirmation first. Needs mediator 0.52.0. |
+| `8` | **Grants** *(admin)* | Stored mux grants of a principal or member DID (`/` to look one up): member, principal, state, scope, expiry, the epoch each was signed under, and the member's current epoch. `d` revokes the selected grant — or, with grants marked (`space`, `a`), every marked grant, each on its own — `D` every grant listed, `E` advances the member's epoch (voiding every grant it gave). Each asks for confirmation first; a bulk revocation then lists every grant it did not revoke, and why. Needs mediator 0.52.0. |
 
 **Quota bars** shade smoothly from green through amber to red along the bar,
 so how full a queue is shows as colour at its leading edge. They use 24-bit
@@ -108,7 +108,9 @@ to 256 colours, then to three plain colours; `NO_COLOR` switches colour off.
 | `g` | Mux | the selected connection's **stored grants** |
 | `/` | Grants | **find** grants by principal DID, member DID, or both |
 | `p` / `g` | Grants | list the selected grant's principal's / member's grants |
-| `d` / `D` | Grants | **revoke** the selected grant / every grant listed (asks for confirmation) |
+| `space` | Grants | **mark** the selected grant (or unmark it) and move down |
+| `a` / `c` | Grants | mark every grant listed / clear the marks |
+| `d` / `D` | Grants | **revoke** the marked grants (or the selected one, with none marked) / every grant listed (asks for confirmation). Marked grants are revoked one at a time: a refusal — a rootAdmin party's grant is protected — leaves the rest to go ahead, and every grant not revoked is listed with why and stays marked |
 | `E` | Grants | **advance the member's epoch**: shows its current epoch, and names only that one, so nothing changes if it moved on meanwhile |
 | `]` | Grants | load the next page |
 | `m` | anywhere | show or hide the **traffic monitor**; an administrator watching everything also sees mux members attach and detach |

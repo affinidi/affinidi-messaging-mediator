@@ -137,6 +137,181 @@ fn summarise(
     out
 }
 
+/// One stored grant, by the member DID that gave it and its id — unique on
+/// that member's record. What a bulk revocation names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GrantKey {
+    pub member: String,
+    pub grant_id: String,
+}
+
+impl GrantKey {
+    pub fn new(member: impl Into<String>, grant_id: impl Into<String>) -> Self {
+        Self {
+            member: member.into(),
+            grant_id: grant_id.into(),
+        }
+    }
+}
+
+/// What a bulk revocation did to one grant.
+#[derive(Debug)]
+pub enum GrantRevokeResult {
+    /// The mediator revoked it.
+    Revoked,
+    /// It named no stored grant: already revoked or expired, by this
+    /// console or anyone else. Nothing was revoked by this request.
+    NotStored,
+    /// The mediator refused, or the console knew it would: nothing about
+    /// this grant changed. A `…:protectedAccount` refusal is a rootAdmin
+    /// party's grant, which only a rootAdmin may revoke.
+    Refused(ConsoleError),
+    /// The request or its answer was lost in transit: the grant may or may
+    /// not be revoked. List the grants again to see.
+    Unconfirmed(ConsoleError),
+    /// Not sent: an earlier grant's request was lost in transit, so the
+    /// rest were left for another try rather than each waiting out the
+    /// same failure.
+    NotAttempted,
+}
+
+impl GrantRevokeResult {
+    /// One grant's revocation, read from what `admin-revoke` answered for
+    /// it alone: revoked only when the answer lists it as revoked.
+    pub fn from_round(
+        grant_id: &str,
+        revoked: &[String],
+        unmatched: &[String],
+        stopped: &MuxAdminRevokeStop,
+    ) -> Self {
+        if revoked.iter().any(|g| g == grant_id) {
+            return Self::Revoked;
+        }
+        if unmatched.iter().any(|g| g == grant_id) {
+            return Self::NotStored;
+        }
+        match stopped {
+            MuxAdminRevokeStop::Failed(e) => {
+                Self::from_error(ConsoleError::from_call(clone_atm_error(e)))
+            }
+            // Answered, but it was neither revoked nor reported missing.
+            _ => Self::Refused(ConsoleError::Unexpected(format!(
+                "grant {grant_id} was neither revoked nor reported missing"
+            ))),
+        }
+    }
+
+    /// A failed request for one grant: a refusal changed nothing; anything
+    /// else leaves the outcome unknown.
+    pub fn from_error(e: ConsoleError) -> Self {
+        match e {
+            ConsoleError::Refused { .. }
+            | ConsoleError::NotPermitted(_)
+            | ConsoleError::Invalid(_) => Self::Refused(e),
+            other => Self::Unconfirmed(other),
+        }
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        matches!(self, Self::Revoked)
+    }
+
+    /// The result in a few words, for a per-grant line.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Revoked => "revoked".into(),
+            Self::NotStored => "no longer stored (nothing revoked)".into(),
+            Self::Refused(e) => format!("refused: {}", e.explain()),
+            Self::Unconfirmed(e) => {
+                format!("not confirmed (list again to see): {}", e.explain())
+            }
+            Self::NotAttempted => "not sent (an earlier request was lost)".into(),
+        }
+    }
+}
+
+/// The ATM error a stop carried, as an owned value (`ATMError` is not
+/// `Clone`): a problem report keeps its code and comment, anything else its
+/// text.
+fn clone_atm_error(
+    e: &affinidi_messaging_sdk::errors::ATMError,
+) -> affinidi_messaging_sdk::errors::ATMError {
+    use affinidi_messaging_sdk::errors::ATMError;
+    match e {
+        ATMError::ProblemReport(code, comment, escalate) => {
+            ATMError::ProblemReport(code.clone(), comment.clone(), escalate.clone())
+        }
+        other => ATMError::MsgSendError(other.to_string()),
+    }
+}
+
+/// What a bulk revocation did, grant by grant, in the order asked.
+#[derive(Debug, Default)]
+pub struct BulkRevokeOutcome {
+    pub results: Vec<(GrantKey, GrantRevokeResult)>,
+}
+
+impl BulkRevokeOutcome {
+    /// The grants the mediator revoked.
+    pub fn revoked(&self) -> impl Iterator<Item = &GrantKey> {
+        self.results
+            .iter()
+            .filter(|(_, r)| r.is_revoked())
+            .map(|(k, _)| k)
+    }
+
+    /// Whether every grant was revoked.
+    pub fn all_revoked(&self) -> bool {
+        self.results.iter().all(|(_, r)| r.is_revoked())
+    }
+
+    /// What it did, in a sentence: how many of how many were revoked, and
+    /// how many of the rest were missing, refused, unconfirmed or not sent.
+    /// Never counts a grant as revoked that the mediator did not report.
+    pub fn summary(&self) -> String {
+        let count =
+            |f: fn(&GrantRevokeResult) -> bool| self.results.iter().filter(|(_, r)| f(r)).count();
+        let revoked = count(|r| matches!(r, GrantRevokeResult::Revoked));
+        let mut out = format!("revoked {revoked} of {} grant(s)", self.results.len());
+        let rest = [
+            (
+                count(|r| matches!(r, GrantRevokeResult::NotStored)),
+                "no longer stored",
+            ),
+            (
+                count(|r| matches!(r, GrantRevokeResult::Refused(_))),
+                "refused",
+            ),
+            (
+                count(|r| matches!(r, GrantRevokeResult::Unconfirmed(_))),
+                "not confirmed",
+            ),
+            (
+                count(|r| matches!(r, GrantRevokeResult::NotAttempted)),
+                "not sent",
+            ),
+        ];
+        let rest: Vec<String> = rest
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        if !rest.is_empty() {
+            out.push_str(&format!("; {}", rest.join(", ")));
+        }
+        out
+    }
+
+    /// One line per grant that was not revoked: which grant, and why.
+    pub fn failures(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter(|(_, r)| !r.is_revoked())
+            .map(|(k, r)| format!("{} of {}: {}", k.grant_id, k.member, r.describe()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +382,102 @@ mod tests {
         let s = summarise(2, 0, 5, &contended);
         assert!(s.starts_with("revoked 2 grant(s); 5 still match"), "{s}");
         assert!(s.contains("busy"), "{s}");
+    }
+
+    fn refusal(code: &str) -> ConsoleError {
+        ConsoleError::Refused {
+            code: code.into(),
+            comment: "no".into(),
+        }
+    }
+
+    #[test]
+    fn a_grant_counts_as_revoked_only_when_the_answer_lists_it() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let done = MuxAdminRevokeStop::Done;
+        assert!(GrantRevokeResult::from_round("g1", &ids(&["g1"]), &[], &done).is_revoked());
+        assert!(matches!(
+            GrantRevokeResult::from_round("g1", &[], &ids(&["g1"]), &done),
+            GrantRevokeResult::NotStored
+        ));
+        // A different grant revoked is not this one.
+        assert!(!GrantRevokeResult::from_round("g1", &ids(&["g2"]), &[], &done).is_revoked());
+        // A later round's refusal is a refusal of this grant.
+        let failed = MuxAdminRevokeStop::Failed(ATMError::ProblemReport(
+            "e.p.messaging/mux/admin-revoke:protectedAccount".into(),
+            "rootAdmin".into(),
+            "NONE".into(),
+        ));
+        assert!(matches!(
+            GrantRevokeResult::from_round("g1", &[], &[], &failed),
+            GrantRevokeResult::Refused(ConsoleError::Refused { code, .. })
+                if code.ends_with(":protectedAccount")
+        ));
+    }
+
+    #[test]
+    fn a_refusal_changed_nothing_but_a_lost_request_is_unconfirmed() {
+        assert!(matches!(
+            GrantRevokeResult::from_error(refusal("e.p.x:protectedAccount")),
+            GrantRevokeResult::Refused(_)
+        ));
+        assert!(matches!(
+            GrantRevokeResult::from_error(ConsoleError::NotPermitted("admins only")),
+            GrantRevokeResult::Refused(_)
+        ));
+        assert!(matches!(
+            GrantRevokeResult::from_error(ConsoleError::Sdk(ATMError::TransportError(
+                "socket closed".into()
+            ))),
+            GrantRevokeResult::Unconfirmed(_)
+        ));
+    }
+
+    #[test]
+    fn a_bulk_outcome_reports_every_grant_and_claims_only_what_was_revoked() {
+        let outcome = BulkRevokeOutcome {
+            results: vec![
+                (GrantKey::new("did:m1", "g1"), GrantRevokeResult::Revoked),
+                (
+                    GrantKey::new("did:root", "g2"),
+                    GrantRevokeResult::Refused(refusal(
+                        "e.p.messaging/mux/admin-revoke:protectedAccount",
+                    )),
+                ),
+                (GrantKey::new("did:m1", "g3"), GrantRevokeResult::NotStored),
+                (
+                    GrantKey::new("did:m2", "g4"),
+                    GrantRevokeResult::Unconfirmed(ConsoleError::Connect("gone".into())),
+                ),
+                (
+                    GrantKey::new("did:m2", "g5"),
+                    GrantRevokeResult::NotAttempted,
+                ),
+            ],
+        };
+        assert!(!outcome.all_revoked());
+        assert_eq!(
+            outcome.summary(),
+            "revoked 1 of 5 grant(s); 1 no longer stored, 1 refused, 1 not confirmed, 1 not sent"
+        );
+        assert_eq!(
+            outcome.revoked().collect::<Vec<_>>(),
+            [&GrantKey::new("did:m1", "g1")]
+        );
+        let failures = outcome.failures();
+        assert_eq!(failures.len(), 4);
+        assert!(
+            failures[0].starts_with("g2 of did:root: refused"),
+            "{failures:?}"
+        );
+        assert!(failures[0].contains("only a rootAdmin"), "{failures:?}");
+        assert!(failures[2].contains("not confirmed"), "{failures:?}");
+
+        let clean = BulkRevokeOutcome {
+            results: vec![(GrantKey::new("did:m", "g"), GrantRevokeResult::Revoked)],
+        };
+        assert!(clean.all_revoked());
+        assert_eq!(clean.summary(), "revoked 1 of 1 grant(s)");
+        assert!(clean.failures().is_empty());
     }
 }

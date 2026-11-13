@@ -14,7 +14,7 @@ use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
 
 use crate::error::{ConsoleError, Result};
-use crate::grants::GrantSelection;
+use crate::grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection};
 use crate::identity::Identity;
 use crate::live::{LiveStream, MembershipFilter, MonitorFeed, MonitorFilter};
 use crate::purge::{PurgePlan, PurgeRequest};
@@ -732,6 +732,47 @@ impl MediatorConsole {
             )
             .await
             .map_err(ConsoleError::from_call)
+    }
+
+    /// Revoke each of `grants`, one `admin-revoke` request per grant, and
+    /// say what happened to each: revoked, no longer stored, refused (a
+    /// rootAdmin party's grant is `…:protectedAccount`), or unconfirmed when
+    /// a request was lost in transit — after which the rest are not sent.
+    ///
+    /// One request per grant because the mediator refuses a whole request
+    /// when any grant it selects is protected; asked one at a time, every
+    /// other grant is still revoked, and each refusal names its grant. A
+    /// grant is reported revoked only when the mediator's answer lists it.
+    pub async fn mux_revoke_each(&self, grants: &[GrantKey]) -> Result<BulkRevokeOutcome> {
+        self.require_admin("revoking stored mux grants")?;
+        self.require_mux_admin_release("messaging/mux/admin-revoke")?;
+        let mut outcome = BulkRevokeOutcome::default();
+        let mut lost = false;
+        for key in grants {
+            if lost {
+                outcome
+                    .results
+                    .push((key.clone(), GrantRevokeResult::NotAttempted));
+                continue;
+            }
+            let selection = GrantSelection::grants(&key.member, vec![key.grant_id.clone()]);
+            let result = match self.mux_revoke(&selection).await {
+                Ok(o) => {
+                    let revoked: Vec<String> =
+                        o.revoked.iter().map(|g| g.grant_id.to_string()).collect();
+                    let unmatched: Vec<String> = o
+                        .unmatched_grant_ids
+                        .iter()
+                        .map(|g| g.to_string())
+                        .collect();
+                    GrantRevokeResult::from_round(&key.grant_id, &revoked, &unmatched, &o.stopped)
+                }
+                Err(e) => GrantRevokeResult::from_error(e),
+            };
+            lost = matches!(result, GrantRevokeResult::Unconfirmed(_));
+            outcome.results.push((key.clone(), result));
+        }
+        Ok(outcome)
     }
 
     /// Advance member `did`'s mux epoch (`messaging/mux/admin-revoke-all`),

@@ -7,15 +7,15 @@
 //! on background tasks and comes back as [`Update`]s, so rendering never
 //! waits on the network.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use affinidi_messaging_mediator_admin::{
-    AddressBook, ConsoleError, GrantSelection, InspectedMessage, MediatorConsole, MembershipFilter,
-    Mode, MonitorFilter, MonitorUpdate, MuxConnectionsQuery, PurgePlan, PurgeRequest, account_hash,
-    revoke_summary, specs,
+    AddressBook, BulkRevokeOutcome, ConsoleError, GrantKey, GrantSelection, InspectedMessage,
+    MediatorConsole, MembershipFilter, Mode, MonitorFilter, MonitorUpdate, MuxConnectionsQuery,
+    PurgePlan, PurgeRequest, account_hash, revoke_summary, specs,
 };
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -123,6 +123,8 @@ pub enum Update {
         result: Result<Value, ConsoleError>,
         more: bool,
     },
+    /// The marked grants' revocation, grant by grant.
+    RevokedMarked(Result<BulkRevokeOutcome, ConsoleError>),
     /// A member DID's current mux epoch, read to confirm advancing it.
     Epoch {
         did: String,
@@ -196,6 +198,8 @@ enum Popup {
     },
     /// Revoke the grants a selection names.
     ConfirmRevoke(GrantSelection),
+    /// Revoke the marked grants, each on its own.
+    ConfirmRevokeMarked(Vec<GrantKey>),
     /// Advance member `did`'s epoch, voiding `epoch`.
     ConfirmBumpEpoch {
         did: String,
@@ -271,6 +275,8 @@ pub struct App {
     grants_epoch: Option<u64>,
     /// The cursor for the next page, when there is one.
     grants_next: Option<String>,
+    /// Grants marked for a bulk revocation.
+    grant_marks: GrantMarks,
     accounts: Vec<Value>,
     accounts_state: TableState,
     config: Vec<Value>,
@@ -336,6 +342,7 @@ impl App {
             grants_state: TableState::default().with_selected(Some(0)),
             grants_epoch: None,
             grants_next: None,
+            grant_marks: GrantMarks::default(),
             accounts: Vec::new(),
             accounts_state: TableState::default().with_selected(Some(0)),
             config: Vec::new(),
@@ -686,9 +693,16 @@ impl App {
         self.grants.clear();
         self.grants_epoch = None;
         self.grants_next = None;
+        self.grant_marks.clear();
         self.grants_state.select(Some(0));
         self.tab = Tab::Grants;
         self.refresh();
+    }
+
+    /// The grant under the cursor, as a bulk revocation names it.
+    fn selected_grant_key(&self) -> Option<GrantKey> {
+        let i = self.grants_state.selected()?;
+        grant_key(self.grants.get(i)?)
     }
 
     fn selected_grant_field(&self, field: &str) -> Option<String> {
@@ -754,6 +768,9 @@ impl App {
                         self.grants.extend(page);
                     } else {
                         self.grants = page;
+                        // A grant no longer listed can't be seen, so it
+                        // can't stay marked.
+                        self.grant_marks.retain_listed(&self.grants);
                     }
                     self.grants_epoch = v["epoch"].as_u64();
                     self.grants_next = v["nextCursor"].as_str().map(str::to_string);
@@ -765,6 +782,13 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
+            Update::RevokedMarked(r) => {
+                match r {
+                    Ok(outcome) => self.revoked_marked(outcome),
+                    Err(e) => self.error(e),
+                }
+                self.refresh();
+            }
             Update::Epoch { did, result } => match result {
                 Ok(epoch) => self.popup = Some(Popup::ConfirmBumpEpoch { did, epoch }),
                 Err(e) => self.error(e),
@@ -865,6 +889,46 @@ impl App {
     /// own loop. Apply it with [`App::apply`].
     pub async fn next_update(&mut self) -> Option<Update> {
         self.rx.recv().await
+    }
+
+    /// Report a bulk revocation: a summary, and every grant that was not
+    /// revoked with why. Those stay marked, to try again; the rest are gone.
+    fn revoked_marked(&mut self, outcome: BulkRevokeOutcome) {
+        let summary = outcome.summary();
+        self.grant_marks.settle(&outcome);
+        if outcome.all_revoked() {
+            self.set_notice((summary, false));
+            return;
+        }
+        // Each grant not revoked, by its short id and its parties' names.
+        let failures: Vec<String> = outcome
+            .results
+            .iter()
+            .filter(|(_, r)| !r.is_revoked())
+            .map(|(key, result)| {
+                let principal = self
+                    .grants
+                    .iter()
+                    .find(|g| grant_key(g).as_ref() == Some(key))
+                    .and_then(|g| g["principal"].as_str())
+                    .map(|p| format!(" → {}", did_label(&self.book, p)))
+                    .unwrap_or_default();
+                format!(
+                    "• grant {} ({}{principal}): {}",
+                    short(&key.grant_id),
+                    did_label(&self.book, &key.member),
+                    result.describe()
+                )
+            })
+            .collect();
+        self.set_notice((summary.clone(), true));
+        self.popup = Some(Popup::Text {
+            title: " Not every grant was revoked ".into(),
+            body: format!(
+                "{summary}.\n\n{}\n\nThose not revoked stay marked.",
+                failures.join("\n")
+            ),
+        });
     }
 
     fn error(&mut self, e: ConsoleError) {
@@ -1024,6 +1088,28 @@ impl App {
                 Some(cursor) => self.load_grants(Some(cursor), GRANT_PAGE),
                 None => self.set_notice(("no more grants".into(), false)),
             },
+            (Tab::Grants, KeyCode::Char(' ')) => {
+                if let Some(key) = self.selected_grant_key() {
+                    self.grant_marks.toggle(key);
+                    self.move_selection(1);
+                }
+            }
+            (Tab::Grants, KeyCode::Char('a')) => {
+                self.grant_marks.mark_all(&self.grants);
+            }
+            (Tab::Grants, KeyCode::Char('c')) => self.grant_marks.clear(),
+            (Tab::Grants, KeyCode::Char('d')) if !self.grant_marks.is_empty() => {
+                self.popup = Some(Popup::ConfirmRevokeMarked(
+                    self.grant_marks.in_listed_order(&self.grants),
+                ));
+            }
+            (Tab::Grants, KeyCode::Char('E')) if !self.grant_marks.is_empty() => {
+                self.set_notice((
+                    "E advances one member's epoch, not the marked grants: c clears the marks"
+                        .into(),
+                    true,
+                ));
+            }
             (Tab::Grants, KeyCode::Char('d')) => {
                 if let (Some(member), Some(id)) = (
                     self.selected_grant_field("did"),
@@ -1307,6 +1393,11 @@ impl App {
                     Update::Done(c.mux_revoke(&selection).await.map(|o| revoke_summary(&o)))
                 });
             }
+            Popup::ConfirmRevokeMarked(keys) if yes => {
+                self.spawn(move |c| async move {
+                    Update::RevokedMarked(c.mux_revoke_each(&keys).await)
+                });
+            }
             Popup::ConfirmBumpEpoch { did, epoch } if yes => {
                 let name = did_label(&self.book, &did);
                 self.spawn(move |c| async move {
@@ -1343,6 +1434,7 @@ impl App {
             Popup::ConfirmDelete { .. }
             | Popup::ConfirmPurge(_)
             | Popup::ConfirmRevoke(_)
+            | Popup::ConfirmRevokeMarked(_)
             | Popup::ConfirmBumpEpoch { .. } => {
                 self.set_notice(("cancelled".into(), false));
             }
@@ -1663,6 +1755,7 @@ impl App {
             self.grants_epoch,
             self.grants.len(),
             self.grants_next.is_some(),
+            self.grant_marks.len(),
             &self.book,
         ));
         if self.grant_query.is_empty() {
@@ -1673,7 +1766,9 @@ impl App {
                      Press / to look one up by principal or member DID, or g on a \
                      connection in the Mux tab.\n\n\
                      On a grant: d revokes it, E advances its member's epoch (voiding every \
-                     grant the member gave), p and g list its principal's or member's grants.",
+                     grant the member gave), p and g list its principal's or member's grants. \
+                     Space marks grants (a marks every one listed, c clears) and d then \
+                     revokes the marked ones, each on its own.",
                 )
                 .wrap(Wrap { trim: false })
                 .block(block),
@@ -1701,7 +1796,10 @@ impl App {
                     })
                     .unwrap_or_default();
                 let narrowed = if g["narrowed"] == true { "*" } else { "" };
+                let marked = grant_key(g).is_some_and(|k| self.grant_marks.contains(&k));
                 Row::new(vec![
+                    Cell::from(if marked { "●" } else { " " })
+                        .style(Style::default().fg(Color::Magenta)),
                     Cell::from(did_label(&self.book, g["did"].as_str().unwrap_or("?"))),
                     Cell::from(did_label(
                         &self.book,
@@ -1718,6 +1816,7 @@ impl App {
         let table = Table::new(
             rows,
             [
+                Constraint::Length(1),
                 Constraint::Fill(2),
                 Constraint::Fill(2),
                 Constraint::Length(12),
@@ -1729,6 +1828,7 @@ impl App {
         )
         .header(
             Row::new(vec![
+                "",
                 "member",
                 "principal",
                 "state",
@@ -1922,7 +2022,7 @@ impl App {
                         "↑↓ select connection  g its grants  n name  b book  m monitor  r refresh  q quit"
                     }
                     Tab::Grants => {
-                        "/ find  ↑↓ select  p principal's  g member's  d revoke  D revoke all listed  E bump epoch  ] more  m monitor  q quit"
+                        "/ find  ↑↓ select  space mark  a mark all  c clear marks  d revoke (marked)  D revoke all listed  E bump epoch  p principal's  g member's  ] more  m monitor  q quit"
                     }
                     Tab::Accounts => {
                         "↑↓ select  ⏎ open  n name  b book  m monitor  r refresh  q quit"
@@ -3100,6 +3200,24 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
             ),
             true,
         ),
+        Popup::ConfirmRevokeMarked(keys) => {
+            let members = keys
+                .iter()
+                .map(|k| &k.member)
+                .collect::<BTreeSet<_>>()
+                .len();
+            (
+                " Revoke marked grants ".into(),
+                format!(
+                    "Revoke {} marked grant(s) of {members} member(s)?\n\n\
+                     Each is revoked on its own: one the mediator refuses (a rootAdmin's, \
+                     say) leaves the rest to go ahead, and you're told which.\n\n\
+                     y to confirm, any other key to cancel",
+                    keys.len()
+                ),
+                true,
+            )
+        }
         Popup::ConfirmBumpEpoch { did, epoch } => (
             " Advance a member's epoch ".into(),
             format!(
@@ -3402,6 +3520,7 @@ fn grants_title(
     epoch: Option<u64>,
     shown: usize,
     more: bool,
+    marked: usize,
     book: &AddressBook,
 ) -> String {
     let mut parts = Vec::new();
@@ -3422,7 +3541,78 @@ fn grants_title(
         ": {shown}{} ",
         if more { "+ (] for more)" } else { "" }
     ));
+    if marked > 0 {
+        title.push_str(&format!("· {marked} marked "));
+    }
     title
+}
+
+/// A listed grant as a bulk revocation names it: its member DID and id.
+fn grant_key(g: &Value) -> Option<GrantKey> {
+    Some(GrantKey::new(g["did"].as_str()?, g["grantId"].as_str()?))
+}
+
+/// The grants marked on the Grants tab for a bulk revocation.
+#[derive(Default, Debug)]
+struct GrantMarks(BTreeSet<GrantKey>);
+
+impl GrantMarks {
+    /// Mark `key`, or unmark it when marked.
+    fn toggle(&mut self, key: GrantKey) {
+        if !self.0.remove(&key) {
+            self.0.insert(key);
+        }
+    }
+
+    /// Mark every grant in `listed`.
+    fn mark_all(&mut self, listed: &[Value]) {
+        self.0.extend(listed.iter().filter_map(grant_key));
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn contains(&self, key: &GrantKey) -> bool {
+        self.0.contains(key)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Keep only the marks of grants in `listed`.
+    fn retain_listed(&mut self, listed: &[Value]) {
+        let listed: BTreeSet<GrantKey> = listed.iter().filter_map(grant_key).collect();
+        self.0.retain(|k| listed.contains(k));
+    }
+
+    /// The marked grants, in the order `listed` shows them.
+    fn in_listed_order(&self, listed: &[Value]) -> Vec<GrantKey> {
+        listed
+            .iter()
+            .filter_map(grant_key)
+            .filter(|k| self.0.contains(k))
+            .collect()
+    }
+
+    /// After a bulk revocation: unmark what is gone — revoked, or no longer
+    /// stored — and keep the rest marked, to try again.
+    fn settle(&mut self, outcome: &BulkRevokeOutcome) {
+        use affinidi_messaging_mediator_admin::GrantRevokeResult;
+        for (key, result) in &outcome.results {
+            if matches!(
+                result,
+                GrantRevokeResult::Revoked | GrantRevokeResult::NotStored
+            ) {
+                self.0.remove(key);
+            }
+        }
+    }
 }
 
 /// What advancing member `name`'s epoch did, in a sentence.
@@ -3517,7 +3707,7 @@ mod tests {
         let book = super::AddressBook::new();
         let none = super::GrantQuery::default();
         assert_eq!(
-            super::grants_title(&none, None, 0, false, &book),
+            super::grants_title(&none, None, 0, false, 0, &book),
             " Stored grants "
         );
         let member = super::GrantQuery {
@@ -3525,7 +3715,7 @@ mod tests {
             member: Some("did:ex:m".into()),
         };
         assert_eq!(
-            super::grants_title(&member, Some(2), 3, true, &book),
+            super::grants_title(&member, Some(2), 3, true, 0, &book),
             " Grants of member did:ex:m · member epoch 2: 3+ (] for more) "
         );
         let both = super::GrantQuery {
@@ -3533,8 +3723,112 @@ mod tests {
             member: Some("did:ex:m".into()),
         };
         assert_eq!(
-            super::grants_title(&both, None, 1, false, &book),
+            super::grants_title(&both, None, 1, false, 0, &book),
             " Grants of principal did:ex:p · member did:ex:m: 1 "
+        );
+        assert_eq!(
+            super::grants_title(&both, None, 4, false, 2, &book),
+            " Grants of principal did:ex:p · member did:ex:m: 4 · 2 marked "
+        );
+    }
+
+    fn listed(grants: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        grants
+            .iter()
+            .map(|(did, id)| serde_json::json!({ "did": did, "grantId": id, "principal": "did:p" }))
+            .collect()
+    }
+
+    #[test]
+    fn grants_are_marked_one_at_a_time_all_at_once_and_cleared() {
+        use affinidi_messaging_mediator_admin::GrantKey;
+        let rows = listed(&[("did:m1", "g1"), ("did:m1", "g2"), ("did:m2", "g1")]);
+        let mut marks = super::GrantMarks::default();
+        assert!(marks.is_empty());
+
+        // The same grant id under another member is another grant.
+        marks.toggle(GrantKey::new("did:m1", "g1"));
+        assert!(marks.contains(&GrantKey::new("did:m1", "g1")));
+        assert!(!marks.contains(&GrantKey::new("did:m2", "g1")));
+        // Toggling again unmarks.
+        marks.toggle(GrantKey::new("did:m1", "g1"));
+        assert!(marks.is_empty());
+
+        marks.mark_all(&rows);
+        assert_eq!(marks.len(), 3);
+        // Marking all again marks nothing twice.
+        marks.mark_all(&rows);
+        assert_eq!(marks.len(), 3);
+        marks.clear();
+        assert!(marks.is_empty());
+        // A row without a member or id can't be marked.
+        marks.mark_all(&[serde_json::json!({ "did": "did:m3" })]);
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn marks_follow_the_listing_and_are_revoked_in_its_order() {
+        use affinidi_messaging_mediator_admin::GrantKey;
+        let rows = listed(&[("did:m2", "g9"), ("did:m1", "g1"), ("did:m1", "g2")]);
+        let mut marks = super::GrantMarks::default();
+        marks.toggle(GrantKey::new("did:m1", "g2"));
+        marks.toggle(GrantKey::new("did:m2", "g9"));
+        assert_eq!(
+            marks.in_listed_order(&rows),
+            [GrantKey::new("did:m2", "g9"), GrantKey::new("did:m1", "g2")]
+        );
+        // A refresh that no longer lists a grant drops its mark.
+        marks.retain_listed(&listed(&[("did:m1", "g1"), ("did:m1", "g2")]));
+        assert_eq!(marks.len(), 1);
+        assert!(marks.contains(&GrantKey::new("did:m1", "g2")));
+    }
+
+    #[test]
+    fn after_a_bulk_revocation_only_the_grants_not_revoked_stay_marked() {
+        use affinidi_messaging_mediator_admin::{
+            BulkRevokeOutcome, ConsoleError, GrantKey, GrantRevokeResult,
+        };
+        let rows = listed(&[
+            ("did:m", "revoked"),
+            ("did:m", "gone"),
+            ("did:root", "protected"),
+            ("did:m", "lost"),
+            ("did:m", "unsent"),
+        ]);
+        let mut marks = super::GrantMarks::default();
+        marks.mark_all(&rows);
+        let key = |id: &str| {
+            GrantKey::new(
+                if id == "protected" {
+                    "did:root"
+                } else {
+                    "did:m"
+                },
+                id,
+            )
+        };
+        let outcome = BulkRevokeOutcome {
+            results: vec![
+                (key("revoked"), GrantRevokeResult::Revoked),
+                (key("gone"), GrantRevokeResult::NotStored),
+                (
+                    key("protected"),
+                    GrantRevokeResult::Refused(ConsoleError::Refused {
+                        code: "e.p.messaging/mux/admin-revoke:protectedAccount".into(),
+                        comment: "rootAdmin".into(),
+                    }),
+                ),
+                (
+                    key("lost"),
+                    GrantRevokeResult::Unconfirmed(ConsoleError::Connect("closed".into())),
+                ),
+                (key("unsent"), GrantRevokeResult::NotAttempted),
+            ],
+        };
+        marks.settle(&outcome);
+        assert_eq!(
+            marks.in_listed_order(&rows),
+            [key("protected"), key("lost"), key("unsent")]
         );
     }
 
