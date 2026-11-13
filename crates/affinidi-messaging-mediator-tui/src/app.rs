@@ -3816,6 +3816,7 @@ mod tests {
                     GrantRevokeResult::Refused(ConsoleError::Refused {
                         code: "e.p.messaging/mux/admin-revoke:protectedAccount".into(),
                         comment: "rootAdmin".into(),
+                        current_epoch: None,
                     }),
                 ),
                 (
@@ -3914,6 +3915,7 @@ mod tests {
         assert!(is_refusal(&ConsoleError::Refused {
             code: "e.p.req.unauthorized".into(),
             comment: "no".into(),
+            current_epoch: None,
         }));
         assert!(is_refusal(&ConsoleError::NotPermitted("monitor")));
         assert!(!is_refusal(&ConsoleError::Connect("dns error".into())));

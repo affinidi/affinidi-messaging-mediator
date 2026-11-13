@@ -23,6 +23,7 @@ use affinidi_messaging_mediator_common::{
         audit::{AuditAction, AuditLogEntry},
     },
 };
+use affinidi_messaging_sdk::errors::ATMError;
 use affinidi_messaging_sdk::messages::Folder;
 use affinidi_messaging_sdk::protocols::mux::{MuxCapability, MuxMembers, sign_attach, sign_grant};
 use affinidi_messaging_sdk::protocols::trust_tasks::ENVELOPE_TYPE;
@@ -68,14 +69,15 @@ async fn with_role(env: &TestEnvironment, alias: &str, role: AccountType) -> Tes
     user
 }
 
-/// A refusal: the problem report's body, as text, so a test can look for
-/// the code in it.
+/// A refusal, as the SDK reads it: a problem report or a `trust-task-error`.
 #[derive(Debug)]
-struct Refused(String);
+struct Refused(ATMError);
 
 impl Refused {
+    /// The mediator's code for the refusal ends with `code`
+    /// ([`ATMError::mediator_code`], the same for either form).
     fn has(&self, code: &str) -> bool {
-        self.0.contains(code)
+        self.0.mediator_code().is_some_and(|c| c.ends_with(code))
     }
 }
 
@@ -134,10 +136,10 @@ async fn task(
     {
         Ok(SendMessageResponse::Message(reply)) => reply,
         Ok(other) => panic!("expected a reply message, got {other:?}"),
-        Err(e) => return Err(Refused(e.to_string())),
+        Err(e) => return Err(Refused(e)),
     };
     if reply.typ.contains("problem-report") {
-        return Err(Refused(reply.body.to_string()));
+        return Err(Refused(ATMError::from_problem_report(&reply)));
     }
     assert_eq!(
         reply.body["type"],
@@ -702,7 +704,7 @@ async fn admin_revoke_all_advances_the_epoch_once() {
         r.has("messaging/mux/admin-revoke-all:epochMismatch"),
         "{r:?}"
     );
-    assert!(r.has("current epoch is 0"), "{r:?}");
+    assert_eq!(r.0.current_epoch(), Some(0), "{r:?}");
 
     let r = revoke_all(&env, &admin, json!({ "did": work.did, "epoch": 0 }))
         .await

@@ -314,6 +314,20 @@ fn retention_end(doc: &TrustTask<Value>, policy: SpecPolicy, now: DateTime<Utc>)
     })
 }
 
+/// The resolver proofs and mux statements look their signing keys up with.
+///
+/// `trust-tasks-proof` 0.38's [`CachedDidResolver`] refuses, before calling
+/// `client`, a DID naming `localhost` or a loopback, private-network or
+/// link-local IP literal. That guards against resolving a DID from an
+/// internal network (SSRF). It stays on in both resolver modes: in local mode
+/// it repeats the `DIDCacheClient`'s own `HostPolicy::PublicOnly`, and in
+/// network mode (`[did_resolver] address` set) it keeps the mediator from
+/// asking the resolver service to fetch an internal host on an attacker's
+/// behalf, whatever that service's own host policy is.
+pub(crate) fn signing_key_resolver(client: DIDCacheClient) -> CachedDidResolver {
+    CachedDidResolver::new(Arc::new(client))
+}
+
 /// The proof verifier: `eddsa` suites only, over keys the issuer's DID
 /// document lists under `authentication` or `assertionMethod`.
 ///
@@ -324,7 +338,7 @@ fn retention_end(doc: &TrustTask<Value>, policy: SpecPolicy, now: DateTime<Utc>)
 /// verification method to the in-band `issuer` (§4.7/§4.8), and the resolver
 /// refuses a key listed only under `keyAgreement`.
 pub(crate) fn proof_verifier(resolver: DIDCacheClient) -> Verifier {
-    Verifier::with_resolver(Arc::new(CachedDidResolver::new(Arc::new(resolver)))).with_options(
+    Verifier::with_resolver(Arc::new(signing_key_resolver(resolver))).with_options(
         VerifyOptions::new()
             .with_allowed_suites(vec![CryptoSuite::EddsaJcs2022, CryptoSuite::EddsaRdfc2022]),
     )
@@ -533,6 +547,37 @@ mod tests {
             run(doc, &did).await,
             Err(Rejection::ProofInvalid(_))
         ));
+    }
+
+    /// A DID on a private host is refused before resolution, in local and
+    /// in network mode alike: the resolver service is never asked for it.
+    #[tokio::test]
+    async fn private_did_hosts_are_refused_in_either_resolver_mode() {
+        const VM: &str = "did:webvh:QmScid:localhost%3A3000#key-0";
+        const REFUSED: &str = "names a host this resolver does not contact";
+
+        let local = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let err = signing_key_resolver(local)
+            .resolve_vm_for_purpose(VM, ProofPurpose::Authentication)
+            .await
+            .expect_err("local mode refuses a localhost DID");
+        assert!(err.to_string().contains(REFUSED), "{err}");
+
+        let remote = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_network_mode("ws://127.0.0.1:9/did/v1/ws")
+                .with_network_timeout(200)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let err = signing_key_resolver(remote)
+            .resolve_vm_for_purpose(VM, ProofPurpose::Authentication)
+            .await
+            .expect_err("network mode refuses it too");
+        assert!(err.to_string().contains(REFUSED), "{err}");
     }
 
     #[tokio::test]

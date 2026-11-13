@@ -186,7 +186,12 @@ async fn a_mediator_without_subscribe_0_2_is_watched_at_0_1_with_traffic_only() 
         .await
         .expect_err("0.2 is withheld");
     assert!(
-        format!("{refused:?}").contains("protocol.trust_task.unsupported"),
+        matches!(
+            refused.refusal_code(),
+            Some("unsupportedType" | "unsupportedVersion")
+        ) || refused
+            .mediator_code()
+            .is_some_and(|c| c.ends_with("protocol.trust_task.unsupported")),
         "{refused:?}"
     );
 

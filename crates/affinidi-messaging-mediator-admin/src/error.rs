@@ -19,10 +19,17 @@ pub enum ConsoleError {
     /// The connection to the mediator could not be established.
     #[error("connecting to the mediator: {0}")]
     Connect(String),
-    /// The mediator answered with a problem report: a refusal, with the stable
-    /// code a caller can act on and the mediator's explanation.
+    /// The mediator refused the request, with a problem report or a
+    /// `trust-task-error` document: the stable code a caller can act on (the
+    /// mediator's own, whichever form the refusal came in; see
+    /// [`ATMError::mediator_code`]), its explanation, and, for an
+    /// `…:epochMismatch`, the epoch in force.
     #[error("the mediator refused ({code}): {comment}")]
-    Refused { code: String, comment: String },
+    Refused {
+        code: String,
+        comment: String,
+        current_epoch: Option<u64>,
+    },
     /// The console's session cannot do this, so nothing was sent.
     #[error("not permitted for this session: {0}")]
     NotPermitted(&'static str),
@@ -41,12 +48,17 @@ pub enum ConsoleError {
 }
 
 impl ConsoleError {
-    /// Classify an SDK error: a problem report from the mediator is a
-    /// [`ConsoleError::Refused`], everything else stays an SDK error.
+    /// Classify an SDK error: a refusal from the mediator, as a problem
+    /// report or a `trust-task-error`, is a [`ConsoleError::Refused`];
+    /// everything else stays an SDK error.
     pub(crate) fn from_call(e: ATMError) -> Self {
-        match e {
-            ATMError::ProblemReport(code, comment, _) => ConsoleError::Refused { code, comment },
-            other => ConsoleError::Sdk(other),
+        match refusal(&e) {
+            Some((code, comment, current_epoch)) => ConsoleError::Refused {
+                code,
+                comment,
+                current_epoch,
+            },
+            None => ConsoleError::Sdk(e),
         }
     }
 
@@ -63,9 +75,7 @@ impl ConsoleError {
     /// named a later epoch than the current one.
     pub fn current_epoch(&self) -> Option<u64> {
         match self {
-            ConsoleError::Refused { code, comment } if code.ends_with(":epochMismatch") => {
-                epoch_in(comment)
-            }
+            ConsoleError::Refused { current_epoch, .. } => *current_epoch,
             _ => None,
         }
     }
@@ -75,9 +85,11 @@ impl ConsoleError {
     /// [`Display`](std::fmt::Display) renders it.
     pub fn explain(&self) -> String {
         match self {
-            ConsoleError::Refused { code, comment } => {
-                explain_refusal(code, comment).unwrap_or_else(|| self.to_string())
-            }
+            ConsoleError::Refused {
+                code,
+                comment,
+                current_epoch,
+            } => explain_refusal(code, comment, *current_epoch).unwrap_or_else(|| self.to_string()),
             other => other.to_string(),
         }
     }
@@ -86,11 +98,30 @@ impl ConsoleError {
 /// Shorthand for console results.
 pub type Result<T> = std::result::Result<T, ConsoleError>;
 
+/// A refusal by the mediator, in either form: its code (the mediator's own,
+/// [`ATMError::mediator_code`]; a problem report's keeps its `e.p.` prefix, as
+/// before), its explanation, and the epoch in force for an `epochMismatch`.
+/// `None` for any other failure.
+pub(crate) fn refusal(e: &ATMError) -> Option<(String, String, Option<u64>)> {
+    let comment = match e {
+        ATMError::ProblemReport(code, comment, _) => {
+            return Some((code.clone(), comment.clone(), e.current_epoch()));
+        }
+        ATMError::TrustTaskError(r) => r.message.clone().unwrap_or_else(|| r.code.clone()),
+        _ => return None,
+    };
+    Some((e.mediator_code()?.to_string(), comment, e.current_epoch()))
+}
+
 /// What a refusal of a stored-grant task means, by its code; `None` for a
 /// code without a plainer reading.
-pub(crate) fn explain_refusal(code: &str, comment: &str) -> Option<String> {
+pub(crate) fn explain_refusal(
+    code: &str,
+    comment: &str,
+    current_epoch: Option<u64>,
+) -> Option<String> {
     let text = if code.ends_with(":epochMismatch") {
-        match epoch_in(comment) {
+        match current_epoch {
             Some(n) => format!(
                 "the epoch changed after it was read: the current epoch is {n}. \
                  Read it again and confirm that one"
@@ -124,22 +155,63 @@ pub(crate) fn explain_refusal(code: &str, comment: &str) -> Option<String> {
     Some(text)
 }
 
-/// The number after "current epoch is" in an `epochMismatch` message.
-fn epoch_in(comment: &str) -> Option<u64> {
-    let (_, rest) = comment.split_once("current epoch is ")?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn refused(code: &str, comment: &str) -> ConsoleError {
-        ConsoleError::Refused {
-            code: code.into(),
-            comment: comment.into(),
-        }
+        ConsoleError::from_call(ATMError::ProblemReport(
+            code.into(),
+            comment.into(),
+            "NONE".into(),
+        ))
+    }
+
+    fn document(code: &str, message: &str, details: serde_json::Value) -> ConsoleError {
+        let refusal =
+            affinidi_messaging_sdk::errors::TrustTaskRefusal::from_document(&serde_json::json!({
+                "id": "e1",
+                "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+                "payload": {
+                    "code": code, "retryable": false, "message": message, "details": details,
+                },
+            }))
+            .expect("a trust-task-error");
+        ConsoleError::from_call(ATMError::TrustTaskError(Box::new(refusal)))
+    }
+
+    #[test]
+    fn a_trust_task_error_is_a_refusal_with_its_typed_epoch() {
+        let e = document(
+            "messaging/mux/admin-revoke-all:epochMismatch",
+            "the request names epoch 5",
+            serde_json::json!({ "currentEpoch": 3 }),
+        );
+        assert_eq!(e.current_epoch(), Some(3));
+        assert_eq!(
+            e.refusal_code(),
+            Some("messaging/mux/admin-revoke-all:epochMismatch")
+        );
+        assert!(
+            e.explain().contains("the current epoch is 3"),
+            "{}",
+            e.explain()
+        );
+    }
+
+    #[test]
+    fn a_translated_code_is_explained_by_the_mediator_code() {
+        let e = document(
+            "permissionDenied",
+            "admin only",
+            serde_json::json!({ "mediatorCode": "authorization.admin_required" }),
+        );
+        assert_eq!(e.refusal_code(), Some("authorization.admin_required"));
+        assert!(
+            e.explain().contains("only an administrator"),
+            "{}",
+            e.explain()
+        );
     }
 
     #[test]
