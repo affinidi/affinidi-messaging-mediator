@@ -9,8 +9,8 @@
 //!   about goes through that one interface.
 //!
 //! - **Well-known keys** — what the mediator reads. A small set of named
-//!   entries (`mediator/admin/credential`, `mediator/jwt/secret`,
-//!   `mediator/vta/last_known_bundle`, ...) with typed accessors in
+//!   entries (`mediator_admin_credential`, `mediator_jwt_secret`,
+//!   `mediator_vta_last_known_bundle`, ...) with typed accessors in
 //!   [`well_known`]. The mediator never dereferences raw URLs per-field;
 //!   it asks [`MediatorSecrets`] for, say, "the admin credential" and the
 //!   helper handles lookup, envelope parsing, and shape validation.

@@ -1252,11 +1252,7 @@ fn didcomm_endpoints(doc: &Document) -> Vec<String> {
 /// mediator's own DID and published endpoints (a forward that would come back
 /// here), plus the operator's `blocked_forwarding_dids` and their endpoints.
 fn refuse_blocked(state: &SharedData, next: &str, hop: RemoteHop) -> NextHop {
-    if blocked_relay(
-        &state.config.processors.forwarding.blocked_forwarding,
-        next,
-        &hop,
-    ) {
+    if blocked_relay(&state.config.processors.forwarding, next, &hop) {
         return NextHop::Unroutable {
             reason: format!(
                 "next hop ({next}) relays via ({}) at ({}), which is on this mediator's \
@@ -1272,7 +1268,11 @@ fn refuse_blocked(state: &SharedData, next: &str, hop: RemoteHop) -> NextHop {
 /// Each of the endpoint, relay DID and next hop is compared in its
 /// [`canonical_relay_target`](crate::common::relay_target::canonical_relay_target)
 /// form, so another spelling of a listed DID or URL is still refused.
-fn blocked_relay(blocked: &ahash::AHashSet<String>, next: &str, hop: &RemoteHop) -> bool {
+fn blocked_relay(
+    blocked: &(impl crate::common::relay_target::BlockList + ?Sized),
+    next: &str,
+    hop: &RemoteHop,
+) -> bool {
     crate::common::relay_target::relay_target_blocked(
         blocked,
         [hop.endpoint.as_str(), hop.relay_to.as_str(), next],

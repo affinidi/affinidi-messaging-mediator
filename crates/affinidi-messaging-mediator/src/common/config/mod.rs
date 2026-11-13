@@ -35,11 +35,12 @@ use affinidi_messaging_mediator_common::{
     MediatorSecrets, database::config::DatabaseConfig, did_web::rewrite_did_document_to_web,
     errors::MediatorError, secrets::open_store,
 };
+use affinidi_messaging_mediator_config::{ConfigError, values};
 use affinidi_secrets_resolver::ThreadedSecretsResolver;
 use async_convert::{TryFrom, async_trait};
 #[cfg(feature = "aws")]
 use aws_config::{self, BehaviorVersion, Region};
-use didwebvh_rs::log_entry::{LogEntry, LogEntryMethods};
+use didwebvh_rs::log_entry::LogEntry;
 #[cfg(feature = "vta")]
 use vta_sdk::credentials::CredentialBundle;
 
@@ -64,69 +65,206 @@ use helpers::{
     preload_self_did, read_did_config, read_document,
 };
 
+/// A [`ConfigError`] from the config crate as the mediator's error.
+pub(crate) fn config_error(err: ConfigError) -> MediatorError {
+    config_error_msg(err.to_string())
+}
+
+/// A configuration error with `msg` as its reason.
+pub(crate) fn config_error_msg(msg: String) -> MediatorError {
+    MediatorError::ConfigError(crate::common::error_codes::CONFIG_ERROR, "NA".into(), msg)
+}
+
+/// The DID resolver's network timeout when none is configured, in
+/// **milliseconds** (the SDK's unit).
+const DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS: u32 = 5_000;
+
 /// Build the runtime [`DIDCacheConfig`] from the raw [`DIDResolverConfig`]
 /// schema. Was `DIDResolverConfig::convert`; became a free function when the
 /// raw type relocated to `affinidi-messaging-mediator-config` (inherent impls
 /// must live in the type's crate, and this conversion pulls the DID-resolver
 /// SDK, which the schema crate avoids).
-fn did_resolver_cache_config(raw: &DIDResolverConfig) -> DIDCacheConfig {
+///
+/// Every number is read strictly. `network_timeout` is in milliseconds; an
+/// unreadable value used to fall back to `5` — five milliseconds, not the
+/// 5000 the template ships.
+fn did_resolver_cache_config(raw: &DIDResolverConfig) -> Result<DIDCacheConfig, MediatorError> {
+    let num = |key: &str, value: &str| -> Result<u32, MediatorError> {
+        values::number(&format!("did_resolver.{key}"), value).map_err(config_error)
+    };
     let mut config = DIDCacheConfigBuilder::default()
-        .with_cache_capacity(raw.cache_capacity.parse().unwrap_or(1000))
-        .with_cache_ttl(raw.cache_ttl.parse().unwrap_or(300))
-        .with_network_timeout(raw.network_timeout.parse().unwrap_or(5))
-        .with_network_cache_limit_count(raw.network_limit.parse().unwrap_or(100));
+        .with_cache_capacity(num("cache_capacity", &raw.cache_capacity)?)
+        .with_cache_ttl(num("cache_ttl", &raw.cache_ttl)?)
+        .with_network_timeout(
+            values::number_at_least("did_resolver.network_timeout", &raw.network_timeout, 1)
+                .map_err(config_error)?,
+        )
+        .with_network_cache_limit_count(num("network_limit", &raw.network_limit)?);
 
     if let Some(address) = &raw.address {
         config = config.with_network_mode(address);
     }
 
-    config.build()
+    Ok(config.build())
 }
 
 /// Build the runtime [`DatabaseConfig`] from the raw `[database]` schema.
 /// `DatabaseConfigRaw` lives in the config crate and `DatabaseConfig` in
 /// mediator-common, so this is a free function (the orphan rule forbids a
-/// `TryFrom` impl here). Mirrors mediator-common's former
-/// `TryFrom<DatabaseConfigRaw>`: `database_timeout` falls back to 2 on a parse
-/// error, and the circuit-breaker tuning to 5 failures and 10 seconds when
-/// absent or unparseable (a threshold of 0 is taken as 1). An empty
+/// `TryFrom` impl here). `database_timeout` (whole seconds, at least 1),
+/// `cluster_mode` (`true`/`false`, absent is `false`) and the circuit-breaker
+/// tuning (`circuit_breaker_threshold`, at least 1, absent is 5;
+/// `circuit_breaker_recovery_secs`, absent is 10) are read strictly. An empty
 /// `functions_file` means the built-in stored-function library.
 fn database_config_from_raw(
-    raw: affinidi_messaging_mediator_config::DatabaseConfigRaw,
-) -> DatabaseConfig {
-    let cluster_mode =
-        affinidi_messaging_mediator_common::database::config::parse_cluster_mode(&raw.cluster_mode);
-    let parsed = |raw: &str, default: u64, name: &str| -> u64 {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return default;
-        }
-        raw.parse().unwrap_or_else(|_| {
-            tracing::warn!(
-                "Could not parse database.{name} value '{raw}', using default: {default}"
-            );
-            default
-        })
-    };
+    raw: &affinidi_messaging_mediator_config::DatabaseConfigRaw,
+) -> Result<DatabaseConfig, MediatorError> {
     let functions_file = raw.functions_file.trim();
-    DatabaseConfig {
-        functions_file: (!functions_file.is_empty()).then(|| functions_file.to_string()),
-        database_url: raw.database_url,
-        database_timeout: raw.database_timeout.parse().unwrap_or(2),
-        cluster_mode,
-        circuit_breaker_threshold: u32::try_from(parsed(
+    let circuit_breaker_threshold = if raw.circuit_breaker_threshold.trim().is_empty() {
+        5
+    } else {
+        values::number_at_least(
+            "database.circuit_breaker_threshold",
             &raw.circuit_breaker_threshold,
-            5,
-            "circuit_breaker_threshold",
-        ))
-        .unwrap_or(u32::MAX)
-        .max(1),
-        circuit_breaker_recovery_secs: parsed(
+            1,
+        )
+        .map_err(config_error)?
+    };
+    Ok(DatabaseConfig {
+        functions_file: (!functions_file.is_empty()).then(|| functions_file.to_string()),
+        database_url: raw.database_url.clone(),
+        database_timeout: values::number_at_least(
+            "database.database_timeout",
+            &raw.database_timeout,
+            1,
+        )
+        .map_err(config_error)?,
+        cluster_mode: values::boolean_or("database.cluster_mode", &raw.cluster_mode, false)
+            .map_err(config_error)?,
+        circuit_breaker_threshold,
+        circuit_breaker_recovery_secs: values::number_or(
+            "database.circuit_breaker_recovery_secs",
             &raw.circuit_breaker_recovery_secs,
             10,
-            "circuit_breaker_recovery_secs",
-        ),
+        )
+        .map_err(config_error)?,
+    })
+}
+
+/// The legal `log_level` values.
+const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
+/// `log_level`, read strictly: an unknown level used to become INFO.
+fn log_level_from(raw: &str) -> Result<LevelFilter, MediatorError> {
+    Ok(
+        match values::one_of("log_level", raw, LOG_LEVELS).map_err(config_error)? {
+            "trace" => LevelFilter::TRACE,
+            "debug" => LevelFilter::DEBUG,
+            "warn" => LevelFilter::WARN,
+            "error" => LevelFilter::ERROR,
+            _ => LevelFilter::INFO,
+        },
+    )
+}
+
+/// `streaming.uuid` must be `hostname://` or `string://<id>`.
+fn check_streaming_uuid(raw: &str) -> Result<(), MediatorError> {
+    if raw.starts_with("hostname://") || raw.starts_with("string://") {
+        Ok(())
+    } else {
+        Err(config_error(ConfigError::invalid(
+            "streaming.uuid",
+            raw,
+            "\"hostname://\" or \"string://<id>\"",
+        )))
     }
+}
+
+/// Check every setting in `raw` that can be checked from the file alone —
+/// no secret backend, no network — exactly as the conversion to [`Config`]
+/// reads it, and return the `[limits]` it gives.
+///
+/// Run first thing at startup, so a bad value stops the mediator before it
+/// opens a secret backend or contacts a VTA, and by `config/reload`, so a
+/// reload that would not survive a restart fails and changes nothing (#112).
+pub(crate) fn validate_raw(raw: &ConfigRaw) -> Result<LimitsConfig, MediatorError> {
+    use security::SecurityConfigRawExt;
+
+    affinidi_messaging_mediator_config::validate::check_secrets_backend(&raw.secrets.backend)
+        .map_err(config_error_msg)?;
+    secrets_cache_ttl(raw.secrets.cache_ttl.as_deref())?;
+    log_level_from(&raw.log_level)?;
+    values::boolean("log_json", &raw.log_json).map_err(config_error)?;
+    let streaming =
+        values::boolean("streaming.enabled", &raw.streaming.enabled).map_err(config_error)?;
+    if streaming {
+        check_streaming_uuid(&raw.streaming.uuid)?;
+    }
+    did_resolver_cache_config(&raw.did_resolver)?;
+    database_config_from_raw(&raw.database)?;
+    raw.security.values()?;
+    processors::forwarding_config_from_raw(raw.processors.forwarding.clone())?;
+    helpers::parse_blocked_forwarding_dids(&raw.processors.forwarding.blocked_forwarding_dids)?;
+    MessageExpiryCleanupConfig::try_from(raw.processors.message_expiry_cleanup.clone())?;
+    SessionExpiryCleanupConfig::try_from(raw.processors.session_expiry_cleanup.clone())?;
+    if let Some(storage) = &raw.storage {
+        check_storage(storage)?;
+    }
+    LimitsConfig::try_from(raw.limits.clone())
+}
+
+/// `[secrets] cache_ttl` in seconds: `None` when unset (the caller's
+/// default), `Some(0)` for "never expires", otherwise a humantime duration
+/// such as `"30d"` or `"12h"`. An unreadable value used to fall back to the
+/// default with a warning.
+fn secrets_cache_ttl(raw: Option<&str>) -> Result<Option<u64>, MediatorError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("0") => Ok(Some(0)),
+        Some(ttl) => humantime::parse_duration(ttl)
+            .map(|d| Some(d.as_secs()))
+            .map_err(|e| {
+                config_error(ConfigError::invalid(
+                    "secrets.cache_ttl",
+                    ttl,
+                    format!("a duration such as \"30d\" or \"12h\", or \"0\" for never ({e})"),
+                ))
+            }),
+    }
+}
+
+/// `[storage]`: a backend this mediator knows, and readable Fjall tuning.
+fn check_storage(storage: &StorageConfig) -> Result<(), MediatorError> {
+    let backend = values::one_of("storage.backend", &storage.backend, &["redis", "fjall"])
+        .map_err(config_error)?;
+    if backend == "fjall"
+        && storage
+            .data_dir
+            .as_deref()
+            .is_none_or(|d| d.trim().is_empty())
+    {
+        return Err(config_error_msg(
+            "storage.data_dir (env STORAGE_DATA_DIR) is required when storage.backend is \
+             \"fjall\""
+                .into(),
+        ));
+    }
+    if let Some(fjall) = &storage.fjall {
+        for (key, value) in [
+            ("storage.fjall.block_cache", &fjall.block_cache),
+            ("storage.fjall.write_buffer", &fjall.write_buffer),
+            ("storage.fjall.max_journal", &fjall.max_journal),
+        ] {
+            values::number::<u64>(key, value).map_err(config_error)?;
+        }
+        values::one_of(
+            "storage.fjall.durability",
+            &fjall.durability,
+            &["buffered", "sync"],
+        )
+        .map_err(config_error)?;
+    }
+    Ok(())
 }
 
 /// Default VTA cache TTL when `[secrets].cache_ttl` is not set.
@@ -337,7 +475,7 @@ impl Config {
         let did_resolver_config = DIDCacheConfigBuilder::default()
             .with_cache_capacity(1000)
             .with_cache_ttl(300)
-            .with_network_timeout(5)
+            .with_network_timeout(DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS)
             .with_network_cache_limit_count(100)
             .build();
 
@@ -536,6 +674,11 @@ impl TryFrom<ConfigRaw> for Config {
     type Error = MediatorError;
 
     async fn try_from(raw: ConfigRaw) -> Result<Self, Self::Error> {
+        // Every value the file alone decides, checked before anything is
+        // opened or contacted. The conversions below read the same values the
+        // same way; this only moves the failure ahead of the side effects.
+        validate_raw(&raw)?;
+
         // Lazy AWS initialization — only load AWS SDK config when an AWS scheme
         // is actually used in the configuration. This avoids the 3+ second IMDS
         // timeout on non-AWS machines.
@@ -620,6 +763,9 @@ impl TryFrom<ConfigRaw> for Config {
                  Only use this for local dev/test."
             );
         }
+        if let Some(warning) = keyring_backend_warning(&raw.secrets.backend) {
+            warn!("{warning}");
+        }
 
         // ── VTA integration ────────────────────────────────────────────
         // If the backend has an admin credential, we're in VTA mode:
@@ -695,18 +841,9 @@ impl TryFrom<ConfigRaw> for Config {
                 },
             };
 
-            // Parse cache TTL — default to 30 days when unset, `0` means
-            // no expiry. Humantime handles `"30d"`, `"12h"`, etc.
-            let ttl_secs = match raw.secrets.cache_ttl.as_deref() {
-                None | Some("") => DEFAULT_CACHE_TTL_SECS,
-                Some("0") => 0,
-                Some(s) => humantime::parse_duration(s)
-                    .map(|d| d.as_secs())
-                    .unwrap_or_else(|e| {
-                        warn!("Could not parse [secrets].cache_ttl '{s}' ({e}); using default");
-                        DEFAULT_CACHE_TTL_SECS
-                    }),
-            };
+            // Cache TTL — 30 days when unset, `0` means no expiry.
+            let ttl_secs = secrets_cache_ttl(raw.secrets.cache_ttl.as_deref())?
+                .unwrap_or(DEFAULT_CACHE_TTL_SECS);
             let cache = vta_cache::MediatorSecretCache::new(mediator_secrets.clone(), ttl_secs);
 
             // Two-line bootstrap narrative: what we're *attempting* first,
@@ -821,21 +958,8 @@ impl TryFrom<ConfigRaw> for Config {
         };
 
         let mut config = Config {
-            log_level: match raw.log_level.as_str() {
-                "trace" => LevelFilter::TRACE,
-                "debug" => LevelFilter::DEBUG,
-                "info" => LevelFilter::INFO,
-                "warn" => LevelFilter::WARN,
-                "error" => LevelFilter::ERROR,
-                _ => LevelFilter::INFO,
-            },
-            log_json: raw.log_json.parse().unwrap_or_else(|_| {
-                warn!(
-                    "Could not parse log_json value '{}', using default: true",
-                    raw.log_json
-                );
-                true
-            }),
+            log_level: log_level_from(&raw.log_level)?,
+            log_json: values::boolean("log_json", &raw.log_json).map_err(config_error)?,
             listen_address: raw.server.listen_address,
             mediator_did,
             admin_did: read_did_config(&raw.server.admin_did, &aws_config, "admin_did").await?,
@@ -849,15 +973,10 @@ impl TryFrom<ConfigRaw> for Config {
                 .server
                 .metrics_bearer_token
                 .filter(|token| !token.0.is_empty()),
-            database: database_config_from_raw(raw.database),
-            streaming_enabled: raw.streaming.enabled.parse().unwrap_or_else(|_| {
-                warn!(
-                    "Could not parse streaming.enabled value '{}', using default: true",
-                    raw.streaming.enabled
-                );
-                true
-            }),
-            did_resolver_config: did_resolver_cache_config(&raw.did_resolver),
+            database: database_config_from_raw(&raw.database)?,
+            streaming_enabled: values::boolean("streaming.enabled", &raw.streaming.enabled)
+                .map_err(config_error)?,
+            did_resolver_config: did_resolver_cache_config(&raw.did_resolver)?,
             api_prefix: {
                 let normalized = helpers::normalize_api_prefix(&raw.server.api_prefix);
                 if normalized != raw.server.api_prefix {
@@ -899,7 +1018,7 @@ impl TryFrom<ConfigRaw> for Config {
                 .unwrap_or_default(),
             // Operating keys come either from the VTA (when integration
             // is active) or from the unified backend's well-known
-            // `mediator/operating/secrets` entry (self-hosted). The
+            // `mediator_operating_secrets` entry (self-hosted). The
             // security converter has just done both lookups by the time
             // we get here, so we can ask the backend directly: if the
             // entry is present we loaded it; otherwise the VTA bundle
@@ -1012,6 +1131,9 @@ impl TryFrom<ConfigRaw> for Config {
             },
         }
 
+        // A DID that does not resolve now is blocked by its DID at once and
+        // its endpoints are added when it does: a third party's DID host being
+        // down must not stop this mediator starting (#146).
         load_forwarding_protection_blocks(
             &did_resolver,
             &mut config.processors.forwarding,
@@ -1031,11 +1153,18 @@ impl TryFrom<ConfigRaw> for Config {
 /// Split a self-hosted DID source into the bodies served at the well-known
 /// routes, returning `(did.json body, did.jsonl body, typed Document)`.
 ///
+/// The source is either a DID document (did:web) — one JSON object — or a
+/// did:webvh log: JSON Lines, one log entry per line, as many entries as the
+/// DID has versions. A log is parsed entry by entry and its chain verified
+/// (each entry's proof, version and parameters against its predecessor; see
+/// [`verify_webvh_log`]); `did.json` serves the **last** entry's document and
+/// `did.jsonl` the source exactly as read. The whole log used to be parsed as
+/// one JSON value, so a log with a second entry — after the first key
+/// rotation — stopped the mediator starting (#120).
+///
 /// We split the canonical DID Document (served at `did.json`) from the raw
-/// log entry stream (served at `did.jsonl`) so each well-known route returns
-/// the correct shape — an earlier version served the raw input verbatim at
-/// both routes, which meant `did.jsonl` returned a DID Document for did:web
-/// sources and `did.json` returned a log envelope for did:webvh sources.
+/// log (served at `did.jsonl`) so each well-known route returns the correct
+/// shape.
 ///
 /// For did:webvh sources the `did.json` body's identifier is additionally
 /// rewritten from `did:webvh:{scid}:{domain}` to `did:web:{domain}` (id,
@@ -1054,95 +1183,121 @@ impl TryFrom<ConfigRaw> for Config {
 /// did:scid DID and every self-reference under it, so the resolver preload
 /// answers for the identity the mediator packs and unpacks as.
 fn split_self_hosted_did_source(
-    document_json: String,
+    source: String,
     mediator_did: &str,
 ) -> Result<(String, Option<String>, Document), MediatorError> {
-    // Validate and parse as LogEntry (webvh format) first, then fall back to
-    // a direct DID Document (did:web source).
-    match LogEntry::deserialize_string(&document_json, None) {
-        Ok(log_entry) => {
-            // did:webvh source — extract the DID document for `did.json`, keep the
-            // raw log entry for `did.jsonl`.
-            let did_doc_value = log_entry.get_did_document().map_err(|err| {
-                error!("Couldn't extract DID Document from LogEntry: {err}");
-                MediatorError::ConfigError(
-                    12,
-                    "NA".into(),
-                    format!("Couldn't extract DID Document from LogEntry: {err}"),
-                )
-            })?;
+    let source_err = |msg: String| {
+        error!("server.did_web_self_hosted: {msg}");
+        config_error_msg(format!("server.did_web_self_hosted: {msg}"))
+    };
 
-            // The extracted state's `id` is the did:webvh DID; rewrite it (and every
-            // self-reference) to the did:web form for the `did.json` handler. The
-            // typed `Document` below is parsed from the original `did:webvh` value so
-            // the resolver preload keeps the mediator's real DID.
-            let webvh_did = did_doc_value
-                .get("id")
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| {
-                    error!("Extracted DID Document from LogEntry is missing an `id`");
-                    MediatorError::ConfigError(
-                        12,
-                        "NA".into(),
-                        "Extracted DID Document from LogEntry is missing an `id`".into(),
-                    )
-                })?
-                .to_string();
+    // One JSON value that is not a log entry: a did:web document.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&source)
+        && !is_webvh_log_entry(&value)
+    {
+        let typed = serde_json::from_value::<Document>(value).map_err(|err| {
+            source_err(format!(
+                "the content is neither a DID document nor a did:webvh log: {err}"
+            ))
+        })?;
+        return Ok((source, None, typed));
+    }
 
-            let (_web_did, web_doc_value) = rewrite_did_document_to_web(&did_doc_value, &webvh_did)
-                .map_err(|err| {
-                    error!("Couldn't rewrite did:webvh document to did:web. Reason: {err}");
-                    MediatorError::ConfigError(
-                        12,
-                        "NA".into(),
-                        format!("Couldn't rewrite did:webvh document to did:web. Reason: {err}"),
-                    )
-                })?;
+    // A did:webvh log.
+    let did_doc_value = verify_webvh_log(&source).map_err(source_err)?;
 
-            // Serialise the rewritten did:web document for the did.json handler. The
-            // resolver receives the typed `Document` below (parsed from the original
-            // did:webvh value) so we don't pay double parse costs at request time.
-            let did_json = serde_json::to_string(&web_doc_value).map_err(|err| {
-                error!("Couldn't serialise extracted DID Document as JSON. Reason: {err}");
-                MediatorError::ConfigError(
-                    12,
-                    "NA".into(),
-                    format!("Couldn't serialise extracted DID Document as JSON. Reason: {err}"),
-                )
-            })?;
+    // The extracted state's `id` is the did:webvh DID; rewrite it (and every
+    // self-reference) to the did:web form for the `did.json` handler. The
+    // typed `Document` below is parsed from the original `did:webvh` value so
+    // the resolver preload keeps the mediator's real DID.
+    let webvh_did = did_doc_value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| source_err("the log's last DID document has no `id`".into()))?
+        .to_string();
 
-            let did_doc_value = if mediator_did.starts_with("did:scid:") {
-                scid_document(&did_doc_value, mediator_did)?
-            } else {
-                did_doc_value
-            };
+    let (_web_did, web_doc_value) = rewrite_did_document_to_web(&did_doc_value, &webvh_did)
+        .map_err(|err| {
+            source_err(format!(
+                "couldn't rewrite did:webvh document to did:web: {err}"
+            ))
+        })?;
 
-            let typed = serde_json::from_value(did_doc_value).map_err(|err| {
-                error!("Couldn't convert DID Document value to Document struct. Reason: {err}");
-                MediatorError::ConfigError(
-                    12,
-                    "NA".into(),
-                    format!(
-                        "Couldn't convert DID Document value to Document struct. Reason: {err}"
-                    ),
-                )
-            })?;
+    // Serialise the rewritten did:web document for the did.json handler. The
+    // resolver receives the typed `Document` below (parsed from the original
+    // did:webvh value) so we don't pay double parse costs at request time.
+    let did_json = serde_json::to_string(&web_doc_value)
+        .map_err(|err| source_err(format!("couldn't serialise the DID document: {err}")))?;
 
-            Ok((did_json, Some(document_json), typed))
+    let did_doc_value = if mediator_did.starts_with("did:scid:") {
+        scid_document(&did_doc_value, mediator_did)?
+    } else {
+        did_doc_value
+    };
+
+    let typed = serde_json::from_value(did_doc_value)
+        .map_err(|err| source_err(format!("the log's DID document is not valid: {err}")))?;
+
+    Ok((did_json, Some(source), typed))
+}
+
+/// Whether `value` looks like a did:webvh log entry rather than a DID
+/// document.
+fn is_webvh_log_entry(value: &serde_json::Value) -> bool {
+    value.get("versionId").is_some() && value.get("state").is_some()
+}
+
+/// Parse a did:webvh log (JSON Lines, one entry per non-empty line), verify
+/// its chain with didwebvh-rs — each entry's proof, `versionId` and parameter
+/// transition against the entry before it — and return the last entry's DID
+/// document.
+///
+/// Witness proofs are not checked: the mediator does not serve
+/// `did-witness.json`, so a resolver that requires witnesses checks them
+/// against wherever that file is published. A log whose last valid entry
+/// deactivates the DID is refused: a mediator cannot run as a deactivated DID.
+fn verify_webvh_log(source: &str) -> Result<serde_json::Value, String> {
+    let mut entries = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
-        Err(_log_entry_err) => {
-            // did:web source — the raw input is the DID document; no log entry to serve.
-            let typed = serde_json::from_str::<Document>(&document_json).map_err(|err| {
-                error!("Couldn't parse content as LogEntry or Document. Reason: {err}");
-                MediatorError::ConfigError(
-                    12,
-                    "NA".into(),
-                    format!("Couldn't parse content as LogEntry or Document. Reason: {err}"),
-                )
-            })?;
-            Ok((document_json, None, typed))
+        let entry = LogEntry::deserialize_string(line, None).map_err(|err| {
+            format!(
+                "line {} is not a did:webvh log entry (and the content is not a DID \
+                 document): {err}",
+                index + 1
+            )
+        })?;
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        return Err("the did:webvh log is empty".into());
+    }
+
+    let mut state = didwebvh_rs::DIDWebVHState::from_log_entries(entries);
+    let log = state.log_entries_mut();
+    for at in 0..log.len() {
+        let (verified, rest) = log.split_at_mut(at);
+        let entry = &mut rest[0];
+        entry.verify_log_entry(verified.last()).map_err(|err| {
+            format!(
+                "did:webvh log entry {} ({}) does not verify: {err}",
+                at + 1,
+                entry.get_version_id()
+            )
+        })?;
+        if entry.validated_parameters.deactivated == Some(true) {
+            return Err(format!(
+                "did:webvh log entry {} ({}) deactivates the DID",
+                at + 1,
+                entry.get_version_id()
+            ));
         }
     }
+    let last = log.last().ok_or("the did:webvh log is empty")?;
+    last.get_did_document()
+        .map_err(|err| format!("couldn't extract the DID document from the log: {err}"))
 }
 
 /// The did:scid's own document for a self-hosted did:webvh log, refusing a log
@@ -1317,6 +1472,21 @@ pub(crate) fn warn_if_tsp_advertised_without_feature(config: &Config) {
     }
 }
 
+/// The startup warning for a `keyring://` secret backend on Linux, where the
+/// keyring backend is the kernel keyring (keyutils): its keys do not survive a
+/// reboot, so the JWT key, admin credential and operating keys are lost and the
+/// mediator then refuses to start (#126).
+fn keyring_backend_warning(backend: &str) -> Option<String> {
+    (cfg!(target_os = "linux") && backend.trim_start().starts_with("keyring://")).then(|| {
+        "Secret backend is keyring:// on Linux, which is the kernel keyring (keyutils): \
+         its keys are lost on reboot, and the mediator will then refuse to start without \
+         its JWT key, admin credential and operating keys. Use it for desktop development \
+         only; choose a persistent backend (aws_secrets://, vault://, k8s://, \
+         file://…?encrypt=1, …) for anything else. See docs/secrets-backend.md."
+            .to_string()
+    })
+}
+
 /// Resolve every filesystem path written in the configuration file against
 /// that file's directory (Keyring VTI-07); see
 /// [`affinidi_messaging_mediator_common::config_path`] for the rule and its
@@ -1362,6 +1532,16 @@ fn resolve_configured_paths(config: &mut ConfigRaw, config_file: &Path) {
     if let Some(key) = config.security.ssl_key_file.as_deref() {
         config.security.ssl_key_file = Some(resolve("ssl_key_file", "SSL_KEY_FILE", key));
     }
+    // `did_web_self_hosted = "file://<path>"`: the path, not the URL.
+    if let Some(path) = config
+        .server
+        .did_web_self_hosted
+        .as_deref()
+        .and_then(|target| target.strip_prefix("file://"))
+    {
+        let resolved = resolve("did_web_self_hosted", "DID_WEB_SELF_HOSTED", path);
+        config.server.did_web_self_hosted = Some(format!("file://{resolved}"));
+    }
 }
 
 pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, MediatorError> {
@@ -1379,11 +1559,18 @@ pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, Mediator
                 )
             })?;
 
+    // The two settings logging itself is built from, checked before it is:
+    // an unknown level used to become INFO, and an unreadable `log_json`
+    // was reported only on stderr.
+    let log_level =
+        values::one_of("log_level", &config.log_level, LOG_LEVELS).map_err(config_error)?;
+    let log_json = values::boolean("log_json", &config.log_json).map_err(config_error)?;
+
     // setup logging/tracing framework
     let filter = if env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
-        EnvFilter::new(config.log_level.as_str())
+        EnvFilter::new(log_level)
     };
 
     let subscriber = tracing_subscriber::fmt()
@@ -1401,17 +1588,7 @@ pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, Mediator
         .with_env_filter(filter);
 
     println!("Switching to tracing subscriber for all logging...");
-    if config
-        .log_json
-        .parse()
-        .unwrap_or_else(|_: std::str::ParseBoolError| {
-            eprintln!(
-                "WARN: Could not parse log_json value '{}', using default: true",
-                config.log_json
-            );
-            true
-        })
-    {
+    if log_json {
         let subscriber = subscriber
             .json()
             // Build the subscriber
@@ -1429,6 +1606,7 @@ pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, Mediator
     // A key the schema does not recognise — typo'd, removed, or filed under the
     // wrong `[table]` — silently took no effect; say so now that it is heard.
     affinidi_messaging_mediator_config::env::warn_unknown_keys(config_file, &unknown_keys);
+    affinidi_messaging_mediator_config::env::warn_ignored_env(&config);
 
     // Here and nowhere earlier: the subscriber above now exists, so the
     // deprecation warning is seen rather than dropped, and the conversion
@@ -1506,15 +1684,269 @@ mod configured_path_tests {
             "the shipped `functions_file` must be written relative to the config file"
         );
     }
+
+    /// `did_web_self_hosted = "file://did.jsonl"` is relative to the config
+    /// file, like the other paths in it (part of #176).
+    #[test]
+    fn a_self_hosted_did_file_resolves_beside_the_config() {
+        let (dir, config_file) = deploy_shipped_conf();
+        fs::write(dir.path().join("did.jsonl"), "{}").unwrap();
+        let mut config = affinidi_messaging_mediator_config::env::read_config_file(
+            config_file.to_str().unwrap(),
+        )
+        .unwrap();
+        config.server.did_web_self_hosted = Some("file://did.jsonl".into());
+
+        resolve_configured_paths(&mut config, &config_file);
+
+        assert_eq!(
+            config.server.did_web_self_hosted,
+            Some(format!("file://{}", dir.path().join("did.jsonl").display()))
+        );
+
+        // Other sources are left alone.
+        config.server.did_web_self_hosted = Some("s3://bucket/did.jsonl".into());
+        resolve_configured_paths(&mut config, &config_file);
+        assert_eq!(
+            config.server.did_web_self_hosted.as_deref(),
+            Some("s3://bucket/did.jsonl")
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_raw_tests {
+    use super::*;
+
+    fn parse(path: &Path) -> ConfigRaw {
+        let toml = std::fs::read_to_string(path).unwrap();
+        affinidi_messaging_mediator_config::env::parse_config(&toml)
+            .unwrap()
+            .0
+    }
+
+    /// Every value the shipped template holds passes the strict checks; the
+    /// only thing it leaves for the operator is the secrets backend, and the
+    /// error for that lists the choices.
+    #[test]
+    fn the_shipped_template_is_valid_once_a_backend_is_chosen() {
+        let mut raw = parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/mediator.toml"));
+        let err = validate_raw(&raw).unwrap_err().to_string();
+        assert!(err.contains("no secrets backend is configured"), "{err}");
+        assert!(err.contains("aws_secrets://"), "{err}");
+
+        raw.secrets.backend = "file:///var/lib/mediator/secrets.json".into();
+        validate_raw(&raw).expect("the template's values are valid");
+    }
+
+    /// The container configs pass the same checks (the published image's
+    /// config and the test deployment's).
+    #[test]
+    fn the_container_configs_are_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in [
+            "docker/conf/mediator.toml",
+            "docker/test/conf/mediator.toml",
+        ] {
+            let path = root.join(rel);
+            if !path.exists() {
+                eprintln!("skipping: {} not present", path.display());
+                continue;
+            }
+            validate_raw(&parse(&path)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+    }
+
+    /// Issue #112: values outside `[limits]` are strict too.
+    #[test]
+    fn an_unreadable_value_anywhere_is_refused_naming_its_key() {
+        let base = || {
+            let mut raw = parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/mediator.toml"));
+            raw.secrets.backend = "file:///var/lib/mediator/secrets.json".into();
+            raw
+        };
+        type Set = fn(&mut ConfigRaw);
+        let cases: [(&str, Set); 11] = [
+            ("log_level", |r| r.log_level = "verbose".into()),
+            ("log_json", |r| r.log_json = "yes".into()),
+            ("streaming.enabled", |r| r.streaming.enabled = "on".into()),
+            ("streaming.uuid", |r| r.streaming.uuid = "myhost".into()),
+            ("did_resolver.cache_capacity", |r| {
+                r.did_resolver.cache_capacity = "1k".into()
+            }),
+            ("did_resolver.network_timeout", |r| {
+                r.did_resolver.network_timeout = "5s".into()
+            }),
+            ("database.database_timeout", |r| {
+                r.database.database_timeout = "2s".into()
+            }),
+            ("security.mediator_acl_mode", |r| {
+                r.security.mediator_acl_mode = "explicit-allow".into()
+            }),
+            ("processors.message_expiry_cleanup.enabled", |r| {
+                r.processors.message_expiry_cleanup.enabled = "1".into()
+            }),
+            ("processors.forwarding.blocked_forwarding_dids", |r| {
+                r.processors.forwarding.blocked_forwarding_dids = "did:example:a".into()
+            }),
+            ("limits.listed_messages", |r| {
+                r.limits.listed_messages = "5O".into()
+            }),
+        ];
+        assert!(validate_raw(&base()).is_ok());
+        for (key, set) in cases {
+            let mut raw = base();
+            set(&mut raw);
+            let err = validate_raw(&raw).expect_err(key).to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_secrets_cache_ttl_is_read_strictly() {
+        assert_eq!(secrets_cache_ttl(None).unwrap(), None);
+        assert_eq!(secrets_cache_ttl(Some("")).unwrap(), None);
+        assert_eq!(secrets_cache_ttl(Some("0")).unwrap(), Some(0));
+        assert_eq!(secrets_cache_ttl(Some("12h")).unwrap(), Some(43_200));
+        let err = secrets_cache_ttl(Some("30 days please"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secrets.cache_ttl"), "{err}");
+    }
+
+    #[test]
+    fn a_storage_section_is_checked() {
+        let mut raw = parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/mediator.toml"));
+        raw.secrets.backend = "file:///var/lib/mediator/secrets.json".into();
+        raw.storage = Some(StorageConfig {
+            backend: "Fjall".into(),
+            data_dir: Some("/var/lib/mediator/data".into()),
+            fjall: Some(affinidi_messaging_mediator_config::FjallConfig::default()),
+        });
+        validate_raw(&raw).expect("fjall, case-insensitive");
+        for (backend, data_dir, durability, expect) in [
+            ("postgres", Some("/d"), "sync", "storage.backend"),
+            ("fjall", None, "sync", "storage.data_dir"),
+            ("fjall", Some("/d"), "fsync", "storage.fjall.durability"),
+        ] {
+            let fjall = affinidi_messaging_mediator_config::FjallConfig {
+                durability: durability.into(),
+                ..Default::default()
+            };
+            raw.storage = Some(StorageConfig {
+                backend: backend.into(),
+                data_dir: data_dir.map(str::to_string),
+                fjall: Some(fjall),
+            });
+            let err = validate_raw(&raw).unwrap_err().to_string();
+            assert!(err.contains(expect), "{expect}: {err}");
+        }
+    }
+
+    /// The resolver's network timeout is in milliseconds; the built-in default
+    /// is 5000 ms, not 5.
+    #[test]
+    fn the_default_resolver_timeout_is_in_milliseconds() {
+        assert_eq!(DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS, 5_000);
+    }
+
+    #[test]
+    fn the_keyring_warning_is_for_linux_only() {
+        let warning = keyring_backend_warning("keyring://affinidi-mediator");
+        assert_eq!(warning.is_some(), cfg!(target_os = "linux"));
+        if let Some(w) = warning {
+            assert!(w.contains("lost on reboot"), "{w}");
+        }
+        assert!(keyring_backend_warning("aws_secrets://us-east-1/x/").is_none());
+    }
 }
 
 #[cfg(test)]
 mod self_hosted_did_tests {
     use super::*;
 
-    // A real did:webvh log entry (didwebvh-rs `basic-create` test vector).
-    // `state.id` is `did:webvh:{scid}:example.com`.
-    const WEBVH_LOG: &str = r#"{"versionId":"1-QmPFhMuZH9gjY2JZgyyrgRuFTywQ4mDhoKGVoGE8uy7hFD","versionTime":"2000-01-01T00:00:00Z","parameters":{"method":"did:webvh:1.0","scid":"Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg","updateKeys":["z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG"],"portable":false,"nextKeyHashes":[],"watchers":[],"witness":{},"deactivated":false},"state":{"@context":["https://www.w3.org/ns/did/v1","https://w3id.org/security/multikey/v1"],"id":"did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com","controller":"did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com","verificationMethod":[{"type":"Multikey","controller":"did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com","publicKeyMultibase":"z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG","id":"did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com#P5RDjVJG"}],"authentication":["did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com#P5RDjVJG"],"assertionMethod":[],"keyAgreement":[],"capabilityDelegation":[],"capabilityInvocation":[]},"proof":[{"type":"DataIntegrityProof","cryptosuite":"eddsa-jcs-2022","verificationMethod":"did:key:z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG#z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG","created":"2000-01-01T00:00:00Z","proofPurpose":"assertionMethod","proofValue":"z3gfipj528cwTsP7aSSWMsPzA5uqSUGSN7WNzJQFf1WTvjpHf9Ftjk6StQmqqzjyjQT9xyqTjEsRp2jw4DBjcyqac"}]}"#;
+    /// A did:webvh log for `https://example.com/`, built and signed with
+    /// didwebvh-rs: the genesis entry plus `updates` more (each adds a
+    /// service); with `deactivate` the last one deactivates the DID. Returns
+    /// the log as stored (JSON Lines, one entry per line) and the did:webvh
+    /// DID.
+    async fn webvh_log(updates: usize, deactivate: bool) -> (String, String) {
+        use didwebvh_rs::{did_key::generate_did_key, prelude::*};
+        use serde_json::json;
+
+        // Entries a day apart: each versionTime must be later than the last.
+        let at = |day: usize| {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap()
+                + chrono::Duration::days(day as i64)
+        };
+        let (_did, key) = generate_did_key(KeyType::Ed25519).unwrap();
+        let pk = key.get_public_keymultibase().unwrap();
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(pk.clone())])),
+            ..Default::default()
+        };
+        let created = create_did(
+            CreateDIDConfig::builder()
+                .address("https://example.com/")
+                .version_time(at(0))
+                .authorization_key(key.clone())
+                .did_document(json!({
+                    "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+                    "id": "{DID}",
+                    "controller": "{DID}",
+                    "verificationMethod": [{
+                        "id": "{DID}#key-0",
+                        "type": "Multikey",
+                        "controller": "{DID}",
+                        "publicKeyMultibase": pk,
+                    }],
+                    "authentication": ["{DID}#key-0"],
+                    "assertionMethod": ["{DID}#key-0"],
+                }))
+                .parameters(params.clone())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let did = created.did().to_string();
+        let mut state = DIDWebVHState::from_log_entries(vec![created.log_entry().clone()]);
+        state.validate().unwrap().assert_complete().unwrap();
+        for n in 0..updates {
+            let mut doc = state.log_entries().last().unwrap().get_state().clone();
+            doc["service"] = json!([{
+                "id": format!("{did}#service-{n}"),
+                "type": "LinkedDomains",
+                "serviceEndpoint": format!("https://example.com/{n}"),
+            }]);
+            let mut builder = UpdateDIDConfig::builder()
+                .state(state)
+                .signing_key(key.clone())
+                .document(doc)
+                .version_time(at(n + 1));
+            if deactivate && n + 1 == updates {
+                builder = builder.deactivate(true);
+            }
+            state = update_did(builder.build().unwrap())
+                .await
+                .unwrap()
+                .into_state();
+        }
+
+        let mut log = String::new();
+        for entry in state.log_entries() {
+            log.push_str(&serde_json::to_string(&entry.log_entry).unwrap());
+            log.push('\n');
+        }
+        (log, did)
+    }
+
+    /// `did:scid:vh:1:{scid}` for a `did:webvh:{scid}:{host}` DID.
+    fn scid_of(webvh_did: &str) -> String {
+        let scid = webvh_did.split(':').nth(2).unwrap();
+        format!("did:scid:vh:1:{scid}")
+    }
 
     // A plain did:web DID document (no webvh log envelope).
     const WEB_DOC: &str = r#"{"@context":["https://www.w3.org/ns/did/v1","https://w3id.org/security/multikey/v1"],"id":"did:web:example.com","controller":"did:web:example.com","verificationMethod":[{"type":"Multikey","controller":"did:web:example.com","publicKeyMultibase":"z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG","id":"did:web:example.com#P5RDjVJG"}],"authentication":["did:web:example.com#P5RDjVJG"]}"#;
@@ -1523,10 +1955,11 @@ mod self_hosted_did_tests {
     /// self-reference) rewritten to did:web, while the did.jsonl body stays
     /// the verbatim webvh log and the typed Document keeps the real did:webvh
     /// id.
-    #[test]
-    fn webvh_source_rewrites_did_json_only() {
+    #[tokio::test]
+    async fn webvh_source_rewrites_did_json_only() {
+        let (log, webvh_did) = webvh_log(0, false).await;
         let (did_json, did_jsonl, typed) =
-            split_self_hosted_did_source(WEBVH_LOG.to_string(), WEBVH_DID).unwrap();
+            split_self_hosted_did_source(log.clone(), &webvh_did).unwrap();
 
         // did.json: rewritten to did:web, no webvh traces anywhere.
         let doc: serde_json::Value = serde_json::from_str(&did_json).unwrap();
@@ -1543,54 +1976,137 @@ mod self_hosted_did_tests {
         }
 
         // did.jsonl: verbatim webvh log, unchanged.
-        assert_eq!(did_jsonl.as_deref(), Some(WEBVH_LOG));
+        assert_eq!(did_jsonl.as_deref(), Some(log.as_str()));
 
         // typed Document: the mediator's real did:webvh identity.
-        assert_eq!(
-            typed.id.as_str(),
-            "did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com"
-        );
+        assert_eq!(typed.id.as_str(), webvh_did);
     }
-
-    const WEBVH_DID: &str = "did:webvh:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg:example.com";
-    const SCID_DID: &str = "did:scid:vh:1:Qmdxt11AjZewCNXX69bpEDobgjySeZ7eFwjf4tgpF6p2Dg";
 
     /// A mediator presenting its log as did:scid: did.jsonl and did.json are
     /// served exactly as for did:webvh, and the typed Document — what the
     /// resolver is preloaded with — is the did:scid's own.
-    #[test]
-    fn scid_identity_gets_its_own_document() {
-        for mediator_did in [SCID_DID.to_string(), format!("{SCID_DID}?src=example.com")] {
+    #[tokio::test]
+    async fn scid_identity_gets_its_own_document() {
+        let (log, webvh_did) = webvh_log(0, false).await;
+        let scid_did = scid_of(&webvh_did);
+        for mediator_did in [scid_did.clone(), format!("{scid_did}?src=example.com")] {
             let (did_json, did_jsonl, typed) =
-                split_self_hosted_did_source(WEBVH_LOG.to_string(), &mediator_did).unwrap();
+                split_self_hosted_did_source(log.clone(), &mediator_did).unwrap();
 
-            assert_eq!(did_jsonl.as_deref(), Some(WEBVH_LOG));
+            assert_eq!(did_jsonl.as_deref(), Some(log.as_str()));
             let web: serde_json::Value = serde_json::from_str(&did_json).unwrap();
             assert_eq!(web["id"], "did:web:example.com");
 
-            assert_eq!(typed.id.as_str(), SCID_DID);
+            assert_eq!(typed.id.as_str(), scid_did);
             let typed = serde_json::to_value(&typed).unwrap();
             assert_eq!(
                 typed["verificationMethod"][0]["id"],
-                format!("{SCID_DID}#P5RDjVJG")
+                format!("{scid_did}#key-0")
             );
-            assert_eq!(typed["authentication"][0], format!("{SCID_DID}#P5RDjVJG"));
+            assert_eq!(typed["authentication"][0], format!("{scid_did}#key-0"));
             let aliases = typed["alsoKnownAs"].as_array().unwrap();
-            assert!(aliases.contains(&serde_json::json!(format!("{SCID_DID}?src=example.com"))));
-            assert!(aliases.contains(&serde_json::json!(WEBVH_DID)));
+            assert!(aliases.contains(&serde_json::json!(format!("{scid_did}?src=example.com"))));
+            assert!(aliases.contains(&serde_json::json!(webvh_did)));
         }
     }
 
     /// A did:scid naming another SCID than the log's is a misconfiguration.
-    #[test]
-    fn scid_identity_must_match_the_log() {
+    #[tokio::test]
+    async fn scid_identity_must_match_the_log() {
+        let (log, _) = webvh_log(0, false).await;
         assert!(
-            split_self_hosted_did_source(
-                WEBVH_LOG.to_string(),
-                "did:scid:vh:1:QmSomeOtherScid?src=example.com"
-            )
-            .is_err()
+            split_self_hosted_did_source(log, "did:scid:vh:1:QmSomeOtherScid?src=example.com")
+                .is_err()
         );
+    }
+
+    /// Issue #120: a log of two entries (after the first key rotation or
+    /// service change) used to stop the mediator starting. The chain is now
+    /// verified entry by entry, did.json serves the LAST entry's document,
+    /// and did.jsonl serves the log exactly as read, line breaks included.
+    #[tokio::test]
+    async fn a_two_entry_webvh_log_serves_its_last_state() {
+        let (log, webvh_did) = webvh_log(1, false).await;
+        assert_eq!(log.lines().count(), 2, "fixture has two entries");
+        let (did_json, did_jsonl, typed) =
+            split_self_hosted_did_source(log.clone(), &webvh_did).unwrap();
+
+        assert_eq!(did_jsonl.as_deref(), Some(log.as_str()));
+        let doc: serde_json::Value = serde_json::from_str(&did_json).unwrap();
+        assert_eq!(doc["id"], "did:web:example.com");
+        // Only the second entry carries the service: this is the last state.
+        assert_eq!(
+            doc["service"][0]["serviceEndpoint"], "https://example.com/0",
+            "{did_json}"
+        );
+        assert_eq!(typed.id.as_str(), webvh_did);
+        assert!(
+            typed
+                .service
+                .iter()
+                .any(|s| s.service_endpoint.get_uri().as_deref() == Some("https://example.com/0"))
+        );
+
+        // Three entries, and blank lines (a trailing newline, a blank line
+        // between entries) are not entries.
+        let (log, webvh_did) = webvh_log(2, false).await;
+        let spaced = log.replacen('\n', "\n\n", 1);
+        let (did_json, did_jsonl, _) =
+            split_self_hosted_did_source(spaced.clone(), &webvh_did).unwrap();
+        assert_eq!(did_jsonl.as_deref(), Some(spaced.as_str()));
+        assert!(did_json.contains("https://example.com/1"), "{did_json}");
+    }
+
+    /// An entry that does not verify against its predecessor is refused,
+    /// naming the setting and the entry.
+    #[tokio::test]
+    async fn a_tampered_webvh_log_is_refused() {
+        let (log, webvh_did) = webvh_log(1, false).await;
+        let tampered = log.replacen("https://example.com/0", "https://evil.example/0", 1);
+        assert_ne!(tampered, log, "fixture must actually change");
+        let err = split_self_hosted_did_source(tampered, &webvh_did)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server.did_web_self_hosted"), "{err}");
+        assert!(err.contains("entry 2"), "{err}");
+
+        // Entries out of order.
+        let mut lines: Vec<&str> = log.lines().collect();
+        lines.swap(0, 1);
+        assert!(split_self_hosted_did_source(lines.join("\n"), &webvh_did).is_err());
+
+        // A line that is not an entry at all.
+        let garbage = format!("{}\nnot json\n", log.lines().next().unwrap());
+        let err = split_self_hosted_did_source(garbage, &webvh_did)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 2"), "{err}");
+    }
+
+    /// A mediator cannot run as a deactivated DID.
+    #[tokio::test]
+    async fn a_deactivated_webvh_log_is_refused() {
+        let (log, webvh_did) = webvh_log(1, true).await;
+        let err = split_self_hosted_did_source(log, &webvh_did)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deactivates"), "{err}");
+    }
+
+    /// A did:web document written over several lines (pretty-printed) is
+    /// still one document, not a log.
+    #[test]
+    fn a_pretty_printed_web_document_is_one_document() {
+        let pretty = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(WEB_DOC).unwrap(),
+        )
+        .unwrap();
+        assert!(pretty.lines().count() > 1);
+        let (did_json, did_jsonl, typed) =
+            split_self_hosted_did_source(pretty.clone(), "did:web:example.com").unwrap();
+        assert_eq!(did_json, pretty);
+        assert!(did_jsonl.is_none());
+        assert_eq!(typed.id.as_str(), "did:web:example.com");
     }
 
     /// did:web source: served verbatim at did.json, no did.jsonl log.
@@ -1721,18 +2237,43 @@ mod database_config_tests {
 
     #[test]
     fn cluster_mode_is_off_when_absent() {
-        assert!(!database_config_from_raw(raw("")).cluster_mode);
+        assert!(!database_config_from_raw(&raw("")).unwrap().cluster_mode);
     }
 
     #[test]
     fn cluster_mode_is_on_only_when_true() {
-        assert!(database_config_from_raw(raw("true")).cluster_mode);
-        assert!(!database_config_from_raw(raw("false")).cluster_mode);
+        assert!(database_config_from_raw(&raw("true")).unwrap().cluster_mode);
+        assert!(
+            database_config_from_raw(&raw(" TRUE"))
+                .unwrap()
+                .cluster_mode
+        );
+        assert!(
+            !database_config_from_raw(&raw("false"))
+                .unwrap()
+                .cluster_mode
+        );
+    }
+
+    /// A typo is refused rather than read as off: running a cluster-mode
+    /// server in single-node mode is the misconfiguration the setting exists
+    /// to rule out.
+    #[test]
+    fn a_cluster_mode_typo_is_refused() {
+        let err = database_config_from_raw(&raw("ture"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("database.cluster_mode"), "{err}");
     }
 
     #[test]
-    fn cluster_mode_typo_falls_back_to_off() {
-        assert!(!database_config_from_raw(raw("ture")).cluster_mode);
+    fn an_unreadable_database_timeout_is_refused() {
+        for bad in ["2s", "", "0", "-1"] {
+            let mut raw = raw("");
+            raw.database_timeout = bad.into();
+            let err = database_config_from_raw(&raw).unwrap_err().to_string();
+            assert!(err.contains("database.database_timeout"), "{bad:?}: {err}");
+        }
     }
 
     /// The startup log prints the whole `Config` with `{:#?}`.

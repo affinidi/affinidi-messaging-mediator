@@ -3,8 +3,10 @@
 //!
 //! ## What it does
 //!
-//! 1. Load the config file (default `conf/mediator.toml`) so we know
-//!    which secret backend to talk to.
+//! 1. Load the config file (default `conf/mediator.toml`) through the same
+//!    loader and environment overlay as the server, so the command talks to
+//!    the secret backend the running mediator uses — including one set only
+//!    by `MEDIATOR_SECRETS_BACKEND`, as container deployments do.
 //! 2. Open the unified secret backend and read the current
 //!    [`affinidi_messaging_mediator_common::AdminCredential`] under the
 //!    well-known key `mediator_admin_credential`.
@@ -26,18 +28,21 @@
 //! ## `--dry-run`
 //!
 //! Performs steps 1–4 (read-only against the VTA), prints the plan,
-//! and exits without touching the backend or the ACL. Use it before
-//! the real rotation in production.
+//! and exits without touching the backend or the ACL. It mints no key: the
+//! new DID is minted by the real run, and printed when it completes. Use it
+//! before the real rotation in production.
 //!
 //! ## Failure semantics
 //!
 //! - **VTA unreachable** → exit non-zero before any state change.
 //! - **`create_acl` fails** → exit non-zero, no backend write.
 //! - **Backend write fails after `create_acl`** → the new ACL entry
-//!   exists on the VTA but the mediator still has the old credential.
-//!   Surfaces a clear remediation message ("rerun with the new key
-//!   manually pasted") and exits non-zero. We do *not* try to rollback
-//!   the ACL because the wizard's logs are the audit trail.
+//!   exists on the VTA but the backend still holds the old credential,
+//!   which keeps working. The new key is not kept anywhere, so the new
+//!   entry is unusable: the command says to remove it on the VTA (e.g.
+//!   `pnm acl delete <new DID>`), fix the cause, and run `rotate-admin`
+//!   again, and exits non-zero. It does not remove the entry itself — the
+//!   VTA may be the very thing that failed.
 //! - **`delete_acl(old)` fails** → the rotation succeeded; the old
 //!   entry is still active. Surface as a warning and exit zero, with
 //!   the operator instructed to remove it via `pnm acl delete`.
@@ -61,21 +66,22 @@ fn transport_preference_for(vta_url: Option<&str>) -> TransportPreference {
     }
 }
 
+/// The secret backend the mediator started from `config_path` uses: read
+/// through the server's own loader, so the environment overlay
+/// (`MEDIATOR_SECRETS_BACKEND`) applies exactly as it does to the server. A
+/// command that read the file alone would, in an env-configured deployment,
+/// rotate the credential in a different store from the one the running
+/// mediator reads.
+fn secrets_backend(config_path: &str) -> Result<String, String> {
+    let raw = affinidi_messaging_mediator_config::env::read_config_file(config_path)
+        .map_err(|e| format!("Couldn't load the configuration '{config_path}': {e}"))?;
+    affinidi_messaging_mediator_config::validate::check_secrets_backend(&raw.secrets.backend)?;
+    Ok(raw.secrets.backend)
+}
+
 pub async fn run(config_path: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config '{config_path}': {e}"))?;
-    let doc: toml::Value =
-        toml::from_str(&raw).map_err(|e| format!("Failed to parse '{config_path}': {e}"))?;
-    let backend_url = doc
-        .get("secrets")
-        .and_then(|s| s.get("backend"))
-        .and_then(|b| b.as_str())
-        .ok_or_else(|| {
-            "Config has no `[secrets].backend` — Phase C+D added the unified backend; \
-             this command requires a `[secrets]` section pointing at a real store. \
-             Re-run `mediator-setup` to migrate."
-                .to_string()
-        })?;
+    let backend_url = secrets_backend(config_path)?;
+    let backend_url = backend_url.as_str();
     info!(
         backend = backend_url,
         config = config_path,
@@ -194,30 +200,32 @@ pub async fn run(config_path: &str, dry_run: bool) -> Result<(), Box<dyn std::er
         "Existing ACL scope read — will mirror onto the new DID",
     );
 
-    let (new_did, new_private_key_multibase) = mint_did_key()?;
-    info!(new_admin_did = %new_did, "Minted new admin did:key");
-
     if dry_run {
         println!();
         println!("\x1b[1mDry run — no changes made.\x1b[0m");
         println!();
         println!("Would rotate:");
-        println!("  Old DID:           {old_did}");
-        println!("  New DID:           {new_did}");
-        println!("  VTA:               {vta_did}");
-        println!("  Context:           {context}");
-        println!("  Role to mirror:    {}", existing_acl.role);
+        println!("  Secret backend:     {backend_url}");
+        println!("  Old DID:            {old_did}");
+        println!("  New DID:            (a new did:key, minted by the real run)");
+        println!("  VTA:                {vta_did}");
+        println!("  Context:            {context}");
+        println!("  Role to mirror:     {}", existing_acl.role);
         println!("  Contexts to mirror: {:?}", existing_acl.allowed_contexts);
         if let Some(label) = existing_acl.label.as_ref() {
-            println!("  Label:             {label}");
+            println!("  Label:              {label}");
         }
         println!();
         println!(
-            "Re-run without --dry-run to perform the rotation. The new key \
-             will be displayed once on success — capture it before the wizard exits."
+            "Re-run without --dry-run to perform the rotation. The new key is written to \
+             the secret backend above and never printed; the old and new DIDs are printed \
+             when the rotation completes."
         );
         return Ok(());
     }
+
+    let (new_did, new_private_key_multibase) = mint_did_key()?;
+    info!(new_admin_did = %new_did, "Minted new admin did:key");
 
     let mut create_req = CreateAclRequest::new(&new_did, &existing_acl.role);
     create_req.allowed_contexts = existing_acl.allowed_contexts.clone();
@@ -356,6 +364,40 @@ fn mint_did_key() -> Result<(String, String), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use affinidi_messaging_mediator_common::ADMIN_CREDENTIAL;
+
+    /// Issue #167: the backend comes from the same loader as the server's, so
+    /// `MEDIATOR_SECRETS_BACKEND` applies; and an unset backend is refused
+    /// with the list of choices.
+    #[test]
+    fn the_backend_is_read_through_the_servers_loader() {
+        let template = include_str!("../../conf/mediator.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mediator.toml");
+
+        // Unless the process environment sets one (CI does not), the
+        // template's unset backend is refused.
+        let env_backend = std::env::var_os("MEDIATOR_SECRETS_BACKEND").is_some();
+        std::fs::write(&path, template).unwrap();
+        if !env_backend {
+            let err = secrets_backend(path.to_str().unwrap()).unwrap_err();
+            assert!(err.contains("no secrets backend is configured"), "{err}");
+        }
+
+        let with_backend = template.replacen(
+            "# backend = \"aws_secrets://us-east-1/prod/mediator/\"",
+            "backend = \"file:///from/the/file.json\"",
+            1,
+        );
+        assert_ne!(with_backend, template);
+        std::fs::write(&path, with_backend).unwrap();
+        // And the file's backend is used.
+        if !env_backend {
+            assert_eq!(
+                secrets_backend(path.to_str().unwrap()).unwrap(),
+                "file:///from/the/file.json"
+            );
+        }
+    }
     use affinidi_messaging_mediator_common::secrets::{
         Result as SecretsResult, SecretStore, backends::MemoryStore,
     };

@@ -5,10 +5,12 @@ use affinidi_messaging_mediator_common::tasks::forwarding::RelayMode;
 // stay here. `ForwardingConfig` is a mediator-common type, so its conversion is
 // a free fn (`forwarding_config_from_raw`) rather than a `TryFrom` (orphan rule).
 use affinidi_messaging_mediator_config::{
-    ForwardingConfigRaw, MessageExpiryCleanupConfigRaw, SessionExpiryCleanupConfigRaw,
+    ForwardingConfigRaw, MessageExpiryCleanupConfigRaw, SessionExpiryCleanupConfigRaw, values,
 };
 use ahash::AHashSet as HashSet;
 use serde::{Deserialize, Serialize};
+
+use super::config_error;
 
 /// Processor configuration for the mediator
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -38,7 +40,8 @@ impl std::convert::TryFrom<MessageExpiryCleanupConfigRaw> for MessageExpiryClean
 
     fn try_from(raw: MessageExpiryCleanupConfigRaw) -> Result<Self, Self::Error> {
         Ok(MessageExpiryCleanupConfig {
-            enabled: raw.enabled.parse().unwrap_or(true),
+            enabled: values::boolean("processors.message_expiry_cleanup.enabled", &raw.enabled)
+                .map_err(config_error)?,
         })
     }
 }
@@ -62,7 +65,8 @@ impl std::convert::TryFrom<SessionExpiryCleanupConfigRaw> for SessionExpiryClean
 
     fn try_from(raw: SessionExpiryCleanupConfigRaw) -> Result<Self, Self::Error> {
         Ok(SessionExpiryCleanupConfig {
-            enabled: raw.enabled.parse().unwrap_or(true),
+            enabled: values::boolean("processors.session_expiry_cleanup.enabled", &raw.enabled)
+                .map_err(config_error)?,
         })
     }
 }
@@ -71,98 +75,67 @@ impl std::convert::TryFrom<SessionExpiryCleanupConfigRaw> for SessionExpiryClean
 /// [`ForwardingConfigRaw`] schema. A free function rather than a `TryFrom` impl
 /// because both types are now foreign to this crate (the raw type moved to
 /// `affinidi-messaging-mediator-config`), which the orphan rule forbids.
+///
+/// Every value is read strictly: one that does not read is an error naming
+/// `processors.forwarding.<key>`, never a default.
 pub(crate) fn forwarding_config_from_raw(
     raw: ForwardingConfigRaw,
 ) -> Result<ForwardingConfig, MediatorError> {
-    let warn_default = |field: &str, default: &str| {
-        eprintln!(
-            "WARN: Could not parse processors.forwarding.{field} config value, using default: {default}"
-        );
-    };
+    fn key(field: &str) -> String {
+        format!("processors.forwarding.{field}")
+    }
+    fn num<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, MediatorError> {
+        values::number(&key(field), value).map_err(config_error)
+    }
+    fn at_least_one<T>(field: &str, value: &str) -> Result<T, MediatorError>
+    where
+        T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy + From<u8>,
+    {
+        values::number_at_least(&key(field), value, T::from(1)).map_err(config_error)
+    }
+    fn flag(field: &str, value: &str) -> Result<bool, MediatorError> {
+        values::boolean(&key(field), value).map_err(config_error)
+    }
 
     Ok(ForwardingConfig {
-        enabled: raw.enabled.parse().unwrap_or_else(|_| {
-            warn_default("enabled", "true");
-            true
-        }),
-        future_time_limit: raw.future_time_limit.parse().unwrap_or_else(|_| {
-            warn_default("future_time_limit", "86400");
-            86400
-        }),
-        external_forwarding: raw.external_forwarding.parse().unwrap_or_else(|_| {
-            warn_default("external_forwarding", "true");
-            true
-        }),
-        report_errors: raw.report_errors.parse().unwrap_or_else(|_| {
-            warn_default("report_errors", "true");
-            true
-        }),
+        enabled: flag("enabled", &raw.enabled)?,
+        future_time_limit: num("future_time_limit", &raw.future_time_limit)?,
+        external_forwarding: flag("external_forwarding", &raw.external_forwarding)?,
+        report_errors: flag("report_errors", &raw.report_errors)?,
         blocked_forwarding: HashSet::new(),
-        rate_window_seconds: raw.rate_window_seconds.parse().unwrap_or_else(|_| {
-            warn_default("rate_window_seconds", "300");
-            300
-        }),
-        ws_threshold_msgs_per_10s: raw.ws_threshold_msgs_per_10s.parse().unwrap_or_else(|_| {
-            warn_default("ws_threshold_msgs_per_10s", "1");
-            1
-        }),
-        ws_idle_timeout_seconds: raw.ws_idle_timeout_seconds.parse().unwrap_or_else(|_| {
-            warn_default("ws_idle_timeout_seconds", "60");
-            60
-        }),
-        batch_size: raw.batch_size.parse().unwrap_or_else(|_| {
-            warn_default("batch_size", "50");
-            50
-        }),
-        max_retries: raw.max_retries.parse().unwrap_or_else(|_| {
-            warn_default("max_retries", "5");
-            5
-        }),
-        initial_backoff_ms: raw.initial_backoff_ms.parse().unwrap_or_else(|_| {
-            warn_default("initial_backoff_ms", "1000");
-            1000
-        }),
-        max_backoff_ms: raw.max_backoff_ms.parse().unwrap_or_else(|_| {
-            warn_default("max_backoff_ms", "60000");
-            60000
-        }),
-        max_concurrent_endpoints: match raw.max_concurrent_endpoints.parse() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                warn_default("max_concurrent_endpoints", "32");
-                32
-            }
-        },
-        delivery_timeout_seconds: match raw.delivery_timeout_seconds.parse() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                warn_default("delivery_timeout_seconds", "90");
-                90
-            }
-        },
-        reclaim_idle_seconds: match raw.reclaim_idle_seconds.parse() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                warn_default("reclaim_idle_seconds", "180");
-                180
-            }
-        },
+        blocked_forwarding_late: Default::default(),
+        rate_window_seconds: num("rate_window_seconds", &raw.rate_window_seconds)?,
+        ws_threshold_msgs_per_10s: num(
+            "ws_threshold_msgs_per_10s",
+            &raw.ws_threshold_msgs_per_10s,
+        )?,
+        ws_idle_timeout_seconds: num("ws_idle_timeout_seconds", &raw.ws_idle_timeout_seconds)?,
+        batch_size: num("batch_size", &raw.batch_size)?,
+        max_retries: num("max_retries", &raw.max_retries)?,
+        initial_backoff_ms: num("initial_backoff_ms", &raw.initial_backoff_ms)?,
+        max_backoff_ms: num("max_backoff_ms", &raw.max_backoff_ms)?,
+        // Zero would stall or disable delivery, so it is refused.
+        max_concurrent_endpoints: at_least_one(
+            "max_concurrent_endpoints",
+            &raw.max_concurrent_endpoints,
+        )?,
+        delivery_timeout_seconds: at_least_one(
+            "delivery_timeout_seconds",
+            &raw.delivery_timeout_seconds,
+        )?,
+        reclaim_idle_seconds: at_least_one("reclaim_idle_seconds", &raw.reclaim_idle_seconds)?,
         consumer_group: raw.consumer_group,
-        accept_invalid_certs: raw.accept_invalid_certs.parse().unwrap_or_else(|_| {
-            warn_default("accept_invalid_certs", "false");
-            false
-        }),
-        max_hops: raw.max_hops.parse().unwrap_or_else(|_| {
-            warn_default("max_hops", "10");
-            10
-        }),
-        relay_mode: match raw.relay_mode.trim().to_ascii_lowercase().as_str() {
+        accept_invalid_certs: flag("accept_invalid_certs", &raw.accept_invalid_certs)?,
+        max_hops: num("max_hops", &raw.max_hops)?,
+        relay_mode: match values::one_of(
+            &key("relay_mode"),
+            &raw.relay_mode,
+            &["", "blind", "rewrap"],
+        )
+        .map_err(config_error)?
+        {
             "rewrap" => RelayMode::Rewrap,
-            "blind" | "" => RelayMode::Blind,
-            other => {
-                warn_default(&format!("relay_mode (unrecognised: {other:?})"), "blind");
-                RelayMode::Blind
-            }
+            _ => RelayMode::Blind,
         },
         relay_trusted_mediators: raw
             .relay_trusted_mediators
@@ -306,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_relay_mode_falls_back_to_blind() {
+    fn unrecognised_relay_mode_is_refused() {
         let raw = ForwardingConfigRaw {
             enabled: "true".to_string(),
             external_forwarding: "true".to_string(),
@@ -330,12 +303,13 @@ mod tests {
             relay_mode: "bogus".to_string(),
             relay_trusted_mediators: String::new(),
         };
-        let config = forwarding_config_from_raw(raw).unwrap();
-        assert_eq!(config.relay_mode, RelayMode::Blind);
+        let err = forwarding_config_from_raw(raw).unwrap_err().to_string();
+        assert!(err.contains("processors.forwarding.relay_mode"), "{err}");
+        assert!(err.contains("\"blind\", \"rewrap\""), "{err}");
     }
 
     #[test]
-    fn test_forwarding_config_try_from_invalid_values_use_defaults() {
+    fn test_forwarding_config_try_from_invalid_values_are_refused() {
         let raw = ForwardingConfigRaw {
             enabled: "not_bool".to_string(),
             external_forwarding: "not_bool".to_string(),
@@ -359,25 +333,80 @@ mod tests {
             relay_mode: "bad".to_string(),
             relay_trusted_mediators: String::new(),
         };
-        let config = forwarding_config_from_raw(raw).unwrap();
-        // All invalid values should fall back to unwrap_or defaults
-        assert!(config.enabled); // default true
-        assert_eq!(config.relay_mode, RelayMode::Blind); // unrecognised → blind
-        assert!(config.external_forwarding); // default true
-        assert!(config.report_errors); // default true
-        assert_eq!(config.future_time_limit, 86400);
-        assert_eq!(config.rate_window_seconds, 300);
-        assert_eq!(config.ws_threshold_msgs_per_10s, 1);
-        assert_eq!(config.ws_idle_timeout_seconds, 60);
-        assert_eq!(config.batch_size, 50);
-        assert_eq!(config.max_retries, 5);
-        assert_eq!(config.initial_backoff_ms, 1000);
-        assert_eq!(config.max_backoff_ms, 60000);
-        // Zero would stall or disable delivery, so it is refused like garbage.
-        assert_eq!(config.max_concurrent_endpoints, 32);
-        assert_eq!(config.delivery_timeout_seconds, 90);
-        assert_eq!(config.reclaim_idle_seconds, 180);
-        assert!(!config.accept_invalid_certs); // default false
-        assert_eq!(config.max_hops, 10); // default 10
+        // Each unreadable value is refused on its own, naming its key.
+        let good = || ForwardingConfigRaw {
+            enabled: "true".to_string(),
+            external_forwarding: "true".to_string(),
+            future_time_limit: "3600".to_string(),
+            report_errors: "true".to_string(),
+            blocked_forwarding_dids: String::new(),
+            rate_window_seconds: "300".to_string(),
+            ws_threshold_msgs_per_10s: "1".to_string(),
+            ws_idle_timeout_seconds: "60".to_string(),
+            batch_size: "50".to_string(),
+            max_retries: "5".to_string(),
+            initial_backoff_ms: "1000".to_string(),
+            max_backoff_ms: "60000".to_string(),
+            max_concurrent_endpoints: "32".to_string(),
+            delivery_timeout_seconds: "90".to_string(),
+            reclaim_idle_seconds: "180".to_string(),
+            consumer_group: "forwarding".to_string(),
+            accept_invalid_certs: "false".to_string(),
+            max_hops: "10".to_string(),
+            relay_mode: "blind".to_string(),
+            relay_trusted_mediators: String::new(),
+        };
+        assert!(forwarding_config_from_raw(good()).is_ok());
+        assert!(forwarding_config_from_raw(raw).is_err());
+        type Set = fn(&mut ForwardingConfigRaw);
+        let cases: [(&str, Set); 6] = [
+            ("enabled", |r| r.enabled = "not_bool".into()),
+            ("future_time_limit", |r| r.future_time_limit = "1d".into()),
+            ("max_concurrent_endpoints", |r| {
+                r.max_concurrent_endpoints = "0".into()
+            }),
+            ("delivery_timeout_seconds", |r| {
+                r.delivery_timeout_seconds = "0".into()
+            }),
+            ("accept_invalid_certs", |r| {
+                r.accept_invalid_certs = "bad".into()
+            }),
+            ("max_hops", |r| r.max_hops = "-1".into()),
+        ];
+        for (field, set) in cases {
+            let mut raw = good();
+            set(&mut raw);
+            let err = forwarding_config_from_raw(raw).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("processors.forwarding.{field}")),
+                "{field}: {err}"
+            );
+        }
+        // Booleans are case-insensitive and trimmed.
+        let mut upper = good();
+        upper.enabled = " FALSE ".into();
+        assert!(!forwarding_config_from_raw(upper).unwrap().enabled);
+    }
+
+    #[test]
+    fn an_unreadable_expiry_cleanup_flag_is_refused() {
+        let err = MessageExpiryCleanupConfig::try_from(MessageExpiryCleanupConfigRaw {
+            enabled: "yes".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("processors.message_expiry_cleanup.enabled"),
+            "{err}"
+        );
+        let err = SessionExpiryCleanupConfig::try_from(SessionExpiryCleanupConfigRaw {
+            enabled: "1".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("processors.session_expiry_cleanup.enabled"),
+            "{err}"
+        );
     }
 }
