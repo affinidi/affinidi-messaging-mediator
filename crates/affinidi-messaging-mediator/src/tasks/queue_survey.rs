@@ -657,7 +657,7 @@ mod tests {
         ) -> Result<Option<u64>, MediatorError> {
             if self.failing.iter().any(|d| d == did_hash) {
                 return Err(MediatorError::InternalError(
-                    500,
+                    crate::error_codes::INTERNAL_ERROR,
                     "test".into(),
                     "probe failed".into(),
                 ));
@@ -676,7 +676,7 @@ mod tests {
         ) -> Result<(usize, usize), MediatorError> {
             if self.failing_sample.iter().any(|d| d == did_hash) {
                 return Err(MediatorError::InternalError(
-                    500,
+                    crate::error_codes::INTERNAL_ERROR,
                     "test".into(),
                     "sample failed".into(),
                 ));

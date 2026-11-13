@@ -1896,7 +1896,7 @@ mod tests {
     fn an_internal_error_reaches_the_monitor_without_its_text() {
         use affinidi_messaging_mediator_common::errors::MediatorError;
         let internal = MediatorError::InternalError(
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             "redis://:secret@db.internal:6379 connection refused".into(),
         );

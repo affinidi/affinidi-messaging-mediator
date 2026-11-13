@@ -606,7 +606,7 @@ async fn the_configured_accounts_keep_their_roles() {
             .await
             .expect_err("a configured account's role is not changed by a Trust Task");
         assert!(
-            format!("{refused:?}").contains("account.update.protected"),
+            format!("{refused:?}").contains("permissionDenied"),
             "refused as protected: {refused:?}"
         );
         assert_eq!(

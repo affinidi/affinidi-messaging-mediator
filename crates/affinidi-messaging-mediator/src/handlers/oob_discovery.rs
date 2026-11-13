@@ -13,6 +13,7 @@
  Alice and Bob then swap messages and create a confidential communication channel between themselves.
 */
 
+use crate::error_codes;
 use crate::{
     SharedData,
     common::authz::{self, Capability},
@@ -50,7 +51,7 @@ pub async fn oob_invite_handler(
     // ACL Check
     if authz::require_capability(&session.acls, Capability::CreateInvites).is_err() {
         return Err(MediatorError::problem(
-            45,
+            error_codes::AUTH_PERMISSION_DENIED,
             session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -115,7 +116,7 @@ pub async fn oob_invite_handler(
         Err(e) if e.is_storage_cap() => return Err(e.into()),
         Err(e) => {
             return Err(MediatorError::problem_with_log(
-                46,
+                error_codes::OOB_STORE_ERROR,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -177,10 +178,13 @@ pub async fn oobid_handler(
             Err(MediatorError::storage_error_opaque(code, "NA", text).into())
         }
         Err(e) if e.is_storage_cap() => {
-            Err(MediatorError::storage_error_opaque(87, "NA", e).into())
+            Err(
+                MediatorError::storage_error_opaque(error_codes::OOB_RETRIEVE_ERROR, "NA", e)
+                    .into(),
+            )
         }
         Err(e) => Err(MediatorError::problem_with_log(
-            87,
+            error_codes::OOB_RETRIEVE_ERROR,
             "NA",
             None,
             ProblemReportSorter::Error,
@@ -215,7 +219,7 @@ pub async fn delete_oobid_handler(
                     return e;
                 }
                 MediatorError::problem_with_log(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session.session_id.clone(),
                     None,
                     ProblemReportSorter::Error,
@@ -250,7 +254,7 @@ pub async fn delete_oobid_handler(
             == 0
         {
             return Err(MediatorError::problem(
-                45,
+                error_codes::AUTH_PERMISSION_DENIED,
                 session.session_id.clone(),
                 None,
                 ProblemReportSorter::Error,

@@ -1,10 +1,11 @@
-//! A Trust Task that asks for it (`"x-errorFormat": "trust-task-error"`) is
-//! refused with a `trust-task-error` document (Trust Tasks SPEC §8) instead of
-//! a DIDComm problem report, over DIDComm and over TSP; one that does not ask
-//! is refused with a problem report, as before.
+//! A refused Trust Task is answered with a `trust-task-error` document
+//! (Trust Tasks SPEC §8) instead of a DIDComm problem report, over DIDComm
+//! and over TSP, whether or not it asks (`"x-errorFormat":
+//! "trust-task-error"`). The code is always a Trust Task code: a standard
+//! one or one the task's specification declares.
 //!
-//! The documents are built and signed by hand, as the SDK this workspace pins
-//! does not ask yet.
+//! The documents are built and signed by hand, so each test controls whether
+//! the request asks.
 
 mod common;
 
@@ -184,7 +185,7 @@ async fn an_epoch_mismatch_carries_the_current_epoch_as_a_typed_detail() {
 }
 
 #[tokio::test]
-async fn a_request_that_does_not_ask_is_refused_with_a_problem_report() {
+async fn a_request_that_does_not_ask_is_refused_with_a_document_too() {
     init_tracing();
     let env = env().await;
     let member = online(&env, "member", None).await;
@@ -199,22 +200,14 @@ async fn a_request_that_does_not_ask_is_refused_with_a_problem_report() {
         false,
     )
     .await;
-    let refusal = match send(&env, &member, doc).await {
-        Err(e) => e,
-        Ok(reply) => {
-            assert!(reply.typ.contains("problem-report"), "{reply:?}");
-            reply.body.to_string()
-        }
-    };
-    assert!(
-        refusal.contains("messaging/mux/revoke-all:epochMismatch"),
-        "{refusal}"
-    );
-    assert!(refusal.contains("current epoch is 0"), "{refusal}");
+    let reply = send(&env, &member, doc.clone()).await.expect("an answer");
+    let p = error_for(&env, &reply, &doc);
+    assert_eq!(p["code"], "messaging/mux/revoke-all:epochMismatch");
+    assert_eq!(p["details"], json!({ "currentEpoch": 0 }));
 }
 
 #[tokio::test]
-async fn a_mediator_code_is_sent_as_a_standard_code_and_kept_in_details() {
+async fn a_refusal_outside_the_task_specs_is_a_standard_code() {
     init_tracing();
     let env = env().await;
     let member = online(&env, "member", None).await;
@@ -231,12 +224,7 @@ async fn a_mediator_code_is_sent_as_a_standard_code_and_kept_in_details() {
     let reply = send(&env, &someone, doc.clone()).await.expect("an answer");
     let p = error_for(&env, &reply, &doc);
     assert_eq!(p["code"], "permissionDenied", "{p:#}");
-    assert!(
-        p["details"]["mediatorCode"]
-            .as_str()
-            .is_some_and(|c| c.starts_with("authorization.")),
-        "{p:#}"
-    );
+    assert!(p.get("details").is_none(), "no mediator code: {p:#}");
 }
 
 /// Over REST the refusal document is stored for the sender, and the POST's
@@ -427,10 +415,7 @@ async fn over_tsp_a_refusal_is_sealed_back_as_a_trust_task_error() {
     assert_eq!(body["type"], ERROR_TYPE, "{body:#}");
     assert_eq!(body["payload"]["inResponseTo"]["id"], doc["id"]);
     assert_eq!(body["payload"]["code"], "malformedRequest", "{body:#}");
-    assert_eq!(
-        body["payload"]["details"]["mediatorCode"], "message.trust_task.malformed",
-        "{body:#}"
-    );
+    assert!(body["payload"].get("details").is_none(), "{body:#}");
 }
 
 /// A request the session could never have had answered — a TSP frame signed

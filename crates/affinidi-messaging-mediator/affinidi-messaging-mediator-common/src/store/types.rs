@@ -10,6 +10,7 @@
 //! duplicates are removed in the call-site refactor commit; carrying them
 //! both during the transition keeps each commit small and reviewable.
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use ahash::AHashMap as HashMap;
@@ -44,7 +45,7 @@ impl TryFrom<&String> for SessionState {
             "Authenticated" => Ok(Self::Authenticated),
             "Blocked" => Ok(Self::Blocked),
             _ => Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 "NA".into(),
                 format!("Unknown session state: ({value})"),
             )),

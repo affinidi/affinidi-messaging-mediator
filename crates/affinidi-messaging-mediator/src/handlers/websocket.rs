@@ -5,6 +5,7 @@ use crate::common::metrics::names::{
 };
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
+use crate::error_codes;
 #[cfg(feature = "tsp")]
 use crate::messages::inbound::handle_inbound_tsp;
 use crate::monitor::{Channel, Protocol};
@@ -328,7 +329,7 @@ pub async fn websocket_handler(
     };
     if authz::require_capability(&session.acls, required).is_err() {
         let error: AppError = MediatorError::problem(
-            40,
+            error_codes::AUTH_NOT_LOCAL,
             session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -2914,7 +2915,7 @@ async fn _package_problem_report(
     .await
     .map_err(|err| {
         MediatorError::MessagePackError(
-            47,
+            error_codes::MESSAGE_PACK_ERROR,
             session.session_id.clone(),
             format!("Couldn't pack DIDComm message. Reason: {err}"),
         )
@@ -2968,7 +2969,7 @@ async fn _package_status_for(
     .await
     .map_err(|err| {
         MediatorError::MessagePackError(
-            47,
+            error_codes::MESSAGE_PACK_ERROR,
             session.session_id.clone(),
             format!("Couldn't pack resync status. Reason: {err}"),
         )

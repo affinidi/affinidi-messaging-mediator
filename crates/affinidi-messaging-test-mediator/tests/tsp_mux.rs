@@ -1445,20 +1445,27 @@ async fn an_ack_off_a_mux_connection_is_refused() {
         .await
         .expect("pack the ack");
     ws.send(Message::Binary(frame.into())).await.expect("write");
-    let closed = timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(f))) => return f,
-                Some(Ok(_)) => continue,
-                _ => return None,
-            }
-        }
-    })
-    .await
-    .expect("refused");
-    assert!(
-        closed.is_some_and(|f| f.code
-            == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+    // Refused with a `trust-task-error` under the code the spec declares,
+    // sealed back on the connection (an ack's answer is pushed, not stored).
+    let sealed = next_binary(&mut ws).await;
+    let (payload, _) = env
+        .atm
+        .tsp()
+        .unpack(&principal.profile, &{
+            use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+            BASE64_URL_SAFE_NO_PAD.encode(&sealed)
+        })
+        .await
+        .expect("unpack the refusal");
+    let refusal: serde_json::Value = serde_json::from_slice(&payload).expect("a document");
+    assert_eq!(
+        refusal["type"], "https://trusttasks.org/spec/trust-task-error/0.6",
+        "{refusal:#}"
+    );
+    assert_eq!(refusal["threadId"], doc["id"], "{refusal:#}");
+    assert_eq!(
+        refusal["payload"]["code"], "messaging/mux:notMuxConnection",
+        "{refusal:#}"
     );
     env.shutdown().await.expect("shutdown");
 }

@@ -5,6 +5,7 @@
 //! storage). This file only carries the Redis-specific persistence
 //! methods on `Database`.
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::{RefreshRotation, Session, SessionState};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
@@ -30,7 +31,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::session_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session_id.into(),
                     &err,
                     format!("Failed to retrieve session ({session_id}). Reason: {err}"),
@@ -51,7 +52,7 @@ impl Database {
                 crate::did_identity::did_hash(did)
             );
             return Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 session_id.into(),
                 "No challenge found when retrieving session".into(),
             ));
@@ -86,7 +87,7 @@ impl Database {
                         .query_async(&mut con_del)
                         .await;
                     return Err(MediatorError::Unauthorized(
-                        20,
+                        error_codes::SESSION_INVALID_STATE,
                         session_id.into(),
                         "Session record was corrupt; please re-authenticate".into(),
                     ));
@@ -95,7 +96,7 @@ impl Database {
         } else {
             warn!("Session ({}): No state found", session_id);
             return Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 session_id.into(),
                 "No state found when retrieving session".into(),
             ));
@@ -107,7 +108,7 @@ impl Database {
         } else {
             warn!("Session ({}): No DID found", session_id);
             return Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 session_id.into(),
                 "No DID found when retrieving session".into(),
             ));
@@ -130,7 +131,7 @@ impl Database {
         } else {
             warn!("{}: Error parsing role_type!", session_id);
             return Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 session_id.into(),
                 "No role_type found when retrieving session!".into(),
             ));
@@ -145,7 +146,7 @@ impl Database {
                             session_id, acls, err
                         );
                         return Err(MediatorError::SessionError(
-                            14,
+                            error_codes::DB_OPERATION_ERROR,
                             session_id.into(),
                             "Failed to parse ACLs for session".into(),
                         ));
@@ -154,7 +155,7 @@ impl Database {
             } else {
                 warn!("{}: Error parsing acls!", session_id);
                 return Err(MediatorError::SessionError(
-                    20,
+                    error_codes::SESSION_INVALID_STATE,
                     session_id.into(),
                     "No ACL found when retrieving session".into(),
                 ));
@@ -162,7 +163,7 @@ impl Database {
         } else {
             warn!("{}: Error parsing acls!", session_id);
             return Err(MediatorError::SessionError(
-                20,
+                error_codes::SESSION_INVALID_STATE,
                 session_id.into(),
                 "No ACL found when retrieving session".into(),
             ));
@@ -217,7 +218,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::session_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     old_session_id.into(),
                     &err,
                     format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
@@ -244,7 +245,7 @@ impl Database {
         let new_sid = format!("SESSION:{new_session_id}");
         let failed = |reason: String| {
             MediatorError::SessionError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 old_session_id.into(),
                 format!("Failed to retrieve session ({old_session_id}). Reason: {reason}"),
             )
@@ -258,7 +259,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::session_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     old_session_id.into(),
                     &err,
                     format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
@@ -279,7 +280,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::session_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     old_session_id.into(),
                     &err,
                     format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
@@ -329,7 +330,7 @@ return 0
         .await
         .map_err(|err| {
             MediatorError::session_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 session_id.into(),
                 &err,
                 format!(
@@ -339,7 +340,7 @@ return 0
         })?;
         if updated == 0 {
             return Err(MediatorError::SessionError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 session_id.into(),
                 format!("Session not found: {session_id}"),
             ));
@@ -374,7 +375,7 @@ return 0
         .await
         .map_err(|err| {
             MediatorError::session_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 session_id.into(),
                 &err,
                 format!(
@@ -404,7 +405,7 @@ return 0
             .await
             .map_err(|err| {
                 MediatorError::session_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session_id.into(),
                     &err,
                     format!(

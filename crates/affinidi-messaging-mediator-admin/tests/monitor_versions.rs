@@ -205,7 +205,7 @@ async fn a_mediator_without_subscribe_0_2_is_watched_at_0_1_with_traffic_only() 
         .await;
     assert!(
         matches!(&membership, Err(ConsoleError::Refused { code, .. })
-            if code.ends_with("protocol.trust_task.unsupported")),
+            if code.ends_with("unsupportedType")),
         "{:?}",
         membership.err()
     );

@@ -3,6 +3,7 @@
 //! messages that need to be forwarded to remote mediators.
 
 use super::Database;
+use crate::error_codes;
 use crate::errors::{MediatorError, StorageCap};
 use std::collections::HashMap;
 use tracing::{Level, debug, event, warn};
@@ -40,7 +41,7 @@ impl Database {
         let stream_id: String = cmd.query_async(&mut conn).await.map_err(|err| {
             event!(Level::ERROR, "Couldn't enqueue forward message: {}", err);
             MediatorError::database_from_redis(
-                90,
+                error_codes::FORWARD_ENQUEUE_ERROR,
                 "forwarding".into(),
                 &err,
                 format!("Couldn't enqueue forward message: {err}"),
@@ -90,7 +91,7 @@ impl Database {
                 } else {
                     event!(Level::ERROR, "Couldn't create consumer group: {}", e);
                     Err(MediatorError::database_from_redis(
-                        91,
+                        error_codes::DB_OPERATION_ERROR,
                         "forwarding".into(),
                         &e,
                         format!("Couldn't create consumer group: {e}"),
@@ -155,7 +156,7 @@ impl Database {
                 .map_err(|err| {
                     event!(Level::ERROR, "XREADGROUP error: {}", err);
                     MediatorError::database_from_redis(
-                        92,
+                        error_codes::DB_OPERATION_ERROR,
                         "forwarding".into(),
                         &err,
                         format!("XREADGROUP error: {err}"),
@@ -213,7 +214,7 @@ impl Database {
         cmd.exec_async(&mut conn).await.map_err(|err| {
             event!(Level::ERROR, "XACK error: {}", err);
             MediatorError::database_from_redis(
-                93,
+                error_codes::DB_OPERATION_ERROR,
                 "forwarding".into(),
                 &err,
                 format!("XACK error: {err}"),
@@ -239,7 +240,7 @@ impl Database {
         cmd.exec_async(&mut conn).await.map_err(|err| {
             event!(Level::ERROR, "XDEL error: {}", err);
             MediatorError::database_from_redis(
-                94,
+                error_codes::DB_OPERATION_ERROR,
                 "forwarding".into(),
                 &err,
                 format!("XDEL error: {err}"),
@@ -283,7 +284,7 @@ impl Database {
                 .map_err(|err| {
                     event!(Level::ERROR, "XAUTOCLAIM error: {}", err);
                     MediatorError::database_from_redis(
-                        95,
+                        error_codes::DB_OPERATION_ERROR,
                         "forwarding".into(),
                         &err,
                         format!("XAUTOCLAIM error: {err}"),
@@ -334,7 +335,7 @@ impl Database {
         let finished: i64 = invocation.invoke_async(&mut conn).await.map_err(|err| {
             event!(Level::ERROR, "forward queue finish error: {}", err);
             MediatorError::database_from_redis(
-                97,
+                error_codes::DB_OPERATION_ERROR,
                 "forwarding".into(),
                 &err,
                 format!("forward queue finish error: {err}"),
@@ -438,7 +439,7 @@ impl Database {
                 invocation.invoke_async(&mut conn).await.map_err(|err| {
                     event!(Level::ERROR, "forward claim refresh error: {}", err);
                     MediatorError::database_from_redis(
-                        96,
+                        error_codes::DB_OPERATION_ERROR,
                         "forwarding".into(),
                         &err,
                         format!("forward claim refresh error: {err}"),

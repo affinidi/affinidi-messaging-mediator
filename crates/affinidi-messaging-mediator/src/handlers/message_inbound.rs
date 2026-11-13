@@ -1,3 +1,4 @@
+use crate::error_codes;
 #[cfg(feature = "tsp")]
 use crate::messages::inbound::handle_inbound_tsp;
 use crate::monitor::{Channel, Protocol};
@@ -104,7 +105,7 @@ pub async fn message_inbound_handler(
         if authz::require_capability(&session.acls, Capability::SendMessages).is_err() {
             metrics::counter!(names::ACL_DENIALS_TOTAL, "action" => "send").increment(1);
             return Err(MediatorError::problem(
-                44,
+                error_codes::AUTH_SEND_DENIED,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -133,7 +134,7 @@ pub async fn message_inbound_handler(
         #[cfg(not(feature = "tsp"))]
         if looks_like_tsp_bytes(&body) {
             return Err(MediatorError::problem(
-                37,
+                error_codes::PROTOCOL_UNSUPPORTED,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -192,7 +193,7 @@ pub async fn message_inbound_handler(
             // door for Aries wallets does not also open anonymous v2 inbound.
             if session.session_id == crate::common::jwt_auth::ANON_V1_SESSION_ID && !is_v1 {
                 return Err(MediatorError::problem(
-                    44,
+                    error_codes::AUTHENTICATION_REQUIRED,
                     session.session_id,
                     None,
                     ProblemReportSorter::Error,
@@ -208,7 +209,7 @@ pub async fn message_inbound_handler(
             if is_v1 {
                 let raw = std::str::from_utf8(&body).map_err(|e| {
                     MediatorError::problem(
-                        19,
+                        error_codes::PARSE_ERROR,
                         session.session_id.clone(),
                         None,
                         ProblemReportSorter::Warning,
@@ -282,7 +283,7 @@ pub async fn message_inbound_handler(
         // byte-identical for existing DIDComm clients.
         let body: InboundMessage = serde_json::from_slice(&body).map_err(|e| {
             MediatorError::problem_with_log(
-                19,
+                error_codes::PARSE_ERROR,
                 session.session_id.clone(),
                 None,
                 ProblemReportSorter::Warning,
@@ -299,7 +300,7 @@ pub async fn message_inbound_handler(
             Ok(s) => s,
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    19,
+                    error_codes::PARSE_ERROR,
                     session.session_id,
                     None,
                     ProblemReportSorter::Warning,

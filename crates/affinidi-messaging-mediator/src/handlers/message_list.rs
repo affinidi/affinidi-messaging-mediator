@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::{
     SharedData,
     common::authz::{self, Capability},
@@ -48,7 +49,7 @@ pub async fn message_list_handler(
         // ACL Check
         if authz::require_capability(&session.acls, Capability::Local).is_err() {
             return Err(MediatorError::problem(
-                40,
+                error_codes::AUTH_NOT_LOCAL,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -74,7 +75,7 @@ pub async fn message_list_handler(
             == 0
         {
             return Err(MediatorError::problem(
-                45,
+                error_codes::AUTH_PERMISSION_DENIED,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,

@@ -1,4 +1,5 @@
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use itertools::Itertools;
 use num_format::{Locale, ToFormattedString};
@@ -91,7 +92,7 @@ impl Database {
                     err
                 );
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("Couldn't get shared METADATA from database: {err}"),
@@ -100,7 +101,7 @@ impl Database {
 
         let result: Vec<String> = from_redis_value(result).map_err(|e| {
             MediatorError::DatabaseError(
-                21,
+                error_codes::DB_PARSE_ERROR,
                 "NA".into(),
                 format!("Couldn't parse GLOBAL metadata from database: {e}"),
             )
@@ -146,7 +147,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "INTERNAL".into(),
                     &err,
                     format!("Couldn't update GLOBAL SEND stats. Reason: {err}"),
@@ -168,7 +169,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "INTERNAL".into(),
                     &err,
                     format!("Couldn't update GLOBAL(WEBSOCKET_OPEN) stats. Reason: {err}"),
@@ -190,7 +191,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "INTERNAL".into(),
                     &err,
                     format!("Couldn't update GLOBAL(WEBSOCKET_CLOSE) stats. Reason: {err}"),
@@ -210,7 +211,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "INTERNAL".into(),
                     &err,
                     format!("Couldn't retrieve FORWARD_Q length. Reason: {err}"),

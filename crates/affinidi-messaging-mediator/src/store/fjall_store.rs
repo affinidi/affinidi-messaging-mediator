@@ -61,6 +61,7 @@
 //! one key-only scan at open and maintained under `write_lock`
 //! thereafter, which is sound because this backend is single-process.
 
+use crate::error_codes;
 use affinidi_messaging_mediator_common::store::mux::{MuxDidRecord, MuxIndexDelta};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
@@ -1062,7 +1063,7 @@ impl FjallStore {
             .open()
             .map_err(|e| {
                 MediatorError::InternalError(
-                    500,
+                    error_codes::INTERNAL_ERROR,
                     "fjall".into(),
                     format!("FjallStore::open: failed to open database at {path:?}: {e}"),
                 )
@@ -1075,7 +1076,7 @@ impl FjallStore {
             })
             .map_err(|e| {
                 MediatorError::InternalError(
-                    500,
+                    error_codes::INTERNAL_ERROR,
                     "fjall".into(),
                     format!("FjallStore::open: failed to open partition '{name}': {e}"),
                 )
@@ -1172,20 +1173,28 @@ impl FjallStore {
 
     fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MediatorError> {
         serde_json::to_vec(value).map_err(|e| {
-            MediatorError::InternalError(500, "fjall".into(), format!("encode failed: {e}"))
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "fjall".into(),
+                format!("encode failed: {e}"),
+            )
         })
     }
 
     /// Helper: decode JSON bytes into the target type.
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, MediatorError> {
         serde_json::from_slice(bytes).map_err(|e| {
-            MediatorError::InternalError(500, "fjall".into(), format!("decode failed: {e}"))
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "fjall".into(),
+                format!("decode failed: {e}"),
+            )
         })
     }
 
     fn db_err(method: &str, e: fjall::Error) -> MediatorError {
         MediatorError::DatabaseError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "fjall".into(),
             format!("FjallStore::{method} failed: {e}"),
         )
@@ -1769,7 +1778,7 @@ impl MediatorStore for FjallStore {
     ) -> Result<MessageMetaData, MediatorError> {
         let Some((_, stored)) = self.record_for(message_hash, recipient_did_hash)? else {
             return Err(MediatorError::DatabaseError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".into(),
                 format!("Message metadata not found for {message_hash}"),
             ));
@@ -2162,7 +2171,7 @@ impl MediatorStore for FjallStore {
             .map_err(|e| Self::db_err("get_session:get", e))?
             .ok_or_else(|| {
                 MediatorError::SessionError(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session_id.into(),
                     format!("Session not found: {session_id}"),
                 )
@@ -2178,7 +2187,7 @@ impl MediatorStore for FjallStore {
         if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
             self.remove_session_if_expired(session_id, now).await;
             return Err(MediatorError::SessionError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 session_id.into(),
                 format!("Session expired: {session_id}"),
             ));
@@ -2324,7 +2333,7 @@ impl MediatorStore for FjallStore {
                 // rather than fabricate a record — the rotation has
                 // nothing to attach to.
                 MediatorError::SessionError(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session_id.into(),
                     format!("Session not found: {session_id}"),
                 )
@@ -2456,7 +2465,7 @@ impl MediatorStore for FjallStore {
             let acc: StoredAccount = Self::decode(&raw)?;
             if acc.role == AccountType::Mediator || acc.role == AccountType::RootAdmin {
                 return Err(MediatorError::InternalError(
-                    18,
+                    error_codes::PROTECTED_ACCOUNT_ERROR,
                     "fjall".into(),
                     "Cannot remove the mediator or root admin account".into(),
                 ));
@@ -2574,7 +2583,7 @@ impl MediatorStore for FjallStore {
             Some(rec) => {
                 let raw = serde_json::to_vec(rec).map_err(|e| {
                     MediatorError::InternalError(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "fjall".into(),
                         format!("mux record encode: {e}"),
                     )
@@ -2657,7 +2666,7 @@ impl MediatorStore for FjallStore {
                 Ok(()) // idempotent re-bind by the same owner
             } else {
                 Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "fjall".into(),
                     "routing verkey is already bound to a different account".into(),
                 ))
@@ -2880,7 +2889,7 @@ impl MediatorStore for FjallStore {
     ) -> Result<MediatorACLGetResponse, MediatorError> {
         if dids.len() > 100 {
             return Err(MediatorError::DatabaseError(
-                27,
+                error_codes::ACL_GET_DIDS_LIMIT,
                 "fjall".into(),
                 "# of DIDs cannot exceed 100".into(),
             ));
@@ -4056,7 +4065,11 @@ impl MediatorStore for FjallStore {
             .insert(
                 key,
                 serde_json::to_vec(&stats).map_err(|e| {
-                    MediatorError::InternalError(14, did_hash.into(), e.to_string())
+                    MediatorError::InternalError(
+                        error_codes::DB_OPERATION_ERROR,
+                        did_hash.into(),
+                        e.to_string(),
+                    )
                 })?,
             )
             .map_err(|e| Self::db_err("account_stats_bump:insert", e))

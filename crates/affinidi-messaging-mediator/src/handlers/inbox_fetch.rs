@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::{
     SharedData,
     after_write::{AfterWrite, HandedOver, HandedOverMessage, fetch_for_handover, respond_then},
@@ -51,7 +52,7 @@ pub async fn inbox_fetch_handler(
         // ACL Check
         if authz::require_capability(&session.acls, Capability::Local).is_err() {
             return Err(MediatorError::problem(
-                40, session.session_id, None,
+                error_codes::AUTH_NOT_LOCAL, session.session_id, None,
                 ProblemReportSorter::Error, ProblemReportScope::Protocol,
                 "authorization.local",
                 "DID isn't local to the mediator",
@@ -63,7 +64,7 @@ pub async fn inbox_fetch_handler(
         // Check options
         if body.limit< 1 || body.limit > 100 {
             return Err(MediatorError::problem_with_log(
-                41, session.session_id, None,
+                error_codes::API_INBOX_FETCH_LIMIT, session.session_id, None,
                 ProblemReportSorter::Error, ProblemReportScope::Protocol,
                 "api.inbox_fetch.limit",
                 "Invalid limit ({1}). Must be 1-100 in range",
@@ -81,7 +82,7 @@ pub async fn inbox_fetch_handler(
         let re = &*RE;
         if let Some(start_id) = &body.start_id && ! re.is_match(start_id) {
                 return Err(MediatorError::problem_with_log(
-                    42, session.session_id, None,
+                    error_codes::API_INBOX_FETCH_START_ID, session.session_id, None,
                     ProblemReportSorter::Error, ProblemReportScope::Protocol,
                     "api.inbox_fetch.start_id",
                     "start_id isn't valid. Should match UNIX_EPOCH in milliseconds + `-(0..999)`. Received: {1}",
@@ -93,7 +94,7 @@ pub async fn inbox_fetch_handler(
 
         // Fetch messages if possible. Nothing is stamped or deleted yet.
         let mut results = fetch_for_handover(&state, &session.session_id, &session.did_hash, &body).await.map_err(|e| {MediatorError::problem_with_log(
-            14, session.session_id.clone(), None,
+            error_codes::DB_OPERATION_ERROR, session.session_id.clone(), None,
             ProblemReportSorter::Error, ProblemReportScope::Protocol,
             "me.res.storage.error",
             "Database transaction error: {1}",

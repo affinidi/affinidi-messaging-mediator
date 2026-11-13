@@ -1,3 +1,4 @@
+use crate::error_codes;
 use affinidi_messaging_mediator_common::{MediatorSecrets, errors::MediatorError};
 // `SecurityConfigRaw` (the raw TOML schema) now lives in the config crate; the
 // conversion to the runtime `SecurityConfig` stays here as an extension trait
@@ -429,7 +430,7 @@ impl SecurityConfig {
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|err| {
             tracing::error!("Could not create JWT key pair. {err}");
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Could not create JWT key pair. {err}"),
             )
@@ -554,7 +555,8 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     /// exactly as before this matcher existed (so existing exact-origin
     /// configs are unaffected).
     fn parse_origin_matcher(token: &str) -> Result<OriginMatcher, MediatorError> {
-        let config_err = |msg: String| MediatorError::ConfigError(12, "NA".into(), msg);
+        let config_err =
+            |msg: String| MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg);
 
         // Fast path: no '*' ⇒ exact origin, parsed verbatim (unchanged
         // legacy behaviour — scheme requirement is enforced by the
@@ -733,7 +735,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             trust_task_verification: self.trust_task_verification.parse().map_err(
                 |e: String| {
                     tracing::error!("{e}");
-                    MediatorError::ConfigError(12, "NA".into(), e)
+                    MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), e)
                 },
             )?,
             // Also a hard error: a deadline that doesn't parse must not
@@ -741,7 +743,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             tsp_auth_accept_unbound_until: parse_accept_until(&self.tsp_auth_accept_unbound_until)
                 .map_err(|e| {
                     tracing::error!("{e}");
-                    MediatorError::ConfigError(12, "NA".into(), e)
+                    MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), e)
                 })?,
             ..SecurityConfig::default(secrets_resolver)
         };
@@ -750,7 +752,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             tracing::error!(
                 "Conflicting configuration: security.force_session_did_match can not be true when security.block_anonymous_outer_envelope is false"
             );
-            return Err(MediatorError::ConfigError(12,
+            return Err(MediatorError::ConfigError(error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "Conflicting configuration: security.force_session_did_match can not be true when security.block_anonymous_outer_envelope is false".into(),
             ));
@@ -760,7 +762,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             .map_err(|err| {
             tracing::error!("Couldn't parse global_acl_default config parameter. Reason: {err}");
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Couldn't parse global_acl_default config parameter. Reason: {err}"),
             )
@@ -805,7 +807,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                     Secret::from_multibase(&entry.private_key_multibase, Some(&entry.key_id))
                         .map_err(|e| {
                             MediatorError::ConfigError(
-                                12,
+                                error_codes::CONFIG_ERROR,
                                 "NA".into(),
                                 format!(
                                     "Could not decode VTA operating secret '{}': {e}",
@@ -837,7 +839,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                 }
                 Ok(None) => {
                     return Err(MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         "No operating secrets found. In self-hosted mode, the backend must \
                          contain an entry at 'mediator/operating/secrets'. Run \
@@ -848,7 +850,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                 Err(err) => {
                     tracing::error!("Could not load operating secrets: {err}");
                     return Err(MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!("Could not load operating secrets: {err}"),
                     ));
@@ -861,7 +863,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "JWT signing secret is missing from the backend (well-known key \
@@ -872,7 +874,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             }
             Err(err) => {
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Could not load JWT signing secret: {err}"),
                 ));

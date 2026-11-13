@@ -34,7 +34,7 @@ pub(crate) fn delivery_refused(
         "delivery refused; the sender is told only that it was refused"
     );
     MediatorError::problem(
-        73,
+        error_codes::DELIVERY_REFUSED,
         &session.session_id,
         message_id,
         ProblemReportSorter::Error,
@@ -103,6 +103,7 @@ use crate::SharedData;
 use crate::common::session::Session;
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat;
+use crate::error_codes;
 #[cfg(feature = "didcomm")]
 use crate::messages::protocols::discover_features;
 #[cfg(feature = "didcomm")]
@@ -167,7 +168,7 @@ impl MessageType {
                 message_pickup::status_request(message, state, session).await
             }
             SDKMessageType::MessagePickupStatusResponse => Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -187,7 +188,7 @@ impl MessageType {
                 message_pickup::toggle_live_delivery(message, state, session).await
             }
             SDKMessageType::AffinidiAuthenticate => Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -198,7 +199,7 @@ impl MessageType {
                 StatusCode::BAD_REQUEST,
             )),
             SDKMessageType::AffinidiAuthenticateRefresh => Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -212,7 +213,7 @@ impl MessageType {
                 routing::process(message, metadata, state, session).await
             }
             SDKMessageType::ProblemReport => Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -226,7 +227,7 @@ impl MessageType {
                 discover_features::process(message, session, state)
             }
             SDKMessageType::DiscoverFeaturesDisclose => Err(MediatorError::problem(
-                88,
+                error_codes::DISCLOSE_NOT_READ,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -237,7 +238,7 @@ impl MessageType {
                 StatusCode::NOT_IMPLEMENTED,
             )),
             SDKMessageType::Other(ref type_) => Err(MediatorError::problem_with_log(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(message.id.to_string()),
                 ProblemReportSorter::Error,
@@ -335,7 +336,7 @@ impl MessageHandler for Message {
     ) -> Result<ProcessMessageResponse, MediatorError> {
         let msg_type = MessageType(self.typ.as_str().parse::<SDKMessageType>().map_err(|err| {
             MediatorError::MediatorError(
-                30,
+                error_codes::MESSAGE_TYPE_INCORRECT,
                 session.session_id.to_string(),
                 Some(self.id.clone()),
                 Box::new(ProblemReport::new(
@@ -357,7 +358,7 @@ impl MessageHandler for Message {
             && expires <= now
         {
             return Err(MediatorError::MediatorError(
-                31,
+                error_codes::MESSAGE_EXPIRED,
                 session.session_id.to_string(),
                 Some(self.id.clone()),
                 Box::new(ProblemReport::new(
@@ -395,7 +396,7 @@ impl MessageHandler for Message {
         // Resolved for the key-count check; the cache serves pack_encrypted's own lookup.
         let to_doc = did_resolver.resolve(to_did).await.map_err(|e| {
             MediatorError::MediatorError(
-                74,
+                error_codes::DID_RESOLVE_ERROR,
                 session_id.to_string(),
                 Some(self.id.clone()),
                 Box::new(ProblemReport::new(
@@ -417,7 +418,7 @@ impl MessageHandler for Message {
             key_agreement_over_limit(&to_doc.doc, pack_options.to_keys_per_recipient_limit)
         {
             return Err(MediatorError::MediatorError(
-                47,
+                error_codes::MESSAGE_PACK_ERROR,
                 session_id.to_string(),
                 Some(self.id.clone()),
                 Box::new(ProblemReport::new(
@@ -455,7 +456,7 @@ impl MessageHandler for Message {
                 Ok(msg) => msg,
                 Err(e) => {
                     return Err(MediatorError::MediatorError(
-                        47,
+                        error_codes::MESSAGE_PACK_ERROR,
                         session_id.to_string(),
                         Some(self.id.clone()),
                         Box::new(ProblemReport::new(
@@ -475,7 +476,7 @@ impl MessageHandler for Message {
             Ok(a)
         } else {
             Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 session_id,
                 Some(self.id.to_string()),
                 ProblemReportSorter::Error,

@@ -126,7 +126,7 @@ impl DatabaseHandler {
 
         let client = redis::Client::open(config.database_url.as_str()).map_err(|err| {
             MediatorError::problem_with_log(
-                1,
+                crate::error_codes::DB_URL_INVALID,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -293,7 +293,7 @@ impl DatabaseHandler {
             .build()
             .map_err(|err| {
                 MediatorError::problem_with_log(
-                    1,
+                    crate::error_codes::DB_URL_INVALID,
                     "NA",
                     None,
                     ProblemReportSorter::Error,
@@ -422,7 +422,7 @@ impl DatabaseHandler {
     pub async fn get_blocking_connection(&self) -> Result<MultiplexedConnection, MediatorError> {
         let client = redis::Client::open(self.redis_url.clone()).map_err(|err| {
             MediatorError::problem_with_log(
-                10,
+                crate::error_codes::DB_CONNECTION_ERROR,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -441,7 +441,7 @@ impl DatabaseHandler {
             .await
             .map_err(|err| {
                 MediatorError::problem_with_log(
-                    11,
+                    crate::error_codes::DB_CONNECTION_ERROR,
                     "NA",
                     None,
                     ProblemReportSorter::Error,
@@ -458,7 +458,7 @@ impl DatabaseHandler {
         // MOVED/READONLY; refuse it and let the caller's retry reconnect.
         if self.keys.cluster_mode() && is_replica(&mut conn).await {
             return Err(MediatorError::problem_with_log(
-                11,
+                crate::error_codes::DB_CONNECTION_ERROR,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -478,7 +478,7 @@ impl DatabaseHandler {
     pub async fn get_pubsub_connection(&self) -> Result<PubSub, MediatorError> {
         let client = redis::Client::open(self.redis_url.clone()).map_err(|err| {
             MediatorError::problem_with_log(
-                4,
+                crate::error_codes::DB_PUBSUB_CONNECTION_ERROR,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -493,7 +493,7 @@ impl DatabaseHandler {
 
         client.get_async_pubsub().await.map_err(|err| {
             MediatorError::problem_with_log(
-                5,
+                crate::error_codes::DB_PUBSUB_RECEIVER_ERROR,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -542,7 +542,7 @@ impl DatabaseHandler {
                 Ok(result) => result,
                 Err(err) => {
                     return Err(MediatorError::problem_with_log(
-                        7,
+                        crate::error_codes::DB_VERSION_PARSE_ERROR,
                         "NA",
                         None,
                         ProblemReportSorter::Error,
@@ -560,7 +560,7 @@ impl DatabaseHandler {
                 Ok(version.to_owned())
             } else {
                 Err(MediatorError::problem_with_log(
-                    8,
+                    crate::error_codes::DB_VERSION_INCOMPATIBLE,
                     "NA",
                     None,
                     ProblemReportSorter::Error,
@@ -576,7 +576,7 @@ impl DatabaseHandler {
             }
         } else {
             Err(MediatorError::problem(
-                9,
+                crate::error_codes::DB_VERSION_UNKNOWN,
                 "NA",
                 None,
                 ProblemReportSorter::Error,
@@ -635,7 +635,7 @@ impl DatabaseHandler {
 #[cfg(feature = "redis-backend")]
 fn storage_info_error(err: &redis::RedisError) -> MediatorError {
     MediatorError::problem_with_log(
-        6,
+        crate::error_codes::DB_SERVER_INFO_ERROR,
         "NA",
         None,
         ProblemReportSorter::Error,
@@ -653,7 +653,7 @@ fn storage_info_error(err: &redis::RedisError) -> MediatorError {
 #[cfg(feature = "redis-backend")]
 fn storage_config_error(text: String) -> MediatorError {
     MediatorError::problem_with_log(
-        2,
+        crate::error_codes::DB_CONFIG_INVALID,
         "NA",
         None,
         ProblemReportSorter::Error,

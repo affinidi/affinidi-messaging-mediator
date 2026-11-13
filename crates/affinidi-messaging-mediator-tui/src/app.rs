@@ -3336,8 +3336,13 @@ async fn watch(
 
 /// The mediator doesn't serve what was asked (its type is unsupported).
 fn is_unsupported(e: &ConsoleError) -> bool {
-    e.refusal_code()
-        .is_some_and(|c| c.ends_with("protocol.trust_task.unsupported"))
+    // `unsupportedType` from a mediator at 0.53 or later; the older
+    // mediator's own code before that.
+    e.refusal_code().is_some_and(|c| {
+        c.ends_with("unsupportedType")
+            || c.ends_with("unsupportedVersion")
+            || c.ends_with("protocol.trust_task.unsupported")
+    })
 }
 
 /// A subscribe the mediator (or the console, knowing its answer) turned down.

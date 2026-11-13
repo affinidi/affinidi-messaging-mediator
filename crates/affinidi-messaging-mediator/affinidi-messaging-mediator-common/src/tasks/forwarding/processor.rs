@@ -27,6 +27,7 @@
 //! - An endpoint URL that does not parse, or that the egress policy does not
 //!   admit: likewise dropped at once with a problem report of its own
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::{MediatorStore, types::ForwardQueueEntry};
 use crate::tasks::forwarding::config::ForwardingConfig;
@@ -736,7 +737,7 @@ impl ForwardingProcessor {
         let http_pool = Arc::new(HttpClientPool::new(config.accept_invalid_certs).map_err(
             |e| {
                 crate::errors::MediatorError::InternalError(
-                    17,
+                    error_codes::INTERNAL_ERROR,
                     "forwarding".into(),
                     format!("Failed to create HTTP client pool: {e}"),
                 )
@@ -1161,7 +1162,7 @@ impl ForwardingProcessor {
             .is_some_and(|fault| fault.load(AtomicOrdering::Acquire))
         {
             return Err(MediatorError::DatabaseError(
-                96,
+                error_codes::DB_OPERATION_ERROR,
                 "forwarding".into(),
                 "claim refresh failed (injected)".into(),
             ));

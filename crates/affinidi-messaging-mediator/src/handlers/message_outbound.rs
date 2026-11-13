@@ -1,3 +1,4 @@
+use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
 use affinidi_messaging_sdk::messages::{
     GetMessagesRequest, GetMessagesResponse,
@@ -43,7 +44,7 @@ pub async fn message_outbound_handler(
         // ACL Check
         if authz::require_capability(&session.acls, Capability::Local).is_err() {
             return Err(MediatorError::problem(
-                40,
+                error_codes::AUTH_NOT_LOCAL,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -66,7 +67,7 @@ pub async fn message_outbound_handler(
         // the mediator with a single request.
         if body.message_ids.len() > state.limits().listed_messages {
             return Err(MediatorError::problem_with_log(
-                43,
+                error_codes::API_MESSAGE_OUTBOUND_LIMIT,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,

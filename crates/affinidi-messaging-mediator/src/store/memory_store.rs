@@ -24,6 +24,7 @@
 //!   re-delivers messages whose owning consumer has gone idle.
 
 use crate::common::time::unix_timestamp_secs;
+use crate::error_codes;
 use affinidi_messaging_mediator_common::store::mux::{MuxDidRecord, MuxIndexDelta};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
@@ -932,7 +933,7 @@ impl MediatorStore for MemoryStore {
         let key: RecordKey = (message_hash.to_string(), recipient_did_hash.to_string());
         let record = state.messages.get(&key).ok_or_else(|| {
             MediatorError::DatabaseError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".into(),
                 format!("Message metadata not found for {message_hash}"),
             )
@@ -1219,7 +1220,7 @@ impl MediatorStore for MemoryStore {
         let mut state = self.state.lock().await;
         let record = state.get_session_record(session_id).ok_or_else(|| {
             MediatorError::SessionError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 session_id.into(),
                 format!("Session not found: {session_id}"),
             )
@@ -1387,7 +1388,7 @@ impl MediatorStore for MemoryStore {
                 && (record.role == AccountType::Mediator || record.role == AccountType::RootAdmin)
             {
                 return Err(MediatorError::InternalError(
-                    18,
+                    error_codes::PROTECTED_ACCOUNT_ERROR,
                     "memory".into(),
                     "Cannot remove the mediator or root admin account".into(),
                 ));
@@ -1524,7 +1525,7 @@ impl MediatorStore for MemoryStore {
             // Claiming another account's routing key would capture its inbound
             // v1 traffic; see the trait's security note.
             Some(_) => Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "routing verkey is already bound to a different account".into(),
             )),
@@ -1694,7 +1695,7 @@ impl MediatorStore for MemoryStore {
     ) -> Result<MediatorACLGetResponse, MediatorError> {
         if dids.len() > 100 {
             return Err(MediatorError::DatabaseError(
-                27,
+                error_codes::ACL_GET_DIDS_LIMIT,
                 "memory".into(),
                 "# of DIDs cannot exceed 100".into(),
             ));

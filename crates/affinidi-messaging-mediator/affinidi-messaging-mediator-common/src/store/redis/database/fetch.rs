@@ -1,5 +1,6 @@
 use super::Database;
 use crate::database::RedisConnection;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::MessageScope;
 use crate::types::messages::{
@@ -58,7 +59,7 @@ impl Database {
                     err
                 );
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("Couldn't fetch_messages() from database: {err}"),

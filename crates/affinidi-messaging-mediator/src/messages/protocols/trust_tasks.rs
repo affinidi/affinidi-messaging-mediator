@@ -17,7 +17,7 @@
 //! membership filter on `access-list/list` replaces `access-list/get`; and the
 //! generic `audit/list` / `config/show` tasks replace `admin/audit-log` /
 //! `admin/config`. The retired URIs are **not** dual-accepted — they answer
-//! `protocol.trust_task.unsupported` like any other unknown type.
+//! `unsupportedType` like any other unknown type.
 //!
 //! [Trust Task]: https://trusttasks.org
 
@@ -26,6 +26,7 @@
 // and stay until 0.1 is withdrawn.
 #![allow(deprecated)]
 
+use crate::error_codes;
 use crate::task_specs::messaging::{
     access_list, account, acl, message, monitor, ping, queue, stats,
 };
@@ -127,7 +128,7 @@ pub(crate) async fn process(
         .ok_or_else(|| {
             tt_problem(
                 session,
-                "message.trust_task.unauthenticated",
+                "permissionDenied",
                 "Trust Task envelopes require an authenticated sender".into(),
                 StatusCode::BAD_REQUEST,
             )
@@ -137,7 +138,7 @@ pub(crate) async fn process(
     let doc: TrustTask<Value> = serde_json::from_value(message.body.clone()).map_err(|e| {
         tt_problem(
             session,
-            "message.trust_task.malformed",
+            "malformedRequest",
             format!("body is not a Trust Task document: {e}"),
             StatusCode::BAD_REQUEST,
         )
@@ -146,9 +147,9 @@ pub(crate) async fn process(
     let now_secs = state.clock.unix_secs();
     let sender_did = vid_of(&sender_kid);
     let request_type = doc.type_uri.to_string();
-    // A request that asks to be refused with a `trust-task-error` document
-    // is answered with one, in place of the problem report.
-    let refusing = crate::messages::protocols::trust_task_error::Refusing::asked_by(&doc);
+    // A refusal is answered with a `trust-task-error` document where one can
+    // be sent (see `trust_task_error`).
+    let refusing = crate::messages::protocols::trust_task_error::Refusing::of(&doc);
     let consumed = consume(
         doc,
         &message.body,
@@ -163,11 +164,8 @@ pub(crate) async fn process(
         Ok(Some(v)) => v,
         // identity_mismatch with no transport sender → emit nothing.
         Ok(None) => return Ok(ProcessMessageResponse::default()),
-        Err(e) => match &refusing {
-            Some(r) => match r.document(&e, session, &sender_did, state).await {
-                Some(doc) => doc,
-                None => return Err(e),
-            },
+        Err(e) => match refusing.document(&e, session, &sender_did, state).await {
+            Some(doc) => doc,
             None => return Err(e),
         },
     };
@@ -232,7 +230,25 @@ pub(crate) enum TaskTransport {
 /// DIDComm authcrypt/JWS unpack, or a TSP unpack (Ed25519 over
 /// envelope‖ciphertext plus HPKE-Auth). Handlers authorise against it, so a
 /// caller that passes an unverified claim hands an attacker the admin surface.
+///
+/// Every refusal it returns carries a Trust Task error code
+/// ([`trust_task_error::normalize`](crate::messages::protocols::trust_task_error::normalize)),
+/// whichever handler or helper raised it.
 pub(crate) async fn consume(
+    doc: TrustTask<Value>,
+    raw: &Value,
+    state: &SharedData,
+    session: &Session,
+    sender_kid: &str,
+    now_secs: u64,
+    transport: TaskTransport,
+) -> Result<Option<Value>, MediatorError> {
+    consume_task(doc, raw, state, session, sender_kid, now_secs, transport)
+        .await
+        .map_err(crate::messages::protocols::trust_task_error::normalize)
+}
+
+async fn consume_task(
     doc: TrustTask<Value>,
     raw: &Value,
     state: &SharedData,
@@ -276,7 +292,7 @@ pub(crate) async fn consume(
             None => {
                 return Err(tt_problem(
                     session,
-                    "protocol.trust_task.unsupported",
+                    "unsupportedType",
                     format!("unsupported Trust Task type: {}", doc.type_uri),
                     StatusCode::NOT_IMPLEMENTED,
                 ));
@@ -682,7 +698,7 @@ fn downcast<P: serde::de::DeserializeOwned>(
     serde_json::from_value(serde_json::to_value(doc).map_err(serialize_err)?).map_err(|e| {
         tt_problem(
             session,
-            "message.trust_task.malformed",
+            "malformedRequest",
             format!("payload does not match the task type: {e}"),
             StatusCode::BAD_REQUEST,
         )
@@ -700,14 +716,7 @@ async fn consume_account_get(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, MediatorError> {
     // Framework basics: addressed to this mediator and not expired.
-    typed.validate_basic(now, mediator_did).map_err(|reason| {
-        tt_problem(
-            session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    validate_tt_basic(&typed, session, mediator_did, now)?;
 
     // Authz: the caller must be the target account itself, or an admin.
     let target_hash = typed.payload.did.to_string();
@@ -719,7 +728,7 @@ async fn consume_account_get(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to read account {target_hash}"),
             StatusCode::FORBIDDEN,
         ));
@@ -732,7 +741,7 @@ async fn consume_account_get(
         .ok_or_else(|| {
             tt_problem(
                 session,
-                "account.not_found",
+                "messaging/account/get:unknownAccount",
                 format!("account {target_hash} not found"),
                 StatusCode::NOT_FOUND,
             )
@@ -777,14 +786,7 @@ async fn consume_account_list(
     mediator_did: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, MediatorError> {
-    typed.validate_basic(now, mediator_did).map_err(|reason| {
-        tt_problem(
-            session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    validate_tt_basic(&typed, session, mediator_did, now)?;
 
     // Authz: admin-only (listing every account is an administrative action).
     require_admin(session, "account/list")?;
@@ -850,7 +852,7 @@ async fn consume_account_list(
         .map_err(|e| {
             tt_problem(
                 session,
-                "account.list.cursor",
+                "internalError",
                 format!("couldn't encode the continuation cursor: {e}"),
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
@@ -898,7 +900,7 @@ async fn consume_account_update(
     let denied = |reason: &str| {
         tt_problem(
             session,
-            "authorization.permission",
+            "permissionDenied",
             reason.to_string(),
             StatusCode::FORBIDDEN,
         )
@@ -912,7 +914,7 @@ async fn consume_account_update(
         .ok_or_else(|| {
             tt_problem(
                 session,
-                "account.not_found",
+                "messaging/account/update:unknownAccount",
                 format!("account {target_hash} not found"),
                 StatusCode::NOT_FOUND,
             )
@@ -928,8 +930,11 @@ async fn consume_account_update(
         current._type,
         &target_hash,
     ) {
-        return Err(denied(
-            "root-admin access is required to modify a privileged account",
+        return Err(tt_problem(
+            session,
+            "messaging/account/update:rootAdminRequired",
+            "root-admin access is required to modify a privileged account".to_string(),
+            StatusCode::FORBIDDEN,
         ));
     }
 
@@ -954,7 +959,7 @@ async fn consume_account_update(
         if is_configured_account(state, &target_hash) {
             return Err(tt_problem(
                 session,
-                "account.update.protected",
+                "permissionDenied",
                 "the roles of the mediator and root-admin accounts cannot be changed".to_string(),
                 StatusCode::FORBIDDEN,
             ));
@@ -962,8 +967,11 @@ async fn consume_account_update(
         // Granting a privileged role, or changing the role of an account that
         // holds one, is for a root admin.
         if !roles::can_assign_role(session.account_type, Some(current._type), new_type) {
-            return Err(denied(
-                "root-admin access is required to grant or change a privileged role",
+            return Err(tt_problem(
+                session,
+                "messaging/account/update:rootAdminRequired",
+                "root-admin access is required to grant or change a privileged role".to_string(),
+                StatusCode::FORBIDDEN,
             ));
         }
     }
@@ -983,7 +991,7 @@ async fn consume_account_update(
     {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to update account {target_hash}"),
             StatusCode::FORBIDDEN,
         ));
@@ -1098,7 +1106,7 @@ async fn consume_account_update(
         .ok_or_else(|| {
             tt_problem(
                 session,
-                "account.not_found",
+                "messaging/account/update:unknownAccount",
                 format!("account {target_hash} not found after update"),
                 StatusCode::NOT_FOUND,
             )
@@ -1243,7 +1251,7 @@ fn gate_self_managed_limit(
         // as a success carrying the old value, which reads as "applied".
         return Err(tt_problem(
             session,
-            "authorization.queue_limit.not_self_manageable",
+            "messaging/account/update:selfChangeDenied",
             format!("this account may not self-manage its `{limit_name}`"),
             StatusCode::FORBIDDEN,
         ));
@@ -1252,7 +1260,7 @@ fn gate_self_managed_limit(
         RESET_QUEUE_LIMIT_TO_DEFAULT => Ok(Some(RESET_QUEUE_LIMIT_TO_DEFAULT)),
         limit if limit < 0 => Err(tt_problem(
             session,
-            "authorization.queue_limit.admin_required",
+            "permissionDenied",
             format!(
                 "admin access is required to set an unlimited `{limit_name}` ({limit}); \
                  this account may set a limit of 0 or more, or \
@@ -1281,7 +1289,7 @@ fn wire_queue_limit(
         Ok(limit) if limit >= RESET_QUEUE_LIMIT_TO_DEFAULT => Ok(Some(limit)),
         _ => Err(tt_problem(
             session,
-            "message.trust_task.malformed",
+            "malformedRequest",
             format!(
                 "`{limit_name}` must be -1 (unlimited), {RESET_QUEUE_LIMIT_TO_DEFAULT} (reset to \
                  the default) or a limit from 0 to {}; got {requested}",
@@ -1324,14 +1332,7 @@ async fn consume_account_remove(
     mediator_did: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, MediatorError> {
-    typed.validate_basic(now, mediator_did).map_err(|reason| {
-        tt_problem(
-            session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    validate_tt_basic(&typed, session, mediator_did, now)?;
 
     let target_hash = typed.payload.did.to_string();
     if !check_permissions(
@@ -1342,7 +1343,7 @@ async fn consume_account_remove(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to remove account {target_hash}"),
             StatusCode::FORBIDDEN,
         ));
@@ -1352,7 +1353,7 @@ async fn consume_account_remove(
     if is_configured_account(state, &target_hash) {
         return Err(tt_problem(
             session,
-            "account.remove.protected",
+            "messaging/account/remove:protectedAccount",
             "the mediator and root-admin accounts cannot be removed".to_string(),
             StatusCode::FORBIDDEN,
         ));
@@ -1368,7 +1369,7 @@ async fn consume_account_remove(
     {
         return Err(tt_problem(
             session,
-            "authorization.permission",
+            "permissionDenied",
             "root-admin access is required to remove a privileged account".to_string(),
             StatusCode::FORBIDDEN,
         ));
@@ -1488,14 +1489,7 @@ async fn consume_account_add(
 ) -> Result<Value, MediatorError> {
     use account::add::v0_1::AccountType as WireType;
 
-    typed.validate_basic(now, mediator_did).map_err(|reason| {
-        tt_problem(
-            session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    validate_tt_basic(&typed, session, mediator_did, now)?;
 
     let target_hash = typed.payload.did.to_string();
     let new_type = match typed.payload.account_type {
@@ -1511,7 +1505,7 @@ async fn consume_account_add(
     let denied = |reason: &str| {
         tt_problem(
             session,
-            "authorization.permission",
+            "permissionDenied",
             reason.to_string(),
             StatusCode::FORBIDDEN,
         )
@@ -1594,14 +1588,7 @@ async fn consume_acl_get(
 ) -> Result<Value, MediatorError> {
     use acl::get::v0_1::{Entry, Response, Vid};
 
-    typed.validate_basic(now, mediator_did).map_err(|reason| {
-        tt_problem(
-            session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    validate_tt_basic(&typed, session, mediator_did, now)?;
 
     let dids: Vec<String> = typed.payload.dids.iter().map(|v| v.to_string()).collect();
     // Bounded here because the pinned schema does not bound it (no
@@ -1609,7 +1596,7 @@ async fn consume_acl_get(
     if dids.len() > ACL_GET_MAX_DIDS {
         return Err(tt_problem(
             session,
-            "message.trust_task.malformed",
+            "malformedRequest",
             format!(
                 "`dids` may name at most {ACL_GET_MAX_DIDS} accounts; this request names {}",
                 dids.len()
@@ -1625,7 +1612,7 @@ async fn consume_acl_get(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             "not permitted to read one or more of the requested ACLs".to_string(),
             StatusCode::FORBIDDEN,
         ));
@@ -1676,7 +1663,7 @@ async fn authorize_access_list(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to access the access list for {target_hash}"),
             StatusCode::FORBIDDEN,
         ));
@@ -1685,7 +1672,7 @@ async fn authorize_access_list(
     {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "messaging/access-list/update:selfChangeDenied",
             "this account may not self-manage its access list".to_string(),
             StatusCode::FORBIDDEN,
         ));
@@ -1702,7 +1689,7 @@ async fn authorize_access_list(
     {
         return Err(tt_problem(
             session,
-            "authorization.permission",
+            "permissionDenied",
             "root-admin access is required to change a privileged account's access list"
                 .to_string(),
             StatusCode::FORBIDDEN,
@@ -1734,12 +1721,12 @@ fn ensure_self_manageable(
     session: &Session,
 ) -> Result<(), MediatorError> {
     let req: account::get::v0_1::MediatorAcl = serde_json::from_value(acl_value.clone())
-        .map_err(|e| serialize_err_msg(format!("invalid ACL payload: {e}")))?;
+        .map_err(|e| malformed_acl(format!("invalid ACL payload: {e}")))?;
     let cur = decode_acl_canonical(base);
     let deny = |flag: &str| -> Result<(), MediatorError> {
         Err(tt_problem(
             session,
-            "authorization.acl.not_self_manageable",
+            "messaging/account/update:selfChangeDenied",
             format!("this account may not change `{flag}`"),
             StatusCode::FORBIDDEN,
         ))
@@ -2066,7 +2053,7 @@ async fn consume_mux_connections(
     if !state.config.limits.mux.enabled {
         return Err(tt_problem(
             session,
-            "protocol.trust_task.unsupported",
+            "unsupportedType",
             format!("unsupported Trust Task type: {}", doc.type_uri),
             StatusCode::NOT_IMPLEMENTED,
         ));
@@ -2108,7 +2095,7 @@ pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), Mediato
     } else {
         Err(tt_problem(
             session,
-            "authorization.admin_required",
+            "permissionDenied",
             format!("{task} requires an admin account"),
             StatusCode::FORBIDDEN,
         ))
@@ -2508,12 +2495,9 @@ fn merge_wire_acl(
     mut base: MediatorACLSet,
 ) -> Result<MediatorACLSet, MediatorError> {
     use account::get::v0_1::{MediatorAcl, MediatorAclAccessListMode};
-    let acl: MediatorAcl = serde_json::from_value(acl_value).map_err(|e| {
-        MediatorError::InternalError(14, "NA".to_string(), format!("invalid ACL payload: {e}"))
-    })?;
-    let acl_err = |e: ACLError| {
-        MediatorError::InternalError(14, "NA".to_string(), format!("ACL update rejected: {e}"))
-    };
+    let acl: MediatorAcl = serde_json::from_value(acl_value)
+        .map_err(|e| malformed_acl(format!("invalid ACL payload: {e}")))?;
+    let acl_err = |e: ACLError| malformed_acl(format!("ACL update rejected: {e}"));
 
     if let Some(mode) = acl.access_list_mode {
         let mode = match mode {
@@ -2577,21 +2561,41 @@ fn to_wire_account<T: serde::de::DeserializeOwned>(acc: &Account) -> T {
     .expect("messaging Account types share the one shared schema")
 }
 
+/// A Trust Task refusal under `code`: one of the framework's standard codes
+/// (SPEC §8.3: `permissionDenied`, `malformedRequest`, …) or a
+/// `<task>:<code>` the task's specification declares. It is answered with a
+/// `trust-task-error` document carrying `code`, or, where no document can be
+/// sent, a problem report `e.p.<code>`
+/// ([`trust_task_error`](crate::messages::protocols::trust_task_error)).
 pub(crate) fn tt_problem(
     session: &Session,
     code: &str,
     message: String,
     status: StatusCode,
 ) -> MediatorError {
+    tt_problem_with_args(session, code, message, vec![], status)
+}
+
+/// [`tt_problem`] with problem-report arguments: the values a declared
+/// code's `details` are built from (`currentEpoch`, `size`).
+pub(crate) fn tt_problem_with_args(
+    session: &Session,
+    code: &str,
+    message: String,
+    args: Vec<String>,
+    status: StatusCode,
+) -> MediatorError {
+    let number = crate::error_codes::trust_task_code(code);
+    debug_assert!(number.is_some(), "{code} is not a Trust Task error code");
     MediatorError::problem(
-        37,
+        number.unwrap_or(crate::error_codes::TT_TASK_FAILED),
         &session.session_id,
         None,
         ProblemReportSorter::Error,
         ProblemReportScope::Protocol,
         code,
         &message,
-        vec![],
+        args,
         status,
     )
 }
@@ -2605,14 +2609,10 @@ fn task_refusal(session: &Session, e: crate::mux::tasks::TaskError) -> MediatorE
         .current_epoch
         .map(|c| vec![c.to_string()])
         .unwrap_or_default();
-    MediatorError::problem(
-        37,
-        &session.session_id,
-        None,
-        ProblemReportSorter::Error,
-        ProblemReportScope::Protocol,
+    tt_problem_with_args(
+        session,
         &e.code,
-        &e.message,
+        e.message,
         args,
         if e.retryable {
             StatusCode::SERVICE_UNAVAILABLE
@@ -2643,7 +2643,7 @@ async fn consume_mux(
     if !state.config.limits.mux.enabled {
         return Err(tt_problem(
             session,
-            "protocol.trust_task.unsupported",
+            "unsupportedType",
             format!("unsupported Trust Task type: {}", doc.type_uri),
             StatusCode::NOT_IMPLEMENTED,
         ));
@@ -2905,7 +2905,7 @@ async fn consume_mux_admin(
     if !state.config.limits.mux.enabled {
         return Err(tt_problem(
             session,
-            "protocol.trust_task.unsupported",
+            "unsupportedType",
             format!("unsupported Trust Task type: {}", doc.type_uri),
             StatusCode::NOT_IMPLEMENTED,
         ));
@@ -2917,7 +2917,7 @@ async fn consume_mux_admin(
             if !roles::is_privileged(session.account_type) {
                 return Err(tt_problem(
                     session,
-                    "authorization.admin_required",
+                    "permissionDenied",
                     "messaging/mux/admin-list requires an administrator account".into(),
                     StatusCode::FORBIDDEN,
                 ));
@@ -3076,11 +3076,15 @@ pub(crate) fn validate_tt_basic<P>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), MediatorError> {
     typed.validate_basic(now, mediator_did).map_err(|reason| {
+        // `expired` or `wrongRecipient`, as the framework names them.
         tt_problem(
             session,
-            "message.trust_task.rejected",
-            format!("Trust Task failed basic validation: {reason:?}"),
-            StatusCode::BAD_REQUEST,
+            reason.code().as_str(),
+            format!(
+                "Trust Task failed basic validation: {}",
+                reason.wire_message()
+            ),
+            StatusCode::FORBIDDEN,
         )
     })
 }
@@ -3106,13 +3110,19 @@ where
         .map_err(|e| serialize_err_msg(format!("couldn't build Trust Task document: {e}")))
 }
 
+/// An ACL in a request that is not a valid ACL: the client's error, so a
+/// `malformedRequest` (400), never an internal one.
+fn malformed_acl(msg: String) -> MediatorError {
+    MediatorError::RequestDataError(error_codes::TT_MALFORMED_REQUEST, "NA".to_string(), msg)
+}
+
 fn serialize_err_msg(msg: String) -> MediatorError {
-    MediatorError::InternalError(14, "NA".to_string(), msg)
+    MediatorError::InternalError(error_codes::INTERNAL_ERROR, "NA".to_string(), msg)
 }
 
 pub(crate) fn serialize_err(e: serde_json::Error) -> MediatorError {
     MediatorError::InternalError(
-        14,
+        error_codes::INTERNAL_ERROR,
         "NA".to_string(),
         format!("couldn't serialise Trust Task response: {e}"),
     )
@@ -3285,7 +3295,7 @@ mod tests {
                 .expect_err("-1 must be refused for a standard account");
             let (code, status) = problem_of(&err);
             assert!(
-                code.ends_with("authorization.queue_limit.admin_required"),
+                code.ends_with("permissionDenied"),
                 "unexpected problem code {code}"
             );
             assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
@@ -3345,7 +3355,7 @@ mod tests {
             .expect_err("a limit the account does not self-manage is refused");
         let (code, status) = problem_of(&err);
         assert!(
-            code.ends_with("authorization.queue_limit.not_self_manageable"),
+            code.ends_with("messaging/account/update:selfChangeDenied"),
             "unexpected problem code {code}"
         );
         assert_eq!(status, StatusCode::FORBIDDEN.as_u16());

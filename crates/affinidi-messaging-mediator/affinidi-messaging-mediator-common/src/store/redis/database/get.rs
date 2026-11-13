@@ -1,4 +1,5 @@
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::types::messages::MessageListElement;
 use itertools::Itertools;
@@ -93,7 +94,7 @@ impl Database {
                         err
                     );
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         &err,
                         format!("Couldn't get message_id({msg_id}) from database: {err}"),
@@ -109,7 +110,7 @@ impl Database {
                 }
                 v => from_redis_value(v).map_err(|e| {
                     MediatorError::InternalError(
-                        17,
+                        error_codes::INTERNAL_ERROR,
                         did_hash.into(),
                         format!("Couldn't convert didcomm_message to string: {e}"),
                     )

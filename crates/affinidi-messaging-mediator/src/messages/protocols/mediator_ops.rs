@@ -13,6 +13,7 @@
 // before 0.1 is withdrawn.
 #![allow(deprecated)]
 
+use crate::error_codes;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -25,7 +26,6 @@ use affinidi_messaging_mediator_common::store::{PurgeFilter, PurgeReport, ops};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_mediator_common::types::audit::AuditAction;
 use affinidi_messaging_mediator_common::types::messages::{Folder, MessageProtocol};
-use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde::de::DeserializeOwned;
@@ -40,7 +40,7 @@ use crate::common::roles;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::trust_tasks::{
-    require_admin, serialize_err, tt_problem, validate_tt_basic,
+    require_admin, serialize_err, tt_problem, tt_problem_with_args, validate_tt_basic,
 };
 use crate::tasks::queue_survey::{AccountQueues, FolderStats, QueueSnapshot};
 
@@ -179,7 +179,7 @@ pub(crate) async fn consume_queue_list(
     let Some(snapshot) = state.queue_snapshot.latest() else {
         return Err(tt_problem(
             session,
-            "message.trust_task.unavailable",
+            "unavailable",
             "no queue survey has completed yet; the first runs a minute after start".into(),
             StatusCode::SERVICE_UNAVAILABLE,
         ));
@@ -199,7 +199,7 @@ pub(crate) async fn consume_queue_list(
         Some(cursor) => parse_cursor(cursor, &snapshot).ok_or_else(|| {
             tt_problem(
                 session,
-                "message.trust_task.malformed",
+                "malformedRequest",
                 "the cursor belongs to a queue survey that has since been replaced; \
                  start again without a cursor"
                     .into(),
@@ -246,7 +246,7 @@ pub(crate) async fn consume_queue_status(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to read the queues of account {target}"),
             StatusCode::FORBIDDEN,
         ));
@@ -254,7 +254,7 @@ pub(crate) async fn consume_queue_status(
     let account = state.database.account_get(&target).await?.ok_or_else(|| {
         tt_problem(
             session,
-            "account.not_found",
+            "messaging/queue/status:unknownAccount",
             format!("account {target} not found"),
             StatusCode::NOT_FOUND,
         )
@@ -413,7 +413,7 @@ fn message_target(
         if authz::require_capability(&session.acls, Capability::Local).is_err() {
             return Err(tt_problem(
                 session,
-                "authorization.local",
+                "permissionDenied",
                 "the account is not local to this mediator".into(),
                 StatusCode::FORBIDDEN,
             ));
@@ -426,7 +426,7 @@ fn message_target(
     ) {
         return Err(tt_problem(
             session,
-            "authorization.account.denied",
+            "permissionDenied",
             format!("not permitted to act on the messages of account {target}"),
             StatusCode::FORBIDDEN,
         ));
@@ -470,7 +470,7 @@ pub(crate) async fn consume_message_list(
     if state.database.account_get(&target).await?.is_none() {
         return Err(tt_problem(
             session,
-            "account.not_found",
+            "messaging/message/list:unknownAccount",
             format!("account {target} not found"),
             StatusCode::NOT_FOUND,
         ));
@@ -491,7 +491,7 @@ pub(crate) async fn consume_message_list(
         Some(c) => stream_successor(c).ok_or_else(|| {
             tt_problem(
                 session,
-                "message.trust_task.malformed",
+                "malformedRequest",
                 "invalid cursor".into(),
                 StatusCode::BAD_REQUEST,
             )
@@ -652,14 +652,10 @@ pub(crate) async fn consume_message_get(
     if stored.size > MESSAGE_GET_MAX_BYTES {
         // The size is also the first argument, which a `trust-task-error`
         // carries as `details.size`.
-        return Err(MediatorError::problem(
-            37,
-            &session.session_id,
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
+        return Err(tt_problem_with_args(
+            session,
             "messaging/message/get:messageTooLarge",
-            &format!(
+            format!(
                 "message {msg_id} is {} bytes; the limit is {MESSAGE_GET_MAX_BYTES}",
                 stored.size
             ),
@@ -735,7 +731,7 @@ pub(crate) async fn consume_message_status(
     if authz::require_capability(&session.acls, Capability::Local).is_err() {
         return Err(tt_problem(
             session,
-            "authorization.local",
+            "permissionDenied",
             "the account is not local to this mediator".into(),
             StatusCode::FORBIDDEN,
         ));
@@ -1625,7 +1621,7 @@ fn parse_cursor(cursor: &str, snapshot: &QueueSnapshot) -> Option<usize> {
 pub(crate) fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, MediatorError> {
     serde_json::from_value(value).map_err(|e| {
         MediatorError::InternalError(
-            14,
+            error_codes::INTERNAL_ERROR,
             "NA".into(),
             format!("couldn't build Trust Task response: {e}"),
         )
@@ -1660,7 +1656,7 @@ pub(crate) async fn consume_config_patch(
     if !roles::is_root(session.account_type) {
         return Err(tt_problem(
             session,
-            "authorization.root_admin_required",
+            "permissionDenied",
             "config/patch changes the mediator for every account and requires a rootAdmin".into(),
             StatusCode::FORBIDDEN,
         ));
@@ -1672,7 +1668,7 @@ pub(crate) async fn consume_config_patch(
     let storage_err = |e: MediatorError| {
         tt_problem(
             session,
-            "config.storage",
+            "unavailable",
             format!("the mediator could not keep configuration overrides: {e}"),
             StatusCode::SERVICE_UNAVAILABLE,
         )
@@ -1803,7 +1799,7 @@ pub(crate) async fn consume_config_reload(
     if !roles::is_root(session.account_type) {
         return Err(tt_problem(
             session,
-            "authorization.root_admin_required",
+            "permissionDenied",
             "config/reload changes the mediator for every account and requires a rootAdmin".into(),
             StatusCode::FORBIDDEN,
         ));
@@ -1811,7 +1807,7 @@ pub(crate) async fn consume_config_reload(
     let Some(path) = config_path() else {
         return Err(tt_problem(
             session,
-            "config.reload.unavailable",
+            "unavailable",
             "this mediator was not started from a configuration file, so there is nothing to \
              reload"
                 .into(),
@@ -1822,7 +1818,7 @@ pub(crate) async fn consume_config_reload(
     let config_err = |e: String| {
         tt_problem(
             session,
-            "config.reload.invalid",
+            "taskFailed",
             format!("the configuration could not be re-read, and nothing changed: {e}"),
             StatusCode::UNPROCESSABLE_ENTITY,
         )

@@ -4,6 +4,7 @@
  */
 
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::ops;
 use crate::store::types::{DeletionAuthority, MessageScope, Session};
@@ -71,7 +72,7 @@ impl Database {
                     .await
                     .map_err(|e| {
                         MediatorError::database_from_redis(
-                            14,
+                            error_codes::DB_OPERATION_ERROR,
                             session.session_id.clone(),
                             &e,
                             format!("Failed to read messages for purge. Reason: {e}"),
@@ -168,7 +169,7 @@ impl Database {
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session.session_id.clone(),
                     &e,
                     format!("Failed to delete stream record. Reason: {e}"),
@@ -196,7 +197,7 @@ impl Database {
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session.session_id.clone(),
                     &e,
                     format!("Failed to delete folder stream. Reason: {e}"),

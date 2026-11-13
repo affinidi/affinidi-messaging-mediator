@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::{
     SharedData,
     common::authz::{self, Capability},
@@ -40,7 +41,7 @@ pub async fn message_delete_handler(
         // ACL Check
         if authz::require_capability(&session.acls, Capability::Local).is_err() {
             return Err(MediatorError::problem(
-                40,
+                error_codes::AUTH_NOT_LOCAL,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -56,7 +57,7 @@ pub async fn message_delete_handler(
         debug!("Deleting ({}) messages", body.message_ids.len());
         if body.message_ids.len() > state.limits().deleted_messages {
             return Err(MediatorError::problem_with_log(
-                43,
+                error_codes::API_MESSAGE_DELETE_LIMIT,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,

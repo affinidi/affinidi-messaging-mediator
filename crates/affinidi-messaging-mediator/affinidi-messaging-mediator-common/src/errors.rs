@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::types::{
     messages::GenericDataStruct,
     problem_report::{ProblemReport, ProblemReportScope, ProblemReportSorter},
@@ -218,7 +219,7 @@ impl MediatorError {
     ) -> Self {
         match cap {
             StorageCap::Full => Self::problem_with_log(
-                97,
+                error_codes::STORAGE_FULL,
                 session_id,
                 msg_id,
                 ProblemReportSorter::Error,
@@ -230,7 +231,7 @@ impl MediatorError {
                 format!("Storage full (error {code}): {cause}"),
             ),
             StorageCap::Busy => Self::problem_with_log(
-                98,
+                error_codes::STORAGE_BUSY,
                 session_id,
                 msg_id,
                 ProblemReportSorter::Warning,
@@ -251,8 +252,8 @@ impl MediatorError {
     /// Matched exactly on the error number and problem code that
     /// [`storage_cap`](Self::storage_cap) sets, never on a part of either.
     pub fn is_storage_cap(&self) -> bool {
-        matches!(self, Self::MediatorError(97, _, _, report, _, _) if report.code == STORAGE_FULL_CODE)
-            || matches!(self, Self::MediatorError(98, _, _, report, _, _) if report.code == STORAGE_BUSY_CODE)
+        matches!(self, Self::MediatorError(error_codes::STORAGE_FULL, _, _, report, _, _) if report.code == STORAGE_FULL_CODE)
+            || matches!(self, Self::MediatorError(error_codes::STORAGE_BUSY, _, _, report, _, _) if report.code == STORAGE_BUSY_CODE)
     }
 
     /// A storage failure as a generic `503` (`me.res.storage.error`) that
@@ -406,7 +407,11 @@ impl From<MediatorError> for ProcessorError {
 
 impl From<ProcessorError> for MediatorError {
     fn from(error: ProcessorError) -> Self {
-        MediatorError::ProcessorError(0, error.clone(), error.to_string())
+        MediatorError::ProcessorError(
+            error_codes::PROCESSOR_ERROR,
+            error.clone(),
+            error.to_string(),
+        )
     }
 }
 
@@ -995,7 +1000,7 @@ mod tests {
         let oom = server_error("OOM command not allowed when used memory > 'maxmemory'.");
         assert_eq!(
             named(&MediatorError::database_from_redis(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "s".into(),
                 &oom,
                 format!("store: {oom}")
@@ -1004,7 +1009,7 @@ mod tests {
         );
         assert_eq!(
             named(&MediatorError::session_from_redis(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "s".into(),
                 &oom,
                 format!("put_session: {oom}")
@@ -1014,7 +1019,7 @@ mod tests {
         let timeout = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
         assert_eq!(
             named(&MediatorError::database_from_redis(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "s".into(),
                 &timeout,
                 "inbox_status failed".into()
@@ -1026,18 +1031,34 @@ mod tests {
         );
         let other = server_error("ERR operation timed out");
         assert!(matches!(
-            MediatorError::database_from_redis(14, "s".into(), &other, other.to_string()),
-            MediatorError::DatabaseError(14, _, _)
+            MediatorError::database_from_redis(
+                crate::error_codes::DB_OPERATION_ERROR,
+                "s".into(),
+                &other,
+                other.to_string()
+            ),
+            MediatorError::DatabaseError(crate::error_codes::DB_OPERATION_ERROR, _, _)
         ));
         assert!(matches!(
-            MediatorError::session_from_redis(14, "s".into(), &other, other.to_string()),
-            MediatorError::SessionError(14, _, _)
+            MediatorError::session_from_redis(
+                crate::error_codes::DB_OPERATION_ERROR,
+                "s".into(),
+                &other,
+                other.to_string()
+            ),
+            MediatorError::SessionError(crate::error_codes::DB_OPERATION_ERROR, _, _)
         ));
     }
 
     #[test]
     fn a_cap_keeps_the_request_it_answers() {
-        match MediatorError::storage_cap(StorageCap::Busy, 10, "NA", Some("req-1".into()), "held") {
+        match MediatorError::storage_cap(
+            StorageCap::Busy,
+            crate::error_codes::DB_DELETE_ERROR,
+            "NA",
+            Some("req-1".into()),
+            "held",
+        ) {
             MediatorError::MediatorError(_, _, msg_id, report, _, _) => {
                 assert!(report.code.ends_with("storage.busy"));
                 assert_eq!(msg_id.as_deref(), Some("req-1"));
@@ -1059,7 +1080,13 @@ mod tests {
 
     #[test]
     fn the_cap_codes_are_what_the_builder_sets() {
-        let code = |cap| match MediatorError::storage_cap(cap, 14, "s", None, "x") {
+        let code = |cap| match MediatorError::storage_cap(
+            cap,
+            crate::error_codes::DB_OPERATION_ERROR,
+            "s",
+            None,
+            "x",
+        ) {
             MediatorError::MediatorError(_, _, _, report, _, _) => report.code,
             other => panic!("unexpected {other:?}"),
         };
@@ -1069,7 +1096,11 @@ mod tests {
 
     #[test]
     fn an_opaque_storage_error_says_nothing_of_its_cause() {
-        let e = MediatorError::storage_error_opaque(14, "", "OOM command not allowed");
+        let e = MediatorError::storage_error_opaque(
+            crate::error_codes::DB_OPERATION_ERROR,
+            "",
+            "OOM command not allowed",
+        );
         match &e {
             MediatorError::MediatorError(_, _, _, report, status, log) => {
                 assert!(report.code.ends_with("me.res.storage.error"));
@@ -1093,41 +1124,55 @@ mod tests {
         };
         assert!(opaque(MediatorError::storage_cap(
             StorageCap::Full,
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "s",
             None,
             "x"
         )));
         assert!(opaque(MediatorError::storage_cap(
             StorageCap::Busy,
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "s",
             None,
             "x"
         )));
         assert!(opaque(MediatorError::DatabaseError(
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "s".into(),
             "OOM".into()
         )));
         assert!(matches!(
-            MediatorError::SessionError(14, "s".into(), "no such session".into()).opaque_storage(),
+            MediatorError::SessionError(
+                crate::error_codes::DB_OPERATION_ERROR,
+                "s".into(),
+                "no such session".into()
+            )
+            .opaque_storage(),
             MediatorError::SessionError(..)
         ));
         assert!(matches!(
             refusal(None).opaque_storage(),
-            MediatorError::MediatorError(44, ..)
+            MediatorError::MediatorError(crate::error_codes::AUTH_SEND_DENIED, ..)
         ));
     }
 
     #[test]
     fn a_cap_refusal_is_recognised_for_passing_through() {
         for cap in [StorageCap::Full, StorageCap::Busy] {
-            assert!(MediatorError::storage_cap(cap, 14, "s", None, "x").is_storage_cap());
+            assert!(
+                MediatorError::storage_cap(
+                    cap,
+                    crate::error_codes::DB_OPERATION_ERROR,
+                    "s",
+                    None,
+                    "x"
+                )
+                .is_storage_cap()
+            );
         }
         assert!(!refusal(None).is_storage_cap());
         let lookalike = MediatorError::problem(
-            97,
+            crate::error_codes::STORAGE_FULL,
             "s",
             None,
             ProblemReportSorter::Error,
@@ -1139,15 +1184,24 @@ mod tests {
         );
         assert!(!lookalike.is_storage_cap());
         assert!(
-            !MediatorError::DatabaseError(14, "s".into(), "storage.full".into()).is_storage_cap()
+            !MediatorError::DatabaseError(
+                crate::error_codes::DB_OPERATION_ERROR,
+                "s".into(),
+                "storage.full".into()
+            )
+            .is_storage_cap()
         );
     }
 
     #[tokio::test]
     async fn a_session_error_reaches_an_http_client_without_its_text() {
         let detail = "Failed to retrieve session (abc). Reason: ERR backend detail 10.0.0.7:6379";
-        let response = AppError::from(MediatorError::SessionError(14, "abc".into(), detail.into()))
-            .into_response();
+        let response = AppError::from(MediatorError::SessionError(
+            crate::error_codes::DB_OPERATION_ERROR,
+            "abc".into(),
+            detail.into(),
+        ))
+        .into_response();
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1162,7 +1216,7 @@ mod tests {
     #[test]
     fn a_database_error_is_not_named_from_its_text() {
         let error = MediatorError::DatabaseError(
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "s".into(),
             "\"OOM\": command not allowed when used memory > 'maxmemory'. timed out".into(),
         );
@@ -1174,7 +1228,13 @@ mod tests {
 
     #[test]
     fn a_full_database_reaches_an_http_client_as_507() {
-        let error = MediatorError::storage_cap(StorageCap::Full, 14, "s", None, "full");
+        let error = MediatorError::storage_cap(
+            StorageCap::Full,
+            crate::error_codes::DB_OPERATION_ERROR,
+            "s",
+            None,
+            "full",
+        );
         assert_eq!(
             AppError::from(error).into_response().status(),
             StatusCode::INSUFFICIENT_STORAGE
@@ -1183,7 +1243,7 @@ mod tests {
 
     fn refusal(msg_id: Option<String>) -> MediatorError {
         MediatorError::problem(
-            44,
+            crate::error_codes::AUTH_SEND_DENIED,
             "s",
             msg_id,
             ProblemReportSorter::Error,
@@ -1211,7 +1271,11 @@ mod tests {
             "an id set by the handler is kept"
         );
         // Errors without a problem report pass through unchanged.
-        let internal = MediatorError::InternalError(1, "s".into(), "x".into());
+        let internal = MediatorError::InternalError(
+            crate::error_codes::DB_URL_INVALID,
+            "s".into(),
+            "x".into(),
+        );
         assert!(matches!(
             internal.threaded_to("req-1"),
             MediatorError::InternalError(..)
@@ -1221,7 +1285,7 @@ mod tests {
     #[test]
     fn test_problem_creates_mediator_error() {
         let err = MediatorError::problem(
-            44,
+            crate::error_codes::AUTH_SEND_DENIED,
             "test-session",
             None,
             ProblemReportSorter::Error,
@@ -1248,7 +1312,7 @@ mod tests {
     #[test]
     fn test_problem_with_log_separate_messages() {
         let err = MediatorError::problem_with_log(
-            19,
+            crate::error_codes::PARSE_ERROR,
             "sess-123",
             Some("msg-456".to_string()),
             ProblemReportSorter::Warning,
@@ -1277,7 +1341,7 @@ mod tests {
     #[test]
     fn test_problem_with_args() {
         let err = MediatorError::problem(
-            63,
+            crate::error_codes::TOO_MANY_ATTACHMENTS,
             "s1",
             Some("m1".to_string()),
             ProblemReportSorter::Warning,
@@ -1357,7 +1421,7 @@ mod tests {
     #[test]
     fn a_queue_refusal_response_carries_retry_after() {
         let err: AppError = MediatorError::problem(
-            95,
+            crate::error_codes::PEER_QUEUE_FULL,
             "session",
             None,
             ProblemReportSorter::Error,
@@ -1384,7 +1448,7 @@ mod tests {
     #[test]
     fn an_unrelated_problem_report_has_no_retry_after() {
         let err: AppError = MediatorError::problem(
-            31,
+            crate::error_codes::MESSAGE_EXPIRED,
             "session",
             None,
             ProblemReportSorter::Error,

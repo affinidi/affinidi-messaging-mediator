@@ -3,6 +3,7 @@ use super::AuthRefreshResponse;
 use super::helpers::{_create_access_token, _create_refresh_token};
 use crate::common::jwt_auth::{clock_aware_validation, jwt_exp_is_expired, token_use_accepted};
 use crate::didcomm_compat::MetaEnvelope;
+use crate::error_codes;
 use crate::{
     SharedData,
     common::authz::{self, Capability},
@@ -32,7 +33,7 @@ pub async fn authentication_refresh(
     async move {
         let s = serde_json::to_string(&body).map_err(|e| {
             MediatorError::problem_with_log(
-                37, "", None,
+                error_codes::PARSE_ERROR, "", None,
                 ProblemReportSorter::Error, ProblemReportScope::Protocol,
                 "message.serialize", "Failed to serialize request body: {1}",
                 vec![e.to_string()], StatusCode::BAD_REQUEST,
@@ -44,7 +45,7 @@ pub async fn authentication_refresh(
             Ok(envelope) => envelope,
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -67,7 +68,7 @@ pub async fn authentication_refresh(
         // plaintext must name the same DID, as on `/authenticate`.
         let Some(from_did) = envelope.from_did.clone() else {
             return Err(MediatorError::problem(
-                39,
+                error_codes::AUTH_FROM_MISSING,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -83,7 +84,7 @@ pub async fn authentication_refresh(
             Some(msg_from) if *msg_from == from_did => (),
             Some(_) => {
                 return Err(MediatorError::problem(
-                    85,
+                    error_codes::MESSAGE_FROM_INCORRECT,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -97,7 +98,7 @@ pub async fn authentication_refresh(
             }
             None => {
                 return Err(MediatorError::problem(
-                    39,
+                    error_codes::AUTH_FROM_MISSING,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -114,7 +115,7 @@ pub async fn authentication_refresh(
         // Only accepts AffinidiAuthenticateRefresh messages
         match msg.typ.as_str().parse::<MessageType>().map_err(|err| {
             MediatorError::problem_with_log(
-                30,
+                error_codes::MESSAGE_TYPE_INCORRECT,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -129,7 +130,7 @@ pub async fn authentication_refresh(
             MessageType::AffinidiAuthenticateRefresh => (),
             _ => {
                 return Err(MediatorError::problem_with_log(
-                    30,
+                    error_codes::MESSAGE_TYPE_INCORRECT,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -149,7 +150,7 @@ pub async fn authentication_refresh(
         if let Some(expires) = msg.expires_time {
             if expires <= now {
                 return Err(MediatorError::problem_with_log(
-                    31,
+                    error_codes::MESSAGE_EXPIRED,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -165,7 +166,7 @@ pub async fn authentication_refresh(
         } else {
             // Authentication responses must have an expires_time header
             return Err(MediatorError::problem(
-                92,
+                error_codes::EXPIRES_TIME_MISSING,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -183,7 +184,7 @@ pub async fn authentication_refresh(
                 refresh_token
             } else {
                 return Err(MediatorError::problem_with_log(
-                    38,
+                    error_codes::REFRESH_TOKEN_PARSE,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -198,7 +199,7 @@ pub async fn authentication_refresh(
             }
         } else {
             return Err(MediatorError::problem_with_log(
-                38,
+                error_codes::REFRESH_TOKEN_PARSE,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -222,7 +223,7 @@ pub async fn authentication_refresh(
             Ok(token) => token,
             Err(err) => {
                 return Err(MediatorError::problem_with_log(
-                    38,
+                    error_codes::REFRESH_TOKEN_PARSE,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -242,7 +243,7 @@ pub async fn authentication_refresh(
         // so we must — same leeway/boundary as before.
         if jwt_exp_is_expired(results.claims.exp, now) {
             return Err(MediatorError::problem_with_log(
-                38,
+                error_codes::REFRESH_TOKEN_EXPIRED,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -266,7 +267,7 @@ pub async fn authentication_refresh(
             state.config.security.jwt_access_expiry,
         ) {
             return Err(MediatorError::problem_with_log(
-                38,
+                error_codes::REFRESH_TOKEN_PARSE,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -306,7 +307,7 @@ pub async fn authentication_refresh(
                 // authenticate again rather than to retry.
                 if let MediatorError::Unauthorized(..) = e {
                     return MediatorError::problem_with_log(
-                        34,
+                        error_codes::AUTH_SESSION_INVALID,
                         "",
                         None,
                         ProblemReportSorter::Error,
@@ -319,7 +320,7 @@ pub async fn authentication_refresh(
                     );
                 }
                 MediatorError::problem_with_log(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -345,7 +346,7 @@ pub async fn authentication_refresh(
         // Is the session in an authenticated state? If not, then we can't refresh
         if session_check.state != SessionState::Authenticated {
             return Err(MediatorError::problem_with_log(
-                34,
+                error_codes::AUTH_SESSION_INVALID,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -363,7 +364,7 @@ pub async fn authentication_refresh(
         if authz::require_capability(&session_check.acls, Capability::NotBlocked).is_err() {
             info!("DID({}) is blocked from connecting", affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did));
             return Err(MediatorError::problem(
-                25,
+                error_codes::AUTH_DID_BLOCKED,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -412,7 +413,7 @@ pub async fn authentication_refresh(
                     return e;
                 }
                 MediatorError::problem_with_log(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -448,7 +449,7 @@ pub async fn authentication_refresh(
                 affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did)
             );
             return Err(MediatorError::problem_with_log(
-                38,
+                error_codes::REFRESH_TOKEN_REUSE,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -493,7 +494,7 @@ pub async fn authentication_refresh(
 /// The refresh token, its session and the sender do not name one DID.
 fn session_mismatch(sender: &str, other: &str) -> AppError {
     MediatorError::problem_with_log(
-        33,
+        error_codes::AUTH_SESSION_MISMATCH,
         "",
         None,
         ProblemReportSorter::Error,

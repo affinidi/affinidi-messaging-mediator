@@ -22,6 +22,7 @@
 //! `#[allow(dead_code)]` precisely so a capability that nothing enforces
 //! shows up as a warning rather than as a silently inert permission bit.
 
+use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_mediator_common::store::MediatorStore;
@@ -251,7 +252,7 @@ pub(crate) fn require_session_sender(
 
     if !session.authenticated {
         return Err(MediatorError::problem(
-            44,
+            error_codes::AUTHENTICATION_REQUIRED,
             &session.session_id,
             msg_id.map(str::to_string),
             ProblemReportSorter::Error,
@@ -273,7 +274,7 @@ pub(crate) fn require_session_sender(
             Ok(())
         }
         Some(sender) => Err(MediatorError::problem_with_log(
-            52,
+            error_codes::SESSION_DID_MISMATCH,
             &session.session_id,
             msg_id.map(str::to_string),
             ProblemReportSorter::Error,

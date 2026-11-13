@@ -10,6 +10,7 @@
 //! once in the log; a signing failure with a key in hand is an error, never a
 //! silent downgrade to unsigned.
 
+use crate::error_codes;
 use std::sync::Once;
 
 use affinidi_did_common::DocumentExt;
@@ -58,7 +59,7 @@ pub(crate) async fn sign_response(
         .await
         .map_err(|e| {
             MediatorError::InternalError(
-                14,
+                error_codes::INTERNAL_ERROR,
                 "NA".into(),
                 format!("couldn't sign the Trust Task response: {e}"),
             )

@@ -26,6 +26,7 @@ pub use affinidi_messaging_mediator_config::{
     SecurityConfigRaw, ServerConfig, SessionExpiryCleanupConfigRaw, StorageConfig, StreamingConfig,
 };
 
+use crate::error_codes;
 use affinidi_did_common::Document;
 use affinidi_did_resolver_cache_sdk::{
     DIDCacheClient,
@@ -416,7 +417,7 @@ fn vta_startup_error(context: &str, err: VtaIntegrationError) -> MediatorError {
     ) {
         print_vta_recovery_playbook(context);
     }
-    MediatorError::ConfigError(12, "NA".into(), detail)
+    MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), detail)
 }
 
 /// Print an operator-facing recovery playbook to stderr when the
@@ -532,7 +533,7 @@ impl TryFrom<ConfigRaw> for Config {
         let aws_config: Option<AwsConfig> = {
             if needs_aws {
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     "Configuration uses aws_secrets://, aws_parameter_store://, or s3:// but the \
                      'aws' feature is not enabled. Rebuild with: cargo build --features aws"
@@ -559,7 +560,7 @@ impl TryFrom<ConfigRaw> for Config {
         // on the first request.
         let store = open_store(&raw.secrets.backend).map_err(|e| {
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!(
                     "Could not open secret backend '{}': {e}",
@@ -571,7 +572,7 @@ impl TryFrom<ConfigRaw> for Config {
         // Read-only probe: verify reachability without needing write perms.
         mediator_secrets.probe_readonly().await.map_err(|e| {
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Secret backend '{}' failed probe: {e}", raw.secrets.backend),
             )
@@ -581,7 +582,7 @@ impl TryFrom<ConfigRaw> for Config {
         // the cause and the fix, and leaves the store as it was.
         mediator_secrets.ensure_migrated().await.map_err(|e| {
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!(
                     "Secret backend '{}' could not be moved to the single-secret layout: {e}",
@@ -611,7 +612,7 @@ impl TryFrom<ConfigRaw> for Config {
             .await
             .map_err(|e| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Could not load admin credential: {e}"),
                 )
@@ -931,7 +932,7 @@ impl TryFrom<ConfigRaw> for Config {
             .await
             .map_err(|err| {
                 MediatorError::DIDError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     "NA".into(),
                     format!("Couldn't start DID Resolver: {err}"),
@@ -1041,7 +1042,7 @@ fn split_self_hosted_did_source(
             let did_doc_value = log_entry.get_did_document().map_err(|err| {
                 error!("Couldn't extract DID Document from LogEntry: {err}");
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Couldn't extract DID Document from LogEntry: {err}"),
                 )
@@ -1057,7 +1058,7 @@ fn split_self_hosted_did_source(
                 .ok_or_else(|| {
                     error!("Extracted DID Document from LogEntry is missing an `id`");
                     MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         "Extracted DID Document from LogEntry is missing an `id`".into(),
                     )
@@ -1068,7 +1069,7 @@ fn split_self_hosted_did_source(
                 .map_err(|err| {
                     error!("Couldn't rewrite did:webvh document to did:web. Reason: {err}");
                     MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!("Couldn't rewrite did:webvh document to did:web. Reason: {err}"),
                     )
@@ -1080,7 +1081,7 @@ fn split_self_hosted_did_source(
             let did_json = serde_json::to_string(&web_doc_value).map_err(|err| {
                 error!("Couldn't serialise extracted DID Document as JSON. Reason: {err}");
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Couldn't serialise extracted DID Document as JSON. Reason: {err}"),
                 )
@@ -1095,7 +1096,7 @@ fn split_self_hosted_did_source(
             let typed = serde_json::from_value(did_doc_value).map_err(|err| {
                 error!("Couldn't convert DID Document value to Document struct. Reason: {err}");
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "Couldn't convert DID Document value to Document struct. Reason: {err}"
@@ -1110,7 +1111,7 @@ fn split_self_hosted_did_source(
             let typed = serde_json::from_str::<Document>(&document_json).map_err(|err| {
                 error!("Couldn't parse content as LogEntry or Document. Reason: {err}");
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Couldn't parse content as LogEntry or Document. Reason: {err}"),
                 )
@@ -1129,7 +1130,7 @@ fn scid_document(
     let document = didwebvh_rs::did_web::to_scid_did_document(webvh_document).map_err(|err| {
         error!("Couldn't express the did:webvh log as did:scid {mediator_did}. Reason: {err}");
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!("Couldn't express the did:webvh log as did:scid {mediator_did}. Reason: {err}"),
         )
@@ -1138,7 +1139,7 @@ fn scid_document(
     if document.get("id").and_then(serde_json::Value::as_str) != Some(identity.as_ref()) {
         error!("The self-hosted did:webvh log is not the log of {mediator_did}");
         return Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!(
                 "mediator_did is {mediator_did}, but the self-hosted log is {}",
@@ -1392,12 +1393,20 @@ pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, Mediator
             // Build the subscriber
             .finish();
         tracing::subscriber::set_global_default(subscriber).map_err(|e| {
-            MediatorError::ConfigError(12, "NA".into(), format!("Couldn't setup logging: {e}"))
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("Couldn't setup logging: {e}"),
+            )
         })?;
     } else {
         let subscriber = subscriber.finish();
         tracing::subscriber::set_global_default(subscriber).map_err(|e| {
-            MediatorError::ConfigError(12, "NA".into(), format!("Couldn't setup logging: {e}"))
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("Couldn't setup logging: {e}"),
+            )
         })?;
     }
 

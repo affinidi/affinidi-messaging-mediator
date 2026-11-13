@@ -1,5 +1,6 @@
 #[cfg(feature = "didcomm")]
 use crate::didcomm_compat::MetaEnvelope;
+use crate::error_codes;
 #[cfg(feature = "didcomm")]
 use crate::messages::MessageHandler;
 #[cfg(feature = "didcomm")]
@@ -56,7 +57,7 @@ fn check_message_size(
     let limit = state.config.limits.message_size;
     if len > limit {
         return Err(MediatorError::problem(
-            37,
+            error_codes::MESSAGE_SIZE_EXCEEDED,
             &session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -87,7 +88,7 @@ pub(crate) async fn handle_inbound(
     #[cfg(not(feature = "didcomm"))]
     {
         Err(MediatorError::problem(
-            37,
+            error_codes::PROTOCOL_UNSUPPORTED,
             &session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -125,7 +126,7 @@ pub(crate) async fn handle_inbound_tsp(
 
     let meta = TspMetaEnvelope::parse(raw).map_err(|e| {
         MediatorError::problem(
-            37,
+            error_codes::MESSAGE_ENVELOPE_READ,
             &session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -230,7 +231,7 @@ pub(crate) async fn handle_inbound_tsp(
         if !state.config.security.local_direct_delivery_allowed {
             return Err(tsp_problem(
                 session,
-                71,
+                error_codes::DIRECT_DELIVERY_DISABLED,
                 "direct_delivery.denied",
                 "Mediator is not accepting direct delivery of TSP messages. They must be \
                  relayed through a routing envelope"
@@ -251,7 +252,7 @@ pub(crate) async fn handle_inbound_tsp(
         if authz::require_capability(&from_acls, Capability::SendMessages).is_err() {
             return Err(tsp_problem(
                 session,
-                44,
+                error_codes::AUTH_SEND_DENIED,
                 "authorization.send",
                 "Sender DID is not authorized to send messages through this mediator".to_string(),
                 StatusCode::FORBIDDEN,
@@ -268,7 +269,7 @@ pub(crate) async fn handle_inbound_tsp(
             .map_err(|e| {
             tsp_problem(
                 session,
-                37,
+                error_codes::MESSAGE_ENVELOPE_READ,
                 "message.tsp.unpack",
                 format!("couldn't unpack TSP layer addressed to mediator: {e}"),
                 StatusCode::BAD_REQUEST,
@@ -338,7 +339,7 @@ pub(crate) async fn handle_inbound_tsp(
     {
         return Err(tsp_problem(
             session,
-            60,
+            error_codes::RELAY_UNTRUSTED_PEER,
             "authorization.relay.untrusted_peer",
             "Relaying peer is not in the trusted relay allowlist".to_string(),
             StatusCode::FORBIDDEN,
@@ -375,7 +376,7 @@ pub(crate) async fn handle_inbound_tsp(
         if authz::require_capability(&from_acls, Capability::SendForwarded).is_err() {
             return Err(tsp_problem(
                 session,
-                44,
+                error_codes::FORWARD_SENDER_DENIED,
                 "authorization.send_forwarded",
                 "Sender DID is not authorized to forward (relay) messages through this mediator"
                     .to_string(),
@@ -392,7 +393,7 @@ pub(crate) async fn handle_inbound_tsp(
             let step = next_hop(&unpacked).map_err(|e| {
                 tsp_problem(
                     session,
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     "message.tsp.route",
                     format!("malformed TSP route: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -402,7 +403,7 @@ pub(crate) async fn handle_inbound_tsp(
             let plan = plan_route_step(step, &meta.sender).map_err(|e| {
                 tsp_problem(
                     session,
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     "message.tsp.malformed",
                     format!("malformed routed inner TSP envelope: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -450,7 +451,7 @@ pub(crate) async fn handle_inbound_tsp(
                     .map_err(|e| {
                         tsp_problem(
                             session,
-                            37,
+                            error_codes::MESSAGE_PACK_ERROR,
                             "message.tsp.reseal",
                             format!("couldn't re-seal routed TSP message: {e}"),
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -488,7 +489,7 @@ pub(crate) async fn handle_inbound_tsp(
             let inner_meta = TspMetaEnvelope::parse(&unpacked.payload).map_err(|e| {
                 tsp_problem(
                     session,
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     "message.tsp.malformed",
                     format!("malformed nested inner TSP envelope: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -530,8 +531,14 @@ pub(crate) async fn handle_inbound_tsp(
                 // The proof is verified over the payload as sent, not as
                 // re-serialised from `doc`. It already parsed as a document,
                 // so it parses as JSON.
-                let raw: serde_json::Value = serde_json::from_slice(&unpacked.payload)
-                    .map_err(|e| MediatorError::InternalError(14, "NA".into(), e.to_string()))?;
+                let raw: serde_json::Value =
+                    serde_json::from_slice(&unpacked.payload).map_err(|e| {
+                        MediatorError::InternalError(
+                            error_codes::DB_OPERATION_ERROR,
+                            "NA".into(),
+                            e.to_string(),
+                        )
+                    })?;
                 return dispatch_tsp_trust_task(state, session, &meta.sender, doc, &raw).await;
             }
             deliver_tsp_local(state, session, &meta.sender, raw).await
@@ -586,10 +593,9 @@ async fn dispatch_tsp_trust_task(
     // The sender VID is the framework identity; TSP VIDs carry no key fragment,
     // so it is already the shape `consume` wants.
     let request_type = doc.type_uri.to_string();
-    // A request that asks to be refused with a `trust-task-error` document
-    // is answered with one, sealed back like a response, in place of the
-    // problem report.
-    let refusing = trust_task_error::Refusing::asked_by(&doc);
+    // A refusal is answered with a `trust-task-error` document, sealed back
+    // like a response, where one can be sent (see `trust_task_error`).
+    let refusing = trust_task_error::Refusing::of(&doc);
     let consumed = trust_tasks::consume(
         doc,
         raw,
@@ -608,16 +614,10 @@ async fn dispatch_tsp_trust_task(
                 affinidi_messaging_sdk::messages::sending::InboundMessageList::default(),
             ));
         }
-        Err(e) => {
-            let document = match &refusing {
-                Some(r) => r.document(&e, session, sender_vid, state).await,
-                None => None,
-            };
-            match document {
-                Some(doc) => doc,
-                None => return Err(e.threaded_to(&task_id)),
-            }
-        }
+        Err(e) => match refusing.document(&e, session, sender_vid, state).await {
+            Some(doc) => doc,
+            None => return Err(e.threaded_to(&task_id)),
+        },
     };
 
     let identity = state.tsp_identity().await?;
@@ -626,7 +626,7 @@ async fn dispatch_tsp_trust_task(
     let payload = serde_json::to_vec(&response).map_err(|e| {
         tsp_problem(
             session,
-            37,
+            error_codes::MESSAGE_PACK_ERROR,
             "message.tsp.trust_task.serialize",
             format!("could not serialise the Trust Task response: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -649,7 +649,7 @@ async fn dispatch_tsp_trust_task(
     .map_err(|e| {
         tsp_problem(
             session,
-            37,
+            error_codes::MESSAGE_PACK_ERROR,
             "message.tsp.trust_task.seal",
             format!("could not seal the Trust Task response: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -729,7 +729,7 @@ async fn deliver_tsp_local(
     let meta = TspMetaEnvelope::parse(bytes).map_err(|e| {
         tsp_problem(
             session,
-            37,
+            error_codes::MESSAGE_ENVELOPE_READ,
             "message.tsp.malformed",
             format!("malformed TSP message: {e}"),
             StatusCode::BAD_REQUEST,
@@ -876,7 +876,7 @@ async fn deliver_opaque(
             .map_err(|e| {
                 tsp_problem(
                     session,
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     "message.bridge.malformed",
                     format!("bridged inner is neither a TSP message nor valid UTF-8 text: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -1006,7 +1006,7 @@ async fn forward_tsp_remote(
         .map_err(|e| {
             tsp_problem(
                 session,
-                90,
+                error_codes::FORWARD_ENQUEUE_ERROR,
                 "message.tsp.forward.enqueue",
                 format!("couldn't enqueue TSP message for remote forwarding: {e}"),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1119,7 +1119,7 @@ async fn tsp_forward_endpoint(
             if crate::common::relay_target::relay_target_blocked(blocked, [url.as_str(), next]) {
                 return Err(tsp_problem(
                     session,
-                    94,
+                    error_codes::FORWARD_LOOP_DETECTED,
                     "protocol.forwarding.loop_detected",
                     format!(
                         "TSP next hop {next} ({url}) is on this mediator's forwarding block list"
@@ -1132,7 +1132,7 @@ async fn tsp_forward_endpoint(
         TspRelay::Loop(what) => {
             return Err(tsp_problem(
                 session,
-                94,
+                error_codes::FORWARD_LOOP_DETECTED,
                 "protocol.forwarding.loop_detected",
                 format!("TSP next hop {next} resolves back to this mediator ({what})"),
                 StatusCode::LOOP_DETECTED,
@@ -1141,7 +1141,7 @@ async fn tsp_forward_endpoint(
         TspRelay::Nothing => {
             return Err(tsp_problem(
                 session,
-                58,
+                error_codes::TSP_NO_ENDPOINT,
                 "message.tsp.no_endpoint",
                 format!("next hop {next} publishes no TSP transport endpoint"),
                 StatusCode::NOT_FOUND,
@@ -1156,7 +1156,7 @@ async fn tsp_forward_endpoint(
         .map_err(|e| {
             tsp_problem(
                 session,
-                58,
+                error_codes::TSP_NEXT_HOP_UNRESOLVABLE,
                 "message.tsp.mediator.unresolvable",
                 format!("next hop {next} is mediated by {mediator}, which did not resolve: {e}"),
                 StatusCode::BAD_GATEWAY,
@@ -1172,7 +1172,7 @@ async fn tsp_forward_endpoint(
             ) {
                 return Err(tsp_problem(
                     session,
-                    94,
+                    error_codes::FORWARD_LOOP_DETECTED,
                     "protocol.forwarding.loop_detected",
                     format!(
                         "TSP next hop {next} is mediated by {mediator} ({url}), which is on \
@@ -1185,7 +1185,7 @@ async fn tsp_forward_endpoint(
         }
         TspRelay::Loop(what) => Err(tsp_problem(
             session,
-            94,
+            error_codes::FORWARD_LOOP_DETECTED,
             "protocol.forwarding.loop_detected",
             format!(
                 "TSP next hop {next} is mediated by {mediator}, which resolves back to this \
@@ -1196,7 +1196,7 @@ async fn tsp_forward_endpoint(
         // A second hop of indirection is deliberately not chased.
         TspRelay::ViaMediator(_) | TspRelay::Nothing => Err(tsp_problem(
             session,
-            58,
+            error_codes::TSP_NO_ENDPOINT,
             "message.tsp.no_endpoint",
             format!(
                 "next hop {next} is mediated by {mediator}, whose document publishes no TSP \
@@ -1219,7 +1219,7 @@ pub(crate) async fn resolve_tsp_vid(
         .await
         .map_err(|e| {
             MediatorError::problem(
-                58,
+                error_codes::TSP_NEXT_HOP_UNRESOLVABLE,
                 session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -1289,7 +1289,7 @@ async fn handle_inbound_didcomm(
             Ok(envelope) => envelope,
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    37,
+                    error_codes::MESSAGE_ENVELOPE_READ,
                     &session.session_id,
                     None,
                     ProblemReportSorter::Error,
@@ -1317,14 +1317,14 @@ async fn handle_inbound_didcomm(
                         Ok(ok) => ok,
                         Err(e) => {
                             return Err(MediatorError::problem_with_log(
-                                32,
+                                error_codes::MESSAGE_UNPACK_FAILED,
                                 &session.session_id,
                                 None,
                                 ProblemReportSorter::Error,
                                 ProblemReportScope::Protocol,
                                 "message.unpack",
-                                "Message unpack failed: envelope {1} Reason: {2}",
-                                vec![message.to_string(), e.to_string()],
+                                "Message unpack failed: envelope sha256 {1} Reason: {2}",
+                                vec![sha256::digest(message), e.to_string()],
                                 StatusCode::FORBIDDEN,
                                 format!("Message unpack failed. Reason: {e}"),
                             ));
@@ -1347,7 +1347,7 @@ async fn handle_inbound_didcomm(
                         && state.config.security.block_anonymous_outer_envelope
                     {
                         return Err(MediatorError::problem(
-                            50,
+                            error_codes::ANON_MESSAGE_ERROR,
                             &session.session_id,
                             Some(msg.id.clone()),
                             ProblemReportSorter::Warning,
@@ -1419,7 +1419,7 @@ async fn handle_inbound_didcomm(
                     // this is a direct delivery method
                     if !state.config.security.local_direct_delivery_allowed {
                         return Err(MediatorError::problem(
-                            71,
+                            error_codes::DIRECT_DELIVERY_DISABLED,
                             &session.session_id,
                             None,
                             ProblemReportSorter::Warning,
@@ -1503,7 +1503,7 @@ async fn handle_inbound_didcomm(
 
                         if authz::require_capability(&from_acls, Capability::SendMessages).is_err() {
                             return Err(MediatorError::problem(
-                                44,
+                                error_codes::AUTH_SEND_DENIED,
                                 &session.session_id,
                                 None,
                                 ProblemReportSorter::Error,
@@ -1516,7 +1516,7 @@ async fn handle_inbound_didcomm(
                         }
                     } else if !state.config.security.local_direct_delivery_allow_anon {
                         return Err(MediatorError::problem(
-                            50,
+                            error_codes::ANON_MESSAGE_ERROR,
                             &session.session_id,
                             None,
                             ProblemReportSorter::Warning,
@@ -1587,14 +1587,14 @@ async fn handle_inbound_didcomm(
                 }
             }
             _ =>   Err(MediatorError::problem_with_log(
-                51,
+                error_codes::INVALID_TO_HEADER,
                 &session.session_id,
                 None,
                 ProblemReportSorter::Error,
                 ProblemReportScope::Protocol,
                 "message.to",
-                "There is no to_did on the envelope! Can't deliver an unknown message. Message: {1}",
-                vec![message.to_string()],
+                "There is no to_did on the envelope! Can't deliver an unknown message. Envelope sha256: {1}",
+                vec![sha256::digest(message)],
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "There is no to_did on the envelope! Can't deliver an unknown message.",
             ))
@@ -1661,7 +1661,7 @@ async fn peel_relay_rewrap_layers(
             peer.as_deref(),
         ) {
             return Err(MediatorError::problem(
-                60,
+                error_codes::RELAY_UNTRUSTED_PEER,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Error,
@@ -1679,7 +1679,7 @@ async fn peel_relay_rewrap_layers(
             .max(depth);
         if depth > state.config.processors.forwarding.max_hops {
             return Err(MediatorError::problem(
-                94,
+                error_codes::FORWARD_LOOP_DETECTED,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Error,
@@ -1714,7 +1714,7 @@ fn is_forward(msg: &affinidi_messaging_didcomm::message::Message) -> bool {
 #[cfg(feature = "didcomm")]
 fn sender_mismatch(session: &Session, msg_id: &str, reason: &str) -> MediatorError {
     MediatorError::problem_with_log(
-        96,
+        error_codes::SENDER_MISMATCH,
         &session.session_id,
         Some(msg_id.to_string()),
         ProblemReportSorter::Error,
@@ -1747,7 +1747,7 @@ fn check_session_sender_match(
     let sender_display = sender_kid.map(|s| s.as_str()).unwrap_or("anonymous");
 
     Err(MediatorError::problem_with_log(
-        52,
+        error_codes::SESSION_DID_MISMATCH,
         &session.session_id,
         Some(msg_id.to_string()),
         ProblemReportSorter::Error,
@@ -1782,7 +1782,7 @@ fn check_direct_delivery_session_match(
 
     let claimed = claimed_sender.unwrap_or("anonymous");
     Err(MediatorError::problem_with_log(
-        52,
+        error_codes::SESSION_DID_MISMATCH,
         &session.session_id,
         None,
         ProblemReportSorter::Error,

@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::types::messages::{Folder, MessageList, MessageListElement};
 use itertools::Itertools;
@@ -56,7 +57,7 @@ impl Database {
                         err
                     );
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         did_hash.into(),
                         &err,
                         format!(
@@ -86,7 +87,7 @@ impl Database {
                     e
                 );
                 MediatorError::DatabaseError(
-                    26,
+                    error_codes::DB_PARSE_ERROR,
                     "NA".into(),
                     format!(
                         "Couldn't parse message_list did({did}) folder({key}): {e}"

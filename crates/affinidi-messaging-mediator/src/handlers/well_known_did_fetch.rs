@@ -1,3 +1,4 @@
+use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError};
 use affinidi_messaging_sdk::messages::SuccessResponse;
 use axum::{Json, extract::State, response::IntoResponse};
@@ -50,7 +51,7 @@ pub async fn well_known_did_json_handler(
             .cloned()
             .ok_or_else(|| -> AppError {
                 MediatorError::ConfigError(
-                    48,
+                    error_codes::MEDIATOR_DID_MISSING,
                     "NA".to_string(),
                     "No Mediator DID Document is configured".to_string(),
                 )
@@ -88,7 +89,7 @@ pub async fn well_known_did_jsonl_handler(
             .cloned()
             .ok_or_else(|| -> AppError {
                 MediatorError::ConfigError(
-                    48,
+                    error_codes::MEDIATOR_DID_MISSING,
                     "NA".to_string(),
                     "No Mediator did:webvh log entry is configured".to_string(),
                 )
