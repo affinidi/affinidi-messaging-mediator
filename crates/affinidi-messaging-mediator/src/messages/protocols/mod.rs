@@ -20,6 +20,70 @@ pub(crate) mod trust_task_verify;
 pub(crate) mod trust_task_versions;
 pub mod trust_tasks;
 
+/// The `to` of a request the mediator answers itself (trust-ping, Discover
+/// Features, Message Pickup), checked to name the mediator. Returns that DID:
+/// the reply is sent from it. `protocol` names the request in the refusal.
+///
+/// One check for every such request, so the reply's `from` can never be a DID
+/// the request merely claimed: without it a request addressed elsewhere would
+/// be answered "from" whatever it named.
+#[cfg(feature = "didcomm")]
+pub(crate) fn addressed_to_mediator(
+    msg: &affinidi_messaging_didcomm::message::Message,
+    mediator_did: &str,
+    session: &crate::common::session::Session,
+    protocol: &str,
+) -> Result<String, affinidi_messaging_mediator_common::errors::MediatorError> {
+    use affinidi_messaging_mediator_common::errors::MediatorError;
+    use affinidi_messaging_sdk::messages::problem_report::{
+        ProblemReportScope, ProblemReportSorter,
+    };
+    use http::StatusCode;
+
+    let Some(to) = msg.to.as_ref() else {
+        return Err(MediatorError::problem(
+            51,
+            &session.session_id,
+            Some(msg.id.clone()),
+            ProblemReportSorter::Warning,
+            ProblemReportScope::Message,
+            "message.to",
+            "Missing to: header in message",
+            vec![],
+            StatusCode::BAD_REQUEST,
+        ));
+    };
+    let Some(first) = to.first() else {
+        return Err(MediatorError::problem(
+            51,
+            &session.session_id,
+            Some(msg.id.clone()),
+            ProblemReportSorter::Warning,
+            ProblemReportScope::Message,
+            "message.to",
+            "Invalid to: header, couldn't get first DID from the field.",
+            vec![],
+            StatusCode::BAD_REQUEST,
+        ));
+    };
+    if !affinidi_messaging_mediator_common::did_identity::same_account(first, mediator_did) {
+        tracing::debug!("to: ({first}) doesn't match Mediator DID ({mediator_did})");
+        return Err(MediatorError::problem_with_log(
+            51,
+            &session.session_id,
+            Some(msg.id.clone()),
+            ProblemReportSorter::Warning,
+            ProblemReportScope::Message,
+            "message.to",
+            "{1} messages must be addressed to the Mediator DID. Received to: {2}",
+            vec![protocol.to_string(), first.to_string()],
+            StatusCode::BAD_REQUEST,
+            format!("{protocol} messages must be addressed to the Mediator DID"),
+        ));
+    }
+    Ok(first.to_owned())
+}
+
 /// Whether `from` may relay through this mediator, given the configured relay
 /// peer allowlist. Shared by the DIDComm re-wrap peel and the TSP routed relay.
 ///

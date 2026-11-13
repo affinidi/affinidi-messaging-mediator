@@ -460,6 +460,7 @@ dependencies = [
  "governor",
  "hostname",
  "http",
+ "http-body",
  "humantime",
  "itertools 0.15.0",
  "jsonwebtoken",

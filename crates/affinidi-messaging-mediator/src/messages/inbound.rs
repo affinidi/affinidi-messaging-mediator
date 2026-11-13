@@ -10,15 +10,17 @@ use crate::messages::protocols::relay_peer_trusted;
 use crate::{SharedData, common::session::Session};
 // Shared by both the DIDComm direct-delivery path and the TSP delivery path.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
+use crate::common::authz;
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
 use crate::common::authz::Capability;
 #[cfg(feature = "tsp")]
 use crate::messages::protocols::trust_tasks;
-#[cfg(any(feature = "didcomm", feature = "tsp"))]
-use crate::{common::authz, messages::store::store_message};
+#[cfg(feature = "didcomm")]
+use crate::messages::store::store_message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_mediator_common::tasks::forwarding::RelayMode;
-#[cfg(any(feature = "didcomm", feature = "tsp"))]
+#[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::{
     problem_report::{ProblemReportScope, ProblemReportSorter},
@@ -32,7 +34,7 @@ use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use tracing::{Instrument, debug, span};
 
-#[cfg(any(feature = "didcomm", feature = "tsp"))]
+#[cfg(feature = "didcomm")]
 use super::{ProcessMessageResponse, WrapperType};
 
 /// Reject a message larger than `limits.message_size`.
@@ -685,10 +687,28 @@ async fn dispatch_tsp_trust_task(
         ));
     }
 
-    // Delivered as any other local message: `deliver_opaque` applies the
-    // recipient's own access-list against the mediator as sender, then stores +
-    // live-streams. A client that can reach us to ask can receive the answer.
-    deliver_opaque(state, session, sender_vid, &identity.vid, &packed.bytes).await
+    // The answer is the mediator's own message, stored as the DIDComm path
+    // stores its replies: from the mediator's account, with no queue or
+    // access-list gate. The task has already run, so a gate here would refuse
+    // the answer to work that was done (and a retry would then meet the
+    // duplicate-execution record); and the reply is not the client's own
+    // traffic, so it is not counted against the client's queues. The requester
+    // must still hold an account to keep an inbox here.
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(sender_vid);
+    if !state.database.account_exists(&to_hash).await? {
+        return Err(crate::messages::delivery_refused(
+            session,
+            None,
+            "a Trust Task answer's requester has no account to hold it",
+        ));
+    }
+    crate::messages::store::store_mediator_reply(
+        state,
+        sender_vid,
+        &BASE64_URL_SAFE_NO_PAD.encode(&packed.bytes),
+        state.clock.unix_secs() + state.limits().message_expiry_seconds,
+    )
+    .await
 }
 
 /// Deliver a TSP message to the local recipient named in *its own envelope*:
@@ -864,19 +884,24 @@ async fn deliver_opaque(
             })?
             .to_string()
     };
-    let data = ProcessMessageResponse {
-        store_message: true,
-        force_live_delivery: false,
-        forward_message: false,
-        data: WrapperType::Envelope(
-            to_vid.to_string(),
-            encoded,
-            state.clock.unix_secs() + state.limits().message_expiry_seconds,
-        ),
-    };
-
+    // Stored as sent by `from_vid` — the sender the caller vouches for — not
+    // the session: on a relay hop the session is the relaying peer (often the
+    // anonymous relay session, with no DID at all), and the queue gates, the
+    // stats and the sender recorded on the message are about who sent it.
+    let msg_id = crate::messages::store::store_envelope(
+        state,
+        session,
+        to_vid,
+        &from_hash,
+        &encoded,
+        state.clock.unix_secs() + state.limits().message_expiry_seconds,
+        false,
+    )
+    .await?;
     tracing::debug!(%to_vid, %from_vid, "TSP/bridged message stored for local recipient");
-    store_message(state, session, &data, &UnpackMetadata::default()).await
+    let mut stored = affinidi_messaging_sdk::messages::sending::InboundMessageList::default();
+    stored.messages.push((to_vid.to_string(), msg_id));
+    Ok(InboundMessageResponse::Stored(stored))
 }
 
 /// Forward a relayed message to the next hop named in the route: deliver locally
@@ -1248,12 +1273,17 @@ async fn handle_inbound_didcomm(
         // path runs on the innermost envelope. In the default `Blind` mode this is
         // skipped entirely, so existing behaviour is unchanged.
         let peeled;
-        let message: &str = if state.config.processors.forwarding.relay_mode == RelayMode::Rewrap {
-            peeled = peel_relay_rewrap_layers(state, session, message.to_string()).await?;
-            &peeled
-        } else {
-            message
-        };
+        let (message, hop_floor): (&str, u32) =
+            if state.config.processors.forwarding.relay_mode == RelayMode::Rewrap {
+                let floor;
+                (peeled, floor) = peel_relay_rewrap_layers(state, session, message.to_string()).await?;
+                (&peeled, floor)
+            } else {
+                (message, 0)
+            };
+        // A forward relayed onwards carries the peer's hop count, never one
+        // its sender chose.
+        crate::messages::protocols::routing::with_relay_hop_floor(hop_floor, async move {
 
         let envelope = match MetaEnvelope::new(message, &state.did_resolver).await {
             Ok(envelope) => envelope,
@@ -1539,6 +1569,7 @@ async fn handle_inbound_didcomm(
                     }
 
                     let data = ProcessMessageResponse {
+                        handed_over: None,
                         store_message: true,
                         force_live_delivery: false,
                         forward_message: false,
@@ -1568,6 +1599,8 @@ async fn handle_inbound_didcomm(
                 "There is no to_did on the envelope! Can't deliver an unknown message.",
             ))
         }
+        })
+        .await
     }
     .instrument(_span)
     .await
@@ -1591,16 +1624,19 @@ async fn peel_relay_rewrap_layers(
     state: &SharedData,
     session: &Session,
     message: String,
-) -> Result<String, MediatorError> {
+) -> Result<(String, u32), MediatorError> {
     let mut current = message;
     let mut depth: u32 = 0;
+    // The hop count the authenticated peers carried, at least one per layer
+    // peeled: the floor for any onward relay.
+    let mut floor: u32 = 0;
     loop {
         let envelope = match MetaEnvelope::new(&current, &state.did_resolver).await {
             Ok(e) => e,
-            Err(_) => return Ok(current),
+            Err(_) => return Ok((current, floor)),
         };
         if envelope.to_did.as_deref() != Some(state.config.mediator_did.as_str()) {
-            return Ok(current);
+            return Ok((current, floor));
         }
         let (msg, meta) = match envelope
             .unpack(
@@ -1610,10 +1646,10 @@ async fn peel_relay_rewrap_layers(
             .await
         {
             Ok(ok) => ok,
-            Err(_) => return Ok(current),
+            Err(_) => return Ok((current, floor)),
         };
         let Some(inner) = rewrap_inner_attachment(&state.config.mediator_did, &msg) else {
-            return Ok(current);
+            return Ok((current, floor));
         };
 
         // Authenticate the relaying peer mediator before peeling its layer:
@@ -1638,6 +1674,9 @@ async fn peel_relay_rewrap_layers(
         }
 
         depth += 1;
+        floor = floor
+            .max(crate::messages::protocols::routing::layer_hop_count(&msg))
+            .max(depth);
         if depth > state.config.processors.forwarding.max_hops {
             return Err(MediatorError::problem(
                 94,

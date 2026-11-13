@@ -667,45 +667,52 @@ async fn message_pickup(
                 .unwrap_or(DEFAULT_DELIVERY_LIMIT)
                 .min(MAX_DELIVERY_LIMIT);
 
-            let fetched = state
-                .database
-                .fetch_messages_delivering(
-                    &session.session_id,
-                    &account.did_hash,
-                    &FetchOptions {
-                        limit: limit as usize,
-                        start_id: None,
-                        // Pickup 2.0 acknowledges separately: deleting on
-                        // delivery would lose any message whose delivery was
-                        // lost in flight. See the protocol module docs.
-                        delete_policy: FetchDeletePolicy::DoNotDelete,
-                    },
-                    state.clock.unix_millis() as u64,
-                    state.config.limits.delivered_expiry_seconds,
-                    state.config.limits.pickup_round_robin,
-                )
-                .await?;
+            // Pickup 2.0 acknowledges separately: deleting on delivery would
+            // lose any message whose delivery was lost in flight. See the
+            // protocol module docs. Nothing is recorded here either: what the
+            // reply carries is stamped delivered and reported once the REST
+            // body is written (R1.1).
+            let fetched = crate::after_write::fetch_for_handover(
+                state,
+                &session.session_id,
+                &account.did_hash,
+                &FetchOptions {
+                    limit: limit as usize,
+                    start_id: None,
+                    delete_policy: FetchDeletePolicy::DoNotDelete,
+                },
+            )
+            .await?;
 
+            // Only what goes into the reply is handed over: a record without
+            // a body, or a body that is not a v1 envelope (a stored TSP
+            // message, say), stays queued rather than being reported as
+            // delivered. Bodies stop at the same byte budget as a v2 pickup.
+            let budget = crate::messages::protocols::message_pickup::delivery_byte_budget(
+                state.limits().message_size,
+            );
+            let mut handed_over = crate::after_write::HandedOver::new(&account.did_hash);
+            let mut messages: Vec<mp::QueuedMessage> = Vec::new();
+            let mut used = 0usize;
             for element in &fetched.success {
-                state
-                    .monitor
-                    .delivered_element(element, crate::monitor::current_channel());
+                let Some(body) = element.msg.as_deref() else {
+                    continue;
+                };
+                let Ok(envelope) = serde_json::from_str(body) else {
+                    continue;
+                };
+                if !messages.is_empty() && used.saturating_add(body.len()) > budget {
+                    break;
+                }
+                used = used.saturating_add(body.len());
+                messages.push(mp::QueuedMessage {
+                    id: element.msg_id.clone(),
+                    envelope,
+                });
+                handed_over
+                    .messages
+                    .push(crate::after_write::HandedOverMessage::of(element));
             }
-            let messages: Vec<mp::QueuedMessage> = fetched
-                .success
-                .iter()
-                .filter_map(|element| {
-                    // `msg` is optional on the store element; a record without
-                    // a body cannot be delivered, and skipping it leaves it
-                    // queued rather than acknowledging something never sent.
-                    let body = element.msg.as_deref()?;
-                    let envelope = serde_json::from_str(body).ok()?;
-                    Some(mp::QueuedMessage {
-                        id: element.msg_id.clone(),
-                        envelope,
-                    })
-                })
-                .collect();
 
             // Nothing queued → answer with a status, as RFC 0685 specifies;
             // an empty `delivery` would look like a delivery that dropped
@@ -716,7 +723,16 @@ async fn message_pickup(
                     .map_err(|e| v1_build_error(session, e));
             }
 
-            mp::delivery(&msg.id, &messages, None).map_err(|e| v1_build_error(session, e))
+            let reply =
+                mp::delivery(&msg.id, &messages, None).map_err(|e| v1_build_error(session, e))?;
+            // v1 is answered over REST only, so the completion waits for the
+            // body; with no REST scope the reply reaches no transport.
+            crate::after_write::defer_or_run(
+                handed_over.completion(state, crate::monitor::current_channel()),
+                false,
+            )
+            .await;
+            Ok(reply)
         }
 
         mp::MessagePickup::MessagesReceived => {

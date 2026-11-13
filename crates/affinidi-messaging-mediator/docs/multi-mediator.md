@@ -145,8 +145,12 @@ repeat. The peel loop is bounded by `max_hops`; exceeding it is error 94,
 recipient check, Bob's access list on B is checked against Alice, not against
 A. (Test: `rewrap_relay_honours_recipients_access_list`.)
 
-`hop_count` is carried across the re-wrap rather than reset, so loop detection
-survives the mode.
+`hop_count` is carried on the re-wrap layer rather than reset, so loop
+detection survives the mode. It is read only from a layer the receiving
+mediator authenticated as a trusted peer, and only as a floor (at least one
+per layer peeled); a forward's own `hop_count` is its sender's to choose and
+is ignored. In `Blind` mode nothing carries the count between mediators, so
+cross-mediator loop detection needs `Rewrap`.
 
 `processors.forwarding.relay_trusted_mediators` is the receiver-side allowlist
 of peer mediator DIDs. Empty accepts any peer (still ACL-gated); non-empty

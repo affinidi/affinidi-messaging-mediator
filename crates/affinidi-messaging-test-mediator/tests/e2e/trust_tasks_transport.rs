@@ -95,3 +95,37 @@ async fn the_default_policy_keeps_trust_tasks_on_didcomm() {
         .expect("account/get answered over DIDComm");
     assert_eq!(account.did.as_str(), alice.did_hash().as_str());
 }
+
+/// The mediator's answer to a Trust Task over TSP is its own message: it is
+/// not gated by the requester's queue limits (#184). Before, a full inbox
+/// refused the answer with `limits.queue.recipient` after the task had run.
+#[tokio::test]
+async fn a_trust_task_answer_over_tsp_is_not_gated_by_the_requesters_queue() {
+    init_tracing();
+    let env = TestEnvironment::spawn_with_tsp_policy(TspPolicy::Required)
+        .await
+        .expect("spawn with TSP required");
+    let alice = env.add_user("full-alice").await.expect("add alice");
+    let mediator_vid = env.mediator.did().to_string();
+    for (ours, theirs) in [(&alice.did, &mediator_vid), (&mediator_vid, &alice.did)] {
+        env.relationship_store
+            .set(ours, theirs, RelationshipState::Bidirectional)
+            .await
+            .expect("seed the relationship with the mediator");
+    }
+
+    // A receive limit of 0: no client message fits.
+    env.mediator
+        .store()
+        .account_change_queue_limits(&alice.did_hash(), None, Some(0))
+        .await
+        .expect("set alice's receive limit");
+
+    let account = env
+        .atm
+        .trust_tasks()
+        .account_get(&alice.profile, None)
+        .await
+        .expect("account/get is answered whatever alice's queue limit");
+    assert_eq!(account.did.as_str(), alice.did_hash().as_str());
+}

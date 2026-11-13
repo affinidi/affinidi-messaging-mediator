@@ -26,7 +26,7 @@ use common::init_tracing;
 use serde_json::json;
 use uuid::Uuid;
 
-/// Small enough to reach in a few sends: a limit of 4 admits 3.
+/// Small enough to reach in a few sends: a limit of 4 admits 4.
 const PER_PEER: i32 = 4;
 
 /// Comfortably more than the cap admits.

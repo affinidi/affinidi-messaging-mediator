@@ -12,6 +12,9 @@ use crate::{
     messages::{ProcessMessageResponse, WrapperType},
 };
 
+/// The Trust Ping 2.0 response type.
+pub(crate) const PING_RESPONSE_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping-response";
+
 // Reads the body of an incoming trust-ping and whether to generate a return ping message
 #[derive(Deserialize)]
 struct Ping {
@@ -30,6 +33,7 @@ impl Default for Ping {
 pub(crate) fn process(
     msg: &Message,
     session: &Session,
+    mediator_did: &str,
     now: u64,
 ) -> Result<ProcessMessageResponse, MediatorError> {
     let _span = span!(
@@ -56,35 +60,7 @@ pub(crate) fn process(
         ));
     }
 
-    let to = if let Some(to) = &msg.to {
-        if let Some(first) = to.first() {
-            first.to_owned()
-        } else {
-            return Err(MediatorError::problem(
-                51,
-                &session.session_id,
-                Some(msg.id.clone()),
-                ProblemReportSorter::Warning,
-                ProblemReportScope::Message,
-                "message.to",
-                "Invalid to: header, couldn't get first DID from the field.",
-                vec![],
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-    } else {
-        return Err(MediatorError::problem(
-            51,
-            &session.session_id,
-            Some(msg.id.clone()),
-            ProblemReportSorter::Warning,
-            ProblemReportScope::Message,
-            "message.to",
-            "Missing to: header in message",
-            vec![],
-            StatusCode::BAD_REQUEST,
-        ));
-    };
+    let to = super::addressed_to_mediator(msg, mediator_did, session, "Trust Ping")?;
     debug!("To: {}", to);
 
     let respond: bool = if let Ok(body) = serde_json::from_value::<Ping>(msg.body.to_owned()) {
@@ -117,10 +93,11 @@ pub(crate) fn process(
             ));
         };
 
-        // Build the message (we swap from and to)
+        // Build the response (we swap from and to). Trust Ping 2.0 answers
+        // with `ping-response`: a peer that saw another `ping` would answer it.
         let response_msg = Message::build(
             Uuid::new_v4().to_string(),
-            "https://didcomm.org/trust-ping/2.0/ping".to_owned(),
+            PING_RESPONSE_TYPE.to_owned(),
             json!({}),
         )
         .thid(msg.id.clone())
@@ -133,6 +110,7 @@ pub(crate) fn process(
         debug!("response_msg: {:?}", response_msg);
 
         Ok(ProcessMessageResponse {
+            handed_over: None,
             store_message: true,
             force_live_delivery: false,
             data: WrapperType::Message(Box::new(response_msg)),
@@ -141,5 +119,55 @@ pub(crate) fn process(
     } else {
         debug!("No response requested");
         Ok(ProcessMessageResponse::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PING_RESPONSE_TYPE, process};
+    use crate::{common::session::Session, messages::WrapperType};
+    use affinidi_messaging_didcomm::message::Message;
+
+    const MEDIATOR: &str = "did:example:mediator";
+
+    fn ping(to: &str) -> Message {
+        Message::build(
+            "ping-1".to_string(),
+            "https://didcomm.org/trust-ping/2.0/ping".to_string(),
+            serde_json::json!({ "response_requested": true }),
+        )
+        .to(to.to_string())
+        .from("did:example:alice".to_string())
+        .finalize()
+    }
+
+    fn session() -> Session {
+        Session {
+            session_id: "s".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The answer is a `ping-response` from the mediator, threaded to the
+    /// ping: another `ping` would be answered by a conformant peer.
+    #[test]
+    fn a_ping_is_answered_with_a_ping_response() {
+        let response = process(&ping(MEDIATOR), &session(), MEDIATOR, 1_000).unwrap();
+        let WrapperType::Message(reply) = response.data else {
+            panic!("a ping with response_requested is answered");
+        };
+        assert_eq!(reply.typ, PING_RESPONSE_TYPE);
+        assert_eq!(reply.thid.as_deref(), Some("ping-1"));
+        assert_eq!(reply.from.as_deref(), Some(MEDIATOR));
+        assert_eq!(reply.to, Some(vec!["did:example:alice".to_string()]));
+    }
+
+    /// A ping addressed to anyone else is refused, never answered "from"
+    /// the DID it named.
+    #[test]
+    fn a_ping_not_addressed_to_the_mediator_is_refused() {
+        let err = process(&ping("did:example:bob"), &session(), MEDIATOR, 1_000)
+            .expect_err("a ping to another DID is not answered");
+        assert!(format!("{err:?}").contains("message.to"), "{err:?}");
     }
 }
