@@ -783,7 +783,7 @@ mod tests {
             let Some(first) = records.first() else {
                 return Ok(0);
             };
-            if self.failing_sample.iter().any(|d| *d == first.to_did_hash) {
+            if self.failing_sample.contains(&first.to_did_hash) {
                 return Err(MediatorError::InternalError(
                     crate::error_codes::INTERNAL_ERROR,
                     "test".into(),

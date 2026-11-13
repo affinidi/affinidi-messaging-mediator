@@ -173,12 +173,13 @@ pub(crate) async fn delete_for_session(
         }
         held.push(row);
     }
-    if watching && bodies.iter().any(Option::is_none) {
-        if let Ok(own) = state.database.get_messages(&session.did_hash, ids).await {
-            for (i, copy) in own.into_iter().enumerate().take(ids.len()) {
-                if bodies[i].is_none() {
-                    bodies[i] = copy.and_then(|c| c.msg);
-                }
+    if watching
+        && bodies.iter().any(Option::is_none)
+        && let Ok(own) = state.database.get_messages(&session.did_hash, ids).await
+    {
+        for (i, copy) in own.into_iter().enumerate().take(ids.len()) {
+            if bodies[i].is_none() {
+                bodies[i] = copy.and_then(|c| c.msg);
             }
         }
     }
@@ -219,7 +220,7 @@ async fn delete_one(
     members: &[String],
     held: &[Vec<bool>],
     i: usize,
-    message: &String,
+    message: &str,
     body_seen: Option<String>,
     channel: crate::monitor::Channel,
     kind: DeleteKind,
@@ -311,7 +312,7 @@ async fn delete_one(
         }
     };
     DeleteResult {
-        id: message.clone(),
+        id: message.to_string(),
         outcome,
         member_without_delete,
     }
