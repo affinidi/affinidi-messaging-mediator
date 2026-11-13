@@ -2662,7 +2662,10 @@ async fn apply_mux_change(
             .await;
     }
     if !changed.narrowed.is_empty() {
-        state.mux.narrow(&changed.narrowed).await;
+        state
+            .mux
+            .narrow(state.streaming_task.as_ref(), &changed.narrowed)
+            .await;
     }
     // An epoch advance ends the member's session attaches as well as its
     // grants, on every connection here, before answering (design §5.2).

@@ -123,6 +123,12 @@ pub mod names {
     /// apart from "never generated", which is the distinction an alert on
     /// [`WS_LIVE_RESYNC_SENT`] alone cannot make.
     pub const WS_LIVE_RESYNC_SUPPRESSED: &str = "ws_live_resync_suppressed_total";
+    /// counter: Times the streaming task's notification subscription fell
+    /// behind and skipped live notifications. Not message loss: the messages
+    /// are stored, and every live client is sent a resync to collect them.
+    /// A steady rate means the streaming loop cannot keep up with the
+    /// notification rate.
+    pub const WS_STREAMING_LAGGED_TOTAL: &str = "ws_streaming_lagged_total";
     /// counter: WebSocket writes that did not complete within the write
     /// timeout. Each one closes its connection: the peer has stopped reading,
     /// and nothing queued for it is reported delivered.

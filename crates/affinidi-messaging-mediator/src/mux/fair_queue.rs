@@ -19,7 +19,7 @@
 //!   the channel into one lane per DID and writes round-robin across the lanes
 //!   with something pending, so a member's frame waits behind at most one
 //!   frame of each other busy DID rather than behind a busy member's whole
-//!   share. Control commands (untagged: member changes, close) have a lane of
+//!   share. Control commands (untagged, such as a close) have a lane of
 //!   their own that is always written first.
 //!
 //! Neither piece writes anything, acknowledges anything or deletes anything:
@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::tasks::websocket_streaming::{QueuedCommand, WS_CHANNEL_SLOTS};
+use crate::tasks::websocket_streaming::{MemberChange, QueuedCommand, WS_CHANNEL_SLOTS};
 
 /// Frames one DID may have queued on a mux connection: the depth a direct
 /// socket has, so a member is never worse off than it would be on its own.
@@ -39,7 +39,9 @@ pub const MEMBER_SLOTS: usize = WS_CHANNEL_SLOTS;
 
 /// Channel capacity kept free of member frames for control commands, which
 /// hold no slot. Member frames can never fill it (their slots are capped
-/// below the channel's capacity), so a `MemberChange` or `Close` always fits.
+/// below the channel's capacity). Member changes do not use the channel at
+/// all ([`MuxSlots::push_member_change`]), and a `Close` that finds the
+/// channel full anyway is sent in the background.
 const CONTROL_HEADROOM: usize = WS_CHANNEL_SLOTS;
 
 /// Why a frame could not take a slot.
@@ -58,6 +60,8 @@ struct SlotsInner {
     total: usize,
     /// DIDs owed a resync: a push for them was dropped.
     resync: HashSet<String>,
+    /// Member changes the socket has yet to report, oldest first.
+    member_changes: Vec<MemberChange>,
 }
 
 /// Slot accounting for one mux connection, shared by its streaming entries
@@ -65,6 +69,8 @@ struct SlotsInner {
 pub struct MuxSlots {
     inner: Mutex<SlotsInner>,
     max_total: usize,
+    /// Wakes the socket loop to report [`take_member_changes`](Self::take_member_changes).
+    pub member_changed: tokio::sync::Notify,
 }
 
 /// One queued frame's slot. Released on drop, so the queue item owns it, the
@@ -96,7 +102,21 @@ impl MuxSlots {
         Arc::new(Self {
             inner: Mutex::new(SlotsInner::default()),
             max_total: max_total.max(MEMBER_SLOTS),
+            member_changed: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Record a change to one member's delivery for the socket to report,
+    /// and wake it. Kept here rather than queued, so it can never be dropped
+    /// for want of room in the queue the members' frames share.
+    pub fn push_member_change(&self, change: MemberChange) {
+        self.lock().member_changes.push(change);
+        self.member_changed.notify_one();
+    }
+
+    /// The member changes not yet reported, oldest first, clearing them.
+    pub fn take_member_changes(&self) -> Vec<MemberChange> {
+        std::mem::take(&mut self.lock().member_changes)
     }
 
     /// Capacity of the connection's channel: every slot, plus room that only

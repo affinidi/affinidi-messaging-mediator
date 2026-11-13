@@ -33,6 +33,13 @@ use crate::tasks::websocket_streaming::{
     EntryKind, QueuedCommand, StreamingTask, StreamingUpdate, StreamingUpdateState,
 };
 
+/// Whether a member with `scope` wants live delivery: its frames pushed
+/// (`receive`), or a resync when mail waits (`pickup`).
+pub fn wants_live(scope: &mux::MuxScope) -> bool {
+    use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
+    scope.contains(Cap::Receive) || scope.contains(Cap::Pickup)
+}
+
 /// [`MuxConn::live_frame`]'s answer for one queued live frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveFrame {
@@ -140,19 +147,64 @@ impl MuxConn {
                     resync: self.resync.clone(),
                     kind: EntryKind::Mux,
                     slots: self.slots.clone(),
+                    wake_only: false,
                 },
             })
             .await;
-        use affinidi_messaging_mediator_common::store::mux::MuxCapability as Cap;
-        if member.scope.contains(Cap::Receive) || member.scope.contains(Cap::Pickup) {
-            let _ = streaming
-                .channel
-                .send(StreamingUpdate {
-                    did_hash: member.did_hash.clone(),
-                    state: StreamingUpdateState::Start { session_id },
-                })
+        if wants_live(&member.scope) {
+            self.set_live(streaming, &member.did_hash, session_id, true)
                 .await;
         }
+    }
+
+    /// Bring the streaming task in step with `member` after it was admitted
+    /// or re-scoped. `before` is `None` for a member new to the connection,
+    /// which is registered; otherwise whether it wanted live delivery before
+    /// the change. A member already carried is never registered again (that
+    /// would read as another connection taking its DID): its live delivery
+    /// is turned on when its new scope gained `receive` or `pickup`, and off
+    /// when it lost both.
+    pub async fn reconcile_member(
+        &self,
+        streaming: Option<&StreamingTask>,
+        member: &MuxMember,
+        before: Option<bool>,
+    ) {
+        let Some(streaming) = streaming else {
+            return;
+        };
+        let Some(was_live) = before else {
+            self.register_member(streaming, member).await;
+            return;
+        };
+        let live = wants_live(&member.scope);
+        if live != was_live {
+            let session_id = self.session.lock().await.session_id.clone();
+            self.set_live(streaming, &member.did_hash, session_id, live)
+                .await;
+        }
+    }
+
+    /// Turn live delivery for member `did_hash` on (`Start`) or off (`Stop`).
+    async fn set_live(
+        &self,
+        streaming: &StreamingTask,
+        did_hash: &str,
+        session_id: String,
+        live: bool,
+    ) {
+        let state = if live {
+            StreamingUpdateState::Start { session_id }
+        } else {
+            StreamingUpdateState::Stop { session_id }
+        };
+        let _ = streaming
+            .channel
+            .send(StreamingUpdate {
+                did_hash: did_hash.to_string(),
+                state,
+            })
+            .await;
     }
 
     /// Take `did_hash` off the connection: out of the member set first (so the
@@ -175,10 +227,17 @@ impl MuxConn {
 
     /// Apply a narrowed grant to the member it admitted here, and tell the
     /// principal with an `attached` event when its scope or expiry changed
-    /// (spec event rule 5).
-    pub async fn narrow(&self, grant: &MuxGrant) {
-        let changed = self.session.lock().await.narrow(grant);
+    /// (spec event rule 5). A member left with neither `receive` nor
+    /// `pickup` has its live delivery turned off.
+    pub async fn narrow(&self, streaming: Option<&StreamingTask>, grant: &MuxGrant) {
+        let (changed, before) = {
+            let mut s = self.session.lock().await;
+            let before = s.get(&grant.did_hash).map(|m| wants_live(&m.scope));
+            (s.narrow(grant), before)
+        };
         if let Some(member) = changed {
+            self.reconcile_member(streaming, &member, before.or(Some(false)))
+                .await;
             self.joined.lock().await.push(member);
             self.notify.notify_one();
         }
@@ -536,12 +595,18 @@ impl MuxRegistry {
                 attached_at: 0,
             };
             for conn in self.for_principal(&g.principal_hash) {
-                let admitted = conn.session.lock().await.admit_grant(member.clone());
+                let (admitted, before) = {
+                    let mut s = conn.session.lock().await;
+                    let before = s.get(&member.did_hash).map(|m| wants_live(&m.scope));
+                    (s.admit_grant(member.clone()), before)
+                };
                 match admitted {
                     Ok(Some((member, new))) => {
-                        if new && let Some(streaming) = streaming {
-                            conn.register_member(streaming, &member).await;
-                        }
+                        // A replacement grant may widen the scope: a member
+                        // first carried for `send` only starts live delivery
+                        // once it gains `receive` or `pickup`.
+                        conn.reconcile_member(streaming, &member, if new { None } else { before })
+                            .await;
                         conn.joined.lock().await.push(member);
                         conn.notify.notify_one();
                         carried.insert(current.grant_id.clone());
@@ -583,10 +648,10 @@ impl MuxRegistry {
 
     /// Re-scope members admitted by narrowed grants: the narrower scope or
     /// earlier expiry takes effect now.
-    pub async fn narrow(&self, grants: &[MuxGrant]) {
+    pub async fn narrow(&self, streaming: Option<&StreamingTask>, grants: &[MuxGrant]) {
         for g in grants {
             for conn in self.for_principal(&g.principal_hash) {
-                conn.narrow(g).await;
+                conn.narrow(streaming, g).await;
             }
         }
     }
@@ -750,6 +815,107 @@ mod tests {
         ));
         registry.insert("sess", &did_hash(principal), conn.clone());
         conn
+    }
+
+    /// A streaming task whose command channel the test reads.
+    fn streaming() -> (StreamingTask, mpsc::Receiver<StreamingUpdate>) {
+        let (tx, rx) = mpsc::channel(32);
+        (
+            StreamingTask {
+                uuid: "test".into(),
+                channel: tx,
+                send_budget: crate::common::ws_budget::WsSendBudget::new(1 << 20),
+                liveness: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    /// The commands sent so far, by kind.
+    fn sent(rx: &mut mpsc::Receiver<StreamingUpdate>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        while let Ok(u) = rx.try_recv() {
+            out.push(match u.state {
+                StreamingUpdateState::Register { .. } => "register",
+                StreamingUpdateState::Start { .. } => "start",
+                StreamingUpdateState::Stop { .. } => "stop",
+                StreamingUpdateState::Deregister { .. } => "deregister",
+                _ => "other",
+            });
+        }
+        out
+    }
+
+    /// #121: a member first carried by a `send`-only grant is registered
+    /// without live delivery; a replacement grant that adds `receive` turns
+    /// it on (and does not register the member again), and narrowing it back
+    /// to `send` turns it off.
+    #[tokio::test]
+    async fn a_grant_gaining_receive_starts_live_delivery_and_losing_it_stops_it() {
+        let registry = MuxRegistry::default();
+        let store = MemoryStore::new();
+        let principal = "did:example:device";
+        let _conn = connected(&registry, principal);
+        let (streaming, mut rx) = streaming();
+        let send_only = MuxScope::new([MuxCapability::Send]).unwrap();
+
+        let mut g1 = grant("g1", "did:example:work", principal);
+        g1.scope = send_only.clone();
+        put(&store, &g1).await;
+        registry
+            .admit_grants(Some(&streaming), &store, &LIMITS, 0, &[g1])
+            .await;
+        assert_eq!(
+            sent(&mut rx),
+            ["register"],
+            "send-only: registered, not live"
+        );
+
+        let mut g2 = grant("g2", "did:example:work", principal);
+        g2.iat = 2;
+        put(&store, &g2).await;
+        registry
+            .admit_grants(
+                Some(&streaming),
+                &store,
+                &LIMITS,
+                0,
+                std::slice::from_ref(&g2),
+            )
+            .await;
+        assert_eq!(
+            sent(&mut rx),
+            ["start"],
+            "gaining receive starts live delivery, without registering again"
+        );
+
+        let mut narrowed = g2.clone();
+        narrowed.narrowed_scope = Some(send_only);
+        registry.narrow(Some(&streaming), &[narrowed]).await;
+        assert_eq!(
+            sent(&mut rx),
+            ["stop"],
+            "losing receive and pickup stops it"
+        );
+    }
+
+    /// #121: re-admitting a member the connection already carries, with the
+    /// same live wish (an attach renewal), sends the streaming task nothing.
+    #[tokio::test]
+    async fn renewing_a_carried_member_does_not_register_it_again() {
+        let registry = MuxRegistry::default();
+        let conn = connected(&registry, "did:example:device");
+        let (streaming, mut rx) = streaming();
+        let member = super::super::session::gauge_tests::member(
+            "did:example:work",
+            super::super::session::MuxSource::Attach,
+            1_000,
+        );
+        conn.reconcile_member(Some(&streaming), &member, None).await;
+        assert_eq!(sent(&mut rx), ["register", "start"]);
+        conn.reconcile_member(Some(&streaming), &member, Some(true))
+            .await;
+        assert!(sent(&mut rx).is_empty(), "a renewal is not a registration");
     }
 
     #[tokio::test]
