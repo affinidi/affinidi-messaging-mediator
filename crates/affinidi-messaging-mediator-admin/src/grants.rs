@@ -119,12 +119,12 @@ fn summarise(
             Some("the last round revoked nothing, so it stopped".to_string())
         }
         MuxAdminRevokeStop::Failed(e) => {
-            let e = match e {
-                affinidi_messaging_sdk::errors::ATMError::ProblemReport(code, comment, _) => {
-                    crate::error::explain_refusal(code, comment)
+            let e = match crate::error::refusal(e) {
+                Some((code, comment, epoch)) => {
+                    crate::error::explain_refusal(&code, &comment, epoch)
                         .unwrap_or_else(|| format!("{comment} ({code})"))
                 }
-                other => other.to_string(),
+                None => e.to_string(),
             };
             Some(format!("a later round failed: {e}"))
         }

@@ -3914,6 +3914,7 @@ mod tests {
         assert!(is_refusal(&ConsoleError::Refused {
             code: "e.p.req.unauthorized".into(),
             comment: "no".into(),
+            current_epoch: None,
         }));
         assert!(is_refusal(&ConsoleError::NotPermitted("monitor")));
         assert!(!is_refusal(&ConsoleError::Connect("dns error".into())));

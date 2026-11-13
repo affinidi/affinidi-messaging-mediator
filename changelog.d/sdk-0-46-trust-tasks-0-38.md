@@ -26,3 +26,21 @@
 - `vta-sdk` (the `vta` feature) still brings its own `affinidi-messaging-sdk`
   0.44 and `trust-tasks-rs` 0.36, as before. Nothing passes their types
   across.
+
+### Breaking — the console reads typed refusals; `ConsoleError::Refused` gains `current_epoch` (sdk 0.46.2)
+
+- The workspace requires `affinidi-messaging-sdk` 0.46.2. Every Trust Task
+  it sends now asks to be refused with a `trust-task-error` document. A
+  mediator that serves that answers with one; others keep answering with
+  problem reports.
+- `ConsoleError::Refused` is built from either form, and gains a
+  `current_epoch: Option<u64>` field. This is a breaking change for code that
+  constructs it or matches it without `..`.
+  - `code` is the mediator's own code (`ATMError::mediator_code`), so code
+    that matched it keeps working. A problem report's code keeps its `e.p.`
+    prefix, as before.
+  - `ConsoleError::current_epoch()` reads the field, which comes from the
+    document's `details.currentEpoch`, or from an older mediator's comment.
+    It no longer parses the comment itself.
+- The console's other refusal checks (monitor unsupported-type fallback, a
+  failed `admin-revoke` round) read either form.

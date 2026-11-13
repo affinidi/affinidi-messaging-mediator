@@ -217,6 +217,7 @@ impl MediatorConsole {
         let (major, minor, patch) = OPERATIONS_SINCE;
         Err(ConsoleError::Refused {
             code: "protocol.trust_task.unsupported".into(),
+            current_epoch: None,
             comment: format!(
                 "this mediator ({}) does not serve {task}: it needs \
                  affinidi-messaging-mediator {major}.{minor}.{patch} or later",
@@ -413,6 +414,7 @@ impl MediatorConsole {
             let (major, minor, patch) = CONFIG_PATCH_SINCE;
             return Err(ConsoleError::Refused {
                 code: "protocol.trust_task.unsupported".into(),
+                current_epoch: None,
                 comment: format!(
                     "this mediator ({}) does not serve config/patch: it needs \
                      affinidi-messaging-mediator {major}.{minor}.{patch} or later",
@@ -658,6 +660,7 @@ impl MediatorConsole {
         let (major, minor, patch) = MUX_ADMIN_SINCE;
         Err(ConsoleError::Refused {
             code: "protocol.trust_task.unsupported".into(),
+            current_epoch: None,
             comment: format!(
                 "this mediator ({}) does not serve {task}: it needs \
                  affinidi-messaging-mediator {major}.{minor}.{patch} or later",

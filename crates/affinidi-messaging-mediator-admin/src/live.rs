@@ -99,10 +99,12 @@ struct Granted {
 
 /// Whether `e` is the mediator saying it doesn't serve the request's type.
 fn is_unsupported_type(e: &ATMError) -> bool {
-    matches!(
-        e,
-        ATMError::ProblemReport(code, ..) if code.ends_with("protocol.trust_task.unsupported")
-    )
+    e.mediator_code()
+        .is_some_and(|c| c.ends_with("protocol.trust_task.unsupported"))
+        || matches!(
+            e.refusal_code(),
+            Some("unsupportedType" | "unsupportedVersion")
+        )
 }
 
 /// Open (or, with `renew`, renew and re-filter) a subscription at `version`.
@@ -613,6 +615,7 @@ mod tests {
         let refused = ConsoleError::Refused {
             code: "e.p.req.not-found".into(),
             comment: "no such subscription".into(),
+            current_epoch: None,
         };
         let lease = now + chrono::Duration::seconds(60);
         assert_eq!(retry_renewal(&refused, 0, lease, now), None);
