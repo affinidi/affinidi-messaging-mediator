@@ -1,11 +1,11 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ED25519};
 
 /// Generate a self-signed SSL certificate and key for local development.
 /// Writes files to the specified directory and returns (cert_path, key_path).
 pub fn generate_self_signed_cert(output_dir: &str) -> anyhow::Result<(String, String)> {
-    fs::create_dir_all(output_dir)?;
+    crate::secure_fs::create_private_dir_all(Path::new(output_dir))?;
 
     let key_pair = KeyPair::generate_for(&PKCS_ED25519)?;
 
@@ -22,7 +22,7 @@ pub fn generate_self_signed_cert(output_dir: &str) -> anyhow::Result<(String, St
     let key_path = Path::new(output_dir).join("end.key");
 
     // Cert is public — the regular world-readable write is fine.
-    fs::write(&cert_path, cert.pem())?;
+    crate::secure_fs::write_public(&cert_path, cert.pem())?;
     // Private key MUST land at 0o600 on Unix; co-tenant readability
     // would be a full TLS-key compromise.
     crate::secure_fs::write_sensitive(&key_path, key_pair.serialize_pem())?;
@@ -36,6 +36,7 @@ pub fn generate_self_signed_cert(output_dir: &str) -> anyhow::Result<(String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_generate_self_signed_cert() {
