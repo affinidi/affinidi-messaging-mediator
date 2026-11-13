@@ -99,7 +99,7 @@ async fn read_until(feed: &mut MonitorFeed, done: impl Fn(&Seen) -> bool) -> See
                     .membership
                     .extend(events.into_iter().map(|e| serde_json::to_value(e).unwrap())),
                 MonitorUpdate::Ended(reason) => panic!("feed ended: {reason}"),
-                MonitorUpdate::Gap { .. } | MonitorUpdate::Heartbeat => {}
+                _ => {}
             }
         }
     })

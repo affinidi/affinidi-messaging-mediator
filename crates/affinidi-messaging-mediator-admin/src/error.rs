@@ -34,6 +34,8 @@ pub enum ConsoleError {
     #[error("not permitted for this session: {0}")]
     NotPermitted(&'static str),
     /// A purge plan was confirmed against a queue that has since changed.
+    /// [`MediatorConsole::purge`](crate::MediatorConsole::purge) no longer
+    /// returns it: a purge is pinned to its preview instead.
     #[error("the queue changed since the purge was previewed ({previewed} then, {now} now)")]
     PlanStale { previewed: u64, now: u64 },
     /// The request was malformed, so nothing was sent.

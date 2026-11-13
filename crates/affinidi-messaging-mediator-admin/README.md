@@ -47,7 +47,22 @@ match console.mode() {
 ```
 
 To share an existing SDK instance with your application, use
-`MediatorConsole::connect_with(atm, identity)`.
+`MediatorConsole::connect_with(atm, identity)` — but read
+[How the console reads its connection](#how-the-console-reads-its-connection)
+first: if your application also reads live messages for the same DID on that
+instance, use `connect_with_unclaimed` instead, or the console takes them.
+
+`console.connection_state()` is the connection's state as the SDK publishes
+it: `ConnState::Disconnected` on every drop, `Connected` on every reconnect.
+Show it rather than inferring connectivity from failed calls:
+
+```rust
+if let Some(mut state) = console.connection_state() {
+    while state.changed().await.is_ok() {
+        println!("mediator connection: {:?}", *state.borrow_and_update());
+    }
+}
+```
 
 ## Where identities come from
 
@@ -98,12 +113,19 @@ let plan = console
     })
     .await?;
 // Show plan.matched to the user and ask them to confirm it.
-console.purge(plan).await?;
+let done = console.purge(plan).await?;
+// done.purged says how many actually went.
 ```
 
-If the queue has changed since the preview, `purge` returns
-`ConsoleError::PlanStale` and removes nothing, so what the user confirmed is
-what gets removed.
+`purge` is pinned to the moment of the preview: it never removes a message
+that arrived after the preview, or one that was not yet old enough then. It
+can remove **fewer** than `plan.matched`, when messages were delivered or
+deleted in between (and, because the pin is in whole seconds, it can leave out
+what arrived in the second before the preview). Report `purged`, not
+`matched`, as what was removed.
+
+The mediator's `queue/purge` has no "as of" member yet, so the pin is an age
+(`olderThanSeconds`) the console computes from the preview time.
 
 ## Live traffic
 
@@ -121,13 +143,18 @@ while let Some(update) = feed.next().await {
         MonitorUpdate::Membership { events, dropped } => { /* only with monitor_with */ }
         MonitorUpdate::Gap { missing } => { /* batches lost in transit */ }
         MonitorUpdate::Heartbeat => { /* the tap is alive */ }
+        MonitorUpdate::Disconnected => { /* the connection dropped, just now */ }
+        MonitorUpdate::Reconnected => { /* …and is back */ }
         MonitorUpdate::Ended(reason) => break,
+        _ => {}
     }
 }
 ```
 
 - **What the feed does for you:** it renews its lease, reports lost batches as
-  `Gap` and a quiet-but-alive tap as `Heartbeat`, and unsubscribes when dropped.
+  `Gap`, a quiet-but-alive tap as `Heartbeat`, and each drop and recovery of
+  the connection as `Disconnected` / `Reconnected` the moment it happens, and
+  unsubscribes when dropped.
 - **What an event contains:** metadata only. Stage, direction, channel,
   protocol (DIDComm or TSP), sender, recipient, size and refusal code.
   Never a message body.
@@ -182,8 +209,23 @@ match console.mux_bump_epoch(&member_did, epoch).await {
 ## How the console reads its connection
 
 The console runs a single reader over its live stream. That reader hands each
-monitor batch to the feed it belongs to, and leaves every other pushed message
-in the queue untouched (the console isn't a mail client). Request/response
-calls on the same connection are safe alongside it, because the SDK
-(0.26.19 and later) hands each reply to the call waiting for it before any
-reader sees it.
+monitor batch to the feed it belongs to. Request/response calls on the same
+connection are safe alongside it, because the SDK (0.26.19 and later) hands
+each reply to the call waiting for it before any reader sees it.
+
+**Every other message pushed live to the console's DID is taken too.** The SDK
+has no receive filtered by message type, so the reader pops each live message
+for its profile off the SDK's cache. The console never deletes one, so the
+mediator keeps its stored copy, but on that SDK instance the message is gone
+until a later pickup or reconnect redelivers it:
+
+- With `connect` (a private SDK instance) this doesn't matter.
+- With `connect_with`, nothing else on that instance may read live messages
+  for the same DID.
+- With `connect_with_unclaimed(atm, identity, tx)`, every message that is not
+  a monitor batch goes to `tx`, with its unpack metadata, for your
+  application to handle and delete as usual. If `tx` is full, the message is
+  not passed on (a warning is logged); it stays stored at the mediator.
+
+The reader logs each drop of the connection at `warn`, and each reconnect at
+`info`.
