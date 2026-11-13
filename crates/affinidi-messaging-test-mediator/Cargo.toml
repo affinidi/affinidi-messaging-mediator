@@ -65,7 +65,7 @@ affinidi-secrets-resolver = "0.5"
 affinidi-did-resolver-cache-sdk = "0.8"
 
 # ── SDK client (for the e2e test environment) ───────────────────────────
-affinidi-messaging-sdk = "0.45"
+affinidi-messaging-sdk = "0.45.17"
 
 # ── JWT signing key generation for the test mediator's session tokens ───
 ring = { version = "0.17", features = ["std"] }
