@@ -2205,32 +2205,55 @@ mod database_config_tests {
 
     #[test]
     fn circuit_breaker_tuning_defaults_and_parses() {
-        let config = database_config_from_raw(raw(""));
+        let config = database_config_from_raw(&raw("")).unwrap();
         assert_eq!(config.circuit_breaker_threshold, 5);
         assert_eq!(config.circuit_breaker_recovery_secs, 10);
 
         let mut tuned = raw("");
-        tuned.circuit_breaker_threshold = "3".into();
+        tuned.circuit_breaker_threshold = " 3 ".into();
         tuned.circuit_breaker_recovery_secs = "30".into();
-        let config = database_config_from_raw(tuned);
+        let config = database_config_from_raw(&tuned).unwrap();
         assert_eq!(config.circuit_breaker_threshold, 3);
         assert_eq!(config.circuit_breaker_recovery_secs, 30);
+    }
 
-        let mut bad = raw("");
-        bad.circuit_breaker_threshold = "0".into();
-        bad.circuit_breaker_recovery_secs = "soon".into();
-        let config = database_config_from_raw(bad);
-        assert_eq!(config.circuit_breaker_threshold, 1);
-        assert_eq!(config.circuit_breaker_recovery_secs, 10);
+    /// An unreadable circuit-breaker value is refused, naming the key, rather
+    /// than falling back to the default with a warning (#112).
+    #[test]
+    fn an_unreadable_circuit_breaker_value_is_refused() {
+        for bad in ["0", "-1", "five", "3s"] {
+            let mut raw = raw("");
+            raw.circuit_breaker_threshold = bad.into();
+            let err = database_config_from_raw(&raw).unwrap_err().to_string();
+            assert!(
+                err.contains("database.circuit_breaker_threshold"),
+                "{bad:?}: {err}"
+            );
+        }
+        for bad in ["soon", "-1", "10s"] {
+            let mut raw = raw("");
+            raw.circuit_breaker_recovery_secs = bad.into();
+            let err = database_config_from_raw(&raw).unwrap_err().to_string();
+            assert!(
+                err.contains("database.circuit_breaker_recovery_secs"),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
     fn an_empty_functions_file_means_the_built_in_library() {
         let mut unset = raw("");
         unset.functions_file = " ".into();
-        assert_eq!(database_config_from_raw(unset).functions_file, None);
         assert_eq!(
-            database_config_from_raw(raw("")).functions_file.as_deref(),
+            database_config_from_raw(&unset).unwrap().functions_file,
+            None
+        );
+        assert_eq!(
+            database_config_from_raw(&raw(""))
+                .unwrap()
+                .functions_file
+                .as_deref(),
             Some("./atm-functions.lua")
         );
     }

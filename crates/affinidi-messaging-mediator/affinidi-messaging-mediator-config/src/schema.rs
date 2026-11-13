@@ -32,11 +32,11 @@ pub struct DatabaseConfigRaw {
     #[serde(default)]
     pub cluster_mode: String,
     /// Consecutive failed database commands that open the circuit breaker.
-    /// Absent or unparseable: 5.
+    /// At least 1; absent: 5. An unreadable value is refused.
     #[serde(default)]
     pub circuit_breaker_threshold: String,
     /// Seconds an open circuit breaker waits before letting a probe command
-    /// through. Absent or unparseable: 10.
+    /// through. Absent: 10. An unreadable value is refused.
     #[serde(default)]
     pub circuit_breaker_recovery_secs: String,
 }

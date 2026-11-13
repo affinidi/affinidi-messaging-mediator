@@ -228,7 +228,7 @@ cluster_mode = "false"
 ### Consecutive failed database commands (connection errors and timeouts, not
 ### error replies) after which the circuit breaker opens: requests then fail
 ### at once instead of each waiting out database_timeout, and /readyz reports
-### the database unavailable. Default 5.
+### the database unavailable. A whole number, at least 1; default 5.
 # circuit_breaker_threshold = "5"
 
 ### Env: DATABASE_CIRCUIT_BREAKER_RECOVERY_SECS
