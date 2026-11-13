@@ -141,6 +141,11 @@ async fn task(
     if reply.typ.contains("problem-report") {
         return Err(Refused(ATMError::from_problem_report(&reply)));
     }
+    if let Some(refusal) =
+        affinidi_messaging_sdk::errors::TrustTaskRefusal::from_document(&reply.body)
+    {
+        return Err(Refused(ATMError::TrustTaskError(Box::new(refusal))));
+    }
     assert_eq!(
         reply.body["type"],
         format!("{type_uri}#response"),
@@ -442,7 +447,7 @@ async fn an_administrator_lists_stored_grants() {
     let denied = list(&env, &device, json!({ "principal": device.did }))
         .await
         .expect_err("a standard account is refused");
-    assert!(denied.has("admin_required"), "{denied:?}");
+    assert!(denied.has("permissionDenied"), "{denied:?}");
 }
 
 /// `admin-revoke` by principal: the live member is detached with reason
@@ -555,11 +560,11 @@ async fn admin_revoke_selects_and_pages_by_remaining() {
     let r = revoke(&env, &service, json!({ "principal": device.did }))
         .await
         .expect_err("the mediator account may not revoke");
-    assert!(r.has("admin_required"), "{r:?}");
+    assert!(r.has("permissionDenied"), "{r:?}");
     let r = revoke_all(&env, &service, json!({ "did": a.did, "epoch": 0 }))
         .await
         .expect_err("nor advance an epoch");
-    assert!(r.has("admin_required"), "{r:?}");
+    assert!(r.has("permissionDenied"), "{r:?}");
 
     // Two of the device's three grants, then the last.
     let first = revoke(&env, &admin, json!({ "principal": device.did, "limit": 2 }))

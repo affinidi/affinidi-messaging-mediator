@@ -13,6 +13,7 @@
 //! | `V1_KEY:<verkey>` | string → DID | forward ingress: verkey → account |
 //! | `V1_KEYS:<did_hash>` | set of verkeys | keylist-query and account removal |
 
+use crate::error_codes;
 use redis::Pipeline;
 use tracing::{Instrument, Level, span};
 
@@ -49,7 +50,7 @@ impl RedisStore {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to claim v1 routing key. Reason: {err}"),
@@ -63,7 +64,7 @@ impl RedisStore {
                     .await
                     .map_err(|err| {
                         MediatorError::database_from_redis(
-                            14,
+                            error_codes::DB_OPERATION_ERROR,
                             "NA".to_string(),
                             &err,
                             format!("Failed to read v1 routing key owner. Reason: {err}"),
@@ -75,7 +76,7 @@ impl RedisStore {
                 // conflict rather than silently taking it.
                 if owner.as_deref() != Some(did) {
                     return Err(MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".to_string(),
                         "routing verkey is already bound to a different account".to_string(),
                     ));
@@ -90,7 +91,7 @@ impl RedisStore {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to index v1 routing key. Reason: {err}"),
@@ -115,7 +116,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to look up v1 routing key. Reason: {err}"),
@@ -133,7 +134,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to read v1 routing key owner. Reason: {err}"),
@@ -157,7 +158,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to unbind v1 routing key. Reason: {err}"),
@@ -187,7 +188,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to read v1 routing key owner. Reason: {err}"),
@@ -204,7 +205,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to unindex v1 routing key. Reason: {err}"),
@@ -223,7 +224,7 @@ impl RedisStore {
         .await
         .map_err(|err| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".to_string(),
                 &err,
                 format!("Failed to unbind v1 routing key. Reason: {err}"),
@@ -245,7 +246,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to list v1 routing keys. Reason: {err}"),
@@ -280,7 +281,7 @@ impl RedisStore {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to purge v1 routing keys for ({did_hash}). Reason: {err}"),

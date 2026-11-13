@@ -1,4 +1,5 @@
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::{DeliveryDecision, ops};
 use crate::types::{
@@ -32,7 +33,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("set_acl failed. Reason: {err}"),
@@ -63,7 +64,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("get_did_acls failed. Reason: {err}"),
@@ -72,7 +73,13 @@ impl Database {
 
             if let Some(acl) = acl {
                 Ok(Some(MediatorACLSet::from_hex_string(&acl).map_err(
-                    |e| MediatorError::InternalError(26, did_hash.into(), e.to_string()),
+                    |e| {
+                        MediatorError::InternalError(
+                            error_codes::ACL_PARSE_ERROR,
+                            did_hash.into(),
+                            e.to_string(),
+                        )
+                    },
                 )?))
             } else {
                 Ok(None)
@@ -96,7 +103,7 @@ impl Database {
             debug!("Requesting ACLs for ({}) DIDs from mediator", dids.len());
             if dids.len() > 100 {
                 return Err(MediatorError::DatabaseError(
-                    27,
+                    error_codes::ACL_GET_DIDS_LIMIT,
                     "NA".to_string(),
                     "# of DIDs cannot exceed 100".to_string(),
                 ));
@@ -113,7 +120,7 @@ impl Database {
 
             let result: Vec<Value> = self.query_each(&mut con, query).await.map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("get_did_acls failed. Reason: {err}"),
@@ -127,7 +134,11 @@ impl Database {
             for (index, item) in result.iter().enumerate() {
                 if let Ok(acls_hex) = from_redis_value::<String>(item.clone()) {
                     let acls = MediatorACLSet::from_hex_string(&acls_hex).map_err(|e| {
-                        MediatorError::InternalError(26, dids[index].clone(), e.to_string())
+                        MediatorError::InternalError(
+                            error_codes::ACL_PARSE_ERROR,
+                            dids[index].clone(),
+                            e.to_string(),
+                        )
                     })?;
                     acl_response.acl_response.push(MediatorACLExpanded {
                         did_hash: dids[index].clone(),
@@ -193,7 +204,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("delivery_decision failed. Reason: {err}"),
@@ -210,7 +221,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("delivery_decision failed. Reason: {err}"),
@@ -223,8 +234,13 @@ impl Database {
         let Some(acl) = acl else {
             return Ok(None);
         };
-        let acls = MediatorACLSet::from_hex_string(&acl)
-            .map_err(|e| MediatorError::InternalError(26, to_hash.into(), e.to_string()))?;
+        let acls = MediatorACLSet::from_hex_string(&acl).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::ACL_PARSE_ERROR,
+                to_hash.into(),
+                e.to_string(),
+            )
+        })?;
         let access_list_allows = ops::access_list_allowed(&acls, sender);
 
         debug!(
@@ -268,7 +284,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("access_list_list failed. Reason: {err}"),
@@ -332,7 +348,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("access_list_add failed. Reason: {err}"),
@@ -379,7 +395,7 @@ impl Database {
 
             query.query_async(&mut con).await.map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("access_list_remove failed. Reason: {err}"),
@@ -407,7 +423,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("access_list_clear failed. Reason: {err}"),
@@ -448,7 +464,7 @@ impl Database {
 
             let results: Vec<u8> = query.query_async(&mut con).await.map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("access_list_get failed. Reason: {err}"),

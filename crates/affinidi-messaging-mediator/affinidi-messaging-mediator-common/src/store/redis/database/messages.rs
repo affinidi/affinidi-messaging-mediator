@@ -4,6 +4,7 @@
  */
 
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::Session;
 use crate::types::messages::Folder;
@@ -30,7 +31,7 @@ impl Database {
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session.session_id.clone(),
                     &e,
                     format!("Failed to delete folder stream. Reason: {e}"),

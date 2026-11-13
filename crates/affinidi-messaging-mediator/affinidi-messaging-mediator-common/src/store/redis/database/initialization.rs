@@ -3,6 +3,7 @@
  */
 
 use super::migrations::run_pending_migrations;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::redis::RedisStore;
 use crate::store::redis::init::RedisInitConfig;
@@ -23,7 +24,7 @@ impl RedisStore {
         let mediator_acl =
             MediatorACLSet::from_string_ruleset("DENY_ALL,LOCAL,BLOCKED").map_err(|e| {
                 MediatorError::ConfigError(
-                    12, // CONFIG_ERROR — mirrors mediator::common::error_codes::CONFIG_ERROR
+                    error_codes::CONFIG_ERROR, // CONFIG_ERROR — mirrors mediator::common::error_codes::CONFIG_ERROR
                     "NA".into(),
                     format!("Hardcoded mediator ACL ruleset is invalid: {e}"),
                 )

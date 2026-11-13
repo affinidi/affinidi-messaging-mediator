@@ -20,6 +20,7 @@
 //! client would look for it — v1 predates DID documents as a discovery
 //! mechanism, and Aries clients are configured with routing keys out of band.
 
+use crate::error_codes;
 use affinidi_did_common::document::DocumentExt;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm_v1::{PrivateIdentity, Verkey};
@@ -53,7 +54,7 @@ impl MediatorDidCommV1Identity {
             .await
             .map_err(|e| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "couldn't resolve mediator DID {did} to derive its DIDComm v1 identity: {e}"
@@ -66,7 +67,7 @@ impl MediatorDidCommV1Identity {
             .await
             .ok_or_else(|| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "mediator DID {did} has no Ed25519 authentication key, so it cannot \
@@ -77,7 +78,7 @@ impl MediatorDidCommV1Identity {
 
         let identity = PrivateIdentity::from_signing_key(did, &signing_key).map_err(|e| {
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("couldn't build the mediator's DIDComm v1 identity: {e}"),
             )

@@ -4,6 +4,7 @@
  */
 use super::DatabaseHandler;
 use crate::database::keys::Keys;
+use crate::error_codes;
 use crate::errors::{MediatorError, StorageCap};
 use crate::store::redis::database::handlers::is_older_library_error;
 use crate::store::types::{DeletionAuthority, MessageScope, OutboxReceipt, RemovedCopy};
@@ -189,7 +190,7 @@ impl DatabaseHandler {
                     } else if let Some(cap) = StorageCap::of_redis(&err) {
                         Err(MediatorError::storage_cap(
                             cap,
-                            10,
+                            error_codes::DB_DELETE_ERROR,
                             "NA",
                             None,
                             format!("Couldn't delete message_hash ({message_hash}). Reason: {err}"),
@@ -197,7 +198,7 @@ impl DatabaseHandler {
                     } else {
                         // Generic database error
                         Err(MediatorError::problem_with_log(
-                            10,
+                            error_codes::DB_DELETE_ERROR,
                             "NA",
                             None,
                             ProblemReportSorter::Warning,

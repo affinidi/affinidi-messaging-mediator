@@ -38,6 +38,7 @@
 //! is reused unchanged (the session is DID-keyed and protocol-agnostic).
 
 use super::helpers::{_create_access_token, _create_refresh_token, create_random_string};
+use crate::error_codes;
 use crate::{
     SharedData,
     common::session::{Session, SessionState},
@@ -250,7 +251,7 @@ pub async fn tsp_authentication_response(
         // VID must be a DID (phase-1 DID-VID constraint).
         if !body.vid.starts_with("did:") {
             return Err(MediatorError::problem(
-                29,
+                error_codes::AUTH_INVALID_DID,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -283,7 +284,7 @@ pub async fn tsp_authentication_response(
             .into();
         if session.state != SessionState::ChallengeSent {
             return Err(MediatorError::problem(
-                34,
+                error_codes::AUTH_SESSION_INVALID,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -298,7 +299,7 @@ pub async fn tsp_authentication_response(
         if !affinidi_messaging_mediator_common::did_identity::same_account(&session.did, &body.vid)
         {
             return Err(MediatorError::problem(
-                33,
+                error_codes::AUTH_SESSION_MISMATCH,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -316,7 +317,7 @@ pub async fn tsp_authentication_response(
             .decode(body.signature.as_bytes())
             .map_err(|e| {
                 MediatorError::problem(
-                    28,
+                    error_codes::AUTH_TSP_STATEMENT_INVALID,
                     &body.session_id,
                     None,
                     ProblemReportSorter::Error,
@@ -329,7 +330,7 @@ pub async fn tsp_authentication_response(
             })?;
         let signature: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
             MediatorError::problem(
-                28,
+                error_codes::AUTH_TSP_STATEMENT_INVALID,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -345,7 +346,7 @@ pub async fn tsp_authentication_response(
         let resolver = DidVidResolver::new(state.did_resolver.clone());
         let resolved = resolver.resolve_did(&body.vid).await.map_err(|e| {
             MediatorError::problem(
-                28,
+                error_codes::AUTH_TSP_STATEMENT_INVALID,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -378,7 +379,7 @@ pub async fn tsp_authentication_response(
         };
         signing::verify(&signed, &signature, &resolved.signing_key).map_err(|_| {
             MediatorError::problem(
-                32,
+                error_codes::MESSAGE_UNPACK_FAILED,
                 &body.session_id,
                 None,
                 ProblemReportSorter::Error,

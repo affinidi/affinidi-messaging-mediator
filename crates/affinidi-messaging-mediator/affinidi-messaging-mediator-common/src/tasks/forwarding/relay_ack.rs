@@ -151,12 +151,12 @@ mod tests {
         let id = frame_id(b"envelope");
         let ack = RelayAck::rejected(
             &id,
-            60,
+            crate::error_codes::RELAY_UNTRUSTED_PEER,
             "Relaying mediator is not in the trusted relay allowlist",
         );
 
         assert!(!ack.ok);
-        assert_eq!(ack.code, Some(60));
+        assert_eq!(ack.code, Some(crate::error_codes::RELAY_UNTRUSTED_PEER));
         assert!(ack.reason.unwrap().contains("trusted relay allowlist"));
     }
 
@@ -188,7 +188,12 @@ mod tests {
     #[test]
     fn round_trips_a_rejection() {
         let id = frame_id(b"envelope");
-        let json = serde_json::to_string(&RelayAck::rejected(&id, 94, "loop detected")).unwrap();
+        let json = serde_json::to_string(&RelayAck::rejected(
+            &id,
+            crate::error_codes::FORWARD_LOOP_DETECTED,
+            "loop detected",
+        ))
+        .unwrap();
         let back: RelayAck = serde_json::from_str(&json).unwrap();
 
         assert!(back.answers(&id));

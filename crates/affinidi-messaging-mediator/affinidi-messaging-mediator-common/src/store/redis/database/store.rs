@@ -1,3 +1,4 @@
+use crate::error_codes;
 use std::time::Instant;
 
 use super::Database;
@@ -100,7 +101,7 @@ impl Database {
             stored.map_err(|err| {
                 event!(Level::ERROR, "Couldn't store message in database: {}", err);
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     session_id.into(),
                     &err,
                     format!("Couldn't store message in database: {err}"),
@@ -342,7 +343,7 @@ impl Database {
         async move {
             if !crate::store::ops::is_message_id(message_hash) {
                 return Err(MediatorError::DatabaseError(
-                    22,
+                    error_codes::DB_METADATA_PARSE_ERROR,
                     session_id.into(),
                     format!("No usable metadata for message {message_hash}"),
                 ));
@@ -368,7 +369,7 @@ impl Database {
                         err
                     );
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         session_id.into(),
                         &err,
                         format!("Couldn't get message metadata from database: {err}"),
@@ -383,7 +384,7 @@ impl Database {
             };
             let metadata = metadata_from_fields(&fields).ok_or_else(|| {
                 MediatorError::DatabaseError(
-                    22,
+                    error_codes::DB_METADATA_PARSE_ERROR,
                     session_id.into(),
                     format!("No usable metadata for message {message_hash}"),
                 )

@@ -30,6 +30,8 @@ pub use affinidi_messaging_mediator_types as types;
 /// the `mediator-setup` wizard (writing the `did-web.json` artefact).
 pub mod did_web;
 
+pub mod error_codes;
+
 /// The account a DID names, and its hash. Pure, always built: every place
 /// the mediator keys storage, sessions or access control by a DID goes
 /// through it, so a did:scid identity is one account whether or not the

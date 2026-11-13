@@ -1,5 +1,6 @@
 use super::helpers::create_random_string;
 use super::{AuthenticationChallenge, ChallengeBody};
+use crate::error_codes;
 use crate::{
     SharedData,
     common::authz,
@@ -34,7 +35,7 @@ pub async fn authentication_challenge(
     // session until it expires.
     if !is_acceptable_challenge_did(&body.did) {
         return Err(MediatorError::problem(
-            29,
+            error_codes::AUTH_INVALID_DID,
             "",
             None,
             ProblemReportSorter::Error,
@@ -87,7 +88,7 @@ pub async fn authentication_challenge(
         if !allowed {
             info!(did_hash = %session.did_hash, "DID is blocked from connecting");
             return Err(MediatorError::problem(
-                25,
+                error_codes::AUTH_DID_BLOCKED,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
@@ -106,7 +107,7 @@ pub async fn authentication_challenge(
                 session.did
             );
             return Err(MediatorError::problem(
-                25,
+                error_codes::AUTH_DID_BLOCKED,
                 session.session_id,
                 None,
                 ProblemReportSorter::Error,
