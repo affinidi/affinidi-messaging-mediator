@@ -333,8 +333,7 @@ pub async fn authentication_response(
             state.config.security.jwt_encoding_key(),
         )?;
 
-        let refresh_expiry =
-            state.config.security.jwt_refresh_expiry - state.config.security.jwt_access_expiry;
+        let refresh_expiry = state.config.security.refresh_token_lifetime();
         let (refresh_token, refresh_expires_at, refresh_token_hash) = _create_refresh_token(
             &session.did,
             &session.session_id,
@@ -395,7 +394,7 @@ pub async fn authentication_response(
         }
 
         metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);
-        info!("Authentication successful for {}", session.did);
+        info!(did_hash = %session.did_hash, "Authentication successful");
 
         Ok((
             StatusCode::OK,

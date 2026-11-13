@@ -3,6 +3,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod did_rate_limiter;
 pub mod error_codes;
+pub mod http_server;
 pub mod jwt_auth;
 /// Startup check that the Redis stored-function library matches this build.
 #[cfg(feature = "redis-backend")]

@@ -1068,9 +1068,20 @@ impl StreamingTask {
                 }
             }
             None => {
-                warn!(
-                    "pub/sub msg received for did_hash({did_hash}) but it doesn't exist in clients HashMap"
+                // Routed here because the store still names this instance as
+                // the DID's live streamer, but no socket here holds it: a
+                // stale claim. Not the sender's problem (the message is in the
+                // inbox), so not a warning; release the claim so later
+                // messages stop being routed here (#148).
+                debug!(
+                    "pub/sub msg received for did_hash({did_hash}) with no client here; releasing its stale streaming claim"
                 );
+                if !self
+                    .promote_standby(database, clients, standby, replay_in_progress, &did_hash)
+                    .await
+                {
+                    self.release(database, &did_hash).await;
+                }
             }
         }
     }
@@ -2366,14 +2377,6 @@ mod tests {
         clients
     }
 
-    /// A `Stop` from a session that has already been replaced must not switch
-    /// live delivery off for the connection that replaced it.
-    ///
-    /// This is the bad direction of the bug: `clients` is keyed by DID hash, so
-    /// an unscoped `Stop` clears both `active` and the stored `Live` state for
-    /// whoever holds the slot. The healthy socket stays connected and simply
-    /// stops receiving pushes — the same silent stop-delivering failure as the
-    /// `Deregister` bug, invisible from both ends.
     /// A live notification that cannot be queued raises the client's resync
     /// flag — the KR-30 / VTI-30 regression.
     ///
@@ -2570,6 +2573,53 @@ mod tests {
         );
     }
 
+    /// A notification for a DID no socket here holds means the store's claim
+    /// that this instance streams it is stale. It is released, so later
+    /// messages stop being routed here; it used to log a WARN per message and
+    /// stay `Live` for good (#148).
+    #[tokio::test]
+    async fn a_notification_for_an_unknown_did_releases_its_stale_claim() {
+        let task = streaming_task();
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        database
+            .streaming_set_state(
+                "bob",
+                &task.uuid,
+                affinidi_messaging_mediator_common::store::types::StreamingClientState::Live,
+            )
+            .await
+            .unwrap();
+        assert!(
+            database
+                .streaming_is_client_live("bob", false)
+                .await
+                .is_some()
+        );
+
+        task.dispatch_payload(
+            &database,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &Arc::new(DashSet::new()),
+            PubSubRecord {
+                did_hash: "bob".to_string(),
+                message: "body".to_string(),
+                force_delivery: false,
+                verbatim: false,
+                stored: None,
+            },
+        )
+        .await;
+
+        assert!(
+            database
+                .streaming_is_client_live("bob", true)
+                .await
+                .is_none(),
+            "the stale claim is released"
+        );
+    }
+
     /// Repeated drops collapse into one signal rather than queueing one signal
     /// per drop. The client's response to any number of them is the same single
     /// drain, and a congested socket is the worst place to add traffic.
@@ -2617,6 +2667,14 @@ mod tests {
         );
     }
 
+    /// A `Stop` from a session that has already been replaced must not switch
+    /// live delivery off for the connection that replaced it.
+    ///
+    /// This is the bad direction of the bug: `clients` is keyed by DID hash, so
+    /// an unscoped `Stop` clears both `active` and the stored `Live` state for
+    /// whoever holds the slot. The healthy socket stays connected and simply
+    /// stops receiving pushes — the same silent stop-delivering failure as the
+    /// `Deregister` bug, invisible from both ends.
     #[tokio::test]
     async fn a_stale_sessions_stop_does_not_deactivate_the_current_socket() {
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());

@@ -160,17 +160,8 @@ pub async fn oobid_handler(
                 data: Some(invite),
             }),
         )),
-        Ok(None) => Ok((
-            StatusCode::OK,
-            Json(SuccessResponse {
-                session_id: "NA".into(),
-                http_code: StatusCode::NOT_FOUND.as_u16(),
-                error_code: 0,
-                error_code_str: "NA".to_string(),
-                message: "NO CONTENT".to_string(),
-                data: None,
-            }),
-        )),
+        // The HTTP status says what the body says: no such invite.
+        Ok(None) => Ok(invite_not_found("NA".into())),
         // Anyone may retrieve an invite, so a storage failure is reported
         // without its cause (full, busy, or the database's own text).
         Err(MediatorError::DatabaseError(code, _, text)) => {
@@ -193,6 +184,22 @@ pub async fn oobid_handler(
         )
         .into()),
     }
+}
+
+/// The answer for an invite id that names no invite: HTTP 404, with the same
+/// status in the body.
+fn invite_not_found(session_id: String) -> (StatusCode, Json<SuccessResponse<String>>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(SuccessResponse {
+            session_id,
+            http_code: StatusCode::NOT_FOUND.as_u16(),
+            error_code: 0,
+            error_code_str: "NA".to_string(),
+            message: "Not found".to_string(),
+            data: None,
+        }),
+    )
 }
 
 /// Removes a OOB Invitation if it exists
@@ -228,19 +235,9 @@ pub async fn delete_oobid_handler(
                 )
             })? {
             Some((_, oob_owner)) => oob_owner,
-            _ => {
-                return Ok((
-                    StatusCode::OK,
-                    Json(SuccessResponse {
-                        session_id: "NA".into(),
-                        http_code: StatusCode::NO_CONTENT.as_u16(),
-                        error_code: 0,
-                        error_code_str: "NA".to_string(),
-                        message: "NO CONTENT".to_string(),
-                        data: None,
-                    }),
-                ));
-            }
+            // Nothing to delete. Said with a real 404 (a 204 cannot carry the
+            // body every other answer here has).
+            _ => return Ok(invite_not_found(session.session_id.clone())),
         };
 
         if oob_did_owner

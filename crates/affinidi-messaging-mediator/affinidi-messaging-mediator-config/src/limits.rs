@@ -93,6 +93,19 @@ pub struct LimitsConfigRaw {
     /// Seconds one write to a WebSocket may take before the mediator closes it.
     #[serde(default = "default_ws_write_timeout_secs")]
     pub ws_write_timeout_secs: String,
+    /// Seconds an HTTP/1 client has to send a request's headers, counted from
+    /// when the connection is ready for its next request, so it also bounds
+    /// how long an idle keep-alive connection is held open.
+    #[serde(default = "default_http_header_read_timeout_secs")]
+    pub http_header_read_timeout_secs: String,
+    /// Seconds one HTTP request (other than a WebSocket upgrade's socket) may
+    /// take, body upload included, before the mediator answers 408.
+    #[serde(default = "default_http_request_timeout_secs")]
+    pub http_request_timeout_secs: String,
+    /// Concurrent TCP connections the HTTP listener holds, WebSockets
+    /// included. `"0"` means unlimited.
+    #[serde(default = "default_max_http_connections")]
+    pub max_http_connections: String,
     /// `[limits.mux]` — DID multiplexing. Absent means disabled.
     #[serde(default)]
     pub mux: MuxConfigRaw,
@@ -205,6 +218,23 @@ fn default_ws_pong_timeout_secs() -> String {
 /// 30 s for one write to complete.
 fn default_ws_write_timeout_secs() -> String {
     "30".to_string()
+}
+
+/// 30 s to send a request's headers (and the most an idle HTTP/1 keep-alive
+/// connection is held).
+fn default_http_header_read_timeout_secs() -> String {
+    "30".to_string()
+}
+
+/// 60 s for one request.
+fn default_http_request_timeout_secs() -> String {
+    "60".to_string()
+}
+
+/// Twice the default WebSocket cap, so HTTP requests still get connections
+/// while every WebSocket slot is taken.
+fn default_max_http_connections() -> String {
+    "20000".to_string()
 }
 
 fn default_rate_limit_burst() -> String {

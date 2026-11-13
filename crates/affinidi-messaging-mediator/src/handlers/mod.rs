@@ -8,6 +8,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use http::StatusCode;
+use tower_http::timeout::TimeoutLayer;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub mod authenticate;
@@ -39,6 +40,14 @@ fn inbound_body_limit(shared_data: &SharedData) -> usize {
     shared_data.config.limits.message_size.max(AXUM_DEFAULT)
 }
 
+/// The per-request deadline for every route but `/ws`.
+fn request_timeout(shared_data: &SharedData) -> TimeoutLayer {
+    TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        std::time::Duration::from_secs(shared_data.config.limits.http_request_timeout_secs),
+    )
+}
+
 /// Body cap for `/authenticate/challenge` and `/tsp/authenticate`: a DID
 /// (at most `MAX_CHALLENGE_DID_LEN` bytes), or a VID, the mediator DID, a
 /// session id, two times and a signature, with room for JSON escaping. Both
@@ -68,8 +77,6 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
         )
         // Delete/remove messages stored in ATM
         .route("/delete", delete(message_delete::message_delete_handler))
-        // Websocket endpoint for ATM clients
-        .route("/ws", get(websocket::websocket_handler))
         // Helps to test if you are who you think you are
         .route("/whoami", get(whoami_handler))
         .route(
@@ -128,6 +135,17 @@ pub fn application_routes(api_prefix: &str, shared_data: &SharedData) -> Router 
                 .layer(DefaultBodyLimit::max(AUTH_CHALLENGE_BODY_LIMIT)),
         );
     }
+
+    // Every route so far gets a deadline (`limits.http_request_timeout_secs`),
+    // body upload included, so a request whose handler hangs (on a slow DID
+    // resolution, say) or whose client trickles its body is answered 408 and
+    // dropped. `route_layer` covers only the routes added before it: `/ws`,
+    // added after, is left out, as an upgraded socket has its own liveness
+    // limits.
+    app = app
+        .route_layer(request_timeout(shared_data))
+        // Websocket endpoint for ATM clients
+        .route("/ws", get(websocket::websocket_handler));
 
     // `api_prefix` arrives in the canonical form produced by
     // `config::helpers::normalize_api_prefix`: either `""` (mount at
@@ -188,45 +206,6 @@ pub async fn liveness_handler() -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({ "status": "alive" })),
     )
-}
-
-/// Determine the current load state of the mediator.
-/// Used for load shedding decisions.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LoadState {
-    /// Normal operation
-    Normal,
-    /// Elevated load — non-essential operations may be deferred
-    Elevated,
-    /// Critical load — only essential operations allowed
-    Critical,
-}
-
-impl LoadState {
-    pub async fn current(state: &SharedData) -> Self {
-        // Check circuit breaker
-        if state.database.circuit_breaker_state() != "closed" {
-            return LoadState::Critical;
-        }
-
-        // Check shutdown
-        if state.shutdown_token.is_cancelled() {
-            return LoadState::Critical;
-        }
-
-        // Check queue depth
-        if let Ok(queue_len) = state.database.forward_queue_len().await {
-            let limit = state.limits().forward_task_queue;
-            if queue_len >= limit {
-                return LoadState::Critical;
-            }
-            if queue_len >= limit * 80 / 100 {
-                return LoadState::Elevated;
-            }
-        }
-
-        LoadState::Normal
-    }
 }
 
 /// Handler that returns the DID registered for this session
