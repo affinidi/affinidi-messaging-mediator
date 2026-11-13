@@ -8,9 +8,10 @@
 - The image no longer runs `apt-get upgrade` on its digest-pinned base, so a
   given digest always builds the same runtime layer. Base-image fixes arrive as
   digest bumps.
-- Only `atm-functions.lua` is copied from the template `conf/` directory; the
-  sample `mediator_did.json` and `secrets.json-example` no longer ship in the
-  image.
+- Nothing is copied from the template `conf/` directory: the sample
+  `mediator_did.json`, `secrets.json-example` and `atm-functions.lua` no longer
+  ship in the image. The container profile leaves `database.functions_file`
+  unset, so the Redis library built into the binary is loaded.
 
 ### Added — `mediator healthcheck` and an image HEALTHCHECK
 

@@ -90,12 +90,12 @@ RUN apt-get update \
 RUN groupadd --system --gid 10001 mediator \
     && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin mediator
 WORKDIR /app
-# Only the Redis Lua functions from the template conf directory. Copying the
-# whole directory would bake in whatever the setup wizard left there in a
-# developer's checkout (secrets.json, admin-monitor.json, keys/) and the
-# template's sample DID. The container config then provides mediator.toml —
-# the mediator defaults to `-c conf/mediator.toml` relative to WORKDIR.
-COPY crates/affinidi-messaging-mediator/conf/atm-functions.lua conf/atm-functions.lua
+# Nothing from the template conf directory: copying it would bake in whatever
+# the setup wizard left there in a developer's checkout (secrets.json,
+# admin-monitor.json, keys/) and the template's sample DID, and the Redis Lua
+# library is built into the binary (`database.functions_file` unset). The
+# container config provides mediator.toml — the mediator defaults to
+# `-c conf/mediator.toml` relative to WORKDIR.
 COPY docker/conf/mediator.toml conf/mediator.toml
 COPY --from=builder /app/target/release/mediator /usr/local/bin/
 COPY --from=builder /app/target/release/mediator-setup /usr/local/bin/
