@@ -1437,6 +1437,35 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Tell every mediator instance sharing this store, this one included,
+    /// `payload`: one traffic-monitor record (JSON the mediator defines) on
+    /// the channel for `scope`, which names the mediator so that two
+    /// deployments sharing one server never hear each other. Best-effort and
+    /// at most once.
+    ///
+    /// The default does nothing: a single-process backend has no other
+    /// instance whose monitor subscribers could hear it.
+    async fn monitor_fanout_publish(
+        &self,
+        _scope: &str,
+        _payload: &str,
+    ) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    /// Subscribe to [`monitor_fanout_publish`](Self::monitor_fanout_publish)
+    /// records for `scope` from every instance, this one's included.
+    /// `Ok(None)` when the backend is single-process (the default).
+    ///
+    /// `Lagged` means records were missed; `Closed` means the subscription
+    /// was lost and must be opened again.
+    async fn monitor_fanout_subscribe(
+        &self,
+        _scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        Ok(None)
+    }
+
     // ─── ACLs ────────────────────────────────────────────────────────────────
 
     /// Replace the ACL bitmask for a DID. Caller is responsible for

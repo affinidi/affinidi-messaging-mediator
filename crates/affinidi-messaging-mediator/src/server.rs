@@ -899,6 +899,16 @@ pub async fn serve_internal(
             let state = state.clone();
             async move { crate::mux::sync::run(state).await }
         });
+        // Membership monitor events from every instance reach every
+        // instance's subscribers. Not load-bearing: while it is down each
+        // instance's subscribers see that instance's events only.
+        if shared_state.database.spans_processes() {
+            let state = shared_state.clone();
+            supervisor.spawn("monitor_fanout", false, move || {
+                let state = state.clone();
+                async move { crate::monitor::fanout::run(state).await }
+            });
+        }
     }
 
     // DIDComm v1 startup checks. Both run before the listener binds, so a

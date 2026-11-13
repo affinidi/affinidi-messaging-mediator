@@ -42,9 +42,10 @@
 //! `messaging/monitor/event` 0.3's `membership` array with its own
 //! `membershipDropped` count, under the same rate ceiling, and are never sent
 //! to a subscription that did not ask. A 0.1 subscription is served exactly as
-//! before: event 0.2 batches, traffic only. Like traffic, membership is per
-//! instance: a connection's changes are seen by subscribers on the instance
-//! that holds the connection.
+//! before: event 0.2 batches, traffic only. Unlike traffic, membership is
+//! not per instance behind a shared Redis: every instance's changes reach
+//! every instance's opted-in subscribers (see [`fanout`]), under the same
+//! filters and standing checks as local ones.
 //!
 //! # What a subscription reveals
 //!
@@ -62,7 +63,7 @@
 //! internal failure is reported as `internalError` with no detail.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "didcomm")]
@@ -76,6 +77,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::SharedData;
+
+pub(crate) mod fanout;
 use affinidi_messaging_mediator_common::store::types::ForwardQueueEntry;
 use affinidi_messaging_mediator_common::tasks::forwarding::{ForwardOutcome, ForwardingObserver};
 use affinidi_messaging_mediator_common::time::unix_timestamp_millis;
@@ -780,6 +783,9 @@ pub(crate) enum Delivery {
 
 struct Subscription {
     owner_did_hash: String,
+    /// Whether its tap opted in to membership events, kept beside the
+    /// settings so the fan-out task can ask without taking their lock.
+    membership: Arc<AtomicBool>,
     settings: Arc<Mutex<Settings>>,
     cancel: CancellationToken,
     sent: Arc<AtomicU64>,
@@ -876,6 +882,8 @@ pub struct TrafficMonitor {
     /// opt in ignores them, and they cannot crowd traffic out of `tx`.
     membership_tx: broadcast::Sender<Arc<MembershipEvent>>,
     subscriptions: Arc<DashMap<String, Subscription>>,
+    /// Membership events shared with the other instances behind one store.
+    fanout: Arc<fanout::Fanout>,
 }
 
 impl Default for TrafficMonitor {
@@ -908,6 +916,7 @@ impl TrafficMonitor {
             tx,
             membership_tx,
             subscriptions: Arc::new(DashMap::new()),
+            fanout: Arc::default(),
         }
     }
 
@@ -936,10 +945,39 @@ impl TrafficMonitor {
     /// Emit a mux membership event if any subscription could see it. Called
     /// once per member change reported in `messaging/mux/event`, after the
     /// change is made (`crate::mux::connection`).
+    ///
+    /// Also offered, without waiting, to the fan-out task while another
+    /// instance has a membership subscriber (see [`fanout`]); never awaited,
+    /// so the connection path it is called from is not slowed by the store.
     pub fn emit_membership(&self, build: impl FnOnce() -> MembershipEvent) {
-        if self.membership_tx.receiver_count() > 0 {
-            let _ = self.membership_tx.send(Arc::new(build()));
+        let local = self.membership_tx.receiver_count() > 0;
+        let remote = self.fanout.wanted();
+        if !local && !remote {
+            return;
         }
+        let event = Arc::new(build());
+        if remote {
+            self.fanout.offer(event.clone());
+        }
+        if local {
+            let _ = self.membership_tx.send(event);
+        }
+    }
+
+    /// Put a membership event another instance reported on this instance's
+    /// bus, where every subscription's own filter and standing check apply
+    /// to it as to a local one. Not offered back to the fan-out.
+    fn inject_membership(&self, event: MembershipEvent) {
+        if self.membership_tx.receiver_count() > 0 {
+            let _ = self.membership_tx.send(Arc::new(event));
+        }
+    }
+
+    /// Whether any subscription here has opted in to membership events.
+    fn has_membership_subscribers(&self) -> bool {
+        self.subscriptions
+            .iter()
+            .any(|s| s.membership.load(Ordering::Relaxed))
     }
 
     /// Every membership event on the bus, unfiltered: for tests of the code
@@ -974,10 +1012,15 @@ impl TrafficMonitor {
                 .filter(|s| s.owner_did_hash == owner_did_hash)
                 .ok_or(MonitorError::UnknownSubscription)?;
             let settings = sub.settings.clone();
+            let opted_in = sub.membership.clone();
             drop(sub);
             let mut guard = settings.lock().await;
             if guard.ended {
                 return Err(MonitorError::UnknownSubscription);
+            }
+            opted_in.store(tap.membership.is_some(), Ordering::Relaxed);
+            if tap.membership.is_some() {
+                self.fanout.listening_changed();
             }
             guard.tap = tap.clone();
             guard.expires_at = expires_at;
@@ -1013,6 +1056,7 @@ impl TrafficMonitor {
             id.clone(),
             Subscription {
                 owner_did_hash: owner_did_hash.to_string(),
+                membership: Arc::new(AtomicBool::new(tap.membership.is_some())),
                 settings: settings.clone(),
                 cancel: cancel.clone(),
                 sent: sent.clone(),
@@ -1020,6 +1064,9 @@ impl TrafficMonitor {
             },
         );
 
+        if tap.membership.is_some() {
+            self.fanout.listening_changed();
+        }
         let task = DeliveryTask {
             state: state.clone(),
             subscription_id: id.clone(),

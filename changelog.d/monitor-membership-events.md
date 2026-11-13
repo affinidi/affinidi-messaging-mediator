@@ -21,9 +21,9 @@
   `permissionDenied`. The membership filter counts toward the re-check that
   ends an administrator's wide tap when it stops being one, and it is on the
   audit log.
-- Membership events are per instance, like traffic: a connection's changes
-  are seen by subscribers on the instance holding the connection. A mediator
-  without mux enabled grants no membership filter.
+- Behind a shared Redis, every instance's membership events reach every
+  instance's subscribers (see "membership monitor events cross instances").
+  A mediator without mux enabled grants no membership filter.
 - Unchanged for existing clients: a 0.1 subscription still gets event 0.2
   batches, traffic only. Pins `messaging/monitor/event` 0.3 and
   `messaging/monitor/subscribe` 0.2 beside their older versions, and takes
