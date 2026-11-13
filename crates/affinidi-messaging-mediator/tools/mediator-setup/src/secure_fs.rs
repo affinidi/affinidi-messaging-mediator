@@ -1,70 +1,156 @@
-//! Mode-restricted file writes for sensitive wizard outputs.
+//! Crash-safe file writes for the wizard's outputs.
 //!
-//! `std::fs::write` honours the process umask, which on most defaults
-//! leaves files world-readable (`0o644`). Anything we generate that
-//! holds key material, secret-backend URLs, or DID material we'd rather
-//! not have a co-tenant read should land at `0o600`. This module
-//! centralises the pattern so callers don't each spell out the
-//! `OpenOptions + mode + write_all` dance, and so the non-Unix fallback
-//! lives in one place.
+//! Every file the wizard writes goes through one of two helpers here:
 //!
-//! On Unix the helper opens with `O_CREAT | O_TRUNC | O_WRONLY` and
-//! mode `0o600`. The `truncate` flag preserves the historical
-//! `fs::write` semantics (clobber existing contents); the mode flag
-//! sets the *new file's* permission bits — pre-existing files keep
-//! whatever perms they already had, which is fine because the wizard
-//! only ever creates fresh artefacts (no in-place edits of secrets).
+//! - [`write_sensitive`] — anything holding key material, secret-backend
+//!   URLs or DID material (`mediator.toml`, `admin-monitor.json`,
+//!   `keys/end.key`, `did.jsonl`, the build recipe, …). The new contents are
+//!   written to a temporary file created `0o600` in the same directory,
+//!   fsynced, and renamed over the target, so the target is never
+//!   world-readable — not even when a previous run (or the operator) left it
+//!   `0o644` — and never half-written.
+//! - [`write_public`] — content that is public by design (`Dockerfile`,
+//!   `atm-functions.lua`, `docker-compose.yml`): the same temp + fsync +
+//!   rename dance, with the process umask's default mode.
 //!
-//! On non-Unix the helper falls back to `fs::write`. Windows ACLs are
-//! a different model and the wizard's threat-model on Windows assumes
-//! the operator owns the directory anyway.
+//! Both refuse to write through a symlink: the wizard replaces the target
+//! path itself, never a file a link happens to point at.
 //!
-//! Files that are *not* sensitive (Dockerfile, `atm-functions.lua`,
-//! `docker-compose.yml`) deliberately don't go through this helper —
-//! their world-readable default is correct.
+//! [`create_private_dir_all`] creates the directories the wizard writes
+//! into as `0o700` (only the ones it creates; an existing directory keeps
+//! its mode).
+//!
+//! On non-Unix targets the permission bits are not applied (Windows ACLs
+//! are a different model, and the wizard's threat model there assumes the
+//! operator owns the directory); the atomic replace still is.
 
 use std::fs;
-use std::io;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 /// Mode bits applied to sensitive file writes on Unix.
 #[cfg(unix)]
 const SENSITIVE_MODE: u32 = 0o600;
 
-/// Write `contents` to `path` with restrictive permissions on Unix
-/// (`0o600`); plain `fs::write` semantics on non-Unix.
-///
-/// Preserves the rest of `fs::write`'s behaviour — creates the file
-/// if missing, truncates if present, leaves the parent directory
-/// alone (callers are responsible for `create_dir_all` first if the
-/// parent might not exist).
-pub fn write_sensitive<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
-    write_sensitive_inner(path.as_ref(), contents.as_ref())
-}
-
+/// Mode bits for directories the wizard creates.
 #[cfg(unix)]
-fn write_sensitive_inner(path: &Path, contents: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+const PRIVATE_DIR_MODE: u32 = 0o700;
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(SENSITIVE_MODE)
-        .open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    Ok(())
+/// Atomically replace `path` with `contents`, readable by the owner only
+/// (`0o600` on Unix) whatever mode the previous file had. Refuses when
+/// `path` is a symlink. The parent directory must exist.
+pub fn write_sensitive<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
+    write_atomic(path.as_ref(), contents.as_ref(), true)
 }
 
-#[cfg(not(unix))]
-fn write_sensitive_inner(path: &Path, contents: &[u8]) -> io::Result<()> {
-    // Windows / WASI / other non-Unix targets: fall back to the
-    // unrestricted write. The operator's threat model on those
-    // platforms is different (per-user profile dirs, ACLs) and
-    // the wizard isn't trying to harden against it.
-    fs::write(path, contents)
+/// Atomically replace `path` with `contents` using the default file mode.
+/// Refuses when `path` is a symlink. The parent directory must exist.
+pub fn write_public<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
+    write_atomic(path.as_ref(), contents.as_ref(), false)
+}
+
+/// `create_dir_all`, creating every missing directory `0o700` on Unix.
+/// Directories that already exist are left as they are.
+pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(PRIVATE_DIR_MODE);
+    }
+    builder.create(dir)
+}
+
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write {}: it is a symbolic link. Remove the link (or point the \
+                 wizard at the real path) and re-run",
+                path.display()
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn temp_path_for(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    let mut tmp = std::ffi::OsString::from(".");
+    tmp.push(name);
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    Ok(path.with_file_name(tmp))
+}
+
+fn write_atomic(path: &Path, contents: &[u8], sensitive: bool) -> io::Result<()> {
+    refuse_symlink(path)?;
+    let tmp = temp_path_for(path)?;
+    // A stale temp file from a crashed run would make `create_new` fail.
+    let _ = fs::remove_file(&tmp);
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if sensitive {
+            options.mode(SENSITIVE_MODE);
+        }
+        // Never follow a link someone planted at the temp name.
+        options.custom_flags(libc_o_nofollow());
+    }
+    #[cfg(not(unix))]
+    let _ = sensitive;
+
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        // Make the rename itself durable.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// `O_NOFOLLOW` without a `libc` dependency: the value is fixed per
+/// platform family.
+#[cfg(unix)]
+fn libc_o_nofollow() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0o400000
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // macOS / iOS / the BSDs.
+        0x0100
+    }
 }
 
 #[cfg(test)]
@@ -88,29 +174,59 @@ mod tests {
     }
 
     #[test]
-    fn write_sensitive_truncates_existing_file() {
+    fn write_sensitive_replaces_existing_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("secret.txt");
         write_sensitive(&path, b"long original contents").unwrap();
         write_sensitive(&path, b"short").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"short");
+        // No temp file left behind.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_sensitive_preserves_existing_perms_on_clobber() {
-        // OpenOptions::mode() only applies on file *creation*. If the
-        // operator widens perms manually (`chmod 0o644`), a re-run
-        // doesn't silently re-tighten. Documented contract — covered
-        // by this test so we don't accidentally start re-applying mode
-        // on every write later.
+    fn write_sensitive_tightens_a_loose_existing_file() {
+        // A re-run over a file left `0o644` (by an older wizard or by hand)
+        // must not write new key material world-readable.
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("secret.txt");
-        write_sensitive(&path, b"v1").unwrap();
+        let path = dir.path().join("admin-monitor.json");
+        fs::write(&path, b"v1").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         write_sensitive(&path, b"v2").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "operator-widened perms must persist");
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"v2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_refuse_a_symlinked_target() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real.txt");
+        fs::write(&real, b"untouched").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(write_sensitive(&link, b"key").is_err());
+        assert!(write_public(&link, b"x").is_err());
+        assert_eq!(fs::read(&real).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_all_makes_new_dirs_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b");
+        create_private_dir_all(&nested).unwrap();
+        for d in [dir.path().join("a"), nested] {
+            let mode = fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
     }
 }
