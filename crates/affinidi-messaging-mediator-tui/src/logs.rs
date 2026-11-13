@@ -98,6 +98,12 @@ impl LogCapture {
         self.lock().lines.iter().cloned().collect()
     }
 
+    /// Run `read` over the lines kept, oldest first, without copying them.
+    /// Logging waits while it runs, so keep it short.
+    pub fn with_lines<R>(&self, read: impl FnOnce(&VecDeque<LogLine>) -> R) -> R {
+        read(&self.lock().lines)
+    }
+
     /// Errors and warnings captured since [`LogCapture::mark_seen`].
     pub fn unseen(&self) -> u64 {
         self.lock().unseen

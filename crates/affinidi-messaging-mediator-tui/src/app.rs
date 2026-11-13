@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use affinidi_messaging_mediator_admin::{
-    AddressBook, BulkRevokeOutcome, ConsoleError, GrantKey, GrantSelection, InspectedMessage,
-    MediatorConsole, MembershipFilter, Mode, MonitorFilter, MonitorUpdate, MuxConnectionsQuery,
-    PurgePlan, PurgeRequest, account_hash, revoke_summary, specs,
+    AddressBook, BulkRevokeOutcome, ConnState, ConsoleError, GrantKey, GrantSelection,
+    InspectedMessage, MediatorConsole, MembershipFilter, Mode, MonitorFilter, MonitorUpdate,
+    MuxConnectionsQuery, PurgePlan, PurgeRequest, account_hash, revoke_summary, specs,
 };
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -31,12 +31,26 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::account_edit::{AccountEdit, Setting};
+use crate::keymap;
 use crate::logs::{CaptureGuard, LogCapture, LogLevel};
 use crate::quota::{ColorDepth, QuotaBar, quota_line};
+use crate::requests::{InFlight, Job, Ticket};
 use crate::tally::TrafficTally;
 
 /// How often the current view refreshes on its own.
 const REFRESH: Duration = Duration::from_secs(5);
+/// The Accounts list is loaded once, then again this often (or on `r`): on a
+/// large mediator it is many signed round trips.
+const ACCOUNTS_EVERY: Duration = Duration::from_secs(300);
+/// How often the mediator surveys its queues for the ranking (`queue/list`
+/// answers from that survey, so asking more often only repeats it).
+const SURVEY_EVERY: Duration = Duration::from_secs(60);
+/// Rows asked for per page of a list.
+const PAGE_ROWS: u32 = 200;
+/// Accounts asked for per page.
+const ACCOUNT_PAGE: u32 = 500;
+/// The fastest the screen is redrawn for monitor traffic alone (~10 fps).
+const FRAME: Duration = Duration::from_millis(100);
 /// How long a notice stays in the footer before the key hints come back.
 const NOTICE_FOR: Duration = Duration::from_secs(12);
 
@@ -71,7 +85,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Queues => "Queues",
@@ -103,16 +117,94 @@ impl GrantQuery {
 /// mediator's 500.
 const GRANT_PAGE: u64 = 100;
 
+/// A list the console pages through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum List {
+    /// The queue ranking (Dashboard, Queues).
+    Queues,
+    /// One queue's messages (Account).
+    Messages,
+    /// The audit log, newest first.
+    Audit,
+    /// Every account on the mediator.
+    Accounts,
+}
+
+impl List {
+    /// The member of a page that holds its rows.
+    fn rows_key(self) -> &'static str {
+        match self {
+            List::Queues => "queues",
+            List::Messages => "messages",
+            List::Audit => "entries",
+            List::Accounts => "accounts",
+        }
+    }
+
+    /// The member of a row that identifies it across pages and refreshes.
+    fn id_key(self) -> &'static str {
+        match self {
+            List::Queues | List::Accounts => "did",
+            List::Messages => "msgId",
+            List::Audit => "eventId",
+        }
+    }
+}
+
+/// The rows of a list loaded so far, and where its next page starts.
+#[derive(Default)]
+struct Paged {
+    rows: Vec<Value>,
+    next: Option<String>,
+    pages: usize,
+}
+
+impl Paged {
+    /// Take in a page: the first (replacing the rows) or the next one.
+    fn take(&mut self, list: List, page: &Value, more: bool) {
+        let rows = page[list.rows_key()]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if more {
+            self.rows.extend(rows);
+            self.pages += 1;
+        } else {
+            self.rows = rows;
+            self.pages = 1;
+        }
+        self.next = page["nextCursor"].as_str().map(str::to_string);
+    }
+
+    /// Paged past its first page: a refresh would drop the rest, so it waits
+    /// for `r`.
+    fn paged(&self) -> bool {
+        self.pages > 1
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// A result of background work, applied with [`App::apply`].
 #[non_exhaustive]
 pub enum Update {
     Stats(Result<Value, ConsoleError>),
-    Queues(Result<Value, ConsoleError>),
     Status(Result<Value, ConsoleError>),
-    Messages(Result<Value, ConsoleError>),
-    Audit(Result<Value, ConsoleError>),
-    /// Every account, all pages.
-    Accounts(Result<Vec<Value>, ConsoleError>),
+    /// A page of a list: the first (replacing what is shown) or, with
+    /// `more`, the next one.
+    Page {
+        list: List,
+        more: bool,
+        result: Result<Value, ConsoleError>,
+    },
+    /// The console's connection to the mediator changed state.
+    Connection(ConnState),
+    /// The answer to a tagged request: applied only while the screen still
+    /// wants it (the same account, queue or listing it was asked for).
+    Tagged(Ticket, Box<Update>),
     /// The mediator's configuration fields.
     Config(Result<Value, ConsoleError>),
     /// A page of live mux connections.
@@ -160,11 +252,40 @@ enum Popup {
         title: String,
         body: String,
     },
+    /// A message, scrolled `scroll` lines down; `y` copies it, `w` writes it
+    /// to a file.
+    Inspect {
+        id: String,
+        body: String,
+        scroll: u16,
+    },
+    /// Every key that works here, scrolled `scroll` lines down.
+    Help {
+        scroll: u16,
+    },
     ConfirmDelete {
         target: Option<String>,
         ids: Vec<String>,
+        /// Whose message, from which queue, which one, from and to whom.
+        about: Vec<String>,
     },
     ConfirmPurge(PurgePlan),
+    /// Apply an account edit: what changes, and a warning when it can lock
+    /// the console out of its own account.
+    ConfirmAccount {
+        edit: AccountEdit,
+        who: String,
+        changes: Vec<String>,
+        warning: Option<String>,
+    },
+    /// Set a configuration key (`to` is `null` to reset its override).
+    ConfirmPatch {
+        key: String,
+        from: String,
+        to: Value,
+        /// What was typed, to go back to editing.
+        typed: Option<String>,
+    },
     /// Name an account: `hash` is the selected account, if any; the user
     /// fills in its DID (optional when `hash` is known) and a nickname.
     Name {
@@ -240,6 +361,8 @@ struct MonitorPane {
     page: usize,
     /// When the monitor resubscribes, while it's between feeds.
     retry_at: Option<Instant>,
+    /// The feed reported the connection down, and not yet back.
+    link_down: bool,
 }
 
 /// The console application.
@@ -251,7 +374,11 @@ pub struct App {
     rx: mpsc::UnboundedReceiver<Update>,
 
     stats: Option<Value>,
-    queues: Option<Value>,
+    queues: Paged,
+    /// When the ranking shown was surveyed, and for which ranking it is.
+    queues_snapshot: Option<chrono::DateTime<chrono::Utc>>,
+    queues_view: Option<String>,
+    queues_fetched: Option<Instant>,
     queue_state: TableState,
     queue_send: bool,
     sort: usize,
@@ -259,11 +386,12 @@ pub struct App {
     /// The account the Account tab shows: `None` is the console's own.
     target: Option<String>,
     status: Option<Value>,
-    messages: Vec<Value>,
+    messages: Paged,
     message_state: TableState,
     message_send: bool,
 
-    audit: Vec<Value>,
+    audit: Paged,
+    audit_state: TableState,
     /// The last `messaging/mux/connections` page.
     mux: Value,
     mux_state: TableState,
@@ -277,7 +405,8 @@ pub struct App {
     grants_next: Option<String>,
     /// Grants marked for a bulk revocation.
     grant_marks: GrantMarks,
-    accounts: Vec<Value>,
+    accounts: Paged,
+    accounts_loaded: Option<Instant>,
     accounts_state: TableState,
     config: Vec<Value>,
     config_state: TableState,
@@ -296,6 +425,19 @@ pub struct App {
 
     /// The host's log output, kept off the terminal while the console runs.
     logs: Option<(LogCapture, CaptureGuard)>,
+
+    /// Background requests in flight, so late answers are dropped.
+    inflight: InFlight,
+    /// The mediator's account hash, to recognise the console's own traffic.
+    mediator_hash: String,
+    /// The connection's state (`None`: unknown, no websocket), and since when.
+    link: Option<ConnState>,
+    link_since: Instant,
+    /// Table rows the screen showed last frame: a page, for PgUp / PgDn.
+    page_rows: usize,
+    /// Set while refreshing after a change: requests go out even when one
+    /// is pending, since that one may predate the change.
+    forcing: bool,
 }
 
 const SORTS: [(&str, &str); 4] = [
@@ -318,6 +460,21 @@ impl App {
             (true, false) => Tab::Audit,
             (false, _) => Tab::Account,
         };
+        // Every drop and reconnect, as the SDK reports it (R6.2).
+        let link = console.connection_state();
+        if let Some(mut state) = link.clone() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(Update::Connection(*state.borrow_and_update()));
+                while state.changed().await.is_ok() {
+                    let now = *state.borrow_and_update();
+                    if tx.send(Update::Connection(now)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let mediator_hash = sha256_hex(console.mediator_did());
         let mut app = Self {
             console: Arc::new(console),
             depth: ColorDepth::detect(),
@@ -325,16 +482,20 @@ impl App {
             tx,
             rx,
             stats: None,
-            queues: None,
+            queues: Paged::default(),
+            queues_snapshot: None,
+            queues_view: None,
+            queues_fetched: None,
             queue_state: TableState::default().with_selected(Some(0)),
             queue_send: false,
             sort: 0,
             target: None,
             status: None,
-            messages: Vec::new(),
+            messages: Paged::default(),
             message_state: TableState::default().with_selected(Some(0)),
             message_send: false,
-            audit: Vec::new(),
+            audit: Paged::default(),
+            audit_state: TableState::default().with_selected(Some(0)),
             mux: Value::Null,
             mux_state: TableState::default().with_selected(Some(0)),
             grant_query: GrantQuery::default(),
@@ -343,7 +504,8 @@ impl App {
             grants_epoch: None,
             grants_next: None,
             grant_marks: GrantMarks::default(),
-            accounts: Vec::new(),
+            accounts: Paged::default(),
+            accounts_loaded: None,
             accounts_state: TableState::default().with_selected(Some(0)),
             config: Vec::new(),
             config_state: TableState::default().with_selected(Some(0)),
@@ -362,6 +524,7 @@ impl App {
                 back: 0,
                 page: 0,
                 retry_at: None,
+                link_down: false,
             },
             popup: None,
             notice: None,
@@ -370,6 +533,12 @@ impl App {
             book: AddressBook::new(),
             book_path: None,
             logs: None,
+            inflight: InFlight::default(),
+            mediator_hash,
+            link: link.map(|s| *s.borrow()),
+            link_since: Instant::now(),
+            page_rows: 10,
+            forcing: false,
         };
         app.know_self();
         app.refresh();
@@ -420,8 +589,9 @@ impl App {
     /// Text pasted into the console (bracketed paste): goes to the field being
     /// edited, if any. Control characters (line breaks) are dropped.
     pub fn handle_paste(&mut self, text: &str) {
+        let clean = |t: &str| -> String { t.trim().chars().filter(|c| !c.is_control()).collect() };
         if let Some(Popup::EditConfig { value, .. }) = &mut self.popup {
-            value.push_str(text.trim());
+            value.push_str(&clean(text));
             return;
         }
         if let Some(Popup::FindGrants {
@@ -431,7 +601,7 @@ impl App {
         }) = &mut self.popup
         {
             let field = if *on_member { member } else { principal };
-            field.push_str(text.trim());
+            field.push_str(&clean(text));
             return;
         }
         if let Some(Popup::Name {
@@ -533,11 +703,71 @@ impl App {
 
     /// Show one account on the Account tab — `None` is the console's own.
     pub fn open_account(&mut self, did_hash: Option<String>) {
-        self.target = did_hash;
-        self.account_info = None;
         self.tab = Tab::Account;
+        self.set_target(did_hash);
+    }
+
+    /// Point the Account tab at another account (or queue): nothing of the
+    /// last one stays on screen, and answers still on their way for it are
+    /// dropped when they arrive.
+    fn set_target(&mut self, did_hash: Option<String>) {
+        // The console's own account is `None`, however it was named.
+        let did_hash = did_hash.filter(|h| h != self.console.did_hash());
+        if did_hash != self.target {
+            self.status = None;
+            self.account_info = None;
+        }
+        self.target = did_hash;
+        self.messages.clear();
         self.message_state.select(Some(0));
         self.refresh();
+    }
+
+    /// The view a job's answer belongs to, as it stands now: an answer asked
+    /// for another one is dropped.
+    fn view_of(&self, job: Job) -> String {
+        let account = self.target.clone().unwrap_or_default();
+        let queue = if self.message_send { "send" } else { "receive" };
+        match job {
+            Job::Status | Job::AccountInfo => account,
+            Job::Messages | Job::More(List::Messages) => format!("{account}/{queue}"),
+            // A popup for an account the user has left would be about the
+            // wrong one.
+            Job::Inspect | Job::PurgePreview if self.tab == Tab::Account => {
+                format!("{account}/{queue}")
+            }
+            Job::Inspect | Job::PurgePreview => "elsewhere".into(),
+            Job::Queues | Job::More(List::Queues) => self.queue_view(),
+            Job::Grants => format!("{:?}", self.grant_query),
+            _ => String::new(),
+        }
+    }
+
+    /// Which ranking the queue list shows.
+    fn queue_view(&self) -> String {
+        format!("{}/{}", self.queue_send, self.sort)
+    }
+
+    /// Run `work` in the background for `job`, tagged so its answer is
+    /// applied only while the screen still wants it. `force` sends it even
+    /// while the same request is pending (a user's action); otherwise a
+    /// pending one is waited for.
+    fn request<F, Fut>(&mut self, job: Job, force: bool, work: F)
+    where
+        F: FnOnce(Arc<MediatorConsole>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Update> + Send + 'static,
+    {
+        let view = self.view_of(job);
+        let now = Instant::now();
+        let ticket = if force || self.forcing {
+            self.inflight.force(job, view, now)
+        } else {
+            match self.inflight.begin(job, view, now) {
+                Some(ticket) => ticket,
+                None => return,
+            }
+        };
+        self.spawn(move |c| async move { Update::Tagged(ticket, Box::new(work(c).await)) });
     }
 
     /// Show the stored mux grants of a `principal` DID, a `member` DID, or
@@ -599,41 +829,39 @@ impl App {
         }
         match self.tab {
             Tab::Dashboard => {
-                self.spawn(|c| async move { Update::Stats(to_value(c.stats().await)) });
-                self.load_queues();
+                self.request(Job::Stats, false, |c| async move {
+                    Update::Stats(to_value(c.stats().await))
+                });
+                self.load_queues(false);
             }
-            Tab::Queues => self.load_queues(),
+            Tab::Queues => self.load_queues(false),
             Tab::Account => {
                 let target = self.target.clone();
-                let send = self.message_send;
                 let t = target.clone();
-                self.spawn(move |c| async move {
+                self.request(Job::Status, false, move |c| async move {
                     Update::Status(to_value(c.queue_status(t, Some(10)).await))
                 });
                 let t = target.clone();
-                self.spawn(
-                    move |c| async move { Update::AccountInfo(to_value(c.account_of(t).await)) },
-                );
-                self.spawn(move |c| async move {
-                    let queue = if send {
-                        specs::message::list::v0_1::Queue::Send
-                    } else {
-                        specs::message::list::v0_1::Queue::Receive
-                    };
-                    Update::Messages(to_value(
-                        c.messages(target, queue, None, None, Some(200)).await,
-                    ))
+                self.request(Job::AccountInfo, false, move |c| async move {
+                    Update::AccountInfo(to_value(c.account_of(t).await))
                 });
+                // Paged past the first page, the list stays as loaded until
+                // `r`: a refresh would drop what was paged in.
+                if !self.messages.paged() {
+                    self.load_messages(None);
+                }
             }
-            Tab::Audit => {
-                self.spawn(
-                    |c| async move { Update::Audit(to_value(c.audit(None, Some(200)).await)) },
-                );
-            }
+            Tab::Audit if !self.audit.paged() => self.load_audit(None),
+            Tab::Audit => {}
             Tab::Accounts => {
-                self.spawn(|c| async move { Update::Accounts(all_accounts(&c).await) })
+                let due = self
+                    .accounts_loaded
+                    .is_none_or(|at| at.elapsed() >= ACCOUNTS_EVERY && !self.accounts.paged());
+                if due {
+                    self.load_accounts(None);
+                }
             }
-            Tab::Mux => self.spawn(|c| async move {
+            Tab::Mux => self.request(Job::Mux, false, |c| async move {
                 // One page: up to 100 connections and 1000 members. The
                 // screen says when there are more.
                 let query = MuxConnectionsQuery::all().limit(100);
@@ -644,16 +872,73 @@ impl App {
                 let limit = (self.grants.len() as u64).clamp(GRANT_PAGE, 500);
                 self.load_grants(None, limit);
             }
-            Tab::Config => {
-                self.spawn(|c| async move { Update::Config(to_value(c.config().await)) })
-            }
+            Tab::Config => self.request(Job::Config, false, |c| async move {
+                Update::Config(to_value(c.config().await))
+            }),
         }
     }
 
-    fn load_queues(&self) {
+    /// Reload after something changed (a delete, a purge, a patch, a
+    /// reconnect): from the first page, without waiting on requests sent
+    /// before the change.
+    fn refresh_after_change(&mut self) {
+        self.forcing = true;
+        self.reload();
+        self.forcing = false;
+    }
+
+    /// Reload the current screen from scratch (`r`): lists go back to their
+    /// first page, and nothing waits for a schedule.
+    pub fn reload(&mut self) {
+        match self.tab {
+            Tab::Dashboard | Tab::Queues => self.queues_fetched = None,
+            Tab::Account => self.messages.pages = 0,
+            Tab::Audit => self.audit.pages = 0,
+            Tab::Accounts => self.accounts_loaded = None,
+            _ => {}
+        }
+        self.refresh();
+    }
+
+    /// Whether the queue ranking is worth asking for again: it is another
+    /// ranking, or the mediator has surveyed its queues since (it does so
+    /// about once a minute; asking in between gets the same answer).
+    fn queues_due(&self) -> bool {
+        if self.queues_view.as_deref() != Some(self.queue_view().as_str()) {
+            return true;
+        }
+        let Some(fetched) = self.queues_fetched else {
+            return true;
+        };
+        if self.queues.paged() {
+            return false;
+        }
+        match self.queues_snapshot {
+            Some(at) => survey_due(at, chrono::Utc::now(), fetched.elapsed()),
+            None => fetched.elapsed() >= REFRESH,
+        }
+    }
+
+    /// The queue ranking: its first page when `force`d or due, else nothing.
+    fn load_queues(&mut self, force: bool) {
+        if !force && !self.queues_due() {
+            return;
+        }
+        self.queues_fetched = Some(Instant::now());
+        self.queues_view = Some(self.queue_view());
+        self.queue_page(None);
+    }
+
+    fn queue_page(&mut self, cursor: Option<String>) {
         let send = self.queue_send;
         let sort = self.sort;
-        self.spawn(move |c| async move {
+        let more = cursor.is_some();
+        let job = if more {
+            Job::More(List::Queues)
+        } else {
+            Job::Queues
+        };
+        self.request(job, more, move |c| async move {
             use specs::queue::list::v0_1::{PayloadSort, Queue};
             let queue = if send { Queue::Send } else { Queue::Receive };
             let sort = match sort {
@@ -662,21 +947,131 @@ impl App {
                 3 => PayloadSort::Saturation,
                 _ => PayloadSort::Count,
             };
-            Update::Queues(to_value(
-                c.queues(Some(queue), Some(sort), None, Some(200)).await,
-            ))
+            let result = to_value(
+                c.queues(Some(queue), Some(sort), cursor, Some(PAGE_ROWS))
+                    .await,
+            );
+            Update::Page {
+                list: List::Queues,
+                more,
+                result,
+            }
         });
+    }
+
+    /// A page of the Account tab's queue: the first, or the one at `cursor`.
+    fn load_messages(&mut self, cursor: Option<String>) {
+        let target = self.target.clone();
+        let send = self.message_send;
+        let more = cursor.is_some();
+        let job = if more {
+            Job::More(List::Messages)
+        } else {
+            Job::Messages
+        };
+        self.request(job, more, move |c| async move {
+            let queue = if send {
+                specs::message::list::v0_1::Queue::Send
+            } else {
+                specs::message::list::v0_1::Queue::Receive
+            };
+            let result = to_value(
+                c.messages(target, queue, None, cursor, Some(PAGE_ROWS))
+                    .await,
+            );
+            Update::Page {
+                list: List::Messages,
+                more,
+                result,
+            }
+        });
+    }
+
+    /// A page of the audit log: the newest, or the one at `cursor`.
+    fn load_audit(&mut self, cursor: Option<String>) {
+        let more = cursor.is_some();
+        let job = if more {
+            Job::More(List::Audit)
+        } else {
+            Job::Audit
+        };
+        self.request(job, more, move |c| async move {
+            let result = to_value(c.audit(cursor, Some(PAGE_ROWS)).await);
+            Update::Page {
+                list: List::Audit,
+                more,
+                result,
+            }
+        });
+    }
+
+    /// A page of the account list: the first, or the one at `cursor`.
+    fn load_accounts(&mut self, cursor: Option<String>) {
+        let more = cursor.is_some();
+        let job = if more {
+            Job::More(List::Accounts)
+        } else {
+            self.accounts_loaded = Some(Instant::now());
+            Job::Accounts
+        };
+        self.request(job, more, move |c| async move {
+            let page = c.accounts(cursor, Some(ACCOUNT_PAGE)).await;
+            Update::Page {
+                list: List::Accounts,
+                more,
+                result: to_value(page),
+            }
+        });
+    }
+
+    /// The next page of the list on screen, when it has one (`]`, or reaching
+    /// its last row).
+    fn load_more(&mut self) {
+        let list = match self.tab {
+            Tab::Dashboard | Tab::Queues => List::Queues,
+            Tab::Account => List::Messages,
+            Tab::Audit => List::Audit,
+            Tab::Accounts => List::Accounts,
+            Tab::Grants => {
+                match self.grants_next.clone() {
+                    Some(cursor) => self.load_grants(Some(cursor), GRANT_PAGE),
+                    None => self.set_notice(("no more grants".into(), false)),
+                }
+                return;
+            }
+            _ => return,
+        };
+        if self.inflight.is_pending(Job::More(list)) {
+            return;
+        }
+        let next = self.paged(list).next.clone();
+        match (list, next) {
+            (_, None) => self.set_notice(("that's all of them".into(), false)),
+            (List::Queues, Some(c)) => self.queue_page(Some(c)),
+            (List::Messages, Some(c)) => self.load_messages(Some(c)),
+            (List::Audit, Some(c)) => self.load_audit(Some(c)),
+            (List::Accounts, Some(c)) => self.load_accounts(Some(c)),
+        }
+    }
+
+    fn paged(&self, list: List) -> &Paged {
+        match list {
+            List::Queues => &self.queues,
+            List::Messages => &self.messages,
+            List::Audit => &self.audit,
+            List::Accounts => &self.accounts,
+        }
     }
 
     /// A page of the Grants tab's query: from its start, or from `cursor`
     /// (then added to what is shown). Nothing while there is no query.
-    fn load_grants(&self, cursor: Option<String>, limit: u64) {
+    fn load_grants(&mut self, cursor: Option<String>, limit: u64) {
         if self.grant_query.is_empty() {
             return;
         }
         let GrantQuery { principal, member } = self.grant_query.clone();
         let more = cursor.is_some();
-        self.spawn(move |c| async move {
+        let work = move |c: Arc<MediatorConsole>| async move {
             let page = c
                 .mux_grants(principal.as_deref(), member.as_deref(), cursor, Some(limit))
                 .await;
@@ -684,7 +1079,13 @@ impl App {
                 result: to_value(page),
                 more,
             }
-        });
+        };
+        if more {
+            // Added to what is shown, so not tied to a refresh.
+            self.spawn(work);
+        } else {
+            self.request(Job::Grants, false, work);
+        }
     }
 
     /// Show the Grants tab for `query`, from its first page.
@@ -722,6 +1123,20 @@ impl App {
     pub fn apply(&mut self, update: Update) {
         let ok = |this: &mut Self| this.updated = Some(Instant::now());
         match update {
+            Update::Tagged(ticket, inner) => {
+                let latest = self.inflight.finish(&ticket);
+                if latest && ticket.view == self.view_of(ticket.job) {
+                    self.apply(*inner);
+                } else if latest && matches!(ticket.job, Job::PurgePreview | Job::Inspect) {
+                    // The user moved on before it came: a popup now would be
+                    // about something no longer on screen.
+                    self.set_notice((
+                        "that answer was for another account or queue; ask again here".into(),
+                        true,
+                    ));
+                }
+            }
+            Update::Connection(state) => self.link_changed(state),
             Update::Stats(r) => match r {
                 Ok(v) => {
                     self.stats = Some(v);
@@ -729,23 +1144,23 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
-            Update::Queues(r) => match r {
+            Update::Page { list, more, result } => match result {
                 Ok(v) => {
-                    self.queues = Some(v);
+                    self.take_page(list, &v, more);
                     ok(self)
                 }
-                Err(e) => self.error(e),
+                Err(e) => {
+                    // Not loaded after all: try again on the next refresh
+                    // rather than in five minutes.
+                    if list == List::Accounts && !more {
+                        self.accounts_loaded = None;
+                    }
+                    self.error(e)
+                }
             },
             Update::Status(r) => match r {
                 Ok(v) => {
                     self.status = Some(v);
-                    ok(self)
-                }
-                Err(e) => self.error(e),
-            },
-            Update::Messages(r) => match r {
-                Ok(v) => {
-                    self.messages = v["messages"].as_array().cloned().unwrap_or_default();
                     ok(self)
                 }
                 Err(e) => self.error(e),
@@ -787,30 +1202,10 @@ impl App {
                     Ok(outcome) => self.revoked_marked(outcome),
                     Err(e) => self.error(e),
                 }
-                self.refresh();
+                self.refresh_after_change();
             }
             Update::Epoch { did, result } => match result {
                 Ok(epoch) => self.popup = Some(Popup::ConfirmBumpEpoch { did, epoch }),
-                Err(e) => self.error(e),
-            },
-            Update::Audit(r) => match r {
-                Ok(v) => {
-                    self.audit = v["entries"].as_array().cloned().unwrap_or_default();
-                    ok(self)
-                }
-                Err(e) => self.error(e),
-            },
-            Update::Accounts(r) => match r {
-                Ok(mut accounts) => {
-                    let book = &self.book;
-                    accounts.sort_by_key(|a| account_order(a, book));
-                    self.accounts = accounts;
-                    let len = self.accounts.len();
-                    if self.accounts_state.selected().is_none_or(|i| i >= len) {
-                        self.accounts_state.select(Some(0));
-                    }
-                    ok(self)
-                }
                 Err(e) => self.error(e),
             },
             Update::AccountInfo(r) => match r {
@@ -828,7 +1223,9 @@ impl App {
                         let key = f["key"].as_str().unwrap_or("").to_string();
                         (!key.starts_with("limits."), key)
                     });
+                    let keep = selected_id(&self.config, &self.config_state, "key");
                     self.config = fields;
+                    reselect(&mut self.config_state, &self.config, "key", keep);
                     ok(self)
                 }
                 Err(e) => self.error(e),
@@ -838,9 +1235,10 @@ impl App {
                     Ok(v) => self.set_notice(patch_summary(&v)),
                     Err(e) => self.error(e),
                 }
-                self.refresh();
+                self.refresh_after_change();
             }
             Update::Inspected(r) => match *r {
+                // Over whatever else is open: the user asked for it just now.
                 Ok(m) => self.popup = Some(inspect_popup(&m)),
                 Err(e) => self.error(e),
             },
@@ -856,7 +1254,7 @@ impl App {
                     Ok(msg) => self.set_notice((msg, false)),
                     Err(e) => self.error(e),
                 }
-                self.refresh();
+                self.refresh_after_change();
             }
             Update::Monitor(u) => self.monitor_update(u),
             Update::MonitorFailed(e) => {
@@ -883,6 +1281,96 @@ impl App {
                     .push_back(MonitorLine::Retry { reason, attempts });
             }
         }
+    }
+
+    /// Take in a page of `list`, keeping the selection on the same row (by
+    /// its id) wherever the refresh moved it.
+    fn take_page(&mut self, list: List, page: &Value, more: bool) {
+        let key = list.id_key();
+        let (paged, state) = match list {
+            List::Queues => (&mut self.queues, &mut self.queue_state),
+            List::Messages => (&mut self.messages, &mut self.message_state),
+            List::Audit => (&mut self.audit, &mut self.audit_state),
+            List::Accounts => (&mut self.accounts, &mut self.accounts_state),
+        };
+        let keep = selected_id(&paged.rows, state, key);
+        paged.take(list, page, more);
+        match list {
+            List::Queues if !more => {
+                self.queues_snapshot = page["snapshotAt"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc));
+            }
+            List::Accounts => {
+                let book = &self.book;
+                self.accounts
+                    .rows
+                    .sort_by_cached_key(|a| account_order(a, book));
+            }
+            _ => {}
+        }
+        let (paged, state) = match list {
+            List::Queues => (&self.queues, &mut self.queue_state),
+            List::Messages => (&self.messages, &mut self.message_state),
+            List::Audit => (&self.audit, &mut self.audit_state),
+            List::Accounts => (&self.accounts, &mut self.accounts_state),
+        };
+        reselect(state, &paged.rows, key, keep);
+    }
+
+    /// The connection went down or came back: say so in the header, the
+    /// monitor and the footer, and reload once it is back.
+    fn link_changed(&mut self, state: ConnState) {
+        let was = self.link.replace(state);
+        if was == Some(state) {
+            return;
+        }
+        let down_for = self.link_since.elapsed();
+        self.link_since = Instant::now();
+        match state {
+            ConnState::Disconnected => {
+                self.monitor_note(
+                    "── connection to the mediator lost — reconnecting ──".into(),
+                    Color::Red,
+                );
+                self.set_notice(("connection to the mediator lost; reconnecting".into(), true));
+            }
+            ConnState::Connected if was == Some(ConnState::Disconnected) => {
+                self.monitor_note(
+                    format!(
+                        "── reconnected to the mediator after {} ──",
+                        human_secs(Some(down_for.as_secs()))
+                    ),
+                    Color::Green,
+                );
+                self.set_notice(("reconnected to the mediator".into(), false));
+                self.refresh_after_change();
+            }
+            _ => {}
+        }
+    }
+
+    /// A note line in the monitor pane (kept even while it is hidden).
+    fn monitor_note(&mut self, text: String, color: Color) {
+        let before = self.monitor.lines.len();
+        self.monitor.lines.push_back(MonitorLine::Note(Line::styled(
+            text,
+            Style::default().fg(color),
+        )));
+        self.monitor_lines_added(before);
+    }
+
+    /// Bookkeeping after lines were added to the monitor: a view scrolled
+    /// back stays on what it shows, and the oldest lines go past the limit.
+    fn monitor_lines_added(&mut self, before: usize) {
+        if self.monitor.back > 0 {
+            self.monitor.back += self.monitor.lines.len() - before;
+        }
+        while self.monitor.lines.len() > MONITOR_LINES {
+            self.monitor.lines.pop_front();
+        }
+        self.scroll_monitor(0);
     }
 
     /// Wait for the next result of background work — for a host running its
@@ -952,7 +1440,13 @@ impl App {
             return Control::Continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Control::Quit,
+            // Only `q` (and Ctrl-C) quit: Esc closes popups, and one Esc too
+            // many must not end the session.
+            KeyCode::Char('q') => return Control::Quit,
+            KeyCode::Esc => {}
+            KeyCode::Char('?') => self.popup = Some(Popup::Help { scroll: 0 }),
+            KeyCode::Char('y') => self.copy_selected(),
+            KeyCode::Char(']') => self.load_more(),
             KeyCode::Char(c @ '1'..='8') => {
                 if let Some(tab) = self.tabs().get((c as u8 - b'1') as usize) {
                     self.tab = *tab;
@@ -965,7 +1459,7 @@ impl App {
                 self.tab = tabs[(i + 1) % tabs.len()];
                 self.refresh();
             }
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r') => self.reload(),
             KeyCode::Char('n') => self.popup = Some(self.name_popup(self.account_in_view())),
             KeyCode::Char('b') => self.popup = Some(Popup::Book { selected: 0 }),
             KeyCode::Char('m') => self.toggle_monitor(),
@@ -1003,6 +1497,8 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.move_selection(self.page_rows.max(1) as i32),
+            KeyCode::PageUp => self.move_selection(-(self.page_rows.max(1) as i32)),
             _ => self.tab_key(key.code),
         }
         Control::Continue
@@ -1012,11 +1508,13 @@ impl App {
         match (self.tab, code) {
             (Tab::Queues | Tab::Dashboard, KeyCode::Char('s')) => {
                 self.sort = (self.sort + 1) % SORTS.len();
-                self.load_queues();
+                self.queues.clear();
+                self.load_queues(true);
             }
             (Tab::Queues | Tab::Dashboard, KeyCode::Char('x')) => {
                 self.queue_send = !self.queue_send;
-                self.load_queues();
+                self.queues.clear();
+                self.load_queues(true);
             }
             (Tab::Queues | Tab::Dashboard, KeyCode::Enter) => {
                 if let Some(did) = self.selected_queue_did() {
@@ -1034,12 +1532,20 @@ impl App {
                     }
                 }
             }
+            // The same key toggles a queue on other screens, so this one asks
+            // before it changes anything.
             (Tab::Config, KeyCode::Char('x')) if self.console.can_patch_config() => {
-                if let Some(field) = self.selected_config()
-                    && field["source"] == "override"
-                {
-                    let key = field["key"].as_str().unwrap_or("").to_string();
-                    self.patch(key, Value::Null);
+                match self.selected_config() {
+                    Some(field) if field["source"] == "override" => {
+                        self.popup = Some(Popup::ConfirmPatch {
+                            key: field["key"].as_str().unwrap_or("").to_string(),
+                            from: config_value(&field["value"]),
+                            to: Value::Null,
+                            typed: None,
+                        });
+                    }
+                    Some(_) => self.set_notice(("that key has no override to reset".into(), false)),
+                    None => {}
                 }
             }
             (Tab::Accounts, KeyCode::Enter) => {
@@ -1084,10 +1590,6 @@ impl App {
                     });
                 }
             }
-            (Tab::Grants, KeyCode::Char(']')) => match self.grants_next.clone() {
-                Some(cursor) => self.load_grants(Some(cursor), GRANT_PAGE),
-                None => self.set_notice(("no more grants".into(), false)),
-            },
             (Tab::Grants, KeyCode::Char(' ')) => {
                 if let Some(key) = self.selected_grant_key() {
                     self.grant_marks.toggle(key);
@@ -1141,15 +1643,15 @@ impl App {
             }
             (Tab::Account, KeyCode::Char('x')) => {
                 self.message_send = !self.message_send;
-                self.message_state.select(Some(0));
-                self.refresh();
+                self.set_target(self.target.clone());
             }
             (Tab::Account, KeyCode::Char('e')) => {
                 if let Some(info) = &self.account_info {
-                    let hash = info["did"]
-                        .as_str()
-                        .map(str::to_string)
-                        .or_else(|| self.target.clone())
+                    // The account on screen: `account_info` is only ever the
+                    // answer for it (a late one for another is dropped).
+                    let hash = self
+                        .target
+                        .clone()
                         .unwrap_or_else(|| self.console.did_hash().to_string());
                     // Only a rootAdmin may change roles: every role an admin
                     // could set other than `standard` is privileged, so the
@@ -1163,23 +1665,29 @@ impl App {
                     self.set_notice(("the account's settings are still loading".into(), true));
                 }
             }
-            (Tab::Account, KeyCode::Char('o')) => {
-                self.target = None;
-                self.refresh();
-            }
+            (Tab::Account, KeyCode::Char('o')) => self.set_target(None),
             (Tab::Account, KeyCode::Char('i')) => {
                 if let Some(id) = self.selected_message_field("msgId") {
                     let target = self.target.clone();
-                    self.spawn(move |c| async move {
+                    self.request(Job::Inspect, true, move |c| async move {
                         Update::Inspected(Box::new(c.inspect(target, &id).await))
                     });
                 }
             }
             (Tab::Account, KeyCode::Char('d')) => {
-                if let Some(id) = self.selected_message_field("msgId") {
+                let selected = self
+                    .message_state
+                    .selected()
+                    .and_then(|i| self.messages.rows.get(i));
+                if let Some(m) = selected
+                    && let Some(id) = m["msgId"].as_str()
+                {
+                    let about =
+                        delete_summary(&self.book, &self.account_label(), self.message_send, m);
                     self.popup = Some(Popup::ConfirmDelete {
                         target: self.target.clone(),
-                        ids: vec![id],
+                        ids: vec![id.to_string()],
+                        about,
                     });
                 }
             }
@@ -1199,11 +1707,80 @@ impl App {
                     peer,
                     older_than_seconds: None,
                 };
-                self.spawn(
-                    move |c| async move { Update::PurgePreview(c.purge_preview(request).await) },
-                );
+                self.request(Job::PurgePreview, true, move |c| async move {
+                    Update::PurgePreview(c.purge_preview(request).await)
+                });
             }
             _ => {}
+        }
+    }
+
+    /// The Account tab's account as the user knows it.
+    fn account_label(&self) -> String {
+        match &self.target {
+            Some(t) => label(&self.book, t),
+            None => format!("{} (you)", label(&self.book, self.console.did_hash())),
+        }
+    }
+
+    /// Copy the full identifier behind the selected row — an account hash, a
+    /// DID, a message id — to the terminal's clipboard (`y`).
+    fn copy_selected(&mut self) {
+        let row = |rows: &[Value], state: &TableState, field: &str| {
+            state
+                .selected()
+                .and_then(|i| rows.get(i))
+                .and_then(|r| r[field].as_str())
+                .map(str::to_string)
+        };
+        let picked: Option<(&str, String)> = match self.tab {
+            Tab::Dashboard | Tab::Queues => {
+                row(&self.queues.rows, &self.queue_state, "did").map(|v| ("account hash", v))
+            }
+            Tab::Accounts => {
+                row(&self.accounts.rows, &self.accounts_state, "did").map(|v| ("account hash", v))
+            }
+            Tab::Account => row(&self.messages.rows, &self.message_state, "msgId")
+                .map(|v| ("message id", v))
+                .or_else(|| {
+                    Some((
+                        "account hash",
+                        self.target
+                            .clone()
+                            .unwrap_or_else(|| self.console.did_hash().to_string()),
+                    ))
+                }),
+            Tab::Audit => row(&self.audit.rows, &self.audit_state, "target")
+                .or_else(|| row(&self.audit.rows, &self.audit_state, "actor"))
+                .map(|v| ("DID", v)),
+            Tab::Config => self
+                .selected_config()
+                .map(|f| ("value", config_value(&f["value"]))),
+            Tab::Mux => self
+                .mux_state
+                .selected()
+                .and_then(|i| self.mux["connections"].get(i))
+                .and_then(|c| c["principal"].as_str())
+                .map(|v| ("principal DID", v.to_string())),
+            Tab::Grants => self.selected_grant_field("did").map(|v| ("member DID", v)),
+        };
+        match picked {
+            Some((what, text)) => self.copy_out(what, &text),
+            None => self.set_notice(("nothing selected to copy".into(), true)),
+        }
+    }
+
+    /// Send `text` to the terminal's clipboard and say so.
+    fn copy_out(&mut self, what: &str, text: &str) {
+        match crate::clipboard::copy(text) {
+            Ok(()) => self.set_notice((
+                format!(
+                    "copied {what} {} (if the terminal allows OSC 52)",
+                    short(text)
+                ),
+                false,
+            )),
+            Err(e) => self.set_notice((format!("copy failed: {e}"), true)),
         }
     }
 
@@ -1299,11 +1876,71 @@ impl App {
                     _ => {}
                 }
             }
+            Popup::Inspect {
+                id,
+                body,
+                mut scroll,
+            } => {
+                let lines = body.lines().count() as u16;
+                let page = self.page_rows.max(1) as u16;
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(page),
+                    KeyCode::PageDown | KeyCode::Char(' ') => scroll = scroll.saturating_add(page),
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = lines,
+                    KeyCode::Char('y') => self.copy_out("message", &body),
+                    KeyCode::Char('w') => {
+                        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        match crate::clipboard::save(&dir, &format!("message-{id}"), &body) {
+                            Ok(path) => self.set_notice((
+                                format!("message written to {}", path.display()),
+                                false,
+                            )),
+                            Err(e) => self.set_notice((format!("message not written: {e}"), true)),
+                        }
+                    }
+                    // Esc, q or anything else closes it.
+                    _ => return,
+                }
+                self.popup = Some(Popup::Inspect {
+                    id,
+                    body,
+                    scroll: scroll.min(lines.saturating_sub(1)),
+                });
+            }
+            Popup::Help { scroll } => {
+                let scroll = match code {
+                    KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1).min(200),
+                    KeyCode::PageUp => scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll.saturating_add(10).min(200),
+                    _ => return,
+                };
+                self.popup = Some(Popup::Help { scroll });
+            }
+            Popup::ConfirmAccount { edit, .. } if yes => self.save_account(edit),
+            // Anything else goes back to the editor, the changes intact.
+            Popup::ConfirmAccount { edit, .. } => {
+                self.set_notice(("not saved — still editing".into(), false));
+                self.popup = Some(Popup::EditAccount(edit));
+            }
+            Popup::ConfirmPatch { key, to, .. } if yes => self.patch(key, to),
+            Popup::ConfirmPatch {
+                key,
+                typed: Some(value),
+                ..
+            } => {
+                self.set_notice(("not applied — still editing".into(), false));
+                self.popup = Some(Popup::EditConfig { key, value });
+            }
+            Popup::ConfirmPatch { .. } => self.set_notice(("cancelled".into(), false)),
             Popup::EditAccount(mut edit) => match code {
                 KeyCode::Esc => self.set_notice(("cancelled".into(), false)),
                 KeyCode::Char('s') => {
                     if edit.changed() {
-                        self.save_account(edit);
+                        self.popup = Some(self.confirm_account(edit));
                     } else {
                         self.set_notice(("nothing changed".into(), false));
                     }
@@ -1326,7 +1963,18 @@ impl App {
                     // A number when it reads as one; otherwise the text as given.
                     let parsed = serde_json::from_str::<Value>(value.trim())
                         .unwrap_or_else(|_| Value::String(value.trim().to_string()));
-                    self.patch(key, parsed);
+                    let from = self
+                        .config
+                        .iter()
+                        .find(|f| f["key"] == key.as_str())
+                        .map(|f| config_value(&f["value"]))
+                        .unwrap_or_else(|| "?".into());
+                    self.popup = Some(Popup::ConfirmPatch {
+                        key,
+                        from,
+                        to: parsed,
+                        typed: Some(value),
+                    });
                 }
                 other => {
                     match other {
@@ -1407,7 +2055,7 @@ impl App {
                 });
             }
             Popup::Text { .. } => {}
-            Popup::ConfirmDelete { target, ids } if yes => {
+            Popup::ConfirmDelete { target, ids, .. } if yes => {
                 self.spawn(move |c| async move {
                     Update::Done(c.delete(target, &ids).await.map(|r| {
                         let deleted = serde_json::to_value(&r)
@@ -1422,11 +2070,12 @@ impl App {
                 });
             }
             Popup::ConfirmPurge(plan) if yes => {
+                let matched = plan.matched;
                 self.spawn(move |c| async move {
                     Update::Done(
                         c.purge(plan)
                             .await
-                            .map(|r| format!("purged {} message(s)", r.purged)),
+                            .map(|r| purge_summary(matched, r.purged)),
                     )
                 });
             }
@@ -1442,23 +2091,72 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        let (state, len) = match self.tab {
-            Tab::Queues | Tab::Dashboard => (&mut self.queue_state, queue_rows(&self.queues).len()),
-            Tab::Account => (&mut self.message_state, self.messages.len()),
-            Tab::Accounts => (&mut self.accounts_state, self.accounts.len()),
-            Tab::Config => (&mut self.config_state, self.config.len()),
+        let (state, len, more) = match self.tab {
+            Tab::Queues | Tab::Dashboard => (
+                &mut self.queue_state,
+                self.queues.rows.len(),
+                self.queues.next.is_some(),
+            ),
+            Tab::Account => (
+                &mut self.message_state,
+                self.messages.rows.len(),
+                self.messages.next.is_some(),
+            ),
+            Tab::Accounts => (
+                &mut self.accounts_state,
+                self.accounts.rows.len(),
+                self.accounts.next.is_some(),
+            ),
+            Tab::Audit => (
+                &mut self.audit_state,
+                self.audit.rows.len(),
+                self.audit.next.is_some(),
+            ),
+            Tab::Config => (&mut self.config_state, self.config.len(), false),
             Tab::Mux => (
                 &mut self.mux_state,
                 self.mux["connections"].as_array().map_or(0, Vec::len),
+                false,
             ),
-            Tab::Grants => (&mut self.grants_state, self.grants.len()),
-            Tab::Audit => return,
+            Tab::Grants => (&mut self.grants_state, self.grants.len(), false),
         };
         if len == 0 {
             return;
         }
-        let i = state.selected().unwrap_or(0) as i32 + delta;
-        state.select(Some(i.clamp(0, len as i32 - 1) as usize));
+        let i = (state.selected().unwrap_or(0) as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        state.select(Some(i));
+        // At the last row of a list with more behind it: fetch the next page.
+        if delta > 0 && i + 1 == len && more {
+            self.load_more();
+        }
+    }
+
+    /// The confirmation an account edit needs before it is sent: what
+    /// changes, and a warning when it can lock the console out.
+    fn confirm_account(&self, mut edit: AccountEdit) -> Popup {
+        let changes = edit
+            .diff()
+            .into_iter()
+            .map(|(name, was, now)| format!("{name}: {was} → {now}"))
+            .collect();
+        let own = edit.target == self.console.did_hash();
+        let warning = edit.risks_lockout().filter(|_| own).map(|what| {
+            format!(
+                "⚠ This is the account the console is signed in as. {what} can lock \
+                 you out of this console, and only another administrator can undo it."
+            )
+        });
+        let who = if own {
+            format!("{} (you)", label(&self.book, &edit.target))
+        } else {
+            label(&self.book, &edit.target)
+        };
+        Popup::ConfirmAccount {
+            edit,
+            who,
+            changes,
+            warning,
+        }
     }
 
     /// Send an account edit's changes with `account/update`.
@@ -1503,18 +2201,21 @@ impl App {
 
     fn selected_account_did(&self) -> Option<String> {
         let i = self.accounts_state.selected()?;
-        self.accounts.get(i)?["did"].as_str().map(str::to_string)
+        self.accounts.rows.get(i)?["did"]
+            .as_str()
+            .map(str::to_string)
     }
 
     fn selected_queue_did(&self) -> Option<String> {
-        let rows = queue_rows(&self.queues);
         let i = self.queue_state.selected()?;
-        rows.get(i)?["did"].as_str().map(str::to_string)
+        self.queues.rows.get(i)?["did"].as_str().map(str::to_string)
     }
 
     fn selected_message_field(&self, field: &str) -> Option<String> {
         let i = self.message_state.selected()?;
-        self.messages.get(i)?[field].as_str().map(str::to_string)
+        self.messages.rows.get(i)?[field]
+            .as_str()
+            .map(str::to_string)
     }
 
     // ─── Monitor ─────────────────────────────────────────────────────────
@@ -1575,10 +2276,9 @@ impl App {
     /// this filter keeps the pane clean on those mediators.
     fn is_own_console_traffic(&self, e: &Value) -> bool {
         let me = self.console.did_hash();
-        let mediator = sha256_hex(self.console.mediator_did());
         let from = e["from"].as_str();
         let to = e["to"].as_str();
-        let own_request = from == Some(me) && to.is_none_or(|to| to == mediator);
+        let own_request = from == Some(me) && to.is_none_or(|to| to == self.mediator_hash);
         let own_reply_cleanup = e["stage"] == "deleted" && to == Some(me) && from.is_none();
         own_request || own_reply_cleanup
     }
@@ -1595,6 +2295,19 @@ impl App {
     }
 
     fn monitor_update(&mut self, update: MonitorUpdate) {
+        // The connection's state comes from this side, not the mediator: it
+        // says nothing about whether the tap is alive.
+        match update {
+            MonitorUpdate::Disconnected => {
+                self.monitor.link_down = true;
+                return;
+            }
+            MonitorUpdate::Reconnected => {
+                self.monitor.link_down = false;
+                return;
+            }
+            _ => {}
+        }
         self.monitor.last_seen = Some(Instant::now());
         self.monitor.retry_at = None;
         let before = self.monitor.lines.len();
@@ -1631,16 +2344,11 @@ impl App {
                     Style::default().fg(Color::Red),
                 )));
             }
+            _ => {}
         }
         // Scrolled back, the view stays on the lines being read while new
         // ones arrive below.
-        if self.monitor.back > 0 {
-            self.monitor.back += self.monitor.lines.len() - before;
-        }
-        while self.monitor.lines.len() > MONITOR_LINES {
-            self.monitor.lines.pop_front();
-        }
-        self.scroll_monitor(0);
+        self.monitor_lines_added(before);
     }
 
     // ─── Loop ────────────────────────────────────────────────────────────
@@ -1656,31 +2364,62 @@ impl App {
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(REFRESH);
         tick.tick().await;
+        // The header's clocks ("down for 12s") move once a second.
+        let mut clock = tokio::time::interval(Duration::from_secs(1));
+        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let logs = self.logs.as_ref().map(|(logs, _)| logs.clone());
+        // Draw at once for the user; monitor traffic alone is batched into at
+        // most one frame per `FRAME`, however fast it arrives.
+        let mut now_please = true;
+        let mut dirty = false;
+        let mut last_draw = Instant::now();
         loop {
-            terminal.draw(|f| self.render(f, f.area()))?;
+            if now_please || (dirty && last_draw.elapsed() >= FRAME) {
+                terminal.draw(|f| self.render(f, f.area()))?;
+                last_draw = Instant::now();
+                (now_please, dirty) = (false, false);
+            }
             let log_changed = async {
                 match &logs {
                     Some(logs) => logs.changed().await,
                     None => std::future::pending().await,
                 }
             };
+            let frame_due = async {
+                if dirty {
+                    tokio::time::sleep_until((last_draw + FRAME).into()).await
+                } else {
+                    std::future::pending().await
+                }
+            };
             tokio::select! {
-                Some(Ok(event)) = events.next() => match event {
-                    // Repaint every cell, whatever wrote over them.
-                    Event::Key(key)
-                        if key.kind == KeyEventKind::Press
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('l') =>
-                    {
-                        terminal.clear()?;
+                Some(Ok(event)) = events.next() => {
+                    now_please = true;
+                    match event {
+                        // Repaint every cell, whatever wrote over them.
+                        Event::Key(key)
+                            if key.kind == KeyEventKind::Press
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                                && key.code == KeyCode::Char('l') =>
+                        {
+                            terminal.clear()?;
+                        }
+                        Event::Key(key) if self.handle_key(key) == Control::Quit => break,
+                        Event::Paste(text) => self.handle_paste(&text),
+                        _ => {}
                     }
-                    Event::Key(key) if self.handle_key(key) == Control::Quit => break,
-                    Event::Paste(text) => self.handle_paste(&text),
-                    _ => {}
-                },
-                Some(update) = self.rx.recv() => self.apply(update),
-                _ = log_changed => {}
+                }
+                Some(update) = self.rx.recv() => {
+                    if matches!(update, Update::Monitor(_)) {
+                        dirty = true;
+                    } else {
+                        now_please = true;
+                    }
+                    self.apply(update);
+                }
+                _ = log_changed => dirty = true,
+                _ = frame_due => {}
+                _ = clock.tick() => dirty = true,
                 _ = tick.tick() => if self.popup.is_none() { self.refresh() },
             }
         }
@@ -1716,6 +2455,8 @@ impl App {
         } else {
             rows[2]
         };
+        // A table's header and borders take three or four rows of the body.
+        self.page_rows = body.height.saturating_sub(4) as usize;
         if !self.console.serves_operations()
             && !matches!(self.tab, Tab::Audit | Tab::Accounts | Tab::Config)
         {
@@ -1731,8 +2472,64 @@ impl App {
                 let back = self.render_logs(f, area, *back);
                 self.popup = Some(Popup::Logs { back });
             }
+            Some(Popup::Help { scroll }) => self.render_help(f, area, *scroll),
             Some(popup) => render_popup(f, area, popup, &self.book),
             None => {}
+        }
+        if self.depth == ColorDepth::Monochrome {
+            crate::theme::strip_colors(f.buffer_mut(), area);
+        }
+    }
+
+    /// Every key that works here, over the screen.
+    fn render_help(&self, f: &mut Frame, area: Rect, scroll: u16) {
+        let cx = self.key_context();
+        let mut text: Vec<Line> = Vec::new();
+        for (title, keys) in keymap::help(cx) {
+            text.push(Line::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            for b in keys {
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<16}", b.keys),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(b.does),
+                ]));
+            }
+            text.push(Line::raw(""));
+        }
+        let w = area.width.saturating_sub(8).min(100);
+        let h = area.height.saturating_sub(2);
+        let rect = Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height - h) / 2,
+            w,
+            h,
+        );
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" Keys ")
+                        .title_bottom(Line::from(" ↑↓ PgUp PgDn scroll  any other key closes ")),
+                ),
+            rect,
+        );
+    }
+
+    fn key_context(&self) -> keymap::Context {
+        keymap::Context {
+            tab: self.tab,
+            monitor: self.monitor.visible,
+            can_patch: self.console.can_patch_config(),
         }
     }
 
@@ -1887,12 +2684,14 @@ impl App {
             .updated
             .map(|t| format!("updated {}s ago", t.elapsed().as_secs()))
             .unwrap_or_else(|| "loading…".into());
+        let (link, link_color) = link_badge(self.link, self.link_since.elapsed());
         let line = Line::from(vec![
             Span::styled(
                 " mediator-console ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(badge, Style::default().fg(Color::Black).bg(color)),
+            Span::styled(format!(" {link}"), Style::default().fg(link_color)),
             Span::raw(format!(
                 "  {} → {}  ",
                 label(&self.book, self.console.did_hash()),
@@ -1939,26 +2738,28 @@ impl App {
         let inner_w = w.saturating_sub(2).max(1) as usize;
         let inner_h = h.saturating_sub(2) as usize;
         let mut rows: Vec<Line> = Vec::new();
-        let lines = self
-            .logs
-            .as_ref()
-            .map(|(logs, _)| logs.lines())
-            .unwrap_or_default();
-        for line in &lines {
-            let color = match line.level {
-                Some(LogLevel::Error) => Color::Red,
-                Some(LogLevel::Warn) => Color::Yellow,
-                Some(LogLevel::Info) => Color::Reset,
-                _ => Color::DarkGray,
-            };
-            let text = match line.repeats {
-                1 => line.text.clone(),
-                n => format!("{}  ×{n}", line.text),
-            };
-            for chunk in wrap_hard(&text, inner_w) {
-                rows.push(Line::styled(chunk, Style::default().fg(color)));
-            }
-        }
+        // Read in place: only the rows that wrap are built, not a copy of
+        // every line kept.
+        let count = self.logs.as_ref().map_or(0, |(logs, _)| {
+            logs.with_lines(|lines| {
+                for line in lines {
+                    let color = match line.level {
+                        Some(LogLevel::Error) => Color::Red,
+                        Some(LogLevel::Warn) => Color::Yellow,
+                        Some(LogLevel::Info) => Color::Reset,
+                        _ => Color::DarkGray,
+                    };
+                    let chunks = match line.repeats {
+                        1 => wrap_hard(&line.text, inner_w),
+                        n => wrap_hard(&format!("{}  ×{n}", line.text), inner_w),
+                    };
+                    for chunk in chunks {
+                        rows.push(Line::styled(chunk, Style::default().fg(color)));
+                    }
+                }
+                lines.len()
+            })
+        });
         let back = back.min(rows.len().saturating_sub(inner_h));
         let skip = rows.len().saturating_sub(inner_h + back);
         let shown: Vec<Line> = rows.into_iter().skip(skip).take(inner_h).collect();
@@ -1973,7 +2774,7 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(format!(" Log — {} line(s) ", lines.len()))
+                    .title(format!(" Log — {count} line(s) "))
                     .title_bottom(Line::from(format!(
                         "{position} ↑↓ PgUp PgDn Home End scroll  c clear  Esc close "
                     ))),
@@ -2009,41 +2810,10 @@ impl App {
             Some((text, false)) => {
                 Line::styled(format!(" ✓ {text}"), Style::default().fg(Color::Green))
             }
-            None => {
-                let keys = match self.tab {
-                    Tab::Dashboard | Tab::Queues => {
-                        "↑↓ select  ⏎ open  s sort  x recv/send  n name  b book  m monitor  f failures  q quit"
-                    }
-                    Tab::Account => {
-                        "↑↓ select  e edit account  i inspect  d delete  p purge  P purge peer  x recv/send  o own  n name  b book  m monitor  q quit"
-                    }
-                    Tab::Audit => "n name  b book  m monitor  r refresh  q quit",
-                    Tab::Mux => {
-                        "↑↓ select connection  g its grants  n name  b book  m monitor  r refresh  q quit"
-                    }
-                    Tab::Grants => {
-                        "/ find  ↑↓ select  space mark  a mark all  c clear marks  d revoke (marked)  D revoke all listed  E bump epoch  p principal's  g member's  ] more  m monitor  q quit"
-                    }
-                    Tab::Accounts => {
-                        "↑↓ select  ⏎ open  n name  b book  m monitor  r refresh  q quit"
-                    }
-                    Tab::Config if self.console.can_patch_config() => {
-                        "↑↓ select  ⏎ change a limit  x reset override  r refresh  q quit"
-                    }
-                    Tab::Config => {
-                        "↑↓ select  r refresh  q quit  (changing limits needs a rootAdmin)"
-                    }
-                };
-                let monitor_keys = match (self.monitor.visible, self.monitor.show_totals) {
-                    (true, false) => "  t totals  PgUp PgDn End scroll",
-                    (true, true) => "  t live",
-                    (false, _) => "",
-                };
-                Line::styled(
-                    format!(" {keys}{monitor_keys}"),
-                    Style::default().fg(Color::DarkGray),
-                )
-            }
+            None => Line::styled(
+                keymap::footer(self.key_context(), area.width as usize),
+                Style::default().fg(Color::DarkGray),
+            ),
         };
         f.render_widget(Paragraph::new(line), area);
     }
@@ -2148,7 +2918,7 @@ impl App {
     }
 
     fn render_queue_table(&mut self, f: &mut Frame, area: Rect, title: &str) {
-        let rows = queue_rows(&self.queues);
+        let rows = &self.queues.rows;
         // The account column fits the longest name (within reason) and the two
         // quota bars share whatever width is left, so the table uses the pane.
         let names: Vec<String> = rows
@@ -2193,13 +2963,12 @@ impl App {
             })
             .collect();
         let snapshot = self
-            .queues
-            .as_ref()
-            .and_then(|q| q["snapshotAt"].as_str())
-            .map(|s| format!(" survey {s} "))
+            .queues_snapshot
+            .map(|s| format!(" survey {} ", s.format("%Y-%m-%d %H:%M:%SZ")))
             .unwrap_or_default();
         let title = format!(
-            "{title}— by {} of {} queue{snapshot}",
+            "{title}— {} by {} of {} queue{snapshot}",
+            count_shown(rows.len(), None, self.queues.next.is_some()),
             SORTS[self.sort].1,
             if self.queue_send { "send" } else { "receive" }
         );
@@ -2316,6 +3085,7 @@ impl App {
 
         let rows: Vec<Row> = self
             .messages
+            .rows
             .iter()
             .map(|m| {
                 let state = m["deliveryState"].as_str().unwrap_or("");
@@ -2338,6 +3108,12 @@ impl App {
                 ])
             })
             .collect();
+        // How many the queue holds, from its status: the list is a page of it.
+        let side = if self.message_send { "send" } else { "receive" };
+        let total = self
+            .status
+            .as_ref()
+            .and_then(|s| s["queues"][side]["count"].as_u64());
         let table = Table::new(
             rows,
             [
@@ -2355,9 +3131,18 @@ impl App {
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} queue — {} messages ",
+            " {} queue — {} messages{} ",
             if self.message_send { "Send" } else { "Receive" },
-            self.messages.len()
+            count_shown(
+                self.messages.rows.len(),
+                total,
+                self.messages.next.is_some()
+            ),
+            if self.messages.paged() {
+                " (paged: r reloads)"
+            } else {
+                ""
+            }
         )));
         f.render_stateful_widget(table, parts[2], &mut self.message_state);
     }
@@ -2549,12 +3334,14 @@ impl App {
     fn render_accounts(&mut self, f: &mut Frame, area: Rect) {
         let names: Vec<String> = self
             .accounts
+            .rows
             .iter()
             .map(|a| label(&self.book, a["did"].as_str().unwrap_or("?")))
             .collect();
         let name_width = fit_width(&names, 15, 40);
         let rows: Vec<Row> = self
             .accounts
+            .rows
             .iter()
             .zip(&names)
             .map(|(a, name)| {
@@ -2615,11 +3402,16 @@ impl App {
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Accounts — {} ", self.accounts.len())),
-        );
+        .block(Block::default().borders(Borders::ALL).title(format!(
+                    " Accounts — {}{} ",
+                    count_shown(self.accounts.rows.len(), None, self.accounts.next.is_some()),
+                    self.accounts_loaded
+                        .map(|at| format!(
+                            " · loaded {} ago, r reloads",
+                            human_secs(Some(at.elapsed().as_secs()))
+                        ))
+                        .unwrap_or_default()
+                )));
         f.render_stateful_widget(table, area, &mut self.accounts_state);
     }
 
@@ -2676,28 +3468,27 @@ impl App {
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Configuration — {} keys, {overrides} overridden ",
-            self.config.len()
+            " Configuration — {} keys, {overrides} overridden{} ",
+            self.config.len(),
+            if self.console.can_patch_config() {
+                ""
+            } else {
+                " · read only (changing limits needs a rootAdmin)"
+            }
         )));
         f.render_stateful_widget(table, area, &mut self.config_state);
     }
 
-    fn render_audit(&self, f: &mut Frame, area: Rect) {
+    /// The audit log, newest first, as `audit/list` 0.2 records each entry:
+    /// when, who, what, to whom, how it ended, and its detail.
+    fn render_audit(&mut self, f: &mut Frame, area: Rect) {
         let rows: Vec<Row> = self
             .audit
+            .rows
             .iter()
             .map(|e| {
-                let pick = |keys: &[&str]| {
-                    keys.iter()
-                        .find_map(|k| e.get(*k).filter(|v| !v.is_null()))
-                        .map(|v| {
-                            v.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| v.to_string())
-                        })
-                        .unwrap_or_default()
-                };
-                let action = pick(&["action"]);
+                let text = |k: &str| e[k].as_str().unwrap_or("").to_string();
+                let action = text("action");
                 // DID-multiplexing decisions (grants suspended under the
                 // unknown-key rule, revoked, an epoch advanced) stand out:
                 // each one cut a device off from a DID.
@@ -2706,39 +3497,70 @@ impl App {
                 } else {
                     Style::default()
                 };
+                let outcome = text("outcome");
+                let outcome_color = match outcome.as_str() {
+                    "success" => Color::Green,
+                    "" => Color::Reset,
+                    "denied" | "failure" | "failed" | "error" => Color::Red,
+                    _ => Color::Yellow,
+                };
+                // Actor and target are DIDs (absent once redacted).
+                let did = |k: &str| match e[k].as_str() {
+                    Some(d) => did_label(&self.book, d),
+                    None => "–".into(),
+                };
                 Row::new(vec![
-                    pick(&["at", "timestamp", "recordedAt"]),
-                    label(&self.book, &pick(&["actor"])),
-                    action,
-                    label(&self.book, &pick(&["target", "subject"])),
-                    pick(&["summary", "detail", "description"]),
+                    Cell::from(e["recordedAt"].as_str().map(when_of).unwrap_or_default()),
+                    Cell::from(did("actor")),
+                    Cell::from(action),
+                    Cell::from(did("target")),
+                    Cell::from(outcome).style(Style::default().fg(outcome_color)),
+                    Cell::from(detail_line(&e["detail"])),
                 ])
                 .style(style)
             })
             .collect();
-        f.render_widget(
+        let title = format!(
+            " Audit log — {} entries, newest first{} ",
+            count_shown(self.audit.rows.len(), None, self.audit.next.is_some()),
+            if self.audit.paged() {
+                " (paged: r reloads)"
+            } else {
+                ""
+            }
+        );
+        f.render_stateful_widget(
             Table::new(
                 rows,
                 [
-                    Constraint::Length(20),
+                    Constraint::Length(15),
                     Constraint::Fill(1),
                     Constraint::Length(20),
                     Constraint::Fill(1),
-                    Constraint::Fill(2),
+                    Constraint::Length(8),
+                    Constraint::Fill(3),
                 ],
             )
             .header(
-                Row::new(vec!["when", "actor", "action", "target", "detail"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                Row::new(vec![
+                    "when", "actor", "action", "target", "outcome", "detail",
+                ])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
             )
-            .block(Block::default().borders(Borders::ALL).title(" Audit log ")),
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .block(Block::default().borders(Borders::ALL).title(title)),
             area,
+            &mut self.audit_state,
         );
     }
 
     fn render_monitor(&mut self, f: &mut Frame, area: Rect) {
         let alive = match (self.monitor.task.is_some(), self.monitor.last_seen) {
             (false, _) => Span::styled("○ stopped", Style::default().fg(Color::Red)),
+            // Said as it happens, not after a silence.
+            (true, _) if self.monitor.link_down || self.link == Some(ConnState::Disconnected) => {
+                Span::styled("✗ connection down", Style::default().fg(Color::Red))
+            }
             (true, _) if let Some(at) = self.monitor.retry_at => Span::styled(
                 format!(
                     "↻ resubscribing in {}s",
@@ -2928,22 +3750,145 @@ fn patch_summary(v: &Value) -> (String, bool) {
     (parts.join("; "), false)
 }
 
-/// Every account on the mediator, reading all pages of `account/list`.
-async fn all_accounts(console: &MediatorConsole) -> Result<Vec<Value>, ConsoleError> {
-    const PAGE: u32 = 500;
-    const MAX_PAGES: usize = 200;
-    let mut all = Vec::new();
-    let mut cursor = None;
-    for _ in 0..MAX_PAGES {
-        let page = serde_json::to_value(console.accounts(cursor, Some(PAGE)).await?)
-            .unwrap_or(Value::Null);
-        all.extend(page["accounts"].as_array().cloned().unwrap_or_default());
-        cursor = page["nextCursor"].as_str().map(str::to_string);
-        if cursor.is_none() {
-            break;
-        }
+/// The row `state` selects, by its `key` member, to find it again after a
+/// refresh.
+fn selected_id(rows: &[Value], state: &TableState, key: &str) -> Option<String> {
+    let i = state.selected()?;
+    rows.get(i)?[key].as_str().map(str::to_string)
+}
+
+/// Select the row whose `key` is `id` (the row selected before a refresh);
+/// when it is gone, keep the position, within the rows there are.
+fn reselect(state: &mut TableState, rows: &[Value], key: &str, id: Option<String>) {
+    let found = id.and_then(|id| rows.iter().position(|r| r[key] == id.as_str()));
+    let i = found.unwrap_or_else(|| {
+        state
+            .selected()
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1))
+    });
+    state.select(Some(i));
+}
+
+/// How many rows a list shows: `200`, `200 of 5000` when the total is known,
+/// and `+ (] more)` when another page is waiting.
+fn count_shown(shown: usize, total: Option<u64>, more: bool) -> String {
+    let mut s = shown.to_string();
+    match total {
+        Some(t) if t > shown as u64 => s.push_str(&format!(" of {t}")),
+        _ if more => s.push('+'),
+        _ => {}
     }
-    Ok(all)
+    if more {
+        s.push_str(" (] more)");
+    }
+    s
+}
+
+/// Whether the mediator has probably surveyed its queues again since the
+/// one taken `at` (fetched `since` ago): a survey is due a minute after the
+/// last. A survey that runs late is not chased every few seconds.
+fn survey_due(
+    at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    since: Duration,
+) -> bool {
+    let age = (now - at).to_std().unwrap_or_default();
+    if age < SURVEY_EVERY {
+        false
+    } else if age < SURVEY_EVERY * 2 {
+        since >= REFRESH
+    } else {
+        since >= SURVEY_EVERY / 2
+    }
+}
+
+/// The header's connection badge: what the SDK says of the connection, and
+/// for how long (`since`) when it is down.
+fn link_badge(link: Option<ConnState>, since: Duration) -> (String, Color) {
+    match link {
+        Some(ConnState::Connected) => ("● connected".into(), Color::Green),
+        Some(ConnState::Connecting) => ("◌ connecting".into(), Color::DarkGray),
+        Some(ConnState::Disconnected) => (
+            format!(
+                "✗ disconnected {} — reconnecting",
+                human_secs(Some(since.as_secs()))
+            ),
+            Color::Red,
+        ),
+        // No websocket (or a state this console doesn't know): say so rather
+        // than claim a connection.
+        _ => ("? connection unknown".into(), Color::Yellow),
+    }
+}
+
+/// An audit time, local: `MM-DD HH:MM:SS`.
+fn when_of(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+/// An audit entry's `detail` object as `key=value` pairs.
+fn detail_line(detail: &Value) -> String {
+    match detail {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => format!("{k}={s}"),
+                other => format!("{k}={other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// A configuration value as the console shows it.
+fn config_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "–".into(),
+        other => other.to_string(),
+    }
+}
+
+/// What a confirmed purge did, against what was counted.
+fn purge_summary(matched: u64, purged: u64) -> String {
+    if purged < matched {
+        format!(
+            "purged {purged} of the {matched} message(s) counted; the rest were delivered or \
+             deleted meanwhile"
+        )
+    } else {
+        format!("purged {purged} message(s)")
+    }
+}
+
+/// The lines a delete confirmation shows: whose message, from which queue,
+/// which one, from and to whom.
+fn delete_summary(book: &AddressBook, account: &str, send: bool, m: &Value) -> Vec<String> {
+    let who = |k: &str| {
+        m[k].as_str()
+            .map_or_else(|| "anonymous".to_string(), |h| label(book, h))
+    };
+    vec![
+        format!("Account  {account}"),
+        format!("Queue    {}", if send { "send" } else { "receive" }),
+        format!("Message  {}", m["msgId"].as_str().unwrap_or("?")),
+        format!("From     {}", who("from")),
+        format!("To       {}", who("to")),
+        format!(
+            "Received {}  ({})",
+            m["receivedAt"].as_str().unwrap_or("?"),
+            human_bytes(m["size"].as_u64())
+        ),
+    ]
 }
 
 /// The Accounts list's order: the mediator and administrators first, then
@@ -3046,19 +3991,72 @@ fn inspect_popup(m: &InspectedMessage) -> Popup {
             "{meta}\n\n── decrypted ──\n{}",
             serde_json::to_string_pretty(message).unwrap_or_default()
         ),
+        // All of it: the popup scrolls, and `y` / `w` take it whole.
         None => format!(
             "{meta}\n\n── encrypted ──\nThis session does not hold the recipient's key.\n\n{}",
-            m.envelope.chars().take(2_000).collect::<String>()
+            m.envelope
         ),
     };
-    Popup::Text {
-        title: " Message ".into(),
+    Popup::Inspect {
+        id: m.meta.msg_id.to_string(),
         body,
+        scroll: 0,
     }
 }
 
 fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
+    let mut scroll = 0;
+    let mut tall = false;
     let (title, body, danger) = match popup {
+        Popup::Inspect {
+            body, scroll: down, ..
+        } => {
+            scroll = *down;
+            tall = true;
+            (
+                " Message — ↑↓ PgUp PgDn scroll  y copy  w write to a file  Esc close ".into(),
+                body.clone(),
+                false,
+            )
+        }
+        // Drawn by `App::render_help`, which knows the screen.
+        Popup::Help { .. } => return,
+        Popup::ConfirmAccount {
+            who,
+            changes,
+            warning,
+            ..
+        } => (
+            " Change an account ".into(),
+            format!(
+                "Account  {who}\n\n{}\n{}\ny applies these changes; any other key goes back to \
+                 editing.",
+                changes
+                    .iter()
+                    .map(|c| format!("  {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                warning
+                    .as_deref()
+                    .map(|w| format!("\n{w}\n"))
+                    .unwrap_or_default(),
+            ),
+            true,
+        ),
+        Popup::ConfirmPatch { key, from, to, .. } => (
+            " Change the configuration ".into(),
+            match to {
+                Value::Null => format!(
+                    "Reset the override of\n  {key}\n(now {from}) to the configured value?\n\n\
+                     y to confirm, any other key to cancel"
+                ),
+                to => format!(
+                    "{key}\n  {from} → {}\n\ny applies it; any other key goes back to editing.",
+                    config_value(to)
+                ),
+            },
+            true,
+        ),
         Popup::Name {
             hash,
             did,
@@ -3164,11 +4162,12 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
             format!("{body}\n\n(any key to close)"),
             false,
         ),
-        Popup::ConfirmDelete { ids, .. } => (
+        Popup::ConfirmDelete { ids, about, .. } => (
             " Delete ".into(),
             format!(
-                "Delete {} message(s)? This cannot be undone.\n\ny to confirm, any other key to cancel",
-                ids.len()
+                "Delete {} message(s)? This cannot be undone.\n\n{}\n\ny to confirm, any other key to cancel",
+                ids.len(),
+                about.join("\n"),
             ),
             true,
         ),
@@ -3233,7 +4232,15 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
         Popup::ConfirmPurge(plan) => (
             " Purge ".into(),
             format!(
-                "Purge {} message(s) ({}) from the {} queue{}?\nUndelivered messages are gone, not returned to their senders.\n\ny to confirm, any other key to cancel",
+                "Account  {}\n\nPurge {} message(s) ({}) from the {} queue{}?\n\
+                 Only messages queued before this count can go: one arriving now stays. \
+                 Fewer may go, if some are delivered meanwhile.\n\
+                 Undelivered messages are gone, not returned to their senders.\n\n\
+                 y to confirm, any other key to cancel",
+                plan.request
+                    .target
+                    .as_deref()
+                    .map_or_else(|| "your own".to_string(), |t| label(book, t)),
                 plan.matched,
                 human_bytes(Some(plan.matched_bytes)),
                 format!("{:?}", plan.request.queue).to_lowercase(),
@@ -3249,8 +4256,12 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
     let w = area.width.saturating_sub(8).min(100);
     let h = area
         .height
-        .saturating_sub(4)
-        .min(if danger { 12 } else { 40 });
+        .saturating_sub(if tall { 2 } else { 4 })
+        .min(match (tall, danger) {
+            (true, _) => u16::MAX,
+            (false, true) => 18,
+            (false, false) => 40,
+        });
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
@@ -3262,6 +4273,7 @@ fn render_popup(f: &mut Frame, area: Rect, popup: &Popup, book: &AddressBook) {
     f.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .alignment(Alignment::Left)
             .block(
                 Block::default()
@@ -3371,13 +4383,6 @@ fn sha256_hex(s: &str) -> String {
     sha256::digest(s)
 }
 
-fn queue_rows(queues: &Option<Value>) -> Vec<Value> {
-    queues
-        .as_ref()
-        .and_then(|q| q["queues"].as_array().cloned())
-        .unwrap_or_default()
-}
-
 fn to_value<T: serde::Serialize>(r: Result<T, ConsoleError>) -> Result<Value, ConsoleError> {
     r.map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
 }
@@ -3400,11 +4405,13 @@ fn short(s: &str) -> String {
     }
 }
 
+/// A DID cut to 30 characters (never inside one: DIDs from an address book
+/// or a profile need not be ASCII).
 fn short_did(s: &str) -> String {
-    if s.len() <= 32 {
+    if s.chars().count() <= 32 {
         s.to_string()
     } else {
-        format!("{}…", &s[..30])
+        format!("{}…", s.chars().take(30).collect::<String>())
     }
 }
 
@@ -3919,6 +4926,125 @@ mod tests {
         }));
         assert!(is_refusal(&ConsoleError::NotPermitted("monitor")));
         assert!(!is_refusal(&ConsoleError::Connect("dns error".into())));
+    }
+
+    #[test]
+    fn short_did_never_cuts_inside_a_character() {
+        let did = format!("did:web:{}", "é".repeat(40));
+        let cut = short_did(&did);
+        assert_eq!(cut.chars().count(), 31);
+        assert!(cut.ends_with('…'));
+        assert_eq!(short_did("did:key:z6Mk"), "did:key:z6Mk");
+    }
+
+    #[test]
+    fn the_connection_badge_is_never_a_stale_connected() {
+        let (up, color) = link_badge(Some(ConnState::Connected), Duration::from_secs(90));
+        assert_eq!((up.as_str(), color), ("● connected", Color::Green));
+        let (down, color) = link_badge(Some(ConnState::Disconnected), Duration::from_secs(12));
+        assert_eq!(color, Color::Red);
+        assert!(down.contains("disconnected 12s"), "{down}");
+        assert!(down.contains("reconnecting"), "{down}");
+        // No websocket: unknown, not connected.
+        let (unknown, _) = link_badge(None, Duration::ZERO);
+        assert!(unknown.contains("unknown"), "{unknown}");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_selection_on_the_same_row() {
+        let rows = |ids: &[&str]| -> Vec<Value> {
+            ids.iter()
+                .map(|id| serde_json::json!({ "msgId": id }))
+                .collect()
+        };
+        let mut state = TableState::default().with_selected(Some(1));
+        let before = rows(&["a", "b", "c"]);
+        let keep = selected_id(&before, &state, "msgId");
+        assert_eq!(keep.as_deref(), Some("b"));
+        // "a" was delivered and a new one arrived: "b" moved up a row.
+        reselect(&mut state, &rows(&["b", "c", "d"]), "msgId", keep);
+        assert_eq!(state.selected(), Some(0));
+        // The selected row went: the position holds, within the rows left.
+        let mut state = TableState::default().with_selected(Some(2));
+        reselect(&mut state, &rows(&["x", "y"]), "msgId", Some("gone".into()));
+        assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn a_page_replaces_or_adds_and_says_whether_more_wait() {
+        let mut paged = Paged::default();
+        paged.take(
+            List::Audit,
+            &serde_json::json!({ "entries": [{ "eventId": "1" }], "nextCursor": "c1" }),
+            false,
+        );
+        assert!(!paged.paged());
+        assert_eq!(paged.next.as_deref(), Some("c1"));
+        paged.take(
+            List::Audit,
+            &serde_json::json!({ "entries": [{ "eventId": "2" }] }),
+            true,
+        );
+        assert!(paged.paged());
+        assert_eq!(paged.rows.len(), 2);
+        assert_eq!(paged.next, None);
+    }
+
+    #[test]
+    fn a_list_says_how_much_of_it_is_shown() {
+        assert_eq!(count_shown(200, Some(5_000), true), "200 of 5000 (] more)");
+        assert_eq!(count_shown(200, None, true), "200+ (] more)");
+        assert_eq!(count_shown(3, Some(3), false), "3");
+    }
+
+    #[test]
+    fn the_queue_ranking_is_asked_for_again_once_resurveyed() {
+        let at = chrono::Utc::now();
+        let secs = chrono::Duration::seconds;
+        // The survey shown is still the latest.
+        assert!(!survey_due(at, at + secs(30), Duration::from_secs(30)));
+        // A minute on, a new one is due.
+        assert!(survey_due(at, at + secs(61), Duration::from_secs(10)));
+        // But not asked for again within one refresh.
+        assert!(!survey_due(at, at + secs(61), Duration::from_secs(1)));
+        // A survey running late is checked on every half minute, not tick.
+        assert!(!survey_due(at, at + secs(300), Duration::from_secs(10)));
+        assert!(survey_due(at, at + secs(300), Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn audit_detail_reads_as_key_value_pairs() {
+        assert_eq!(
+            detail_line(&serde_json::json!({ "queue": "receive", "purged": 3 })),
+            "purged=3 queue=receive"
+        );
+        assert_eq!(detail_line(&Value::Null), "");
+    }
+
+    #[test]
+    fn a_short_purge_says_what_happened_to_the_rest() {
+        assert_eq!(purge_summary(3, 3), "purged 3 message(s)");
+        assert!(purge_summary(3, 2).starts_with("purged 2 of the 3"));
+    }
+
+    #[test]
+    fn a_delete_confirmation_names_its_account_queue_and_message() {
+        let mut book = AddressBook::new();
+        book.insert("did:example:alice", "alice");
+        let m = serde_json::json!({
+            "msgId": "m-1", "from": sha256::digest("did:example:alice"),
+            "to": "bobhash", "receivedAt": "2026-09-21T10:00:00Z", "size": 10,
+        });
+        let lines = delete_summary(&book, "bob", false, &m).join("\n");
+        for want in [
+            "Account  bob",
+            "Queue    receive",
+            "Message  m-1",
+            "From     alice",
+            "To       bobhash",
+        ] {
+            assert!(lines.contains(want), "{want}:\n{lines}");
+        }
     }
 
     #[test]

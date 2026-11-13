@@ -89,6 +89,13 @@ async fn run(args: Args, logs: LogCapture) -> Result<(), Box<dyn std::error::Err
     );
 
     let mut terminal = ratatui::init();
+    // `ratatui::init`'s panic hook restores raw mode and the screen, not
+    // bracketed paste: turn that off first, or the shell is left with it on.
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        restore(info);
+    }));
     // Bracketed paste: a pasted DID arrives whole, not as keystrokes.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let result = App::new(console)

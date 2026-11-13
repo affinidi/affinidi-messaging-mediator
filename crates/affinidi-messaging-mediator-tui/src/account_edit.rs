@@ -157,6 +157,38 @@ impl AccountEdit {
         self.rows != self.original
     }
 
+    /// What changes, row by row: `(setting, was, now)`, to show before it is
+    /// sent.
+    pub fn diff(&mut self) -> Vec<(String, String, String)> {
+        self.commit_typing();
+        self.rows
+            .iter()
+            .zip(&self.original)
+            .filter(|(now, was)| now != was)
+            .map(|(now, was)| (now.name(), was.shown(), now.shown()))
+            .collect()
+    }
+
+    /// What in the changes can cut the account off: a lower role, or
+    /// `blocked` turned on. `None` when nothing does. Worth a warning when
+    /// the account is the one the console is signed in as.
+    pub fn risks_lockout(&self) -> Option<String> {
+        let rank = |r: &str| ROLES.iter().position(|x| *x == r);
+        let mut risks = Vec::new();
+        for (now, was) in self.rows.iter().zip(&self.original) {
+            match (was, now) {
+                (Setting::Role(from), Setting::Role(to)) if rank(to) < rank(from) => {
+                    risks.push(format!("Lowering the role {from} → {to}"));
+                }
+                (Setting::Flag(k, false), Setting::Flag(_, true)) if k == "blocked" => {
+                    risks.push("Blocking it".to_string());
+                }
+                _ => {}
+            }
+        }
+        (!risks.is_empty()).then(|| risks.join(" and "))
+    }
+
     /// The `account/update` members that changed, as JSON:
     /// `(accountType, acl, queueLimits)`, each `None` when nothing in it did.
     pub fn changes(&mut self) -> (Option<Value>, Option<Value>, Option<Value>) {
@@ -239,6 +271,42 @@ mod tests {
         assert_eq!(acl, Some(json!({ "accessListMode": "explicitAllow" })));
         assert_eq!(limits, Some(json!({ "receiveQueueLimit": -1 })));
         assert_eq!(e.rows[6].shown(), "unlimited");
+    }
+
+    #[test]
+    fn the_changes_are_listed_before_they_are_sent() {
+        let mut e = AccountEdit::new("abc".into(), &account(), true);
+        assert!(e.diff().is_empty());
+        e.toggle(); // role: standard -> admin
+        e.selected = 1;
+        e.toggle(); // blocked on
+        assert_eq!(
+            e.diff(),
+            [
+                ("role".into(), "standard".into(), "admin".into()),
+                ("blocked".into(), "✗ off".into(), "✓ on".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn lowering_a_role_or_blocking_is_a_lockout_risk_and_raising_is_not() {
+        let mut admin = account();
+        admin["accountType"] = json!("rootAdmin");
+        let mut e = AccountEdit::new("abc".into(), &admin, true);
+        assert_eq!(e.risks_lockout(), None);
+        e.toggle(); // rootAdmin -> standard (wraps)
+        assert_eq!(
+            e.risks_lockout().as_deref(),
+            Some("Lowering the role rootAdmin → standard")
+        );
+        e.selected = 1;
+        e.toggle(); // blocked on
+        assert!(e.risks_lockout().unwrap().ends_with("and Blocking it"));
+
+        let mut raise = AccountEdit::new("abc".into(), &account(), true);
+        raise.toggle(); // standard -> admin
+        assert_eq!(raise.risks_lockout(), None);
     }
 
     #[test]
