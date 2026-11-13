@@ -6,7 +6,7 @@
 //!   big"), so the client knows the message was the problem; it used to end
 //!   silently, read as the client leaving (#139).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
