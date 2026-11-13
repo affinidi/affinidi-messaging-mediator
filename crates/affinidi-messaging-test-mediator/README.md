@@ -10,6 +10,48 @@ identity, a random JWT signing key, and the caller's choice of
 storage backend — `MemoryStore` by default, optional `FjallStore` for
 on-disk persistence semantics.
 
+> **Test fixture only.** The mediator it runs speaks plain HTTP (no TLS)
+> and, as the `standalone` example configures it, admits any DID
+> (allow-all ACL). Never expose it on a network anyone else can reach.
+
+## Keys stay on their own side
+
+As in production, private keys do **not** cross the client/mediator
+boundary by default:
+
+- the mediator's keys live only in the mediator's own resolver — the SDK
+  in a [`TestEnvironment`] cannot decrypt what is addressed to the
+  mediator;
+- user keys from `TestEnvironment::add_user` or
+  `TestMediatorHandle::add_user` live only client-side (the SDK's
+  resolver, or `TestMediatorHandle::secrets_resolver()`) — the mediator
+  cannot decrypt what is addressed to a user.
+
+So an envelope that is wrapped wrongly, misrouted or encrypted to the
+wrong party fails here as it would against a real mediator, instead of
+unpacking anyway. A test that must act **as the mediator** (forging an
+envelope the mediator would have signed, say) opts in:
+
+```rust,ignore
+// The SDK's resolver also gets the mediator's keys:
+let env = TestEnvironment::spawn().await?.with_mediator_keys().await;
+
+// Or one resolver on both sides, as the fixture used to work:
+let mediator = TestMediator::builder().share_secrets(true).spawn().await?;
+```
+
+All users of one `TestEnvironment` share its SDK client and resolver, so
+Alice's profile can still decrypt Bob's mail. Use a separate environment
+where a test needs recipients that cannot read each other's mail.
+
+## Stopping
+
+Dropping a `TestMediatorHandle` (or the `TestEnvironment` holding it)
+cancels the mediator, so a test that fails part-way leaves nothing
+running; with Fjall, the temp directory is removed once the server task
+has ended. `shutdown()` followed by `join().await` also waits for the
+drain.
+
 ## When to use
 
 Anywhere you need an in-process mediator for tests:
@@ -118,8 +160,10 @@ let alice = mediator.add_user("alice").await.unwrap();
 ```
 
 Both register the user as `LOCAL, ALLOW_ALL` on the mediator and
-insert the user's secrets into the mediator's resolver, so callers
-can pack/unpack messages without further wiring.
+insert the user's secrets into the handle's client-side resolver
+(`mediator.secrets_resolver()`), so callers can pack/unpack messages
+without further wiring. The mediator itself never sees them (see
+[Keys stay on their own side](#keys-stay-on-their-own-side)).
 
 If you need to drive the mediator with externally-created DIDs, mint
 them yourself with the mediator's DID as their DIDComm service URI
@@ -353,7 +397,7 @@ explicitly — and a plain `cargo test` silently compiles their tests
 | `fjall-backend` | `FjallStore` + the tests gated on it |
 | `tsp` | mediator TSP support, `atm.tsp()`, and every `#[cfg(feature = "tsp")]` test (TSP delivery, auth, websocket, pickup, federation, cross-mediator routing, capability discovery) |
 | `didcomm-v1` | mediator DIDComm v1 (Aries RFC 0019) support and its tests: forward ingress, coordinate-mediation and message pickup |
-| `redis-backend` | `RedisStore`, for the size sweep (`tests/size_sweep.rs`) against a real Redis named by `REDIS_URL` |
+| `redis-backend` | `RedisStore`, for the cross-instance tests and the size sweep against a real Redis named by `REDIS_URL` |
 
 To run everything locally:
 
@@ -369,17 +413,35 @@ isn't default, a fully green CI run had been saying nothing at all
 about the TSP transport. If you add a test behind a new feature gate,
 add the matching job too, or it will not run.
 
-Note that no part of the default suite requires Redis. `skip_if_no_redis()`
-in `tests/common` is a retained no-op that always returns `false`. The
-opt-in message-size sweep can also run on Redis:
+Note that no part of the default suite requires Redis. The opt-in
+message-size sweep can also run on Redis:
 
 ```sh
 cargo test -p affinidi-messaging-test-mediator --features tsp,fjall-backend \
-    --test size_sweep -- --ignored --nocapture
+    --test e2e -- size_sweep:: --ignored --nocapture
 # with Redis too (a server with at least 8 databases):
 REDIS_URL=redis://127.0.0.1:6379 cargo test -p affinidi-messaging-test-mediator \
-    --features tsp,fjall-backend,redis-backend --test size_sweep -- --ignored --nocapture
+    --features tsp,fjall-backend,redis-backend --test e2e -- size_sweep:: --ignored --nocapture
 ```
+
+### Layout of the suite
+
+The end-to-end tests are one binary, `tests/e2e/main.rs`, with a module
+per area (each was its own binary, each linking the whole mediator, SDK
+and TDK). Select an area with a name filter:
+
+```sh
+cargo test -p affinidi-messaging-test-mediator --test e2e -- mux_send:: tsp_mux::
+```
+
+Shared helpers (`now`, `basic_message`, `store_grant`, `inbox_len`,
+`token_and_ws_uri`, `poll_until`, `await_streaming`, `redis_store`) live
+in `tests/common`. Wait for an observable condition with `poll_until` or
+`await_monitor_event` rather than a fixed sleep. Tests run in parallel
+in one process, so each Redis test keeps a logical database of its own.
+Only tests that need a process to themselves stay separate binaries:
+`metrics_endpoint` and `mux_metrics` (the Prometheus recorder is
+process-wide) and `config_reload` (the recorded configuration path is).
 
 ## Cross-workspace consumption
 

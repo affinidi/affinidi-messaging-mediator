@@ -4,8 +4,40 @@
 //! `127.0.0.1:0` (ephemeral port), with a freshly-generated `did:peer`
 //! identity, a random JWT signing key, and the caller's choice of
 //! storage backend. Returns a [`TestMediatorHandle`] exposing the
-//! bound URL, the mediator DID, the populated secrets resolver, and
+//! bound URL, the mediator DID, a client-side secrets resolver, and
 //! a shutdown control.
+//!
+//! # Key isolation
+//!
+//! By default the fixture keeps private keys on the side of the
+//! client/mediator boundary they belong to, as in production:
+//!
+//! - the **mediator's** keys live only in the mediator's own,
+//!   server-side resolver;
+//! - **user** keys minted by [`TestMediatorHandle::add_user`] or
+//!   [`TestEnvironment::add_user`] live only in a client-side resolver
+//!   ([`TestMediatorHandle::secrets_resolver`], or the SDK's resolver in
+//!   `env.tdk`).
+//!
+//! So a mis-wrapped or misrouted envelope fails to unpack here just as
+//! it would against a real mediator. Tests that genuinely need to act
+//! *as the mediator* (forging an envelope the mediator signed, say) opt
+//! in explicitly, either with [`TestMediatorBuilder::share_secrets`]
+//! (one resolver on both sides, as the fixture used to work) or
+//! with [`TestEnvironment::with_mediator_keys`] (the mediator's keys
+//! copied into the SDK's resolver only).
+//!
+//! All users of one [`TestEnvironment`] still share its single SDK
+//! client and resolver, so one user's profile can decrypt mail
+//! addressed to another. Build a second environment when a test needs
+//! recipients that cannot read each other's mail.
+//!
+//! # Lifetime
+//!
+//! Dropping a [`TestMediatorHandle`] (or the [`TestEnvironment`] that
+//! owns it) cancels the mediator, so a test that fails part-way leaves
+//! nothing listening. Call [`TestMediatorHandle::shutdown`] and then
+//! [`TestMediatorHandle::join`] to wait for the drain.
 //!
 //! # Quick start
 //!
@@ -22,6 +54,7 @@
 //!     let did = mediator.did();
 //!     // ... use SDK against `endpoint` and `did` ...
 //!
+//!     // Dropping `mediator` stops it; `shutdown` + `join` waits for the drain.
 //!     mediator.shutdown();
 //!     mediator.join().await.unwrap();
 //! }
@@ -63,9 +96,10 @@
 //! The mediator's DID is `did:peer:2.*` — fully self-describing. Test
 //! clients using `affinidi-did-resolver-cache-sdk` resolve it locally
 //! via the built-in `PeerResolver`; no DNS or network round trip is
-//! required. The fixture's secrets resolver is pre-populated with the
-//! mediator's signing and key-agreement secrets so the SDK can encrypt
-//! to the mediator without any setup beyond cloning the resolver:
+//! required: encrypting to the mediator needs only its public keys,
+//! which its DID carries. The client-side resolver holds the keys of
+//! the users minted through the handle, and nothing of the mediator's
+//! (see [Key isolation](#key-isolation)):
 //!
 //! ```ignore
 //! let resolver = mediator.secrets_resolver();
@@ -192,8 +226,9 @@ impl TestMediator {
     /// DID (the routing 2.0 shape — see the README's "Local vs.
     /// remote routing" section), already registered with the mediator
     /// as a LOCAL, `ALLOW_ALL` account, and whose key material is
-    /// inserted into the mediator's secrets resolver so callers can
-    /// pack and unpack messages without any extra wiring.
+    /// inserted into the handle's client-side resolver
+    /// ([`TestMediatorHandle::secrets_resolver`]) so callers can pack
+    /// and unpack messages without any extra wiring.
     ///
     /// Returns the mediator handle alongside the users in the same
     /// order the aliases were passed. For ATM-based scenarios that
@@ -219,9 +254,11 @@ impl TestMediator {
 /// [`TestMediatorHandle::add_user`].
 ///
 /// Owns its own `did:peer` and key material. Already registered on
-/// the mediator (LOCAL, ALLOW_ALL) and inserted into the mediator's
-/// secrets resolver, so a caller only needs to plug `did` and
-/// `secrets` into whatever DIDComm stack they're testing.
+/// the mediator (LOCAL, ALLOW_ALL) and inserted into the handle's
+/// client-side resolver ([`TestMediatorHandle::secrets_resolver`]), so a
+/// caller only needs to plug `did` and `secrets` into whatever DIDComm
+/// stack they're testing. The mediator itself never holds them unless
+/// [`TestMediatorBuilder::share_secrets`] was set.
 #[derive(Debug, Clone)]
 pub struct TestMediatorUser {
     /// `did:peer:2.*` whose DIDComm service URI is the mediator's DID.
@@ -229,7 +266,7 @@ pub struct TestMediatorUser {
     /// Human-readable alias (e.g. `"alice"`).
     pub alias: String,
     /// Verification + key-agreement secrets for `did`. Already
-    /// inserted into the mediator's shared secrets resolver — copy
+    /// inserted into the handle's client-side resolver — copy
     /// elsewhere only if you need a separate resolver.
     pub secrets: Vec<Secret>,
 }
@@ -387,6 +424,8 @@ pub struct TestMediatorBuilder {
     admin_identity: Option<AdminIdentity>,
     /// See [`TestMediatorBuilder::replica_of`].
     replica: Option<ReplicaIdentity>,
+    /// See [`TestMediatorBuilder::share_secrets`].
+    share_secrets: bool,
     /// Temp directory backing a Fjall store, kept alive for the lifetime
     /// of the resulting handle so the partition files don't get cleaned
     /// up while the mediator is still using them.
@@ -447,6 +486,7 @@ impl Default for TestMediatorBuilder {
             clock: None,
             admin_identity: None,
             replica: None,
+            share_secrets: false,
             #[cfg(feature = "fjall-backend")]
             fjall_dir: None,
         }
@@ -1011,9 +1051,30 @@ impl TestMediatorBuilder {
         let store = FjallStore::open(dir.path()).map_err(TestMediatorError::Mediator)?;
         self.store = Some(Arc::new(store));
         // Hold the temp dir alive for the lifetime of the builder so
-        // it lands in the handle's `_fjall_dir` slot once `spawn` runs.
+        // it lands in the handle's `fjall_dir` slot once `spawn` runs.
         self.fjall_dir = Some(dir);
         Ok(self)
+    }
+
+    /// Share one secrets resolver across the client/mediator boundary.
+    ///
+    /// **Off by default.** With it off the mediator's private keys stay in
+    /// the mediator's resolver and users' keys stay client-side, as in
+    /// production, so an envelope encrypted to the wrong party fails to
+    /// unpack (see [Key isolation](crate#key-isolation)).
+    ///
+    /// Turn it on only for a test that must act as the mediator, such as
+    /// forging an envelope the mediator would have signed. Then
+    /// [`TestMediatorHandle::secrets_resolver`] is the mediator's own
+    /// resolver, [`TestMediatorHandle::add_user`] puts each user's keys in
+    /// it, and a [`TestEnvironment`] built on the handle copies the
+    /// mediator's keys into the SDK's resolver and each user's keys into
+    /// the mediator's. That is how the fixture used to work. A
+    /// test that only needs the SDK to hold the mediator's keys can use
+    /// [`TestEnvironment::with_mediator_keys`] instead.
+    pub fn share_secrets(mut self, share: bool) -> Self {
+        self.share_secrets = share;
+        self
     }
 
     /// Spawn the mediator and wait until it's listening. Returns the
@@ -1051,6 +1112,14 @@ impl TestMediatorBuilder {
                 (r.did.clone(), r.secrets.clone(), Arc::new(resolver))
             }
             None => generate_mediator_identity(&service_uri).await?,
+        };
+        // The client side's resolver: the mediator's own when sharing was
+        // asked for, otherwise a separate, empty one.
+        let client_resolver = if self.share_secrets {
+            secrets_resolver.clone()
+        } else {
+            let (resolver, _task) = ThreadedSecretsResolver::new(None).await;
+            Arc::new(resolver)
         };
         // Honor an operator-supplied admin identity if present —
         // otherwise fall back to the historical opaque shape so tests
@@ -1247,13 +1316,15 @@ impl TestMediatorBuilder {
         register_local_dids(&store_for_local_accounts, &self.local_dids).await?;
 
         Ok(TestMediatorHandle {
-            inner,
-            secrets_resolver,
+            inner: Some(inner),
+            server_resolver: secrets_resolver,
+            client_resolver,
+            share_secrets: self.share_secrets,
             mediator_secrets,
             jwt_pkcs8,
             store: store_for_local_accounts,
             #[cfg(feature = "fjall-backend")]
-            _fjall_dir: self.fjall_dir,
+            fjall_dir: self.fjall_dir,
         })
     }
 }
@@ -1279,11 +1350,25 @@ impl std::fmt::Debug for ReplicaIdentity {
     }
 }
 
-/// Handle to a running test mediator. Drop or call
-/// [`TestMediatorHandle::shutdown`] to stop it.
+/// Handle to a running test mediator.
+///
+/// Dropping the handle cancels the mediator: a test that returns early or
+/// panics leaves no server, listener or processor running. Dropping does
+/// not wait for the drain; call [`TestMediatorHandle::shutdown`] and then
+/// [`TestMediatorHandle::join`] for that. With a Fjall store the backing
+/// temp directory is removed only once the server task has ended.
+#[must_use = "dropping the handle stops the mediator"]
 pub struct TestMediatorHandle {
-    inner: MediatorHandle,
-    secrets_resolver: Arc<ThreadedSecretsResolver>,
+    /// `None` only once [`Self::join`] has taken it, so `Drop` has
+    /// nothing left to cancel.
+    inner: Option<MediatorHandle>,
+    /// The mediator's own resolver: its operating keys, and users' keys
+    /// only under [`TestMediatorBuilder::share_secrets`].
+    server_resolver: Arc<ThreadedSecretsResolver>,
+    /// What [`Self::secrets_resolver`] hands to client code. The same `Arc`
+    /// as `server_resolver` under [`TestMediatorBuilder::share_secrets`].
+    client_resolver: Arc<ThreadedSecretsResolver>,
+    share_secrets: bool,
     mediator_secrets: Vec<Secret>,
     /// The session-token signing key, for [`Self::replica_identity`].
     jwt_pkcs8: Vec<u8>,
@@ -1295,22 +1380,56 @@ pub struct TestMediatorHandle {
     store: Arc<dyn MediatorStore>,
     /// Backing temp dir for the Fjall store (when applicable). Held
     /// alongside the handle so the partition files survive as long as
-    /// the mediator is using them, and get cleaned up on drop.
+    /// the mediator is using them; removed after the server task ends
+    /// (see the `Drop` impl and [`Self::join`]).
     #[cfg(feature = "fjall-backend")]
-    _fjall_dir: Option<tempfile::TempDir>,
+    fjall_dir: Option<tempfile::TempDir>,
+}
+
+impl Drop for TestMediatorHandle {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        inner.shutdown();
+        #[cfg(feature = "fjall-backend")]
+        if let Some(dir) = self.fjall_dir.take() {
+            // Removing the directory under a store that is still running
+            // would fail its last writes, so wait for the server task, off
+            // this synchronous drop. Without a runtime the task can no
+            // longer run, and the directory goes now.
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        let _ = inner.join().await;
+                        drop(dir);
+                    });
+                }
+                Err(_) => drop(dir),
+            }
+        }
+    }
 }
 
 impl TestMediatorHandle {
+    /// The running mediator. Present until [`Self::join`] consumes the
+    /// handle, so never `None` behind a `&self`.
+    fn inner(&self) -> &MediatorHandle {
+        self.inner
+            .as_ref()
+            .expect("the mediator handle is only taken by join, which consumes self")
+    }
+
     /// HTTP base URL the mediator is listening on, e.g.
     /// `http://127.0.0.1:54321/mediator/v1/`.
     pub fn endpoint(&self) -> &Url {
-        &self.inner.http_endpoint
+        &self.inner().http_endpoint
     }
 
     /// WebSocket URL for live streaming, e.g.
     /// `ws://127.0.0.1:54321/mediator/v1/ws`.
     pub fn ws_endpoint(&self) -> &Url {
-        &self.inner.ws_endpoint
+        &self.inner().ws_endpoint
     }
 
     /// What a second instance of this mediator needs to be the same
@@ -1325,17 +1444,17 @@ impl TestMediatorHandle {
 
     /// Bound socket address.
     pub fn bound_addr(&self) -> SocketAddr {
-        self.inner.bound_addr
+        self.inner().bound_addr
     }
 
     /// The mediator's DID.
     pub fn did(&self) -> &str {
-        &self.inner.mediator_did
+        &self.inner().mediator_did
     }
 
     /// The admin DID configured at startup.
     pub fn admin_did(&self) -> &str {
-        &self.inner.admin_did
+        &self.inner().admin_did
     }
 
     /// The mediator's own store, for tests that need to assert on what the
@@ -1349,15 +1468,33 @@ impl TestMediatorHandle {
         self.store.clone()
     }
 
-    /// Pre-populated secrets resolver. Tests should clone this and
-    /// pass it into their SDK setup so the test client can sign and
-    /// decrypt messages addressed to the mediator.
+    /// The client side's secrets resolver: the keys of every user minted
+    /// with [`Self::add_user`] / [`TestMediator::with_users`]. Hand it to
+    /// the SDK or DIDComm stack under test.
+    ///
+    /// It does **not** hold the mediator's private keys, and the mediator
+    /// does not hold these, unless the mediator was built with
+    /// [`TestMediatorBuilder::share_secrets`]; then this is the mediator's
+    /// own resolver. Encrypting to the mediator needs only its DID.
     pub fn secrets_resolver(&self) -> Arc<ThreadedSecretsResolver> {
-        self.secrets_resolver.clone()
+        self.client_resolver.clone()
     }
 
-    /// The mediator's signing and key-agreement secrets, in case the
-    /// caller wants to merge them into a different resolver.
+    /// Whether the mediator was built with
+    /// [`TestMediatorBuilder::share_secrets`].
+    pub fn shares_secrets(&self) -> bool {
+        self.share_secrets
+    }
+
+    /// The mediator's own resolver, for the fixture's opt-in sharing.
+    pub(crate) fn server_secrets_resolver(&self) -> &Arc<ThreadedSecretsResolver> {
+        &self.server_resolver
+    }
+
+    /// The mediator's signing and key-agreement secrets, for a test that
+    /// has to act as the mediator (forging what it would sign). Copying
+    /// them into a client-side resolver gives up key isolation for that
+    /// resolver; see [Key isolation](crate#key-isolation).
     pub fn mediator_secrets(&self) -> &[Secret] {
         &self.mediator_secrets
     }
@@ -1381,7 +1518,7 @@ impl TestMediatorHandle {
             .and_then(|secret| <[u8; 32]>::try_from(secret.get_private_bytes()).ok())
             .and_then(|seed| {
                 affinidi_messaging_didcomm_v1::PrivateIdentity::from_signing_key(
-                    &self.inner.mediator_did,
+                    &self.inner().mediator_did,
                     &seed,
                 )
                 .ok()
@@ -1392,18 +1529,25 @@ impl TestMediatorHandle {
     /// Shareable shutdown token. Cancel from anywhere to drain the
     /// mediator without consuming the handle.
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.inner.shutdown_token()
+        self.inner().shutdown_token()
     }
 
     /// Trigger graceful shutdown. The server stops accepting new
     /// connections and drains in-flight requests for up to 30s.
     pub fn shutdown(&self) {
-        self.inner.shutdown();
+        self.inner().shutdown();
     }
 
-    /// Wait for the mediator to exit. Consumes the handle.
-    pub async fn join(self) -> Result<(), MediatorError> {
-        self.inner.join().await
+    /// Wait for the mediator to exit. Consumes the handle. Call
+    /// [`Self::shutdown`] first, or this waits until something else
+    /// cancels [`Self::shutdown_token`]. Any Fjall temp directory is
+    /// removed after the server task has ended, as `self` drops.
+    pub async fn join(mut self) -> Result<(), MediatorError> {
+        self.inner
+            .take()
+            .expect("the mediator handle is only taken by join, which consumes self")
+            .join()
+            .await
     }
 
     /// Register `did` as a LOCAL, ALLOW_ALL account on the running
@@ -1422,8 +1566,11 @@ impl TestMediatorHandle {
 
     /// Generate a fresh `did:peer:2.*` whose DIDComm service URI is
     /// this mediator's DID, register it as a LOCAL ALLOW_ALL account,
-    /// insert its secrets into the mediator's resolver, and return
-    /// the user.
+    /// insert its secrets into the client-side resolver
+    /// ([`Self::secrets_resolver`]; the mediator's own resolver only
+    /// under [`TestMediatorBuilder::share_secrets`]), and return the
+    /// user. [`TestEnvironment::add_user`] does the same for its SDK's
+    /// resolver.
     ///
     /// The post-spawn counterpart to [`TestMediator::with_users`].
     /// Use this when a test needs to add participants incrementally
@@ -1462,7 +1609,9 @@ impl TestMediatorHandle {
         )
         .map_err(|e| TestMediatorError::DidGeneration(e.to_string()))?;
 
-        self.secrets_resolver.insert_vec(&secrets).await;
+        // Client-side only (the same resolver as the mediator's under
+        // `share_secrets`).
+        self.client_resolver.insert_vec(&secrets).await;
         register_local_did_with_acl(&self.store, &did, &acls).await?;
 
         Ok(TestMediatorUser {

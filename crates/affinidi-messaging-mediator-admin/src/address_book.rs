@@ -100,15 +100,53 @@ impl AddressBook {
 
     /// Write the saved entries to `path`, creating its directory if needed.
     /// Application-supplied names are not written.
+    ///
+    /// The write is atomic: the book goes to a temporary file beside `path`,
+    /// is flushed to disk, and is then renamed over it, so a crash mid-save
+    /// leaves the old book whole. On Unix the file is created at mode `0600`:
+    /// it maps account hashes back to DIDs, which the mediator itself never
+    /// holds.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent()
-            && !dir.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(dir)?;
-        }
+        use std::io::Write;
+
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => {
+                std::fs::create_dir_all(dir)?;
+                dir
+            }
+            _ => Path::new("."),
+        };
         let text = serde_json::to_string_pretty(&self.entries)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, text + "\n")
+
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".{}.tmp", std::process::id()));
+        let tmp = dir.join(tmp_name);
+
+        // A leftover from a crashed save by a process with the same id.
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = (|| {
+            let mut file = options.open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// Name `did` (or a bare account hash). Naming an account again renames
@@ -247,6 +285,43 @@ mod tests {
                 .entries()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_replaces_the_file_whole_and_private() {
+        let dir = std::env::temp_dir().join(format!("ab-save-{}", std::process::id()));
+        let path = dir.join("book.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[]\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let mut book = AddressBook::new();
+        book.insert(DID, "alice");
+        book.save(&path).unwrap();
+
+        assert_eq!(
+            AddressBook::load(&path)
+                .unwrap()
+                .name_of(&sha256::digest(DID)),
+            Some("alice")
+        );
+        // Nothing but the book is left beside it.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("book.json")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
