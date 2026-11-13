@@ -239,6 +239,79 @@ async fn a_mediator_code_is_sent_as_a_standard_code_and_kept_in_details() {
     );
 }
 
+/// Over REST the refusal document is stored for the sender, and the POST's
+/// answer names it (`Stored`), as it names a response: that id is how a
+/// REST client collects either (`affinidi-messaging-sdk` from 0.46.3; 0.46.2
+/// asked for the request's own digest and so found neither). (TSP over REST
+/// collects its reply from the inbox by thread id instead:
+/// `over_tsp_a_refusal_is_sealed_back_as_a_trust_task_error`.)
+#[tokio::test]
+async fn over_rest_the_refusal_is_named_in_the_posts_answer() {
+    use affinidi_messaging_sdk::messages::GetMessagesRequest;
+
+    init_tracing();
+    let env = env().await;
+    // No websocket: the SDK sends over REST.
+    let member = env.add_user("member").await.expect("add user");
+    let someone = env.add_user("someone").await.expect("add user");
+    let doc = request(
+        &env,
+        &someone,
+        ADMIN_REVOKE_ALL,
+        json!({ "did": member.did, "epoch": 0 }),
+        true,
+    )
+    .await;
+    let mediator_did = env.mediator.did().to_string();
+    let secs = chrono::Utc::now().timestamp() as u64;
+    let msg = Message::build(
+        format!("urn:uuid:{}", Uuid::new_v4()),
+        ENVELOPE_TYPE.to_string(),
+        doc.clone(),
+    )
+    .to(mediator_did.clone())
+    .from(someone.did.clone())
+    .created_time(secs)
+    .expires_time(secs + 60)
+    .finalize();
+    let msg_id = msg.id.clone();
+    let (packed, _) = env
+        .atm
+        .pack_encrypted(&msg, &mediator_did, Some(&someone.did), None)
+        .await
+        .expect("authcrypt");
+    let answer = env
+        .atm
+        .send_message(&someone.profile, &packed, &msg_id, false, false)
+        .await
+        .expect("the POST is answered, not refused");
+    let SendMessageResponse::RestAPI(answer) = answer else {
+        panic!("a REST answer: {answer:?}");
+    };
+    let stored = answer["data"]["Stored"]["messages"]
+        .as_array()
+        .expect("the answer names what was stored");
+    assert_eq!(stored.len(), 1, "{answer:#}");
+    assert_eq!(stored[0][0], someone.did.as_str(), "stored for the sender");
+    let id = stored[0][1].as_str().expect("its id").to_string();
+
+    let fetched = env
+        .atm
+        .get_messages(
+            &someone.profile,
+            &GetMessagesRequest {
+                message_ids: vec![id],
+                delete: true,
+            },
+        )
+        .await
+        .expect("get");
+    let packed_reply = fetched.success[0].msg.as_ref().expect("the stored reply");
+    let (reply, _) = env.atm.unpack(packed_reply).await.expect("unpack");
+    let p = error_for(&env, &reply, &doc);
+    assert_eq!(p["code"], "permissionDenied", "{p:#}");
+}
+
 /// The refusal of `messaging/mux/ack` is pushed to the connection like its
 /// answer, never stored: a stored one would need acknowledging in turn.
 #[tokio::test]
