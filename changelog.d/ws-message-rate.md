@@ -4,8 +4,16 @@
   WebSocket is now metered per socket, at the same rate as HTTP requests:
   `limits.ws_messages_per_second` and `limits.ws_message_burst` (new) inherit
   `rate_limit_per_ip` / `rate_limit_burst` (100 a second, burst 50, by
-  default) when unset; set them to override, `0` = unlimited. Ping, pong and
-  close frames are not counted.
+  default) when unset; set them to override. If the per-IP value is `0`
+  (per-IP limiting off, as is usual behind a load balancer) the built-in
+  100 / 50 apply instead, so turning per-IP limiting off never turns this off.
+  Only an explicit `ws_messages_per_second = "0"` disables it, and the
+  mediator warns at startup when it is off. Ping, pong and close frames are
+  not counted.
+- A `ws_messages_per_second`, `ws_message_burst` or
+  `ws_message_throttle_close_secs` value that is not a whole number refuses to
+  start with a configuration error naming the key, rather than being replaced
+  by a guess.
 - When the per-DID limit (`limits.did_rate_limit_per_second` /
   `did_rate_limit_burst`, off by default) is enabled, each WebSocket message
   is also charged, exactly as an HTTP request is, to the sender's DID, so a
@@ -39,6 +47,6 @@ socket's rate — should pace their sends or reconnect with backoff after a
 1008, and operators with such clients should set
 `limits.ws_messages_per_second` / `ws_message_burst` (or set
 `ws_message_throttle_close_secs = 0` to slow without closing) before
-upgrading. A deployment that set `rate_limit_per_ip = 0` gets no per-socket
-message limit unless it sets these keys. With `did_rate_limit_per_second`
+upgrading. This includes deployments with `rate_limit_per_ip = 0`: they get
+the built-in 100 / 50 unless they set these keys. With `did_rate_limit_per_second`
 enabled, WebSocket messages now count against it.

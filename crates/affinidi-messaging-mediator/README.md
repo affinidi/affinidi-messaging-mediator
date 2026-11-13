@@ -291,8 +291,11 @@ direct messaging only, no relay or invites.
 
 Messages on an authenticated WebSocket are metered per socket at the same rate
 as HTTP requests: unless `[limits] ws_messages_per_second` / `ws_message_burst`
-are set (`0` = unlimited), each socket inherits `rate_limit_per_ip` /
-`rate_limit_burst` (100 a second, burst 50, by default). When the per-DID limit
+are set, each socket inherits `rate_limit_per_ip` / `rate_limit_burst` (100 a
+second, burst 50, by default). Turning per-IP limiting off (`0`, common behind
+a load balancer) does not turn this off: the built-in 100 / 50 apply instead.
+Only an explicit `ws_messages_per_second = "0"` disables it (warned at
+startup), and an unreadable value refuses to start. When the per-DID limit
 (`did_rate_limit_per_second`) is enabled, each message is also charged to the
 sender's DID, shared across all of its sockets. A message over the rate is not
 dropped: the mediator stops reading the socket until it is due, and a socket

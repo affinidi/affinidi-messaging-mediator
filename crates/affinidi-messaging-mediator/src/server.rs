@@ -807,6 +807,11 @@ pub async fn serve_internal(
             config.limits.ws_message_burst,
             config.limits.ws_message_throttle_close_secs,
         );
+    } else {
+        warn!(
+            "WebSocket message rate limiting is OFF (limits.ws_messages_per_second = 0): \
+             messages on an authenticated WebSocket are not rate limited per socket."
+        );
     }
 
     let mediator_did = config.mediator_did.clone();

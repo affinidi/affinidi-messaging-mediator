@@ -106,21 +106,25 @@ pub struct LimitsConfig {
     /// Every inbound text or binary frame after the upgrade is one message;
     /// control frames are not counted. A socket over its rate is read more
     /// slowly (the mediator stops reading until the next message is due).
-    /// 0 = unlimited. When the configuration leaves it unset it inherits
-    /// [`rate_limit_per_ip`](Self::rate_limit_per_ip), so WebSocket messages
-    /// are held to the same rate as HTTP requests.
+    /// Only an explicit 0 turns it off. When the configuration leaves it unset
+    /// it inherits [`rate_limit_per_ip`](Self::rate_limit_per_ip), so
+    /// WebSocket messages are held to the same rate as HTTP requests — unless
+    /// that is 0 (per-IP limiting off, as is usual behind a load balancer),
+    /// when the built-in 100 applies instead: switching per-IP limiting off
+    /// never switches this off with it. An unreadable value refuses to start.
     #[serde(default = "defaults::ws_messages_per_second")]
     pub ws_messages_per_second: u32,
     /// Messages an authenticated WebSocket may send back-to-back above
     /// [`ws_messages_per_second`](Self::ws_messages_per_second). 0 is read as 1.
     /// When the configuration leaves it unset it inherits
-    /// [`rate_limit_burst`](Self::rate_limit_burst).
+    /// [`rate_limit_burst`](Self::rate_limit_burst) if that is above 0, and is
+    /// otherwise the built-in 50. An unreadable value refuses to start.
     #[serde(default = "defaults::ws_message_burst")]
     pub ws_message_burst: u32,
     /// Seconds an authenticated WebSocket may stay continuously over its
     /// message rate (including the per-DID rate, when enabled) before the
     /// mediator closes it with 1008. 0 = never close; the socket is only
-    /// slowed.
+    /// slowed. An unreadable value refuses to start.
     #[serde(default = "defaults::ws_message_throttle_close_secs")]
     pub ws_message_throttle_close_secs: u64,
     /// Requests per second `/metrics` answers, across all callers. Must be > 0.
@@ -457,6 +461,56 @@ where
     Ok(parsed)
 }
 
+/// The WebSocket message rate: `(ws_messages_per_second, ws_message_burst,
+/// ws_message_throttle_close_secs)`.
+///
+/// This limit is never switched off implicitly. An unset rate or burst
+/// inherits the per-IP HTTP value (`rate_limit_per_ip` / `rate_limit_burst`)
+/// only when that is above 0, and otherwise takes the built-in default; only
+/// an explicit `0` turns the rate off. A value that cannot be read refuses to
+/// start rather than being guessed at, since a guess could turn the limit off
+/// or make it far looser than intended.
+fn ws_message_limits(raw: &LimitsConfigRaw) -> Result<(u32, u32, u64), MediatorError> {
+    fn explicit<T: std::str::FromStr>(
+        field: &str,
+        value: &str,
+    ) -> Result<Option<T>, MediatorError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value.parse().map(Some).map_err(|_| {
+            MediatorError::ConfigError(
+                crate::common::error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!(
+                    "limits.{field} must be a whole number of 0 or more (0 = off); got {value:?}"
+                ),
+            )
+        })
+    }
+    let inherited = |value: &str, default: u32| -> u32 {
+        match value.trim().parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => default,
+        }
+    };
+    let rate = match explicit("ws_messages_per_second", &raw.ws_messages_per_second)? {
+        Some(rate) => rate,
+        None => inherited(&raw.rate_limit_per_ip, defaults::ws_messages_per_second()),
+    };
+    let burst = match explicit("ws_message_burst", &raw.ws_message_burst)? {
+        Some(burst) => burst,
+        None => inherited(&raw.rate_limit_burst, defaults::ws_message_burst()),
+    };
+    let close_secs = explicit(
+        "ws_message_throttle_close_secs",
+        &raw.ws_message_throttle_close_secs,
+    )?
+    .unwrap_or_else(defaults::ws_message_throttle_close_secs);
+    Ok((rate, burst, close_secs))
+}
+
 const DEFAULT_WS_PING_INTERVAL_SECS: u64 = 30;
 const DEFAULT_WS_PONG_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_WS_WRITE_TIMEOUT_SECS: u64 = 30;
@@ -517,20 +571,9 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
             );
         };
 
-        // The WebSocket message rate inherits the per-IP HTTP rate and burst
-        // when it is not set, and falls back to them when it cannot be read.
-        let per_ip_rate: u32 = raw.rate_limit_per_ip.trim().parse().unwrap_or(100);
-        let per_ip_burst: u32 = raw.rate_limit_burst.trim().parse().unwrap_or(50);
-        let inherit = |field: &str, value: &str, inherited: u32| -> u32 {
-            let value = value.trim();
-            if value.is_empty() {
-                return inherited;
-            }
-            value.parse().unwrap_or_else(|_| {
-                warn_default(field, &inherited.to_string());
-                inherited
-            })
-        };
+        // The WebSocket message rate: see `ws_message_limits`.
+        let (ws_messages_per_second, ws_message_burst, ws_message_throttle_close_secs) =
+            ws_message_limits(&raw)?;
 
         let secs = |field: &str, value: &str, default: u64| -> u64 {
             value.parse().unwrap_or_else(|_| {
@@ -715,20 +758,9 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 &raw.metrics_requests_per_second,
                 defaults::metrics_requests_per_second(),
             )?,
-            ws_messages_per_second: inherit(
-                "ws_messages_per_second",
-                &raw.ws_messages_per_second,
-                per_ip_rate,
-            ),
-            ws_message_burst: inherit("ws_message_burst", &raw.ws_message_burst, per_ip_burst),
-            ws_message_throttle_close_secs: raw
-                .ws_message_throttle_close_secs
-                .trim()
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default("ws_message_throttle_close_secs", "10");
-                    defaults::ws_message_throttle_close_secs()
-                }),
+            ws_messages_per_second,
+            ws_message_burst,
+            ws_message_throttle_close_secs,
             ws_ping_interval_secs,
             ws_pong_timeout_secs,
             ws_write_timeout_secs,
@@ -988,9 +1020,9 @@ mod tests {
             relay_frame_burst: "100".to_string(),
             relay_bytes_per_second: "4194304".to_string(),
             metrics_requests_per_second: "5".to_string(),
-            ws_messages_per_second: "fast".to_string(),
-            ws_message_burst: "-3".to_string(),
-            ws_message_throttle_close_secs: "later".to_string(),
+            ws_messages_per_second: String::new(),
+            ws_message_burst: String::new(),
+            ws_message_throttle_close_secs: "10".to_string(),
             ws_ping_interval_secs: "soon".to_string(),
             ws_pong_timeout_secs: "30".to_string(),
             ws_write_timeout_secs: "-1".to_string(),
@@ -1001,8 +1033,8 @@ mod tests {
         assert_eq!(limits.attachments_max_count, 20);
         assert_eq!(limits.crypto_operations_per_message, 1000);
         assert_eq!(limits.relay_connections_per_ip, 10);
-        // An unreadable WebSocket message rate falls back to the per-IP HTTP
-        // rate and burst ("100" / "50" here).
+        // Unset, the WebSocket message rate inherits the per-IP HTTP rate and
+        // burst ("100" / "50" here).
         assert_eq!(limits.ws_messages_per_second, 100);
         assert_eq!(limits.ws_message_burst, 50);
         assert_eq!(limits.ws_message_throttle_close_secs, 10);
@@ -1011,6 +1043,108 @@ mod tests {
         assert_eq!(limits.ws_ping_interval_secs, 30);
         assert_eq!(limits.ws_pong_timeout_secs, 60);
         assert_eq!(limits.ws_write_timeout_secs, 30);
+    }
+
+    /// Turning per-IP limiting off (common behind a load balancer) does not
+    /// turn the WebSocket message rate off with it; only an explicit 0 does.
+    #[test]
+    fn the_websocket_message_rate_is_never_switched_off_implicitly() {
+        let raw: LimitsConfigRaw = toml::from_str(
+            r#"
+            attachments_max_count = "20"
+            crypto_operations_per_message = "1000"
+            deleted_messages = "100"
+            forward_task_queue = "50000"
+            http_size = "10485760"
+            listed_messages = "100"
+            local_max_acl = "1000"
+            message_expiry_seconds = "604800"
+            message_size = "1048576"
+            queued_send_messages_soft = "2000"
+            queued_send_messages_hard = "10000"
+            queued_receive_messages_soft = "200"
+            queued_receive_messages_hard = "1000"
+            to_keys_per_recipient = "100"
+            to_recipients = "100"
+            ws_size = "10485760"
+            access_list_limit = "1000"
+            oob_invite_ttl = "86400"
+            rate_limit_per_ip = "0"
+            rate_limit_burst = "0"
+            "#,
+        )
+        .unwrap();
+
+        // Per-IP off, WebSocket keys unset: the built-in defaults apply.
+        let limits = LimitsConfig::try_from(raw.clone()).unwrap();
+        assert_eq!(limits.rate_limit_per_ip, 0);
+        assert_eq!(limits.ws_messages_per_second, 100);
+        assert_eq!(limits.ws_message_burst, 50);
+        assert_eq!(limits.ws_message_throttle_close_secs, 10);
+
+        // An unreadable per-IP value is not inherited either.
+        let mut unreadable = raw.clone();
+        unreadable.rate_limit_per_ip = "lots".to_string();
+        let limits = LimitsConfig::try_from(unreadable).unwrap();
+        assert_eq!(limits.ws_messages_per_second, 100);
+
+        // Only an explicit 0 turns the WebSocket rate off.
+        let mut off = raw.clone();
+        off.ws_messages_per_second = "0".to_string();
+        assert_eq!(
+            LimitsConfig::try_from(off).unwrap().ws_messages_per_second,
+            0
+        );
+    }
+
+    /// An unreadable WebSocket message limit refuses to start, naming the key,
+    /// rather than being guessed at.
+    #[test]
+    fn an_unreadable_websocket_message_limit_refuses_to_start() {
+        let base = LimitsConfigRaw {
+            ws_messages_per_second: String::new(),
+            ws_message_burst: String::new(),
+            ws_message_throttle_close_secs: "10".to_string(),
+            ..toml::from_str::<LimitsConfigRaw>(
+                r#"
+                attachments_max_count = "20"
+                crypto_operations_per_message = "1000"
+                deleted_messages = "100"
+                forward_task_queue = "50000"
+                http_size = "10485760"
+                listed_messages = "100"
+                local_max_acl = "1000"
+                message_expiry_seconds = "604800"
+                message_size = "1048576"
+                queued_send_messages_soft = "2000"
+                queued_send_messages_hard = "10000"
+                queued_receive_messages_soft = "200"
+                queued_receive_messages_hard = "1000"
+                to_keys_per_recipient = "100"
+                to_recipients = "100"
+                ws_size = "10485760"
+                access_list_limit = "1000"
+                oob_invite_ttl = "86400"
+                "#,
+            )
+            .unwrap()
+        };
+        assert!(LimitsConfig::try_from(base.clone()).is_ok());
+        for (field, bad) in [
+            ("ws_messages_per_second", "fast"),
+            ("ws_messages_per_second", "-1"),
+            ("ws_message_burst", "1.5"),
+            ("ws_message_throttle_close_secs", "later"),
+        ] {
+            let mut raw = base.clone();
+            match field {
+                "ws_messages_per_second" => raw.ws_messages_per_second = bad.to_string(),
+                "ws_message_burst" => raw.ws_message_burst = bad.to_string(),
+                _ => raw.ws_message_throttle_close_secs = bad.to_string(),
+            }
+            let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
+            assert!(err.contains(field), "{field}={bad}: {err}");
+        }
     }
 
     #[test]

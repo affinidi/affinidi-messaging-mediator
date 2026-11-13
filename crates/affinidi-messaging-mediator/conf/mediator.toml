@@ -666,9 +666,13 @@ oob_invite_ttl = "86400"
 # did_rate_limit_burst = "10"
 
 ### Env: LIMIT_WS_MESSAGES_PER_SECOND
-### Messages per second read from one authenticated WebSocket (0 = unlimited).
+### Messages per second read from one authenticated WebSocket.
 ### Commented out = inherit rate_limit_per_ip, so WebSocket messages are held to
-### the same rate as HTTP requests (100 by default); set it to override.
+### the same rate as HTTP requests (100 by default). If rate_limit_per_ip is 0
+### (per-IP limiting off, e.g. behind a load balancer) the built-in 100 applies
+### instead: turning per-IP limiting off does not turn this off. Only an
+### explicit "0" disables it, and the mediator warns at startup when it is off.
+### A value that is not a whole number refuses to start.
 ### Every text or binary frame after the upgrade is one message; ping, pong and
 ### close frames are not counted. Applies to every authenticated socket,
 ### including DID-multiplexing connections (whose members' messages share the
@@ -688,7 +692,8 @@ oob_invite_ttl = "86400"
 ### Env: LIMIT_WS_MESSAGE_BURST
 ### Messages an authenticated WebSocket may send back-to-back above
 ### ws_messages_per_second (token-bucket depth). Commented out = inherit
-### rate_limit_burst (50 by default); set it to override.
+### rate_limit_burst when that is above 0, otherwise the built-in 50. A value
+### that is not a whole number refuses to start.
 # ws_message_burst = "50"
 
 ### Env: LIMIT_WS_MESSAGE_THROTTLE_CLOSE_SECS
@@ -697,7 +702,7 @@ oob_invite_ttl = "86400"
 ### enabled) before it is closed with 1008. The clock starts at the first
 ### message that has to wait and resets when a message arrives within the rate,
 ### so a one-off burst is only slowed. 0 = never close (only slow).
-### Default 10.
+### Default 10. A value that is not a whole number refuses to start.
 # ws_message_throttle_close_secs = "10"
 
 ### Env: LIMIT_WS_SEND_BUFFER
