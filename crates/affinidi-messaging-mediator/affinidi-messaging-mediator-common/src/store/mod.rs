@@ -219,7 +219,7 @@ pub fn purge_left_messages(did_hash: &str, report: &PurgeReport) -> Result<(), M
         return Ok(());
     }
     Err(MediatorError::DatabaseError(
-        14,
+        error_codes::DB_OPERATION_ERROR,
         "NA".into(),
         format!(
             "Account ({did_hash}) is blocked but not removed: {} of its queued messages could not be deleted; retry the removal",
@@ -403,7 +403,7 @@ pub fn account_gone(session_id: &str) -> MediatorError {
 /// client's token outlived its session and it must authenticate again.
 pub fn session_not_found(session_id: &str) -> MediatorError {
     MediatorError::Unauthorized(
-        21,
+        error_codes::AUTH_SESSION_INVALID,
         session_id.into(),
         "Session not found or expired; please re-authenticate".into(),
     )
@@ -413,7 +413,13 @@ pub fn session_not_found(session_id: &str) -> MediatorError {
 /// `get_session`: the session is over, and the client must authenticate
 /// again. Anything else from `get_session` is a storage failure.
 pub fn is_session_over(err: &MediatorError) -> bool {
-    matches!(err, MediatorError::Unauthorized(20 | 21, ..))
+    matches!(
+        err,
+        MediatorError::Unauthorized(
+            error_codes::SESSION_INVALID_STATE | error_codes::AUTH_SESSION_INVALID,
+            ..
+        )
+    )
 }
 
 /// The error `update_session_authenticated` returns when the challenge
@@ -2483,7 +2489,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // atomic rename override this (the delete below and a second
         // caller's read can still interleave here).
         let mut session = match self.get_session(old_session_id, did).await {
-            Err(MediatorError::Unauthorized(21, ..)) => {
+            Err(MediatorError::Unauthorized(error_codes::AUTH_SESSION_INVALID, ..)) => {
                 return Err(session_not_awaiting_answer(old_session_id));
             }
             other => other?,

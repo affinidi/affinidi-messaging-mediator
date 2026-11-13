@@ -326,7 +326,7 @@ pub(crate) async fn read_document(
         "file" => std::fs::read_to_string(path).map_err(|err| {
             error!("Could not read server.did_web_self_hosted ({path}): {err}");
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Could not read server.did_web_self_hosted ({path}): {err}"),
             )
@@ -519,7 +519,7 @@ pub(crate) fn parse_blocked_forwarding_dids(raw: &str) -> Result<Vec<String>, Me
     serde_json::from_str(raw).map_err(|err| {
         error!("Could not parse processors.forwarding.blocked_forwarding_dids. Reason: {err}");
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!(
                 "processors.forwarding.blocked_forwarding_dids = {raw:?} is not valid: expected \

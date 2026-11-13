@@ -65,7 +65,7 @@ pub(crate) async fn run_pending_migrations(
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    crate::error_codes::DB_OPERATION_ERROR,
                     "migrations".into(),
                     &e,
                     format!("Failed to take the migration lock: {e}"),
@@ -76,7 +76,7 @@ pub(crate) async fn run_pending_migrations(
         }
         if std::time::Instant::now() >= deadline {
             return Err(MediatorError::DatabaseError(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "migrations".into(),
                 format!(
                     "Another instance has held the migration lock ({MIGRATION_LOCK_KEY}) for over {}s",
@@ -111,7 +111,7 @@ async fn run_locked(db: &Database, config: &RedisInitConfig) -> Result<(), Media
     let unknown = unknown_applied(&applied, &migrations);
     if !unknown.is_empty() {
         return Err(MediatorError::ConfigError(
-            2,
+            crate::error_codes::DB_CONFIG_INVALID,
             "migrations".into(),
             format!(
                 "The database records schema migration(s) {unknown:?} that this mediator does not know: a newer mediator has migrated it. Run that version (or newer)."

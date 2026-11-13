@@ -203,7 +203,7 @@ async fn retry_or_fail(err: &redis::RedisError, attempt: u32) -> Result<(), Medi
             err
         );
         return Err(MediatorError::DatabaseError(
-            14,
+            crate::error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             format!("Couldn't reach the database after {attempt} attempts: {err}"),
         ));

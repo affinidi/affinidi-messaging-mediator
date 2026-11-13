@@ -82,7 +82,7 @@ impl Database {
             // No such function: no library, or one that predates versions.
             Err(err) if err.to_string().contains("Function not found") => Ok(0),
             Err(err) => Err(MediatorError::database_from_redis(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "Initialization".into(),
                 &err,
                 format!("Couldn't read the stored-function library version: {err}"),

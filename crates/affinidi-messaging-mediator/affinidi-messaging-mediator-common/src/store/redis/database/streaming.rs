@@ -241,7 +241,7 @@ impl Database {
                     response
                 );
                 Err(MediatorError::DatabaseError(
-                    23,
+                    error_codes::DB_PUBSUB_CLEAN_START,
                     "NA".into(),
                     format!("redis fn clean_start_streaming() failed. Response ({response:?})"),
                 ))

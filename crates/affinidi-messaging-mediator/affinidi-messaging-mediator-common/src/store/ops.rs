@@ -331,7 +331,7 @@ pub fn delete_permission_denied(message_hash: &str, request_msg_id: Option<&str>
 pub fn parse_range_bound(bound: &str, is_end: bool) -> Result<(u64, u64), MediatorError> {
     let refuse = || {
         MediatorError::RequestDataError(
-            22,
+            crate::error_codes::DB_METADATA_PARSE_ERROR,
             "NA".into(),
             format!("Invalid message range bound ({bound}): expected -, +, <ms> or <ms>-<seq>"),
         )
