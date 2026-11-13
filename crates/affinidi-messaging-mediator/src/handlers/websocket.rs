@@ -567,7 +567,8 @@ struct ConnectionSlot {
 
 impl ConnectionSlot {
     /// Reserve a place in the global count. `Err` carries the count already
-    /// in use when it is at `max`; the reservation is backed out by then.
+    /// in use when it is at `max` (`0` = no limit); the reservation is backed
+    /// out by then.
     fn acquire(count: &Arc<AtomicUsize>, max: usize) -> Result<Self, usize> {
         let current = count.fetch_add(1, Ordering::Relaxed);
         let slot = Self {
@@ -578,7 +579,8 @@ impl ConnectionSlot {
             per_did: None,
             per_source: None,
         };
-        if current >= max {
+        // 0 is "unlimited", as documented and as the per-DID cap reads it.
+        if max != 0 && current >= max {
             Err(current)
         } else {
             Ok(slot)
@@ -880,12 +882,66 @@ mod close_code {
     /// Policy violation — auth expired, per-DID cap, duplicate displacement.
     pub const POLICY: u16 = 1008;
     /// A message larger than the mediator accepts.
-    #[cfg(feature = "tsp")]
     pub const MESSAGE_TOO_BIG: u16 = 1009;
     /// Unexpected server-side condition.
     pub const SERVER_ERROR: u16 = 1011;
     /// Transient capacity limit — try again later.
     pub const TRY_AGAIN_LATER: u16 = 1013;
+}
+
+/// The close for a socket whose next frame could not be read. A frame over
+/// `limits.ws_size` is refused by the WebSocket layer itself, as a capacity
+/// error: that is 1009, so the client knows the message, not the connection,
+/// was the problem. Anything else is the stream failing (1001).
+///
+/// The error is matched by its text: the WebSocket library behind axum is not
+/// a direct dependency, so its error type cannot be named here.
+fn read_error_close(error: &axum::Error) -> (u16, &'static str) {
+    let mut source: Option<&dyn std::error::Error> = Some(error);
+    while let Some(e) = source {
+        let text = e.to_string();
+        if text.contains("Space limit exceeded") || text.contains("Message too long") {
+            return (close_code::MESSAGE_TOO_BIG, "message too big");
+        }
+        source = e.source();
+    }
+    (close_code::GOING_AWAY, "connection error")
+}
+
+/// Tell a DIDComm client that the message it sent was refused, with the
+/// problem report the error carries (a generic error is only logged).
+///
+/// One path for every frame a DIDComm message can arrive in: a refusal that
+/// is only logged leaves the sender believing its message went (R1.1), and
+/// whether that happens must not depend on Text or Binary framing.
+async fn report_refusal(
+    state: &SharedData,
+    session: &Session,
+    socket: &mut BoundedSocket,
+    error: MediatorError,
+) {
+    warn!("WebSocket inbound error: {}", error);
+    #[cfg(feature = "didcomm")]
+    match error {
+        MediatorError::MediatorError(_, _, msg_id, problem_report, _, log_message) => {
+            match _package_problem_report(state, session, msg_id, *problem_report).await {
+                Ok(msg) => {
+                    warn!(log_message);
+                    if let Err(e) = socket.send(Message::Text(msg.into())).await {
+                        warn!("Failed to send problem report to WebSocket client: {e}");
+                    }
+                }
+                Err(e) => warn!("Error packaging problem report: {:?}", e),
+            }
+        }
+        // A generic error carries no problem report to send.
+        other => warn!("Error processing message: {:?}", other),
+    }
+    #[cfg(not(feature = "didcomm"))]
+    {
+        let _ = (state, session, socket);
+        warn!("Error processing message: {:?}", error);
+    }
 }
 
 /// The close a raw-TSP socket sends when the mediator refuses a message on it.
@@ -1257,6 +1313,13 @@ async fn handle_socket(
                     resync: live_resync.clone(),
                     kind: EntryKind::Direct,
                     slots: mux_slots.clone(),
+                    // A raw-TSP socket answers any notification for its own
+                    // DID by draining its inbox (below), so a redelivery to it
+                    // is one wake-up.
+                    #[cfg(feature = "tsp")]
+                    wake_only: tsp_mode,
+                    #[cfg(not(feature = "tsp"))]
+                    wake_only: false,
                 },
             };
             match streaming.channel.send(start).await {
@@ -1529,7 +1592,21 @@ async fn handle_socket(
                         }
                     };
                     match value { Some(msg) => {
-                        if let Ok(msg) = msg {
+                        let msg = match msg {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                // A frame the socket could not read: over
+                                // `ws_size` (1009, so the client knows to
+                                // send less), or malformed. Either way the
+                                // socket cannot go on, and the reason is
+                                // logged and told rather than read as the
+                                // client leaving.
+                                close_reason = read_error_close(&e);
+                                warn!(code = close_reason.0, "WebSocket read failed; closing: {e}");
+                                break;
+                            }
+                        };
+                        {
                             match msg {
                                 Message::Text(msg) => {
                                     // A `tsp-mux` socket carries binary TSP frames
@@ -1541,11 +1618,6 @@ async fn handle_socket(
                                         close_reason = (close_code::POLICY, "tsp-mux sockets carry TSP frames only");
                                         break;
                                     }
-                                    if msg.len() > state.config.limits.ws_size {
-                                        warn!("Error processing message, the size is too big. limit is {}, message size is {}", state.config.limits.ws_size, msg.len());
-                                        continue;
-                                    }
-
                                     // A relay frame over the socket's budget is
                                     // refused with a negative ack, which sends the
                                     // relaying mediator to its REST fallback (where
@@ -1627,38 +1699,10 @@ async fn handle_socket(
                                         continue;
                                     }
 
-                                    match outcome {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            warn!("WebSocket inbound error: {}", e);
-
-                                            // Send a problem report to the sender
-                                            #[cfg(feature = "didcomm")]
-                                            match e {
-                                                MediatorError::MediatorError(_, _, msg_id, problem_report, _, log_message) => {
-                                                    match  _package_problem_report(&state, &session, msg_id, *problem_report).await {
-                                                        Ok(msg) => {
-                                                            warn!(log_message);
-                                                            if let Err(e) = socket.send(Message::Text(msg.into())).await {
-                                                                warn!("Failed to send message to WebSocket client: {e}");
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("Error packaging problem report: {:?}", e);
-                                                        }
-                                                    }
-                                                },
-                                                other => {
-                                                    // This is a generic error, we don't need to send a problem report
-                                                    warn!("Error processing message: {:?}", other);
-                                                }
-                                            }
-                                            #[cfg(not(feature = "didcomm"))]
-                                            warn!("Error processing message: {:?}", e);
-
-                                            continue;
-                                        }
-                                    };
+                                    if let Err(e) = outcome {
+                                        report_refusal(&state, &session, &mut socket, e).await;
+                                        continue;
+                                    }
                                 }
                                 Message::Ping(_) => {
                                     // Don't need to do anything, the library will automatically respond with a pong
@@ -1679,11 +1723,6 @@ async fn handle_socket(
                                         close_reason = (close_code::POLICY, "relay sockets carry text frames only");
                                         break;
                                     }
-                                    if msg.len() > state.config.limits.ws_size {
-                                        warn!("Error processing message, the size is too big. limit is {}, message size is {}", state.config.limits.ws_size, msg.len());
-                                        continue;
-                                    }
-
                                     // A binary frame leading with the TSP magic byte (0xF8) is a
                                     // TSP message; route it to the TSP handler. Other binary frames
                                     // are UTF-8-decoded and handled as DIDComm exactly as before.
@@ -1725,13 +1764,7 @@ async fn handle_socket(
                                                 break;
                                             }
                                             // A DIDComm socket can carry the problem report itself.
-                                            #[cfg(feature = "didcomm")]
-                                            if let MediatorError::MediatorError(_, _, msg_id, problem_report, _, _) = e
-                                                && let Ok(report) = _package_problem_report(&state, &session, msg_id, *problem_report).await
-                                                && let Err(e) = socket.send(Message::Text(report.into())).await
-                                            {
-                                                warn!("Failed to send problem report to WebSocket client: {e}");
-                                            }
+                                            report_refusal(&state, &session, &mut socket, e).await;
                                         }
                                         continue;
                                     }
@@ -1770,14 +1803,15 @@ async fn handle_socket(
                                     };
 
                                     state.monitor.received(&session.did_hash, Channel::Websocket, Protocol::DidComm, msg.as_bytes());
-                                    match crate::monitor::with_channel(Channel::Websocket, handle_inbound(&state, &session, &msg)).await {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            state.monitor.refused(&session.did_hash, Channel::Websocket, Protocol::DidComm, msg.as_bytes(), &e);
-                                            warn!("WebSocket inbound error: {}", e);
-                                            continue;
-                                        }
-                                    };
+                                    if let Err(e) = crate::monitor::with_channel(Channel::Websocket, handle_inbound(&state, &session, &msg)).await {
+                                        state.monitor.refused(&session.did_hash, Channel::Websocket, Protocol::DidComm, msg.as_bytes(), &e);
+                                        // Told as a Text frame refusal is: a
+                                        // client that frames DIDComm as Binary
+                                        // must not take a refused message for
+                                        // a sent one (R1.1).
+                                        report_refusal(&state, &session, &mut socket, e).await;
+                                        continue;
+                                    }
                                 }
                                 Message::Close(_) => {
                                     debug!("Received close message, closing connection");
@@ -1796,6 +1830,21 @@ async fn handle_socket(
                     if let Some(conn) = &mux_conn {
                         for frame in crate::mux::connection::drain_changes(&state, conn, mux_wire).await {
                             if let Err(e) = socket.send(frame.into()).await {
+                                warn!("Failed to send mux event to WebSocket client: {e}");
+                            }
+                        }
+                    }
+                }
+                // A member's live delivery moved (or came back): recorded on
+                // the connection's slots by the streaming task, so it is never
+                // lost to a full queue, and reported here in order.
+                _ = async { match &mux_slots { Some(s) => s.member_changed.notified().await, None => std::future::pending().await } }, if mux_conn.is_some() => {
+                    woke = tokio::time::Instant::now();
+                    if let (Some(conn), Some(slots)) = (&mux_conn, &mux_slots) {
+                        for change in slots.take_member_changes() {
+                            if let Some(frame) = crate::mux::connection::on_member_change(&state, conn, change, mux_wire).await
+                                && let Err(e) = socket.send(frame.into()).await
+                            {
                                 warn!("Failed to send mux event to WebSocket client: {e}");
                             }
                         }
@@ -3669,6 +3718,19 @@ mod connection_slot_tests {
         assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 
+    /// #147: `max_websocket_connections = 0` is "unlimited", as documented,
+    /// not "refuse every socket".
+    #[tokio::test]
+    async fn a_limit_of_zero_admits_every_socket() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let slots: Vec<_> = (0..3)
+            .map(|_| ConnectionSlot::acquire(&count, 0).expect("0 is no limit"))
+            .collect();
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        drop(slots);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn a_dropped_slot_releases_everything_it_took() {
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
@@ -3769,5 +3831,28 @@ mod connection_slot_tests {
         settle().await;
         assert_eq!(count.load(Ordering::Relaxed), 0);
         assert_eq!(closes(&database).await, (0, 0));
+    }
+}
+
+/// #139: a frame the socket could not read closes it with a code that says
+/// why.
+#[cfg(test)]
+mod read_error_tests {
+    use super::read_error_close;
+    use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError};
+
+    #[test]
+    fn an_oversized_frame_closes_with_1009() {
+        let e = axum::Error::new(WsError::Capacity(CapacityError::MessageTooLong {
+            size: 2,
+            max_size: 1,
+        }));
+        assert_eq!(read_error_close(&e), (1009, "message too big"));
+    }
+
+    #[test]
+    fn any_other_read_error_closes_as_going_away() {
+        let e = axum::Error::new(WsError::ConnectionClosed);
+        assert_eq!(read_error_close(&e).0, 1001);
     }
 }

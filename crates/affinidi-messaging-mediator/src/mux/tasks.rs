@@ -525,15 +525,20 @@ pub async fn attach(
         let admitted = match verify_attach(ctx, &ident, raw, max_attach_lifetime_secs).await {
             Ok((member, suspended)) => {
                 changed.suspended.extend(suspended);
-                conn.session.lock().await.admit(member)
+                let mut s = conn.session.lock().await;
+                let before = s
+                    .get(&member.did_hash)
+                    .map(|m| super::registry::wants_live(&m.scope));
+                s.admit(member).map(|m| (m, before))
             }
             Err(e) => Err(e),
         };
         results.push(match admitted {
-            Ok(member) => {
-                if let Some(streaming) = streaming {
-                    conn.register_member(streaming, &member).await;
-                }
+            Ok((member, before)) => {
+                // A renewal of a member the connection already carries is
+                // not a new registration: only a change in whether it wants
+                // live delivery reaches the streaming task.
+                conn.reconcile_member(streaming, &member, before).await;
                 // Reported to the principal like any join (spec event rule 5).
                 conn.joined.lock().await.push(member.clone());
                 conn.notify.notify_one();
