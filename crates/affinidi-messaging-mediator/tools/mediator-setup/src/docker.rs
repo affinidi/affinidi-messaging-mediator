@@ -78,7 +78,7 @@ CMD ["mediator", "-c", "{CONTAINER_CONFIG_DIR}/{config_name}"]
 
     // Build context: the workspace root, relative to the compose file.
     let output_abs = absolute(output_dir);
-    let workspace = crate::find_workspace_root();
+    let workspace = crate::install::find_workspace_root();
     let (context, dockerfile_in_context) = match &workspace {
         Some(root) => (
             relative_path(&output_abs, root),

@@ -190,7 +190,7 @@ pub async fn store_vta_session(
     // back to this cache on any failure, so first boot survives VTA
     // unavailability. TTL `0` = no expiry: the runtime overwrites it with a
     // fresh snapshot on every successful VTA contact.
-    let cached_keys = match crate::build_did_secrets_bundle(session) {
+    let cached_keys = match crate::provision::mint::build_did_secrets_bundle(session) {
         Some(bundle) => {
             let json = serde_json::to_value(&bundle)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize cached VTA bundle: {e}"))?;
