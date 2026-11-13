@@ -44,7 +44,10 @@ wait_healthy() {
 echo "==> first start: build, generate an identity, start"
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up -d --build
-$COMPOSE logs setup | grep -q "generating a new mediator identity" || {
+# Logs are captured first: `logs | grep -q` under pipefail fails whenever grep
+# exits early and `logs` takes the SIGPIPE, even on a match.
+setup_log="$($COMPOSE logs --no-color setup)"
+grep -q "generating a new mediator identity" <<<"$setup_log" || {
   echo "ERROR: setup did not generate an identity" >&2
   $COMPOSE logs setup >&2
   exit 1
@@ -57,7 +60,8 @@ echo "    $first_did" | cut -c1-80
 echo "==> restart: the identity in the volume is reused"
 $COMPOSE down
 $COMPOSE up -d
-$COMPOSE logs setup | grep -q "reusing that identity" || {
+setup_log="$($COMPOSE logs --no-color setup)"
+grep -q "reusing that identity" <<<"$setup_log" || {
   echo "ERROR: setup did not reuse the existing identity" >&2
   $COMPOSE logs setup >&2
   exit 1

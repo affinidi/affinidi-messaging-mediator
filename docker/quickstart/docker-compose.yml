@@ -68,6 +68,8 @@ services:
 
   mediator:
     image: messaging-mediator:quickstart
+    # Built by the `setup` service above; never pulled from a registry.
+    pull_policy: never
     working_dir: /etc/mediator
     command: ["-c", "conf/mediator.toml"]
     volumes:
