@@ -10,6 +10,11 @@
   Only an explicit `ws_messages_per_second = "0"` disables it, and the
   mediator warns at startup when it is off. Ping, pong and close frames are
   not counted.
+- The budget is per socket, not per DID: a DID-multiplexing connection has
+  one budget shared by every DID it carries, however many there are. Raise
+  `ws_messages_per_second` / `ws_message_burst` for busy multiplexing
+  clients, and watch `rate_limited_total{scope="ws"}` to see when they are
+  being slowed.
 - A `ws_messages_per_second`, `ws_message_burst` or
   `ws_message_throttle_close_secs` value that is not a whole number refuses to
   start with a configuration error naming the key, rather than being replaced

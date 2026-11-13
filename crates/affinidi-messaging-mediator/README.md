@@ -295,7 +295,10 @@ are set, each socket inherits `rate_limit_per_ip` / `rate_limit_burst` (100 a
 second, burst 50, by default). Turning per-IP limiting off (`0`, common behind
 a load balancer) does not turn this off: the built-in 100 / 50 apply instead.
 Only an explicit `ws_messages_per_second = "0"` disables it (warned at
-startup), and an unreadable value refuses to start. When the per-DID limit
+startup), and an unreadable value refuses to start. The budget is per socket:
+a DID-multiplexing connection has one budget shared by all the DIDs it
+carries, so raise `ws_messages_per_second` / `ws_message_burst` for busy
+multiplexing clients and watch `rate_limited_total{scope="ws"}`. When the per-DID limit
 (`did_rate_limit_per_second`) is enabled, each message is also charged to the
 sender's DID, shared across all of its sockets. A message over the rate is not
 dropped: the mediator stops reading the socket until it is due, and a socket

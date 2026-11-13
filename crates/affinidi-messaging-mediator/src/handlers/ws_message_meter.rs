@@ -5,8 +5,9 @@
 //!
 //! - **the socket's own** — `limits.ws_messages_per_second`, with
 //!   `limits.ws_message_burst` above it (on by default; unset, they inherit
-//!   the per-IP HTTP limits `rate_limit_per_ip` / `rate_limit_burst`, 100 / 50;
-//!   `0` = unlimited);
+//!   the per-IP HTTP limits when those are above 0, else 100 / 50; only an
+//!   explicit `0` turns it off). One budget per socket, however many DIDs it
+//!   carries: a DID-multiplexing connection's members all share it;
 //! - **the DID's** — the per-DID limiter (`limits.did_rate_limit_per_second`)
 //!   that also meters authenticated HTTP requests, when it is enabled. One DID
 //!   holding many sockets shares one DID budget across all of them.

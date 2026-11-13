@@ -674,9 +674,11 @@ oob_invite_ttl = "86400"
 ### explicit "0" disables it, and the mediator warns at startup when it is off.
 ### A value that is not a whole number refuses to start.
 ### Every text or binary frame after the upgrade is one message; ping, pong and
-### close frames are not counted. Applies to every authenticated socket,
-### including DID-multiplexing connections (whose members' messages share the
-### one socket's rate); anonymous inter-mediator relay sockets have their own
+### close frames are not counted. Applies to every authenticated socket. One
+### socket = one budget, however many DIDs it carries: a DID-multiplexing
+### connection's members all share it, so raise this (and ws_message_burst) for
+### busy multiplexing clients and watch `rate_limited_total{scope="ws"}`.
+### Anonymous inter-mediator relay sockets have their own
 ### budget (relay_frames_per_second). The mediator's own DID and admin_did are
 ### not metered.
 ### Over the rate, nothing is dropped: the mediator holds the message and stops
