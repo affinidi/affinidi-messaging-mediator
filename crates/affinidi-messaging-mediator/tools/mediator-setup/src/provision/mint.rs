@@ -6,7 +6,7 @@ use crate::app::{AdminMode, DidMethod};
 use crate::consts::*;
 use crate::provision::MintedArtefacts;
 use crate::provision::backend::validate_operating_secrets;
-use crate::{exit, generators, recipe, vta};
+use crate::{config_writer, exit, generators, recipe, vta};
 
 /// Project a [`vta_sdk::sealed_transfer::template_bootstrap::DidKeyMaterialV2`]
 /// onto the `Secret` shape the mediator-common secrets store expects.
@@ -145,20 +145,6 @@ pub(crate) fn build_did_secrets_bundle(
 
     // AdminOnly — no VTA-provisioned integration DID to cache.
     None
-}
-
-/// Drop any HTTP path from a URL, returning `<scheme>://<host>[:<port>]`.
-/// Used to derive the did:webvh DID identifier from the operator's full
-/// public URL (the trailing `/mediator/v1` would otherwise get baked into
-/// the DID and route the resolver away from `/.well-known/did.jsonl`).
-pub(crate) fn strip_url_path_owned(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut u) => {
-            u.set_path("");
-            u.to_string().trim_end_matches('/').to_string()
-        }
-        Err(_) => raw.to_string(),
-    }
 }
 
 /// Glue a base URL and an HTTP path prefix together with exactly one
@@ -351,7 +337,7 @@ pub(crate) async fn mint_did_material(
             } else {
                 config.public_url.clone()
             };
-            let address = strip_url_path_owned(&raw_url);
+            let address = config_writer::strip_url_path(&raw_url);
             let service_url = combine_url_prefix(&address, &config.api_prefix);
             let result = generators::did_webvh::generate_did_webvh_as(
                 &address,

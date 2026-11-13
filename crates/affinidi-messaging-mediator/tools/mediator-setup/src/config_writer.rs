@@ -166,10 +166,13 @@ pub fn write_config(
 
 /// Get the config directory from the config path.
 pub(crate) fn config_dir(config: &WizardConfig) -> std::path::PathBuf {
-    Path::new(&config.config_path)
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf()
+    dir_of(Path::new(&config.config_path)).to_path_buf()
+}
+
+/// The directory holding `config_path`, where every file of a setup is
+/// written next to `mediator.toml`.
+pub(crate) fn dir_of(config_path: &Path) -> &Path {
+    config_path.parent().unwrap_or(Path::new("."))
 }
 
 /// Parse the default template and patch in wizard-generated values.
@@ -420,6 +423,21 @@ fn webvh_did_host(did: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+/// Drop any HTTP path from a URL, returning `<scheme>://<host>[:<port>]`.
+/// A did:webvh resolves to `<url>/.well-known/did.jsonl`, so a trailing
+/// `/mediator/v1` on the operator's public URL must not reach the DID
+/// identifier or the VTA's `CreateDidWebvhRequest.url`. Unparseable input
+/// is returned unchanged.
+pub(crate) fn strip_url_path(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) => {
+            u.set_path("");
+            u.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => raw.to_string(),
     }
 }
 

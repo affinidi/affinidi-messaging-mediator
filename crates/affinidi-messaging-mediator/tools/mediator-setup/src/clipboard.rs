@@ -106,6 +106,15 @@ impl CopyMethod {
     }
 }
 
+/// Copy `text` and describe the outcome for the status line the wizard
+/// shows: "Copied {label} via {method}" or "Clipboard unavailable: …".
+pub fn copy_with_status(text: &str, label: &str) -> String {
+    match copy_to_clipboard(text) {
+        Ok(method) => format!("Copied {label} via {}", method.label()),
+        Err(e) => format!("Clipboard unavailable: {e}"),
+    }
+}
+
 /// Copy `text` to the operator's clipboard, picking OSC 52 or
 /// `arboard` based on whether the wizard appears to be running over
 /// SSH.

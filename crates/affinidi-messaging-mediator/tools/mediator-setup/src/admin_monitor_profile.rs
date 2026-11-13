@@ -61,10 +61,7 @@ pub fn write(
     admin_did: &str,
     admin_secret: &Secret,
 ) -> anyhow::Result<PathBuf> {
-    let dir = Path::new(config_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let out_path = dir.join(PROFILE_FILENAME);
+    let out_path = crate::config_writer::dir_of(Path::new(config_path)).join(PROFILE_FILENAME);
 
     let wire = WireProfile {
         alias: "admin",

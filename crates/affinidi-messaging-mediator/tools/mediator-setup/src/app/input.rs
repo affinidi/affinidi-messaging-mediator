@@ -439,7 +439,8 @@ impl WizardApp {
                 if let Some(DidPhase::EnterCustomUrl) = self.did_phase {
                     let v = self.text_input.value().trim().to_string();
                     if !v.is_empty() {
-                        self.config.vta_webvh_self_host_url = Self::strip_url_path(&v);
+                        self.config.vta_webvh_self_host_url =
+                            crate::config_writer::strip_url_path(&v);
                     }
                     self.config.vta_webvh_server_id = None;
                     self.config.vta_webvh_path = None;

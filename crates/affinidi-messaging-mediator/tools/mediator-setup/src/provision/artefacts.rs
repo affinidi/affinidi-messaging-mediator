@@ -17,10 +17,7 @@ use crate::{
 /// Fatal on failure: `mediator.toml` points `did_web_self_hosted` at this
 /// file, and a mediator whose DID log is missing cannot serve its DID.
 pub(crate) fn write_did_jsonl(config_path: &str, log_content: &str) -> anyhow::Result<PathBuf> {
-    let did_jsonl_path = std::path::Path::new(config_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("did.jsonl");
+    let did_jsonl_path = config_writer::dir_of(Path::new(config_path)).join("did.jsonl");
     // Strict JSON-Lines requires each record to end with `\n`. Some upstream
     // sources (the VTA's `provision.webvh_log()`, the local generator) include
     // a trailing newline already, others don't — normalise to exactly one so
@@ -59,10 +56,7 @@ pub(crate) fn write_did_web_json(
             return None;
         }
     };
-    let did_web_path = std::path::Path::new(config_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("did-web.json");
+    let did_web_path = config_writer::dir_of(Path::new(config_path)).join("did-web.json");
     // did:web documents are public by definition (the operator hosts
     // them at `/.well-known/did.json`), but mirror the owner-only posture
     // of did.jsonl for defence in depth until the operator copies it out.

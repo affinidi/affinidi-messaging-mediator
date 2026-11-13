@@ -354,7 +354,7 @@ impl WizardApp {
                 if self.did_phase == Some(DidPhase::SelectWebvhHost) {
                     let mut opts = Vec::new();
                     let stripped = if self.config.vta_webvh_self_host_url.is_empty() {
-                        Self::strip_url_path(&self.config.public_url)
+                        crate::config_writer::strip_url_path(&self.config.public_url)
                     } else {
                         self.config.vta_webvh_self_host_url.clone()
                     };

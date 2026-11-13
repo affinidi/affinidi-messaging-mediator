@@ -418,38 +418,7 @@ impl WizardApp {
                     Some(m) => m,
                     None => return, // defensive — shouldn't happen after PreflightDone
                 };
-                // Record the choice on state (read by
-                // `start_vta_provision` after the path prompt resolves,
-                // and by the UI if the runner later fails). Serverless
-                // also wipes any stale `webvh_path` from a back-nav.
-                let is_serverless = {
-                    let Some(st_mut) = self.vta_connect.as_mut() else {
-                        return;
-                    };
-                    st_mut.webvh_server_choice = choice.clone();
-                    if choice.is_none() {
-                        st_mut.webvh_path = None;
-                        true
-                    } else {
-                        st_mut.phase = ConnectPhase::EnterWebvhPath;
-                        false
-                    }
-                };
-                if is_serverless {
-                    self.start_vta_provision(rest_url, mediator_did);
-                } else {
-                    // Server-hosted — prompt for an optional path.
-                    // Pre-fill with any value captured on a prior
-                    // attempt (back-nav round-trip) so the operator
-                    // can accept with Enter.
-                    let prefill = self
-                        .vta_connect
-                        .as_ref()
-                        .and_then(|s| s.webvh_path.clone())
-                        .unwrap_or_default();
-                    self.mode = InputMode::TextInput;
-                    self.text_input = Input::new(prefill);
-                }
+                self.commit_webvh_server_choice(choice, rest_url, mediator_did);
             }
             ConnectPhase::Connected => {
                 // Persist the authenticated session so later steps can
@@ -782,32 +751,36 @@ impl WizardApp {
                 AutoPick::ServerlessOnly => None,
                 AutoPick::SinglePick(id) => Some(id),
             };
-            let is_serverless = {
-                let Some(st) = self.vta_connect.as_mut() else {
-                    return;
-                };
-                st.webvh_server_choice = choice.clone();
-                if choice.is_none() {
-                    st.webvh_path = None;
-                    true
-                } else {
-                    // Auto-picked a server — still prompt for the
-                    // optional path so the operator can supply one.
-                    st.phase = ConnectPhase::EnterWebvhPath;
-                    false
-                }
-            };
-            if is_serverless {
-                self.start_vta_provision(rest_url, mediator_did);
-            } else {
-                let prefill = self
-                    .vta_connect
-                    .as_ref()
-                    .and_then(|s| s.webvh_path.clone())
-                    .unwrap_or_default();
-                self.mode = InputMode::TextInput;
-                self.text_input = Input::new(prefill);
-            }
+            self.commit_webvh_server_choice(choice, rest_url, mediator_did);
+        }
+    }
+
+    /// Commit a webvh hosting choice, picked by the operator or
+    /// automatically (an empty or single-entry catalogue). The choice is
+    /// recorded on the sub-flow state (read by `start_vta_provision` and by
+    /// the UI if the flight later fails). Serverless (`None`) starts the
+    /// provision flight at once and drops any stale path from a back-nav;
+    /// a server goes through the optional path prompt, pre-filled with the
+    /// value of a previous attempt so the operator can accept with Enter.
+    fn commit_webvh_server_choice(
+        &mut self,
+        choice: Option<String>,
+        rest_url: Option<String>,
+        mediator_did: String,
+    ) {
+        let Some(st) = self.vta_connect.as_mut() else {
+            return;
+        };
+        let serverless = choice.is_none();
+        st.webvh_server_choice = choice;
+        if serverless {
+            st.webvh_path = None;
+            self.start_vta_provision(rest_url, mediator_did);
+        } else {
+            st.phase = ConnectPhase::EnterWebvhPath;
+            let prefill = st.webvh_path.clone().unwrap_or_default();
+            self.mode = InputMode::TextInput;
+            self.text_input = Input::new(prefill);
         }
     }
 

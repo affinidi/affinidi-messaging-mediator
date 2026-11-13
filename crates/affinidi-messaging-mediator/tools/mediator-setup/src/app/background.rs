@@ -218,13 +218,6 @@ impl WizardApp {
     /// Shared clipboard-write helper for the Summary panel. Mirrors
     /// the helpers on `VtaConnectState` / `SealedHandoffState`.
     pub(super) fn copy_text_to_clipboard(&mut self, text: &str, label: &str) {
-        match crate::clipboard::copy_to_clipboard(text) {
-            Ok(method) => {
-                self.clipboard_status = Some(format!("Copied {label} via {}", method.label()));
-            }
-            Err(e) => {
-                self.clipboard_status = Some(format!("Clipboard unavailable: {e}"));
-            }
-        }
+        self.clipboard_status = Some(crate::clipboard::copy_with_status(text, label));
     }
 }

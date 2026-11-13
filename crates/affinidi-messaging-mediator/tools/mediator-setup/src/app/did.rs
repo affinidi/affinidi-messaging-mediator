@@ -6,21 +6,6 @@ use tui_input::Input;
 use super::{DidPhase, InputMode, WizardApp, WizardStep};
 
 impl WizardApp {
-    /// Strip any URL path so the stripped `<scheme>://<host>[:port]`
-    /// lands on the VTA's `CreateDidWebvhRequest.url`. webvh resolves
-    /// to `<url>/.well-known/did.jsonl`, so a trailing `/mediator/v1`
-    /// on the operator-typed URL would point the resolver somewhere
-    /// that doesn't serve the DID document.
-    pub(super) fn strip_url_path(raw: &str) -> String {
-        match url::Url::parse(raw) {
-            Ok(mut u) => {
-                u.set_path("");
-                u.to_string().trim_end_matches('/').to_string()
-            }
-            Err(_) => raw.to_string(),
-        }
-    }
-
     /// Number of entries in the webvh-host selection list — kept as
     /// a helper for future navigation code (e.g. up/down clamping)
     /// though the renderer derives the count from `current_options()`

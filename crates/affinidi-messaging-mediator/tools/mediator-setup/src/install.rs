@@ -25,49 +25,25 @@ pub(crate) fn install_or_print_commands(
     install: bool,
     install_root: Option<&str>,
 ) -> anyhow::Result<()> {
-    let features = config.cargo_features();
-    let needs_explicit = config.needs_explicit_features();
-
     if !install {
-        let install_cmd = format!(
-            "cargo {}",
-            build_install_args(&features, needs_explicit, None).join(" ")
+        out!(
+            "  \x1b[1mTo install:\x1b[0m\n    \x1b[36m{}\x1b[0m\n",
+            install_command(config, None)
         );
-        let build_cmd = format!(
-            "cargo {}",
-            build_cargo_args(&features, needs_explicit).join(" ")
+        out!(
+            "  \x1b[1mTo build from source:\x1b[0m\n    \x1b[36m{}\x1b[0m\n",
+            build_command(config)
         );
-        out!("  \x1b[1mTo install:\x1b[0m\n    \x1b[36m{install_cmd}\x1b[0m\n");
-        out!("  \x1b[1mTo build from source:\x1b[0m\n    \x1b[36m{build_cmd}\x1b[0m\n");
         return Ok(());
     }
 
-    let install_args = build_install_args(&features, needs_explicit, install_root);
-    let install_cmd = format!("cargo {}", install_args.join(" "));
     let build_dir = find_workspace_root()
         .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root for cargo install"))?;
-    let install_location = install_root.map(|r| format!("{r}/bin")).unwrap_or_else(|| {
-        let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".into());
-        format!("{cargo_home}/bin")
-    });
+    let install_location = install_root
+        .map(|r| format!("{r}/bin"))
+        .unwrap_or_else(default_install_bin);
 
-    out!("  \x1b[1mInstall command:\x1b[0m");
-    out!(
-        "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
-        build_dir.display()
-    );
-    out!("    \x1b[36m{install_cmd}\x1b[0m\n");
-    out!(
-        "  \x1b[38;5;69mInstalling mediator to {install_location} \
-         (this may take a few minutes)...\x1b[0m\n"
-    );
-
-    let status = Command::new("cargo")
-        .args(&install_args)
-        .current_dir(&build_dir)
-        .status();
-
-    match status {
+    match run_cargo_install(config, &build_dir, install_root, &install_location) {
         Ok(exit) if exit.success() => {
             out!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
             print_run_command(&config.config_path, &install_location);
@@ -258,10 +234,7 @@ pub(crate) fn print_run_command(config_path: &str, install_location: &str) {
 
 /// Offer to install the mediator after configuration.
 pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
-    let features = config.cargo_features();
-    let needs_explicit = config.needs_explicit_features();
-    let build_args = build_cargo_args(&features, needs_explicit);
-    let build_cmd = format!("cargo {}", build_args.join(" "));
+    let build_cmd = build_command(config);
 
     // Try to find workspace root
     let workspace_root = find_workspace_root();
@@ -272,12 +245,8 @@ pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
     let build_dir = if let Some(root) = workspace_root {
         root
     } else {
-        let install_cmd = format!(
-            "cargo {}",
-            build_install_args(&features, needs_explicit, None).join(" ")
-        );
         out!("  \x1b[33mCannot find workspace root.\x1b[0m");
-        print_manual_instructions(&install_cmd, &build_cmd, config);
+        print_manual_instructions(&install_command(config, None), &build_cmd, config);
         print_final_summary(config, true);
         return;
     };
@@ -294,11 +263,7 @@ pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
 
     match choice {
         Some(1) => {
-            let install_cmd = format!(
-                "cargo {}",
-                build_install_args(&features, needs_explicit, None).join(" ")
-            );
-            print_manual_instructions(&install_cmd, &build_cmd, config);
+            print_manual_instructions(&install_command(config, None), &build_cmd, config);
             print_final_summary(config, true);
             return;
         }
@@ -310,8 +275,7 @@ pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
     }
 
     // Ask for custom install path
-    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".to_string());
-    let default_bin = format!("{cargo_home}/bin");
+    let default_bin = default_install_bin();
 
     out!();
     print!("  \x1b[1mInstall location\x1b[0m [{default_bin}]: ");
@@ -333,38 +297,19 @@ pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
         None
     };
 
-    let install_args = build_install_args(&features, needs_explicit, install_root.as_deref());
-    let install_cmd = format!("cargo {}", install_args.join(" "));
-
+    let install_cmd = install_command(config, install_root.as_deref());
     let install_location = install_root
         .as_ref()
         .map(|r| format!("{r}/bin"))
         .unwrap_or_else(|| default_bin.clone());
 
-    // Print the full command + working directory *before* running it.
-    // Mirrors `run_from_recipe`'s existing behaviour — the command
-    // lives in the operator's scroll history regardless of whether
-    // the build succeeds, so a "retry with different flags" or
-    // "inspect why this rebuilt everything" follow-up doesn't need
-    // them to chase the recipe or memo the feature set.
-    out!("\n  \x1b[1mInstall command:\x1b[0m");
-    out!(
-        "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
-        build_dir.display()
-    );
-    out!("    \x1b[36m{install_cmd}\x1b[0m\n");
-
-    out!(
-        "  \x1b[38;5;69mInstalling mediator to {install_location} \
-         (this may take a few minutes)...\x1b[0m\n"
-    );
-
-    let status = Command::new("cargo")
-        .args(&install_args)
-        .current_dir(&build_dir)
-        .status();
-
-    match status {
+    out!();
+    match run_cargo_install(
+        config,
+        &build_dir,
+        install_root.as_deref(),
+        &install_location,
+    ) {
         Ok(exit) if exit.success() => {
             out!("\n  \x1b[32m\u{2714} Installation successful!\x1b[0m\n");
             print_run_command(&config.config_path, &install_location);
@@ -382,6 +327,59 @@ pub(crate) fn offer_build_and_guidance(config: &app::WizardConfig) {
     }
 
     print_final_summary(config, true);
+}
+
+/// `cargo install …` for the mediator this config describes.
+fn install_command(config: &app::WizardConfig, install_root: Option<&str>) -> String {
+    let args = build_install_args(
+        &config.cargo_features(),
+        config.needs_explicit_features(),
+        install_root,
+    );
+    format!("cargo {}", args.join(" "))
+}
+
+/// `cargo build …` for the mediator this config describes.
+fn build_command(config: &app::WizardConfig) -> String {
+    let args = build_cargo_args(&config.cargo_features(), config.needs_explicit_features());
+    format!("cargo {}", args.join(" "))
+}
+
+/// `$CARGO_HOME/bin`, where `cargo install` puts the binary by default.
+fn default_install_bin() -> String {
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "~/.cargo".into());
+    format!("{cargo_home}/bin")
+}
+
+/// Print the install command and its working directory, then run it. The
+/// command is printed *before* it runs so it stays in the operator's
+/// scroll-back whether or not the build succeeds — a retry with other
+/// flags needs neither the recipe nor the feature set to hand.
+fn run_cargo_install(
+    config: &app::WizardConfig,
+    build_dir: &Path,
+    install_root: Option<&str>,
+    install_location: &str,
+) -> io::Result<std::process::ExitStatus> {
+    let install_args = build_install_args(
+        &config.cargo_features(),
+        config.needs_explicit_features(),
+        install_root,
+    );
+    out!("  \x1b[1mInstall command:\x1b[0m");
+    out!(
+        "    \x1b[2mcd\x1b[0m \x1b[36m{}\x1b[0m",
+        build_dir.display()
+    );
+    out!("    \x1b[36mcargo {}\x1b[0m\n", install_args.join(" "));
+    out!(
+        "  \x1b[38;5;69mInstalling mediator to {install_location} \
+         (this may take a few minutes)...\x1b[0m\n"
+    );
+    Command::new("cargo")
+        .args(&install_args)
+        .current_dir(build_dir)
+        .status()
 }
 
 /// Print manual build/run instructions when auto-install is skipped or fails.
