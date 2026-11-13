@@ -13,7 +13,7 @@ The same screens are also available as ratatui components, which you can embed
 in another application ([Embedding](#embedding)).
 
 ```
- mediator-console  ADMIN   b48a53fa…1f29 → did:peer:2.Vz6Mkkn…      updated 1s ago
+ mediator-console  ADMIN  ● connected  b48a53fa…1f29 → did:peer:2.Vz6Mkkn…  updated 1s ago
  1 Dashboard │ 2 Queues │ 3 Account │ 4 Audit
 ┌ Account 1f22bbf6…b9a1 ─────────────────────┐┌ Traffic — all traffic ● live ───────┐
 │receive: 0 / 200    oldest –                ││22:46:24 ▶ received  didcomm   rest …│
@@ -78,10 +78,10 @@ is reported plainly.
 | Key | Screen | Shows |
 |---|---|---|
 | `1` | **Dashboard** *(admin)* | Version and uptime, websocket connections, message and session totals, forwarding queue and circuit breaker, and **queue pressure**: the fullest receive and send queue, as gradient bars. Below that, the busiest queues. |
-| `2` | **Queues** *(admin)* | Every account with a non-empty queue, ranked by depth, bytes, oldest message or saturation (`s` cycles the ranking, `x` switches between receive and send). Each queue has a **quota bar**. The ranking comes from the mediator's once-a-minute survey, and the title shows when that survey ran. |
-| `3` | **Account** | One account's two queues with quota bars, its **send queue by recipient** (who hasn't collected yet), and its messages. For a standard account, this is the whole console. |
-| `4` | **Audit** *(admin)* | The mediator's audit log of privileged changes. Monitor subscriptions and cross-account reads are recorded here too. |
-| `5` | **Accounts** *(admin)* | Every account on the mediator: name, hash, role (coloured), receive and send depth, bytes queued, access-list size. The mediator and administrators come first, then accounts you've named, then the rest. `⏎` opens one. Works on older mediators too. |
+| `2` | **Queues** *(admin)* | Every account with a non-empty queue, ranked by depth, bytes, oldest message or saturation (`s` cycles the ranking, `x` switches between receive and send). Each queue has a **quota bar**. The ranking comes from the mediator's once-a-minute survey, and the title shows when that survey ran; the console asks again only once a newer survey is due. 200 rows a page, `]` for more. |
+| `3` | **Account** | One account's two queues with quota bars, its **send queue by recipient** (who hasn't collected yet), and its messages, 200 at a time (the title says "200 of 5000"; `]` or the last row loads more). For a standard account, this is the whole console. |
+| `4` | **Audit** *(admin)* | The mediator's audit log of privileged changes, newest first: when, actor, action, target, **outcome** (success, denied, …) and the detail as `key=value` pairs. Monitor subscriptions and cross-account reads are recorded here too. Scroll with `↑↓` / `PgUp` `PgDn`; reaching the last row (or `]`) loads the next page. |
+| `5` | **Accounts** *(admin)* | Every account on the mediator: name, hash, role (coloured), receive and send depth, bytes queued, access-list size. The mediator and administrators come first, then accounts you've named, then the rest. `⏎` opens one. Loaded a page (500) at a time as you scroll, and reloaded every five minutes or on `r`, not on every refresh. Works on older mediators too. |
 | `6` | **Config** *(admin)* | The mediator's configuration: key, value, source (`override` when a patch set it) and whether a change applies live or at restart. A **rootAdmin** can change a `limits.*` value (`⏎`) or reset an override (`x`); a patch can tighten a limit, not loosen it past the configuration. |
 | `7` | **Mux** *(admin)* | Live mux connections and the member DIDs each carries. `g` lists the selected connection's stored grants. |
 | `8` | **Grants** *(admin)* | Stored mux grants of a principal or member DID (`/` to look one up): member, principal, state, scope, expiry, the epoch each was signed under, and the member's current epoch. `d` revokes the selected grant — or, with grants marked (`space`, `a`), every marked grant, each on its own — `D` every grant listed, `E` advances the member's epoch (voiding every grant it gave). Each asks for confirmation first; a bulk revocation then lists every grant it did not revoke, and why. Needs mediator 0.52.0. |
@@ -89,20 +89,26 @@ is reported plainly.
 **Quota bars** shade smoothly from green through amber to red along the bar,
 so how full a queue is shows as colour at its leading edge. They use 24-bit
 colour when `COLORTERM` says the terminal supports it. Otherwise they fall back
-to 256 colours, then to three plain colours; `NO_COLOR` switches colour off.
+to 256 colours, then to three plain colours. `NO_COLOR` switches colour off
+everywhere: badges and highlights are shown reversed instead.
 
 ### Keys
+
+`?` shows every key that works on the screen you're on; the footer shows the
+common ones, and ends in `… ? for more` when they don't all fit.
 
 | Key | Where | Does |
 |---|---|---|
 | `↑` `↓` / `j` `k` | tables | select a row |
+| `PgUp` `PgDn` | tables (monitor closed) | a page of rows |
+| `]` | Dashboard, Queues, Account, Audit, Accounts, Grants | load the next page (reaching the last row does too) |
 | `⏎` | Dashboard, Queues, Accounts | open the selected account |
-| `⏎` / `x` | Config (rootAdmin) | change the selected limit / remove its override |
+| `⏎` / `x` | Config (rootAdmin) | change the selected limit / reset its override. Both show the change (`from → to`) and wait for `y` |
 | `x` | Queues, Account | receive ↔ send queue |
 | `s` | Dashboard, Queues | change the ranking |
-| `e` | Account | **edit** the account's role, ACL flags, access-list mode and queue limits (saved with `s`) |
-| `i` | Account | **inspect** the selected message: its metadata and raw envelope, decrypted locally when you hold the recipient's key (your own mail) |
-| `d` | Account | **delete** the selected message (asks for confirmation) |
+| `e` | Account | **edit** the account's role, ACL flags, access-list mode and queue limits. `s` shows what changes (`role: admin → rootAdmin`) and `y` applies it; editing your own account to a lower role or `blocked` warns that it can lock you out |
+| `i` | Account | **inspect** the selected message: its metadata and whole raw envelope, decrypted locally when you hold the recipient's key (your own mail). Scroll with `↑↓` `PgUp` `PgDn`; `y` copies it, `w` writes it to a file in the current directory |
+| `d` | Account | **delete** the selected message. The confirmation names the account, the queue, the message id, and who it is from and to |
 | `p` / `P` | Account | **purge** the queue, or only messages exchanged with the selected message's counterparty (see below) |
 | `o` | Account | back to your own account |
 | `g` | Mux | the selected connection's **stored grants** |
@@ -112,7 +118,6 @@ to 256 colours, then to three plain colours; `NO_COLOR` switches colour off.
 | `a` / `c` | Grants | mark every grant listed / clear the marks |
 | `d` / `D` | Grants | **revoke** the marked grants (or the selected one, with none marked) / every grant listed (asks for confirmation). Marked grants are revoked one at a time: a refusal — a rootAdmin party's grant is protected — leaves the rest to go ahead, and every grant not revoked is listed with why and stays marked |
 | `E` | Grants | **advance the member's epoch**: shows its current epoch, and names only that one, so nothing changes if it moved on meanwhile |
-| `]` | Grants | load the next page |
 | `m` | anywhere | show or hide the **traffic monitor**; an administrator watching everything also sees mux members attach and detach |
 | `f` | anywhere | monitor failures only |
 | `t` | monitor open | switch the monitor between live lines and **per-account totals** |
@@ -120,10 +125,13 @@ to 256 colours, then to three plain colours; `NO_COLOR` switches colour off.
 | `l` | anywhere | the **log**: errors and warnings the console captured (see below) |
 | `Ctrl-L` | anywhere | repaint the whole screen |
 | `n` | anywhere | **name** an account: the selected one, or any account by pasting its DID |
+| `y` | anywhere | **copy** the selected row's full account hash, DID or message id to the clipboard (OSC 52: the terminal must allow it) |
+| `?` | anywhere | every key |
 | `b` | anywhere | the **address book**: rename (`n`), add (`a`), remove (`x`) |
-| `r` | anywhere | refresh now (screens also refresh every 5 s) |
+| `r` | anywhere | reload now, from the first page (screens also refresh every 5 s; a list you've paged through waits for `r`) |
 | `Tab` | anywhere | next screen |
-| `q` / `Esc` | anywhere | quit, or close a popup |
+| `q` / `Ctrl-C` | anywhere | quit |
+| `Esc` | popups | close it. On its own `Esc` does nothing: it never quits |
 
 ## Names for accounts
 
@@ -148,11 +156,18 @@ traffic monitor.
 
 ## Deleting and purging
 
-A purge is always counted first. The console shows how many messages (and
-bytes) would go and waits for `y`. It then checks the count again and refuses,
-removing nothing, if the queue has changed in the meantime, so what you
-confirmed is what gets removed. Purged messages are gone; they aren't returned
-to their senders.
+A purge is always counted first. The console shows whose queue, which queue,
+and how many messages (and bytes) would go, and waits for `y`. The purge is
+then pinned to the moment of that count: a message that arrives after it is
+never removed. Fewer may go than were counted, when some are delivered in the
+meantime, and the console says how many did. (The pin is in whole seconds, so
+it can also leave out what arrived in the second before the count.) Purged
+messages are gone; they aren't returned to their senders.
+
+A delete names the account, queue, message id, sender and recipient before it
+asks. Background answers are tied to what they were asked for: a slow answer
+for one account never lands on another's screen, and a purge count for an
+account you have left is dropped rather than shown.
 
 What the mediator allows:
 
@@ -180,7 +195,8 @@ everything (admin) or your own traffic (everyone else).
 
 - **Metadata only.** Message bodies never appear.
 - **Honest about its own state.** The pane's title shows whether the feed is
-  live, silent or stopped, how many events the mediator dropped (because of the
+  live, silent or stopped, or the connection down (the moment it drops, not
+  after a silence), how many events the mediator dropped (because of the
   rate limit, or because the console was briefly offline), and how many batches
   were lost in transit.
 - **Totals.** The title shows how many messages the monitor has seen and
@@ -197,6 +213,15 @@ everything (admin) or your own traffic (everyone else).
 - **Scroll back.** The pane keeps the last 2,000 lines. `PgUp` stops following
   and pages back; new traffic keeps arriving below without moving what you're
   reading, and the bottom edge says how much is newer. `End` follows again.
+
+## Connection state
+
+The header always says what the SDK reports of the console's connection to
+the mediator: `● connected`, `◌ connecting`, or `✗ disconnected 12s —
+reconnecting` while it is down (`? connection unknown` when there is no
+websocket to report on). Each drop and each recovery is also written into the
+monitor pane as a line, and the drop is logged at `warn`, so it shows in the
+log (`l`) too. When the connection comes back the screen reloads.
 
 ## Log output
 
@@ -243,7 +268,13 @@ app.run(&mut terminal).await?;
   ```
 
   A host with its own loop redraws when `app.log_changed()` resolves.
-- `App::open_account(did_hash)` jumps straight to one account.
+- `App::open_account(did_hash)` jumps straight to one account; `App::reload()`
+  reloads the screen from its first page, as `r` does.
+- `App::run` redraws at once for keys and answers, and batches monitor
+  traffic (`Update::Monitor`) into at most ten frames a second. A host with
+  its own loop should do the same under heavy traffic.
+- `Update::Connection` carries the connection state into the header and the
+  monitor; `App::new` subscribes to it for you.
 - The gradient `QuotaBar` widget (and `quota_line` for table cells) works on
   its own.
 - The engine underneath, including identities, purge plans and monitor feeds,

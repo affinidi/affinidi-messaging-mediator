@@ -13,13 +13,18 @@
 
 pub mod account_edit;
 pub mod app;
+mod clipboard;
+mod keymap;
 pub mod logs;
 pub mod quota;
+mod requests;
 pub mod tally;
+mod theme;
 
-pub use app::{App, Control, Tab, Update};
+pub use app::{App, Control, List, Tab, Update};
 pub use logs::{LogCapture, LogLevel, LogLine};
 pub use quota::{ColorDepth, QuotaBar, quota_line};
+pub use requests::Ticket;
 
 /// Where the console keeps its address book unless told otherwise:
 /// `$XDG_CONFIG_HOME/mediator-console/address-book.json`, falling back to
