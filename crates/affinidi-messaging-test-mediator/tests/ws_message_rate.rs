@@ -173,61 +173,53 @@ async fn a_socket_that_stays_over_the_rate_is_closed_with_1008() {
     env.shutdown().await.expect("shutdown");
 }
 
-/// One DID's sockets share the per-DID budget: messages on a second socket
-/// wait for the first socket's spending, though the second socket's own
-/// budget is untouched.
+/// WebSocket messages are charged to the sender's DID, in the same budget as
+/// its HTTP requests: messages spend it, and the DID's next request is
+/// refused. (Two sockets of one DID sharing the budget is covered by the
+/// meter's unit tests: a second direct socket for one DID takes over the
+/// DID's live delivery and the first is closed. The admin-DID exemption is covered there too: the
+/// configured admin identity has no local account to open a socket with.)
 #[tokio::test]
-async fn one_did_pays_for_its_messages_across_sockets() {
+async fn websocket_messages_are_charged_to_the_did() {
     init_tracing();
     let env = env_with(
         TestMediator::builder()
-            .did_rate_limit(2, 2)
+            .did_rate_limit(1, 3)
             .ws_message_rate(1_000, 1_000, 30),
     )
     .await;
     let alice = user(&env, "Alice").await;
-    let mut first = open_ws(&env, &alice.did).await;
-    let mut second = open_ws(&env, &alice.did).await;
+    let token = env
+        .tdk
+        .authentication()
+        .authenticate(alice.did.clone(), env.mediator.did().to_string(), 3, None)
+        .await
+        .expect("authenticate")
+        .access_token;
+    let mut ws = open_ws(&env, &alice.did).await;
 
-    // Let the DID's bucket (2 deep, 2/s) refill after the two upgrades.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // Let the DID's bucket (3 deep, 1/s) refill after the upgrade.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
 
-    // The first socket spends the DID's burst.
-    send_then_ping(&mut first, 2).await;
-    // The second socket's own budget is fresh, but the DID's is empty: two
-    // messages at 2/s take about a second.
-    let took = send_then_ping(&mut second, 2).await;
+    // Three messages spend the DID's burst; a fourth waits about a second for
+    // the DID's budget, though the socket's own budget is untouched.
+    let took = send_then_ping(&mut ws, 4).await;
     assert!(
-        took >= Duration::from_millis(700),
-        "the second socket must wait for the DID's budget; pong after {took:?}"
+        took >= Duration::from_millis(600),
+        "the fourth message must wait for the DID's budget; pong after {took:?}"
     );
 
-    env.shutdown().await.expect("shutdown");
-}
-
-/// The admin DID is not metered, per socket or per DID.
-#[tokio::test]
-async fn the_admin_did_is_not_metered() {
-    init_tracing();
-    let admin = TestMediator::random_admin_identity().expect("admin identity");
-    let env = env_with(
-        TestMediator::builder()
-            .did_rate_limit(1, 1)
-            .ws_message_rate(1, 1, 1)
-            .admin_identity(admin.clone()),
-    )
-    .await;
-    let admin_user = env.add_admin(admin).await.expect("admin");
-    let mut ws = open_ws(&env, &admin_user.did).await;
-
-    let took = send_then_ping(&mut ws, 30).await;
-    assert!(
-        took < Duration::from_millis(1_000),
-        "admin messages were slowed; pong after {took:?}"
-    );
-    // Still open after more than the close deadline's worth of traffic.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    send_then_ping(&mut ws, 30).await;
+    // The budget is spent: an HTTP request for the same DID is refused.
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .get(format!("{}whoami", env.mediator.endpoint()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("whoami");
+    assert_eq!(response.status().as_u16(), 429);
 
     env.shutdown().await.expect("shutdown");
 }
