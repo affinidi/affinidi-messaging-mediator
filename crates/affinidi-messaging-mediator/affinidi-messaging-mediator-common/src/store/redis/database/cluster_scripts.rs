@@ -48,6 +48,10 @@ pub(crate) const DELETE_LEASE_MS: u64 = 30_000;
 /// recipient may see the message twice. It needs an earlier build to have
 /// died mid-store of exactly these bytes just before the upgrade.
 ///
+/// The body and metadata also get an expiry a day past the message's own: a
+/// backstop, so a record the sweeper never reaches (its index entry lost)
+/// still goes, as the library's `store_message` does.
+///
 /// KEYS: body, metadata, legacy metadata, recipient index. ARGV: body, bytes,
 /// to, from (`ANONYMOUS` for none), delete lease ms, store token, store lease
 /// ms, expires at (epoch secs).
@@ -110,13 +114,23 @@ redis.call('SADD', KEYS[4], ARGV[3])
 if ARGV[4] ~= 'ANONYMOUS' then
     redis.call('HSET', KEYS[2], 'FROM', ARGV[4])
 end
+local expires = tonumber(ARGV[8]) or 0
+if expires > 0 and expires < 100000000000 then
+    local at = string.format('%d', expires + 86400)
+    redis.call('EXPIREAT', KEYS[1], at)
+    redis.call('EXPIREAT', KEYS[2], at)
+end
 return { tostring(result), meta.RELEASE_TO or '', meta.RELEASE_FROM or '',
     meta.RELEASE_BYTES or '', meta.RELEASE_RECEIVE_ID or '', meta.RELEASE_SEND_ID or '' }
 "#,
     )
 });
 
-/// Recipient slot: count the message and add it to the inbox, once. A repeat
+/// Recipient slot: add the message to the inbox and count it, once. The
+/// `XADD` comes first: a script is not rolled back, and it is the write that
+/// can be refused, so a refusal counts nothing. Its id is `*`, which Redis
+/// keeps above the stream's newest id, so a clock stepping back cannot refuse
+/// it. A repeat
 /// (a retry, or the same message stored twice at once) returns the id of the
 /// first entry and counts nothing, the rule the library's `store_message`
 /// keeps for the same recipient.
@@ -131,17 +145,16 @@ local queued = redis.call('HGET', KEYS[3], ARGV[5])
 if queued then
     return queued
 end
-redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_BYTES', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_COUNT', 1)
-local t = redis.call('TIME')
-local id = string.format('%d%03d', t[1], t[2] / 1000) .. '-*'
+local id
 local maxlen = tonumber(ARGV[4])
 if maxlen > 0 then
-    id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', maxlen, id,
+    id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', maxlen, '*',
         'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'FROM', ARGV[3])
 else
-    id = redis.call('XADD', KEYS[2], id, 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'FROM', ARGV[3])
+    id = redis.call('XADD', KEYS[2], '*', 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'FROM', ARGV[3])
 end
+redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_BYTES', ARGV[2])
+redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_COUNT', 1)
 redis.call('HSET', KEYS[3], ARGV[5], id)
 return id
 "#,
@@ -162,18 +175,17 @@ local queued = redis.call('HGET', KEYS[4], ARGV[5])
 if queued then
     return queued
 end
+local id
+local maxlen = tonumber(ARGV[4])
+if maxlen > 0 then
+    id = redis.call('XADD', KEYS[3], 'MAXLEN', '~', maxlen, '*',
+        'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'TO', ARGV[3])
+else
+    id = redis.call('XADD', KEYS[3], '*', 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'TO', ARGV[3])
+end
 redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_BYTES', ARGV[2])
 redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_COUNT', 1)
 redis.call('HINCRBY', KEYS[2], ARGV[3], 1)
-local t = redis.call('TIME')
-local id = string.format('%d%03d', t[1], t[2] / 1000) .. '-*'
-local maxlen = tonumber(ARGV[4])
-if maxlen > 0 then
-    id = redis.call('XADD', KEYS[3], 'MAXLEN', '~', maxlen, id,
-        'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'TO', ARGV[3])
-else
-    id = redis.call('XADD', KEYS[3], id, 'MSG_ID', ARGV[1], 'BYTES', ARGV[2], 'TO', ARGV[3])
-end
 redis.call('HSET', KEYS[4], ARGV[5], id)
 return id
 "#,
@@ -325,7 +337,9 @@ return 1
     )
 });
 
-/// Recipient slot of a delete: release the counters and the inbox entry,
+/// Recipient slot of a delete: release the counters (only while the account
+/// record exists: `HINCRBY` would recreate a removed account's record as a
+/// partial ghost) and the inbox entry,
 /// found by message hash in this slot. Releases nothing when the message was
 /// never queued here, so counters only move back what they moved forward,
 /// nor when the entry isn't the one the claim saw: a delete that stalled
@@ -340,8 +354,10 @@ local queued = redis.call('HGET', KEYS[3], ARGV[1])
 if not queued or (ARGV[3] ~= '' and queued ~= ARGV[3]) then
     return 0
 end
-redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_BYTES', -tonumber(ARGV[2]))
-redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_COUNT', -1)
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_BYTES', -tonumber(ARGV[2]))
+    redis.call('HINCRBY', KEYS[1], 'RECEIVE_QUEUE_COUNT', -1)
+end
 redis.call('XDEL', KEYS[2], queued)
 redis.call('HDEL', KEYS[3], ARGV[1])
 return 1
@@ -349,7 +365,8 @@ return 1
     )
 });
 
-/// Sender slot of a delete: release the counters, the per-recipient count
+/// Sender slot of a delete: release the counters (only while the account
+/// record exists, as [`RELEASE_INBOX`]), the per-recipient count
 /// (dropped at zero) and the outbox entry, as [`RELEASE_INBOX`].
 ///
 /// KEYS: account, per-recipient counts, outbox, outbox ids. ARGV: record
@@ -362,8 +379,10 @@ local queued = redis.call('HGET', KEYS[4], ARGV[1])
 if not queued or (ARGV[4] ~= '' and queued ~= ARGV[4]) then
     return 0
 end
-redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_BYTES', -tonumber(ARGV[2]))
-redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_COUNT', -1)
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_BYTES', -tonumber(ARGV[2]))
+    redis.call('HINCRBY', KEYS[1], 'SEND_QUEUE_COUNT', -1)
+end
 if tonumber(redis.call('HINCRBY', KEYS[2], ARGV[3], -1)) <= 0 then
     redis.call('HDEL', KEYS[2], ARGV[3])
 end
@@ -387,7 +406,11 @@ return 1
 /// before.
 ///
 /// KEYS: metadata, legacy metadata. ARGV: recipient, now ms, deadline (epoch
-/// secs, 0 for none). Returns `{found, first, advanced, per_recipient}`.
+/// secs, 0 for none). Returns `{found, first, advanced, per_recipient,
+/// attempts, bytes, previous_expiry}`: `attempts` the handovers before this
+/// one, `bytes` the record's size, and `previous_expiry` the expiry the
+/// record had before this call (0 for none), whose index entry the caller
+/// removes when `advanced`.
 pub(crate) static MARK_DELIVERED: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -397,22 +420,24 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
 elseif redis.call('HGET', KEYS[2], 'TO') == ARGV[1] then
     key = KEYS[2]
 else
-    return { 0, 0, 0, 0 }
+    return { 0, 0, 0, 0, 0, 0, 0 }
 end
 local first = redis.call('HSETNX', key, 'FIRST_DELIVERED_AT', ARGV[2])
-redis.call('HINCRBY', key, 'DELIVERY_ATTEMPTS', 1)
+local attempts = redis.call('HINCRBY', key, 'DELIVERY_ATTEMPTS', 1) - 1
+local bytes = tonumber(redis.call('HGET', key, 'BYTES')) or 0
+local expires = redis.call('HGET', key, 'EXPIRES_AT')
+local previous = tonumber(expires) or 0
 local advanced = 0
 local deadline = tonumber(ARGV[3])
 if first == 1 and deadline > 0 then
-    local expires = redis.call('HGET', key, 'EXPIRES_AT')
     if not expires then
         advanced = 1
-    elseif tonumber(expires) == 0 or deadline < tonumber(expires) then
+    elseif previous == 0 or deadline < previous then
         redis.call('HSET', key, 'EXPIRES_AT', deadline)
         advanced = 1
     end
 end
-return { 1, first, advanced, per_recipient }
+return { 1, first, advanced, per_recipient, attempts, bytes, previous }
 "#,
     )
 });

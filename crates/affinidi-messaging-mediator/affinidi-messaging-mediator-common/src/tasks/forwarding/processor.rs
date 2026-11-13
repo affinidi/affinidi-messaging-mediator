@@ -383,6 +383,11 @@ enum ReportReason {
     NotPermitted,
 }
 
+/// How long a forward-queue consumer holding nothing must have been idle
+/// before the reclaim sweep removes it. Well past any read's block time, so
+/// a running processor's consumer is never removed.
+const CONSUMER_PRUNE_IDLE: Duration = Duration::from_secs(3600);
+
 /// When an entry may first be attempted (unix ms): after the delay its sender
 /// asked for, and after the not-before of a retry.
 fn due_at_ms(entry: &ForwardQueueEntry) -> u128 {
@@ -1014,6 +1019,15 @@ impl ForwardingProcessor {
                                     break;
                                 }
                             }
+                        }
+                        // Each processor run reads under a consumer name of its
+                        // own; drop those of earlier runs once they hold
+                        // nothing (their entries came back through the sweep).
+                        if let Err(e) = database
+                            .forward_queue_prune_consumers(&group, &consumer, CONSUMER_PRUNE_IDLE)
+                            .await
+                        {
+                            debug!("Could not remove idle FORWARD_Q consumers: {e}");
                         }
                     }
                     match database

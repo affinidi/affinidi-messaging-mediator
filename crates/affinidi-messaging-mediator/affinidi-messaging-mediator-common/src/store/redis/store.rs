@@ -21,7 +21,8 @@ use crate::store::redis::database::{
 };
 use crate::store::{
     DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope,
-    OUTBOX_RECEIPT_TTL, OutboxReceipt, RemovedCopy, SentMessageState, StoredMessageRef, mux, ops,
+    OUTBOX_RECEIPT_TTL, OutboxReceipt, POISON_ATTEMPTS, RemovedCopy, SentMessageState,
+    StoredMessageRef, mux, ops,
 };
 
 /// Whether a per-recipient receipt is still within [`OUTBOX_RECEIPT_TTL`]. Its
@@ -186,6 +187,10 @@ pub struct RedisStore {
     pub(crate) handler: DatabaseHandler,
     circuit_breaker: Arc<CircuitBreaker>,
     lua_scripts_path: Option<String>,
+    /// The library source [`MediatorStore::initialize`] loads, when given
+    /// (see [`with_library`](Self::with_library)); else the file at
+    /// `lua_scripts_path`.
+    library_source: Option<(Arc<str>, String)>,
     broadcast_channels: Arc<Mutex<HashMap<String, broadcast::Sender<PubSubRecord>>>>,
     /// Slots in the local broadcast ring that bridges Redis pub/sub to the
     /// streaming task. See `with_pubsub_capacity`.
@@ -195,6 +200,13 @@ pub struct RedisStore {
     mux_channels: Arc<Mutex<HashMap<String, broadcast::Sender<mux::MuxChangeRecord>>>>,
     /// The bridges from monitor fan-out channels to local subscribers.
     monitor_channels: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    /// One long-lived blocking connection per forward-queue consumer (a
+    /// blocking `XREADGROUP` holds its connection, so consumers cannot
+    /// share one). Dropped on error and opened again on the next read.
+    pub(crate) blocking_connections: Arc<std::sync::Mutex<HashMap<String, MultiplexedConnection>>>,
+    /// Forward-queue consumer groups known to exist, so a read creates its
+    /// group once rather than before every read; forgotten on `NOGROUP`.
+    pub(crate) forward_groups: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl RedisStore {
@@ -217,11 +229,23 @@ impl RedisStore {
                 circuit_breaker_recovery_secs,
             )),
             lua_scripts_path,
+            library_source: None,
             broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
             pubsub_capacity: PUBSUB_BROADCAST_CAPACITY,
             mux_channels: Arc::new(Mutex::new(HashMap::new())),
             monitor_channels: Arc::new(Mutex::new(HashMap::new())),
+            blocking_connections: Default::default(),
+            forward_groups: Default::default(),
         }
+    }
+
+    /// Load `source` (an `atm-functions.lua` library; `origin` names it in
+    /// the log) on [`MediatorStore::initialize`], rather than reading the
+    /// file at `lua_scripts_path`. The mediator passes the library compiled
+    /// into it, so the library it loads is always the one it was built with.
+    pub fn with_library(mut self, source: impl Into<Arc<str>>, origin: impl Into<String>) -> Self {
+        self.library_source = Some((source.into(), origin.into()));
+        self
     }
 
     /// Size the local broadcast ring that bridges Redis pub/sub to the streaming
@@ -424,7 +448,10 @@ impl RedisStore {
     }
 
     /// Get a clone of the auto-reconnecting multiplexed Redis connection.
-    /// Protected by circuit breaker for fast-fail when Redis is unavailable.
+    /// Protected by circuit breaker for fast-fail when Redis is unavailable:
+    /// the connection reports the outcome of each command it sends to the
+    /// breaker, so the breaker sees real command failures (handing out a
+    /// clone cannot fail, and records nothing).
     pub async fn get_connection(&self) -> Result<RedisConnection, MediatorError> {
         if !self.circuit_breaker.allow_request() {
             return Err(MediatorError::DatabaseError(
@@ -434,16 +461,11 @@ impl RedisStore {
             ));
         }
 
-        match self.handler.get_async_connection().await {
-            Ok(conn) => {
-                self.circuit_breaker.record_success();
-                Ok(conn)
-            }
-            Err(e) => {
-                self.circuit_breaker.record_failure();
-                Err(e)
-            }
-        }
+        Ok(self
+            .handler
+            .get_async_connection()
+            .await?
+            .with_breaker(self.circuit_breaker.clone()))
     }
 
     /// Get a dedicated Redis connection with no response timeout for
@@ -467,6 +489,13 @@ impl RedisStore {
                 Err(e)
             }
         }
+    }
+
+    /// Report a command that could not reach the server to the circuit
+    /// breaker, for connections that do not report their own (the blocking
+    /// and pub/sub connections).
+    pub(crate) fn circuit_breaker_record_failure(&self) {
+        self.circuit_breaker.record_failure();
     }
 
     /// Circuit breaker state, surfaced in `messaging/stats/show` and `/readyz`.
@@ -598,6 +627,9 @@ impl MediatorStore for RedisStore {
     // ─── Bootstrap & health ─────────────────────────────────────────────────
 
     async fn initialize(&self) -> Result<(), MediatorError> {
+        if let Some((source, origin)) = &self.library_source {
+            return self.load_library(source, origin).await.map(|_| ());
+        }
         let path = self.lua_scripts_path.as_ref().ok_or_else(|| {
             MediatorError::ConfigError(
                 12,
@@ -784,28 +816,46 @@ impl MediatorStore for RedisStore {
         // where the script moved the record's own expiry (a legacy record,
         // which carries none, is always given the entry, as before).
         //
-        // Added, not moved: the record's original entry stays, and the
-        // sweeper drops it as stale once it sees the record's expiry is the
-        // earlier deadline — or finds the record already gone.
+        // Moved: the entry is added under the deadline, then taken out of
+        // the record's previous bucket, so a delivered message holds one
+        // index entry, not two. Should the removal fail, the previous entry
+        // stays, and the sweeper drops it as stale once it sees the record's
+        // expiry is the earlier deadline, or finds the record already gone.
         let slot_key = format!("MSG_EXPIRY:{deadline}");
         let mut moving: Vec<String> = Vec::new();
+        let mut previous: HashMap<u64, Vec<String>> = HashMap::new();
         for (id, reply) in msg_ids.iter().zip(replies) {
-            let [found, first, advanced, per_recipient] = reply.as_slice() else {
+            let &[found, first, advanced, per_recipient, ref rest @ ..] = reply.as_slice() else {
                 continue;
             };
-            if *found == 0 {
+            if found == 0 {
                 continue;
             }
-            if *first == 1 {
+            // A script from before these fields answered four: nothing to
+            // count or move for them.
+            let (attempts, bytes, previous_expiry) = match rest {
+                [attempts, bytes, previous_expiry, ..] => (*attempts, *bytes, *previous_expiry),
+                _ => (0, 0, 0),
+            };
+            report.bytes += usize::try_from(bytes).unwrap_or(0);
+            if first == 1 {
                 report.first_delivered += 1;
             } else {
                 report.redelivered += 1;
+                if attempts >= i64::from(POISON_ATTEMPTS) {
+                    report.poison_suspected += 1;
+                }
             }
-            if *advanced == 1 {
-                moving.push(Keys::record_member(
-                    id,
-                    (*per_recipient == 1).then_some(recipient_did_hash),
-                ));
+            if advanced == 1 {
+                let member =
+                    Keys::record_member(id, (per_recipient == 1).then_some(recipient_did_hash));
+                if let Ok(slot) = u64::try_from(previous_expiry)
+                    && slot > 0
+                    && slot != deadline
+                {
+                    previous.entry(slot).or_default().push(member.clone());
+                }
+                moving.push(member);
             }
         }
         if moving.is_empty() {
@@ -829,6 +879,25 @@ impl MediatorStore for RedisStore {
         if let Err(err) = self.exec_steps(&mut conn, vec![index, bucket]).await {
             warn!("Couldn't bring delivered-message expiry forward: {err}");
             report.expiry_advanced = 0;
+            return Ok(report);
+        }
+        // Each previous bucket in its own step (its own slot in cluster
+        // mode). An emptied bucket stays listed in the index until the
+        // sweeper reaches it and finds it empty.
+        let steps: Vec<redis::Pipeline> = previous
+            .into_iter()
+            .map(|(slot, members)| {
+                let mut step = redis::pipe();
+                step.cmd("SREM")
+                    .arg(format!("MSG_EXPIRY:{slot}"))
+                    .arg(members);
+                step
+            })
+            .collect();
+        if !steps.is_empty()
+            && let Err(err) = self.exec_steps(&mut conn, steps).await
+        {
+            debug!("Couldn't drop delivered messages' previous expiry entries: {err}");
         }
         Ok(report)
     }
@@ -1105,42 +1174,31 @@ impl MediatorStore for RedisStore {
         self.fetch_messages(session_id, did_hash, options).await
     }
 
-    async fn purge_folder(
+    async fn delete_folder_entries(
         &self,
-        session_id: &str,
         did_hash: &str,
         folder: Folder,
-    ) -> Result<(usize, usize), MediatorError> {
-        // Synthesize a minimal Session for the legacy `purge_messages`
-        // signature — it only reads `session_id` for log context and
-        // doesn't touch the other fields.
-        let session = Session {
-            session_id: session_id.to_string(),
-            ..Default::default()
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError> {
+        if stream_ids.is_empty() {
+            return Ok(());
+        }
+        let key = match folder {
+            Folder::Inbox => self.keys().receive_q(did_hash),
+            Folder::Outbox => self.keys().send_q(did_hash),
         };
-        self.purge_messages(
-            &session,
-            did_hash,
-            folder,
-            &DeletionAuthority::Owner {
-                did_hash: did_hash.to_string(),
-            },
-        )
-        .await
-    }
-
-    async fn purge_folder_by(
-        &self,
-        session_id: &str,
-        did_hash: &str,
-        folder: Folder,
-        by: DeletionAuthority,
-    ) -> Result<(usize, usize), MediatorError> {
-        let session = Session {
-            session_id: session_id.to_string(),
-            ..Default::default()
-        };
-        self.purge_messages(&session, did_hash, folder, &by).await
+        let mut conn = self.get_connection().await?;
+        redis::Cmd::xdel(&key, stream_ids)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    14,
+                    "NA".into(),
+                    &e,
+                    format!("Failed to delete folder entries. Reason: {e}"),
+                )
+            })
     }
 
     async fn delete_folder_stream(
@@ -2163,12 +2221,38 @@ impl MediatorStore for RedisStore {
         count: usize,
         block: Duration,
     ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
-        // Auto-create the consumer group on first read. Idempotent —
-        // the legacy ensure_group ignores BUSYGROUP errors.
-        self.forward_queue_ensure_group(group_name).await?;
-        let inner = self
-            .forward_queue_read(group_name, consumer_name, count, block.as_millis() as usize)
-            .await?;
+        // Create the consumer group on the first read, and again only when
+        // a read finds it gone (NOGROUP: the stream was deleted or the
+        // database flushed), rather than before every read.
+        let known = self
+            .forward_groups
+            .lock()
+            .map(|groups| groups.contains(group_name))
+            .unwrap_or(false);
+        if !known {
+            self.forward_queue_ensure_group(group_name).await?;
+            if let Ok(mut groups) = self.forward_groups.lock() {
+                groups.insert(group_name.to_string());
+            }
+        }
+        let block_ms = block.as_millis() as usize;
+        let inner = match self
+            .forward_queue_read(group_name, consumer_name, count, block_ms)
+            .await
+        {
+            Err(err) if err.to_string().contains("NOGROUP") => {
+                if let Ok(mut groups) = self.forward_groups.lock() {
+                    groups.remove(group_name);
+                }
+                self.forward_queue_ensure_group(group_name).await?;
+                if let Ok(mut groups) = self.forward_groups.lock() {
+                    groups.insert(group_name.to_string());
+                }
+                self.forward_queue_read(group_name, consumer_name, count, block_ms)
+                    .await?
+            }
+            other => other?,
+        };
         Ok(inner.into_iter().map(fwd_entry_into_new).collect())
     }
 
@@ -2182,6 +2266,25 @@ impl MediatorStore for RedisStore {
 
     async fn forward_queue_delete(&self, stream_ids: &[&str]) -> Result<(), MediatorError> {
         self.forward_queue_delete(stream_ids).await
+    }
+
+    async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        self.forward_queue_ack_and_delete(group_name, stream_ids)
+            .await
+    }
+
+    async fn forward_queue_prune_consumers(
+        &self,
+        group_name: &str,
+        keep_consumer: &str,
+        min_idle: Duration,
+    ) -> Result<usize, MediatorError> {
+        self.forward_queue_prune_consumers(group_name, keep_consumer, min_idle)
+            .await
     }
 
     async fn forward_queue_autoclaim(
@@ -2697,63 +2800,36 @@ impl MediatorStore for RedisStore {
                         )
                     })?;
 
-                let mut done: Vec<String> = Vec::new();
-                for member in batch {
-                    if !seen.insert(member.clone()) {
-                        continue;
-                    }
-                    // `<id>:<to>` names one recipient's record. A bare `<id>`
-                    // is a legacy per-id record, named by its own TO.
-                    let (msg_id, to) = Keys::parse_record_member(&member);
-                    let to = match to {
-                        Some(to) => Some(to.to_string()),
-                        None => redis::cmd("HGET")
-                            .arg(self.keys().msg_meta(msg_id, None))
-                            .arg("TO")
-                            .query_async::<Option<String>>(&mut conn)
-                            .await
-                            .unwrap_or(None),
-                    };
-                    let Some(to) = to else {
-                        report.already_deleted += 1;
-                        done.push(member);
-                        continue;
-                    };
-                    let meta = match on_expired {
-                        Some(_) => MediatorStore::get_message_metadata(self, &to, msg_id)
-                            .await
-                            .ok(),
-                        None => None,
-                    };
-                    // Only if this entry is still the record's expiry: an
-                    // entry left by a deadline the record no longer has is
-                    // answered as not found and dropped, sparing the record.
-                    match self
-                        .handler
-                        .delete_message(
-                            None,
-                            admin_did_hash,
-                            msg_id,
-                            MessageScope::Recipient(&to),
-                            Some(admin_did_hash),
-                            slot,
+                // The batch's deletes run together (pipelined over the one
+                // multiplexed connection), not one round trip after another.
+                let fresh: Vec<String> = batch
+                    .into_iter()
+                    .filter(|member| seen.insert(member.clone()))
+                    .collect();
+                let outcomes = futures_util::future::join_all(fresh.iter().map(|member| {
+                    let conn = conn.clone();
+                    async move {
+                        (
+                            member,
+                            self.expire_member(conn, member, admin_did_hash, slot, on_expired)
+                                .await,
                         )
-                        .await
-                    {
-                        Ok(_) => {
+                    }
+                }))
+                .await;
+                let mut done: Vec<String> = Vec::new();
+                for (member, outcome) in outcomes {
+                    match outcome {
+                        ExpireOutcome::Expired => {
                             report.expired += 1;
-                            if let (Some(observe), Some(meta)) = (on_expired, &meta) {
-                                observe(msg_id, meta);
-                            }
-                            done.push(member);
+                            done.push(member.clone());
                         }
-                        Err(err) if ops::is_delete_not_found(&err) => {
+                        ExpireOutcome::Gone => {
                             report.already_deleted += 1;
-                            done.push(member);
+                            done.push(member.clone());
                         }
-                        Err(err) => {
+                        ExpireOutcome::Failed => {
                             // Left in the bucket; the next sweep retries it.
-                            warn!("Couldn't expire message {member}, retrying next sweep: {err}");
                             bucket_cleared = false;
                         }
                     }
@@ -2795,10 +2871,7 @@ impl MediatorStore for RedisStore {
                     warn!("sweep_expired_messages couldn't defer bucket {key}: {err}");
                 }
             } else {
-                redis::cmd("ZREM")
-                    .arg("MSG_EXPIRY")
-                    .arg(key)
-                    .exec_async(&mut conn)
+                self.drop_empty_expiry_bucket(&mut conn, key, slot)
                     .await
                     .map_err(|err| {
                         MediatorError::database_from_redis(
@@ -2812,6 +2885,129 @@ impl MediatorStore for RedisStore {
         }
 
         Ok(report)
+    }
+}
+
+/// Remove expiry bucket KEYS[2] from the index KEYS[1] only if it is empty:
+/// a store may have added a message to it since the sweeper last scanned it,
+/// and unlisting the bucket then would leave that message with no expiry.
+/// Single-node only (the two keys are in different slots in cluster mode).
+static DROP_EMPTY_BUCKET: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+if redis.call('SCARD', KEYS[2]) == 0 then
+  return redis.call('ZREM', KEYS[1], KEYS[2])
+end
+return 0
+"#,
+    )
+});
+
+impl RedisStore {
+    /// Unlist the swept expiry bucket `key` from `MSG_EXPIRY`, unless a
+    /// message was added to it meanwhile. Single-node: one script. Cluster
+    /// mode cannot run one script over both keys, so it unlists the bucket
+    /// and then lists it again (at its own time `slot`) if it is not empty;
+    /// a store adds to the index before the bucket, so a store between the
+    /// two steps either lists the bucket again itself or is seen here.
+    async fn drop_empty_expiry_bucket(
+        &self,
+        conn: &mut RedisConnection,
+        key: &str,
+        slot: Option<u64>,
+    ) -> redis::RedisResult<()> {
+        if !self.keys().cluster_mode() {
+            return DROP_EMPTY_BUCKET
+                .key("MSG_EXPIRY")
+                .key(key)
+                .invoke_async::<i64>(conn)
+                .await
+                .map(|_| ());
+        }
+        redis::cmd("ZREM")
+            .arg("MSG_EXPIRY")
+            .arg(key)
+            .exec_async(conn)
+            .await?;
+        let left: i64 = redis::cmd("SCARD").arg(key).query_async(conn).await?;
+        if left > 0 {
+            redis::cmd("ZADD")
+                .arg("MSG_EXPIRY")
+                .arg("NX")
+                .arg(slot.unwrap_or(0))
+                .arg(key)
+                .exec_async(conn)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// What happened to one expiry-bucket member.
+enum ExpireOutcome {
+    Expired,
+    Gone,
+    Failed,
+}
+
+impl RedisStore {
+    /// Expire the record a bucket member names, if it is due at `slot`.
+    async fn expire_member(
+        &self,
+        mut conn: RedisConnection,
+        member: &str,
+        admin_did_hash: &str,
+        slot: Option<u64>,
+        on_expired: Option<crate::store::OnExpired<'_>>,
+    ) -> ExpireOutcome {
+        // `<id>:<to>` names one recipient's record. A bare `<id>` is a
+        // legacy per-id record, named by its own TO.
+        let (msg_id, to) = Keys::parse_record_member(member);
+        let to = match to {
+            Some(to) => Some(to.to_string()),
+            None => redis::cmd("HGET")
+                .arg(self.keys().msg_meta(msg_id, None))
+                .arg("TO")
+                .query_async::<Option<String>>(&mut conn)
+                .await
+                .unwrap_or(None),
+        };
+        let Some(to) = to else {
+            return ExpireOutcome::Gone;
+        };
+        let meta = match on_expired {
+            Some(_) => MediatorStore::get_message_metadata(self, &to, msg_id)
+                .await
+                .ok(),
+            None => None,
+        };
+        // Only if this entry is still the record's expiry: an entry left by
+        // a deadline the record no longer has is answered as not found and
+        // dropped, sparing the record.
+        match self
+            .handler
+            .delete_message(
+                None,
+                admin_did_hash,
+                msg_id,
+                MessageScope::Recipient(&to),
+                Some(admin_did_hash),
+                slot,
+            )
+            .await
+        {
+            Ok(_) => {
+                if let (Some(observe), Some(meta)) = (on_expired, &meta) {
+                    observe(msg_id, meta);
+                }
+                ExpireOutcome::Expired
+            }
+            Err(err) if ops::is_delete_not_found(&err) => ExpireOutcome::Gone,
+            Err(err) => {
+                warn!("Couldn't expire message {member}, retrying next sweep: {err}");
+                ExpireOutcome::Failed
+            }
+        }
     }
 }
 

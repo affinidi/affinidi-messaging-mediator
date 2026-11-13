@@ -832,6 +832,7 @@ impl MediatorStore for MemoryStore {
                 continue;
             };
             let first_delivery = record.first_delivered_at_ms.is_none();
+            report.bytes += record.bytes;
             if first_delivery {
                 report.first_delivered += 1;
             } else {
@@ -954,6 +955,12 @@ impl MediatorStore for MemoryStore {
         range: Option<(&str, &str)>,
         limit: u32,
     ) -> Result<MessageList, MediatorError> {
+        let (start, end) = range.unwrap_or(("-", "+"));
+        let start_id = ops::parse_range_bound(start, false)?;
+        let end_id = ops::parse_range_bound(end, true)?;
+        if start_id > end_id {
+            return Ok(Vec::new());
+        }
         let state = self.state.lock().await;
         let stream = match folder {
             Folder::Inbox => state.inbox.get(did_hash),
@@ -961,18 +968,6 @@ impl MediatorStore for MemoryStore {
         };
         let Some(stream) = stream else {
             return Ok(Vec::new());
-        };
-
-        let (start, end) = range.unwrap_or(("-", "+"));
-        let start_id = if start == "-" {
-            (0, 0)
-        } else {
-            parse_stream_id(start).unwrap_or((0, 0))
-        };
-        let end_id = if end == "+" {
-            (u64::MAX, u64::MAX)
-        } else {
-            parse_stream_id(end).unwrap_or((u64::MAX, u64::MAX))
         };
 
         let mut out = Vec::new();
@@ -1043,7 +1038,7 @@ impl MediatorStore for MemoryStore {
                     .get(&(entry.msg_id.clone(), did_hash.to_string()))
                     .map(|r| r.body.clone())
             };
-            let mut element = MessageListElement {
+            let element = MessageListElement {
                 msg_id: entry.msg_id.clone(),
                 receive_id: Some(format_stream_id(*sid)),
                 size: entry.bytes as u64,
@@ -1064,11 +1059,13 @@ impl MediatorStore for MemoryStore {
                         },
                     )
                     .await;
+                // The message stays queued, and the client still gets it
+                // with the failed delete reported, as on Redis: at least
+                // once, never a body withheld while the message remains.
                 if let Err(e) = result {
                     response
                         .delete_errors
                         .push((entry.msg_id.clone(), e.to_string()));
-                    element.msg = None;
                 }
             }
             response.success.push(element);
@@ -1077,76 +1074,25 @@ impl MediatorStore for MemoryStore {
         Ok(response)
     }
 
-    async fn purge_folder(
+    async fn delete_folder_entries(
         &self,
-        session_id: &str,
         did_hash: &str,
         folder: Folder,
-    ) -> Result<(usize, usize), MediatorError> {
-        self.purge_folder_by(
-            session_id,
-            did_hash,
-            folder,
-            DeletionAuthority::Owner {
-                did_hash: did_hash.to_string(),
-            },
-        )
-        .await
-    }
-
-    async fn purge_folder_by(
-        &self,
-        _session_id: &str,
-        did_hash: &str,
-        folder: Folder,
-        by: DeletionAuthority,
-    ) -> Result<(usize, usize), MediatorError> {
-        // Snapshot the message IDs in the folder under the lock, then
-        // call delete_message on each (which re-acquires the lock).
-        // Each entry names one record: the owner's in an inbox, the entry's
-        // recipient in an outbox.
-        let records: Vec<RecordKey> = {
-            let state = self.state.lock().await;
-            match folder {
-                Folder::Inbox => state.inbox.get(did_hash).map(|s| {
-                    s.values()
-                        .map(|e| (e.msg_id.clone(), did_hash.to_string()))
-                        .collect()
-                }),
-                Folder::Outbox => state.outbox.get(did_hash).map(|s| {
-                    s.values()
-                        .map(|e| (e.msg_id.clone(), e.peer_did.clone()))
-                        .collect()
-                }),
-            }
-            .unwrap_or_default()
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let stream = match folder {
+            Folder::Inbox => state.inbox.get_mut(did_hash),
+            Folder::Outbox => state.outbox.get_mut(did_hash),
         };
-
-        let mut count = 0;
-        let mut bytes = 0;
-        for (msg_id, to) in records {
-            let bytes_before = {
-                let state = self.state.lock().await;
-                state
-                    .messages
-                    .get(&(msg_id.clone(), to.clone()))
-                    .map(|r| r.bytes)
-                    .unwrap_or(0)
-            };
-            if self
-                .delete_message_in(&msg_id, MessageScope::Recipient(&to), by.clone())
-                .await
-                .is_ok()
-            {
-                count += 1;
-                bytes += bytes_before;
+        if let Some(stream) = stream {
+            for id in stream_ids {
+                if let Some(id) = parse_stream_id(id) {
+                    stream.remove(&id);
+                }
             }
         }
-
-        // Drop the (now-empty) stream key.
-        self.delete_folder_stream(_session_id, did_hash, folder)
-            .await?;
-        Ok((count, bytes))
+        Ok(())
     }
 
     async fn delete_folder_stream(
@@ -1218,11 +1164,7 @@ impl MediatorStore for MemoryStore {
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
         let mut state = self.state.lock().await;
         let record = state.get_session_record(session_id).ok_or_else(|| {
-            MediatorError::SessionError(
-                14,
-                session_id.into(),
-                format!("Session not found: {session_id}"),
-            )
+            affinidi_messaging_mediator_common::store::session_not_found(session_id)
         })?;
         let mut session = record.session.clone();
 
@@ -1291,6 +1233,21 @@ impl MediatorStore for MemoryStore {
             },
         );
         state.incr_counter("SESSIONS_SUCCESS", 1);
+        Ok(())
+    }
+
+    /// In place, keeping the session's expiry, as Redis and Fjall do: a
+    /// refresh-token update must not extend the session's life.
+    async fn update_refresh_token_hash(
+        &self,
+        session_id: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.get_session_record(session_id).ok_or_else(|| {
+            affinidi_messaging_mediator_common::store::session_not_found(session_id)
+        })?;
+        record.session.refresh_token_hash = Some(refresh_token_hash.to_string());
         Ok(())
     }
 
@@ -1405,15 +1362,19 @@ impl MediatorStore for MemoryStore {
             .await?;
         // As the mediator, not the owner: senders see these as `discarded`,
         // not collected by a recipient who never read them.
-        self.purge_folder_by(
-            "",
-            did_hash,
-            Folder::Inbox,
-            DeletionAuthority::Admin {
-                admin_did_hash: did_hash.to_string(),
-            },
-        )
-        .await?;
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
+        self.delete_folder_stream("", did_hash, Folder::Inbox)
+            .await?;
 
         // Drop the account, admin set membership, and known-DIDs entry.
         let mut state = self.state.lock().await;

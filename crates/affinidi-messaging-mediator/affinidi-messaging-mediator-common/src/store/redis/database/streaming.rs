@@ -155,6 +155,10 @@ return 1
     )
 });
 
+/// The most registrations one `clean_start_streaming` call clears (the
+/// library function's and the cluster script's batch).
+const CLEAN_START_BATCH: i64 = 500;
+
 /// DIDs read per `HMGET` in [`Database::streaming_owners`].
 const OWNERS_BATCH: usize = 500;
 
@@ -169,7 +173,29 @@ fn parse_owner(row: &str) -> Option<(&str, bool)> {
 }
 
 impl Database {
+    /// Drop this instance's registrations left from a previous run. One
+    /// script call clears at most [`CLEAN_START_BATCH`] (so one call never
+    /// blocks the server for long); this calls it until a batch comes back
+    /// short, so an instance that had more connected clients than that
+    /// leaves none of them registered as live here.
     pub async fn streaming_clean_start(&self, uuid: &str) -> Result<(), MediatorError> {
+        let mut total: i64 = 0;
+        loop {
+            let cleaned = self.streaming_clean_start_batch(uuid).await?;
+            total += cleaned;
+            if cleaned < CLEAN_START_BATCH {
+                break;
+            }
+        }
+        event!(
+            Level::INFO,
+            "clean_start_streaming() cleaned {} sessions",
+            total
+        );
+        Ok(())
+    }
+
+    async fn streaming_clean_start_batch(&self, uuid: &str) -> Result<i64, MediatorError> {
         let mut conn = self.get_connection().await?;
 
         let response: Vec<Value> = if self.keys().cluster_mode() {
@@ -205,24 +231,20 @@ impl Database {
             )
         })?;
 
-        if let Ok(count) = from_redis_value::<i64>(response[0].clone()) {
-            event!(
-                Level::INFO,
-                "clean_start_streaming() cleaned {} sessions",
-                count
-            );
-            Ok(())
-        } else {
-            event!(
-                Level::ERROR,
-                "clean_start_streaming() failed to parse response: {:?}",
-                response
-            );
-            Err(MediatorError::DatabaseError(
-                23,
-                "NA".into(),
-                format!("redis fn clean_start_streaming() failed. Response ({response:?})"),
-            ))
+        match response.first().map(|v| from_redis_value::<i64>(v.clone())) {
+            Some(Ok(count)) => Ok(count),
+            _ => {
+                event!(
+                    Level::ERROR,
+                    "clean_start_streaming() failed to parse response: {:?}",
+                    response
+                );
+                Err(MediatorError::DatabaseError(
+                    23,
+                    "NA".into(),
+                    format!("redis fn clean_start_streaming() failed. Response ({response:?})"),
+                ))
+            }
         }
     }
 
