@@ -216,7 +216,8 @@ pub struct StatementVerifier {
 
 impl StatementVerifier {
     pub fn new(resolver: DIDCacheClient) -> Self {
-        let resolver = Arc::new(CachedDidResolver::new(Arc::new(resolver)));
+        let resolver =
+            Arc::new(crate::messages::protocols::trust_task_verify::signing_key_resolver(resolver));
         let verifier = Verifier::with_resolver(resolver.clone()).with_options(
             VerifyOptions::new()
                 // JCS only: mux statements carry no `@context`, so RDF

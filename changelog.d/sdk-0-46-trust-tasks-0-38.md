@@ -21,8 +21,23 @@
   - It bounds DID resolution in the `affinidi` proof backend (10 s, no
     private hosts).
   - Its in-memory replay guard refuses when full.
-  A request the mediator accepted before can therefore be refused if it
-  breaks one of these rules.
+- Tested against this mediator, clients on `affinidi-messaging-sdk` 0.45.17
+  (`trust-tasks-rs` 0.37) and 0.44.0 (0.36) see no change. The tasks tried
+  were authentication, ping, account get/update, ACL and access-list
+  get/update/list, queue and message status, stats, audit, monitor subscribe,
+  mux grant/list/revoke-all/admin-list/admin-revoke-all, and message pickup,
+  with proofs enforced.
+  - Their timestamps are in range.
+  - Their documents carry no `@context`.
+  - The mediator keeps its own replay record.
+  - The `type` check applies only to `ping`, which both versions pass.
+- **DID host policy.** The proof backend's new refusal of DIDs naming
+  `localhost` or a private IP literal is kept when the mediator resolves DIDs
+  itself (local mode). Its own resolver already refused those hosts there.
+  With `[did_resolver] address` set (network mode), the resolver service
+  fetches the documents under its own host policy. The proof backend's check
+  is lifted there, so a local-dev stack whose VTA is
+  `did:webvh:{SCID}:localhost%3A3000` keeps working as it did on 0.37.
 - `vta-sdk` (the `vta` feature) still brings its own `affinidi-messaging-sdk`
   0.44 and `trust-tasks-rs` 0.36, as before. Nothing passes their types
   across.
