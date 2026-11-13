@@ -102,7 +102,9 @@ tokio::task_local! {
 /// and what it deferred. The caller decides when (and whether) to run them.
 pub(crate) async fn collect<F: Future>(f: F) -> (F::Output, AfterWrite) {
     let after = AfterWrite::default();
-    let output = AFTER_WRITE.scope(after.clone(), f).await;
+    // Boxed: `f` is a whole inbound handler, and a scope around it inline
+    // would double its size on the caller's stack.
+    let output = AFTER_WRITE.scope(after.clone(), Box::pin(f)).await;
     (output, after)
 }
 

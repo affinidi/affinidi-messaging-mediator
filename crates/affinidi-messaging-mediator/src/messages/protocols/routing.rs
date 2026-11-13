@@ -100,7 +100,9 @@ tokio::task_local! {
 /// carries the count between mediators, so loop detection across mediators
 /// needs `Rewrap` mode.
 pub(crate) async fn with_relay_hop_floor<F: std::future::Future>(floor: u32, f: F) -> F::Output {
-    RELAY_HOP_FLOOR.scope(floor, f).await
+    // Boxed: `f` is the rest of an inbound handler, and a scope around it
+    // inline would add its whole size to the caller's stack.
+    RELAY_HOP_FLOOR.scope(floor, Box::pin(f)).await
 }
 
 fn relay_hop_floor() -> u32 {

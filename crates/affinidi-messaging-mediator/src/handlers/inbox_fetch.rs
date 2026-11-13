@@ -111,12 +111,27 @@ pub async fn inbox_fetch_handler(
         let after = AfterWrite::default();
         let ids: Vec<String> = results.success.iter().map(|m| m.msg_id.clone()).collect();
         if matches!(body.delete_policy, FetchDeletePolicy::Optimistic) {
-            // Deleted once written; stamping a message about to be deleted
-            // would only resurrect its metadata on Redis.
+            // Recorded, then deleted, once written.
             let reported: Vec<HandedOverMessage> = results.success.iter().map(HandedOverMessage::of).collect();
             let state = state.clone();
             let owner = session.did_hash.clone();
             after.push_completion(Box::pin(async move {
+                // The handover is recorded through `record_delivered` like any
+                // other written delivery (the store's delivery stamp and sent
+                // counters move there), before the delete: stamping a message
+                // already deleted would resurrect its metadata on Redis.
+                if let Err(e) = state
+                    .database
+                    .record_delivered(
+                        &owner,
+                        &ids,
+                        state.clock.unix_millis() as u64,
+                        state.config.limits.delivered_expiry_seconds,
+                    )
+                    .await
+                {
+                    warn!("couldn't record {} written message(s) as delivered: {e}", ids.len());
+                }
                 for (msg_id, m) in ids.iter().zip(&reported) {
                     state.monitor.delivered_as(
                         &m.msg_id, m.from.as_deref(), m.to.as_deref(), m.size,
