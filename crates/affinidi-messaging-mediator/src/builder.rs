@@ -453,6 +453,20 @@ impl MediatorBuilder {
         self
     }
 
+    /// Refuse these Trust Task request types (full type URIs, e.g. a `0.2`
+    /// one) as unsupported, exactly as a mediator that predates them does.
+    /// For testing a client's fallback to an older version against a real
+    /// mediator; nothing is withheld by default, and the config file cannot
+    /// set it.
+    pub fn withhold_task_types<I, S>(mut self, type_uris: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.withheld_task_types = type_uris.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Replace the security config wholesale. Use this to inject
     /// pre-built JWT keys from your secrets backend, configure CORS,
     /// adjust ACL defaults, etc.

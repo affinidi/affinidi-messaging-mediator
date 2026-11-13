@@ -369,6 +369,8 @@ pub struct TestMediatorBuilder {
     mux_enabled: bool,
     /// Override for `[limits.mux] max_dids_per_connection`.
     mux_max_dids_per_connection: Option<usize>,
+    /// See [`TestMediatorBuilder::withhold_task_types`].
+    withheld_task_types: Vec<String>,
     /// See [`TestMediatorBuilder::streaming_liveness`].
     streaming_liveness:
         Option<affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness>,
@@ -434,6 +436,7 @@ impl Default for TestMediatorBuilder {
             websocket_liveness: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
+            withheld_task_types: Vec::new(),
             streaming_liveness: None,
             queue_send_limit_per_peer: None,
             message_size: None,
@@ -759,6 +762,20 @@ impl TestMediatorBuilder {
         liveness: affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness,
     ) -> Self {
         self.streaming_liveness = Some(liveness);
+        self
+    }
+
+    /// Refuse these Trust Task request types (full type URIs) as
+    /// unsupported, as a mediator that predates them would
+    /// (`MediatorBuilder::withhold_task_types`) — to test a client's
+    /// fallback to an older version, e.g. `monitor/subscribe` 0.2 withheld
+    /// leaves 0.1. Nothing is withheld by default.
+    pub fn withhold_task_types<I, S>(mut self, type_uris: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.withheld_task_types = type_uris.into_iter().map(Into::into).collect();
         self
     }
 
@@ -1179,6 +1196,9 @@ impl TestMediatorBuilder {
         }
         if let Some(liveness) = self.streaming_liveness {
             builder = builder.streaming_liveness(liveness);
+        }
+        if !self.withheld_task_types.is_empty() {
+            builder = builder.withhold_task_types(self.withheld_task_types.clone());
         }
         if let Some(cidrs) = &self.trust_xff_cidrs {
             builder.config_mut().trust_xff_cidrs = cidrs

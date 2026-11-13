@@ -246,11 +246,20 @@ pub(crate) async fn consume(
     // Route by task type. The match is exhaustive over `ServedTask`, so a type
     // registered in `served_tasks!` without a handler here fails to compile.
     let sk = Some(sender_kid.clone());
+    // A type withheld by the embedder (a test standing in for an older
+    // mediator) is refused below as one that isn't served at all.
+    let withheld = !state.config.withheld_task_types.is_empty()
+        && state
+            .config
+            .withheld_task_types
+            .iter()
+            .any(|t| *t == doc.type_uri.to_string());
     // A 0.2 request is served by its 0.1 task's handler (`newer` says which
     // version was asked for; see `trust_task_versions`).
-    let (task, newer) = match ServedTask::from_type_uri(&doc.type_uri) {
+    let served = ServedTask::from_type_uri(&doc.type_uri).filter(|_| !withheld);
+    let (task, newer) = match served {
         Some(task) => (task, None),
-        None => match NewerVersion::from_type_uri(&doc.type_uri) {
+        None => match NewerVersion::from_type_uri(&doc.type_uri).filter(|_| !withheld) {
             Some(newer) => (newer.base(), Some(newer)),
             None => {
                 return Err(tt_problem(

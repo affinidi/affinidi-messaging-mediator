@@ -193,6 +193,13 @@ pub struct Config {
     /// `MediatorBuilder::streaming_liveness` sets others.
     #[serde(skip)]
     pub streaming_liveness: crate::tasks::websocket_streaming::StreamingLiveness,
+    /// Trust Task request type URIs refused as unsupported, as a mediator
+    /// that predates them would refuse them. Not in the config file: it
+    /// exists so a client's fallback can be tested against a real mediator
+    /// (`MediatorBuilder::withhold_task_types`). Empty — everything served —
+    /// by default.
+    #[serde(skip)]
+    pub withheld_task_types: Vec<String>,
     pub database: DatabaseConfig,
     pub security: SecurityConfig,
     #[serde(skip_serializing)]
@@ -327,6 +334,7 @@ impl Config {
             streaming_enabled: true,
             streaming_uuid: "".into(),
             streaming_liveness: Default::default(),
+            withheld_task_types: Vec::new(),
             did_resolver_config,
             api_prefix: "/mediator/v1".into(),
             // The default config is only used inside the early-startup
