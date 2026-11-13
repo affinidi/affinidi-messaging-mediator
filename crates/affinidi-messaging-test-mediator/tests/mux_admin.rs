@@ -17,6 +17,7 @@ use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator::task_specs::messaging::mux as spec;
 use affinidi_messaging_mediator_common::{
     did_identity::did_hash,
+    store::{mux as mux_store, types::DeletionAuthority},
     types::{
         accounts::AccountType,
         audit::{AuditAction, AuditLogEntry},
@@ -776,4 +777,83 @@ async fn admin_revoke_all_advances_the_epoch_once() {
         r.has("messaging/mux/admin-revoke-all:unknownAccount"),
         "{r:?}"
     );
+}
+
+/// A `grantsRevoked` notice lost to a crash after `admin-revoke-all`
+/// committed is re-sent when the principal next connects with the reason the
+/// live one carried, `admin` — not `epochBumped`, which is what a member's
+/// own `revoke-all` is re-sent as (R2.1).
+#[tokio::test]
+async fn a_notice_lost_after_admin_revoke_all_is_resent_as_admin() {
+    init_tracing();
+    let env = env().await;
+    let admin = with_role(&env, "operator", AccountType::Admin).await;
+    let laptop = env.add_user("laptop").await.unwrap();
+    let work = env.add_user("work").await.unwrap();
+    let (_, grant_id) = grant(&env, &work, &laptop).await;
+    work.profile.stop_websocket().await.unwrap();
+
+    let r = revoke_all(&env, &admin, json!({ "did": work.did, "epoch": 0 }))
+        .await
+        .expect("advance");
+    assert_eq!(r["revokedGrants"], 1);
+    let live = stored_notices(&env, &laptop).await;
+    assert_eq!(live.len(), 1, "{live:#?}");
+    assert_eq!(live[0]["revocations"][0]["reason"], "admin");
+
+    // The process died after the commit, before the notice: none in the
+    // inbox, and the voided grant not marked told.
+    let store = env.mediator.store();
+    let laptop_hash = laptop.did_hash();
+    for m in store
+        .list_messages(&laptop_hash, Folder::Inbox, None, 100)
+        .await
+        .expect("inbox")
+    {
+        store
+            .delete_message(
+                &m.msg_id,
+                DeletionAuthority::Admin {
+                    admin_did_hash: admin.did_hash(),
+                },
+            )
+            .await
+            .expect("delete the notice");
+    }
+    assert!(stored_notices(&env, &laptop).await.is_empty());
+    let now = chrono::Utc::now().timestamp() as u64;
+    mux_store::modify(
+        &*store,
+        &work.did_hash(),
+        &mux_store::MuxLimits::default(),
+        now,
+        None,
+        |rec, _| {
+            for g in rec.grants.iter_mut().filter(|g| g.grant_id == grant_id) {
+                assert_eq!(g.voided_by, Some(mux_store::MuxVoidedBy::Admin));
+                g.noticed = false;
+            }
+            Ok(())
+        },
+    )
+    .await
+    .expect("forget the notice");
+
+    // Opening the laptop's mux connection recovers the notice it is owed.
+    mux_online(&env, &laptop).await;
+    let resent = timeout(Duration::from_secs(5), async {
+        loop {
+            let got = stored_notices(&env, &laptop).await;
+            if !got.is_empty() {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the owed notice is re-sent");
+    assert_eq!(resent.len(), 1, "{resent:#?}");
+    assert_eq!(resent[0]["notice"], "grantsRevoked");
+    assert_eq!(resent[0]["revocations"][0]["grantIds"], json!([grant_id]));
+    assert_eq!(resent[0]["revocations"][0]["reason"], "admin");
 }

@@ -719,6 +719,7 @@ mod tests {
             noticed: false,
             key_agreement_fps: Vec::new(),
             expiring_noticed: false,
+            voided_by: None,
         }
     }
 

@@ -11,10 +11,11 @@
 //! after the store write and the registry detach.
 //!
 //! **Process dies on the next line (R2.1).** A `grantsSuspended` or
-//! `grantsRevoked`/`epochBumped` notice lost to a crash after the commit is
-//! re-sent: such grants stay on the record with `noticed == false` until the
-//! notice is stored, and [`recover`] sends any still owed when the principal
-//! next opens a mux connection. A grant revoked by its member, or removed
+//! `grantsRevoked` notice for an epoch advance (`epochBumped`, or `admin`
+//! for an administrator's) lost to a crash after the commit is re-sent: such
+//! grants stay on the record with `noticed == false` until the notice is
+//! stored, and [`recover`] sends any still owed, with the reason the grant
+//! records, when the principal next opens a mux connection. A grant revoked by its member, or removed
 //! with its account, is deleted from the record, so its `grantsRevoked`
 //! notice is best effort; `messaging/mux/list` remains the source of truth.
 
@@ -804,7 +805,7 @@ async fn tell_present(state: &SharedData, did: &str, did_hash: &str, suspended: 
     }
 }
 
-/// Send the `grantsSuspended` / `grantsRevoked` (`epochBumped`) notices a
+/// Send the `grantsSuspended` / `grantsRevoked` (`epochBumped` or `admin`) notices a
 /// principal is still owed: its dead grants whose notice was never stored
 /// (the process died between the commit and the notice). Called when the
 /// principal opens a mux connection, before `pendingNotices` is counted.
@@ -851,14 +852,28 @@ pub async fn recover(state: &SharedData, principal_hash: &str) {
         .await;
         mark_noticed(state, &suspended, &told).await;
     }
-    if !voided.is_empty() {
+    for (reason, voided) in by_void_reason(voided) {
         let told = store_all(
             state,
-            per_principal(&voided, ListKind::Revoked, "epochBumped", now),
+            per_principal(&voided, ListKind::Revoked, reason, now),
         )
         .await;
         mark_noticed(state, &voided, &told).await;
     }
+}
+
+/// `EpochRevoked` grants grouped by the `grantsRevoked` reason each is owed:
+/// `admin` where an administrator voided it, `epochBumped` where its member
+/// did (or the record predates [`MuxGrant::voided_by`]) — the reason the
+/// live notice carried.
+fn by_void_reason(voided: Vec<MuxGrant>) -> BTreeMap<&'static str, Vec<MuxGrant>> {
+    let mut out: BTreeMap<&'static str, Vec<MuxGrant>> = BTreeMap::new();
+    for g in voided {
+        out.entry(LeaveReason::voided(&g).wire())
+            .or_default()
+            .push(g);
+    }
+    out
 }
 
 /// How many notices wait in `did_hash`'s inbox, for `ready.pendingNotices`.
@@ -935,6 +950,7 @@ mod tests {
             noticed: false,
             key_agreement_fps: Vec::new(),
             expiring_noticed: false,
+            voided_by: None,
         }
     }
 
@@ -960,6 +976,38 @@ mod tests {
         for n in &notices {
             assert!(conforms(&n.payload), "{:#}", n.payload);
         }
+    }
+
+    #[test]
+    fn recovery_labels_a_voided_grant_with_who_voided_it() {
+        let voided = |id: &str, member: &str, by: Option<mux::MuxVoidedBy>| MuxGrant {
+            state: MuxGrantState::EpochRevoked,
+            voided_by: by,
+            ..grant(id, member, "phone", Some(100))
+        };
+        let groups = by_void_reason(vec![
+            voided("g1", "work", Some(mux::MuxVoidedBy::Admin)),
+            voided("g2", "home", Some(mux::MuxVoidedBy::Member)),
+            // Stored before the field existed, or by an older instance.
+            voided("g3", "club", None),
+        ]);
+        let ids = |r: &str| {
+            groups[r]
+                .iter()
+                .map(|g| g.grant_id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(ids("admin"), ["g1"]);
+        assert_eq!(ids("epochBumped"), ["g2", "g3"]);
+
+        let notices = per_principal(&groups["admin"], ListKind::Revoked, "admin", 200);
+        assert_eq!(notices.len(), 1);
+        let n = &notices[0].payload;
+        assert!(conforms(n));
+        assert_eq!(n["notice"], "grantsRevoked");
+        assert_eq!(n["revocations"][0]["reason"], "admin");
+        assert_eq!(n["revocations"][0]["grantIds"], json!(["g1"]));
     }
 
     #[test]

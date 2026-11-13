@@ -469,7 +469,7 @@ pub async fn revoke_all(ctx: &Ctx<'_>, payload: &Value) -> Result<(Value, Change
         .await
         .map_err(|e| TaskError::new("revoke-all", &MuxError::Statement(e)))?;
 
-    let outcome = grants::advance_epoch(ctx, &st.did_hash, st.epoch)
+    let outcome = grants::advance_epoch(ctx, &st.did_hash, st.epoch, mux::MuxVoidedBy::Member)
         .await
         .map_err(|e| TaskError::new("revoke-all", &e))?;
 

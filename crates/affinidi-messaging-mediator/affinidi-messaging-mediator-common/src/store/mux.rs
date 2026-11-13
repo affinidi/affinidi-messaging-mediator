@@ -119,6 +119,23 @@ pub enum MuxGrantState {
     EpochRevoked,
 }
 
+/// Who advanced the epoch that voided an `EpochRevoked` grant
+/// ([`MuxGrant::voided_by`]): what labels the `grantsRevoked` notice and the
+/// detach for it — `epochBumped` for the member, `admin` for an
+/// administrator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MuxVoidedBy {
+    /// The member's own `messaging/mux/revoke-all`.
+    Member,
+    /// An administrator's `messaging/mux/admin-revoke-all`.
+    Admin,
+    /// A value a later version wrote that this one does not know. Read as
+    /// the member's, the label used before the field existed.
+    #[serde(other)]
+    Unknown,
+}
+
 impl MuxGrantState {
     /// Whether a grant in this state still counts against
     /// `max_grants_per_did`. Dead grants are kept only so they can be listed.
@@ -176,6 +193,13 @@ pub struct MuxGrant {
     /// Whether the `grantsExpiring` notice for this grant is stored.
     #[serde(default, skip_serializing_if = "is_false")]
     pub expiring_noticed: bool,
+    /// Who voided the grant, set with `EpochRevoked`, so a notice re-sent
+    /// after a crash, or a detach decided from the record alone, carries the
+    /// reason the live one did. Absent on records stored before the field
+    /// existed, or by an instance that predates it: read as the member's
+    /// (`epochBumped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voided_by: Option<MuxVoidedBy>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -788,12 +812,14 @@ fn revoke_where(
 }
 
 /// `revoke-all` (§5.2): bump the epoch and mark every live grant
-/// `EpochRevoked`. Returns the new epoch and the grants it voided.
-pub fn revoke_all(rec: &mut MuxDidRecord, now: u64) -> (u64, Vec<MuxGrant>) {
+/// `EpochRevoked`, voided by `by`. Returns the new epoch and the grants it
+/// voided.
+pub fn revoke_all(rec: &mut MuxDidRecord, now: u64, by: MuxVoidedBy) -> (u64, Vec<MuxGrant>) {
     rec.epoch += 1;
     let mut voided = Vec::new();
     for g in rec.grants.iter_mut().filter(|g| g.is_usable(now)) {
         g.set_state(MuxGrantState::EpochRevoked, now);
+        g.voided_by = Some(by);
         voided.push(g.clone());
     }
     (rec.epoch, voided)
@@ -1038,6 +1064,7 @@ mod tests {
             noticed: false,
             key_agreement_fps: Vec::new(),
             expiring_noticed: false,
+            voided_by: None,
         }
     }
 
@@ -1222,17 +1249,46 @@ mod tests {
     }
 
     #[test]
+    fn voided_by_reads_old_records_and_unknown_values() {
+        // A record stored before the field existed has none, and one without
+        // it serializes as before.
+        let g = grant("g1", "p", "k1", NOW, 0);
+        let v = serde_json::to_value(&g).unwrap();
+        assert!(v.get("voidedBy").is_none());
+        assert_eq!(
+            serde_json::from_value::<MuxGrant>(v.clone())
+                .unwrap()
+                .voided_by,
+            None
+        );
+        let mut admin = v.clone();
+        admin["voidedBy"] = "admin".into();
+        assert_eq!(
+            serde_json::from_value::<MuxGrant>(admin).unwrap().voided_by,
+            Some(MuxVoidedBy::Admin)
+        );
+        // A value a later version writes does not make the record unreadable.
+        let mut later = v;
+        later["voidedBy"] = "somethingNew".into();
+        assert_eq!(
+            serde_json::from_value::<MuxGrant>(later).unwrap().voided_by,
+            Some(MuxVoidedBy::Unknown)
+        );
+    }
+
+    #[test]
     fn revoke_all_bumps_the_epoch_and_voids_live_grants() {
         let mut rec = MuxDidRecord::default();
         put_grant(&mut rec, grant("g1", "p", "k1", NOW, 0), &limits(), NOW, 0).unwrap();
         put_grant(&mut rec, grant("g2", "q", "k1", NOW, 0), &limits(), NOW, 0).unwrap();
-        let (epoch, voided) = revoke_all(&mut rec, NOW + 1);
+        let (epoch, voided) = revoke_all(&mut rec, NOW + 1, MuxVoidedBy::Admin);
         assert_eq!(epoch, 1);
         assert_eq!(voided.len(), 2);
         assert!(
             rec.grants
                 .iter()
-                .all(|g| g.state == MuxGrantState::EpochRevoked)
+                .all(|g| g.state == MuxGrantState::EpochRevoked
+                    && g.voided_by == Some(MuxVoidedBy::Admin))
         );
         // The old grant can't come back under the old epoch.
         let err = put_grant(

@@ -301,7 +301,7 @@ pub async fn revoke_all(ctx: &Ctx<'_>, member_did: &str) -> Result<(u64, Vec<Mux
         &ctx.limits,
         ctx.now,
         None,
-        |rec, _| Ok(mux::revoke_all(rec, ctx.now)),
+        |rec, _| Ok(mux::revoke_all(rec, ctx.now, mux::MuxVoidedBy::Member)),
     )
     .await?)
 }
@@ -322,12 +322,14 @@ pub enum EpochAdvance {
 /// Advance member `did_hash`'s epoch if `epoch` is its current one — the
 /// compare-and-set every epoch advance makes, whoever asks: a member's own
 /// `revoke-all` statement or an administrator's `admin-revoke-all` (design
-/// §5.2). One atomic write; [`MuxStoreError::Contended`] when it could not
-/// be made, with nothing changed.
+/// §5.2). `by` is recorded on the grants it voids. One atomic write;
+/// [`MuxStoreError::Contended`] when it could not be made, with nothing
+/// changed.
 pub async fn advance_epoch(
     ctx: &Ctx<'_>,
     did_hash: &str,
     epoch: u64,
+    by: mux::MuxVoidedBy,
 ) -> Result<EpochAdvance, MuxError> {
     Ok(
         mux::modify(ctx.store, did_hash, &ctx.limits, ctx.now, None, |rec, _| {
@@ -336,7 +338,7 @@ pub async fn advance_epoch(
             } else if rec.epoch < epoch {
                 EpochAdvance::Future(rec.epoch)
             } else {
-                let (e, voided) = mux::revoke_all(rec, ctx.now);
+                let (e, voided) = mux::revoke_all(rec, ctx.now, by);
                 EpochAdvance::Advanced(e, voided)
             })
         })

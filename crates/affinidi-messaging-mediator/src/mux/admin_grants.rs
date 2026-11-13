@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use affinidi_messaging_mediator_common::{
     did_identity::did_hash,
-    store::mux::{self, MuxGrant, MuxStoreError},
+    store::mux::{self, MuxGrant, MuxStoreError, MuxVoidedBy},
     types::accounts::AccountType,
 };
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
@@ -530,7 +530,7 @@ pub async fn admin_revoke_all(
             false,
         ));
     }
-    match grants::advance_epoch(ctx, &hash, req.epoch).await {
+    match grants::advance_epoch(ctx, &hash, req.epoch, MuxVoidedBy::Admin).await {
         Ok(EpochAdvance::Advanced(epoch, voided)) => Ok((
             json!({ "did": req.did, "epoch": epoch, "epochAdvanced": true, "revokedGrants": voided.len() }),
             Changed {
@@ -594,6 +594,7 @@ mod tests {
             noticed: false,
             key_agreement_fps: Vec::new(),
             expiring_noticed: false,
+            voided_by: None,
         }
     }
 
