@@ -100,11 +100,18 @@ git rebase --signoff origin/main
    non-obvious — a subtle invariant, a reason for an unusual ordering, a
    reference to an incident or upstream issue.
 6. **No `unsafe`** in production code without a sign-off in the PR description.
+   The workspace sets `unsafe_code = "deny"`: a new site needs
+   `#[allow(unsafe_code)]` and a `// SAFETY:` comment saying why it is sound,
+   which is what the reviewer signs off.
 7. **No `unwrap`/`expect` on untrusted input** (network frames, config,
-   stored data). `unwrap` on internal invariants is fine.
+   stored data). `unwrap` on internal invariants is fine. Not lint-enforced
+   (clippy's `unwrap_used` cannot tell the two apart); reviewers check it.
 8. **Transport semantics are API.** Changes to send / ack / reconnect / delivery
    behaviour are breaking for consumers even when signatures do not change:
    call them out in a `changelog.d/` fragment.
+9. **Clippy is clean under every feature combination CI builds**, with
+   `-D warnings`: the default set, `--all-features`, TSP-only, and each
+   storage and secrets backend.
 
 ## Code of Conduct
 
@@ -143,3 +150,23 @@ Examples of unacceptable behavior by participants include:
   address, without explicit permission.
 - Other conduct which could reasonably be considered inappropriate in a
   professional setting.
+
+### Scope and enforcement
+
+This Code of Conduct is adapted from the
+[Contributor Covenant](https://www.contributor-covenant.org), version 1.4,
+available at
+<https://www.contributor-covenant.org/version/1/4/code-of-conduct.html>; that
+text, including its responsibilities, scope and enforcement sections, applies
+in full. The sections above summarise it.
+
+It applies within all project spaces (issues, pull requests, discussions and
+reviews) and when someone represents the project in public spaces.
+
+Report abusive, harassing, or otherwise unacceptable behaviour to the project
+team at <security@affinidi.com> (the contact in [SECURITY.md](SECURITY.md)).
+Every complaint is reviewed and investigated, and results in a response
+deemed necessary and appropriate to the circumstances. The project team keeps
+the reporter's identity confidential. Maintainers who do not follow or enforce
+the Code of Conduct in good faith may face temporary or permanent
+repercussions as determined by other members of the project's leadership.
