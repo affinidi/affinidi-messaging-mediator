@@ -67,7 +67,8 @@ directly; code that matched the old mediator codes through
 | 10 | 110 | `w.m.database.message.delete.not_found` |
 | 10 | 111 | `w.m.database.message.delete.permission_denied` |
 | 10, 11 | 3 | `e.p.me.res.storage.connection.blocking` |
-| 91–97 | 14 | forwarding-queue storage failures (logged; they collided with client codes) |
+| 91–98 | 14 | forwarding-queue storage failures (logged; they collided with client codes) |
+| 21 | 34 | a session that no longer exists (`store::session_not_found`; 21 is `e.p.database.stats.parse`) |
 | 500 | 17 | internal errors in the Fjall store and at shutdown |
 
 - `w.m.message.header.ephemera.invalid` is spelled

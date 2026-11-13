@@ -1197,7 +1197,7 @@ impl MediatorStore for RedisStore {
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    crate::error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &e,
                     format!("Failed to delete folder entries. Reason: {e}"),

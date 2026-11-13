@@ -690,11 +690,11 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         let err = |e: affinidi_messaging_mediator_config::ConfigError| {
             let msg = e.to_string();
             tracing::error!("{msg}");
-            MediatorError::ConfigError(12, "NA".into(), msg)
+            MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg)
         };
         let msg_err = |msg: String| {
             tracing::error!("{msg}");
-            MediatorError::ConfigError(12, "NA".into(), msg)
+            MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg)
         };
         let flag = |field: &str, value: &str| {
             values::boolean(&format!("security.{field}"), value).map_err(err)

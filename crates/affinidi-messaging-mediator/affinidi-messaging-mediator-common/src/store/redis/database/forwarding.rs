@@ -282,7 +282,7 @@ impl Database {
         pipe.exec_async(&mut conn).await.map_err(|err| {
             event!(Level::ERROR, "XACK/XDEL error: {}", err);
             MediatorError::database_from_redis(
-                93,
+                error_codes::DB_OPERATION_ERROR,
                 "forwarding".into(),
                 &err,
                 format!("XACK/XDEL error: {err}"),
@@ -320,7 +320,7 @@ impl Database {
             }
             Err(err) => {
                 return Err(MediatorError::database_from_redis(
-                    98,
+                    error_codes::DB_OPERATION_ERROR,
                     "forwarding".into(),
                     &err,
                     format!("XINFO CONSUMERS error: {err}"),
@@ -364,7 +364,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        98,
+                        error_codes::DB_OPERATION_ERROR,
                         "forwarding".into(),
                         &err,
                         format!("XGROUP DELCONSUMER error: {err}"),
