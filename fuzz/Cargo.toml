@@ -1,0 +1,53 @@
+[package]
+name = "affinidi-messaging-mediator-fuzz"
+version = "0.0.0"
+description = "cargo-fuzz targets for the parsers the mediator runs on untrusted input"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace (and lockfile, fuzz/Cargo.lock), so the fuzz build —
+# nightly, sanitizers, libfuzzer — never touches the main workspace's graph or
+# Cargo.lock. The root workspace lists its members explicitly, so fuzz/ is not
+# one of them.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The envelope / frame parsers the mediator runs first on bytes from the
+# network. Requirements follow the main workspace's (major.minor).
+affinidi-tsp = "0.3"
+affinidi-messaging-didcomm = "0.15"
+# Lean (types-only) build: the inbound protocol classifier.
+affinidi-messaging-mediator-common = { path = "../crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common", default-features = false }
+
+[[bin]]
+name = "tsp_meta_envelope"
+path = "fuzz_targets/tsp_meta_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "didcomm_message_json"
+path = "fuzz_targets/didcomm_message_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "didcomm_jws"
+path = "fuzz_targets/didcomm_jws.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_detect"
+path = "fuzz_targets/envelope_detect.rs"
+test = false
+doc = false
+bench = false

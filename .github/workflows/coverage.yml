@@ -1,0 +1,78 @@
+name: Coverage
+
+# Line coverage of the default-feature workspace suite (cargo-llvm-cov), as an
+# lcov artifact plus a summary on the run page. Informational only: it never
+# fails on a coverage number, and it is not part of ci.yml, so it never gates
+# `nightly`. Runs weekly, on demand, and after each push to main.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 04:30 UTC Mondays.
+    - cron: "30 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer main push supersedes an older coverage run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "--cfg tracing_unstable"
+
+jobs:
+  coverage:
+    name: cargo llvm-cov (workspace)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    # Non-blocking by design: a flaky test under instrumentation must not
+    # turn anything red that a reviewer then has to explain.
+    continue-on-error: true
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95.0"
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          # The version is whatever this pinned install-action release ships.
+          tool: cargo-llvm-cov
+      - uses: ./.github/actions/native-deps
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage (lines, default features)'
+            echo '```'
+            cargo llvm-cov report --summary-only || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: ignore
+          retention-days: 14
