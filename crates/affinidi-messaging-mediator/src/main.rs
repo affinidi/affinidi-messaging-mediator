@@ -1,9 +1,6 @@
-#[cfg(feature = "vta")]
 use affinidi_messaging_mediator::commands;
 use affinidi_messaging_mediator::server::start;
-use clap::Parser;
-#[cfg(feature = "vta")]
-use clap::Subcommand;
+use clap::{Parser, Subcommand};
 
 // ─── Allocator ──────────────────────────────────────────────────────────────
 //
@@ -29,7 +26,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///
 /// Raise these (or drop the `jemalloc` feature) if you are optimising for
 /// allocation throughput over resident footprint.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. `malloc_conf` is the name jemalloc documents
+/// for exactly this, it is defined once (in the binary, never the library), and
+/// the value is the NUL-terminated static string jemalloc expects.
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
 #[unsafe(export_name = "malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
@@ -54,19 +57,27 @@ struct Cli {
     #[arg(short = 'c', long, default_value = "conf/mediator.toml", global = true)]
     config: String,
 
-    /// `rotate-admin` is the only subcommand, and it is a conversation
-    /// with a VTA. A build without `vta` has none, so the field goes too:
-    /// clap's `Subcommand` derive has nothing to generate from an empty
-    /// enum.
-    #[cfg(feature = "vta")]
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[cfg(feature = "vta")]
 #[derive(Subcommand)]
 enum Command {
-    /// Rotate the mediator's admin credential.
+    /// Check that a running mediator is alive (for container healthchecks).
+    ///
+    /// GETs the `livez` route of the mediator described by the config file
+    /// (`--config`, with the usual environment overrides): `listen_address`
+    /// (a wildcard bind is probed on loopback), `api_prefix` and `use_ssl`.
+    /// Exits 0 when it answers 2xx, 1 otherwise.
+    Healthcheck {
+        /// Probe this URL instead of the one derived from the config.
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Rotate the mediator's admin credential. Needs the `vta` feature: the
+    /// whole operation is a conversation with a VTA.
+    #[cfg(feature = "vta")]
     ///
     /// Reads the existing credential from the unified secret backend,
     /// authenticates to the VTA, registers a fresh did:key with the
@@ -87,20 +98,31 @@ async fn main() {
     let cli = Cli::parse();
 
     // Subcommand first, server second: no subcommand means "run the
-    // mediator", which is the historical behaviour and the only one a
-    // build without `vta` has.
-    #[cfg(feature = "vta")]
-    if let Some(Command::RotateAdmin { dry_run }) = cli.command {
-        // Subcommands handle their own tracing init lazily
-        // (rotate_admin uses the global subscriber if one is
-        // already in place; otherwise it falls back to a minimal
-        // env-filter setup so info!/warn! land somewhere visible).
-        init_subcommand_tracing();
-        if let Err(e) = commands::rotate_admin::run(&cli.config, dry_run).await {
-            eprintln!("\x1b[31mError:\x1b[0m {e}");
-            std::process::exit(1);
+    // mediator", which is the historical behaviour.
+    match cli.command {
+        None => {}
+        Some(Command::Healthcheck { url }) => {
+            // No tracing subscriber: a healthcheck's output is its exit
+            // status plus one line on failure.
+            if let Err(e) = commands::healthcheck::run(&cli.config, url.as_deref()).await {
+                eprintln!("unhealthy: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        #[cfg(feature = "vta")]
+        Some(Command::RotateAdmin { dry_run }) => {
+            // Subcommands handle their own tracing init lazily
+            // (rotate_admin uses the global subscriber if one is
+            // already in place; otherwise it falls back to a minimal
+            // env-filter setup so info!/warn! land somewhere visible).
+            init_subcommand_tracing();
+            if let Err(e) = commands::rotate_admin::run(&cli.config, dry_run).await {
+                eprintln!("\x1b[31mError:\x1b[0m {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
     }
 
     if let Err(e) = start(&cli.config).await {

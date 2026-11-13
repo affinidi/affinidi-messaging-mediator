@@ -10,6 +10,9 @@
 //! and returns. The CLI dispatcher in `main.rs` matches on a clap
 //! subcommand enum and calls the right `run`.
 
+/// Liveness probe for container healthchecks (`mediator healthcheck`).
+pub mod healthcheck;
+
 /// Admin-credential rotation against a VTA. Requires `vta` — the whole
 /// operation is a conversation with one.
 #[cfg(feature = "vta")]

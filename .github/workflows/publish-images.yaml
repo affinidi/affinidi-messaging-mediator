@@ -54,6 +54,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to a `ci:image` PR supersedes the image build already running
+# for it. Tag and dispatch runs are never cancelled: they publish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   IMAGE_NAME: messaging-mediator
   DOCKERFILE: docker/mediator.Dockerfile
@@ -71,6 +77,7 @@ jobs:
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'ci:image')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       # Read-only: check-dispatch.sh looks the version up in GHCR.
@@ -79,8 +86,9 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       is_latest: ${{ steps.v.outputs.is_latest }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
 
@@ -129,24 +137,43 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
         run: bash docker/ci/check-dispatch.sh
 
-  # Build the PRODUCTION image (docker/mediator.Dockerfile) and prove it boots
-  # with the expected feature set. This is the gate that catches a broken
-  # production image (wrong feature set, unreadable config, panics on startup)
-  # before anything is published.
+  # Build the PRODUCTION image (docker/mediator.Dockerfile) on each
+  # architecture we publish and prove it boots with the expected feature set.
+  # This is the gate that catches a broken production image (wrong feature
+  # set, unreadable config, panics on startup) before anything is published.
+  #
+  # Each arch caches to its own GHA scope with mode=max, and `build` below
+  # builds from that same scope on the same runner type, so the publishing
+  # build replays the verified layers instead of compiling again. (It cannot
+  # simply push this job's image: pushing needs `packages: write`, which only
+  # the `release` environment grants, and PR runs must not enter it.)
   verify-image:
-    name: verify image boots
+    name: verify image boots (${{ matrix.arch }})
     needs: [version]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Add swap
-        # A release build of `trust-tasks-rs` (all-specs) peaks at ~6.7 GB in one
-        # rustc. While the graph holds two copies of it (0.31 via vta-sdk, 0.32
-        # direct) they compile at once and exhaust the runner's 16 GB, and the
-        # hosted runner dies as "received a shutdown signal". Swap lets that peak
-        # page instead of killing the job. Memory is printed so a runner that
-        # still dies says so.
+        # A release build of `trust-tasks-rs` peaks at several GB in one rustc,
+        # and while the graph holds two copies of it (via vta-sdk and direct;
+        # scripts/version-duplicates-allow.txt) they can compile at once. Thin
+        # LTO lowered the link peak, but swap still lets a peak page instead of
+        # the hosted runner dying as "received a shutdown signal". Memory is
+        # printed so a runner that still dies says so.
         run: |
           free -h
           sudo swapoff -a || true
@@ -159,16 +186,16 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
-      - name: Build image (amd64, load locally)
+      - name: Build image (${{ matrix.arch }}, load locally)
         uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
         with:
           context: .
           file: ${{ env.DOCKERFILE }}
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           load: true
           tags: ${{ env.IMAGE_NAME }}:verify
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
       - name: Boot probe
         env:
@@ -180,6 +207,7 @@ jobs:
     needs: [version, verify-image]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     environment: release
     permissions:
       contents: read
@@ -195,15 +223,17 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Add swap
-        # A release build of `trust-tasks-rs` (all-specs) peaks at ~6.7 GB in one
-        # rustc. While the graph holds two copies of it (0.31 via vta-sdk, 0.32
-        # direct) they compile at once and exhaust the runner's 16 GB, and the
-        # hosted runner dies as "received a shutdown signal". Swap lets that peak
-        # page instead of killing the job. Memory is printed so a runner that
-        # still dies says so.
+        # A release build of `trust-tasks-rs` peaks at several GB in one rustc,
+        # and while the graph holds two copies of it (via vta-sdk and direct;
+        # scripts/version-duplicates-allow.txt) they can compile at once. Thin
+        # LTO lowered the link peak, but swap still lets a peak page instead of
+        # the hosted runner dying as "received a shutdown signal". Memory is
+        # printed so a runner that still dies says so.
         run: |
           free -h
           sudo swapoff -a || true
@@ -255,6 +285,7 @@ jobs:
     needs: [version, build]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     # One run at a time moves a given version's tag; a second waits.
     concurrency:
@@ -269,8 +300,9 @@ jobs:
       digest: ${{ steps.manifest.outputs.digest }}
     steps:
       - name: Checkout CI scripts
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           sparse-checkout: docker/ci
           sparse-checkout-cone-mode: false
 
@@ -314,6 +346,7 @@ jobs:
     needs: [version, publish-ghcr]
     if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && vars.AWS_ROLE_ARN != '' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     permissions:
       contents: read
@@ -322,8 +355,9 @@ jobs:
       attestations: write
     steps:
       - name: Checkout CI scripts
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           sparse-checkout: docker/ci
           sparse-checkout-cone-mode: false
 

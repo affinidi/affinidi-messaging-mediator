@@ -767,6 +767,11 @@ impl SecretStore for EncryptedFileStore {
 }
 
 #[cfg(test)]
+// The `unsafe` here is only `std::env::{set_var, remove_var}` (unsafe since
+// the 2024 edition), which the tests use to drive the passphrase variables.
+// SAFETY: every test that touches the environment holds `env_lock()` while it
+// does, so no two of them mutate or read those variables concurrently.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::sync::mpsc;

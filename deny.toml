@@ -15,13 +15,26 @@ version = 2
 # advisory genuinely has to be accepted, add it with a reason *and* the condition
 # that would clear it, and delete it the moment that condition is met.
 #
-# Note this governs the BUILD GRAPH. `cargo audit` reads Cargo.lock and has its
-# own list, `auditIgnore`, duplicated in .github/workflows/checks.yaml and
-# release.yaml — change those together.
+# Note this governs the BUILD GRAPH. `cargo audit` (pipeline-rust's
+# checks-no-test workflow, the `security` job in ci.yml) reads Cargo.lock and
+# is configured separately; keep any suppression in step. advisories.yml runs
+# `cargo deny check advisories` daily, so a new RUSTSEC advisory against the
+# committed lockfile surfaces without waiting for a PR.
 ignore = []
 
 [bans]
+# Duplicate versions are policed where they matter, for the ecosystem crates
+# whose types this workspace shares (scripts/check-workspace-duplicates.sh,
+# with a dated allowlist). Across the whole graph they are routine.
 multiple-versions = "allow"
+
+[sources]
+# CLAUDE.md: TDK (and every other) dependency comes from crates.io, never a git
+# repository or another registry. Enforced here rather than left to review.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
 
 [licenses]
 # We want really high confidence when inferring licenses from text

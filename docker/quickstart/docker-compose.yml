@@ -1,0 +1,91 @@
+# Local quickstart: the production mediator image + Redis, with an identity
+# generated on this machine the first time the stack starts.
+#
+#   docker compose -f docker/quickstart/docker-compose.yml up --build
+#
+# Then the mediator is at http://localhost:7037/mediator/v1/ (livez, readyz,
+# authenticate, ...). It listens on 127.0.0.1 only.
+#
+# First start: the `setup` service runs `mediator-setup` against
+# docker/quickstart/mediator-build.toml, which generates the mediator DID
+# (did:peer), an admin did:key and the JWT signing key into the
+# `mediator-conf` volume, then exits. Later starts find the config there and
+# reuse it. To start over with a new identity:
+#
+#   docker compose -f docker/quickstart/docker-compose.yml down -v
+#
+# The admin credential (admin-monitor.json, which holds the admin PRIVATE key)
+# is in the volume; copy it out for the console with
+#
+#   docker compose -f docker/quickstart/docker-compose.yml cp \
+#     mediator:/etc/mediator/conf/admin-monitor.json .
+#
+# (and keep it out of git: .gitignore covers **/conf/admin-monitor.json).
+#
+# This is a playground, not a deployment: plain file secrets, no TLS, open
+# network mode. Unlike docker-compose.test.yml it never uses keys committed to
+# this repository.
+
+name: mediator-quickstart
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # One-shot: generate the identity and config on first start, then exit.
+  # Runs as root only to hand the fresh volume to the mediator's UID (10001).
+  setup:
+    build:
+      context: ../..
+      dockerfile: docker/mediator.Dockerfile
+    image: messaging-mediator:quickstart
+    user: "0:0"
+    working_dir: /etc/mediator
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ -f conf/mediator.toml ]; then
+          echo "quickstart: conf/mediator.toml exists in the volume; reusing that identity"
+        else
+          echo "quickstart: generating a new mediator identity"
+          /usr/local/bin/mediator-setup --from /quickstart/mediator-build.toml
+        fi
+        chown -R 10001:10001 /etc/mediator/conf
+        chmod 700 /etc/mediator/conf
+    volumes:
+      - mediator-conf:/etc/mediator/conf
+      - ./mediator-build.toml:/quickstart/mediator-build.toml:ro
+    restart: "no"
+
+  mediator:
+    image: messaging-mediator:quickstart
+    # Built by the `setup` service above; never pulled from a registry.
+    pull_policy: never
+    working_dir: /etc/mediator
+    command: ["-c", "conf/mediator.toml"]
+    volumes:
+      - mediator-conf:/etc/mediator/conf
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: redis://redis:6379/
+    ports:
+      # Loopback only: do not publish a playground mediator on the LAN.
+      - "127.0.0.1:7037:7037"
+    # Health comes from the image's HEALTHCHECK (`mediator healthcheck`).
+
+volumes:
+  mediator-conf:
+  redis-data:

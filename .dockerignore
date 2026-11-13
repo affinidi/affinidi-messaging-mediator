@@ -1,10 +1,45 @@
 # Build-context excludes for docker/mediator.Dockerfile (repo-root context).
 # Keep the context small and reproducible — the container does a clean
-# `cargo build`, so the host target/ must not leak in.
+# `cargo build`, so the host target/ must not leak in — and keep anything not
+# needed to compile the two binaries out of it, so an edit there does not
+# invalidate the source layers.
 target/
+target-*/
 .git/
 .github/
 .vscode/
 .idea/
+.claude/
 tasks/
 **/*.md
+interop/
+scripts/
+changelog.d/
+# Only docker/conf/mediator.toml is copied into the image.
+docker/ci/
+docker/did-web/
+docker/quickstart/
+docker/smoke/
+docker/test/
+docker-compose*.yml
+
+# Key material the setup wizard (or an operator) may leave in a checkout. The
+# runtime stage copies named files only, but the builder copies the whole
+# context, so keep these out of every layer. Mirrors .gitignore.
+**/conf/secrets.json
+**/conf/secrets-admin.json
+**/conf/admin-monitor.json
+**/conf/keys/
+**/secrets.json
+**/did.jsonl
+**/did-web.json
+**/bootstrap-request.json
+**/bootstrap-request-vp.json
+**/*.armor
+**/*.pem
+**/*.key
+**/environments.json*
+.env
+.env.*
+**/.env
+**/.env.*

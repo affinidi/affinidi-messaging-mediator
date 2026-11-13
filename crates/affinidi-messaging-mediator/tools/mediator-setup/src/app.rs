@@ -3835,6 +3835,15 @@ impl WizardApp {
                 // with it. Operators who want persistence beyond the
                 // wizard run set the var themselves before starting
                 // the mediator.
+                //
+                // SAFETY: `set_var` is unsafe because another thread may
+                // read the environment at the same time. This runs on the
+                // wizard's UI thread in response to a keypress; the reader is
+                // the encrypted file backend, which this thread opens later.
+                // The residual risk is a library reading some other variable
+                // on a worker thread at this instant, accepted for a
+                // short-lived interactive tool (the operator is typing).
+                #[allow(unsafe_code)]
                 unsafe {
                     std::env::set_var(affinidi_messaging_mediator_common::PASSPHRASE_ENV, &value);
                 }
@@ -5124,6 +5133,11 @@ impl WizardApp {
 }
 
 #[cfg(test)]
+// The `unsafe` here is only `std::env::remove_var` (unsafe since the 2024
+// edition) on the passphrase variable the wizard exports.
+// SAFETY: the tests that touch it are `#[serial_test::serial(passphrase_env)]`,
+// so no two of them read or write it concurrently.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

@@ -565,6 +565,11 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+// The `unsafe` here is only `std::env::{set_var, remove_var}` (unsafe since
+// the 2024 edition) on `MEDIATOR_BOOTSTRAP_SEED_TTL`.
+// SAFETY: the tests that set it are `#[serial_test::serial]`, so they never run
+// beside each other or beside the serial tests that read it.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

@@ -17,27 +17,27 @@ path = "src/bin/mediator-console.rs"
 
 [dependencies]
 affinidi-messaging-mediator-admin = { version = "0.52.0", path = "../affinidi-messaging-mediator-admin" }
-ratatui = "0.30"
+ratatui.workspace = true
 # Crossterm must match the version ratatui uses.
-crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util = "0.3"
-serde = "1"
-sha256 = "1"
-serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = { workspace = true, features = ["event-stream"] }
+futures-util = { workspace = true, features = ["default"] }
+serde.workspace = true
+sha256.workspace = true
+serde_json.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
+clap = { workspace = true, features = ["derive"] }
+tracing.workspace = true
 # The `mediator-console` binary's log output, captured into the console.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi"] }
 
 [dev-dependencies]
 affinidi-messaging-test-mediator = { version = "0.52.0", path = "../affinidi-messaging-test-mediator" }
 affinidi-messaging-mediator-common = { version = "0.52.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
-affinidi-messaging-didcomm = "0.15"
-uuid = { version = "1", features = ["v4"] }
+affinidi-messaging-didcomm.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 ## Signs the mux grants the Grants tab lists.
-affinidi-messaging-sdk = "0.46.3"
+affinidi-messaging-sdk.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+name: Install native deps
+description: >-
+  The system libraries the workspace links against on Ubuntu runners: libdbus
+  (keyring), libssl (aws-lc / native-tls paths), libchafa (mediator-tui image
+  rendering) and pkg-config. One definition for every workflow, so adding a
+  library is one edit.
+runs:
+  using: composite
+  steps:
+    - name: Install native deps
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev libchafa-dev pkg-config
