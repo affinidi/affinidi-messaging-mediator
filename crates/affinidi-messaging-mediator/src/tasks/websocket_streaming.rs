@@ -35,7 +35,7 @@ use crate::common::metrics::names::{
     STREAMING_ENTRIES_RECLAIMED_TOTAL, STREAMING_HEARTBEAT_LAPSES_TOTAL,
     WEBSOCKET_CHURN_REFUSED_TOTAL, WEBSOCKET_DUPLICATE_CHURN_TOTAL,
     WEBSOCKET_DUPLICATE_REPLACEMENTS_TOTAL, WEBSOCKET_REDELIVERED_MESSAGES_TOTAL,
-    WS_LIVE_DELIVERY_DROPPED,
+    WS_LIVE_DELIVERY_DROPPED, WS_STREAMING_LAGGED_TOTAL,
 };
 use crate::common::ws_budget::{SendPermit, WsSendBudget};
 use crate::mux::fair_queue::{MuxSlots, SlotCredit, SlotRefusal};
@@ -50,7 +50,7 @@ use affinidi_messaging_mediator_common::{
     types::messages::FetchOptions,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use dashmap::DashSet;
+use dashmap::DashMap;
 use std::{
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -80,6 +80,19 @@ const REDELIVERY_PAGE: usize = 50;
 /// so a pathologically large inbox can't pin the drain task. If hit, the
 /// remainder is left for the client to pick up via normal message-pickup.
 const REDELIVERY_MAX: usize = 1000;
+
+/// How long the redelivery drain waits for room (in the socket's queue, its
+/// mux share or the global byte budget) for one frame before it stops and
+/// raises the client's resync. The drain is a task of its own, so waiting
+/// paces it to the socket rather than holding up anyone else.
+#[cfg(not(test))]
+const REDELIVERY_FRAME_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const REDELIVERY_FRAME_WAIT: Duration = Duration::from_millis(300);
+
+/// How often the drain re-tries a mux share or the byte budget, neither of
+/// which can be awaited, while it waits for room.
+const REDELIVERY_RETRY: Duration = Duration::from_millis(20);
 
 /// How often the task re-reads, for each of its mux entries, which instance
 /// the store says streams the DID. The `Taken`/`Released` handoffs normally
@@ -145,6 +158,8 @@ enum ReclaimReason {
     DeadOwner,
     /// A direct socket here found the DID held by a mux entry elsewhere.
     OutranksMux,
+    /// The streaming task restarted, and its clean start removed the entry.
+    Restart,
 }
 
 impl ReclaimReason {
@@ -153,6 +168,7 @@ impl ReclaimReason {
             ReclaimReason::Missing => "missing",
             ReclaimReason::DeadOwner => "dead_owner",
             ReclaimReason::OutranksMux => "outranks_mux",
+            ReclaimReason::Restart => "restart",
         }
     }
 }
@@ -234,9 +250,24 @@ struct ClientEntry {
     /// (design §7.2 fair queuing); `None` on a direct socket, whose queue is
     /// the plain bounded channel.
     slots: Option<Arc<MuxSlots>>,
+    /// The socket answers any notification by draining the DID's whole
+    /// stored inbox itself (a raw-TSP socket), so an inbox redelivery to it
+    /// is one wake-up, not a push of every stored message.
+    wake_only: bool,
 }
 
 impl ClientEntry {
+    /// Where an inbox redelivery for this entry pushes.
+    fn drain_target(&self) -> DrainTarget {
+        DrainTarget {
+            tx: self.tx.clone(),
+            slots: self.slots.clone(),
+            resync: self.resync.clone(),
+            session_id: self.session_id.clone(),
+            wake_only: self.wake_only,
+        }
+    }
+
     /// Whether this entry is the one the connection with `session_id` and
     /// send queue `channel` registered.
     fn is_registered_by(
@@ -248,6 +279,104 @@ impl ClientEntry {
             && channel
                 .upgrade()
                 .is_some_and(|tx| tx.same_channel(&self.tx))
+    }
+}
+
+/// The sockets registered with the streaming task: kept outside each run of
+/// the task, so a supervised restart does not forget them (see
+/// [`StreamingTask::spawn_supervised`]).
+#[derive(Default)]
+pub(crate) struct Registered {
+    /// The live entry for each DID, keyed by DID hash.
+    clients: HashMap<String, ClientEntry>,
+    /// Entries that yielded the live slot to another socket for the same
+    /// DID (design §7.2): a mux member behind its DID's direct socket, or
+    /// behind a newer mux connection. Newest last. Promoted when the live
+    /// entry goes away.
+    standby: HashMap<String, Vec<ClientEntry>>,
+}
+
+/// Where an inbox redelivery pushes: one registered entry's queue.
+#[derive(Clone)]
+struct DrainTarget {
+    tx: mpsc::Sender<QueuedCommand>,
+    slots: Option<Arc<MuxSlots>>,
+    resync: Arc<AtomicBool>,
+    /// The entry's session, which the store's fetch is made for.
+    session_id: String,
+    /// See [`ClientEntry::wake_only`].
+    wake_only: bool,
+}
+
+/// The inbox redeliveries in flight: at most one drain per DID.
+///
+/// One per DID damps a duplicate-socket duel, which replaces the socket
+/// every couple of seconds and must not start a whole-inbox dump for each
+/// replacement. But a drain pushes to the socket that asked for it, and once
+/// that socket is replaced its pushes go nowhere. So a request while a drain
+/// runs is not skipped: it is left for the running drain, which hands itself
+/// over to the newest socket and starts the inbox again for it. Whoever holds
+/// the DID's slot last is the one the drain finishes on.
+#[derive(Default)]
+pub(crate) struct Redeliveries {
+    /// DIDs with a drain running, each with the newer socket it should move
+    /// to, if one asked meanwhile.
+    running: DashMap<String, Option<DrainTarget>>,
+}
+
+impl Redeliveries {
+    /// Whether a drain is running for `did_hash`.
+    #[cfg(all(test, feature = "memory-backend"))]
+    pub(crate) fn contains(&self, did_hash: &str) -> bool {
+        self.running.contains_key(did_hash)
+    }
+
+    /// Record a drain for `did_hash` to `target`. Returns `target` when no
+    /// drain was running and the caller must start one for it; `None` when
+    /// the running drain takes `target` over.
+    fn claim(&self, did_hash: &str, target: DrainTarget) -> Option<DrainTarget> {
+        use dashmap::mapref::entry::Entry;
+        match self.running.entry(did_hash.to_string()) {
+            Entry::Occupied(mut running) => {
+                running.insert(Some(target));
+                None
+            }
+            Entry::Vacant(free) => {
+                free.insert(None);
+                Some(target)
+            }
+        }
+    }
+
+    /// The newer socket the running drain for `did_hash` should move to.
+    fn handover(&self, did_hash: &str) -> Option<DrainTarget> {
+        self.running
+            .get_mut(did_hash)
+            .and_then(|mut next| next.take())
+    }
+
+    /// The drain for `did_hash` is done with its socket: release it, or
+    /// return the newer socket it must start over for.
+    fn finish(&self, did_hash: &str) -> Option<DrainTarget> {
+        if self
+            .running
+            .remove_if(did_hash, |_, next| next.is_none())
+            .is_some()
+        {
+            return None;
+        }
+        self.handover(did_hash)
+    }
+}
+
+/// Raise the resync of every live entry: told to collect, each client finds
+/// whatever live notification it missed. For when the notifications that
+/// were missed cannot be named (the subscription lagged).
+fn raise_resync_all(clients: &HashMap<String, ClientEntry>) {
+    for (did_hash, entry) in clients {
+        if entry.active {
+            raise_resync(entry.slots.as_ref(), &entry.resync, did_hash);
+        }
     }
 }
 
@@ -271,6 +400,9 @@ pub enum StreamingUpdateState {
         /// included: the slots its queued frames hold. `None` for a direct
         /// socket.
         slots: Option<Arc<MuxSlots>>,
+        /// The socket drains the DID's stored inbox itself on any
+        /// notification (raw TSP). See `ClientEntry::wake_only`.
+        wake_only: bool,
     },
     /// Enable live delivery for the socket owned by `session_id`.
     ///
@@ -462,7 +594,8 @@ impl DeliveryReport {
     }
 }
 
-/// Queue a payload to one client without blocking.
+/// Queue a live payload to one client without blocking, `verbatim` choosing
+/// the command the socket handler receives.
 ///
 /// Returns `false` if the message was dropped — either the global byte pool is
 /// exhausted or this connection's queue is full. Both mean the client is not
@@ -472,19 +605,6 @@ impl DeliveryReport {
 /// Non-blocking is the whole point: this is called from the single streaming
 /// loop that serves every DID, so awaiting one slow client here would stall live
 /// delivery for all of them.
-fn try_queue_message(
-    tx: &mpsc::Sender<QueuedCommand>,
-    slots: Option<&Arc<MuxSlots>>,
-    budget: &WsSendBudget,
-    did_hash: &str,
-    message: String,
-    report: Option<DeliveryReport>,
-) -> bool {
-    try_queue(tx, slots, budget, did_hash, message, false, report)
-}
-
-/// [`try_queue_message`], with `verbatim` choosing the command the socket
-/// handler receives.
 ///
 /// On a mux connection (`slots` set) the payload must first take one of its
 /// DID's slots: a DID that already holds its share is refused here, so it is
@@ -582,6 +702,34 @@ fn raise_resync(slots: Option<&Arc<MuxSlots>>, resync: &AtomicBool, did_hash: &s
     resync.store(true, Ordering::Relaxed);
 }
 
+/// Tell a mux connection's socket that one of its members' delivery moved,
+/// so it can report it (R6.2).
+///
+/// Recorded on the connection's shared slots and the socket woken, rather
+/// than queued: the queue is shared with every member's frames and can be
+/// full, and a member change that is dropped leaves the principal with the
+/// wrong picture of which members it carries live, and `deliveryActive`
+/// wrong with it. The record cannot be dropped, and keeps its order. An entry
+/// without mux slots (a mux entry always has them) falls back to its queue.
+fn tell_member(
+    tx: &mpsc::Sender<QueuedCommand>,
+    slots: Option<&Arc<MuxSlots>>,
+    change: MemberChange,
+) {
+    if let Some(slots) = slots {
+        slots.push_member_change(change);
+        return;
+    }
+    if tx
+        .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+            change,
+        )))
+        .is_err()
+    {
+        warn!("couldn't queue a mux member change: the send queue is full or closed");
+    }
+}
+
 /// Push one live notification to a registered client, raising its resync flag
 /// if the push could not be queued.
 ///
@@ -672,15 +820,28 @@ impl StreamingTask {
             liveness,
         };
         let rx = Arc::new(Mutex::new(rx));
+        // The registered sockets outlive a restart for the same reason the
+        // receiver does. Were they locals of the run, a restart would forget
+        // every one: a direct socket would notice (its queue closes) and
+        // reconnect, but a mux connection's queue is held open by the mux
+        // registry too, so it would stay up and silently receive nothing.
+        // Kept here, the next run claims them back in the store and
+        // redelivers what arrived while it was down.
+        let registered = Arc::new(Mutex::new(Registered::default()));
+        let replays = Arc::new(Redeliveries::default());
 
         let supervised = task.clone();
         supervisor.spawn("websocket_streaming", false, move || {
             let task = supervised.clone();
             let database = database.clone();
             let rx = rx.clone();
+            let registered = registered.clone();
+            let replays = replays.clone();
             async move {
                 let mut rx = rx.lock().await;
-                task.ws_streaming_task(database, &mut rx).await
+                let mut registered = registered.lock().await;
+                task.ws_streaming_task(database, &mut rx, &mut registered, replays)
+                    .await
             }
         });
 
@@ -693,6 +854,8 @@ impl StreamingTask {
         self,
         database: Arc<dyn MediatorStore>,
         channel: &mut mpsc::Receiver<StreamingUpdate>,
+        registered: &mut Registered,
+        replay_in_progress: Arc<Redeliveries>,
     ) -> Result<(), MediatorError> {
         let _span = span!(Level::INFO, "ws_streaming_task", uuid = &self.uuid);
 
@@ -702,20 +865,12 @@ impl StreamingTask {
             // Clean up any existing sessions left over from previous runs
             database.streaming_clean_start(&self.uuid).await?;
 
-            // Create a hashmap to store the clients keyed by did_hash.
-            let mut clients: HashMap<String, ClientEntry> = HashMap::new();
-            // Entries that yielded the live slot to another socket for the same
-            // DID (design §7.2): a mux member behind its DID's direct socket,
-            // or behind a newer mux connection. Newest last. Promoted when the
-            // live entry goes away.
-            let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
-
-            // DIDs with an inbox-redelivery drain currently in flight. Used to
-            // damp duplicate-socket flip-flop: a duel that replaces the socket
-            // every couple of seconds must not re-dump the whole inbox on each
-            // replacement. A replay already running for a DID covers the current
-            // inbox state, so concurrent replacements skip spawning another.
-            let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+            let Registered { clients, standby } = registered;
+            // A restart: the sockets registered with the previous run are
+            // still here, but the clean start above just removed their
+            // entries from the store. Claim them back.
+            self.restore(&database, clients, standby, &replay_in_progress)
+                .await;
 
             // Subscribe to delivery notifications via the trait. Backends
             // are responsible for the wire-level transport (Redis pub/sub,
@@ -749,29 +904,33 @@ impl StreamingTask {
                                     "this instance's streaming heartbeat had lapsed; other instances may have taken over its DIDs. Rechecking ownership now"
                                 );
                                 metrics::counter!(STREAMING_HEARTBEAT_LAPSES_TOTAL).increment(1);
-                                self.recheck_ownership(&database, &mut clients, &mut standby, &replay_in_progress).await;
+                                self.recheck_ownership(&database, clients, standby, &replay_in_progress).await;
                             }
                             Ok(_) => {}
                             Err(err) => warn!("couldn't renew the streaming heartbeat: {err}"),
                         }
                     }
                     _ = ownership.tick() => {
-                        self.recheck_ownership(&database, &mut clients, &mut standby, &replay_in_progress).await;
+                        self.recheck_ownership(&database, clients, standby, &replay_in_progress).await;
                     }
                     value = rx.recv() => {
                         match value {
                             Ok(payload) => {
-                                self.dispatch_payload(&database, &mut clients, &mut standby, &replay_in_progress, payload).await;
+                                self.dispatch_payload(&database, clients, standby, &replay_in_progress, payload).await;
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Subscriber fell behind; backend's broadcast capacity
-                                // was exceeded. Live messages were dropped, but the
-                                // queueing path still picked them up — clients just
-                                // won't get a real-time push for those entries.
+                                // was exceeded. The skipped notifications' messages
+                                // are stored, but nobody can say whose they were, so
+                                // every live client is told to collect: a client that
+                                // only listens would otherwise never learn of them
+                                // (R6.2). The socket's resync floor rate-limits it.
                                 warn!(
-                                    "Streaming subscriber lagged, dropped {} live notifications",
+                                    "Streaming subscriber lagged, dropped {} live notifications; raising resync for every live client",
                                     skipped
                                 );
+                                metrics::counter!(WS_STREAMING_LAGGED_TOTAL).increment(1);
+                                raise_resync_all(clients);
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 error!("Streaming subscription closed, attempting to resubscribe");
@@ -792,23 +951,23 @@ impl StreamingTask {
                         if let Some(value) = &value {
                             match &value.state {
                                 StreamingUpdateState::Register { .. } => {
-                                    self._handle_registration(&database, &mut clients, &mut standby, &replay_in_progress, value).await;
+                                    self._handle_registration(&database, clients, standby, &replay_in_progress, value).await;
                                 },
                                 StreamingUpdateState::Start { session_id } => {
-                                    self._handle_activation(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, true).await;
+                                    self._handle_activation(&database, clients, standby, &replay_in_progress, &value.did_hash, session_id, true).await;
                                 },
                                 StreamingUpdateState::Stop { session_id } => {
-                                    self._handle_activation(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, false).await;
+                                    self._handle_activation(&database, clients, standby, &replay_in_progress, &value.did_hash, session_id, false).await;
                                 },
                                 StreamingUpdateState::Deregister { session_id, channel } => {
-                                    self._handle_deregistration(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash, session_id, channel).await;
+                                    self._handle_deregistration(&database, clients, standby, &replay_in_progress, &value.did_hash, session_id, channel).await;
                                 }
                                 StreamingUpdateState::RemoteTaken => {
-                                    stand_by_taken(&mut clients, &mut standby, &value.did_hash);
+                                    stand_by_taken(clients, standby, &value.did_hash);
                                 }
                                 StreamingUpdateState::RemoteReleased => {
                                     if !clients.contains_key(&value.did_hash)
-                                        && self.promote_standby(&database, &mut clients, &mut standby, &replay_in_progress, &value.did_hash).await
+                                        && self.promote_standby(&database, clients, standby, &replay_in_progress, &value.did_hash).await
                                     {
                                         debug!(did_hash = %value.did_hash, "the DID's owner elsewhere left; its mux entry here took it back");
                                     }
@@ -829,13 +988,13 @@ impl StreamingTask {
     /// Never awaits a client's send queue: this runs in the single loop that
     /// serves every DID, so blocking on one slow socket would stall live
     /// delivery for all of them. A client that cannot keep up has its push
-    /// dropped (see [`try_queue_message`]).
+    /// dropped (see [`try_queue`]).
     async fn dispatch_payload(
         &self,
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         payload: PubSubRecord,
     ) {
         let PubSubRecord {
@@ -941,21 +1100,18 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         did_hash: &str,
         session_id: &str,
         active: bool,
     ) {
-        // The socket to flush to, captured while the entry is borrowed.
-        let (client_tx, client_slots, client_resync, kind) = match clients.get_mut(did_hash) {
+        // The socket to flush to, captured while the entry is borrowed, and
+        // whether live delivery was already on: a repeated `Start` changes
+        // nothing, and must not drain the inbox again.
+        let (target, kind, was_active) = match clients.get_mut(did_hash) {
             Some(entry) if entry.session_id == session_id => {
-                entry.active = active;
-                (
-                    entry.tx.clone(),
-                    entry.slots.clone(),
-                    entry.resync.clone(),
-                    entry.kind,
-                )
+                let was_active = std::mem::replace(&mut entry.active, active);
+                (entry.drain_target(), entry.kind, was_active)
             }
             Some(entry) => {
                 // A standby entry keeps its wish, so that it is honoured if
@@ -1020,14 +1176,13 @@ impl StreamingTask {
                 if kind == EntryKind::Mux
                     && let Some(entry) = clients.remove(did_hash)
                 {
-                    let _ =
-                        entry
-                            .tx
-                            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
-                                MemberChange::Inactive {
-                                    did_hash: did_hash.to_string(),
-                                },
-                            )));
+                    tell_member(
+                        &entry.tx,
+                        entry.slots.as_ref(),
+                        MemberChange::Inactive {
+                            did_hash: did_hash.to_string(),
+                        },
+                    );
                     standby.entry(did_hash.to_string()).or_default().push(entry);
                 }
                 return;
@@ -1053,27 +1208,17 @@ impl StreamingTask {
         //
         // Reuses the redelivery already written for socket replacement
         // (issue #374): fetched `DoNotDelete`, at-least-once, idempotent by
-        // message id, guarded by `replay_in_progress` so concurrent triggers
-        // drain once. A client that already had a message simply sees it
-        // again and deletes it as usual.
-        if active {
-            if replay_in_progress.insert(did_hash.to_string()) {
-                spawn_inbox_redelivery(
-                    Arc::clone(database),
-                    client_tx,
-                    client_slots,
-                    client_resync,
-                    self.send_budget.clone(),
-                    did_hash.to_string(),
-                    session_id.to_string(),
-                    Arc::clone(replay_in_progress),
-                );
-            } else {
-                debug!(
-                    did_hash = %did_hash,
-                    "Inbox redelivery already in progress for DID; skipping the activation drain"
-                );
-            }
+        // message id, one drain per DID at a time (`Redeliveries`). A client
+        // that already had a message simply sees it again and deletes it as
+        // usual.
+        //
+        // Only when delivery turns on: a `Start` for a socket already live
+        // has nothing new to cover, and a client repeating it must not be
+        // able to re-dump its inbox each time.
+        if active && !was_active {
+            self.redeliver(database, replay_in_progress, did_hash, target);
+        } else if active {
+            debug!(did_hash = %did_hash, "live delivery already on; no redelivery");
         }
     }
 
@@ -1086,7 +1231,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         did_hash: &str,
         session_id: &str,
         channel: &mpsc::WeakSender<QueuedCommand>,
@@ -1146,7 +1291,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         value: &StreamingUpdate,
     ) {
         let StreamingUpdateState::Register {
@@ -1156,6 +1301,7 @@ impl StreamingTask {
             resync: client_resync,
             kind,
             slots: client_slots,
+            wake_only,
         } = &value.state
         else {
             // Only `Register` updates reach this helper.
@@ -1191,7 +1337,53 @@ impl StreamingTask {
             churn_streak,
             kind: *kind,
             slots: client_slots.clone(),
+            wake_only: *wake_only,
         };
+
+        // The connection that already holds this DID's entry registering it
+        // again (a mux connection renewing a member it carries): an in-place
+        // update, not a duplicate. Superseding its own entry would tell the
+        // client its member had moved when it had not, leave a standby entry
+        // behind for the live one, and redeliver the inbox for nothing.
+        if let Some(live) = clients.get_mut(&value.did_hash)
+            && live.session_id == new_session_id
+            && live.tx.same_channel(client_tx)
+        {
+            live.resync = client_resync.clone();
+            live.kind = *kind;
+            live.slots = client_slots.clone();
+            live.wake_only = *wake_only;
+            debug!(
+                did = did,
+                session = new_session_id,
+                "re-registration of the live entry; updated in place"
+            );
+            return;
+        }
+        if let Some(waiting) = standby.get_mut(&value.did_hash).and_then(|v| {
+            v.iter_mut()
+                .find(|e| e.session_id == new_session_id && e.tx.same_channel(client_tx))
+        }) {
+            waiting.resync = client_resync.clone();
+            waiting.kind = *kind;
+            waiting.slots = client_slots.clone();
+            waiting.wake_only = *wake_only;
+            // Still behind another socket: say so again, since a
+            // registration is the connection's cue to forget it was.
+            tell_member(
+                client_tx,
+                client_slots.as_ref(),
+                MemberChange::Inactive {
+                    did_hash: value.did_hash.clone(),
+                },
+            );
+            debug!(
+                did = did,
+                session = new_session_id,
+                "re-registration of a standby entry; updated in place"
+            );
+            return;
+        }
 
         // Mux precedence (design §7.2). A direct socket outranks a mux member,
         // and among mux connections the newest carries the DID. A displaced
@@ -1200,11 +1392,13 @@ impl StreamingTask {
         if let Some(old) = clients.get(&value.did_hash) {
             match (old.kind, *kind) {
                 (EntryKind::Direct, EntryKind::Mux) => {
-                    let _ = client_tx.try_send(QueuedCommand::control(
-                        WebSocketCommands::MemberChange(MemberChange::Inactive {
+                    tell_member(
+                        client_tx,
+                        client_slots.as_ref(),
+                        MemberChange::Inactive {
                             did_hash: value.did_hash.clone(),
-                        }),
-                    ));
+                        },
+                    );
                     standby
                         .entry(value.did_hash.clone())
                         .or_default()
@@ -1220,13 +1414,13 @@ impl StreamingTask {
                     // The live mux entry yields: to a direct socket always, and
                     // to a newer mux connection by newest-wins.
                     let old = clients.remove(&value.did_hash).expect("present above");
-                    let _ =
-                        old.tx
-                            .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
-                                MemberChange::Superseded {
-                                    did_hash: value.did_hash.clone(),
-                                },
-                            )));
+                    tell_member(
+                        &old.tx,
+                        old.slots.as_ref(),
+                        MemberChange::Superseded {
+                            did_hash: value.did_hash.clone(),
+                        },
+                    );
                     standby.entry(value.did_hash.clone()).or_default().push(old);
                     self.install(
                         database,
@@ -1360,7 +1554,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         did_hash: &str,
         entry: ClientEntry,
         replacing: bool,
@@ -1392,13 +1586,13 @@ impl StreamingTask {
             }
         };
         if !claim.held_here {
-            let _ = entry
-                .tx
-                .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
-                    MemberChange::Inactive {
-                        did_hash: did_hash.to_string(),
-                    },
-                )));
+            tell_member(
+                &entry.tx,
+                entry.slots.as_ref(),
+                MemberChange::Inactive {
+                    did_hash: did_hash.to_string(),
+                },
+            );
             debug!(
                 did_hash = %did_hash,
                 session = %entry.session_id,
@@ -1432,34 +1626,111 @@ impl StreamingTask {
             kind = ?entry.kind,
             "Registered streaming for DID: ({did_hash}) registered_clients({registered_clients})",
         );
-        let client_tx = entry.tx.clone();
-        let client_slots = entry.slots.clone();
-        let client_resync = entry.resync.clone();
-        let session_id = entry.session_id.clone();
+        let target = entry.drain_target();
         clients.insert(did_hash.to_string(), entry);
 
-        // Skip if a redelivery for this DID is already running, so a
-        // flip-flop duel can't amplify into a repeated whole-inbox dump.
+        // One drain per DID at a time, so a flip-flop duel can't amplify
+        // into concurrent whole-inbox dumps: a drain already running for the
+        // displaced socket is handed over to this one (`Redeliveries`).
         if replacing {
-            if replay_in_progress.insert(did_hash.to_string()) {
-                spawn_inbox_redelivery(
-                    Arc::clone(database),
-                    client_tx,
-                    client_slots,
-                    client_resync,
-                    self.send_budget.clone(),
-                    did_hash.to_string(),
-                    session_id,
-                    Arc::clone(replay_in_progress),
-                );
-            } else {
-                debug!(
-                    did_hash = %did_hash,
-                    "Inbox redelivery already in progress for DID; skipping duplicate drain"
-                );
-            }
+            self.redeliver(database, replay_in_progress, did_hash, target);
         }
         true
+    }
+
+    /// Redeliver `did_hash`'s stored inbox to `target`, the socket that now
+    /// holds the DID (see [`spawn_inbox_redelivery`]).
+    ///
+    /// A socket that drains the inbox itself on any notification (raw TSP)
+    /// is sent one wake-up, its resync, rather than a push per stored
+    /// message: each push would only make it drain again, and it records as
+    /// delivered just what it writes.
+    fn redeliver(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        replays: &Arc<Redeliveries>,
+        did_hash: &str,
+        target: DrainTarget,
+    ) {
+        if target.wake_only {
+            raise_resync(target.slots.as_ref(), &target.resync, did_hash);
+            debug!(did_hash = %did_hash, "redelivery to a socket that drains itself; woken");
+            return;
+        }
+        match replays.claim(did_hash, target) {
+            Some(target) => spawn_inbox_redelivery(
+                Arc::clone(database),
+                target,
+                self.send_budget.clone(),
+                did_hash.to_string(),
+                Arc::clone(replays),
+            ),
+            None => debug!(
+                did_hash = %did_hash,
+                "inbox redelivery already running for this DID; handed over to the newest socket"
+            ),
+        }
+    }
+
+    /// After a restart, claim back every socket the previous run had
+    /// registered: the clean start removed their entries from the store, and
+    /// any message that arrived meanwhile was stored but not pushed. An entry
+    /// whose socket has gone is dropped; one standing by for a DID nobody now
+    /// holds takes it.
+    async fn restore(
+        &self,
+        database: &Arc<dyn MediatorStore>,
+        clients: &mut HashMap<String, ClientEntry>,
+        standby: &mut HashMap<String, Vec<ClientEntry>>,
+        replays: &Arc<Redeliveries>,
+    ) {
+        clients.retain(|_, e| !e.tx.is_closed());
+        standby.retain(|_, waiting| {
+            waiting.retain(|e| !e.tx.is_closed());
+            !waiting.is_empty()
+        });
+        if clients.is_empty() && standby.is_empty() {
+            return;
+        }
+        warn!(
+            live = clients.len(),
+            standing_by = standby.len(),
+            "streaming task restarted; claiming back the sockets registered before it"
+        );
+        let live: Vec<String> = clients.keys().cloned().collect();
+        for did_hash in live {
+            self.reclaim(
+                database,
+                clients,
+                standby,
+                replays,
+                &did_hash,
+                ReclaimReason::Restart,
+            )
+            .await;
+        }
+        let waiting: Vec<String> = standby
+            .keys()
+            .filter(|d| !clients.contains_key(*d))
+            .cloned()
+            .collect();
+        // Only for a DID nobody holds: one held elsewhere stays as it was,
+        // and its connection has already been told so.
+        let owners = match database.streaming_owners(&waiting).await {
+            Ok(owners) => owners,
+            Err(err) => {
+                warn!(
+                    "couldn't read who streams the DIDs standing by; the ownership recheck will: {err}"
+                );
+                return;
+            }
+        };
+        for (did_hash, owner) in waiting.into_iter().zip(owners) {
+            if owner.is_none() {
+                self.promote_standby(database, clients, standby, replays, &did_hash)
+                    .await;
+            }
+        }
     }
 
     /// Bring this instance's entries in step with the store's owners
@@ -1491,7 +1762,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
     ) {
         let held: Vec<String> = clients.keys().cloned().collect();
         let owners = match database.streaming_owners(&held).await {
@@ -1654,7 +1925,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         did_hash: &str,
         reason: ReclaimReason,
     ) {
@@ -1736,7 +2007,7 @@ impl StreamingTask {
         database: &Arc<dyn MediatorStore>,
         clients: &mut HashMap<String, ClientEntry>,
         standby: &mut HashMap<String, Vec<ClientEntry>>,
-        replay_in_progress: &Arc<DashSet<String>>,
+        replay_in_progress: &Arc<Redeliveries>,
         did_hash: &str,
     ) -> bool {
         let Some(waiting) = standby.get_mut(did_hash) else {
@@ -1760,6 +2031,7 @@ impl StreamingTask {
         // one collects by pickup, as it would have on its own.
         let replay = entry.active;
         let tx = entry.tx.clone();
+        let slots = entry.slots.clone();
         // A direct socket on another instance may hold the DID: then the
         // entry goes back on standby, still inactive.
         if !self
@@ -1776,11 +2048,13 @@ impl StreamingTask {
         {
             return false;
         }
-        let _ = tx.try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
+        tell_member(
+            &tx,
+            slots.as_ref(),
             MemberChange::Reactivated {
                 did_hash: did_hash.to_string(),
             },
-        )));
+        );
         true
     }
 }
@@ -1801,13 +2075,13 @@ fn stand_by_taken(
         return false;
     }
     let entry = clients.remove(did_hash).expect("present above");
-    let _ = entry
-        .tx
-        .try_send(QueuedCommand::control(WebSocketCommands::MemberChange(
-            MemberChange::Superseded {
-                did_hash: did_hash.to_string(),
-            },
-        )));
+    tell_member(
+        &entry.tx,
+        entry.slots.as_ref(),
+        MemberChange::Superseded {
+            did_hash: did_hash.to_string(),
+        },
+    );
     standby.entry(did_hash.to_string()).or_default().push(entry);
     debug!(did_hash = %did_hash, "another instance took this DID; its mux entry stands by");
     true
@@ -1832,134 +2106,215 @@ fn remove_standby(
     removed
 }
 
-/// Drain the recipient's undelivered inbox to a freshly-registered socket
-/// after it displaced a duplicate, re-pushing each stored (but not yet
-/// deleted) message as a live-stream frame. Runs as a detached task so the
-/// streaming `select!` loop — which services every DID — never blocks on a
-/// multi-page database drain.
+/// Drain the recipient's undelivered inbox to the socket that now holds the
+/// DID (it displaced a duplicate, turned live delivery on, or was claimed
+/// back), re-pushing each stored (but not yet deleted) message as a
+/// live-stream frame. Runs as a detached task so the streaming `select!` loop
+/// — which services every DID — never blocks on a multi-page database drain.
 ///
-/// Messages are fetched with `DoNotDelete`: redelivery is a notification
-/// re-cover, not an ack. The client deletes what it has processed via the
-/// normal message-pickup path, so this is at-least-once and idempotent by
-/// message id.
+/// Messages are fetched with `DoNotDelete` and without stamping:
+/// redelivery is a notification re-cover, not an ack, and queueing is not
+/// delivery. Each frame carries its [`DeliveryReport`], so the socket loop
+/// records the message as delivered only once it has written it (R1.1). The
+/// client deletes what it has processed via the normal message-pickup path,
+/// so this is at-least-once and idempotent by message id.
 ///
-/// A drain that stops before the end of the inbox (the socket's queue or the
-/// byte budget is full, the safety cap is reached, or a fetch fails) raises
-/// the client's resync, as a dropped live push does: what is left is still
-/// stored, and a client that only listens would otherwise never learn of it.
-#[allow(clippy::too_many_arguments)]
+/// Being a task of its own, the drain waits for room in the socket's queue
+/// (and its mux share, and the global byte budget) rather than giving up on
+/// the first full queue, so it is paced to the socket and the paging and
+/// [`REDELIVERY_MAX`] take effect. A socket that makes no room for
+/// [`REDELIVERY_FRAME_WAIT`], a fetch that fails, or the cap being reached
+/// stops the drain with messages possibly left behind: the client's resync is
+/// raised, as a dropped live push does, since a client that only listens
+/// would otherwise never learn of them.
+///
+/// A newer socket for the DID asking for a drain meanwhile takes this one
+/// over (see [`Redeliveries`]): it starts the inbox again for that socket.
 fn spawn_inbox_redelivery(
     database: Arc<dyn MediatorStore>,
-    client_tx: mpsc::Sender<QueuedCommand>,
-    client_slots: Option<Arc<MuxSlots>>,
-    client_resync: Arc<AtomicBool>,
+    first: DrainTarget,
     budget: WsSendBudget,
     did_hash: String,
-    session_id: String,
-    replay_in_progress: Arc<DashSet<String>>,
+    redeliveries: Arc<Redeliveries>,
 ) {
     tokio::spawn(async move {
-        let mut start_id: Option<String> = None;
-        let mut total: usize = 0;
-        // Set when the drain stops with messages possibly left behind.
-        let mut cut_short = false;
+        let mut target = first;
+        loop {
+            match drain_inbox(&database, &target, &budget, &did_hash, &redeliveries).await {
+                DrainEnd::HandedOver(next) => {
+                    debug!(did_hash = %did_hash, "inbox redelivery handed over to a newer socket");
+                    target = next;
+                    continue;
+                }
+                DrainEnd::Complete(total) => {
+                    if total > 0 {
+                        debug!(did_hash = %did_hash, total, "Inbox redelivery complete");
+                    }
+                }
+                DrainEnd::CutShort(total) => {
+                    raise_resync(target.slots.as_ref(), &target.resync, &did_hash);
+                    debug!(did_hash = %did_hash, total, "Inbox redelivery stopped early; resync raised");
+                }
+            }
+            match redeliveries.finish(&did_hash) {
+                Some(next) => target = next,
+                None => break,
+            }
+        }
+    });
+}
 
-        'drain: loop {
-            let options = FetchOptions {
-                limit: REDELIVERY_PAGE,
-                start_id: start_id.clone(),
-                ..Default::default() // delete_policy defaults to DoNotDelete
+/// How one pass of [`drain_inbox`] ended.
+enum DrainEnd {
+    /// The whole inbox was queued; this many messages.
+    Complete(usize),
+    /// Stopped with messages possibly left behind, after this many.
+    CutShort(usize),
+    /// A newer socket for the DID asked for a drain: start again for it.
+    HandedOver(DrainTarget),
+}
+
+/// Queue `did_hash`'s stored inbox to `target`, page by page.
+async fn drain_inbox(
+    database: &Arc<dyn MediatorStore>,
+    target: &DrainTarget,
+    budget: &WsSendBudget,
+    did_hash: &str,
+    redeliveries: &Redeliveries,
+) -> DrainEnd {
+    let mut start_id: Option<String> = None;
+    let mut total: usize = 0;
+    loop {
+        if let Some(next) = redeliveries.handover(did_hash) {
+            return DrainEnd::HandedOver(next);
+        }
+        let options = FetchOptions {
+            limit: REDELIVERY_PAGE,
+            start_id: start_id.clone(),
+            ..Default::default() // delete_policy defaults to DoNotDelete
+        };
+        // Fetched without stamping, in stream order (this drain re-covers a
+        // socket's whole inbox, paging with `start_id`). Each message is
+        // stamped by the socket once its frame is written
+        // (`DeliveryReport::stamp`): queueing is not delivery (R1.1).
+        let page = match database
+            .fetch_messages(&target.session_id, did_hash, &options)
+            .await
+        {
+            Ok(page) => page,
+            Err(err) => {
+                warn!(did_hash = %did_hash, "Inbox redelivery fetch failed, aborting drain: {err}");
+                return DrainEnd::CutShort(total);
+            }
+        };
+        if page.success.is_empty() {
+            return DrainEnd::Complete(total);
+        }
+        let page_len = page.success.len();
+
+        for element in page.success {
+            // Advance the cursor regardless of body presence so a missing
+            // body can't pin the drain on the same page forever.
+            if let Some(receive_id) = &element.receive_id {
+                start_id = Some(receive_id.clone());
+            }
+            let Some(msg) = element.msg else { continue };
+            if let Some(next) = redeliveries.handover(did_hash) {
+                return DrainEnd::HandedOver(next);
+            }
+            let report = DeliveryReport {
+                msg_id: element.msg_id,
+                from: element.from_address,
+                to: element.to_address,
+                size: element.size,
+                protocol: crate::monitor::Protocol::detect(&msg),
+                stamp: Some(did_hash.to_string()),
             };
-            // Fetched without stamping, in stream order (this drain re-covers
-            // a socket's whole inbox, paging with `start_id`). Each message is
-            // stamped by the socket once its frame is written
-            // (`DeliveryReport::stamp`): queueing is not delivery (R1.1), and a
-            // raw-TSP socket answers these with its own drain, writing only
-            // TSP frames.
-            let page = match database
-                .fetch_messages(&session_id, &did_hash, &options)
+
+            // Fetched with `DoNotDelete`, so anything not queued here stays
+            // in the inbox. Stopping early is therefore lossless, and the
+            // resync the caller raises tells the client to collect the rest.
+            if !queue_redelivered(target, budget, did_hash, msg, report, REDELIVERY_FRAME_WAIT)
                 .await
             {
-                Ok(page) => page,
-                Err(err) => {
-                    warn!(
-                        did_hash = %did_hash,
-                        "Inbox redelivery fetch failed, aborting drain: {err}"
-                    );
-                    cut_short = true;
-                    break 'drain;
-                }
-            };
-            if page.success.is_empty() {
-                break 'drain;
+                debug!(
+                    did_hash = %did_hash,
+                    "no room on the socket for a redelivered message; \
+                     stopping drain, remainder left for message-pickup"
+                );
+                return DrainEnd::CutShort(total);
             }
-            let page_len = page.success.len();
+            metrics::counter!(WEBSOCKET_REDELIVERED_MESSAGES_TOTAL).increment(1);
+            total += 1;
 
-            for element in page.success {
-                // Advance the cursor regardless of body presence so a missing
-                // body can't pin the drain on the same page forever.
-                if let Some(receive_id) = &element.receive_id {
-                    start_id = Some(receive_id.clone());
-                }
-                let Some(msg) = element.msg else { continue };
-                let report = DeliveryReport {
-                    msg_id: element.msg_id,
-                    from: element.from_address,
-                    to: element.to_address,
-                    size: element.size,
-                    protocol: crate::monitor::Protocol::detect(&msg),
-                    stamp: Some(did_hash.clone()),
-                };
-
-                // Fetched with `DoNotDelete`, so anything not queued here stays
-                // in the inbox. Stopping the drain early is therefore lossless,
-                // and the resync raised below tells the client to collect the
-                // remainder through message-pickup.
-                if !try_queue_message(
-                    &client_tx,
-                    client_slots.as_ref(),
-                    &budget,
-                    &did_hash,
-                    msg,
-                    Some(report),
-                ) {
-                    debug!(
-                        did_hash = %did_hash,
-                        "Send queue or byte budget unavailable mid-redelivery; \
-                         stopping drain, remainder left for message-pickup"
-                    );
-                    cut_short = true;
-                    break 'drain;
-                }
-                metrics::counter!(WEBSOCKET_REDELIVERED_MESSAGES_TOTAL).increment(1);
-                total += 1;
-
-                if total >= REDELIVERY_MAX {
-                    warn!(
-                        did_hash = %did_hash,
-                        max = REDELIVERY_MAX,
-                        "Inbox redelivery hit its safety cap; remaining messages \
-                         left for normal message-pickup"
-                    );
-                    cut_short = true;
-                    break 'drain;
-                }
-            }
-
-            // A short page means the stream is exhausted.
-            if page_len < REDELIVERY_PAGE {
-                break 'drain;
+            if total >= REDELIVERY_MAX {
+                warn!(
+                    did_hash = %did_hash,
+                    max = REDELIVERY_MAX,
+                    "Inbox redelivery hit its safety cap; remaining messages \
+                     left for normal message-pickup"
+                );
+                return DrainEnd::CutShort(total);
             }
         }
 
-        if cut_short {
-            raise_resync(client_slots.as_ref(), &client_resync, &did_hash);
-            debug!(did_hash = %did_hash, total, "Inbox redelivery stopped early; resync raised");
-        } else if total > 0 {
-            debug!(did_hash = %did_hash, total, "Inbox redelivery complete");
+        // A short page means the stream is exhausted.
+        if page_len < REDELIVERY_PAGE {
+            return DrainEnd::Complete(total);
         }
-        replay_in_progress.remove(&did_hash);
+    }
+}
+
+/// Queue one redelivered message to `target`, waiting up to `wait` for room:
+/// a slot of the DID's share on a mux connection, bytes in the global budget,
+/// then a place in the socket's queue. Returns `false` when there was none in
+/// time, or the socket has gone.
+///
+/// The share and the budget cannot be awaited, so they are re-tried; the
+/// queue is awaited. The share and bytes are taken first, so a place in the
+/// queue is never held while waiting on them.
+async fn queue_redelivered(
+    target: &DrainTarget,
+    budget: &WsSendBudget,
+    did_hash: &str,
+    message: String,
+    report: DeliveryReport,
+    wait: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    let slot = loop {
+        match target.slots.as_ref().map(|s| s.try_acquire(did_hash)) {
+            None => break None,
+            Some(Ok(slot)) => break Some(slot),
+            Some(Err(_)) => {}
+        }
+        if target.tx.is_closed() || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(REDELIVERY_RETRY).await;
+    };
+    let permit = loop {
+        if let Some(permit) = budget.try_reserve(message.len()) {
+            break permit;
+        }
+        if target.tx.is_closed() || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(REDELIVERY_RETRY).await;
+    };
+    let place = match tokio::time::timeout_at(deadline, target.tx.reserve()).await {
+        Ok(Ok(place)) => place,
+        // Closed, or no room in time.
+        _ => return false,
+    };
+    place.send(QueuedCommand {
+        cmd: WebSocketCommands::Message(message),
+        report: Some(report),
+        did_hash: Some(did_hash.to_string()),
+        _permit: Some(permit),
+        _slot: slot,
     });
+    true
 }
 
 // MemoryStore (the in-process backend used here) is only compiled under the
@@ -2005,6 +2360,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
         clients
@@ -2038,6 +2394,7 @@ mod tests {
             churn_streak: 0,
             kind: EntryKind::Direct,
             slots: None,
+            wake_only: false,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -2089,6 +2446,7 @@ mod tests {
             churn_streak: 0,
             kind: EntryKind::Mux,
             slots: Some(slots.clone()),
+            wake_only: false,
         };
         let (busy, quiet) = (entry(), entry());
         let budget = WsSendBudget::new(1_000_000);
@@ -2156,6 +2514,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         )]);
         let record = |msg_id: Option<&str>| PubSubRecord {
@@ -2174,7 +2533,7 @@ mod tests {
                     &database,
                     &mut clients,
                     &mut HashMap::new(),
-                    &Arc::new(DashSet::new()),
+                    &Arc::new(Redeliveries::default()),
                     $r,
                 )
                 .await
@@ -2227,6 +2586,7 @@ mod tests {
             churn_streak: 0,
             kind: EntryKind::Direct,
             slots: None,
+            wake_only: false,
         };
         let budget = WsSendBudget::new(1_000_000);
 
@@ -2275,7 +2635,7 @@ mod tests {
             .expect("mark live");
 
         // Session A — long since replaced — disables live delivery on its way out.
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         task._handle_activation(
             &database,
             &mut clients,
@@ -2310,7 +2670,7 @@ mod tests {
 
         let mut clients = clients_with(&did_hash, "B", false);
 
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         task._handle_activation(
             &database,
             &mut clients,
@@ -2345,7 +2705,7 @@ mod tests {
 
         let mut clients = clients_with(&did_hash, "B", false);
 
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         task._handle_activation(
             &database,
             &mut clients,
@@ -2368,7 +2728,7 @@ mod tests {
             "and must be reflected in the stored streaming state"
         );
 
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         task._handle_activation(
             &database,
             &mut clients,
@@ -2402,7 +2762,7 @@ mod tests {
         let task = streaming_task();
 
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         task._handle_activation(
             &database,
             &mut clients,
@@ -2441,7 +2801,7 @@ mod tests {
             .expect("store message");
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
 
         // Client A is the existing live session.
@@ -2457,6 +2817,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
 
@@ -2471,6 +2832,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         };
 
@@ -2528,7 +2890,7 @@ mod tests {
         let did = "did:example:full-queue";
         let did_hash = digest(did);
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
 
         let (a_tx, mut a_rx) = mpsc::channel(1);
@@ -2545,6 +2907,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
 
@@ -2588,7 +2951,7 @@ mod tests {
         let did = "did:example:shared-session";
         let did_hash = digest(did);
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
         let mut standby: HashMap<String, Vec<ClientEntry>> = HashMap::new();
 
@@ -2678,7 +3041,7 @@ mod tests {
             .expect("store message");
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let (tx, mut rx) = mpsc::channel(5);
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
         clients.insert(
@@ -2692,6 +3055,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
 
@@ -2728,7 +3092,7 @@ mod tests {
         use affinidi_messaging_mediator_common::store::StreamingClientState;
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         let task = streaming_task();
-        let replay: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let did = "did_hash_member";
         let (tx, mut rx) = mpsc::channel(8);
         let mut clients = HashMap::from([(
@@ -2742,6 +3106,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Mux,
                 slots: None,
+                wake_only: false,
             },
         )]);
         let mut standby = HashMap::new();
@@ -2809,7 +3174,7 @@ mod tests {
         use affinidi_messaging_mediator_common::store::StreamingClientState;
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         let task = streaming_task();
-        let replay: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let entry = |tx: mpsc::Sender<QueuedCommand>| ClientEntry {
             tx,
             session_id: "D".to_string(),
@@ -2819,6 +3184,7 @@ mod tests {
             churn_streak: 0,
             kind: EntryKind::Direct,
             slots: None,
+            wake_only: false,
         };
         let (gone, elsewhere, closed) = (
             digest("did:example:gone"),
@@ -2902,7 +3268,7 @@ mod tests {
                 .expect("store message");
         }
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
 
         for (room, cut_short) in [(1, true), (5, false)] {
             let (tx, mut rx) = mpsc::channel(room);
@@ -2918,6 +3284,7 @@ mod tests {
                     churn_streak: 0,
                     kind: EntryKind::Direct,
                     slots: None,
+                    wake_only: false,
                 },
             )]);
             task._handle_activation(
@@ -2966,7 +3333,7 @@ mod tests {
             .expect("store message");
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let (tx, mut rx) = mpsc::channel(5);
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
         clients.insert(
@@ -2980,6 +3347,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
 
@@ -3016,7 +3384,7 @@ mod tests {
             .expect("store message");
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
 
         let (b_tx, mut b_rx) = mpsc::channel(5);
@@ -3029,6 +3397,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         };
 
@@ -3061,7 +3430,7 @@ mod tests {
         let did_hash = digest(did);
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
 
         // Keep every receiver alive: a live incumbent channel is a precondition
@@ -3077,6 +3446,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         };
 
@@ -3161,7 +3531,7 @@ mod tests {
         let did_hash = digest(did);
 
         let task = streaming_task();
-        let replay_in_progress: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let replay_in_progress: Arc<Redeliveries> = Arc::new(Redeliveries::default());
         let mut clients: HashMap<String, ClientEntry> = HashMap::new();
 
         // Incumbent deep in a churn streak, but its receiver is dropped — the
@@ -3179,6 +3549,7 @@ mod tests {
                 churn_streak: CHURN_REFUSE_STREAK * 10,
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         );
 
@@ -3192,6 +3563,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 kind: EntryKind::Direct,
                 slots: None,
+                wake_only: false,
             },
         };
         task._handle_registration(
@@ -3227,6 +3599,7 @@ mod tests {
                 resync: Arc::new(AtomicBool::new(false)),
                 kind,
                 slots: None,
+                wake_only: false,
             },
         }
     }
@@ -3242,7 +3615,7 @@ mod tests {
     async fn a_mux_member_stands_by_behind_a_direct_socket() {
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         let task = streaming_task();
-        let replay = Arc::new(DashSet::new());
+        let replay = Arc::new(Redeliveries::default());
         let mut clients = HashMap::new();
         let mut standby = HashMap::new();
         let did = "did:example:mux-a";
@@ -3287,7 +3660,7 @@ mod tests {
             .await
             .unwrap();
         let task = streaming_task();
-        let replay = Arc::new(DashSet::new());
+        let replay = Arc::new(Redeliveries::default());
         let mut clients = HashMap::new();
         let mut standby = HashMap::new();
 
@@ -3329,7 +3702,7 @@ mod tests {
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         let did = "did:example:mux-c";
         let task = streaming_task();
-        let replay = Arc::new(DashSet::new());
+        let replay = Arc::new(Redeliveries::default());
         let mut clients = HashMap::new();
         let mut standby = HashMap::new();
 
@@ -3400,6 +3773,7 @@ mod tests {
                 churn_streak: 0,
                 kind: EntryKind::Mux,
                 slots: None,
+                wake_only: false,
             }],
         );
         assert!(!remove_standby(&mut standby, "h", "someone-else", &channel));
@@ -3418,7 +3792,7 @@ mod tests {
     async fn one_mux_connection_carries_many_dids_and_tags_each_frame() {
         let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
         let task = streaming_task();
-        let replay = Arc::new(DashSet::new());
+        let replay = Arc::new(Redeliveries::default());
         let mut clients = HashMap::new();
         let mut standby = HashMap::new();
         let (tx, mut rx) = mpsc::channel(16);
@@ -3461,5 +3835,374 @@ mod tests {
         }
         assert!(seen.contains(&(digest("did:example:m1"), "for did:example:m1".into())));
         assert!(seen.contains(&(digest("did:example:m2"), "for did:example:m2".into())));
+    }
+
+    // ─── review fixes (#113 #115 #118 #121 #124 #136) ─────────────────────
+
+    /// A live entry for `did_hash`, its queue `tx`.
+    fn live_entry(
+        tx: mpsc::Sender<QueuedCommand>,
+        session_id: &str,
+        resync: Arc<AtomicBool>,
+    ) -> ClientEntry {
+        ClientEntry {
+            tx,
+            session_id: session_id.to_string(),
+            active: false,
+            registered_at: Instant::now(),
+            resync,
+            churn_streak: 0,
+            kind: EntryKind::Direct,
+            slots: None,
+            wake_only: false,
+        }
+    }
+
+    /// Wait until no redelivery runs for `did_hash`.
+    async fn drained(replays: &Redeliveries, did_hash: &str) {
+        timeout(StdDuration::from_secs(5), async {
+            while replays.contains(did_hash) {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the redelivery finishes");
+    }
+
+    /// #113: the drain waits for the socket to make room instead of giving up
+    /// on the first full queue, so an inbox far larger than the queue (and
+    /// than one page) reaches the socket in full, in order, and nothing is
+    /// stamped delivered until the socket reports it written.
+    #[tokio::test]
+    async fn a_redelivery_waits_for_room_and_pages_through_the_inbox() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:big-inbox");
+        let count = REDELIVERY_PAGE + 25;
+        for i in 0..count {
+            database
+                .store_message("s", &format!("m{i:03}"), &did_hash, None, 0, 1000)
+                .await
+                .unwrap();
+        }
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        // The size of a real socket's queue.
+        let (tx, mut rx) = mpsc::channel(WS_CHANNEL_SLOTS);
+        let resync = Arc::new(AtomicBool::new(false));
+        let mut clients = HashMap::from([(did_hash.clone(), live_entry(tx, "A", resync.clone()))]);
+        task._handle_activation(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replays,
+            &did_hash,
+            "A",
+            true,
+        )
+        .await;
+
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            let cmd = timeout(StdDuration::from_secs(2), rx.recv())
+                .await
+                .expect("the drain keeps going as the socket reads")
+                .expect("queue open");
+            let report = cmd.report.expect("a redelivered frame carries its report");
+            assert_eq!(report.stamp.as_deref(), Some(did_hash.as_str()));
+            if let WebSocketCommands::Message(m) = cmd.cmd {
+                seen.push(m);
+            }
+        }
+        drained(&replays, &did_hash).await;
+        let expected: Vec<String> = (0..count).map(|i| format!("m{i:03}")).collect();
+        assert_eq!(seen, expected);
+        assert!(!resync.load(Ordering::Relaxed), "nothing was left behind");
+    }
+
+    /// #113: a `Start` for a socket whose live delivery is already on does
+    /// not drain the inbox again, so a client cannot re-dump it at will.
+    #[tokio::test]
+    async fn a_repeated_start_does_not_redeliver_again() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:repeat");
+        database
+            .store_message("s", "stored", &did_hash, None, 0, 1000)
+            .await
+            .unwrap();
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut clients = HashMap::from([(
+            did_hash.clone(),
+            live_entry(tx, "A", Arc::new(AtomicBool::new(false))),
+        )]);
+        for _ in 0..3 {
+            task._handle_activation(
+                &database,
+                &mut clients,
+                &mut HashMap::new(),
+                &replays,
+                &did_hash,
+                "A",
+                true,
+            )
+            .await;
+            drained(&replays, &did_hash).await;
+        }
+        let mut frames = 0;
+        while rx.try_recv().is_ok() {
+            frames += 1;
+        }
+        assert_eq!(frames, 1, "one drain, on the first Start only");
+    }
+
+    /// #113: a socket that drains its inbox itself on any notification (raw
+    /// TSP) is redelivered to with one wake-up, its resync: no stored message
+    /// is fetched or queued for it.
+    #[tokio::test]
+    async fn a_socket_that_drains_itself_gets_one_wake_up() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:raw-tsp");
+        for i in 0..5 {
+            database
+                .store_message("s", &format!("m{i}"), &did_hash, None, 0, 1000)
+                .await
+                .unwrap();
+        }
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let resync = Arc::new(AtomicBool::new(false));
+        let mut entry = live_entry(tx, "A", resync.clone());
+        entry.wake_only = true;
+        let mut clients = HashMap::from([(did_hash.clone(), entry)]);
+        task._handle_activation(
+            &database,
+            &mut clients,
+            &mut HashMap::new(),
+            &replays,
+            &did_hash,
+            "A",
+            true,
+        )
+        .await;
+        assert!(resync.load(Ordering::Relaxed), "woken once");
+        assert!(!replays.contains(&did_hash), "no drain was started");
+        assert!(rx.try_recv().is_err(), "nothing was queued");
+    }
+
+    /// #118: a socket that replaces one whose redelivery is still running
+    /// takes the drain over and gets the whole inbox, instead of the drain
+    /// being skipped as a duplicate and running on to the closed socket.
+    #[tokio::test]
+    async fn a_replacing_socket_takes_over_a_running_redelivery() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:handover";
+        let did_hash = digest(did);
+        for i in 0..3 {
+            database
+                .store_message("s", &format!("m{i}"), &did_hash, None, 0, 1000)
+                .await
+                .unwrap();
+        }
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        let mut standby = HashMap::new();
+        // A's queue has room for one frame, and A never reads: its drain
+        // waits for room.
+        let (a_tx, _a_rx) = mpsc::channel(1);
+        let mut clients = HashMap::from([(
+            did_hash.clone(),
+            live_entry(a_tx, "A", Arc::new(AtomicBool::new(false))),
+        )]);
+        task._handle_activation(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replays,
+            &did_hash,
+            "A",
+            true,
+        )
+        .await;
+        assert!(replays.contains(&did_hash), "A's drain is running");
+
+        let (b_tx, mut b_rx) = mpsc::channel(8);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replays,
+            &reg(did, "B", b_tx, EntryKind::Direct),
+        )
+        .await;
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            match next_cmd(&mut b_rx).await.cmd {
+                WebSocketCommands::Message(m) => seen.push(m),
+                _ => panic!("expected a redelivered message"),
+            }
+        }
+        assert_eq!(seen, ["m0", "m1", "m2"], "B gets the whole inbox");
+        drained(&replays, &did_hash).await;
+    }
+
+    /// #115: a lagged subscription raises the resync of every live client,
+    /// and the owed DID on a mux connection; a client with live delivery off
+    /// collects by pickup anyway and is left alone.
+    #[tokio::test]
+    async fn a_lag_raises_resync_for_every_live_client() {
+        use crate::mux::fair_queue::MuxSlots;
+        let (tx, _rx) = mpsc::channel(1);
+        let live = Arc::new(AtomicBool::new(false));
+        let idle = Arc::new(AtomicBool::new(false));
+        let member = Arc::new(AtomicBool::new(false));
+        let slots = MuxSlots::new(64);
+        let mut a = live_entry(tx.clone(), "A", live.clone());
+        a.active = true;
+        let b = live_entry(tx.clone(), "B", idle.clone());
+        let mut m = live_entry(tx, "M", member.clone());
+        m.active = true;
+        m.kind = EntryKind::Mux;
+        m.slots = Some(slots.clone());
+        let clients = HashMap::from([
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("m".to_string(), m),
+        ]);
+        raise_resync_all(&clients);
+        assert!(live.load(Ordering::Relaxed));
+        assert!(!idle.load(Ordering::Relaxed));
+        assert!(member.load(Ordering::Relaxed));
+        assert_eq!(slots.take_resync(), vec!["m".to_string()]);
+    }
+
+    /// #121: the connection that holds a DID's mux entry registering it again
+    /// (an attach renewal) updates it in place: it is not told the member was
+    /// superseded, no standby entry is left behind, and it stays live.
+    #[tokio::test]
+    async fn a_same_connection_re_registration_is_an_update_in_place() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:renewed";
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        for _ in 0..2 {
+            task._handle_registration(
+                &database,
+                &mut clients,
+                &mut standby,
+                &replays,
+                &reg(did, "mux", tx.clone(), EntryKind::Mux),
+            )
+            .await;
+            task._handle_activation(
+                &database,
+                &mut clients,
+                &mut standby,
+                &replays,
+                &digest(did),
+                "mux",
+                true,
+            )
+            .await;
+        }
+        drained(&replays, &digest(did)).await;
+        assert!(rx.try_recv().is_err(), "no superseded, no redelivery");
+        assert!(standby.is_empty(), "no zombie standby entry");
+        assert!(clients.get(&digest(did)).is_some_and(|e| e.active));
+    }
+
+    /// #136: a member change reaches a mux connection even when its queue is
+    /// full: it is recorded on the connection's slots, in order.
+    #[tokio::test]
+    async fn a_member_change_is_not_lost_to_a_full_queue() {
+        use crate::mux::fair_queue::MuxSlots;
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did = "did:example:busy-mux";
+        let task = streaming_task();
+        let replays = Arc::new(Redeliveries::default());
+        let mut clients = HashMap::new();
+        let mut standby = HashMap::new();
+        let slots = MuxSlots::new(64);
+        // A full queue.
+        let (m_tx, _m_rx) = mpsc::channel(1);
+        m_tx.try_send(QueuedCommand::for_test(None)).unwrap();
+        let mut update = reg(did, "mux", m_tx, EntryKind::Mux);
+        if let StreamingUpdateState::Register { slots: s, .. } = &mut update.state {
+            *s = Some(slots.clone());
+        }
+        task._handle_registration(&database, &mut clients, &mut standby, &replays, &update)
+            .await;
+        let (d_tx, _d_rx) = mpsc::channel(8);
+        task._handle_registration(
+            &database,
+            &mut clients,
+            &mut standby,
+            &replays,
+            &reg(did, "direct", d_tx, EntryKind::Direct),
+        )
+        .await;
+        assert_eq!(
+            slots.take_member_changes(),
+            vec![MemberChange::Superseded {
+                did_hash: digest(did)
+            }]
+        );
+    }
+
+    /// #124: the sockets registered before a restart of the streaming task
+    /// are kept, claimed back in the store (which the restart's clean start
+    /// wiped), and redelivered what arrived while it was down.
+    #[tokio::test]
+    async fn a_restarted_streaming_task_claims_back_its_sockets() {
+        let database: Arc<dyn MediatorStore> = Arc::new(MemoryStore::new());
+        let did_hash = digest("did:example:restart");
+        database
+            .store_message("s", "while-down", &did_hash, None, 0, 1000)
+            .await
+            .unwrap();
+        let task = streaming_task();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut entry = live_entry(tx, "A", Arc::new(AtomicBool::new(false)));
+        entry.active = true;
+        let registered = Arc::new(Mutex::new(Registered::default()));
+        registered
+            .lock()
+            .await
+            .clients
+            .insert(did_hash.clone(), entry);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+        let run = {
+            let database = database.clone();
+            let registered = registered.clone();
+            tokio::spawn(async move {
+                let mut rx = cmd_rx.lock().await;
+                let mut registered = registered.lock().await;
+                task.ws_streaming_task(
+                    database,
+                    &mut rx,
+                    &mut registered,
+                    Arc::new(Redeliveries::default()),
+                )
+                .await
+            })
+        };
+        match next_cmd(&mut rx).await.cmd {
+            WebSocketCommands::Message(m) => assert_eq!(m, "while-down"),
+            _ => panic!("expected the stored message"),
+        }
+        assert!(
+            database
+                .streaming_is_client_live(&did_hash, true)
+                .await
+                .is_some(),
+            "claimed back as live"
+        );
+        run.abort();
     }
 }

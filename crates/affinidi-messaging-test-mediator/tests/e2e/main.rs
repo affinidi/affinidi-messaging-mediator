@@ -89,6 +89,7 @@ mod tsp_transport_adapter;
 mod tsp_websocket;
 mod unprocessable_live_frames;
 mod websocket_expired_token;
+mod websocket_limits;
 mod websocket_liveness;
 mod websocket_per_did_cap;
 mod websocket_shutdown;

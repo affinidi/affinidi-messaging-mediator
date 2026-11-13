@@ -389,6 +389,8 @@ pub struct TestMediatorBuilder {
     jwt_refresh_expiry_secs: Option<u64>,
     /// Override for `LimitsConfig.max_websocket_connections_per_did`.
     max_websocket_connections_per_did: Option<usize>,
+    /// Override for `LimitsConfig.max_websocket_connections`.
+    max_websocket_connections: Option<usize>,
     /// Override for the relay socket limits: `(relay_connections_per_ip,
     /// relay_frames_per_second, relay_frame_burst)`.
     relay_limits: Option<(usize, u32, u32)>,
@@ -471,6 +473,7 @@ impl Default for TestMediatorBuilder {
             jwt_access_expiry_secs: None,
             jwt_refresh_expiry_secs: None,
             max_websocket_connections_per_did: None,
+            max_websocket_connections: None,
             relay_limits: None,
             trust_xff_cidrs: None,
             metrics_access: None,
@@ -724,6 +727,13 @@ impl TestMediatorBuilder {
     /// production default (100). Set small to exercise the cap in tests.
     pub fn max_websocket_connections_per_did(mut self, max: usize) -> Self {
         self.max_websocket_connections_per_did = Some(max);
+        self
+    }
+
+    /// Override `LimitsConfig.max_websocket_connections` — the cap on
+    /// concurrent WebSocket connections across the mediator (`0` = no limit).
+    pub fn max_websocket_connections(mut self, max: usize) -> Self {
+        self.max_websocket_connections = Some(max);
         self
     }
 
@@ -1195,6 +1205,9 @@ impl TestMediatorBuilder {
         let mut limits = affinidi_messaging_mediator::common::config::LimitsConfig::default();
         if let Some(max) = self.max_websocket_connections_per_did {
             limits.max_websocket_connections_per_did = max;
+        }
+        if let Some(max) = self.max_websocket_connections {
+            limits.max_websocket_connections = max;
         }
         if let Some((connections, frames, burst)) = self.relay_limits {
             limits.relay_connections_per_ip = connections;

@@ -978,6 +978,11 @@ pub async fn serve_internal(
         }
     }
 
+    // What the server task waits for after the HTTP server has stopped (see
+    // `wait_for_shutdown`).
+    let open_sockets = shared_state.active_websocket_count.clone();
+    let task_health = shared_state.component_health.clone();
+
     let app: Router = application_routes(&api_prefix, &shared_state);
 
     let rate_limiter = ip_rate_limiter(&config.limits);
@@ -1130,6 +1135,7 @@ pub async fn serve_internal(
                             format!("HTTP server error: {e}"),
                         )
                     })?;
+                wait_for_shutdown(&open_sockets, &task_health).await;
                 info!("Mediator shutdown complete.");
                 Ok(())
             });
@@ -1158,6 +1164,7 @@ pub async fn serve_internal(
                             format!("HTTPS server error: {e}"),
                         )
                     })?;
+                wait_for_shutdown(&open_sockets, &task_health).await;
                 info!("Mediator shutdown complete.");
                 Ok(())
             });
@@ -1290,6 +1297,52 @@ fn print_banner() {
         r#" d8'          `8b  88       88     88  88       88  88   `"8bbdP"Y8  88     88     `8'     88   `"Ybbd8"'   `"8bbdP"Y8  88  `"8bbdP"Y8    "Y888  `"YbbdP"'   88"#
     );
     println!();
+}
+
+/// How long a stopping mediator waits for its WebSockets to close and its
+/// background tasks to stop, once the HTTP server has.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
+
+/// After the HTTP server has stopped, wait (up to [`SHUTDOWN_DRAIN`]) for
+/// every WebSocket to have closed and every supervised task to have stopped.
+///
+/// The server's graceful shutdown does not track upgraded connections, so it
+/// can finish while sockets are still closing: each closes with 1001 on the
+/// shutdown token, deregisters and records its close, and a process that
+/// exits as soon as `join` returns would cut that short, leaving clients to
+/// infer the drop (R6.2). A component still `Restarting` is not a running
+/// task (the supervisor stops those at once on shutdown), so only `Running`
+/// ones are waited for.
+async fn wait_for_shutdown(
+    open_sockets: &AtomicUsize,
+    task_health: &crate::tasks::supervisor::HealthRegistry,
+) {
+    use crate::tasks::supervisor::ComponentState;
+    let settled = || {
+        open_sockets.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && !task_health
+                .iter()
+                .any(|c| c.state == ComponentState::Running)
+    };
+    let waited = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+        while !settled() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        let running: Vec<String> = task_health
+            .iter()
+            .filter(|c| c.state == ComponentState::Running)
+            .map(|c| c.name.clone())
+            .collect();
+        warn!(
+            open_websockets = open_sockets.load(std::sync::atomic::Ordering::Relaxed),
+            ?running,
+            "shutdown: gave up waiting for WebSockets to close and tasks to stop after {}s",
+            SHUTDOWN_DRAIN.as_secs()
+        );
+    }
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
