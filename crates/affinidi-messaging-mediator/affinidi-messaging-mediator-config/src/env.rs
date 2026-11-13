@@ -111,6 +111,10 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.security.trust_task_verification,
         "TRUST_TASK_VERIFICATION"
     );
+    env_override!(
+        config.security.tsp_auth_accept_unbound_until,
+        "TSP_AUTH_ACCEPT_UNBOUND_UNTIL"
+    );
 
     env_override!(config.streaming.enabled, "STREAMING_ENABLED");
     env_override!(config.streaming.uuid, "STREAMING_UUID");

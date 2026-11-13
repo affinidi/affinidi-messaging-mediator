@@ -39,8 +39,9 @@ fn inbound_body_limit(shared_data: &SharedData) -> usize {
 }
 
 /// Body cap for `/authenticate/challenge` and `/tsp/authenticate`: a DID
-/// (at most `MAX_CHALLENGE_DID_LEN` bytes) or a VID, a session id and a
-/// signature, with room for JSON escaping. Both are unauthenticated.
+/// (at most `MAX_CHALLENGE_DID_LEN` bytes), or a VID, the mediator DID, a
+/// session id, two times and a signature, with room for JSON escaping. Both
+/// are unauthenticated.
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 const AUTH_CHALLENGE_BODY_LIMIT: usize = 16 * 1024;
 

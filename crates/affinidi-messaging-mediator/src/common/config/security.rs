@@ -308,6 +308,13 @@ pub struct SecurityConfig {
     /// Whether a Trust Task failing its acceptance checks is refused or only
     /// logged. See [`TrustTaskVerification`].
     pub trust_task_verification: TrustTaskVerification,
+    /// Unix time (seconds) until which `POST /tsp/authenticate` also accepts
+    /// the older request that signs only the challenge string, for clients
+    /// built before `affinidi-messaging-sdk` 0.45.16. `None` (the default)
+    /// accepts only the signed statement naming this mediator; so does any
+    /// time at or after the deadline. A transition setting: it is logged at
+    /// boot and on every login that uses it.
+    pub tsp_auth_accept_unbound_until: Option<u64>,
 }
 
 /// What the mediator does with a Trust Task that fails its acceptance checks —
@@ -326,6 +333,27 @@ pub enum TrustTaskVerification {
     #[default]
     Warn,
     Enforce,
+}
+
+/// Parse `security.tsp_auth_accept_unbound_until`: empty is `None` (only the
+/// signed statement naming this mediator is accepted); otherwise an RFC 3339
+/// time such as `2027-03-01T00:00:00Z`, as Unix seconds.
+pub(crate) fn parse_accept_until(raw: &str) -> Result<Option<u64>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let at = humantime::parse_rfc3339_weak(raw).map_err(|e| {
+        format!(
+            "security.tsp_auth_accept_unbound_until must be empty or an RFC 3339 time \
+             (e.g. \"2027-03-01T00:00:00Z\"), not {raw:?}: {e}"
+        )
+    })?;
+    let secs = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| format!("security.tsp_auth_accept_unbound_until is before 1970: {raw:?}"))?
+        .as_secs();
+    Ok(Some(secs))
 }
 
 impl std::str::FromStr for TrustTaskVerification {
@@ -371,6 +399,10 @@ impl Debug for SecurityConfig {
             .field("force_session_did_match", &self.force_session_did_match)
             .field("block_remote_admin_msgs", &self.block_remote_admin_msgs)
             .field("trust_task_verification", &self.trust_task_verification)
+            .field(
+                "tsp_auth_accept_unbound_until",
+                &self.tsp_auth_accept_unbound_until,
+            )
             .field(
                 "enable_inter_mediator_relay",
                 &self.enable_inter_mediator_relay,
@@ -451,6 +483,7 @@ impl SecurityConfig {
             block_remote_admin_msgs: true,
             trust_task_verification: TrustTaskVerification::Warn,
             enable_inter_mediator_relay: false,
+            tsp_auth_accept_unbound_until: None,
         }
     }
 }
@@ -703,6 +736,13 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                     MediatorError::ConfigError(12, "NA".into(), e)
                 },
             )?,
+            // Also a hard error: a deadline that doesn't parse must not
+            // quietly become "no deadline" or "accept for ever".
+            tsp_auth_accept_unbound_until: parse_accept_until(&self.tsp_auth_accept_unbound_until)
+                .map_err(|e| {
+                    tracing::error!("{e}");
+                    MediatorError::ConfigError(12, "NA".into(), e)
+                })?,
             ..SecurityConfig::default(secrets_resolver)
         };
 
@@ -1116,5 +1156,22 @@ mod tests {
         let origin = HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
         note_refused_origin(&seen, &origin);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// The older TSP login form is accepted only under an explicit, dated
+    /// opt-in: empty means never, and a value that doesn't parse is refused
+    /// rather than read as "no deadline".
+    #[test]
+    fn tsp_auth_accept_unbound_until_parses_strictly() {
+        use super::parse_accept_until;
+        assert_eq!(parse_accept_until("").unwrap(), None);
+        assert_eq!(parse_accept_until("   ").unwrap(), None);
+        assert_eq!(
+            parse_accept_until("2027-03-01T00:00:00Z").unwrap(),
+            Some(1_803_859_200)
+        );
+        for bad in ["true", "yes", "1803772800", "2027-03-01", "next month"] {
+            assert!(parse_accept_until(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 }

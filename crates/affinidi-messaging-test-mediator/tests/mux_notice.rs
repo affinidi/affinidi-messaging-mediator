@@ -606,8 +606,9 @@ mod tsp_login {
     use affinidi_messaging_sdk::protocols::tsp::RelationshipState;
     use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 
-    /// A real `/tsp/authenticate` handshake as `user`: the challenge signed
-    /// with `#key-1`, the key the mediator resolves as the VID's signing key.
+    /// A real `/tsp/authenticate` handshake as `user`: a statement carrying the
+    /// challenge and naming this mediator, signed with `#key-1`, the key the
+    /// mediator resolves as the VID's signing key.
     async fn tsp_login(env: &TestEnvironment, user: &TestUser) {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -634,17 +635,33 @@ mod tsp_login {
             .get_private_bytes()
             .try_into()
             .unwrap();
-        let signature = affinidi_tsp::crypto::signing::sign(
-            challenge["data"]["challenge"].as_str().unwrap().as_bytes(),
-            &key,
-        )
-        .unwrap();
+        // The statement names this mediator, the session and an expiry.
+        let mediator = env.mediator.did().to_string();
+        let session_id = challenge["data"]["session_id"].as_str().unwrap();
+        let created_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires_time = created_time + 60;
+        let statement =
+            affinidi_messaging_mediator::handlers::authenticate::tsp::signed_statement_bytes(
+                challenge["data"]["challenge"].as_str().unwrap(),
+                session_id,
+                &user.did,
+                &mediator,
+                created_time,
+                expires_time,
+            );
+        let signature = affinidi_tsp::crypto::signing::sign(&statement, &key).unwrap();
         post(
             "tsp/authenticate",
             json!({
                 "vid": user.did,
-                "session_id": challenge["data"]["session_id"],
+                "session_id": session_id,
                 "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+                "to": mediator,
+                "created_time": created_time,
+                "expires_time": expires_time,
             }),
         )
         .await;

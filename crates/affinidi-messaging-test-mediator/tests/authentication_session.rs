@@ -740,7 +740,63 @@ async fn removed_account_ends_the_session_fjall() {
 
 // ─── TSP ─────────────────────────────────────────────────────────────────────
 
-/// `/tsp/authenticate` creates the account once the challenge signature
+/// The Ed25519 private key behind `#key-1` of a generated `did:peer`.
+#[cfg(feature = "tsp")]
+fn ed25519_key(secrets: &[affinidi_secrets_resolver::secrets::Secret]) -> [u8; 32] {
+    secrets
+        .iter()
+        .find(|s| s.id.ends_with("#key-1"))
+        .unwrap()
+        .get_private_bytes()
+        .try_into()
+        .unwrap()
+}
+
+/// The `/tsp/authenticate` body for a challenge response: the signed
+/// statement addressed to `to`, valid for 60 s from now.
+#[cfg(feature = "tsp")]
+fn tsp_statement_body(did: &str, key: &[u8; 32], challenge: &JsonValue, to: &str) -> String {
+    let session_id = challenge["data"]["session_id"].as_str().unwrap();
+    let created = now();
+    let statement =
+        affinidi_messaging_mediator::handlers::authenticate::tsp::signed_statement_bytes(
+            challenge["data"]["challenge"].as_str().unwrap(),
+            session_id,
+            did,
+            to,
+            created,
+            created + 60,
+        );
+    let signature = affinidi_tsp::crypto::signing::sign(&statement, key).unwrap();
+    json!({
+        "vid": did,
+        "session_id": session_id,
+        "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+        "to": to,
+        "created_time": created,
+        "expires_time": created + 60,
+    })
+    .to_string()
+}
+
+/// The older `/tsp/authenticate` body: a signature over the challenge string
+/// alone.
+#[cfg(feature = "tsp")]
+fn tsp_unbound_body(did: &str, key: &[u8; 32], challenge: &JsonValue) -> String {
+    let signature = affinidi_tsp::crypto::signing::sign(
+        challenge["data"]["challenge"].as_str().unwrap().as_bytes(),
+        key,
+    )
+    .unwrap();
+    json!({
+        "vid": did,
+        "session_id": challenge["data"]["session_id"],
+        "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
+    })
+    .to_string()
+}
+
+/// `/tsp/authenticate` creates the account once the signed statement
 /// verifies, as `/authenticate` does.
 #[cfg(feature = "tsp")]
 #[tokio::test]
@@ -757,38 +813,115 @@ async fn tsp_account_is_created_when_the_challenge_is_answered() {
     )
     .unwrap();
     let did_hash = sha256::digest(&did);
-    let signing: [u8; 32] = secrets
-        .iter()
-        .find(|s| s.id.ends_with("#key-1"))
-        .unwrap()
-        .get_private_bytes()
-        .try_into()
-        .unwrap();
+    let key = ed25519_key(&secrets);
 
-    let (status, body) = challenge(&env.mediator, &did).await;
-    assert_eq!(status, 200, "{body}");
+    let (status, issued) = challenge(&env.mediator, &did).await;
+    assert_eq!(status, 200, "{issued}");
     assert!(!store.account_exists(&did_hash).await.unwrap());
 
-    let signature = affinidi_tsp::crypto::signing::sign(
-        body["data"]["challenge"].as_str().unwrap().as_bytes(),
-        &signing,
-    )
-    .unwrap();
     let (status, body) = post(
         &env.mediator,
         "tsp/authenticate",
-        json!({
-            "vid": did,
-            "session_id": body["data"]["session_id"],
-            "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
-        })
-        .to_string(),
+        tsp_statement_body(&did, &key, &issued, env.mediator.did()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(store.account_exists(&did_hash).await.unwrap());
 
     env.shutdown().await.unwrap();
+}
+
+/// A statement signed for a different mediator does not log in here, and
+/// leaves the challenge unanswered.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn tsp_statement_for_another_mediator_is_refused() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let key = ed25519_key(&alice.secrets);
+
+    let (status, issued) = challenge(&env.mediator, &alice.did).await;
+    assert_eq!(status, 200, "{issued}");
+
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        tsp_statement_body(
+            &alice.did,
+            &key,
+            &issued,
+            "did:web:other-mediator.example.com",
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(32), "{body}");
+
+    // The same challenge, answered for this mediator, still works.
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        tsp_statement_body(&alice.did, &key, &issued, env.mediator.did()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    env.shutdown().await.unwrap();
+}
+
+/// A signature over the challenge alone is refused unless the operator has
+/// opted in, and accepted while that opt-in has not lapsed.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn tsp_unbound_signature_needs_the_operator_opt_in() {
+    init_tracing();
+    let env = spawn_env(
+        Arc::new(MemoryStore::new()),
+        AccessListModeType::ExplicitDeny,
+    )
+    .await;
+    let alice = env.add_user("alice").await.unwrap();
+    let key = ed25519_key(&alice.secrets);
+    let (_, issued) = challenge(&env.mediator, &alice.did).await;
+    let (status, body) = post(
+        &env.mediator,
+        "tsp/authenticate",
+        tsp_unbound_body(&alice.did, &key, &issued),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["errorCode"].as_u64(), Some(32), "{body}");
+    env.shutdown().await.unwrap();
+
+    for (until, accepted) in [(now() + 3600, true), (now() - 1, false)] {
+        let mediator = TestMediator::builder()
+            .store(Arc::new(MemoryStore::new()))
+            .acl_mode(AccessListModeType::ExplicitDeny)
+            .tsp_auth_accept_unbound_until(Some(until))
+            .spawn()
+            .await
+            .expect("spawn mediator");
+        let env = TestEnvironment::new(mediator)
+            .await
+            .expect("wire the SDK to the mediator");
+        let bob = env.add_user("bob").await.unwrap();
+        let key = ed25519_key(&bob.secrets);
+        let (_, issued) = challenge(&env.mediator, &bob.did).await;
+        let (status, body) = post(
+            &env.mediator,
+            "tsp/authenticate",
+            tsp_unbound_body(&bob.did, &key, &issued),
+        )
+        .await;
+        let expected = if accepted { 200 } else { 401 };
+        assert_eq!(status, expected, "until {until}: {body}");
+        env.shutdown().await.unwrap();
+    }
 }
 
 /// `/tsp/authenticate` refuses a DID blocked after it was issued a challenge.
@@ -802,36 +935,19 @@ async fn tsp_login_refused_when_blocked_after_the_challenge() {
     )
     .await;
     let alice = env.add_user("alice").await.unwrap();
-    let signing: [u8; 32] = alice
-        .secrets
-        .iter()
-        .find(|s| s.id.ends_with("#key-1"))
-        .unwrap()
-        .get_private_bytes()
-        .try_into()
-        .unwrap();
+    let key = ed25519_key(&alice.secrets);
 
-    let (status, body) = challenge(&env.mediator, &alice.did).await;
-    assert_eq!(status, 200, "{body}");
+    let (status, issued) = challenge(&env.mediator, &alice.did).await;
+    assert_eq!(status, 200, "{issued}");
 
     let mut blocked = acl::allow_all();
     blocked.set_blocked(true);
     env.mediator.set_acl(&alice.did, blocked).await.unwrap();
 
-    let signature = affinidi_tsp::crypto::signing::sign(
-        body["data"]["challenge"].as_str().unwrap().as_bytes(),
-        &signing,
-    )
-    .unwrap();
     let (status, body) = post(
         &env.mediator,
         "tsp/authenticate",
-        json!({
-            "vid": alice.did,
-            "session_id": body["data"]["session_id"],
-            "signature": BASE64_URL_SAFE_NO_PAD.encode(signature),
-        })
-        .to_string(),
+        tsp_statement_body(&alice.did, &key, &issued, env.mediator.did()),
     )
     .await;
     assert_eq!(status, 403, "{body}");

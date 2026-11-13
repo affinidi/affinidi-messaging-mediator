@@ -2,8 +2,9 @@
 //!
 //! Unlike `tsp_delivery.rs` (which lets the SDK authenticate over the built-in
 //! DIDComm flow), this environment registers a `TspAuthHandler` as the *only*
-//! authentication path: every profile authenticates by signing the mediator's
-//! `/authenticate/challenge` with its Ed25519 VID key and POSTing the signature
+//! authentication path: every profile authenticates by signing, with its
+//! Ed25519 VID key, a statement that carries the mediator's
+//! `/authenticate/challenge` and names this mediator, and POSTing the signature
 //! to `POST /tsp/authenticate`, minting the JWT used for the REST send/fetch.
 //!
 //! Driving a flow that *requires* authentication (Alice sends a TSP Direct
@@ -11,7 +12,7 @@
 //! chain end to end:
 //!
 //! ```text
-//! challenge → Ed25519-sign-with-VID → /tsp/authenticate → JWT → REST send/fetch
+//! challenge → sign statement with VID → /tsp/authenticate → JWT → REST send/fetch
 //! ```
 //!
 //! Both the send and the fetch require a valid token the `TspAuthHandler`
