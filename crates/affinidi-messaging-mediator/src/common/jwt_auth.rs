@@ -285,8 +285,9 @@ pub(crate) async fn authenticate_token(
     // record and the blocked check have all passed: charging any earlier would
     // let a forged token naming a victim DID spend that DID's quota. Every
     // authenticated HTTP route (and the `/ws` upgrade) comes through this
-    // function, so this is the one place the limit is enforced. Frames on an
-    // established WebSocket are not charged — see `did_rate_limiter`.
+    // function, so this is where the limit is enforced for requests. Messages
+    // on an established WebSocket are charged per message by the socket's
+    // message meter (`handlers::ws_message_meter`).
     if let Err(limited) = state.did_rate_limiter.try_acquire(&did_hash) {
         metrics::counter!(RATE_LIMITED_TOTAL, "scope" => did_rate_limiter::PER_DID_SCOPE)
             .increment(1);

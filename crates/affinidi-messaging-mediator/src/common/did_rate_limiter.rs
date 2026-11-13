@@ -1,23 +1,22 @@
-//! Per-DID rate limiting for authenticated HTTP requests.
+//! Per-DID rate limiting for authenticated requests and WebSocket messages.
 //!
 //! Unlike the per-IP rate limiter (which runs as Tower middleware), this limiter
 //! operates at the application level because the DID is only known after JWT
-//! validation. It is charged in exactly one place:
-//! `authenticate_token`, once the
-//! token has been fully validated. That covers every route that authenticates a
-//! caller — `/inbound` (DIDComm and TSP), `/outbound`, `/fetch`, `/list`,
-//! `/delete`, `/whoami`, `/oob` and the `/ws` upgrade — and a
-//! refusal is a `429` carrying the mediator's rate-limit attribution contract
-//! (see [`refusal_response`]).
+//! validation. It is charged in two places:
+//!
+//! - `authenticate_token`, once the token has been fully validated. That covers
+//!   every route that authenticates a caller — `/inbound` (DIDComm and TSP),
+//!   `/outbound`, `/fetch`, `/list`, `/delete`, `/whoami`, `/oob` and the `/ws`
+//!   upgrade — and a refusal is a `429` carrying the mediator's rate-limit
+//!   attribution contract (see [`refusal_response`]).
+//! - Every message read from an established, authenticated WebSocket
+//!   (`handlers::ws_message_meter`), so one DID cannot spread its load across
+//!   many sockets. There is no HTTP status mid-session, so a refusal there is
+//!   backpressure: the socket is read more slowly, and closed with 1008 if it
+//!   stays over the rate (see [`DidRateLimiter::try_acquire_wait`]).
 //!
 //! # What is deliberately not charged
 //!
-//! - **Frames on an established WebSocket.** The socket's upgrade request is
-//!   charged; the messages it then carries are not. A refusal mid-session has
-//!   no HTTP status to carry it, DIDComm's problem-report registry has no
-//!   rate-limit descriptor, and closing the socket would drop a frame the
-//!   client already believes it sent. Choosing a signal is a protocol decision,
-//!   so none is invented here.
 //! - **Anonymous sessions** — the inter-mediator relay session and the DIDComm
 //!   v1 anonymous-forward session. They carry no DID, so there is nothing to key
 //!   on, and keying them all on one shared bucket would let one busy peer
@@ -302,6 +301,19 @@ impl DidRateLimiter {
     /// request to, and sharing one bucket across all of them would let one
     /// relaying peer starve the rest.
     pub fn try_acquire(&self, did_hash: &str) -> Result<(), DidRateLimited> {
+        // Retry-After wants whole seconds, and 0 would invite an immediate
+        // retry that is guaranteed to fail.
+        self.try_acquire_wait(did_hash)
+            .map_err(|wait| DidRateLimited {
+                retry_after_secs: wait.as_secs().max(1),
+            })
+    }
+
+    /// As [`Self::try_acquire`], but a refusal carries the exact wait until
+    /// the DID's next token, for a caller that waits rather than answering
+    /// with `Retry-After` (the WebSocket message meter). A capacity refusal
+    /// carries the capacity retry hint.
+    pub fn try_acquire_wait(&self, did_hash: &str) -> Result<(), Duration> {
         let Some(active) = &self.active else {
             return Ok(());
         };
@@ -327,26 +339,22 @@ impl DidRateLimiter {
                 // unbounded. Same 429 contract as a quota refusal. (A small,
                 // bounded overshoot is possible if many *new* DIDs race here at
                 // once — acceptable; the invariant is "bounded", not "exact".)
-                return Err(DidRateLimited {
-                    retry_after_secs: CAPACITY_RETRY_AFTER_SECS,
-                });
+                return Err(Duration::from_secs(CAPACITY_RETRY_AFTER_SECS));
             }
         }
 
         active
             .limiter
             .check_key(&did_hash.to_owned())
-            .map_err(|not_until| {
-                // governor reports the instant the next token is available;
-                // Retry-After wants whole seconds, and 0 would invite an immediate
-                // retry that is guaranteed to fail.
-                DidRateLimited {
-                    retry_after_secs: not_until
-                        .wait_time_from(DefaultClock::default().now())
-                        .as_secs()
-                        .max(1),
-                }
-            })
+            // governor reports the instant the next token is available.
+            .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()))
+    }
+
+    /// Is `did_hash` one of the exempt DIDs (the mediator's own, the admin
+    /// DID)? Answered whether or not limiting is enabled, so other limits that
+    /// share the exemption (the WebSocket message rate) can ask.
+    pub fn is_exempt(&self, did_hash: &str) -> bool {
+        !did_hash.is_empty() && self.exempt.contains(did_hash)
     }
 
     /// Check whether the given DID hash is within its rate limit.
@@ -551,6 +559,31 @@ mod tests {
         }
         assert!(limiter.try_acquire("user").is_ok());
         assert!(limiter.try_acquire("user").is_err());
+    }
+
+    /// The exact wait is reported for a caller that sleeps instead of
+    /// answering with `Retry-After`; it is below a second at a fast rate.
+    #[test]
+    fn a_refusal_reports_the_exact_wait() {
+        let limiter = DidRateLimiter::new(10, 1);
+        assert!(limiter.try_acquire_wait("aaa").is_ok());
+        let wait = limiter.try_acquire_wait("aaa").unwrap_err();
+        assert!(wait <= Duration::from_millis(100), "{wait:?}");
+        // The HTTP form still rounds up to a whole second.
+        assert_eq!(limiter.try_acquire("aaa").unwrap_err().retry_after_secs, 1);
+    }
+
+    /// Exemption is known even with limiting off, so the WebSocket message
+    /// rate can share it.
+    #[test]
+    fn exemption_is_reported_whether_or_not_limiting_is_enabled() {
+        for per_second in [0, 1] {
+            let limiter = DidRateLimiter::new(per_second, 1)
+                .with_exempt_did_hashes(["admin".to_string(), String::new()]);
+            assert!(limiter.is_exempt("admin"));
+            assert!(!limiter.is_exempt("user"));
+            assert!(!limiter.is_exempt(""));
+        }
     }
 
     /// An anonymous (relay) session has no DID hash. It must not be charged —

@@ -1023,6 +1023,64 @@ impl RelayMeter {
     }
 }
 
+/// What the read side of the connection loop produced.
+enum Inbound {
+    /// A frame from the peer (or the end of the stream), as
+    /// [`BoundedSocket::recv`] returns it.
+    Frame(Option<Result<Message, axum::Error>>),
+    /// The socket has stayed over its message rate for too long.
+    RateLimited,
+}
+
+/// The next frame from the peer, read no faster than `meter` allows.
+///
+/// A text or binary message over the rate is kept in `held` and the socket is
+/// not read again until it is due, so the peer's further frames wait in its
+/// own send buffer: one message is held, never more. Control frames are read
+/// and returned as they come while nothing is held.
+///
+/// Cancel-safe, as the connection loop's `select!` needs: the only await
+/// after a message is taken off the socket is the pause, and the message is
+/// in `held` for it, so a dropped future loses nothing and the message is
+/// charged again (each budget once) on the next call.
+async fn next_inbound(
+    socket: &mut BoundedSocket,
+    held: &mut Option<Message>,
+    mut meter: Option<&mut crate::handlers::ws_message_meter::WsMessageMeter>,
+) -> Inbound {
+    use crate::handlers::ws_message_meter::Verdict;
+    loop {
+        let (message, was_held) = match held.take() {
+            Some(message) => (message, true),
+            None => match socket.recv().await {
+                Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) if meter.is_some() => {
+                    (message, false)
+                }
+                other => return Inbound::Frame(other),
+            },
+        };
+        let Some(meter) = meter.as_deref_mut() else {
+            return Inbound::Frame(Some(Ok(message)));
+        };
+        match meter.charge(Instant::now()) {
+            Verdict::Admit => {
+                if was_held {
+                    // The mediator chose not to read while it waited, so a
+                    // ping that went unanswered meanwhile is not held against
+                    // the peer, which was sending all along.
+                    socket.pings.answered();
+                }
+                return Inbound::Frame(Some(Ok(message)));
+            }
+            Verdict::Close => return Inbound::RateLimited,
+            Verdict::Wait(pause) => {
+                *held = Some(message);
+                tokio::time::sleep(pause).await;
+            }
+        }
+    }
+}
+
 /// Build a close message carrying an RFC 6455 code + human-readable reason.
 fn close_with(code: u16, reason: &'static str) -> Message {
     Message::Close(Some(CloseFrame {
@@ -1393,6 +1451,21 @@ async fn handle_socket(
 
         // Inbound frame budget for a relay socket (see `RelayMeter`).
         let mut relay_meter = is_relay.then(|| RelayMeter::new(&state.config.limits));
+        // Inbound message rate for an authenticated socket (see
+        // `ws_message_meter`): read with the live limits, so a `config/patch`
+        // applies to every socket opened after it. `None` for a relay socket
+        // and for the exempt DIDs.
+        let mut message_meter = if is_relay {
+            None
+        } else {
+            crate::handlers::ws_message_meter::WsMessageMeter::new(
+                &state.limits(),
+                &state.did_rate_limiter,
+                &session.did_hash,
+            )
+        };
+        // A message read but held back until it is due (see `next_inbound`).
+        let mut held: Option<Message> = None;
 
         // Why this socket ends up closing — surfaced in the final close frame.
         let mut close_reason: (u16, &'static str) = (close_code::NORMAL, "normal closure");
@@ -1417,6 +1490,9 @@ async fn handle_socket(
             let drain_pending = tsp_drain_rest.is_some() && queue_idle(&rx, fair.as_ref());
             #[cfg(not(feature = "tsp"))]
             let drain_pending = false;
+            // While a message is held the loop is deliberately not reading,
+            // so an unanswered ping is not the peer's silence.
+            let reading = held.is_none();
             select! {
                 // The mediator is stopping. The HTTP server's graceful
                 // shutdown does not track upgraded sockets; before this they
@@ -1442,8 +1518,16 @@ async fn handle_socket(
                     };
                     break;
                 }
-                value = socket.recv() => {
+                inbound = next_inbound(&mut socket, &mut held, message_meter.as_mut()) => {
                     woke = tokio::time::Instant::now();
+                    let value = match inbound {
+                        Inbound::Frame(value) => value,
+                        Inbound::RateLimited => {
+                            warn!("WebSocket stayed over its message rate; closing");
+                            close_reason = (close_code::POLICY, crate::handlers::ws_message_meter::CLOSE_REASON);
+                            break;
+                        }
+                    };
                     match value { Some(msg) => {
                         if let Ok(msg) = msg {
                             match msg {
@@ -1753,7 +1837,7 @@ async fn handle_socket(
                 // else has arrived from the peer either: it has gone without
                 // closing.
                 _ = tokio::time::sleep_until(ping_deadline.unwrap_or_else(|| tokio::time::Instant::now() + liveness.ping_interval)),
-                    if ping_deadline.is_some() => {
+                    if ping_deadline.is_some() && reading => {
                     warn!(
                         grace_secs = liveness.grace.as_secs(),
                         "WebSocket ping unanswered, and no frame from the peer; closing"

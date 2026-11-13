@@ -216,6 +216,15 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         "LIMIT_RELAY_BYTES_PER_SECOND"
     );
     env_override!(
+        config.limits.ws_messages_per_second,
+        "LIMIT_WS_MESSAGES_PER_SECOND"
+    );
+    env_override!(config.limits.ws_message_burst, "LIMIT_WS_MESSAGE_BURST");
+    env_override!(
+        config.limits.ws_message_throttle_close_secs,
+        "LIMIT_WS_MESSAGE_THROTTLE_CLOSE_SECS"
+    );
+    env_override!(
         config.limits.metrics_requests_per_second,
         "LIMIT_METRICS_REQUESTS_PER_SECOND"
     );

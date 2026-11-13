@@ -13,8 +13,8 @@
 //! - anonymous inter-mediator relay traffic, which carries no DID, is never
 //!   charged, so one peer's forwards cannot throttle routing.
 //!
-//! Frames on an established WebSocket are not metered; that gap is documented
-//! in the mediator's CHANGELOG and `conf/mediator.toml`.
+//! Messages on an established WebSocket are charged too; see
+//! `ws_message_rate.rs`.
 
 mod common;
 

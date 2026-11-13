@@ -23,6 +23,7 @@ pub use readiness::readiness_handler;
 pub(crate) mod oob_discovery;
 pub mod websocket;
 pub mod well_known_did_fetch;
+pub(crate) mod ws_message_meter;
 
 /// How much of an `/inbound` body is buffered before the handler sees it.
 ///

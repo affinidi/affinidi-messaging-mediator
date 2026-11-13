@@ -65,6 +65,20 @@ pub struct LimitsConfigRaw {
     /// Sustained bytes per second accepted on one relay WebSocket.
     #[serde(default = "default_relay_bytes_per_second")]
     pub relay_bytes_per_second: String,
+    /// Sustained messages per second read from one authenticated WebSocket.
+    /// `"0"` means unlimited. Empty (the default) inherits `rate_limit_per_ip`,
+    /// so WebSocket messages are held to the same rate as HTTP requests.
+    #[serde(default)]
+    pub ws_messages_per_second: String,
+    /// Messages an authenticated WebSocket may send back-to-back above the
+    /// sustained rate. Empty (the default) inherits `rate_limit_burst`.
+    #[serde(default)]
+    pub ws_message_burst: String,
+    /// Seconds an authenticated WebSocket may stay over its message rate
+    /// before the mediator closes it with 1008. `"0"` means never close (the
+    /// socket is only slowed).
+    #[serde(default = "default_ws_message_throttle_close_secs")]
+    pub ws_message_throttle_close_secs: String,
     /// Requests per second the `/metrics` endpoint answers, across all callers.
     #[serde(default = "default_metrics_requests_per_second")]
     pub metrics_requests_per_second: String,
@@ -168,6 +182,10 @@ fn default_relay_frame_burst() -> String {
 /// is always at least `ws_size` deep), it just uses up the allowance.
 fn default_relay_bytes_per_second() -> String {
     "4194304".to_string()
+}
+/// 10 s over the rate before the socket is closed.
+fn default_ws_message_throttle_close_secs() -> String {
+    "10".to_string()
 }
 /// 5 — a Prometheus scrape is one request every 10-60 s per scraper.
 fn default_metrics_requests_per_second() -> String {

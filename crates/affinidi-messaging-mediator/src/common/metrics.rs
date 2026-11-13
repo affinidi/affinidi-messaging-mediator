@@ -234,7 +234,10 @@ pub mod names {
 
     // ── Rate limiting ───────────────────────────────────────────────────────
 
-    /// counter: Requests rejected by rate limiter (label: scope = ip|did)
+    /// counter: Requests rejected by rate limiter (label: scope = ip|did|ws).
+    /// `ws` counts messages on an authenticated WebSocket that had to wait for
+    /// the socket's message rate; `did` also counts WebSocket messages that
+    /// waited for the per-DID rate.
     pub const RATE_LIMITED_TOTAL: &str = "rate_limited_total";
     /// counter: Requests the per-IP limiter refused because it could not tell
     /// which client sent them (label: reason = invalid_forwarded_for |

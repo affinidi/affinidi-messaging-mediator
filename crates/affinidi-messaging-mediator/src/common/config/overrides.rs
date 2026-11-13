@@ -119,6 +119,17 @@ pub const PATCHABLE: &[Patchable] = &[
     key("limits.access_list_limit", KeyClass::Live, 1, 1_000_000),
     key("limits.oob_invite_ttl", KeyClass::Live, 60, YEAR),
     key("limits.forward_task_queue", KeyClass::Live, 1, 10_000_000),
+    // The WebSocket message rate is read when a socket opens, so a patch
+    // applies to every connection opened after it; an open socket keeps the
+    // rate it started with. 0 (unlimited / never close) is below the floor.
+    key("limits.ws_messages_per_second", KeyClass::Live, 1, 100_000),
+    key("limits.ws_message_burst", KeyClass::Live, 1, 100_000),
+    key(
+        "limits.ws_message_throttle_close_secs",
+        KeyClass::Live,
+        1,
+        HOUR,
+    ),
     // Connection and rate limiting, and the HTTP/WS body-size layers, are
     // built once at startup. For these, 0 means unlimited.
     key(
@@ -481,6 +492,50 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("above the most allowed"), "{err}");
+    }
+
+    #[test]
+    fn the_websocket_message_rate_can_be_tightened_but_not_switched_off() {
+        let base = LimitsConfig::default(); // 100/s, burst 50, close after 10 s
+        for key in [
+            "limits.ws_messages_per_second",
+            "limits.ws_message_burst",
+            "limits.ws_message_throttle_close_secs",
+        ] {
+            assert_eq!(class_of(key), Some(KeyClass::Live), "{key}");
+            let err = with_override(&base, &base, key, &json!(0)).unwrap_err();
+            assert!(err.contains("switch this limit off"), "{key}: {err}");
+        }
+        let next =
+            with_override(&base, &base, "limits.ws_messages_per_second", &json!(10)).unwrap();
+        assert_eq!(next.ws_messages_per_second, 10);
+        let err =
+            with_override(&base, &base, "limits.ws_messages_per_second", &json!(101)).unwrap_err();
+        assert!(err.contains("above the configured value"), "{err}");
+        let next = with_override(
+            &base,
+            &base,
+            "limits.ws_message_throttle_close_secs",
+            &json!(3),
+        )
+        .unwrap();
+        assert_eq!(next.ws_message_throttle_close_secs, 3);
+
+        // An operator who configured the rate off can still turn it on by
+        // patch, up to the absolute cap.
+        let unlimited = LimitsConfig {
+            ws_messages_per_second: 0,
+            ..LimitsConfig::default()
+        };
+        assert!(
+            with_override(
+                &unlimited,
+                &unlimited,
+                "limits.ws_messages_per_second",
+                &json!(200)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
