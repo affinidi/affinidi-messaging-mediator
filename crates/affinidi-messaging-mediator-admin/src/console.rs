@@ -1,11 +1,14 @@
 //! A connected console session.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use affinidi_messaging_core::ConnState;
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_sdk::protocols::trust_tasks::{MuxAdminRevokeOutcome, MuxConnectionsQuery};
-use affinidi_messaging_sdk::tasks::messaging::{account, message, mux, queue, stats};
+use affinidi_messaging_sdk::tasks::messaging::{
+    access_list, account, acl, message, mux, queue, stats,
+};
 use affinidi_messaging_sdk::tasks::{audit, config};
 use affinidi_messaging_sdk::{
     ATM, config::ATMConfig, messages::compat::UnpackMetadata, profiles::ATMProfile,
@@ -15,7 +18,7 @@ use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::error::{ConsoleError, Result};
+use crate::error::{ConsoleError, Result, bounded};
 use crate::grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection};
 use crate::identity::Identity;
 use crate::live::{LiveStream, MembershipFilter, MonitorFeed, MonitorFilter};
@@ -31,8 +34,8 @@ pub enum Mode {
     /// An administrator: sees and manages every account. `root` adds the
     /// rootAdmin-only operations (reading another account's message bodies,
     /// granting or changing a privileged role — admin, rootAdmin, mediator —
-    /// and changing, removing or acting on the queues of another privileged
-    /// account).
+    /// changing, removing or acting on the queues of another privileged
+    /// account, and changing or reloading the configuration).
     Admin { root: bool },
     /// Any other account: its own queues, messages, settings and traffic.
     SelfService,
@@ -47,7 +50,8 @@ pub struct Capabilities {
     /// message metadata, the audit log, configuration, monitoring everyone.
     pub mediator_wide: bool,
     /// Read another account's message body; grant or change a privileged role;
-    /// change, remove or act on the queues of another privileged account.
+    /// change, remove or act on the queues of another privileged account;
+    /// change or reload the configuration.
     pub root: bool,
     /// The account is served locally (has queues here). Needed for self-service
     /// message operations.
@@ -72,6 +76,48 @@ pub struct InspectedMessage {
     pub opened: Option<(Message, UnpackMetadata)>,
 }
 
+/// How long a console waits: for the whole connection, and for each answer.
+///
+/// Every request the console sends is bounded (R1.2); a call that runs out
+/// of time fails with [`ConsoleError::Timeout`], which
+/// [`is_transient`](ConsoleError::is_transient). To bound one call
+/// differently, wrap it in [`with_deadline`](crate::with_deadline); to cancel
+/// one, drop its future.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConsoleOptions {
+    /// The longest [`MediatorConsole::connect`] takes, all of it: resolving
+    /// the DID, authenticating, and reading the account. Default 30 s.
+    pub connect_timeout: Duration,
+    /// The longest any one call waits for the mediator's answer. Default
+    /// 30 s. [`MediatorConsole::mux_revoke`] sends up to
+    /// [`MUX_REVOKE_MAX_ROUNDS`] requests and gets that many times this.
+    pub request_timeout: Duration,
+}
+
+impl Default for ConsoleOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ConsoleOptions {
+    /// Bound the whole connection by `timeout`.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Bound each call by `timeout`.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+}
+
 /// A live console session with one mediator, as one identity.
 pub struct MediatorConsole {
     atm: ATM,
@@ -88,6 +134,8 @@ pub struct MediatorConsole {
     mediator_version: Option<String>,
     /// The connection's state, as the SDK publishes it.
     conn: Option<watch::Receiver<ConnState>>,
+    /// How long each call waits for an answer.
+    request_timeout: Duration,
 }
 
 /// The first mediator release that serves the operations tasks the console is
@@ -97,9 +145,11 @@ pub const OPERATIONS_SINCE: (u64, u64, u64) = (0, 28, 20);
 /// The first mediator release that serves `config/patch`.
 pub const CONFIG_PATCH_SINCE: (u64, u64, u64) = (0, 28, 27);
 
-/// The first mediator release that serves the administrator's stored-grant
-/// tasks (`messaging/mux/admin-list`, `admin-revoke`, `admin-revoke-all`)
-/// and `messaging/monitor/subscribe` 0.2, with its mux membership events.
+/// The first mediator release that serves DID multiplexing: the
+/// administrator's stored-grant tasks (`messaging/mux/admin-list`,
+/// `admin-revoke`, `admin-revoke-all`), an account's own grant tasks
+/// (`messaging/mux/grant`, `list`, `revoke`, `revoke-all`) and
+/// `messaging/monitor/subscribe` 0.2, with its mux membership events.
 pub const MUX_ADMIN_SINCE: (u64, u64, u64) = (0, 52, 0);
 
 /// How many `admin-revoke` requests [`MediatorConsole::mux_revoke`] sends at
@@ -115,23 +165,44 @@ pub const ACTIVITY_SINCE: (u64, u64, u64) = (0, 28, 33);
 pub const STATS_SINCE: (u64, u64, u64) = (0, 28, 36);
 
 impl MediatorConsole {
-    /// Connect as `identity`, with a private SDK instance.
+    /// Connect as `identity`, with a private SDK instance and the default
+    /// [`ConsoleOptions`].
     pub async fn connect(identity: Identity) -> Result<Self> {
-        let config = TDKConfig::headless().map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        let tdk = TDKSharedState::new(config)
-            .await
-            .map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        let atm_config = ATMConfig::builder()
-            .build()
-            .map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        let atm = ATM::new(atm_config, Arc::new(tdk))
-            .await
-            .map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        Self::connect_exclusive(atm, identity).await
+        Self::connect_with_options(identity, ConsoleOptions::default()).await
     }
 
-    /// Connect as `identity` through an SDK instance dedicated to the console.
-    /// `identity`'s secrets are added to that instance's resolver.
+    /// Connect as `identity`, with a private SDK instance, waiting as
+    /// `options` says. The whole connection is bounded by
+    /// [`ConsoleOptions::connect_timeout`].
+    ///
+    /// The instance is the console's alone, so the console takes every live
+    /// message pushed to `identity`'s DID on it, as
+    /// [`connect_exclusive`](Self::connect_exclusive) does.
+    pub async fn connect_with_options(identity: Identity, options: ConsoleOptions) -> Result<Self> {
+        let connect = async {
+            let config = TDKConfig::headless()
+                .map_err(|e| ConsoleError::connect("configuring the TDK", e))?;
+            let tdk = TDKSharedState::new(config)
+                .await
+                .map_err(|e| ConsoleError::connect("starting the TDK", e))?;
+            // The SDK's own REST calls get the same bound as the console's.
+            let atm_config = ATMConfig::builder()
+                .with_request_timeout(options.request_timeout)
+                .build()
+                .map_err(|e| ConsoleError::connect("configuring the SDK", e))?;
+            let atm = ATM::new(atm_config, Arc::new(tdk))
+                .await
+                .map_err(|e| ConsoleError::connect("starting the SDK", e))?;
+            Self::connect_inner(atm, identity, None, options.request_timeout).await
+        };
+        bounded_connect(options.connect_timeout, connect).await
+    }
+
+    /// Connect as `identity` through an SDK instance dedicated to the console,
+    /// with the default [`ConsoleOptions`] (see
+    /// [`connect_exclusive_with_options`](Self::connect_exclusive_with_options)
+    /// for others). `identity`'s secrets are added to that instance's
+    /// resolver.
     ///
     /// **The console takes every live message pushed to `identity`'s DID on
     /// that instance.** The SDK has no receive filtered by message type, so
@@ -143,7 +214,25 @@ impl MediatorConsole {
     /// the DID uses [`connect_with_unclaimed`](Self::connect_with_unclaimed),
     /// which hands those messages on instead.
     pub async fn connect_exclusive(atm: ATM, identity: Identity) -> Result<Self> {
-        Self::connect_inner(atm, identity, None).await
+        Self::connect_exclusive_with_options(atm, identity, ConsoleOptions::default()).await
+    }
+
+    /// [`connect_exclusive`](Self::connect_exclusive), waiting as `options`
+    /// says; the same warning applies.
+    ///
+    /// The SDK instance's own REST timeout is its configuration's, not
+    /// `options.request_timeout`; the console still bounds each call by the
+    /// latter.
+    pub async fn connect_exclusive_with_options(
+        atm: ATM,
+        identity: Identity,
+        options: ConsoleOptions,
+    ) -> Result<Self> {
+        bounded_connect(
+            options.connect_timeout,
+            Self::connect_inner(atm, identity, None, options.request_timeout),
+        )
+        .await
     }
 
     /// Connect as `identity` through an existing SDK instance, taking every
@@ -163,10 +252,13 @@ impl MediatorConsole {
         Self::connect_exclusive(atm, identity).await
     }
 
-    /// Connect as `identity` through an existing SDK instance, for an application that shares
-    /// the SDK instance **and the DID** with its own live traffic: every
-    /// pushed message that is not one of the console's monitor batches goes
-    /// to `unclaimed`, with its unpack metadata, rather than being dropped.
+    /// Connect as `identity` through an existing SDK instance, for an
+    /// application that shares the SDK instance **and the DID** with its own
+    /// live traffic, with the default [`ConsoleOptions`] (see
+    /// [`connect_with_unclaimed_options`](Self::connect_with_unclaimed_options)
+    /// for others): every pushed message that is not one of the console's
+    /// monitor batches goes to `unclaimed`, with its unpack metadata, rather
+    /// than being dropped.
     ///
     /// The console never deletes such a message at the mediator: the
     /// application acknowledges (deletes) it as it would any other. When
@@ -177,13 +269,34 @@ impl MediatorConsole {
         identity: Identity,
         unclaimed: tokio::sync::mpsc::Sender<crate::live::Unclaimed>,
     ) -> Result<Self> {
-        Self::connect_inner(atm, identity, Some(unclaimed)).await
+        Self::connect_with_unclaimed_options(atm, identity, unclaimed, ConsoleOptions::default())
+            .await
+    }
+
+    /// [`connect_with_unclaimed`](Self::connect_with_unclaimed), waiting as
+    /// `options` says.
+    ///
+    /// The SDK instance's own REST timeout is its configuration's, not
+    /// `options.request_timeout`; the console still bounds each call by the
+    /// latter.
+    pub async fn connect_with_unclaimed_options(
+        atm: ATM,
+        identity: Identity,
+        unclaimed: tokio::sync::mpsc::Sender<crate::live::Unclaimed>,
+        options: ConsoleOptions,
+    ) -> Result<Self> {
+        bounded_connect(
+            options.connect_timeout,
+            Self::connect_inner(atm, identity, Some(unclaimed), options.request_timeout),
+        )
+        .await
     }
 
     async fn connect_inner(
         atm: ATM,
         identity: Identity,
         unclaimed: Option<tokio::sync::mpsc::Sender<crate::live::Unclaimed>>,
+        request_timeout: Duration,
     ) -> Result<Self> {
         if identity.secrets.is_empty() {
             return Err(ConsoleError::Identity(format!(
@@ -208,26 +321,30 @@ impl MediatorConsole {
             Some(mediator_did.clone()),
         )
         .await
-        .map_err(|e| ConsoleError::Connect(e.to_string()))?;
+        .map_err(|e| ConsoleError::connect(format!("setting up {}", identity.did), e))?;
         // `ATMProfile::new` drops a mediator it could not set up rather than
         // failing; a profile without one would fail every call later, so say
         // so now.
-        profile.dids().map_err(|_| {
-            ConsoleError::Connect(format!(
-                "could not reach mediator {mediator_did} for {}",
-                identity.did
-            ))
+        profile.dids().map_err(|e| {
+            ConsoleError::connect(
+                format!(
+                    "could not reach mediator {mediator_did} for {}",
+                    identity.did
+                ),
+                e,
+            )
         })?;
         let profile = atm
             .profile_add(&profile, true)
             .await
-            .map_err(|e| ConsoleError::Connect(e.to_string()))?;
+            .map_err(|e| ConsoleError::connect("authenticating to the mediator", e))?;
 
-        let account = atm
-            .trust_tasks()
-            .account_get(&profile, None)
-            .await
-            .map_err(ConsoleError::from_call)?;
+        let account = bounded(
+            "messaging/account/get",
+            request_timeout,
+            atm.trust_tasks().account_get(&profile, None),
+        )
+        .await?;
         let (mode, capabilities) = classify(&account);
         let mediator_version = probe_version(&atm, &profile).await;
         let conn = profile.connection_state().await;
@@ -245,6 +362,7 @@ impl MediatorConsole {
             capabilities,
             live,
             mediator_version,
+            request_timeout,
         })
     }
 
@@ -266,25 +384,51 @@ impl MediatorConsole {
         self.mediator_version.as_deref()
     }
 
+    /// How long each call waits for the mediator's answer.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Wait `timeout` for each answer from now on. Monitor feeds already
+    /// open keep the timeout they were opened with.
+    pub fn set_request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = timeout;
+    }
+
+    /// Send one request for `operation`, bounded by the request timeout.
+    async fn call<T>(
+        &self,
+        operation: &'static str,
+        request: impl Future<Output = std::result::Result<T, affinidi_messaging_sdk::errors::ATMError>>,
+    ) -> Result<T> {
+        bounded(operation, self.request_timeout, request).await
+    }
+
     /// Whether the mediator serves the operations tasks: statistics, the queue
     /// ranking and queue status, message listing, reading, deleting and
     /// purging, and live traffic. Assumed to when its version is unknown;
     /// the mediator then answers for itself.
     pub fn serves_operations(&self) -> bool {
+        self.serves_since(OPERATIONS_SINCE)
+    }
+
+    /// Whether the mediator's release is `since` or later; assumed to be
+    /// when its version is unknown.
+    fn serves_since(&self, since: (u64, u64, u64)) -> bool {
         self.mediator_version
             .as_deref()
             .and_then(parse_version)
-            .is_none_or(|v| v >= OPERATIONS_SINCE)
+            .is_none_or(|v| v >= since)
     }
 
     /// Refuse locally, with the reason, a task this mediator is too old to
     /// serve. An older mediator doesn't answer such a request at all, so
     /// sending it would only wait out the reply timeout.
-    fn require_operations(&self, task: &'static str) -> Result<()> {
-        if self.serves_operations() {
+    fn require_release(&self, since: (u64, u64, u64), task: &'static str) -> Result<()> {
+        if self.serves_since(since) {
             return Ok(());
         }
-        let (major, minor, patch) = OPERATIONS_SINCE;
+        let (major, minor, patch) = since;
         Err(ConsoleError::Refused {
             code: "protocol.trust_task.unsupported".into(),
             current_epoch: None,
@@ -296,6 +440,10 @@ impl MediatorConsole {
                     .unwrap_or("unknown version")
             ),
         })
+    }
+
+    fn require_operations(&self, task: &'static str) -> Result<()> {
+        self.require_release(OPERATIONS_SINCE, task)
     }
 
     pub fn did(&self) -> &str {
@@ -323,11 +471,11 @@ impl MediatorConsole {
     /// — after an administrator changed its role or ACL, for example.
     pub async fn refresh(&mut self) -> Result<()> {
         self.account = self
-            .atm
-            .trust_tasks()
-            .account_get(&self.profile, None)
-            .await
-            .map_err(ConsoleError::from_call)?;
+            .call(
+                "messaging/account/get",
+                self.atm.trust_tasks().account_get(&self.profile, None),
+            )
+            .await?;
         (self.mode, self.capabilities) = classify(&self.account);
         Ok(())
     }
@@ -340,11 +488,25 @@ impl MediatorConsole {
         }
     }
 
+    fn require_root(&self, what: &'static str) -> Result<()> {
+        if self.capabilities.root {
+            Ok(())
+        } else {
+            Err(ConsoleError::NotPermitted(what))
+        }
+    }
+
+    /// Whether `target` names another account than the console's own.
+    fn is_other(&self, target: &Target) -> bool {
+        target.as_ref().is_some_and(|t| *t != self.did_hash)
+    }
+
     /// A target other than the console's own account needs admin standing.
     fn require_target(&self, target: &Target, what: &'static str) -> Result<()> {
-        match target {
-            Some(t) if *t != self.did_hash => self.require_admin(what),
-            _ => Ok(()),
+        if self.is_other(target) {
+            self.require_admin(what)
+        } else {
+            Ok(())
         }
     }
 
@@ -353,11 +515,11 @@ impl MediatorConsole {
     pub async fn stats(&self) -> Result<stats::show::v0_1::Response> {
         self.require_admin("mediator statistics")?;
         self.require_operations("messaging/stats/show")?;
-        self.atm
-            .trust_tasks()
-            .stats_show(&self.profile)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/stats/show",
+            self.atm.trust_tasks().stats_show(&self.profile),
+        )
+        .await
     }
 
     /// One page of this mediator's live mux connections (DID
@@ -370,11 +532,13 @@ impl MediatorConsole {
     ) -> Result<mux::connections::v0_1::Response> {
         self.require_admin("the mux connections")?;
         self.require_operations("messaging/mux/connections")?;
-        self.atm
-            .trust_tasks()
-            .mux_connections(&self.profile, &query)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/mux/connections",
+            self.atm
+                .trust_tasks()
+                .mux_connections(&self.profile, &query),
+        )
+        .await
     }
 
     /// One page of accounts ranked by the given queue and key.
@@ -387,31 +551,35 @@ impl MediatorConsole {
     ) -> Result<queue::list::v0_1::Response> {
         self.require_admin("the queue ranking")?;
         self.require_operations("messaging/queue/list")?;
-        self.atm
-            .trust_tasks()
-            .queue_list(&self.profile, queue, sort, None, cursor, limit)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/queue/list",
+            self.atm
+                .trust_tasks()
+                .queue_list(&self.profile, queue, sort, None, cursor, limit),
+        )
+        .await
     }
 
+    /// One page of every account on the mediator, with activity times and
+    /// lifetime counters where the mediator serves them.
     pub async fn accounts(
         &self,
         cursor: Option<String>,
         limit: Option<u32>,
     ) -> Result<account::list::v0_2::Response> {
         self.require_admin("the account list")?;
-        self.atm
-            .trust_tasks()
-            .account_list_detailed(
+        self.call(
+            "messaging/account/list",
+            self.atm.trust_tasks().account_list_detailed(
                 &self.profile,
                 cursor,
                 limit,
                 None,
                 self.serves_activity(),
                 self.serves_stats(),
-            )
-            .await
-            .map_err(ConsoleError::from_call)
+            ),
+        )
+        .await
     }
 
     /// Whether this mediator serves each account's last-received and
@@ -441,29 +609,32 @@ impl MediatorConsole {
             .is_some_and(|v| v >= STATS_SINCE)
     }
 
+    /// One page of the audit log, newest first. Pass the previous page's
+    /// `next_cursor` to continue.
+    ///
+    /// The log can be filtered by action, actor, outcome and time on the
+    /// wire, but the SDK's `audit_list` does not take those members yet, so
+    /// this lists everything.
     pub async fn audit(
         &self,
         cursor: Option<String>,
         page_size: Option<u32>,
     ) -> Result<audit::list::v0_2::Response> {
         self.require_admin("the audit log")?;
-        self.atm
-            .trust_tasks()
-            .audit_list(&self.profile, cursor, page_size)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "audit/list",
+            self.atm
+                .trust_tasks()
+                .audit_list(&self.profile, cursor, page_size),
+        )
+        .await
     }
 
     /// Whether this session can change the mediator's configuration:
     /// a rootAdmin, on a mediator that serves `config/patch` (or whose version
     /// is unknown, when the mediator answers for itself).
     pub fn can_patch_config(&self) -> bool {
-        self.capabilities.root
-            && self
-                .mediator_version
-                .as_deref()
-                .and_then(parse_version)
-                .is_none_or(|v| v >= CONFIG_PATCH_SINCE)
+        self.capabilities.root && self.serves_since(CONFIG_PATCH_SINCE)
     }
 
     /// Change mediator limits at runtime (`config/patch`, rootAdmin). Keys are
@@ -474,56 +645,165 @@ impl MediatorConsole {
     pub async fn patch_config(
         &self,
         overrides: serde_json::Map<String, Value>,
-    ) -> Result<affinidi_messaging_sdk::tasks::config::patch::v0_1::Response> {
-        if !self.capabilities.root {
-            return Err(ConsoleError::NotPermitted(
-                "changing the mediator's configuration needs a rootAdmin",
-            ));
-        }
-        if !self.can_patch_config() {
-            let (major, minor, patch) = CONFIG_PATCH_SINCE;
-            return Err(ConsoleError::Refused {
-                code: "protocol.trust_task.unsupported".into(),
-                current_epoch: None,
-                comment: format!(
-                    "this mediator ({}) does not serve config/patch: it needs \
-                     affinidi-messaging-mediator {major}.{minor}.{patch} or later",
-                    self.mediator_version
-                        .as_deref()
-                        .unwrap_or("unknown version")
-                ),
-            });
-        }
-        self.atm
-            .trust_tasks()
-            .config_patch(&self.profile, overrides)
-            .await
-            .map_err(ConsoleError::from_call)
+    ) -> Result<config::patch::v0_1::Response> {
+        self.require_root("changing the mediator's configuration needs a rootAdmin")?;
+        self.require_release(CONFIG_PATCH_SINCE, "config/patch")?;
+        self.call(
+            "config/patch",
+            self.atm
+                .trust_tasks()
+                .config_patch(&self.profile, overrides),
+        )
+        .await
     }
 
+    /// Re-read the mediator's limits from its configuration file and
+    /// environment, without a restart (`config/reload`, rootAdmin). Answers
+    /// which keys' running values changed; keys that apply only at a restart
+    /// are never among them.
+    pub async fn reload_config(&self) -> Result<config::reload::v0_1::Response> {
+        self.require_root("reloading the mediator's configuration needs a rootAdmin")?;
+        self.call(
+            "config/reload",
+            self.atm.trust_tasks().config_reload(&self.profile),
+        )
+        .await
+    }
+
+    /// The mediator's effective configuration, key by key.
     pub async fn config(&self) -> Result<config::show::v0_1::Response> {
         self.require_admin("the mediator configuration")?;
-        self.atm
-            .trust_tasks()
-            .config_show(&self.profile, None)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "config/show",
+            self.atm.trust_tasks().config_show(&self.profile, None),
+        )
+        .await
+    }
+
+    // ─── Accounts (administrators) ───────────────────────────────────────
+
+    /// Register account `did_hash` (`messaging/account/add`, administrators)
+    /// with `role` and, optionally, an ACL applied over the mediator's
+    /// default. Creating an admin or rootAdmin account needs a rootAdmin.
+    pub async fn add_account(
+        &self,
+        did_hash: String,
+        role: account::add::v0_2::AccountType,
+        acl: Option<account::add::v0_2::MediatorAcl>,
+    ) -> Result<account::add::v0_2::Account> {
+        use account::add::v0_2::AccountType;
+        self.require_admin("adding an account")?;
+        if matches!(role, AccountType::Admin | AccountType::RootAdmin) {
+            self.require_root("creating a privileged account needs a rootAdmin")?;
+        }
+        self.call(
+            "messaging/account/add",
+            self.atm
+                .trust_tasks()
+                .account_add(&self.profile, did_hash, role, acl),
+        )
+        .await
+    }
+
+    /// Remove an account (`messaging/account/remove`): `None` is the
+    /// console's own, which also ends this session's standing at the
+    /// mediator. Another account needs an administrator (and a privileged
+    /// one a rootAdmin); the mediator's own and rootAdmin accounts cannot be
+    /// removed. `true` when a record was removed.
+    pub async fn remove_account(&self, target: Target) -> Result<bool> {
+        self.require_target(&target, "removing another account")?;
+        self.call(
+            "messaging/account/remove",
+            self.atm.trust_tasks().account_remove(&self.profile, target),
+        )
+        .await
     }
 
     // ─── One account (self, or any for an administrator) ────────────────
 
     pub async fn account_of(&self, target: Target) -> Result<account::get::v0_2::Account> {
         self.require_target(&target, "another account")?;
-        self.atm
-            .trust_tasks()
-            .account_get_detailed(
+        self.call(
+            "messaging/account/get",
+            self.atm.trust_tasks().account_get_detailed(
                 &self.profile,
                 target,
                 self.serves_activity(),
                 self.serves_stats(),
-            )
-            .await
-            .map_err(ConsoleError::from_call)
+            ),
+        )
+        .await
+    }
+
+    /// The ACL of each of `did_hashes` (`messaging/acl/get`), and the ones
+    /// the mediator does not know. Any account but the console's own needs
+    /// an administrator.
+    pub async fn acls(&self, did_hashes: Vec<String>) -> Result<acl::get::v0_1::Response> {
+        if did_hashes.iter().any(|h| *h != self.did_hash) {
+            self.require_admin("another account's ACL")?;
+        }
+        if did_hashes.is_empty() {
+            return Err(ConsoleError::Invalid("name at least one account".into()));
+        }
+        self.call(
+            "messaging/acl/get",
+            self.atm.trust_tasks().acl_get(&self.profile, did_hashes),
+        )
+        .await
+    }
+
+    /// One page of an account's access list (`messaging/access-list/list`).
+    /// With `entries`, only those of them on the list come back: a
+    /// membership check. Pass the previous page's `next_cursor` to continue.
+    pub async fn access_list(
+        &self,
+        target: Target,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        entries: Option<Vec<String>>,
+    ) -> Result<access_list::list::v0_1::Response> {
+        self.require_target(&target, "another account's access list")?;
+        self.call(
+            "messaging/access-list/list",
+            self.atm
+                .trust_tasks()
+                .access_list_list(&self.profile, target, cursor, limit, entries),
+        )
+        .await
+    }
+
+    /// Change an account's access list (`messaging/access-list/update`):
+    /// `clear` it, then `add`, then `remove` entries (account hashes), in
+    /// that order, so `clear` with `add` replaces it. Answers what was added
+    /// and removed, and the new count. The console's own list needs
+    /// `selfManageList` (or an administrator); another account's, an
+    /// administrator.
+    pub async fn update_access_list(
+        &self,
+        target: Target,
+        clear: bool,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> Result<access_list::update::v0_1::Response> {
+        if self.is_other(&target) {
+            self.require_admin("another account's access list")?;
+        } else if !self.capabilities.mediator_wide && !self.capabilities.self_manage_list {
+            return Err(ConsoleError::NotPermitted(
+                "this account may not change its own access list (selfManageList is off)",
+            ));
+        }
+        if !clear && add.is_empty() && remove.is_empty() {
+            return Err(ConsoleError::Invalid(
+                "nothing to change: clear, add or remove entries".into(),
+            ));
+        }
+        self.call(
+            "messaging/access-list/update",
+            self.atm
+                .trust_tasks()
+                .access_list_update(&self.profile, target, clear, add, remove),
+        )
+        .await
     }
 
     /// Both queues of an account, live; `peers` adds the top counterparties.
@@ -534,11 +814,13 @@ impl MediatorConsole {
     ) -> Result<queue::status::v0_1::Response> {
         self.require_target(&target, "another account's queues")?;
         self.require_operations("messaging/queue/status")?;
-        self.atm
-            .trust_tasks()
-            .queue_status(&self.profile, target, peers)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/queue/status",
+            self.atm
+                .trust_tasks()
+                .queue_status(&self.profile, target, peers),
+        )
+        .await
     }
 
     /// One page of an account's queue: metadata only, oldest first.
@@ -552,31 +834,39 @@ impl MediatorConsole {
     ) -> Result<message::list::v0_1::Response> {
         self.require_target(&target, "another account's messages")?;
         self.require_operations("messaging/message/list")?;
-        self.atm
-            .trust_tasks()
-            .message_list(&self.profile, target, queue, peer, cursor, limit)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/message/list",
+            self.atm
+                .trust_tasks()
+                .message_list(&self.profile, target, queue, peer, cursor, limit),
+        )
+        .await
     }
 
     /// Fetch one stored message and, if this session can decrypt it, open it.
     /// Opening happens here, locally; the plaintext never goes back to the
     /// mediator.
     pub async fn inspect(&self, target: Target, msg_id: &str) -> Result<InspectedMessage> {
-        if target.as_ref().is_some_and(|t| *t != self.did_hash) && !self.capabilities.root {
+        if self.is_other(&target) && !self.capabilities.root {
             return Err(ConsoleError::NotPermitted(
                 "reading another account's message body needs a rootAdmin",
             ));
         }
         self.require_operations("messaging/message/get")?;
         let got = self
-            .atm
-            .trust_tasks()
-            .message_get(&self.profile, target, msg_id)
-            .await
-            .map_err(ConsoleError::from_call)?;
+            .call(
+                "messaging/message/get",
+                self.atm
+                    .trust_tasks()
+                    .message_get(&self.profile, target, msg_id),
+            )
+            .await?;
         let envelope = got.message.to_string();
-        let opened = self.atm.unpack(&envelope).await.ok();
+        // Unpacking can resolve DIDs; it is bounded like a request.
+        let opened = tokio::time::timeout(self.request_timeout, self.atm.unpack(&envelope))
+            .await
+            .ok()
+            .and_then(|r| r.ok());
         Ok(InspectedMessage {
             meta: got.meta,
             envelope,
@@ -584,6 +874,9 @@ impl MediatorConsole {
         })
     }
 
+    /// Delete stored messages by id, in one call. Unlike a purge there is no
+    /// preview: the ids name exactly what goes. Each id's answer says
+    /// whether it was deleted.
     pub async fn delete(
         &self,
         target: Target,
@@ -591,11 +884,13 @@ impl MediatorConsole {
     ) -> Result<message::delete::v0_1::Response> {
         self.require_target(&target, "another account's messages")?;
         self.require_operations("messaging/message/delete")?;
-        self.atm
-            .trust_tasks()
-            .message_delete(&self.profile, target, msg_ids)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/message/delete",
+            self.atm
+                .trust_tasks()
+                .message_delete(&self.profile, target, msg_ids),
+        )
+        .await
     }
 
     /// Count what a purge would remove, and return a plan to confirm.
@@ -643,22 +938,23 @@ impl MediatorConsole {
         dry_run: bool,
     ) -> Result<queue::purge::v0_1::Response> {
         self.require_operations("messaging/queue/purge")?;
-        self.atm
-            .trust_tasks()
-            .queue_purge(
+        self.call(
+            "messaging/queue/purge",
+            self.atm.trust_tasks().queue_purge(
                 &self.profile,
                 request.target.clone(),
                 request.queue,
                 request.peer.clone(),
                 request.older_than_seconds,
                 dry_run,
-            )
-            .await
-            .map_err(ConsoleError::from_call)
+            ),
+        )
+        .await
     }
 
     /// Apply a partial account update: role, capability flags, queue limits.
-    /// Omitted members are unchanged.
+    /// Omitted members are unchanged. A single call, with no preview: show
+    /// the user what changes before sending it.
     pub async fn update_account(
         &self,
         target: Target,
@@ -671,17 +967,17 @@ impl MediatorConsole {
             self.require_admin("changing a role")?;
             // Granting a privileged role is the mediator's rootAdmin-only rule;
             // checked here so the console can say so before the round trip.
-            if *role != account::update::v0_2::AccountType::Standard && !self.capabilities.root {
-                return Err(ConsoleError::NotPermitted(
-                    "granting a privileged role needs a rootAdmin",
-                ));
+            if *role != account::update::v0_2::AccountType::Standard {
+                self.require_root("granting a privileged role needs a rootAdmin")?;
             }
         }
-        self.atm
-            .trust_tasks()
-            .account_update(&self.profile, target, role, acl, limits)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/account/update",
+            self.atm
+                .trust_tasks()
+                .account_update(&self.profile, target, role, acl, limits),
+        )
+        .await
     }
 
     // ─── Live traffic ────────────────────────────────────────────────────
@@ -711,7 +1007,7 @@ impl MediatorConsole {
     ) -> Result<MonitorFeed> {
         self.require_operations("messaging/monitor/subscribe")?;
         if membership.is_some() {
-            self.require_mux_admin_release("mux membership events")?;
+            self.require_release(MUX_ADMIN_SINCE, "mux membership events")?;
         }
         self.live
             .open_feed(
@@ -720,38 +1016,97 @@ impl MediatorConsole {
                 filter,
                 membership,
                 self.serves_mux_admin(),
+                self.request_timeout,
             )
             .await
     }
 
+    // ─── An account's own mux grants ─────────────────────────────────────
+
+    /// Store grant statements (`messaging/mux/grant`), signed by the member
+    /// with the SDK's `protocols::mux::sign_grant`. Either party may send
+    /// them; each is accepted or refused on its own.
+    pub async fn mux_grant(&self, statements: Vec<Value>) -> Result<mux::grant::v0_1::Response> {
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/grant")?;
+        if statements.is_empty() {
+            return Err(ConsoleError::Invalid("no grant statements to store".into()));
+        }
+        self.call(
+            "messaging/mux/grant",
+            self.atm.trust_tasks().mux_grant(&self.profile, statements),
+        )
+        .await
+    }
+
+    /// One page of this account's own stored grants (`messaging/mux/list`):
+    /// those it holds as a principal, or with `as_member` those it gave, with
+    /// its current epoch.
+    pub async fn mux_own_grants(
+        &self,
+        as_member: bool,
+        cursor: Option<String>,
+        limit: Option<u64>,
+    ) -> Result<mux::list::v0_1::Response> {
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/list")?;
+        self.call(
+            "messaging/mux/list",
+            self.atm
+                .trust_tasks()
+                .mux_list(&self.profile, as_member, cursor, limit),
+        )
+        .await
+    }
+
+    /// Revoke this account's own grants (`messaging/mux/revoke`): as a
+    /// principal, `dids` are members to drop; with `as_member`, principals
+    /// to leave. `grant_ids` name grants directly either way.
+    pub async fn mux_revoke_own(
+        &self,
+        as_member: bool,
+        grant_ids: Vec<String>,
+        dids: Vec<String>,
+    ) -> Result<mux::revoke::v0_1::Response> {
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/revoke")?;
+        if grant_ids.is_empty() && dids.is_empty() {
+            return Err(ConsoleError::Invalid(
+                "name the grants or DIDs to revoke".into(),
+            ));
+        }
+        self.call(
+            "messaging/mux/revoke",
+            self.atm
+                .trust_tasks()
+                .mux_revoke(&self.profile, as_member, grant_ids, dids),
+        )
+        .await
+    }
+
+    /// Void every grant this account gave under an epoch
+    /// (`messaging/mux/revoke-all`), with a statement signed by the member
+    /// (the SDK's `protocols::mux::sign_revoke_all`). An administrator does
+    /// this without the member's signature with
+    /// [`mux_bump_epoch`](Self::mux_bump_epoch).
+    pub async fn mux_revoke_all_own(
+        &self,
+        statement: Value,
+    ) -> Result<mux::revoke_all::v0_1::Response> {
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/revoke-all")?;
+        self.call(
+            "messaging/mux/revoke-all",
+            self.atm
+                .trust_tasks()
+                .mux_revoke_all(&self.profile, statement),
+        )
+        .await
+    }
+
     // ─── Stored mux grants (administrators) ─────────────────────────────
 
-    /// Whether this mediator serves the stored-grant administration tasks
+    /// Whether this mediator serves DID multiplexing: the stored-grant tasks
     /// and monitor membership events. Assumed to when its version is
     /// unknown; the mediator then answers for itself.
     pub fn serves_mux_admin(&self) -> bool {
-        self.mediator_version
-            .as_deref()
-            .and_then(parse_version)
-            .is_none_or(|v| v >= MUX_ADMIN_SINCE)
-    }
-
-    fn require_mux_admin_release(&self, task: &'static str) -> Result<()> {
-        if self.serves_mux_admin() {
-            return Ok(());
-        }
-        let (major, minor, patch) = MUX_ADMIN_SINCE;
-        Err(ConsoleError::Refused {
-            code: "protocol.trust_task.unsupported".into(),
-            current_epoch: None,
-            comment: format!(
-                "this mediator ({}) does not serve {task}: it needs \
-                 affinidi-messaging-mediator {major}.{minor}.{patch} or later",
-                self.mediator_version
-                    .as_deref()
-                    .unwrap_or("unknown version")
-            ),
-        })
+        self.serves_since(MUX_ADMIN_SINCE)
     }
 
     /// One page of stored mux grants (`messaging/mux/admin-list`): those of
@@ -769,17 +1124,19 @@ impl MediatorConsole {
         limit: Option<u64>,
     ) -> Result<mux::admin_list::v0_1::Response> {
         self.require_admin("the stored mux grants")?;
-        self.require_mux_admin_release("messaging/mux/admin-list")?;
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/admin-list")?;
         if principal.is_none() && member.is_none() {
             return Err(ConsoleError::Invalid(
                 "name a principal DID, a member DID, or both".into(),
             ));
         }
-        self.atm
-            .trust_tasks()
-            .mux_admin_list(&self.profile, principal, member, cursor, limit)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.call(
+            "messaging/mux/admin-list",
+            self.atm
+                .trust_tasks()
+                .mux_admin_list(&self.profile, principal, member, cursor, limit),
+        )
+        .await
     }
 
     /// A member DID's current mux epoch: the one
@@ -801,29 +1158,33 @@ impl MediatorConsole {
     /// stopped; [`revoke_summary`](crate::revoke_summary) puts that in a
     /// sentence. A refusal of the first request, with nothing revoked, is the
     /// error — `…:protectedAccount` when a party is a root administrator and
-    /// this session is not one.
+    /// this session is not one. The rounds together are bounded by
+    /// [`MUX_REVOKE_MAX_ROUNDS`] request timeouts.
     pub async fn mux_revoke(&self, selection: &GrantSelection) -> Result<MuxAdminRevokeOutcome> {
         self.require_admin("revoking stored mux grants")?;
-        self.require_mux_admin_release("messaging/mux/admin-revoke")?;
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/admin-revoke")?;
         selection.check()?;
-        self.atm
-            .trust_tasks()
-            .mux_admin_revoke_until_done(
+        bounded(
+            "messaging/mux/admin-revoke",
+            self.request_timeout
+                .saturating_mul(MUX_REVOKE_MAX_ROUNDS as u32),
+            self.atm.trust_tasks().mux_admin_revoke_until_done(
                 &self.profile,
                 selection.principal.as_deref(),
                 selection.member.as_deref(),
                 &selection.grant_ids,
                 None,
                 MUX_REVOKE_MAX_ROUNDS,
-            )
-            .await
-            .map_err(ConsoleError::from_call)
+            ),
+        )
+        .await
     }
 
     /// Revoke each of `grants`, one `admin-revoke` request per grant, and
     /// say what happened to each: revoked, no longer stored, refused (a
     /// rootAdmin party's grant is `…:protectedAccount`), or unconfirmed when
-    /// a request was lost in transit — after which the rest are not sent.
+    /// a request was lost in transit or timed out — after which the rest are
+    /// not sent.
     ///
     /// One request per grant because the mediator refuses a whole request
     /// when any grant it selects is protected; asked one at a time, every
@@ -831,7 +1192,7 @@ impl MediatorConsole {
     /// grant is reported revoked only when the mediator's answer lists it.
     pub async fn mux_revoke_each(&self, grants: &[GrantKey]) -> Result<BulkRevokeOutcome> {
         self.require_admin("revoking stored mux grants")?;
-        self.require_mux_admin_release("messaging/mux/admin-revoke")?;
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/admin-revoke")?;
         let mut outcome = BulkRevokeOutcome::default();
         let mut lost = false;
         for key in grants {
@@ -875,12 +1236,14 @@ impl MediatorConsole {
         epoch: u64,
     ) -> Result<mux::admin_revoke_all::v0_1::Response> {
         self.require_admin("advancing a member's mux epoch")?;
-        self.require_mux_admin_release("messaging/mux/admin-revoke-all")?;
-        self.atm
-            .trust_tasks()
-            .mux_admin_revoke_all(&self.profile, did, epoch)
-            .await
-            .map_err(ConsoleError::from_call)
+        self.require_release(MUX_ADMIN_SINCE, "messaging/mux/admin-revoke-all")?;
+        self.call(
+            "messaging/mux/admin-revoke-all",
+            self.atm
+                .trust_tasks()
+                .mux_admin_revoke_all(&self.profile, did, epoch),
+        )
+        .await
     }
 
     /// The SDK instance, for an embedding application.
@@ -899,28 +1262,46 @@ impl Drop for MediatorConsole {
     }
 }
 
+/// Run a connection, bounded by `after`.
+async fn bounded_connect<T>(
+    after: Duration,
+    connect: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(after, connect).await {
+        Ok(result) => result,
+        Err(_) => Err(ConsoleError::Timeout {
+            operation: "connecting to the mediator",
+            after,
+        }),
+    }
+}
+
 /// Mode and capabilities from the mediator's record of the account.
 fn classify(account: &account::get::v0_2::Account) -> (Mode, Capabilities) {
-    let role = serde_json::to_value(account.account_type).unwrap_or(Value::Null);
-    let role = role.as_str().unwrap_or("standard");
-    let admin = matches!(role, "admin" | "rootAdmin");
-    let root = role == "rootAdmin";
-    let acl = serde_json::to_value(&account.acl).unwrap_or(Value::Null);
-    let flag = |k: &str| acl.get(k).and_then(Value::as_bool).unwrap_or(false);
+    use account::get::v0_2::AccountType;
+    let (admin, root) = match account.account_type {
+        AccountType::RootAdmin => (true, true),
+        AccountType::Admin => (true, false),
+        // `standard`, `mediator`, and any role this console doesn't know:
+        // never more than self-service.
+        _ => (false, false),
+    };
     let mode = if admin {
         Mode::Admin { root }
     } else {
         Mode::SelfService
     };
+    let acl = &account.acl;
+    let on = |flag: Option<bool>| flag.unwrap_or(false);
     (
         mode,
         Capabilities {
             mediator_wide: admin,
             root,
-            local: flag("local"),
-            self_manage_list: flag("selfManageList"),
-            self_manage_send_limit: flag("selfManageSendQueueLimit"),
-            self_manage_receive_limit: flag("selfManageReceiveQueueLimit"),
+            local: on(acl.local),
+            self_manage_list: on(acl.self_manage_list),
+            self_manage_send_limit: on(acl.self_manage_send_queue_limit),
+            self_manage_receive_limit: on(acl.self_manage_receive_queue_limit),
         },
     )
 }
@@ -956,16 +1337,16 @@ fn mediator_did_in(uri: &str) -> Option<String> {
 async fn probe_version(atm: &ATM, profile: &ATMProfile) -> Option<String> {
     let base = profile.get_mediator_rest_endpoint()?;
     let url = format!("{}/readyz", base.trim_end_matches('/'));
-    let response = atm
-        .get_tdk()
-        .client()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
+    let probe = async {
+        let response = atm.get_tdk().client().get(&url).send().await.ok()?;
+        let body: Value = response.json().await.ok()?;
+        body["version"].as_str().map(str::to_string)
+    };
+    // Headers and body together, not just until the headers arrive.
+    tokio::time::timeout(Duration::from_secs(5), probe)
         .await
-        .ok()?;
-    let body: Value = response.json().await.ok()?;
-    body["version"].as_str().map(str::to_string)
+        .ok()
+        .flatten()
 }
 
 /// `major.minor.patch`, ignoring any pre-release or build suffix.
@@ -1026,5 +1407,58 @@ mod tests {
         let (mode, caps) = classify(&account("rootAdmin", serde_json::json!({})));
         assert_eq!(mode, Mode::Admin { root: true });
         assert!(caps.mediator_wide && caps.root);
+        // The mediator's own account administers nothing through a console.
+        assert_eq!(
+            classify(&account("mediator", serde_json::json!({}))).0,
+            Mode::SelfService
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_hangs_times_out() {
+        let hang = std::future::pending::<Result<()>>();
+        let e = bounded_connect(Duration::from_millis(10), hang)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ConsoleError::Timeout { .. }), "{e:?}");
+        assert!(e.is_transient());
+        let options = ConsoleOptions::default()
+            .with_connect_timeout(Duration::from_secs(3))
+            .with_request_timeout(Duration::from_secs(4));
+        assert_eq!(options.connect_timeout, Duration::from_secs(3));
+        assert_eq!(options.request_timeout, Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_hangs_times_out_naming_its_task() {
+        let hang = std::future::pending::<
+            std::result::Result<(), affinidi_messaging_sdk::errors::ATMError>,
+        >();
+        let e = bounded("audit/list", Duration::from_millis(10), hang)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConsoleError::Timeout {
+                    operation: "audit/list",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        let slow = crate::with_deadline("stats", Duration::from_millis(10), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            slow,
+            ConsoleError::Timeout {
+                operation: "stats",
+                ..
+            }
+        ));
     }
 }

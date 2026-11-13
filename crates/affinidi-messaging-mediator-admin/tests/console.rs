@@ -283,4 +283,97 @@ async fn a_root_admin_changes_a_limit_and_an_admin_is_told_it_cannot() {
         console.patch_config(overrides).await,
         Err(ConsoleError::NotPermitted(_))
     ));
+    assert!(matches!(
+        console.reload_config().await,
+        Err(ConsoleError::NotPermitted(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_adds_and_removes_accounts_and_edits_an_access_list() {
+    use specs::account::add::v0_2::AccountType as NewRole;
+
+    let env = env().await;
+    let alice = env.add_user("alice").await.expect("alice");
+    let bob = env.add_user("bob").await.expect("bob");
+    let op = env.add_user("operator").await.expect("operator");
+    promote(&env, &op, AccountType::Admin).await;
+
+    let console = MediatorConsole::connect(identity(&env, &op))
+        .await
+        .expect("operator connects");
+
+    // An account the mediator has not seen: added, read, removed.
+    let stranger = affinidi_messaging_mediator_admin::account_hash("did:example:stranger");
+    let added = console
+        .add_account(stranger.clone(), NewRole::Standard, None)
+        .await
+        .expect("add an account");
+    assert_eq!(added.did.as_str(), stranger);
+    // Only a rootAdmin may create a privileged one: refused before sending.
+    assert!(matches!(
+        console
+            .add_account(stranger.clone(), NewRole::Admin, None)
+            .await,
+        Err(ConsoleError::NotPermitted(_))
+    ));
+    let acls = console
+        .acls(vec![stranger.clone(), alice.did_hash()])
+        .await
+        .expect("acl/get");
+    assert_eq!(acls.entries.len(), 2, "{acls:?}");
+    assert!(
+        console
+            .remove_account(Some(stranger.clone()))
+            .await
+            .expect("remove")
+    );
+
+    // Bob's access list: alice added, listed, checked, removed.
+    let target = Some(bob.did_hash());
+    let changed = console
+        .update_access_list(target.clone(), false, vec![alice.did_hash()], vec![])
+        .await
+        .expect("access-list/update");
+    assert_eq!(changed.access_list_count, 1);
+    let listed = console
+        .access_list(target.clone(), None, Some(10), None)
+        .await
+        .expect("access-list/list");
+    assert_eq!(listed.entries.len(), 1);
+    assert_eq!(listed.entries[0].as_str(), alice.did_hash());
+    let member = console
+        .access_list(target.clone(), None, None, Some(vec![op.did_hash()]))
+        .await
+        .expect("membership check");
+    assert!(member.entries.is_empty(), "the operator is not on it");
+    let changed = console
+        .update_access_list(target, false, vec![], vec![alice.did_hash()])
+        .await
+        .expect("remove the entry");
+    assert_eq!(changed.access_list_count, 0);
+
+    // A standard account can't touch another account's list, and one that
+    // may not manage its own is told so without a round trip.
+    let bob_console = MediatorConsole::connect(identity(&env, &bob))
+        .await
+        .expect("bob connects");
+    assert!(matches!(
+        bob_console
+            .access_list(Some(alice.did_hash()), None, None, None)
+            .await,
+        Err(ConsoleError::NotPermitted(_))
+    ));
+    if !bob_console.capabilities().self_manage_list {
+        assert!(matches!(
+            bob_console
+                .update_access_list(None, false, vec![alice.did_hash()], vec![])
+                .await,
+            Err(ConsoleError::NotPermitted(_))
+        ));
+    }
+    bob_console
+        .access_list(None, None, None, None)
+        .await
+        .expect("bob reads his own list");
 }

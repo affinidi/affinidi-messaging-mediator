@@ -448,7 +448,7 @@ mod tests {
                 (GrantKey::new("did:m1", "g3"), GrantRevokeResult::NotStored),
                 (
                     GrantKey::new("did:m2", "g4"),
-                    GrantRevokeResult::Unconfirmed(ConsoleError::Connect("gone".into())),
+                    GrantRevokeResult::Unconfirmed(ConsoleError::connect("sending", "gone")),
                 ),
                 (
                     GrantKey::new("did:m2", "g5"),
