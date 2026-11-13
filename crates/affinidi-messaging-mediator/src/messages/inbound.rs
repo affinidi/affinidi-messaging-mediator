@@ -608,7 +608,7 @@ async fn dispatch_tsp_trust_task(
         }
         Err(e) => {
             let document = match &refusing {
-                Some(r) => r.document(&e, sender_vid, state).await,
+                Some(r) => r.document(&e, session, sender_vid, state).await,
                 None => None,
             };
             match document {

@@ -33,6 +33,7 @@ use trust_tasks_rs::{ErrorPayload, StandardCode, TrustTask, TrustTaskCode};
 use uuid::Uuid;
 
 use crate::SharedData;
+use crate::common::session::Session;
 use crate::messages::protocols::trust_task_sign;
 
 /// Top-level request member asking for refusals as `trust-task-error`
@@ -80,12 +81,24 @@ impl Refusing {
     /// `None` when `e` has no form here, or the document could not be built
     /// or signed: the request is then refused as before, with `e`, so a
     /// refusal is never lost to its own encoding.
+    ///
+    /// `None` too, so the request is refused with a problem report on the
+    /// connection, unless `session` is an authenticated session of
+    /// `sender_did`: the one case in which the request could have succeeded.
+    /// A document costs a signature and a stored message, as a response does;
+    /// a sender that could never get a response (a relay-only session, or a
+    /// TSP frame signed by another DID than the session's) must not be able
+    /// to make the mediator sign and store anything.
     pub(crate) async fn document(
         &self,
         e: &MediatorError,
+        session: &Session,
         sender_did: &str,
         state: &SharedData,
     ) -> Option<Value> {
+        if crate::common::authz::require_session_sender(session, Some(sender_did), None).is_err() {
+            return None;
+        }
         let payload = error_payload(e)?;
         let code = payload.code.to_string();
         let mut doc = self.request.reject_with_recipient(

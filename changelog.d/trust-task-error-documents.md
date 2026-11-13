@@ -27,6 +27,11 @@
 - An internal or storage failure is `internalError` or `unavailable` with a
   generic message. Its text stays in the log, as it does for an HTTP client.
   An `identityMismatch` names neither identity (SPEC §8.1).
+- A document goes only to a request whose sender is the session's
+  authenticated account, the one case in which it could have been answered.
+  A relay-only session, or a TSP frame signed by another DID than the
+  session's, is refused with a problem report as before. Nothing is signed
+  or stored for it.
 - The refusal of `messaging/mux/ack` is pushed to the connection only, never
   stored, like its answer. It says no more than the problem report did, so an
   ack still does not confirm that another DID's message exists.

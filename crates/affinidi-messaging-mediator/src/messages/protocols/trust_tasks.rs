@@ -164,7 +164,7 @@ pub(crate) async fn process(
         // identity_mismatch with no transport sender → emit nothing.
         Ok(None) => return Ok(ProcessMessageResponse::default()),
         Err(e) => match &refusing {
-            Some(r) => match r.document(&e, &sender_did, state).await {
+            Some(r) => match r.document(&e, session, &sender_did, state).await {
                 Some(doc) => doc,
                 None => return Err(e),
             },

@@ -359,3 +359,76 @@ async fn over_tsp_a_refusal_is_sealed_back_as_a_trust_task_error() {
         "{body:#}"
     );
 }
+
+/// A request the session could never have had answered — a TSP frame signed
+/// by another DID than the session's — is refused with a problem report on
+/// the connection, never with a signed document stored for its signer.
+#[cfg(feature = "tsp")]
+#[tokio::test]
+async fn a_sender_that_is_not_the_session_gets_no_document() {
+    use affinidi_messaging_sdk::protocols::tsp::RelationshipState;
+
+    init_tracing();
+    let mediator = TestMediator::builder()
+        .local_direct_delivery(true, false)
+        // So the frame reaches the Trust Task pipeline rather than the
+        // earlier session check.
+        .force_session_did_match(false)
+        .spawn()
+        .await
+        .expect("spawn mediator");
+    let env = TestEnvironment::new(mediator).await.expect("env");
+    let alice = env.add_user("alice").await.expect("add alice");
+    let bob = env.add_user("bob").await.expect("add bob");
+    let mediator_vid = env.mediator.did().to_string();
+    for user in [&alice, &bob] {
+        for (ours, theirs) in [(&user.did, &mediator_vid), (&mediator_vid, &user.did)] {
+            env.relationship_store
+                .set(ours, theirs, RelationshipState::Bidirectional)
+                .await
+                .expect("seed the relationship with the mediator");
+        }
+    }
+
+    // Bob's request, signed and sealed by bob, posted on alice's session.
+    let doc = request(
+        &env,
+        &bob,
+        "https://trusttasks.org/spec/messaging/account/get/0.1",
+        json!({}),
+        true,
+    )
+    .await;
+    let frame = env
+        .atm
+        .tsp()
+        .pack(
+            &bob.profile,
+            &mediator_vid,
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("pack as bob");
+    let sent = env.atm.tsp().send_raw(&alice.profile, &frame).await;
+    assert!(sent.is_err(), "refused on the connection: {sent:?}");
+
+    // Nothing was signed and stored for bob.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let inbox = env
+        .atm
+        .fetch_messages(
+            &bob.profile,
+            &FetchOptions {
+                limit: 10,
+                start_id: None,
+                delete_policy: FetchDeletePolicy::DoNotDelete,
+            },
+        )
+        .await
+        .expect("fetch");
+    assert!(
+        inbox.success.is_empty(),
+        "nothing stored: {:?}",
+        inbox.success
+    );
+}
