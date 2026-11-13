@@ -28,12 +28,135 @@ publish = true
 rust-version = "1.95.0"
 
 [workspace.dependencies]
+# Every third-party dependency that two or more members use, so a version moves
+# in one place. Members inherit with `<dep>.workspace = true` (or `{ workspace =
+# true, features = [...] }`) and add their own features: features listed here
+# apply to every member, so they are kept to the ones every member needs.
+#
+# Where an entry says `default-features = false`, a member that wants the
+# defaults lists `"default"` in its own `features`: a member cannot turn
+# default features back on with its own `default-features` key.
+#
+# Workspace members are NOT listed here. Their `{ version = "X.Y.Z", path = ... }`
+# requirements stay in each manifest, where scripts/release_lib.py moves them in
+# lockstep.
+
+# ── Affinidi TDK / VTI ───────────────────────────────────────────────────
+# Each minimum is the highest any member needed; the member manifests say why
+# where it matters (e.g. affinidi-messaging-sdk's 0.46.3).
+affinidi-crypto = "0.2"
+affinidi-data-integrity = "0.8"
+affinidi-did-common = "0.4.4"
+affinidi-did-resolver-cache-sdk = "0.8.47"
+affinidi-messaging-didcomm = "0.15.9"
+affinidi-messaging-didcomm-v1 = "0.2"
+affinidi-messaging-sdk = "0.46.3"
+affinidi-secrets-resolver = "0.5"
+affinidi-tdk = { version = "0.43.0", default-features = false }
+affinidi-tdk-common = "0.7"
+affinidi-tsp = "0.3"
+didwebvh-rs = "0.8.1"
+trust-tasks-proof = { version = "0.38.0", default-features = false }
+trust-tasks-rs = { version = "0.38.0", default-features = false }
+vta-sdk = "0.77"
+
+# ── AWS SDK ──────────────────────────────────────────────────────────────
+aws-config = "1.13"
+# Every aws-sdk-* crate is `default-features = false` + the default set MINUS
+# `rustls`. The aws-sdk crates ship BOTH TLS stacks in their defaults:
+#   rustls               -> aws-smithy-runtime/tls-rustls
+#                        -> aws-smithy-http-client/legacy-rustls-ring
+#                        -> rustls 0.21 + rustls-webpki 0.101.7
+#   default-https-client -> aws-smithy-http-client/rustls-aws-lc
+#                        -> rustls 0.23 + rustls-webpki 0.103.13
+# The legacy stack is pure back-compat and drags three rustls-webpki
+# advisories in with it: RUSTSEC-2026-0098 / -0099 (name-constraint
+# bypasses) and RUSTSEC-2026-0104 (reachable panic in CRL parsing).
+# Dropping `rustls` leaves the aws-lc-rs stack, which is the provider
+# this workspace prefers anyway.
+#
+# aws-sdk-s3 is also minus `sigv4a`: SigV4a signing exists for S3 Multi-Region
+# Access Points, and every `s3://` target here is a plain bucket and key. It
+# pulls p256 0.13 / crypto-bigint 0.5.5, which carries RUSTSEC-2026-0387
+# (secret-dependent timing) with no 0.5.x fix.
+#
+# Re-read this before adding a feature to any of them in a member manifest.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+
+# ── Web, HTTP, TLS ───────────────────────────────────────────────────────
+axum = "0.8"
+# Must match vta-sdk's reqwest major so `&Client` types line up.
+reqwest = { version = "0.13", default-features = false }
+ring = { version = "0.17", features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tokio-tungstenite = { version = "0.30", default-features = false }
+
+# ── Storage ──────────────────────────────────────────────────────────────
+## Redis 7.1+ server required.
+redis = "1.2"
+
+# ── TUI ──────────────────────────────────────────────────────────────────
+# ratatui and crossterm move together: crossterm must be the version ratatui
+# uses, and every ratatui consumer (wizard, console) moves at once.
+crossterm = "0.29"
+ratatui = "0.30"
+
+# ── Async runtime ────────────────────────────────────────────────────────
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false }
 tokio = "1"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+
+# ── Serialization and encoding ───────────────────────────────────────────
+base64 = "0.23"
+serde = "1"
+serde_json = "1"
+sha256 = "1"
+toml = "1"
+
+# ── Observability ────────────────────────────────────────────────────────
+metrics = "0.24"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false }
+
+# ── Utilities ────────────────────────────────────────────────────────────
+ahash = "0.8"
+chrono = { version = "0.4", default-features = false }
+clap = "4"
+humantime = "2"
+ipnet = "2"
+itertools = "0.15"
+num-format = "0.4"
+rand = "0.10"
+semver = "1"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+url = "2"
+uuid = "1"
+zeroize = "1"
 
 [profile.release]
-# Tell `rustc` to optimize for small code size.
-opt-level = "s"
-lto = true
+# Throughput over size: the mediator's hot paths are pure-Rust crypto, JSON and
+# base64, which want inlining and vectorisation (opt-level = 3), not the
+# size-tuned "s". Thin LTO with a single codegen unit gets most of fat LTO's
+# cross-crate inlining at a fraction of its peak memory, which is what pushed
+# the image build into swap. Symbols are stripped; panics still name file and
+# line. Cargo reads this profile only for builds of THIS workspace — see
+# "Release profile" in README.md for `cargo install` users.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.lints.rust]
+# CONTRIBUTING.md: no `unsafe` in production code without a sign-off. Every
+# existing site carries `#[allow(unsafe_code)]` and a `// SAFETY:` comment; a
+# new one fails the build until it gets both.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 uninlined_format_args = "warn"

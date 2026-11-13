@@ -38,17 +38,17 @@ path = "src/forwarding/main.rs"
 affinidi-messaging-mediator-common = { version = "0.52.0", path = "../affinidi-messaging-mediator-common", features = ["redis-backend"] }
 
 # ── CLI ──────────────────────────────────────────────────────────────────
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 
 # ── Serialization (config TOML parsing only) ─────────────────────────────
-serde = { version = "1", features = ["derive"] }
-sha256 = "1"
-toml = "1"
+serde = { workspace = true, features = ["derive"] }
+sha256.workspace = true
+toml.workspace = true
 
 # ── Async runtime + observability ────────────────────────────────────────
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tracing = { version = "0.1", features = ["valuable"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = { workspace = true, features = ["valuable"] }
+tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt"] }
 
 [lints]
 workspace = true

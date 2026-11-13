@@ -143,22 +143,22 @@ trust-tasks-build = "0.1.2"
 # dry-run guard cannot tell from "this crate uses an API that does not exist".
 # Naming the version turns it into an unmet requirement the guard recognises as
 # waiting on a sibling this release publishes, which is what it is.
-affinidi-messaging-sdk = "0.46.3"
+affinidi-messaging-sdk.workspace = true
 ## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
-affinidi-messaging-didcomm = { version = "0.15.9", optional = true }
+affinidi-messaging-didcomm = { workspace = true, optional = true }
 ## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
-affinidi-messaging-didcomm-v1 = { version = "0.2", optional = true }
+affinidi-messaging-didcomm-v1 = { workspace = true, optional = true }
 ## Trust Tasks runtime — consumes Trust Task documents carried over the binding
 ## envelope. The task types are generated at build time from trust-tasks.lock
 ## (see build.rs and `crate::task_specs`), so no prebuilt spec module is compiled.
-trust-tasks-rs = { version = "0.38.0", default-features = false, optional = true }
+trust-tasks-rs = { workspace = true, optional = true }
 # Verifies Trust Task proofs (eddsa-jcs-2022) before any handler runs.
-trust-tasks-proof = { version = "0.38.0", default-features = false, features = ["affinidi"], optional = true }
-affinidi-data-integrity = { version = "0.8", optional = true }
+trust-tasks-proof = { workspace = true, optional = true, features = ["affinidi"] }
+affinidi-data-integrity = { workspace = true, optional = true }
 ## Optional: JOSE key-agreement types for the didcomm compat layer (#327)
-affinidi-crypto = { version = "0.2", features = ["jose"], optional = true }
+affinidi-crypto = { workspace = true, optional = true, features = ["jose"] }
 ## Optional: Trust Spanning Protocol (activated by `tsp` feature)
-affinidi-tsp = { version = "0.3", optional = true }
+affinidi-tsp = { workspace = true, optional = true }
 ## Multibase/multicodec encoding helpers (needed by didcomm for key encoding)
 affinidi-encoding = { version = "0.1", optional = true }
 ## Shared types: DatabaseHandler, errors, config structs, secret storage.
@@ -184,18 +184,18 @@ affinidi-messaging-mediator-common = { version = "0.52.0", path = "affinidi-mess
 # lockstep with that crate's own version.
 affinidi-messaging-mediator-config = { version = "0.52.0", path = "affinidi-messaging-mediator-config" }
 ## Humantime for the VTA cache TTL (`[secrets].cache_ttl = "30d"`).
-humantime = "2"
+humantime.workspace = true
 ## CLI parsing for the mediator binary's subcommands (`mediator`,
 ## `mediator rotate-admin`, …). Added in Phase I — pre-Phase-I builds
 ## had no subcommand surface so `main.rs` skipped clap.
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 ## DID resolution with in-memory cache (capacity: 1000 DIDs, TTL: 300s).
 ## `did-webs` (0.8.47): a did:webs client or recipient resolves when its KERI
 ## key event log verifies, under the same host policy as did:web and
 ## did:webvh. 0.8.47 does not turn on serde_json's `preserve_order`.
-affinidi-did-resolver-cache-sdk = { version = "0.8.47", features = ["network", "did-webs"] }
-affinidi-did-common = "0.4.4"
-affinidi-secrets-resolver = "0.5"
+affinidi-did-resolver-cache-sdk = { workspace = true, features = ["network", "did-webs"] }
+affinidi-did-common.workspace = true
+affinidi-secrets-resolver.workspace = true
 ## Shared background-task supervision (restart-on-failure + health registry)
 affinidi-task-utils = "0.1"
 ## VTA SDK for centralized DID/key management via Verifiable Trust Agent.
@@ -209,12 +209,10 @@ affinidi-task-utils = "0.1"
 ## a second `trust-tasks-rs` (0.2.57, from vta-sdk 0.21.6) in this workspace's
 ## lockfile long after everything else had moved to 0.9. A bounded range is a
 ## tax that comes due silently; prefer a caret and move it deliberately.
-vta-sdk = { version = "0.77", features = [
-  "integration",
-], optional = true }
+vta-sdk = { workspace = true, features = ["integration"], optional = true }
 
 # ── Web Framework ────────────────────────────────────────────────────────
-axum = { version = "0.8", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
 ## TLS termination for direct HTTPS (alternative: use a reverse proxy)
 axum-server = { version = "0.8", features = ["tls-rustls"] }
@@ -225,7 +223,7 @@ tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
 # ── Database (Redis) ─────────────────────────────────────────────────────
 ## Redis 7.1+ required. Uses multiplexed connection (not pool).
 ## TLS: use `rediss://` URL scheme. Auth: `redis://:password@host/`.
-redis = { version = "1.2", features = [
+redis = { workspace = true, features = [
   "tokio-rustls-comp",       # TLS via rustls (for rediss:// URLs)
   "tls-rustls-insecure",     # Allow self-signed certs (dev only, controlled by config)
   "connection-manager",      # Auto-reconnecting multiplexed connection
@@ -240,74 +238,47 @@ redis = { version = "1.2", features = [
 fjall = { version = "3.1", optional = true }
 
 # ── DID Infrastructure ───────────────────────────────────────────────────
-didwebvh-rs = "0.8.1"
+didwebvh-rs.workspace = true
 
 # ── AWS Integration (optional, behind `aws` feature) ────────────────────
 ## Used for Secrets Manager (aws_secrets://), Parameter Store (aws_parameter_store://)
 ## To build without: --no-default-features --features didcomm
-aws-config = { version = "1.13", optional = true }
+aws-config = { workspace = true, optional = true }
 
-# `default-features = false` + the default set MINUS `rustls`.
-# The aws-sdk crates ship BOTH TLS stacks in their defaults:
-#   rustls               -> aws-smithy-runtime/tls-rustls
-#                        -> aws-smithy-http-client/legacy-rustls-ring
-#                        -> rustls 0.21 + rustls-webpki 0.101.7
-#   default-https-client -> aws-smithy-http-client/rustls-aws-lc
-#                        -> rustls 0.23 + rustls-webpki 0.103.13
-# The legacy stack is pure back-compat and drags three rustls-webpki
-# advisories in with it: RUSTSEC-2026-0098 / -0099 (name-constraint
-# bypasses) and RUSTSEC-2026-0104 (reachable panic in CRL parsing).
-# Dropping `rustls` leaves the aws-lc-rs stack, which is the provider
-# this workspace prefers anyway.
-aws-sdk-ssm = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
-# `default-features = false` + the default set MINUS `rustls`.
-# The aws-sdk crates ship BOTH TLS stacks in their defaults:
-#   rustls               -> aws-smithy-runtime/tls-rustls
-#                        -> aws-smithy-http-client/legacy-rustls-ring
-#                        -> rustls 0.21 + rustls-webpki 0.101.7
-#   default-https-client -> aws-smithy-http-client/rustls-aws-lc
-#                        -> rustls 0.23 + rustls-webpki 0.103.13
-# The legacy stack is pure back-compat and drags three rustls-webpki
-# advisories in with it: RUSTSEC-2026-0098 / -0099 (name-constraint
-# bypasses) and RUSTSEC-2026-0104 (reachable panic in CRL parsing).
-# Dropping `rustls` leaves the aws-lc-rs stack, which is the provider
-# this workspace prefers anyway.
-#
-# Also minus `sigv4a`: SigV4a signing exists for S3 Multi-Region Access
-# Points, and an `s3://` target is a plain bucket and key (`parse_s3_target`).
-# It pulls p256 0.13 / crypto-bigint 0.5.5, which carries RUSTSEC-2026-0387
-# (secret-dependent timing) with no 0.5.x fix.
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
+# TLS-stack feature set: see the aws-sdk-* comment in the root Cargo.toml.
+aws-sdk-ssm = { workspace = true, optional = true }
+# TLS-stack feature set: see the aws-sdk-* comment in the root Cargo.toml.
+aws-sdk-s3 = { workspace = true, optional = true }
 
 # ── Cryptography & Security ─────────────────────────────────────────────
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
-ring = { version = "0.17", features = ["std"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12"] }
+ring.workspace = true
+rustls.workspace = true
 ## Constant-time comparison for DID authorization checks
-subtle = "2"
+subtle.workspace = true
 
 # ── Serialization & Encoding ────────────────────────────────────────────
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-base64 = "0.23"
-toml = "1"
-sha256 = "1"
-url = "2"
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+base64.workspace = true
+toml.workspace = true
+sha256.workspace = true
+url.workspace = true
 
 # ── Async Runtime ────────────────────────────────────────────────────────
 tokio = { workspace = true, features = ["full"] }
-tokio-stream = "0.1"
-tokio-util = "0.7"
+tokio-stream.workspace = true
+tokio-util.workspace = true
 async-convert = "1"
-async-trait = "0.1"
-futures-util = "0.3"
+async-trait.workspace = true
+futures-util = { workspace = true, features = ["default"] }
 
 # ── Observability ────────────────────────────────────────────────────────
 ## Prometheus metrics via /metrics endpoint
-metrics = "0.24"
+metrics.workspace = true
 metrics-exporter-prometheus = "0.18"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt", "json"] }
 
 # ── Rate Limiting & Resilience ───────────────────────────────────────────
 ## Per-IP and per-DID rate limiting (in-memory, not distributed)
@@ -315,23 +286,23 @@ affinidi-rate-limit = "0.1.4"
 governor = "0.10"
 
 # ── HTTP Client (for forwarding to remote mediators) ─────────────────────
-reqwest = { version = "0.13", features = ["rustls", "json"] }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["default", "rustls", "json"] }
+tokio-tungstenite = { workspace = true, features = ["default", "rustls-tls-native-roots"] }
 
 # ── Utilities ────────────────────────────────────────────────────────────
-ahash = { version = "0.8", features = ["serde"] }
+ahash = { workspace = true, features = ["serde"] }
 ## Lock-free concurrent set for the streaming task's in-flight redelivery
 ## guard (no poison-on-panic, unlike std::sync::Mutex). Already compiled in
 ## the tree via `governor`.
 dashmap = "6.2"
-chrono = "0.4"
+chrono = { workspace = true, features = ["default"] }
 hostname = "0.4"
-itertools = "0.15"
-num-format = "0.4"
-rand = "0.10"
+itertools.workspace = true
+num-format.workspace = true
+rand.workspace = true
 regex = "1"
-semver = "1"
-uuid = { version = "1", features = ["v4", "fast-rng"] }
+semver.workspace = true
+uuid = { workspace = true, features = ["v4", "fast-rng"] }
 
 # ── Allocator ────────────────────────────────────────────────────────────
 ## jemalloc, used by the `mediator` binary only (set as the global allocator
@@ -355,13 +326,13 @@ tikv-jemallocator = { version = "0.7", optional = true }
 affinidi-encoding = "0.1"
 lazy_static = "1"
 ## `FjallStore` smoke tests open a temp directory.
-tempfile = "3"
+tempfile.workspace = true
 ## `did_example` lets curve-negotiation regression tests inject local DID
 ## documents into the resolver without any network I/O. Feature-unified with
 ## the `network` build above only for test targets.
-affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["did_example"] }
+affinidi-did-resolver-cache-sdk = { workspace = true, features = ["did_example"] }
 ## In-memory secrets + example DID docs for the `pack_encrypted` regression.
-affinidi-secrets-resolver = "0.5"
+affinidi-secrets-resolver.workspace = true
 ## `test-util` enables `tokio::time::pause/advance` so the task-supervisor
 ## backoff tests run deterministically without real sleeps.
 tokio = { workspace = true, features = ["test-util"] }
