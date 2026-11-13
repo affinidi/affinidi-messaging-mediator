@@ -382,7 +382,7 @@ checksum = "c98e71c5ff327cd6b018051975264cde1a5d4e8104ba9c5f36f0568b3e198034"
 dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "affinidi-tsp",
@@ -436,7 +436,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator-common",
  "affinidi-messaging-mediator-config",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-rate-limit",
  "affinidi-secrets-resolver",
  "affinidi-task-utils",
@@ -505,7 +505,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-messaging-test-mediator",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
@@ -659,7 +659,7 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-admin",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-messaging-test-mediator",
  "chrono",
  "clap",
@@ -727,9 +727,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.46.1"
+version = "0.46.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc879cbf944b2e2d37a5bedebb2982b4979b1b115d22ede957e99ccff695d07"
+checksum = "af23ef5a7e977bc5ea0a20cae95474d4f6c073f380883fe56801227a2c1241a6"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -779,7 +779,7 @@ dependencies = [
  "affinidi-messaging-didcomm-v1",
  "affinidi-messaging-mediator",
  "affinidi-messaging-mediator-common",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-secrets-resolver",
  "affinidi-tdk 0.43.0",
  "affinidi-tdk-common",
@@ -1004,7 +1004,7 @@ dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
- "affinidi-messaging-sdk 0.46.1",
+ "affinidi-messaging-sdk 0.46.2",
  "affinidi-secrets-resolver",
  "affinidi-tdk-common",
  "clap",
