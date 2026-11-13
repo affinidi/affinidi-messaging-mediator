@@ -247,7 +247,7 @@ pub async fn reconcile(
                     if let Some(g) = rec.grants.iter().find(|g| g.grant_id == grant_id)
                         && (g.narrowed_scope.is_some() || g.narrowed_exp.is_some())
                     {
-                        conn.narrow(g).await;
+                        conn.narrow(streaming, g).await;
                     }
                 }
             }
