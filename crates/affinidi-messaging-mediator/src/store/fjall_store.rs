@@ -1671,6 +1671,7 @@ impl MediatorStore for FjallStore {
                 continue;
             };
             let first_delivery = stored.first_delivered_at_ms.is_none();
+            report.bytes += stored.bytes;
             if first_delivery {
                 report.first_delivered += 1;
             } else {
@@ -1797,21 +1798,12 @@ impl MediatorStore for FjallStore {
         };
 
         // Compute (start, end) sub-keys within the DID's prefix.
-        let (start_id, end_id) = range
-            .map(|(s, e)| {
-                let s_id = if s == "-" {
-                    (0, 0)
-                } else {
-                    parse_stream_id_string(s).unwrap_or((0, 0))
-                };
-                let e_id = if e == "+" {
-                    (u64::MAX, u64::MAX)
-                } else {
-                    parse_stream_id_string(e).unwrap_or((u64::MAX, u64::MAX))
-                };
-                (s_id, e_id)
-            })
-            .unwrap_or(((0, 0), (u64::MAX, u64::MAX)));
+        let (start, end) = range.unwrap_or(("-", "+"));
+        let start_id = ops::parse_range_bound(start, false)?;
+        let end_id = ops::parse_range_bound(end, true)?;
+        if start_id > end_id {
+            return Ok(Vec::new());
+        }
 
         let start_key = stream_key_from_id(did_hash, start_id);
         let end_key = stream_key_from_id(did_hash, end_id);
@@ -1884,7 +1876,12 @@ impl MediatorStore for FjallStore {
 
         let entries: Vec<((u64, u64), StoredStreamEntry)> = {
             let mut buf = Vec::new();
-            for guard in self.inbox.range(start_key..=end_key).take(limit) {
+            for guard in self.inbox.range(start_key..=end_key) {
+                // `limit` counts entries returned, so it is checked after the
+                // cursor entry itself has been skipped.
+                if buf.len() >= limit {
+                    break;
+                }
                 let (key, value) = guard
                     .into_inner()
                     .map_err(|e| Self::db_err("fetch_messages:range", e))?;
@@ -1912,7 +1909,7 @@ impl MediatorStore for FjallStore {
                 .record_for(&entry.msg_id, did_hash)?
                 .map(|(_, stored)| stored.body);
 
-            let mut element = MessageListElement {
+            let element = MessageListElement {
                 msg_id: entry.msg_id.clone(),
                 receive_id: Some(format_stream_id(sid.0, sid.1)),
                 size: entry.bytes as u64,
@@ -1933,11 +1930,13 @@ impl MediatorStore for FjallStore {
                         },
                     )
                     .await;
+                // The message stays queued, and the client still gets it
+                // with the failed delete reported, as on Redis: at least
+                // once, never a body withheld while the message remains.
                 if let Err(e) = result {
                     response
                         .delete_errors
                         .push((entry.msg_id.clone(), e.to_string()));
-                    element.msg = None;
                 }
             }
             response.success.push(element);
@@ -1945,83 +1944,31 @@ impl MediatorStore for FjallStore {
         Ok(response)
     }
 
-    async fn purge_folder(
+    async fn delete_folder_entries(
         &self,
-        session_id: &str,
         did_hash: &str,
         folder: Folder,
-    ) -> Result<(usize, usize), MediatorError> {
-        self.purge_folder_by(
-            session_id,
-            did_hash,
-            folder,
-            DeletionAuthority::Owner {
-                did_hash: did_hash.to_string(),
-            },
-        )
-        .await
-    }
-
-    async fn purge_folder_by(
-        &self,
-        session_id: &str,
-        did_hash: &str,
-        folder: Folder,
-        by: DeletionAuthority,
-    ) -> Result<(usize, usize), MediatorError> {
-        // Snapshot all msg_ids in this folder, then delete each via
-        // the trait method (which handles cross-partition cleanup).
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError> {
         let partition = match folder {
             Folder::Inbox => &self.inbox,
             Folder::Outbox => &self.outbox,
         };
-        let did_bytes = did_hash.as_bytes();
-        let did_len = did_bytes.len();
-        let start = stream_key(did_hash, 0, 0);
-        let end = stream_key(did_hash, u64::MAX, u64::MAX);
-
-        // Each entry names one record: the owner's in an inbox, the entry's
-        // recipient in an outbox.
-        let mut records = Vec::new();
-        for guard in partition.range(start..=end) {
-            let (key, value) = guard
-                .into_inner()
-                .map_err(|e| Self::db_err("purge_folder:range", e))?;
-            if key.len() < did_len + 16 || &key[..did_len] != did_bytes {
-                continue;
-            }
-            let entry: StoredStreamEntry = Self::decode(&value)?;
-            let to = match folder {
-                Folder::Inbox => did_hash.to_string(),
-                Folder::Outbox => entry.peer_did,
-            };
-            records.push((entry.msg_id, to));
-        }
-
-        let mut count = 0;
-        let mut bytes = 0;
-        for (msg_id, to) in records {
-            // Look up bytes before delete (delete_message removes the
-            // record).
-            let bytes_before = self
-                .record_for(&msg_id, &to)
-                .ok()
-                .flatten()
-                .map(|(_, s)| s.bytes)
-                .unwrap_or(0);
-            if self
-                .delete_message_in(&msg_id, MessageScope::Recipient(&to), by.clone())
-                .await
-                .is_ok()
-            {
-                count += 1;
-                bytes += bytes_before;
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut any = false;
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                batch.remove(partition, stream_key_from_id(did_hash, sid));
+                any = true;
             }
         }
-
-        self.delete_folder_stream(session_id, did_hash, folder)
-            .await?;
-        Ok((count, bytes))
+        if any {
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("delete_folder_entries:commit", e))?;
+        }
+        Ok(())
     }
 
     async fn delete_folder_stream(
@@ -2116,18 +2063,14 @@ impl MediatorStore for FjallStore {
             reply.newest_received = format_stream_id(ms, seq);
         }
 
-        // Live-delivery flag: streaming_clients lookup (key prefix is
-        // mediator_uuid; we don't have it here, so any matching state
-        // counts as live).
-        for guard in self.streaming_clients.iter() {
-            let (key, _v) = guard
-                .into_inner()
-                .map_err(|e| Self::db_err("inbox_status:streaming.iter", e))?;
-            if key.ends_with(did_bytes) {
-                reply.live_delivery = true;
-                break;
-            }
-        }
+        // Live delivery: a registration with live mode on. A socket that is
+        // connected but has not turned live mode on is not live.
+        reply.live_delivery = self
+            .streaming_clients
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("inbox_status:streaming.get", e))?
+            .and_then(|raw| Self::decode::<StoredStreamingClient>(&raw).ok())
+            .is_some_and(|c| c.state == StreamingClientState::Live);
 
         Ok(reply)
     }
@@ -2161,11 +2104,7 @@ impl MediatorStore for FjallStore {
             .get(session_id.as_bytes())
             .map_err(|e| Self::db_err("get_session:get", e))?
             .ok_or_else(|| {
-                MediatorError::SessionError(
-                    14,
-                    session_id.into(),
-                    format!("Session not found: {session_id}"),
-                )
+                affinidi_messaging_mediator_common::store::session_not_found(session_id)
             })?;
         let stored: StoredSession = Self::decode(&raw)?;
 
@@ -2177,11 +2116,7 @@ impl MediatorStore for FjallStore {
             .unwrap_or(0);
         if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
             self.remove_session_if_expired(session_id, now).await;
-            return Err(MediatorError::SessionError(
-                14,
-                session_id.into(),
-                format!("Session expired: {session_id}"),
-            ));
+            return Err(affinidi_messaging_mediator_common::store::session_not_found(session_id));
         }
 
         // `Session::session_id` is `#[serde(skip)]`; restore it from
@@ -2474,15 +2409,19 @@ impl MediatorStore for FjallStore {
             .await?;
         // As the mediator, not the owner: senders see these as `discarded`,
         // not collected by a recipient who never read them.
-        self.purge_folder_by(
-            "",
-            did_hash,
-            Folder::Inbox,
-            DeletionAuthority::Admin {
-                admin_did_hash: did_hash.to_string(),
-            },
-        )
-        .await?;
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
+        self.delete_folder_stream("", did_hash, Folder::Inbox)
+            .await?;
 
         // Drop account, admin entry, and access list.
         let _guard = self.write_lock.lock().await;
@@ -2527,15 +2466,17 @@ impl MediatorStore for FjallStore {
         // A message stored while the inbox was being purged — the steps above
         // each take the lock on their own — would otherwise outlive the
         // account, with no row left to count it against.
-        self.purge_folder_by(
-            "",
-            did_hash,
-            Folder::Inbox,
-            DeletionAuthority::Admin {
-                admin_did_hash: did_hash.to_string(),
-            },
-        )
-        .await?;
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
         Ok(true)
     }
 

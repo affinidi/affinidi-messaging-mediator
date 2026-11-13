@@ -37,6 +37,12 @@ impl Database {
                 )
             })?;
 
+        // No record: expired (Redis dropped it at its TTL), deleted, or never
+        // there. The client must authenticate again; not a server fault.
+        if session_db.is_empty() {
+            return Err(crate::store::session_not_found(session_id));
+        }
+
         let mut session: Session = Session {
             session_id: session_id.into(),
             ..Default::default()
@@ -125,15 +131,18 @@ impl Database {
             return Err(crate::store::account_gone(session_id));
         }
 
+        // A DID record without a role is not an account (one an earlier
+        // build left behind after removing the account): answered as the
+        // account being gone, as the other backends, which hold accounts
+        // whole, would.
         if let Some(Some(role_type)) = did_db.first() {
             session.account_type = AccountType::from(role_type.as_str());
         } else {
-            warn!("{}: Error parsing role_type!", session_id);
-            return Err(MediatorError::SessionError(
-                20,
-                session_id.into(),
-                "No role_type found when retrieving session!".into(),
-            ));
+            warn!(
+                "{}: account record has no role; treating the account as gone",
+                session_id
+            );
+            return Err(crate::store::account_gone(session_id));
         }
         if let Some(acls) = did_db.get(1) {
             if let Some(acls) = acls {
@@ -152,12 +161,11 @@ impl Database {
                     }
                 }
             } else {
-                warn!("{}: Error parsing acls!", session_id);
-                return Err(MediatorError::SessionError(
-                    20,
-                    session_id.into(),
-                    "No ACL found when retrieving session".into(),
-                ));
+                warn!(
+                    "{}: account record has no ACLs; treating the account as gone",
+                    session_id
+                );
+                return Err(crate::store::account_gone(session_id));
             }
         } else {
             warn!("{}: Error parsing acls!", session_id);

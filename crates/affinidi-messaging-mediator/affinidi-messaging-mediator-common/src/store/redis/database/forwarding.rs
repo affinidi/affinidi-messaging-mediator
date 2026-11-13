@@ -131,10 +131,31 @@ impl Database {
         count: usize,
         block_ms: usize,
     ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
-        // Use a dedicated connection with no response timeout for blocking XREADGROUP.
-        // The redis crate 1.x defaults to a 500ms response timeout which is shorter
-        // than the BLOCK duration, causing spurious timeout errors.
-        let mut conn = self.get_blocking_connection().await?;
+        // A dedicated connection with no response timeout for blocking
+        // XREADGROUP (the redis crate 1.x defaults to a 500ms response
+        // timeout, shorter than the BLOCK duration). One per consumer, kept
+        // for its next read rather than opened per read: a blocked read
+        // holds its connection, so consumers must not share one.
+        let cached = self
+            .blocking_connections
+            .lock()
+            .ok()
+            .and_then(|conns| conns.get(consumer_name).cloned());
+        let mut conn = match cached {
+            Some(conn) => conn,
+            None => {
+                let conn = self.get_blocking_connection().await?;
+                if let Ok(mut conns) = self.blocking_connections.lock() {
+                    // Consumer names are per processor run; a restarted
+                    // processor's connection is never used again.
+                    if conns.len() >= MAX_BLOCKING_CONNECTIONS {
+                        conns.clear();
+                    }
+                    conns.insert(consumer_name.to_string(), conn.clone());
+                }
+                conn
+            }
+        };
 
         // XREADGROUP GROUP <group> <consumer> BLOCK <ms> COUNT <n> STREAMS FORWARD_Q >
         #[allow(clippy::type_complexity)]
@@ -154,6 +175,15 @@ impl Database {
                 .await
                 .map_err(|err| {
                     event!(Level::ERROR, "XREADGROUP error: {}", err);
+                    // Open a fresh connection for the next read: this one
+                    // may be broken, and it is not the shared connection
+                    // that reconnects by itself.
+                    if let Ok(mut conns) = self.blocking_connections.lock() {
+                        conns.remove(consumer_name);
+                    }
+                    if crate::database::is_unavailable(&err) {
+                        self.circuit_breaker_record_failure();
+                    }
                     MediatorError::database_from_redis(
                         92,
                         "forwarding".into(),
@@ -221,6 +251,132 @@ impl Database {
         })?;
 
         Ok(())
+    }
+
+    /// Ack and delete `stream_ids` as one `MULTI`/`EXEC` (one key, so one
+    /// slot in cluster mode too): a crash between a separate ack and delete
+    /// would leave an entry no consumer holds and the group has read past,
+    /// so it would never be read, claimed or deleted again.
+    pub async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        if stream_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get_connection().await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        pipe.cmd("XACK").arg("FORWARD_Q").arg(group_name);
+        for id in stream_ids {
+            pipe.arg(*id);
+        }
+        pipe.ignore();
+        pipe.cmd("XDEL").arg("FORWARD_Q");
+        for id in stream_ids {
+            pipe.arg(*id);
+        }
+        pipe.ignore();
+        pipe.exec_async(&mut conn).await.map_err(|err| {
+            event!(Level::ERROR, "XACK/XDEL error: {}", err);
+            MediatorError::database_from_redis(
+                93,
+                "forwarding".into(),
+                &err,
+                format!("XACK/XDEL error: {err}"),
+            )
+        })
+    }
+
+    /// Remove the consumers of `group_name` that hold no entries and have
+    /// been idle for at least `min_idle`, other than `keep_consumer`. Each
+    /// processor run reads as a consumer of its own name, so every restart
+    /// leaves one behind. A consumer holding entries is kept: removing it
+    /// would drop its claims, and the reclaim sweep hands those on instead.
+    /// Returns how many were removed.
+    pub async fn forward_queue_prune_consumers(
+        &self,
+        group_name: &str,
+        keep_consumer: &str,
+        min_idle: std::time::Duration,
+    ) -> Result<usize, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let consumers: Vec<HashMap<String, redis::Value>> = match redis::cmd("XINFO")
+            .arg("CONSUMERS")
+            .arg("FORWARD_Q")
+            .arg(group_name)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(consumers) => consumers,
+            // No stream or group yet: nothing to prune.
+            Err(err)
+                if err.to_string().contains("NOGROUP")
+                    || err.to_string().contains("no such key") =>
+            {
+                return Ok(0);
+            }
+            Err(err) => {
+                return Err(MediatorError::database_from_redis(
+                    98,
+                    "forwarding".into(),
+                    &err,
+                    format!("XINFO CONSUMERS error: {err}"),
+                ));
+            }
+        };
+        let field = |consumer: &HashMap<String, redis::Value>, name: &str| {
+            consumer
+                .get(name)
+                .and_then(|v| redis::from_redis_value::<i64>(v.clone()).ok())
+        };
+        let min_idle_ms = min_idle.as_millis() as i64;
+        let mut removed = 0;
+        for consumer in &consumers {
+            let Some(name) = consumer
+                .get("name")
+                .and_then(|v| redis::from_redis_value::<String>(v.clone()).ok())
+            else {
+                continue;
+            };
+            // `inactive` (Redis 7.2+) is the time since the last successful
+            // interaction; `idle` since the last attempted one.
+            let idle = field(consumer, "inactive")
+                .filter(|ms| *ms >= 0)
+                .or_else(|| field(consumer, "idle"))
+                .unwrap_or(0);
+            if name == keep_consumer
+                || field(consumer, "pending").unwrap_or(1) != 0
+                || idle < min_idle_ms
+            {
+                continue;
+            }
+            // DELCONSUMER drops the consumer's pending entries with it, so
+            // only one still holding none is removed: checked again here, in
+            // one script, in case it read something since XINFO.
+            let deleted: i64 = PRUNE_CONSUMER
+                .key("FORWARD_Q")
+                .arg(group_name)
+                .arg(&name)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        98,
+                        "forwarding".into(),
+                        &err,
+                        format!("XGROUP DELCONSUMER error: {err}"),
+                    )
+                })?;
+            if deleted == 1 {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            debug!("Removed {removed} idle forward-queue consumer(s) of group {group_name}");
+        }
+        Ok(removed)
     }
 
     /// Delete acknowledged messages from the stream to free memory
@@ -343,6 +499,26 @@ impl Database {
         Ok(finished == 1)
     }
 }
+
+/// Most blocking connections kept for forward-queue consumers at once.
+const MAX_BLOCKING_CONNECTIONS: usize = 16;
+
+/// Remove consumer ARGV[2] of group ARGV[1] if it holds no entries. Returns
+/// 1 when removed.
+///
+/// KEYS: [1] the stream.
+static PRUNE_CONSUMER: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local p = redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2])
+if #p > 0 then
+  return 0
+end
+redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+return 1
+"#,
+    )
+});
 
 /// Reset the idle time of the entries in ARGV[3..] that consumer ARGV[2] of
 /// group ARGV[1] still holds, and return the ids it does not. Ownership is

@@ -10,6 +10,14 @@
 //! - Open → HalfOpen: after `open_duration` has elapsed
 //! - HalfOpen → Closed: on success
 //! - HalfOpen → Open: on failure (resets the timer)
+//! - HalfOpen → HalfOpen, with another probe let through: when the probe has
+//!   reported nothing within `open_duration` (it was cancelled, or never sent
+//!   a command), so a lost probe cannot leave the breaker failing every
+//!   request until restart.
+//!
+//! The Redis store reports the outcome of every command it sends (see
+//! `RedisConnection::with_breaker`), so the breaker follows the database's
+//! actual health.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::{error, info, warn};
@@ -31,7 +39,8 @@ pub struct CircuitBreaker {
     state: AtomicU32,
     consecutive_failures: AtomicU32,
     failure_threshold: u32,
-    /// When the circuit was opened (unix timestamp seconds)
+    /// When the circuit was opened, or the current HalfOpen probe let
+    /// through (unix timestamp seconds)
     opened_at: AtomicU64,
     /// How long to wait before transitioning from Open to HalfOpen
     open_duration_secs: u64,
@@ -68,6 +77,7 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                     {
+                        self.opened_at.store(now, Ordering::Release);
                         info!("Circuit breaker: Open → HalfOpen (testing Redis connectivity)");
                         return true;
                     }
@@ -75,9 +85,17 @@ impl CircuitBreaker {
                 false
             }
             STATE_HALF_OPEN => {
-                // Only allow one probe request through in half-open state
-                // Additional requests fail fast
-                false
+                // One probe at a time; others fail fast. A probe that has
+                // reported nothing for `open_duration` is taken as lost (its
+                // task was cancelled, or it never sent a command), and the
+                // next request becomes the probe.
+                let now = now_secs();
+                let started = self.opened_at.load(Ordering::Acquire);
+                now.saturating_sub(started) >= self.open_duration_secs.max(1)
+                    && self
+                        .opened_at
+                        .compare_exchange(started, now, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
             }
             _ => true,
         }
@@ -180,6 +198,24 @@ mod tests {
         cb.record_success();
         assert_eq!(cb.state_str(), "closed");
         assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn a_lost_probe_lets_another_through_after_the_recovery_time() {
+        let cb = CircuitBreaker::new(1, 1);
+        cb.record_failure();
+        // Pretend the circuit opened long ago, so the next request probes.
+        cb.opened_at.store(0, Ordering::Release);
+        assert!(cb.allow_request());
+        assert_eq!(cb.state_str(), "half_open");
+        // The probe never reports. Within the recovery time nothing passes.
+        assert!(!cb.allow_request());
+        // Past it, the next request becomes the probe, once.
+        cb.opened_at.store(now_secs() - 2, Ordering::Release);
+        assert!(cb.allow_request());
+        assert!(!cb.allow_request());
+        cb.record_success();
+        assert_eq!(cb.state_str(), "closed");
     }
 
     #[test]

@@ -242,19 +242,20 @@ pub(crate) async fn authenticate_token(
         .get_session(&session_id, &did)
         .await
         .map_err(|e| {
-            // The account behind the session was removed: the token is no
-            // longer good, which is not a server fault.
+            // The session is gone (expired, deleted, lost with the store) or
+            // its account was removed: the token is no longer good, which is
+            // not a server fault. 401, so the client authenticates again.
             if let MediatorError::Unauthorized(..) = e {
-                info!("{}: session's account no longer exists", session_id);
+                info!("{}: session is over: {}", session_id, e);
                 return AuthError::InvalidToken;
             }
+            // A real storage failure. The cause stays in the log; the client
+            // gets a fixed message.
             error!(
                 "{}: Couldn't get session from database! Reason: {}",
                 session_id, e
             );
-            AuthError::InternalServerError(format!(
-                "Couldn't get session from database! Reason: {e}"
-            ))
+            AuthError::InternalServerError("Couldn't read the session".into())
         })?
         .into();
 
@@ -334,8 +335,15 @@ where
         {
             Some(address) => address.to_string(),
             _ => {
-                warn!("No remote address in request!");
-                return Err(AuthError::MissingCredentials);
+                // The server was started without connect info: a wiring
+                // fault, not the client's.
+                error!(
+                    "No remote address (ConnectInfo) in request: the router must be served with \
+                     into_make_service_with_connect_info"
+                );
+                return Err(AuthError::InternalServerError(
+                    "Connection information is unavailable".into(),
+                ));
             }
         };
 

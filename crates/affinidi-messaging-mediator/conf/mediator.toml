@@ -156,8 +156,13 @@ trust_xff_cidrs = []
 ### ****************************************************************************************************************************
 [database]
 ### Env: DATABASE_FUNCTIONS_FILE
-### Path to the database functions file
-functions_file = "./atm-functions.lua"
+### The Redis stored-function library is built into the mediator, and absent
+### this setting the built-in one is loaded. Set it only to load another copy
+### of conf/atm-functions.lua; a file older than the built-in library (by its
+### LIBRARY_VERSION line) is refused in favour of the built-in one. Either
+### way the library is loaded only over an older one: a database already
+### holding a newer library (loaded by a newer mediator) keeps it.
+# functions_file = "./atm-functions.lua"
 
 ### Env: DATABASE_URL
 ### URL of the Redis compatible database
@@ -190,6 +195,18 @@ database_timeout = "2"
 ###     error; only then do writes fail with error 97 (storage full). Alarm on
 ###     BytesUsedForCache at 75% of the maximum, as AWS recommends.
 cluster_mode = "false"
+
+### Env: DATABASE_CIRCUIT_BREAKER_THRESHOLD
+### Consecutive failed database commands (connection errors and timeouts, not
+### error replies) after which the circuit breaker opens: requests then fail
+### at once instead of each waiting out database_timeout, and /readyz reports
+### the database unavailable. Default 5.
+# circuit_breaker_threshold = "5"
+
+### Env: DATABASE_CIRCUIT_BREAKER_RECOVERY_SECS
+### Seconds an open circuit breaker waits before letting one probe command
+### through; the probe's outcome closes or re-opens it. Default 10.
+# circuit_breaker_recovery_secs = "10"
 
 ### ****************************************************************************************************************************
 ### Security configuration

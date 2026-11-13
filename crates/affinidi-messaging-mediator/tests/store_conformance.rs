@@ -2077,7 +2077,7 @@ async fn check_purge_and_removal_receipts(store: Arc<dyn MediatorStore>) {
     // overrides it, so call the default's body directly).
     let (to, from) = ("did_hash_rcpt_default_by", "did_hash_sndr_default_by");
     let ids = receipt_fixture(&store, to, from, "default-by").await;
-    let (purged, _) = affinidi_messaging_mediator_common::store::purge_folder_by_listing(
+    let purged = affinidi_messaging_mediator_common::store::purge_folder_by_listing(
         store.as_ref(),
         "s",
         to,
@@ -2088,7 +2088,7 @@ async fn check_purge_and_removal_receipts(store: Arc<dyn MediatorStore>) {
     )
     .await
     .expect("default purge");
-    assert_eq!(purged, 4, "the default purge empties the folder");
+    assert_eq!(purged.count, 4, "the default purge empties the folder");
     assert_eq!(
         first_reason(&store, from, &ids).await,
         Some(RemovalReason::Discarded),
@@ -3388,11 +3388,10 @@ async fn redis_mux_changes_reach_every_instance() {
     }
 }
 
-/// Redis only: fetching a message by id counts it as sent in the global
-/// stats. The two counters are one MULTI, so a malformed command in it
-/// drops both.
-#[cfg(feature = "redis-backend")]
+/// The global sent counters move when a handover is recorded, on every
+/// backend, and not on a plain read by id.
 async fn check_fetch_counts_sent(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::types::messages::{FetchDeletePolicy, FetchOptions};
     let to = "did_hash_recipient_sent_stats";
     store
         .account_add(to, &allow_all(), None)
@@ -3404,23 +3403,417 @@ async fn check_fetch_counts_sent(store: Arc<dyn MediatorStore>) {
         .await
         .expect("store_message");
 
+    // A read is not a handover: the sent counters stay put.
     let before = store.get_global_stats().await.expect("stats before");
     let fetched = store
         .get_message(to, &id)
         .await
         .expect("get_message")
         .expect("stored message is retrievable by id");
+    let after_read = store.get_global_stats().await.expect("stats after read");
+    assert_eq!(
+        after_read.sent_count, before.sent_count,
+        "a plain read counts nothing sent"
+    );
+
+    // Recording the handover counts it, on every backend.
+    store
+        .record_delivered(to, std::slice::from_ref(&id), 1_700_000_000_000, 0)
+        .await
+        .expect("record_delivered");
     let after = store.get_global_stats().await.expect("stats after");
     assert_eq!(
         after.sent_count - before.sent_count,
         1,
-        "a fetch counts one message sent"
+        "a recorded handover counts one message sent"
     );
     assert_eq!(
         after.sent_bytes - before.sent_bytes,
         fetched.size as i64,
-        "a fetch counts the message's bytes sent"
+        "a recorded handover counts the message's bytes sent"
     );
+
+    // An optimistic delivering fetch deletes what it hands over, and counts it.
+    let response = store
+        .fetch_messages_delivering(
+            "s",
+            to,
+            &FetchOptions {
+                limit: 10,
+                start_id: None,
+                delete_policy: FetchDeletePolicy::Optimistic,
+            },
+            1_700_000_000_000,
+            0,
+            false,
+        )
+        .await
+        .expect("fetch");
+    assert_eq!(response.success.len(), 1);
+    let last = store.get_global_stats().await.expect("stats last");
+    assert_eq!(last.sent_count - after.sent_count, 1);
+}
+
+/// A delayed forward (delay_milli > 0) left pending by the consumer that read
+/// it — as a processor does with a delay beyond what it parks, or as one that
+/// crashed leaves everything — is handed to another consumer by autoclaim,
+/// with its delay intact, and that consumer finishes it. Uses its own group,
+/// and only the entry it adds.
+async fn check_forward_queue_delayed_entry_survives_its_reader(store: Arc<dyn MediatorStore>) {
+    let group = "delayed-recovery-group";
+    let mut entry = forward_entry_for_check("delayed-forward");
+    entry.delay_milli = 3_600_000;
+    entry.received_at_ms = 1_700_000_000_000;
+    let id = store
+        .forward_queue_enqueue(&entry, 0)
+        .await
+        .expect("enqueue");
+
+    // Consumer A reads it and dies holding it.
+    let read = store
+        .forward_queue_read(group, "consumer-a", 1_000, Duration::from_millis(50))
+        .await
+        .expect("read");
+    let mine = read
+        .iter()
+        .find(|e| e.stream_id == id)
+        .expect("consumer-a claims the delayed entry");
+    assert_eq!(
+        mine.delay_milli, 3_600_000,
+        "the delay is stored with the entry"
+    );
+
+    // Consumer B takes it over through the reclaim sweep.
+    let mut cursor = "0-0".to_string();
+    let mut reclaimed = None;
+    loop {
+        let page = store
+            .forward_queue_autoclaim(group, "consumer-b", Duration::ZERO, 1_000, &cursor)
+            .await
+            .expect("autoclaim");
+        if let Some(e) = page.entries.into_iter().find(|e| e.stream_id == id) {
+            reclaimed = Some(e);
+        }
+        match page.next_cursor {
+            Some(next) if reclaimed.is_none() => cursor = next,
+            _ => break,
+        }
+    }
+    let reclaimed = reclaimed.expect("consumer-b reclaims the entry consumer-a held");
+    assert_eq!(
+        reclaimed.delay_milli, 3_600_000,
+        "the delay survives the reclaim"
+    );
+    assert_eq!(reclaimed.message, "delayed-forward");
+
+    // A no longer holds it: its finish changes nothing; B's removes it.
+    assert!(
+        !store
+            .forward_queue_finish(group, "consumer-a", &id, None)
+            .await
+            .expect("finish by a"),
+        "the dead consumer no longer holds the entry"
+    );
+    // Consumer A holds nothing now, so pruning idle consumers may remove it
+    // (a backend that keeps no consumer records removes nothing); B's claim
+    // is untouched either way.
+    store
+        .forward_queue_prune_consumers(group, "consumer-b", Duration::ZERO)
+        .await
+        .expect("prune consumers");
+    assert!(
+        store
+            .forward_queue_finish(group, "consumer-b", &id, None)
+            .await
+            .expect("finish by b"),
+        "the reclaiming consumer finishes the entry"
+    );
+}
+
+/// Ack and delete as one step leaves nothing behind.
+async fn check_forward_queue_ack_and_delete(store: Arc<dyn MediatorStore>) {
+    let group = "ack-and-delete-group";
+    let id = store
+        .forward_queue_enqueue(&forward_entry_for_check("ack-and-delete"), 0)
+        .await
+        .expect("enqueue");
+    let before = store.forward_queue_len().await.expect("len");
+    let read = store
+        .forward_queue_read(group, "consumer", 1_000, Duration::from_millis(50))
+        .await
+        .expect("read");
+    assert!(read.iter().any(|e| e.stream_id == id));
+    store
+        .forward_queue_ack_and_delete(group, &[id.as_str()])
+        .await
+        .expect("ack and delete");
+    assert_eq!(
+        store.forward_queue_len().await.expect("len after"),
+        before - 1,
+        "the entry is gone from the queue"
+    );
+    assert!(
+        !store
+            .forward_queue_finish(group, "consumer", &id, None)
+            .await
+            .expect("finish"),
+        "the entry is no longer pending"
+    );
+}
+
+/// Purge contract, the same on every backend: a full purge reports what it
+/// removed and empties the folder; a purge whose deletes are refused counts
+/// them as failed, keeps going, and leaves every refused message listed.
+async fn check_purge_reports(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::DeletionAuthority;
+    use affinidi_messaging_mediator_common::types::messages::Folder;
+    let (to, from) = ("did_hash_purge_report_to", "did_hash_purge_report_from");
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add");
+    let mut bytes = 0;
+    for n in 0..3 {
+        let body = format!("{{\"protected\":\"purge-report-{n}\"}}");
+        bytes += body.len();
+        store
+            .store_message("s", &body, to, Some(from), NEVER, 0)
+            .await
+            .expect("store");
+    }
+
+    // Refused: an owner authority that is not the folder's owner.
+    let refused = store
+        .purge_folder_by(
+            "s",
+            to,
+            Folder::Inbox,
+            DeletionAuthority::Owner {
+                did_hash: "did_hash_purge_report_stranger".into(),
+            },
+        )
+        .await
+        .expect("a refused purge still answers");
+    assert_eq!(refused.count, 0, "nothing was removed");
+    assert_eq!(refused.failed, 3, "every refusal is counted");
+    assert_eq!(
+        store
+            .list_messages(to, Folder::Inbox, None, 100)
+            .await
+            .expect("list")
+            .len(),
+        3,
+        "a message that was not removed stays listed"
+    );
+
+    let done = store
+        .purge_folder("s", to, Folder::Inbox)
+        .await
+        .expect("purge");
+    assert_eq!(done.count, 3);
+    assert_eq!(done.bytes, bytes);
+    assert_eq!(done.failed, 0);
+    assert!(
+        store
+            .list_messages(to, Folder::Inbox, None, 100)
+            .await
+            .expect("list after")
+            .is_empty(),
+        "the folder is empty"
+    );
+    assert_eq!(queue_counters(&store, to).await.0, 0);
+}
+
+/// A removed account stays removed while its sent messages are delivered and
+/// deleted afterwards; and `account_add`'s queue limit is kept as both
+/// limits.
+async fn check_removed_sender_stays_removed(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
+    let (to, from) = ("did_hash_ghost_to", "did_hash_ghost_from");
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add to");
+    store
+        .account_add(from, &allow_all(), Some(7))
+        .await
+        .expect("account_add from");
+    let account = store
+        .account_get(from)
+        .await
+        .expect("get")
+        .expect("account exists");
+    assert_eq!(
+        account.queue_send_limit,
+        Some(7),
+        "send limit from account_add"
+    );
+    assert_eq!(
+        account.queue_receive_limit,
+        Some(7),
+        "receive limit from account_add"
+    );
+
+    let id = store
+        .store_message("s", "{\"protected\":\"ghost\"}", to, Some(from), NEVER, 0)
+        .await
+        .expect("store");
+    assert!(
+        store
+            .account_remove(&admin_session("admin_hash"), from)
+            .await
+            .expect("account_remove")
+    );
+    store
+        .delete_message_in(
+            &id,
+            MessageScope::Recipient(to),
+            DeletionAuthority::Owner {
+                did_hash: to.to_string(),
+            },
+        )
+        .await
+        .expect("the recipient collects the removed sender's message");
+    assert!(
+        !store.account_exists(from).await.expect("exists"),
+        "the removed sender is not recreated by the delete"
+    );
+    assert!(store.account_get(from).await.expect("get").is_none());
+}
+
+/// Observable semantics every backend shares (#180): live delivery means live
+/// mode on; bad list ranges are refused; a paged fetch returns `limit`
+/// messages after the cursor; a fifth-plus redelivery is flagged; a missing
+/// message has no delivery state; an unknown DID is no admin; a missing
+/// session is "not found", not a storage failure.
+async fn check_shared_semantics(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::POISON_ATTEMPTS;
+    use affinidi_messaging_mediator_common::types::messages::{
+        FetchDeletePolicy, FetchOptions, Folder,
+    };
+    let to = "did_hash_semantics_to";
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add");
+
+    // live_delivery
+    store
+        .streaming_set_state(to, "semantics-uuid", StreamingClientState::Registered)
+        .await
+        .expect("register");
+    assert!(
+        !store.inbox_status(to).await.expect("status").live_delivery,
+        "a registered socket without live mode is not live"
+    );
+    store
+        .streaming_set_state(to, "semantics-uuid", StreamingClientState::Live)
+        .await
+        .expect("live");
+    assert!(store.inbox_status(to).await.expect("status").live_delivery);
+    store
+        .streaming_set_state(to, "semantics-uuid", StreamingClientState::Deregistered)
+        .await
+        .expect("deregister");
+
+    // list ranges
+    for bad in ["(1-0", "abc", "1-x"] {
+        assert!(
+            store
+                .list_messages(to, Folder::Inbox, Some((bad, "+")), 10)
+                .await
+                .is_err(),
+            "range start {bad} is refused"
+        );
+    }
+
+    // paging
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        ids.push(
+            store
+                .store_message(
+                    "s",
+                    &format!("{{\"protected\":\"page-{n}\"}}"),
+                    to,
+                    None,
+                    NEVER,
+                    0,
+                )
+                .await
+                .expect("store"),
+        );
+    }
+    let options = |start_id: Option<String>| FetchOptions {
+        limit: 2,
+        start_id,
+        delete_policy: FetchDeletePolicy::DoNotDelete,
+    };
+    let first = store
+        .fetch_messages("s", to, &options(None))
+        .await
+        .expect("fetch");
+    assert_eq!(first.success.len(), 2, "a fetch returns `limit` messages");
+    let cursor = first.success[0].receive_id.clone();
+    let second = store
+        .fetch_messages("s", to, &options(cursor))
+        .await
+        .expect("fetch page");
+    assert_eq!(
+        second.success.len(),
+        2,
+        "a paged fetch returns `limit` messages after the cursor"
+    );
+    assert_eq!(second.success[0].msg_id, ids[1]);
+
+    // poison flag
+    let mut flagged = 0;
+    for _ in 0..(POISON_ATTEMPTS + 2) {
+        flagged = store
+            .mark_delivered(to, std::slice::from_ref(&ids[0]), 1_700_000_000_000, 0)
+            .await
+            .expect("mark")
+            .poison_suspected;
+    }
+    assert_eq!(flagged, 1, "a redelivery past the threshold is flagged");
+
+    // delivery state of a missing message
+    let missing = "0".repeat(64);
+    assert!(
+        store
+            .delivery_state(to, &missing)
+            .await
+            .expect("state")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .delivery_states(
+                &[affinidi_messaging_mediator_common::store::MessageRef::new(
+                    to, &missing,
+                )]
+            )
+            .await
+            .expect("states"),
+        vec![None]
+    );
+
+    // admin check of an unknown DID
+    assert!(
+        !store
+            .check_admin_account("did_hash_semantics_nobody")
+            .await
+            .expect("admin check")
+    );
+
+    // missing session
+    match store
+        .get_session("no-such-session", "did:example:nobody")
+        .await
+    {
+        Err(e) if affinidi_messaging_mediator_common::store::is_session_over(&e) => {}
+        other => panic!("a missing session is not-found, got {other:?}"),
+    }
 }
 
 // ─── One body, several recipients ───────────────────────────────────────────
@@ -3627,18 +4020,18 @@ async fn check_same_body_for_two_recipients(store: Arc<dyn MediatorStore>) {
     // ── A purge removes the purger's copy only ─────────────────────────────
     store_for(a, NEVER).await;
     store_for(b, NEVER).await;
-    let (count, bytes) = store
+    let report = store
         .purge_folder("s", a, Folder::Inbox)
         .await
         .expect("purge a's inbox");
-    assert_eq!((count, bytes as u64), (1, len));
+    assert_eq!((report.count, report.bytes as u64), (1, len));
     assert_eq!(queue_counters(&store, b).await, (1, len, 0, 0));
     assert!(store.get_message(b, &id).await.unwrap().is_some());
-    let (count, _) = store
+    let report = store
         .purge_folder("s", b, Folder::Inbox)
         .await
         .expect("purge b's inbox");
-    assert_eq!(count, 1);
+    assert_eq!(report.count, 1);
     assert_nothing_queued(&store, from, &[a, b, from]).await;
 
     // ── The sender withdrawing by id withdraws every copy it sent ──────────
@@ -4145,6 +4538,11 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_repeated_store(store.clone()).await;
     check_concurrent_delete(store.clone()).await;
     check_fetch_counts_sent(store.clone()).await;
+    check_forward_queue_delayed_entry_survives_its_reader(store.clone()).await;
+    check_forward_queue_ack_and_delete(store.clone()).await;
+    check_purge_reports(store.clone()).await;
+    check_removed_sender_stays_removed(store.clone()).await;
+    check_shared_semantics(store.clone()).await;
     check_same_body_for_two_recipients(store.clone()).await;
     check_stale_expiry_entry_keeps_a_later_copy(store.clone()).await;
     check_acknowledgement_never_removes_another_copy(store.clone()).await;
@@ -4356,6 +4754,30 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn mux_changes_single_process() {
                 check_mux_changes_single_process(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn fetch_counts_sent() {
+                check_fetch_counts_sent(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_delayed_entry_survives_its_reader() {
+                check_forward_queue_delayed_entry_survives_its_reader(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn forward_queue_ack_and_delete() {
+                check_forward_queue_ack_and_delete(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn purge_reports() {
+                check_purge_reports(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn removed_sender_stays_removed() {
+                check_removed_sender_stays_removed(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn shared_semantics() {
+                check_shared_semantics(ready($ctor).await).await;
             }
         }
     };
@@ -4730,11 +5152,11 @@ async fn check_redis_legacy_records_keep_working(
 
     // A purge removes a legacy record at the head of the inbox.
     write_legacy_redis_record(store, "{\"protected\":\"legacy-purge\"}", a, from, NEVER).await;
-    let (count, _) = dyn_store
+    let report = dyn_store
         .purge_folder("s", a, Folder::Inbox)
         .await
         .expect("purge");
-    assert_eq!(count, 1);
+    assert_eq!(report.count, 1);
     assert_nothing_queued(&dyn_store, from, &[a, b, from]).await;
 
     // An instance of an earlier build calls `delete_message` with the

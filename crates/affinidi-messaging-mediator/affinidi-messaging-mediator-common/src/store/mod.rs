@@ -116,6 +116,9 @@ pub struct DeliveryMarkReport {
     pub poison_suspected: usize,
     /// Messages whose expiry was brought forward.
     pub expiry_advanced: usize,
+    /// Bytes of the messages handed over (first deliveries and
+    /// redeliveries), for the global sent counters.
+    pub bytes: usize,
 }
 
 /// Turn a [`DeliveryMarkReport`] into counters.
@@ -207,42 +210,113 @@ impl PurgeFilter {
     }
 }
 
-/// The default [`MediatorStore::purge_folder_by`], over the store's own
-/// primitives: the unfiltered [`purge_folder_filtered_by`] (whose default
-/// deletes each message with `by`) until nothing is left, then the stream key.
-/// Public so the store-conformance suite can run this exact path against
-/// every backend, which all override the trait method.
+/// For account removal: an error when the inbox purge left messages queued,
+/// so the account is not removed with messages still stored for it. The
+/// account stays blocked; running the removal again retries them.
+pub fn purge_left_messages(did_hash: &str, report: &PurgeReport) -> Result<(), MediatorError> {
+    if report.failed == 0 {
+        return Ok(());
+    }
+    Err(MediatorError::DatabaseError(
+        14,
+        "NA".into(),
+        format!(
+            "Account ({did_hash}) is blocked but not removed: {} of its queued messages could not be deleted; retry the removal",
+            report.failed
+        ),
+    ))
+}
+
+/// Messages one purge page lists and deletes together.
+const PURGE_PAGE: u32 = 100;
+
+/// The purge every backend runs ([`MediatorStore::purge_folder_by`]): one
+/// algorithm, so the backends cannot disagree on what a purge does.
 ///
-/// [`purge_folder_filtered_by`]: MediatorStore::purge_folder_filtered_by
+/// - Pages through the folder by cursor (the exclusive successor of the
+///   last stream id seen), deleting each page's messages together — on
+///   Redis one pipelined batch per page rather than a round trip each.
+/// - A message already gone (a concurrent pickup, the expiry sweep) is not
+///   a failure: it is absent, as asked. Its stream entry, which names
+///   nothing, is removed explicitly.
+/// - Any other refusal is counted in [`PurgeReport::failed`] and the walk
+///   goes on, so one undeletable message cannot hold up the rest. Its entry
+///   stays: only entries whose message was removed leave the folder, so a
+///   message still stored is never left unlisted.
+///
+/// `count`/`bytes` are what this call removed. Public so the conformance
+/// suite can run it directly.
 pub async fn purge_folder_by_listing<S: MediatorStore + ?Sized>(
     store: &S,
-    session_id: &str,
+    _session_id: &str,
     did_hash: &str,
     folder: Folder,
     by: DeletionAuthority,
-) -> Result<(usize, usize), MediatorError> {
-    let (mut count, mut bytes) = (0, 0);
+) -> Result<PurgeReport, MediatorError> {
+    let mut report = PurgeReport::default();
+    let mut cursor = "-".to_string();
+    let mut orphans: Vec<String> = Vec::new();
     loop {
-        let report = store
-            .purge_folder_filtered_by(
-                did_hash,
-                folder.clone(),
-                &PurgeFilter::default(),
-                by.clone(),
-            )
+        let page = store
+            .list_messages(did_hash, folder.clone(), Some((&cursor, "+")), PURGE_PAGE)
             .await?;
-        count += report.count;
-        bytes += report.bytes;
-        // A pass caps its work and says so; stop once one finishes, or
-        // removes nothing (only undeletable messages left).
-        if !report.truncated || report.count == 0 {
+        if page.is_empty() {
             break;
         }
+        let outcomes = futures_util::future::join_all(page.iter().map(|element| {
+            // The copy in this folder, named by its recipient: the owner in
+            // an inbox, the listed recipient in an outbox.
+            let scope = match (&folder, element.to_address.as_deref()) {
+                (Folder::Inbox, _) => MessageScope::Recipient(did_hash),
+                (Folder::Outbox, Some(to)) => MessageScope::Recipient(to),
+                (Folder::Outbox, None) => MessageScope::Party(did_hash),
+            };
+            let by = by.clone();
+            async move { store.delete_message_in(&element.msg_id, scope, by).await }
+        }))
+        .await;
+
+        let mut last_id = None;
+        for (element, outcome) in page.iter().zip(outcomes) {
+            let stream_id = match folder {
+                Folder::Inbox => element.receive_id.as_deref(),
+                Folder::Outbox => element.send_id.as_deref(),
+            };
+            last_id = stream_id.map(str::to_string).or(last_id);
+            report.scanned += 1;
+            match outcome {
+                Ok(_) => {
+                    report.count += 1;
+                    report.bytes += element.size as usize;
+                }
+                Err(e) if ops::is_delete_not_found(&e) => {
+                    if let Some(id) = stream_id {
+                        orphans.push(id.to_string());
+                    }
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        msg_id = %element.msg_id,
+                        error = %e,
+                        "purge could not remove a message; it stays queued"
+                    );
+                }
+            }
+        }
+
+        let Some(next) = last_id.as_deref().and_then(exclusive_successor) else {
+            break;
+        };
+        cursor = next;
     }
-    store
-        .delete_folder_stream(session_id, did_hash, folder)
-        .await?;
-    Ok((count, bytes))
+
+    if !orphans.is_empty() {
+        store
+            .delete_folder_entries(did_hash, folder, &orphans)
+            .await?;
+    }
+    Ok(report)
 }
 
 /// What a filtered purge did, or would have done.
@@ -320,6 +394,25 @@ pub fn account_gone(session_id: &str) -> MediatorError {
         session_id.into(),
         "The session's account no longer exists; please re-authenticate".into(),
     )
+}
+
+/// The error every backend's `get_session` returns for a session that does
+/// not exist: never created, expired, deleted, or lost with the store (a
+/// flush, a memory-backed mediator's restart). Not a server fault: the
+/// client's token outlived its session and it must authenticate again.
+pub fn session_not_found(session_id: &str) -> MediatorError {
+    MediatorError::Unauthorized(
+        21,
+        session_id.into(),
+        "Session not found or expired; please re-authenticate".into(),
+    )
+}
+
+/// Whether `err` is the [`session_not_found`] or [`account_gone`] answer of
+/// `get_session`: the session is over, and the client must authenticate
+/// again. Anything else from `get_session` is a storage failure.
+pub fn is_session_over(err: &MediatorError) -> bool {
+    matches!(err, MediatorError::Unauthorized(20 | 21, ..))
 }
 
 /// The error `update_session_authenticated` returns when the challenge
@@ -424,9 +517,12 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
 
     /// One-time backend setup. Called once during mediator startup, after
     /// the store is constructed but before any request handlers spin up.
-    /// Backends use this to run their migrations, register Lua functions,
-    /// open partitions, etc. Idempotent: safe to call against an already-
-    /// initialised backend.
+    /// Backends use this for setup that needs nothing from the mediator's
+    /// configuration (Fjall: its schema migrations). The Redis store loads
+    /// its stored-function library here; its migrations, which need the
+    /// mediator and admin DIDs, run from `RedisStore::initialize_redis`,
+    /// which the mediator calls first. Idempotent: safe to call against an
+    /// already-initialised backend.
     async fn initialize(&self) -> Result<(), MediatorError>;
 
     /// Liveness check used by `/readyz`. Should be cheap (single round-trip
@@ -748,6 +844,8 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // messages (as the in-memory and Fjall stores do) would still be doing
         // a pointless read per message.
         if matches!(options.delete_policy, FetchDeletePolicy::Optimistic) {
+            let bytes = response.success.iter().map(|m| m.size as usize).sum();
+            self.count_sent(response.success.len(), bytes).await;
             return Ok(response);
         }
 
@@ -779,8 +877,38 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
                 .mark_delivered(recipient_did_hash, msg_ids, now_ms, delivered_ttl_secs)
                 .await?;
             publish_delivery_metrics(&report);
+            self.count_sent(report.first_delivered + report.redelivered, report.bytes)
+                .await;
         }
         Ok(())
+    }
+
+    /// Add a handover of `count` messages totalling `bytes` to the global
+    /// `SENT_COUNT` / `SENT_BYTES` counters.
+    ///
+    /// The contract every backend shares: the sent counters move when a
+    /// handover is recorded — by [`record_delivered`](Self::record_delivered)
+    /// (which [`fetch_messages_delivering`](Self::fetch_messages_delivering)
+    /// uses), or by an optimistic `fetch_messages_delivering`, which deletes
+    /// what it hands over — never on a plain read. Best-effort, like the
+    /// delivery stamp: a failure is logged and the handover stands.
+    async fn count_sent(&self, count: usize, bytes: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Err(e) = self
+            .stats_increment(StatCounter::SentCount, count as i64)
+            .await
+        {
+            tracing::warn!("Couldn't count {count} sent message(s): {e}");
+        }
+        if bytes > 0
+            && let Err(e) = self
+                .stats_increment(StatCounter::SentBytes, bytes as i64)
+                .await
+        {
+            tracing::warn!("Couldn't count {bytes} sent byte(s): {e}");
+        }
     }
 
     /// Record that `msg_ids` have been handed to `recipient_did_hash`: stamp
@@ -926,15 +1054,24 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         options: &FetchOptions,
     ) -> Result<GetMessagesResponse, MediatorError>;
 
-    /// Delete every message in a folder for the given DID. Returns
-    /// `(count_purged, bytes_purged)`. After purging, removes the
-    /// underlying stream key.
+    /// Delete every message in a folder for the given DID, with the owner's
+    /// authority. See [`purge_folder_by`](Self::purge_folder_by).
     async fn purge_folder(
         &self,
         session_id: &str,
         did_hash: &str,
         folder: Folder,
-    ) -> Result<(usize, usize), MediatorError>;
+    ) -> Result<PurgeReport, MediatorError> {
+        self.purge_folder_by(
+            session_id,
+            did_hash,
+            folder,
+            DeletionAuthority::Owner {
+                did_hash: did_hash.to_string(),
+            },
+        )
+        .await
+    }
 
     /// [`purge_folder`](Self::purge_folder), deleting with `by`'s authority.
     ///
@@ -945,19 +1082,18 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// account removal — must pass [`DeletionAuthority::Admin`] so senders see
     /// `discarded`, not a collection that never happened.
     ///
-    /// The default honours `by`, so a backend that doesn't override this
-    /// can't hand senders the wrong receipt: it runs the unfiltered
-    /// [`purge_folder_filtered_by`](Self::purge_folder_filtered_by) (whose
-    /// default deletes with `by`) until nothing is left, then drops the
-    /// stream key as `purge_folder` does. Backends override it with their
-    /// faster bulk path; `purge_folder` is this with the owner's authority.
+    /// Every backend runs the one algorithm in [`purge_folder_by_listing`]:
+    /// paged, already-gone counts as removed, other refusals counted in
+    /// [`PurgeReport::failed`] without stopping the purge, and only the
+    /// entries of removed messages leave the folder. A caller must check
+    /// `failed`: non-zero means messages are still queued.
     async fn purge_folder_by(
         &self,
         session_id: &str,
         did_hash: &str,
         folder: Folder,
         by: DeletionAuthority,
-    ) -> Result<(usize, usize), MediatorError> {
+    ) -> Result<PurgeReport, MediatorError> {
         purge_folder_by_listing(self, session_id, did_hash, folder, by).await
     }
 
@@ -1109,6 +1245,16 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         Ok(report)
     }
 
+    /// Remove the entries `stream_ids` from `did_hash`'s `folder` stream,
+    /// leaving the messages they name alone. A purge uses it for entries
+    /// whose message is already gone. An id not in the stream is ignored.
+    async fn delete_folder_entries(
+        &self,
+        did_hash: &str,
+        folder: Folder,
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError>;
+
     /// Remove the stream key for a folder without purging the messages
     /// it references. Used when account removal needs to drop the
     /// recipient's inbox view but leave the actual messages in place
@@ -1174,7 +1320,11 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// A `ChallengeSent` session may have no account yet (accounts are
     /// created once the challenge is answered) and is returned with default
     /// ACLs. Any other session whose DID has no account fails with
-    /// [`account_gone`]. An empty `did` skips the join (store-internal use).
+    /// [`account_gone`]; a DID record without a role or ACLs is not an
+    /// account. An empty `did` skips the join (store-internal use).
+    ///
+    /// A session that does not exist (or has expired) fails with
+    /// [`session_not_found`]. Every other error is a storage failure.
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError>;
 
     /// Delete a session record. Used for logout and as the *first* step
@@ -1886,6 +2036,24 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         self.forward_queue_delete(stream_ids).await
     }
 
+    /// Remove consumers of `group_name` that hold no entries and have been
+    /// idle for at least `min_idle`, other than `keep_consumer` (the
+    /// caller's own). Every processor run reads under a consumer name of its
+    /// own, so a backend that records consumers would otherwise keep one per
+    /// restart for ever. A consumer still holding entries is never removed:
+    /// its entries are handed on by
+    /// [`forward_queue_autoclaim`](Self::forward_queue_autoclaim). Returns
+    /// how many were removed. The default, for a backend that keeps no
+    /// consumer records, removes nothing.
+    async fn forward_queue_prune_consumers(
+        &self,
+        _group_name: &str,
+        _keep_consumer: &str,
+        _min_idle: Duration,
+    ) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
     /// Reclaim entries idle for longer than `min_idle` (typical: a
     /// crashed/timed-out consumer). The reclaiming consumer becomes the
     /// new owner of the returned entries.
@@ -2313,7 +2481,12 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // its answer: a challenge is answered once. Backends without an
         // atomic rename override this (the delete below and a second
         // caller's read can still interleave here).
-        let mut session = self.get_session(old_session_id, did).await?;
+        let mut session = match self.get_session(old_session_id, did).await {
+            Err(MediatorError::Unauthorized(21, ..)) => {
+                return Err(session_not_awaiting_answer(old_session_id));
+            }
+            other => other?,
+        };
         if session.state != SessionState::ChallengeSent {
             return Err(session_not_awaiting_answer(old_session_id));
         }

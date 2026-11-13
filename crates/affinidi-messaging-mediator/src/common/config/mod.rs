@@ -87,20 +87,45 @@ fn did_resolver_cache_config(raw: &DIDResolverConfig) -> DIDCacheConfig {
 /// `DatabaseConfigRaw` lives in the config crate and `DatabaseConfig` in
 /// mediator-common, so this is a free function (the orphan rule forbids a
 /// `TryFrom` impl here). Mirrors mediator-common's former
-/// `TryFrom<DatabaseConfigRaw>` exactly: the circuit-breaker tuning is fixed
-/// here and `database_timeout` falls back to 2 on a parse error.
+/// `TryFrom<DatabaseConfigRaw>`: `database_timeout` falls back to 2 on a parse
+/// error, and the circuit-breaker tuning to 5 failures and 10 seconds when
+/// absent or unparseable (a threshold of 0 is taken as 1). An empty
+/// `functions_file` means the built-in stored-function library.
 fn database_config_from_raw(
     raw: affinidi_messaging_mediator_config::DatabaseConfigRaw,
 ) -> DatabaseConfig {
     let cluster_mode =
         affinidi_messaging_mediator_common::database::config::parse_cluster_mode(&raw.cluster_mode);
+    let parsed = |raw: &str, default: u64, name: &str| -> u64 {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return default;
+        }
+        raw.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Could not parse database.{name} value '{raw}', using default: {default}"
+            );
+            default
+        })
+    };
+    let functions_file = raw.functions_file.trim();
     DatabaseConfig {
-        functions_file: Some(raw.functions_file),
+        functions_file: (!functions_file.is_empty()).then(|| functions_file.to_string()),
         database_url: raw.database_url,
         database_timeout: raw.database_timeout.parse().unwrap_or(2),
         cluster_mode,
-        circuit_breaker_threshold: 5,
-        circuit_breaker_recovery_secs: 10,
+        circuit_breaker_threshold: u32::try_from(parsed(
+            &raw.circuit_breaker_threshold,
+            5,
+            "circuit_breaker_threshold",
+        ))
+        .unwrap_or(u32::MAX)
+        .max(1),
+        circuit_breaker_recovery_secs: parsed(
+            &raw.circuit_breaker_recovery_secs,
+            10,
+            "circuit_breaker_recovery_secs",
+        ),
     }
 }
 
@@ -1657,7 +1682,41 @@ mod database_config_tests {
             database_timeout: "2".into(),
             scripts_path: None,
             cluster_mode: cluster_mode.into(),
+            circuit_breaker_threshold: String::new(),
+            circuit_breaker_recovery_secs: String::new(),
         }
+    }
+
+    #[test]
+    fn circuit_breaker_tuning_defaults_and_parses() {
+        let config = database_config_from_raw(raw(""));
+        assert_eq!(config.circuit_breaker_threshold, 5);
+        assert_eq!(config.circuit_breaker_recovery_secs, 10);
+
+        let mut tuned = raw("");
+        tuned.circuit_breaker_threshold = "3".into();
+        tuned.circuit_breaker_recovery_secs = "30".into();
+        let config = database_config_from_raw(tuned);
+        assert_eq!(config.circuit_breaker_threshold, 3);
+        assert_eq!(config.circuit_breaker_recovery_secs, 30);
+
+        let mut bad = raw("");
+        bad.circuit_breaker_threshold = "0".into();
+        bad.circuit_breaker_recovery_secs = "soon".into();
+        let config = database_config_from_raw(bad);
+        assert_eq!(config.circuit_breaker_threshold, 1);
+        assert_eq!(config.circuit_breaker_recovery_secs, 10);
+    }
+
+    #[test]
+    fn an_empty_functions_file_means_the_built_in_library() {
+        let mut unset = raw("");
+        unset.functions_file = " ".into();
+        assert_eq!(database_config_from_raw(unset).functions_file, None);
+        assert_eq!(
+            database_config_from_raw(raw("")).functions_file.as_deref(),
+            Some("./atm-functions.lua")
+        );
     }
 
     #[test]

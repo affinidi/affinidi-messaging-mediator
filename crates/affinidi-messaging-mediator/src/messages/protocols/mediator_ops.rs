@@ -21,7 +21,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     DeletionAuthority, DeliveryState, MessageRef, MessageScope, SentMessageState,
 };
-use affinidi_messaging_mediator_common::store::{PurgeFilter, PurgeReport, ops};
+use affinidi_messaging_mediator_common::store::{PurgeFilter, ops};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_mediator_common::types::audit::AuditAction;
 use affinidi_messaging_mediator_common::types::messages::{Folder, MessageProtocol};
@@ -1317,17 +1317,10 @@ pub(crate) async fn consume_queue_purge(
             .purge_folder_filtered_by(&target, folder.clone(), &filter, by)
             .await?
     } else {
-        let (count, bytes) = state
+        state
             .database
             .purge_folder_by(&session.session_id, &target, folder.clone(), by)
-            .await?;
-        PurgeReport {
-            count,
-            bytes,
-            scanned: count,
-            failed: 0,
-            truncated: false,
-        }
+            .await?
     };
 
     let queue_name = if matches!(folder, Folder::Outbox) {

@@ -322,6 +322,35 @@ pub fn delete_permission_denied(message_hash: &str, request_msg_id: Option<&str>
     )
 }
 
+/// One bound of a [`list_messages`](crate::store::MediatorStore::list_messages)
+/// range, as `(ms, seq)`: `-` (the start of the stream), `+` (its end), a
+/// stream id `<ms>-<seq>`, or a bare `<ms>`, which as a start means
+/// `<ms>-0` and as an end `<ms>-<max>` (Redis's reading). Anything else is
+/// refused, the same on every backend, rather than read as unbounded.
+pub fn parse_range_bound(bound: &str, is_end: bool) -> Result<(u64, u64), MediatorError> {
+    let refuse = || {
+        MediatorError::RequestDataError(
+            22,
+            "NA".into(),
+            format!("Invalid message range bound ({bound}): expected -, +, <ms> or <ms>-<seq>"),
+        )
+    };
+    match bound {
+        "-" => Ok((0, 0)),
+        "+" => Ok((u64::MAX, u64::MAX)),
+        _ => match bound.split_once('-') {
+            Some((ms, seq)) => Ok((
+                ms.parse().map_err(|_| refuse())?,
+                seq.parse().map_err(|_| refuse())?,
+            )),
+            None => {
+                let ms = bound.parse().map_err(|_| refuse())?;
+                Ok((ms, if is_end { u64::MAX } else { 0 }))
+            }
+        },
+    }
+}
+
 /// Whether a delete failed only because the message was already gone.
 ///
 /// Matched on the problem report's descriptor, not on its rendered text, so a
@@ -337,6 +366,18 @@ pub fn is_delete_not_found(err: &MediatorError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_bounds_parse_the_same_everywhere() {
+        assert_eq!(parse_range_bound("-", false).unwrap(), (0, 0));
+        assert_eq!(parse_range_bound("+", true).unwrap(), (u64::MAX, u64::MAX));
+        assert_eq!(parse_range_bound("12-3", false).unwrap(), (12, 3));
+        assert_eq!(parse_range_bound("12", false).unwrap(), (12, 0));
+        assert_eq!(parse_range_bound("12", true).unwrap(), (12, u64::MAX));
+        assert!(parse_range_bound("(12-3", false).is_err());
+        assert!(parse_range_bound("abc", true).is_err());
+        assert!(parse_range_bound("1-x", true).is_err());
+    }
 
     #[test]
     fn the_recipient_removing_it_is_collection() {

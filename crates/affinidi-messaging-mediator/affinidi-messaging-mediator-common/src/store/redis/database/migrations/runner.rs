@@ -13,20 +13,110 @@ use crate::store::redis::database::Database;
 use crate::store::redis::init::RedisInitConfig;
 use semver::Version;
 use std::collections::HashSet;
+use std::time::Duration;
 use tracing::{info, warn};
 
 const MIGRATIONS_SET_KEY: &str = "SCHEMA_MIGRATIONS";
 
-/// Run all pending migrations in order.
+/// Held by the instance running migrations, so instances starting together
+/// do not run them concurrently. Expires on its own if its holder dies.
+const MIGRATION_LOCK_KEY: &str = "SCHEMA_MIGRATIONS:LOCK";
+
+/// How long the migration lock is held at most.
+const MIGRATION_LOCK_TTL: Duration = Duration::from_secs(300);
+
+/// How long an instance waits for another's migrations before giving up.
+const MIGRATION_LOCK_WAIT: Duration = Duration::from_secs(600);
+
+/// Release the lock KEYS[1] only if ARGV[1] still holds it.
+static RELEASE_LOCK: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#,
+    )
+});
+
+/// Run all pending migrations in order, holding [`MIGRATION_LOCK_KEY`].
 /// Called during mediator startup from database initialization.
+///
+/// Refuses to start when the database records a migration this build does
+/// not know: a newer mediator has migrated the schema, and this one would
+/// run against data it was not written for.
 pub(crate) async fn run_pending_migrations(
     db: &Database,
     config: &RedisInitConfig,
 ) -> Result<(), MediatorError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let deadline = std::time::Instant::now() + MIGRATION_LOCK_WAIT;
+    loop {
+        let mut conn = db.get_connection().await?;
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(MIGRATION_LOCK_KEY)
+            .arg(&token)
+            .arg("NX")
+            .arg("PX")
+            .arg(MIGRATION_LOCK_TTL.as_millis() as u64)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    14,
+                    "migrations".into(),
+                    &e,
+                    format!("Failed to take the migration lock: {e}"),
+                )
+            })?;
+        if acquired.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(MediatorError::DatabaseError(
+                14,
+                "migrations".into(),
+                format!(
+                    "Another instance has held the migration lock ({MIGRATION_LOCK_KEY}) for over {}s",
+                    MIGRATION_LOCK_WAIT.as_secs()
+                ),
+            ));
+        }
+        info!("Another instance is running database migrations; waiting for it");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let result = run_locked(db, config).await;
+
+    let mut conn = db.get_connection().await?;
+    if let Err(e) = RELEASE_LOCK
+        .key(MIGRATION_LOCK_KEY)
+        .arg(&token)
+        .invoke_async::<i64>(&mut conn)
+        .await
+    {
+        warn!("Couldn't release the migration lock (it expires on its own): {e}");
+    }
+    result
+}
+
+async fn run_locked(db: &Database, config: &RedisInitConfig) -> Result<(), MediatorError> {
     let migrations = all_migrations();
 
     // Bootstrap: detect legacy schema version system and seed applied set
     let applied = bootstrap_if_needed(db, &migrations).await?;
+
+    let unknown = unknown_applied(&applied, &migrations);
+    if !unknown.is_empty() {
+        return Err(MediatorError::ConfigError(
+            2,
+            "migrations".into(),
+            format!(
+                "The database records schema migration(s) {unknown:?} that this mediator does not know: a newer mediator has migrated it. Run that version (or newer)."
+            ),
+        ));
+    }
 
     let pending: Vec<&MigrationDef> = migrations
         .iter()
@@ -66,6 +156,14 @@ pub(crate) async fn run_pending_migrations(
     );
 
     Ok(())
+}
+
+/// Applied migration ids this build does not define, in order.
+fn unknown_applied(applied: &HashSet<u32>, migrations: &[MigrationDef]) -> Vec<u32> {
+    let known: HashSet<u32> = migrations.iter().map(|m| m.id).collect();
+    let mut unknown: Vec<u32> = applied.difference(&known).copied().collect();
+    unknown.sort_unstable();
+    unknown
 }
 
 /// Get the set of applied migration IDs from Redis.
@@ -217,5 +315,19 @@ async fn bootstrap_if_needed(
         // Fresh database — no legacy version, no migrations applied yet
         info!("Fresh database detected — no migrations applied yet");
         Ok(HashSet::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_applied_migration_this_build_lacks_is_reported() {
+        let migrations = all_migrations();
+        let mut applied: HashSet<u32> = migrations.iter().map(|m| m.id).collect();
+        assert!(unknown_applied(&applied, &migrations).is_empty());
+        applied.insert(9_999);
+        assert_eq!(unknown_applied(&applied, &migrations), vec![9_999]);
     }
 }
