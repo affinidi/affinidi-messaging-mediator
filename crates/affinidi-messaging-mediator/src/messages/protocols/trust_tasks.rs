@@ -61,9 +61,7 @@ use crate::common::roles;
 use crate::common::session::Session;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::trust_task_versions::NewerVersion;
-use crate::messages::protocols::{
-    mediator_ops, trust_task_error, trust_task_sign, trust_task_verify,
-};
+use crate::messages::protocols::{mediator_ops, trust_task_sign, trust_task_verify};
 #[cfg(feature = "didcomm")]
 use crate::messages::{ProcessMessageResponse, WrapperType};
 
@@ -150,7 +148,7 @@ pub(crate) async fn process(
     let request_type = doc.type_uri.to_string();
     // A request that asks to be refused with a `trust-task-error` document
     // is answered with one, in place of the problem report.
-    let refusing = trust_task_error::Refusing::asked_by(&doc);
+    let refusing = crate::messages::protocols::trust_task_error::Refusing::asked_by(&doc);
     let consumed = consume(
         doc,
         &message.body,
@@ -2415,7 +2413,7 @@ pub(crate) fn tt_problem(
 /// A mux task's request-level refusal as a problem report. An
 /// `epochMismatch` carries the epoch in force as its first argument, which a
 /// `trust-task-error` turns into `details.currentEpoch`
-/// ([`trust_task_error`]); the comment says it too, for older clients.
+/// ([`trust_task_error`](crate::messages::protocols::trust_task_error)); the comment says it too, for older clients.
 fn task_refusal(session: &Session, e: crate::mux::tasks::TaskError) -> MediatorError {
     let args = e
         .current_epoch
