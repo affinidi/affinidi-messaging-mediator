@@ -1,0 +1,63 @@
+name: Fuzz
+
+# Runs the cargo-fuzz targets in fuzz/ (the TSP meta-envelope, DIDComm message
+# and JWS parsers, and the inbound protocol classifier: what the mediator runs
+# first on bytes from the network) for a few minutes each. Weekly and on
+# demand: a time-boxed run finds shallow crashes, and these parsers change
+# rarely here (most live in affinidi-tdk-rs).
+#
+# A crash uploads the reproducer as an artifact. Reproduce locally with
+#   cargo +nightly fuzz run --fuzz-dir fuzz <target> <artifact>
+#
+# Not part of ci.yml, so it never gates `nightly`.
+
+on:
+  schedule:
+    # 03:00 UTC Sundays.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [tsp_meta_envelope, didcomm_message_json, didcomm_jws, envelope_detect]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # libFuzzer needs nightly (-Zsanitizer). Invoked as `cargo +nightly`
+      # because rust-toolchain.toml would otherwise select the stable pin.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          # The version is whatever this pinned install-action release ships.
+          tool: cargo-fuzz
+      - uses: ./.github/actions/native-deps
+      - name: cargo fuzz run ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
+        run: |
+          cargo +nightly fuzz run --fuzz-dir fuzz "${{ matrix.target }}" -- \
+            -max_total_time="$SECONDS_PER_TARGET"
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
