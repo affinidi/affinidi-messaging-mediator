@@ -9,8 +9,10 @@ at the worst moment — mid-cut, or mid-publish:
 
   1. toolchain sync — rust-toolchain.toml's `channel` is the source of truth.
      Every `toolchain: "X"` in .github/workflows/* must equal it, the workspace
-     `rust-version` must not exceed it, and the `FROM rust:<major.minor>` the
-     mediator-setup wizard writes into generated Dockerfiles must match it.
+     `rust-version` must not exceed it, the production image's builder
+     (`FROM rust:X` in docker/mediator.Dockerfile) must equal it, and the
+     `FROM rust:<major.minor>` the mediator-setup wizard writes into generated
+     Dockerfiles must match it.
   2. lockstep — every member inherits `version.workspace = true`, and every
      internal dependency requires exactly the workspace version
      (`{ version = "0.42.0", path = ... }`). `set_version` moves them together;
@@ -44,6 +46,7 @@ from changelog_fragments import POINTER, fragment_problems, unreleased_is_pointe
 from release_lib import ROOT, lockstep_problems, parse_release, unreleased_split, workspace_version  # noqa: E402
 
 SETUP_DOCKER_SRC = "crates/affinidi-messaging-mediator/tools/mediator-setup/src/docker.rs"
+IMAGE_DOCKERFILE = "docker/mediator.Dockerfile"
 
 
 def vtuple(v):
@@ -69,6 +72,20 @@ def toolchain_problems():
     if rv and re.fullmatch(r"\d+\.\d+(\.\d+)?", rv) and re.fullmatch(r"\d+\.\d+(\.\d+)?", channel):
         if vtuple(rv) > vtuple(channel):
             problems.append(f"Cargo.toml rust-version {rv} is above the toolchain channel {channel}")
+    image_dockerfile = ROOT / IMAGE_DOCKERFILE
+    if image_dockerfile.exists():
+        found = False
+        for lineno, line in enumerate(image_dockerfile.read_text().splitlines(), 1):
+            m = re.match(r"\s*FROM\s+rust:(\d+\.\d+(?:\.\d+)?)", line, re.I)
+            if m:
+                found = True
+                if m.group(1) != channel:
+                    problems.append(f"{IMAGE_DOCKERFILE}:{lineno}: FROM rust:{m.group(1)}, expected rust:{channel}")
+            m = re.match(r"\s*ARG\s+RUST_VERSION=(\S+)", line)
+            if m and m.group(1) != channel:
+                problems.append(f"{IMAGE_DOCKERFILE}:{lineno}: RUST_VERSION={m.group(1)}, expected {channel}")
+        if not found:
+            problems.append(f"{IMAGE_DOCKERFILE}: no literal `FROM rust:<version>` line for the toolchain guard to check")
     docker_src = ROOT / SETUP_DOCKER_SRC
     if docker_src.exists():
         mm = ".".join(channel.split(".")[:2])

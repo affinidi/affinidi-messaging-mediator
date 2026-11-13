@@ -47,14 +47,49 @@ process-wide rustls provider.
 
 - From source: `cargo run -p affinidi-messaging-mediator --release`, see the
   [mediator README](crates/affinidi-messaging-mediator/README.md).
-- Container: `ghcr.io/affinidi/messaging-mediator:<version>`; see
-  [`docker/`](docker) and `docker-compose.test.yml` for a local stack.
+- Local quickstart: `docker compose -f docker/quickstart/docker-compose.yml up --build`
+  builds the image, generates a fresh mediator identity on first start, and
+  serves it on `http://localhost:7037/mediator/v1/` (loopback only). See the
+  header of [`docker/quickstart/docker-compose.yml`](docker/quickstart/docker-compose.yml).
+  `docker-compose.test.yml` is the CI test harness: its keys are committed to
+  this repository, so never use it as a local or shared stack.
+- Container: `ghcr.io/affinidi/messaging-mediator:<version>`. The image runs as
+  UID:GID `10001:10001` (mounted config and secrets must be readable by it) and
+  declares a `HEALTHCHECK` that runs `mediator healthcheck` (a GET of `livez`).
   Release images (`vX.Y.Z`, `vX.Y.Z-rc.N`) are built only from their release
   tag, and each carries a signed build-provenance attestation. To be sure a
   deployment runs the image you checked, pin it by digest
   (`ghcr.io/affinidi/messaging-mediator@sha256:…`) and check it with
   `gh attestation verify oci://ghcr.io/affinidi/messaging-mediator@sha256:… --owner affinidi`.
 - First-time configuration: `cargo run -p affinidi-messaging-mediator-setup`.
+
+### Release profile
+
+Release builds of this workspace (the container image, `cargo build
+--release` here) use:
+
+```toml
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+```
+
+Cargo applies a workspace's profile only when building that workspace, so
+`cargo install affinidi-messaging-mediator` (or a service that embeds the
+mediator through `MediatorBuilder`) gets cargo's default release profile
+instead: `opt-level = 3` with no LTO and 16 codegen units. To build the same
+binary the image ships:
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=thin \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+CARGO_PROFILE_RELEASE_STRIP=symbols \
+  cargo install affinidi-messaging-mediator --locked
+```
+
+An embedding service sets the same keys in its own `[profile.release]`.
 
 ## Releases and support
 
