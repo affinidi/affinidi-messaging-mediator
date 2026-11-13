@@ -34,6 +34,7 @@ mod forward_recipient_admission;
 mod forwarding_abandonment_report;
 mod forwarding_processor;
 mod health_endpoints;
+mod http_hardening;
 mod lifecycle;
 mod local_did_websocket;
 mod mediator_ops;
