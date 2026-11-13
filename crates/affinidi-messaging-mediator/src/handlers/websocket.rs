@@ -1855,7 +1855,7 @@ async fn handle_socket(
                 _ = mux_sweep.tick(), if mux_conn.is_some() => {
                     woke = tokio::time::Instant::now();
                     if let Some(conn) = &mux_conn {
-                        crate::mux::connection::sweep(&state, conn, false).await;
+                        crate::mux::connection::spawn_sweep(&state, conn, false);
                     }
                 }
                 // A drain left undone for live frames resumes after the select
@@ -1867,7 +1867,7 @@ async fn handle_socket(
                 _ = mux_revalidate.tick(), if mux_conn.is_some() => {
                     woke = tokio::time::Instant::now();
                     if let Some(conn) = &mux_conn {
-                        crate::mux::connection::sweep(&state, conn, true).await;
+                        crate::mux::connection::spawn_sweep(&state, conn, true);
                     }
                 }
                 _ = mux_standing.tick(), if mux_conn.is_some() => {

@@ -792,11 +792,52 @@ async fn take_changes(
     (joined, left)
 }
 
+/// Store reads, or DID resolutions, one [`sweep`] keeps in flight at once.
+const SWEEP_PARALLEL: usize = 8;
+
+/// [`sweep`] as its own task, so the socket loop that calls it keeps reading
+/// frames, writing queued ones and sending pings meanwhile (#132). Leavers
+/// reach the loop as they do from any other task: queued on the connection
+/// for [`drain_changes`], with its `notify` woken. Does nothing while a sweep
+/// of the same kind is still running on the connection.
+pub fn spawn_sweep(state: &SharedData, conn: &Arc<MuxConn>, revalidate: bool) {
+    use std::sync::atomic::Ordering;
+    if sweep_flag(conn, revalidate).swap(true, Ordering::AcqRel) {
+        return;
+    }
+    /// Lowers the flag however the sweep ends, a panic included, so one
+    /// failed sweep does not stop every later one.
+    struct Running(Arc<MuxConn>, bool);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            sweep_flag(&self.0, self.1).store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let state = state.clone();
+    let running = Running(conn.clone(), revalidate);
+    tokio::spawn(async move {
+        sweep(&state, &running.0, revalidate).await;
+        drop(running);
+    });
+}
+
+/// The connection's running flag for one kind of sweep.
+fn sweep_flag(conn: &MuxConn, revalidate: bool) -> &std::sync::atomic::AtomicBool {
+    if revalidate {
+        &conn.revalidate_running
+    } else {
+        &conn.sweep_running
+    }
+}
+
 /// Periodic sweep: expire lapsed members and, when `revalidate` is set,
 /// re-check each grant-admitted member's signing key (§5.1). Leavers are
 /// queued on the connection for [`drain_changes`]. Account standing has its
-/// own pass, [`standing_pass`], run off the socket loop.
+/// own pass, [`standing_pass`]. Run it off the socket loop ([`spawn_sweep`]):
+/// the store reads and DID resolutions are bounded-parallel, not sequential,
+/// but with a thousand members they are still not free.
 pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
+    use futures_util::StreamExt;
     let streaming = state.streaming_task.as_ref();
     let now = state.clock.unix_secs();
     let expired: Vec<String> = {
@@ -827,25 +868,31 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
             .collect()
     };
     let limits = state.config.limits.mux.store_limits();
-    for (did_hash, grant_id) in by_grant {
-        let rec = match affinidi_messaging_mediator_common::store::mux::load(
-            &*state.database,
-            &did_hash,
-            &limits,
-            now,
-        )
-        .await
-        {
-            Ok(rec) => rec,
-            // Store unavailable: keep the member and look again next sweep.
-            Err(e) => {
-                debug!("mux grant re-check deferred: {e}");
-                continue;
+    let limits = &limits;
+    let leaving: Vec<(String, String, LeaveReason)> = futures_util::stream::iter(by_grant)
+        .map(|(did_hash, grant_id)| async move {
+            match affinidi_messaging_mediator_common::store::mux::load(
+                &*state.database,
+                &did_hash,
+                limits,
+                now,
+            )
+            .await
+            {
+                Ok(rec) => grant_leave_reason(&rec, &grant_id, now)
+                    .map(|reason| (did_hash, grant_id, reason)),
+                // Store unavailable: keep the member and look again next sweep.
+                Err(e) => {
+                    debug!("mux grant re-check deferred: {e}");
+                    None
+                }
             }
-        };
-        let Some(reason) = grant_leave_reason(&rec, &grant_id, now) else {
-            continue;
-        };
+        })
+        .buffer_unordered(SWEEP_PARALLEL)
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
+    for (did_hash, grant_id, reason) in leaving {
         conn.detach_grant_id(streaming, &did_hash, &grant_id, reason)
             .await;
     }
@@ -861,8 +908,19 @@ pub async fn sweep(state: &SharedData, conn: &MuxConn, revalidate: bool) {
     // Snapshot, then check without the lock (DID resolution is network I/O).
     let to_check: Vec<MuxMember> = conn.session.lock().await.members().cloned().collect();
     let verifier = StatementVerifier::new(state.did_resolver.clone());
-    for m in to_check {
-        match super::grants::key_is_current(&verifier, &m.kid, &m.key_fp).await {
+    // Resolved a few at a time, so one slow `did:web` member holds up its
+    // own check rather than every other member's.
+    let verifier_ref = &verifier;
+    let checked: Vec<(MuxMember, _)> = futures_util::stream::iter(to_check)
+        .map(|m| async move {
+            let current = super::grants::key_is_current(verifier_ref, &m.kid, &m.key_fp).await;
+            (m, current)
+        })
+        .buffer_unordered(SWEEP_PARALLEL)
+        .collect()
+        .await;
+    for (m, current) in checked {
+        match current {
             Ok(true) => {}
             Ok(false) => {
                 if let MuxSource::Grant { .. } = m.source {

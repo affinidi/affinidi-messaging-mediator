@@ -80,6 +80,11 @@ pub struct MuxConn {
     /// Set while a standing pass over every member is running, so a slow
     /// store never stacks one pass on another.
     pub standing_pass: AtomicBool,
+    /// Set while a periodic sweep ([`super::connection::spawn_sweep`]) is
+    /// running, one flag per kind, so a slow store or resolver never stacks
+    /// one sweep on another.
+    pub sweep_running: AtomicBool,
+    pub revalidate_running: AtomicBool,
 }
 
 /// [`MuxConn::standing_seen`]: one member's last good standing check.
@@ -109,6 +114,8 @@ impl MuxConn {
             opened_at: 0,
             standing_seen: Mutex::new(std::collections::HashMap::new()),
             standing_pass: AtomicBool::new(false),
+            sweep_running: AtomicBool::new(false),
+            revalidate_running: AtomicBool::new(false),
         }
     }
 
