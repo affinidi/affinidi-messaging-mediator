@@ -358,8 +358,240 @@ impl KeyStoragePhase {
     }
 }
 
+/// One entry of a step's option list: the value it selects, the label and
+/// one-line help shown in the list, and the longer text for the info box.
+///
+/// A step's list, its Enter handling and its default highlight are all
+/// derived from one table of these, so they cannot drift apart (they did:
+/// Enter mapped index 6 to `file://` while the default highlight put
+/// `file://` at index 5, which was Kubernetes).
+#[derive(Debug, Clone, Copy)]
+pub struct Choice<T: Copy + 'static> {
+    pub value: T,
+    pub label: &'static str,
+    pub help: &'static str,
+    pub info: &'static str,
+}
+
+impl<T: Copy + PartialEq + 'static> Choice<T> {
+    pub fn option(&self) -> SelectionOption {
+        SelectionOption::new(self.label, self.help)
+    }
+}
+
+/// Index of the entry holding `value`.
+pub fn index_of<T: Copy + PartialEq + 'static>(choices: &[Choice<T>], value: T) -> Option<usize> {
+    choices.iter().position(|c| c.value == value)
+}
+
+/// [`index_of`] for the string-valued tables, comparing with any `&str`.
+pub fn index_of_str(choices: &[Choice<&'static str>], value: &str) -> Option<usize> {
+    choices.iter().position(|c| c.value == value)
+}
+
+pub const DEPLOYMENT_CHOICES: [Choice<&str>; 3] = [
+    Choice {
+        value: DEPLOYMENT_LOCAL,
+        label: "Local development",
+        help: "Desktop, quick start — ideal for testing",
+        info: "Starts from: VTA online, OS keyring for secrets, no SSL, local Redis, and an \
+               open network (any DID may message any other). Every choice can be changed on \
+               the following screens.",
+    },
+    Choice {
+        value: DEPLOYMENT_SERVER,
+        label: "Headless server",
+        help: "Production deployment on cloud or bare metal",
+        info: "Starts from: VTA online, OS keyring for secrets, no SSL (TLS proxy), local \
+               Redis, and a closed network — DIDs exchange messages only with an explicit ACL \
+               grant. Every choice can be changed on the following screens.",
+    },
+    Choice {
+        value: DEPLOYMENT_CONTAINER,
+        label: "Container",
+        help: "Docker image for container orchestration",
+        info: "Same defaults as a server (including the closed network), plus a Dockerfile and docker-compose.yml next to \
+               mediator.toml. The image holds only the binary; the config directory and keys \
+               are mounted. The OS keyring does not exist inside a container — pick a secret \
+               manager or Kubernetes Secrets.",
+    },
+];
+
+pub const KEY_STORAGE_CHOICES: [Choice<&str>; 7] = [
+    Choice {
+        value: STORAGE_KEYRING,
+        label: "OS Keyring (keyring://) [recommended for desktop]",
+        help: "macOS Keychain, Linux Secret Service, Windows Credential Manager",
+        info: "Uses the OS keyring (macOS Keychain, Linux Secret Service, Windows Credential \
+               Manager). Good for desktop development and single-host servers.",
+    },
+    Choice {
+        value: STORAGE_AWS,
+        label: "AWS Secrets Manager (aws_secrets://)",
+        help: "AWS cloud production",
+        info: "Store secrets in AWS Secrets Manager. Requires AWS credentials configured. \
+               Suitable for AWS production.",
+    },
+    Choice {
+        value: STORAGE_GCP,
+        label: "Google Cloud Secret Manager (gcp_secrets://)",
+        help: "GCP cloud production",
+        info: "Store secrets in Google Cloud Secret Manager. Auth via Application Default \
+               Credentials (GOOGLE_APPLICATION_CREDENTIALS / `gcloud auth application-default \
+               login` / GKE workload identity).",
+    },
+    Choice {
+        value: STORAGE_AZURE,
+        label: "Azure Key Vault (azure_keyvault://)",
+        help: "Azure cloud production",
+        info: "Store secrets in Azure Key Vault. Auth via Azure CLI / azd developer \
+               credentials (`az login`). Sovereign clouds supported via full DNS in the vault \
+               field.",
+    },
+    Choice {
+        value: STORAGE_VAULT,
+        label: "HashiCorp Vault (vault://)",
+        help: "Enterprise / multi-cloud (KV v2 only); token / Kubernetes / AppRole auth",
+        info: "Store secrets in HashiCorp Vault (KV v2): token (VAULT_TOKEN), Kubernetes or \
+               AppRole auth. The mount point must already exist on the server.",
+    },
+    Choice {
+        value: STORAGE_K8S,
+        label: "Kubernetes Secrets (k8s://)",
+        help: "Native Secret object via the K8s API (in-cluster ServiceAccount)",
+        info: "Store every key in one Kubernetes Secret, through the API with the pod's \
+               ServiceAccount (or kubeconfig). The namespace defaults to the ServiceAccount's.",
+    },
+    Choice {
+        value: STORAGE_FILE,
+        label: "Local file (file://)",
+        help: "Stored in secrets.json — DEV ONLY, requires explicit confirmation",
+        info: "Secrets written to a local JSON file, optionally passphrase-encrypted. \
+               Unencrypted it is DEV ONLY — anyone with file access can read the private keys. \
+               The wizard requires an explicit confirmation before accepting this choice.",
+    },
+];
+
+/// The VTA step's first question. `None` is "No VTA".
+pub const VTA_INTENT_CHOICES: [Choice<Option<VtaIntent>>; 4] = [
+    Choice {
+        value: Some(VtaIntent::FullSetup),
+        label: "Full setup — VTA mints my mediator DID",
+        help: "VTA renders a DID template, mints integration + admin keys, issues an \
+               authorisation VC. The wizard will skip the DID step when this path is chosen.",
+        info: "The mediator's integration DID, admin DID, and VTA trust bundle are all issued \
+               by the VTA via a template render. The wizard skips the DID step when this path \
+               is chosen.",
+    },
+    Choice {
+        value: Some(VtaIntent::AdminOnly),
+        label: "Admin credential only — I'll bring my own DID",
+        help: "Mediator keeps the DID from the DID step; the VTA only supplies an admin \
+               credential used for VTA admin APIs.",
+        info: "The mediator keeps the DID you configure in the next step. The VTA only \
+               supplies an admin credential used to authenticate against VTA admin APIs.",
+    },
+    Choice {
+        value: Some(VtaIntent::OfflineExport),
+        label: "Pick up pre-provisioned mediator (offline export)",
+        help: "VTA already provisioned the context + mediator DID + keys (e.g. during VTA \
+               bootstrap). Wizard writes a request; VTA admin runs `vta contexts reprovision \
+               --id <ctx> --recipient <file>` and returns the existing material in a \
+               ContextProvision bundle. Always offline.",
+        info: "The VTA already holds this mediator's DID and keys. The wizard writes a request \
+               file; the VTA admin re-exports the existing material sealed to it. Use for \
+               migrations and restores.",
+    },
+    Choice {
+        value: None,
+        label: "No VTA",
+        help: "Manage keys and DIDs independently (local dev, cloud secret stores).",
+        info: "Keys and DIDs are generated locally or stored in cloud secret managers. You are \
+               responsible for backup and rotation.",
+    },
+];
+
+pub const SSL_CHOICES: [Choice<&str>; 3] = [
+    Choice {
+        value: SSL_NONE,
+        label: "No SSL (use TLS-terminating proxy)",
+        help: "Recommended: nginx, Caddy, AWS ALB handle TLS",
+        info: "Run the mediator behind a reverse proxy (nginx, Caddy, AWS ALB) that terminates \
+               TLS. The mediator runs plain HTTP. This is the recommended approach.",
+    },
+    Choice {
+        value: SSL_EXISTING,
+        label: "Provide existing certificates",
+        help: "Use your own SSL certificate and key files",
+        info: "Provide paths to existing SSL certificate and key files.",
+    },
+    Choice {
+        value: SSL_SELF_SIGNED,
+        label: "Generate self-signed certificates",
+        help: "Local development only — not for production",
+        info: "Generate self-signed certificates for local development. Browsers will show \
+               security warnings.",
+    },
+];
+
+const DID_CHOICE_VTA: Choice<&str> = Choice {
+    value: DID_VTA,
+    label: "Configure via VTA (recommended)",
+    help: "Centralized key management — VTA creates and hosts your DID",
+    info: "VTA creates and manages the mediator's DID and keys centrally. Uses the built-in \
+           `didcomm-mediator` template. To customise: `pnm did-templates init didcomm-mediator \
+           > custom.json`, edit, then upload under the same name — context/global scope \
+           shadows the built-in automatically.",
+};
+const DID_CHOICE_WEBVH: Choice<&str> = Choice {
+    value: DID_WEBVH,
+    label: "Generate did:webvh",
+    help: "Production — generates keys you manage yourself; you host did.jsonl",
+    info: "did:webvh requires a webvh server (or the mediator itself) to host the DID log. \
+           Rendered locally from the `didcomm-mediator` template. The log's update and \
+           pre-rotation keys are stored in the secret backend so the DID can be updated \
+           later.",
+};
+const DID_CHOICE_PEER: Choice<&str> = Choice {
+    value: DID_PEER,
+    label: "Generate did:peer",
+    help: "Quick start — generates random keys, no hosting required",
+    info: "did:peer is self-contained — no hosting required. Generates random keys that you \
+           must back up and manage yourself. Best for local dev and testing.",
+};
+
+const ADMIN_CHOICE_GENERATE: Choice<&str> = Choice {
+    value: ADMIN_GENERATE,
+    label: "Generate a new admin did:key",
+    help: "A fresh Ed25519 key, separate from any VTA credential",
+    info: "Generates a new Ed25519 did:key for the mediator's admin API. Its key is stored in \
+           admin-monitor.json (and, without a VTA, in the secret backend). In a VTA setup it \
+           is separate from the VTA credential, which stays the mediator↔VTA identity.",
+};
+const ADMIN_CHOICE_PASTE: Choice<&str> = Choice {
+    value: ADMIN_PASTE,
+    label: "Use an existing admin DID",
+    help: "Paste a DID you control (any method)",
+    info: "Paste any DID (did:key, did:peer, did:webvh, …) that will administer the \
+           mediator. The wizard holds no key for it.",
+};
+const ADMIN_CHOICE_VTA: Choice<&str> = Choice {
+    value: ADMIN_VTA,
+    label: "Use the VTA-issued credential",
+    help: "One key for both the VTA credential and the mediator's admin API",
+    info: "Reuses the admin DID the VTA issued for this mediator as the admin-API identity. \
+           Simpler, but one key then serves two trust scopes (VTA admin and mediator admin).",
+};
+const ADMIN_CHOICE_SKIP: Choice<&str> = Choice {
+    value: ADMIN_SKIP,
+    label: "Skip for now",
+    help: "Configure admin later",
+    info: "You can configure the admin DID later by editing mediator.toml or via the admin \
+           API.",
+};
+
 /// Accumulated configuration choices from the wizard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WizardConfig {
     pub config_path: String,
     pub deployment_type: String,
@@ -599,6 +831,8 @@ impl WizardConfig {
             STORAGE_GCP => features.push("secrets-gcp"),
             STORAGE_AZURE => features.push("secrets-azure"),
             STORAGE_VAULT => features.push("secrets-vault"),
+            STORAGE_K8S => features.push("secrets-k8s"),
+            // `file://` needs no feature: the file backend is always built.
             _ => {}
         }
 
@@ -930,6 +1164,66 @@ pub struct WizardApp {
     /// first entry. Cleared on the next successful match or when the
     /// operator backs out of the sub-flow.
     pub passphrase_validation_error: Option<String>,
+    /// `--force-reprovision`: the operator accepts writing over a backend
+    /// that already holds a provisioned mediator. Set by `main` before the
+    /// TUI starts; read by the KeyStorage backend check.
+    pub force_reprovision: bool,
+    /// Talk to the real secret backend from inside the TUI: probe it when
+    /// the KeyStorage step completes and persist a VTA session as soon as
+    /// it exists. Set by `main`; off in unit tests, which drive the state
+    /// machine without a runtime or a backend.
+    pub live_backend: bool,
+    /// The KeyStorage backend check, while it runs or after it failed.
+    pub backend_check: Option<BackendCheck>,
+    /// The backend URL the last successful check covered. Leaving
+    /// KeyStorage re-checks only when the choice changed.
+    backend_checked_url: Option<String>,
+    /// Result channel of a background task (backend check or session
+    /// persistence).
+    background_rx: Option<UnboundedReceiver<BackgroundEvent>>,
+    /// Outcome of persisting the VTA session into the secret backend,
+    /// shown to the operator.
+    pub session_persist_status: Option<String>,
+    /// The spawned provision flight, so Esc can stop it rather than just
+    /// stop listening to it.
+    vta_task: Option<tokio::task::JoinHandle<()>>,
+    /// Ctrl+C / F10 / Esc-on-first-step was pressed while a VTA session
+    /// exists: a y/n confirmation is on screen.
+    quit_confirm: bool,
+    /// Inline error for the text input on screen (a required field left
+    /// empty, a wrong confirmation phrase, a malformed DID). Cleared on
+    /// the next successful confirm or step change.
+    pub input_error: Option<String>,
+    /// Which SSL path the "Provide existing certificates" text input is
+    /// collecting.
+    pub ssl_field: Option<SslField>,
+    /// Advances on every tick; drives the spinner of background checks.
+    pub tick: usize,
+}
+
+/// The two text inputs of the "Provide existing certificates" choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslField {
+    Cert,
+    Key,
+}
+
+/// State of the KeyStorage backend check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendCheck {
+    /// Probing `url` (shown redacted).
+    Running(String),
+    /// The probe failed, or the backend already holds a mediator.
+    Failed(String),
+}
+
+/// Results of the TUI's background tasks.
+#[derive(Debug)]
+pub enum BackgroundEvent {
+    /// The backend check finished: `Ok` with the URL it covered.
+    BackendChecked(Result<String, String>),
+    /// Persisting the VTA session finished.
+    SessionPersisted(Result<String, String>),
 }
 
 impl WizardApp {
@@ -969,6 +1263,214 @@ impl WizardApp {
             cors_validation_error: None,
             pending_passphrase: None,
             passphrase_validation_error: None,
+            force_reprovision: false,
+            live_backend: false,
+            backend_check: None,
+            backend_checked_url: None,
+            background_rx: None,
+            session_persist_status: None,
+            vta_task: None,
+            quit_confirm: false,
+            input_error: None,
+            ssl_field: None,
+            tick: 0,
+        }
+    }
+
+    /// Lift the online sub-flow's connection onto `vta_session`.
+    fn capture_connected_session(&mut self) {
+        if let Some(state) = self.vta_connect.as_ref()
+            && let Some(conn) = state.connection.as_ref()
+        {
+            self.vta_session = Some(VtaSession {
+                context_id: state.context_id.clone(),
+                vta_did: state.vta_did.clone(),
+                rest_url: conn.rest_url.clone(),
+                mediator_did: conn.mediator_did.clone(),
+                // Lift the SDK's online 2-variant reply into the local
+                // 3-variant `VtaReply` (offline-only `ContextExport` is
+                // built directly by `crate::sealed_handoff`).
+                reply: conn.reply.clone().into(),
+            });
+        }
+    }
+
+    // ── Quit confirmation ────────────────────────────────────────────
+
+    /// Ctrl+C / F10 / Esc on the first step. Quits at once unless a VTA
+    /// session exists — the VTA has then minted keys or used the setup ACL
+    /// for this run — in which case a y/n confirmation comes first.
+    pub fn request_quit(&mut self) {
+        if self.vta_session.is_some() && !self.quit_confirm {
+            self.quit_confirm = true;
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    /// The KeyStorage backend check is in flight; input waits for it.
+    pub fn backend_check_running(&self) -> bool {
+        matches!(self.backend_check, Some(BackendCheck::Running(_)))
+    }
+
+    pub fn quit_confirm_pending(&self) -> bool {
+        self.quit_confirm
+    }
+
+    /// A key while the quit confirmation is on screen: `y` quits, anything
+    /// else stays.
+    pub fn answer_quit_confirm(&mut self, yes: bool) {
+        self.quit_confirm = false;
+        if yes {
+            self.should_quit = true;
+        }
+    }
+
+    // ── Background work (backend check, session persistence) ─────────
+
+    /// A provision flight is running on a spawned task.
+    pub fn provision_in_flight(&self) -> bool {
+        self.vta_connect
+            .as_ref()
+            .is_some_and(|s| s.phase == ConnectPhase::Testing && s.event_rx.is_some())
+    }
+
+    /// Stop the spawned provision flight, if any.
+    fn abort_vta_task(&mut self) {
+        if let Some(task) = self.vta_task.take() {
+            task.abort();
+        }
+    }
+
+    fn background_channel(&mut self) -> tokio::sync::mpsc::UnboundedSender<BackgroundEvent> {
+        let (tx, rx) = unbounded_channel();
+        self.background_rx = Some(rx);
+        tx
+    }
+
+    /// Probe the chosen backend and check it holds no provisioned mediator,
+    /// on a spawned task. The KeyStorage step advances when it succeeds.
+    fn start_backend_check(&mut self) {
+        let url = crate::config_writer::build_backend_url(&self.config);
+        let shown = affinidi_messaging_mediator_common::redact::redact_url(&url);
+        let force = self.force_reprovision;
+        self.backend_check = Some(BackendCheck::Running(shown.clone()));
+        let tx = self.background_channel();
+        tokio::spawn(async move {
+            let result = async {
+                let store = crate::secret_backend::open_and_probe_secret_backend(
+                    &url,
+                    crate::secret_backend::ProvisionProbe::ReadWrite,
+                )
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+                if !force {
+                    let found = crate::secret_backend::provisioned_well_known_keys(&store)
+                        .await
+                        .map_err(|e| format!("{e:#}"))?;
+                    if !found.is_empty() {
+                        return Err(format!(
+                            "{shown} already holds a provisioned mediator ({}). Pick another \
+                             backend, or quit and re-run with --force-reprovision (replaces \
+                             those keys) or --uninstall.",
+                            found.join(", ")
+                        ));
+                    }
+                }
+                Ok(url)
+            }
+            .await;
+            let _ = tx.send(BackgroundEvent::BackendChecked(result));
+        });
+    }
+
+    /// Store the VTA session's admin credential and key cache in the
+    /// secret backend now, so a quit or a later failure does not lose what
+    /// the VTA already minted.
+    fn persist_session(&mut self) {
+        if !self.live_backend {
+            return;
+        }
+        let Some(session) = self.vta_session.clone() else {
+            return;
+        };
+        let url = crate::config_writer::build_backend_url(&self.config);
+        self.session_persist_status =
+            Some("Storing the VTA credential in the secret backend…".into());
+        let tx = self.background_channel();
+        tokio::spawn(async move {
+            let result = async {
+                let store = crate::secret_backend::open_secret_backend(&url)
+                    .map_err(|e| format!("{e:#}"))?;
+                crate::secret_backend::store_vta_session(&store, &session)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                Ok(affinidi_messaging_mediator_common::redact::redact_url(&url))
+            }
+            .await;
+            let _ = tx.send(BackgroundEvent::SessionPersisted(result));
+        });
+    }
+
+    /// Apply finished background work. Called on every tick.
+    pub fn drain_background(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        let Some(rx) = self.background_rx.as_mut() else {
+            return;
+        };
+        let event = match rx.try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.background_rx = None;
+                return;
+            }
+        };
+        self.background_rx = None;
+        self.apply_background(event);
+    }
+
+    fn apply_background(&mut self, event: BackgroundEvent) {
+        match event {
+            BackgroundEvent::BackendChecked(Ok(url)) => {
+                self.backend_check = None;
+                self.backend_checked_url = Some(url);
+                if self.current_step == WizardStep::KeyStorage {
+                    self.advance();
+                }
+            }
+            BackgroundEvent::BackendChecked(Err(e)) => {
+                self.backend_check = Some(BackendCheck::Failed(e));
+                // Back on the scheme list so another backend can be picked.
+                self.key_storage_phase = None;
+                self.mode = InputMode::Selecting;
+                self.selection_index = self.default_selection_index();
+            }
+            BackgroundEvent::SessionPersisted(Ok(url)) => {
+                self.session_persist_status = Some(format!("VTA credential stored in {url}."));
+            }
+            BackgroundEvent::SessionPersisted(Err(e)) => {
+                self.session_persist_status = Some(format!(
+                    "Could not store the VTA credential yet ({e}); it is written again at \
+                     the end of the wizard."
+                ));
+            }
+        }
+    }
+
+    /// Forget a VTA session when the operator goes back to the VTA step or
+    /// leaves VTA integration: the rest of the setup must not use it. The
+    /// VTA-side state stays, and so does a credential already stored.
+    fn discard_vta_session(&mut self) {
+        if self.vta_session.take().is_some() {
+            self.tui_bootstrap_artifacts = None;
+            self.vta_stub_notice = Some(
+                "The previous VTA session was discarded. What the VTA did for it (a minted \
+                 DID, a used setup ACL) remains on the VTA side, and a credential already \
+                 stored in the secret backend stays there — finishing with a different \
+                 choice needs --force-reprovision."
+                    .into(),
+            );
         }
     }
 
@@ -1123,10 +1625,13 @@ impl WizardApp {
                 self.tui_bootstrap_artifacts =
                     Some(crate::bootstrap_headless::BootstrapArtifacts {
                         request_path: state.request_path.take(),
+                        seed_bundle_id: None,
                     });
                 self.vta_session = state.session.take();
                 self.sealed_handoff = None;
                 self.mode = InputMode::Selecting;
+                // Store the credential now, before leaving the VTA step.
+                self.persist_session();
                 self.advance();
             }
         }
@@ -1333,6 +1838,7 @@ impl WizardApp {
         // only the back path zeroed `recipient_secret`, and
         // `seed_bytes` was never zeroed at all.
         let _state = self.sealed_handoff.take();
+        self.discard_vta_session();
         self.config.use_vta = false;
         self.config.vta_mode = String::new();
         self.mode = InputMode::Selecting;
@@ -1381,15 +1887,18 @@ impl WizardApp {
                 // Initial attempt — let the orchestrator auto-pick.
                 self.start_vta_test(None);
             }
-            ConnectPhase::Testing => {
-                // Only meaningful after the runner has finished with a
-                // failure — let the operator retry. If the runner is still
-                // in flight `event_rx` is still `Some` and we ignore Enter.
-                let st = self.vta_connect.as_ref().expect("subflow");
-                if st.event_rx.is_none() && st.last_error.is_some() {
-                    self.start_vta_test(None);
-                }
+            // Only meaningful after the runner has finished with a failure —
+            // let the operator retry. If the runner is still in flight
+            // `event_rx` is still `Some` and Enter is ignored.
+            ConnectPhase::Testing
+                if self
+                    .vta_connect
+                    .as_ref()
+                    .is_some_and(|st| st.event_rx.is_none() && st.last_error.is_some()) =>
+            {
+                self.start_vta_test(None);
             }
+            ConnectPhase::Testing => {}
             ConnectPhase::PickWebvhServer => {
                 // Index 0 is "serverless"; indices 1..=N map to
                 // `st.webvh_servers[i-1]`. Commit the pick. Serverless
@@ -1448,22 +1957,7 @@ impl WizardApp {
                 // carries the right variant — FullSetup → Full,
                 // AdminOnly → AdminOnly — we just wrap the transport
                 // context around it.
-                if let Some(state) = self.vta_connect.as_ref()
-                    && let Some(conn) = state.connection.as_ref()
-                {
-                    self.vta_session = Some(VtaSession {
-                        context_id: state.context_id.clone(),
-                        vta_did: state.vta_did.clone(),
-                        rest_url: conn.rest_url.clone(),
-                        mediator_did: conn.mediator_did.clone(),
-                        // Lift the SDK's online 2-variant reply into
-                        // the local 3-variant `VtaReply` (offline-only
-                        // `ContextExport` lives here too — built
-                        // directly by `crate::sealed_handoff` and not
-                        // reachable from the online path).
-                        reply: conn.reply.clone().into(),
-                    });
-                }
+                self.capture_connected_session();
                 self.vta_connect = None;
                 self.mode = InputMode::Selecting;
                 self.advance();
@@ -1611,7 +2105,8 @@ impl WizardApp {
         }
         self.selection_index = 0;
 
-        tokio::spawn(async move {
+        self.abort_vta_task();
+        self.vta_task = Some(tokio::spawn(async move {
             run_connection_test(
                 intent,
                 vta_did,
@@ -1623,7 +2118,7 @@ impl WizardApp {
                 tx,
             )
             .await;
-        });
+        }));
     }
 
     /// Kick off the FullSetup provision flight once the preflight has
@@ -1664,7 +2159,8 @@ impl WizardApp {
         // routes to `select_current`, not `confirm_text_input`.
         self.mode = InputMode::Selecting;
 
-        tokio::spawn(async move {
+        self.abort_vta_task();
+        self.vta_task = Some(tokio::spawn(async move {
             crate::vta::runner::run_provision_flight(
                 vta_did,
                 setup_did,
@@ -1680,7 +2176,7 @@ impl WizardApp {
                 tx,
             )
             .await;
-        });
+        }));
     }
 
     /// Drain any pending events from the runner and apply them to the
@@ -1732,6 +2228,15 @@ impl WizardApp {
         // to a disabled row. Snap to the first enabled option so the
         // operator's first Enter doesn't no-op on a dimmed row.
         let post_phase = self.vta_connect.as_ref().map(|s| s.phase.clone());
+
+        // Connected: capture the session and store its credential in the
+        // backend right away — the VTA has minted for this run, and a quit
+        // or later failure must not lose it.
+        if pre_phase != post_phase && post_phase == Some(ConnectPhase::Connected) {
+            self.vta_task = None;
+            self.capture_connected_session();
+            self.persist_session();
+        }
         if pre_phase != post_phase
             && matches!(
                 post_phase,
@@ -1816,6 +2321,7 @@ impl WizardApp {
             ConnectPhase::EnterDid => {
                 let val = self.text_input.value().trim().to_string();
                 if val.is_empty() {
+                    self.input_error = Some("The VTA DID is required.".into());
                     return Ok(());
                 }
                 st.vta_did = val;
@@ -1857,8 +2363,9 @@ impl WizardApp {
                         // routes straight to `enter_sealed_handoff_subflow`.
                         // Pattern is exhaustive because the enum
                         // demands it; reaching here would be a wiring
-                        // bug.
-                        unreachable!("OfflineExport never enters the online VTA sub-flow");
+                        // bug: leave the sub-flow rather than panic.
+                        self.exit_vta_subflow();
+                        return Ok(());
                     }
                 }
             }
@@ -1867,6 +2374,7 @@ impl WizardApp {
                 if val.is_empty() {
                     // Block advance until the operator provides a URL —
                     // the VTA template requires it.
+                    self.input_error = Some("The mediator's public URL is required.".into());
                     return Ok(());
                 }
                 st.mediator_url = val.clone();
@@ -1950,8 +2458,9 @@ impl WizardApp {
                     VtaIntent::OfflineExport => {
                         // Online sub-flow is never entered for
                         // OfflineExport. See note in
-                        // `vta_subflow_confirm_text` above.
-                        unreachable!("OfflineExport never enters the online VTA sub-flow");
+                        // `vta_subflow_confirm_text` above. Leave rather than panic.
+                        self.exit_vta_subflow();
+                        return;
                     }
                 }
                 self.mode = InputMode::TextInput;
@@ -1992,9 +2501,12 @@ impl WizardApp {
                     .unwrap_or(0);
             }
             ConnectPhase::Testing | ConnectPhase::Connected => {
-                // Abort the runner (receiver drop closes the channel on its
-                // side) and return to the instructions screen so the
-                // operator can re-check the ACL and try again.
+                // Stop the runner task itself — dropping the receiver alone
+                // left the flight running — and return to the instructions
+                // screen so the operator can re-check the ACL and try again.
+                if let Some(task) = self.vta_task.take() {
+                    task.abort();
+                }
                 st.event_rx = None;
                 st.diagnostics.clear();
                 st.last_error = None;
@@ -2178,20 +2690,12 @@ impl WizardApp {
     /// Get the options for the current step.
     pub fn current_options(&self) -> Vec<SelectionOption> {
         match self.current_step {
-            WizardStep::Deployment => vec![
-                SelectionOption::new(
-                    "Local development",
-                    "Desktop, quick start — ideal for testing",
-                ),
-                SelectionOption::new(
-                    "Headless server",
-                    "Production deployment on cloud or bare metal",
-                ),
-                SelectionOption::new("Container", "Docker image for container orchestration"),
-            ],
+            WizardStep::Deployment => DEPLOYMENT_CHOICES.iter().map(Choice::option).collect(),
             WizardStep::Vta => {
                 if let Some(phase) = self.vta_phase() {
-                    let st = self.vta_connect.as_ref().expect("phase implies state");
+                    let Some(st) = self.vta_connect.as_ref() else {
+                        return vec![];
+                    };
                     return match phase {
                         ConnectPhase::AwaitingAcl => vec![SelectionOption::new(
                             "Test VTA connection",
@@ -2324,28 +2828,13 @@ impl WizardApp {
                     };
                 }
                 match self.vta_step_phase {
-                    VtaStepPhase::SelectIntent => vec![
-                        SelectionOption::new(
-                            "Full setup — VTA mints my mediator DID",
-                            "VTA renders a DID template, mints integration + admin keys, issues an authorisation VC. The wizard will skip the DID step when this path is chosen.",
-                        ),
-                        SelectionOption::new(
-                            "Admin credential only — I'll bring my own DID",
-                            "Mediator keeps the DID from the DID step; the VTA only supplies an admin credential used for VTA admin APIs.",
-                        ),
-                        SelectionOption::new(
-                            "Pick up pre-provisioned mediator (offline export)",
-                            "VTA already provisioned the context + mediator DID + keys (e.g. during VTA bootstrap). Wizard writes a request; VTA admin runs `vta contexts reprovision --id <ctx> --recipient <file>` and returns the existing material in a ContextProvision bundle. Always offline.",
-                        ),
-                        SelectionOption::new(
-                            "No VTA",
-                            "Manage keys and DIDs independently (local dev, cloud secret stores).",
-                        ),
-                    ],
+                    VtaStepPhase::SelectIntent => {
+                        VTA_INTENT_CHOICES.iter().map(Choice::option).collect()
+                    }
                     VtaStepPhase::SelectTransport => {
-                        let intent = self
-                            .vta_intent_choice
-                            .expect("transport phase implies an intent was picked");
+                        let Some(intent) = self.vta_intent_choice else {
+                            return vec![];
+                        };
                         let (online_sub, offline_sub) = match intent {
                             VtaIntent::FullSetup => (
                                 "Direct DIDComm session to a running VTA. Requires: `pnm acl create` run out-of-band first to enrol the wizard's ephemeral setup DID in the target context.",
@@ -2455,31 +2944,7 @@ impl WizardApp {
                     ));
                     return opts;
                 }
-                let mut opts = vec![];
-                // "Configure via VTA" is only meaningful when the
-                // operator picked `FullSetup` on the Vta step — that's
-                // the intent that has the VTA mint the integration
-                // DID. `AdminOnly` keeps the operator's own DID and
-                // hides this option; `No VTA` never shows it.
-                if self.config.use_vta && self.shows_vta_did_option() {
-                    opts.push(SelectionOption::new(
-                        "Configure via VTA (recommended)",
-                        "Centralized key management — VTA creates and hosts your DID",
-                    ));
-                }
-                opts.push(SelectionOption::new(
-                    "Generate did:webvh",
-                    "Production — generates random keys you must manage yourself",
-                ));
-                opts.push(SelectionOption::new(
-                    "Generate did:peer",
-                    "Quick start — generates random keys, no hosting required",
-                ));
-                opts.push(SelectionOption::new(
-                    "Import existing DID",
-                    "Paste an existing DID string and secrets",
-                ));
-                opts
+                self.did_choices().iter().map(Choice::option).collect()
             }
             WizardStep::KeyStorage => {
                 // The file:// encrypt/no-encrypt choice rides on top
@@ -2516,41 +2981,23 @@ impl WizardApp {
                         ),
                     ];
                 }
-                // Unified secret-storage backends. `vta://` is no longer a
-                // backend (the VTA is a *source* of keys, not a store) and
-                // `string://` has been removed (inline secrets in TOML are
-                // unsafe even for CI — use `file://` with env-var overrides
-                // instead).
-                vec![
-                    SelectionOption::new(
-                        "OS Keyring (keyring://) [recommended for desktop]",
-                        "macOS Keychain, Linux Secret Service, Windows Credential Manager",
-                    ),
-                    SelectionOption::new(
-                        "AWS Secrets Manager (aws_secrets://)",
-                        "AWS cloud production",
-                    ),
-                    SelectionOption::new(
-                        "Google Cloud Secret Manager (gcp_secrets://)",
-                        "GCP cloud production",
-                    ),
-                    SelectionOption::new(
-                        "Azure Key Vault (azure_keyvault://)",
-                        "Azure cloud production",
-                    ),
-                    SelectionOption::new(
-                        "HashiCorp Vault (vault://)",
-                        "Enterprise / multi-cloud (KV v2 only); token / Kubernetes / AppRole auth",
-                    ),
-                    SelectionOption::new(
-                        "Kubernetes Secrets (k8s://)",
-                        "Native Secret object via the K8s API (in-cluster ServiceAccount)",
-                    ),
-                    SelectionOption::new(
-                        "Local file (file://)",
-                        "Stored in secrets.json — DEV ONLY, requires explicit confirmation",
-                    ),
-                ]
+                // Unified secret-storage backends. `vta://` is not a backend
+                // (the VTA is a *source* of keys) and `string://` was removed.
+                KEY_STORAGE_CHOICES
+                    .iter()
+                    .map(|c| {
+                        if c.value == STORAGE_KEYRING
+                            && self.config.deployment_type == DEPLOYMENT_CONTAINER
+                        {
+                            SelectionOption::new(
+                                "OS Keyring (keyring://) — not available inside a container",
+                                "The container has no OS keyring; the mediator would not find its keys",
+                            )
+                        } else {
+                            c.option()
+                        }
+                    })
+                    .collect()
             }
             WizardStep::Security => {
                 if self.security_phase == Some(SecurityPhase::CorsPolicy) {
@@ -2597,20 +3044,7 @@ impl WizardApp {
                         ),
                     ]
                 } else {
-                    vec![
-                        SelectionOption::new(
-                            "No SSL (use TLS-terminating proxy)",
-                            "Recommended: nginx, Caddy, AWS ALB handle TLS",
-                        ),
-                        SelectionOption::new(
-                            "Provide existing certificates",
-                            "Use your own SSL certificate and key files",
-                        ),
-                        SelectionOption::new(
-                            "Generate self-signed certificates",
-                            "Local development only — not for production",
-                        ),
-                    ]
+                    SSL_CHOICES.iter().map(Choice::option).collect()
                 }
             }
             WizardStep::Database => {
@@ -2647,26 +3081,7 @@ impl WizardApp {
                     vec![]
                 }
             }
-            WizardStep::Admin => {
-                let mut opts = vec![
-                    SelectionOption::new(
-                        "Generate a new admin did:key",
-                        "Creates a new Ed25519 key pair",
-                    ),
-                    SelectionOption::new("Paste an existing admin DID", "Use any DID method"),
-                ];
-                if self.admin_options_include_vta() {
-                    opts.push(SelectionOption::new(
-                        "Generate admin DID from VTA",
-                        "Retrieve from VTA context",
-                    ));
-                }
-                opts.push(SelectionOption::new(
-                    "Skip for now",
-                    "Configure admin later",
-                ));
-                opts
-            }
+            WizardStep::Admin => self.admin_choices().iter().map(Choice::option).collect(),
             // Output step is text-input (the renderer branches on
             // `current_step == Output` and draws a compact prompt),
             // so no selection list is needed here.
@@ -2678,12 +3093,7 @@ impl WizardApp {
     /// Get the info text for the currently highlighted option.
     pub fn current_info_text(&self) -> String {
         match self.current_step {
-            WizardStep::Deployment => match self.selection_index {
-                0 => "Sets sensible defaults for local development: did:peer, inline secrets, no SSL, localhost Redis.".into(),
-                1 => "Sets defaults for production: did:webvh, external secret storage, TLS proxy, local or remote Redis.".into(),
-                2 => "Same as server, plus generates a Dockerfile and docker-compose.yml with correct feature flags.".into(),
-                _ => String::new(),
-            },
+            WizardStep::Deployment => DEPLOYMENT_CHOICES.get(self.selection_index).map(|c| c.info.to_string()).unwrap_or_default(),
             WizardStep::Vta => {
                 if let Some(phase) = self.vta_phase() {
                     return match phase {
@@ -2703,7 +3113,9 @@ impl WizardApp {
                             "Opening a DIDComm session to the VTA, sending the signed provisioning request, and opening the sealed bundle the VTA returns…".into()
                         }
                         ConnectPhase::PickWebvhServer => {
-                            let st = self.vta_connect.as_ref().expect("phase implies state");
+                            let Some(st) = self.vta_connect.as_ref() else {
+                                return String::new();
+                            };
                             match self.selection_index {
                                 0 => "Self-host the minted DID at the mediator URL (no webvh hosting server). Pick this if the mediator owns the public endpoint for its did.jsonl log.".into(),
                                 i => {
@@ -2741,9 +3153,10 @@ impl WizardApp {
                     return notice.clone();
                 }
                 match (self.vta_step_phase, self.selection_index) {
-                    (VtaStepPhase::SelectIntent, 0) => "The mediator's integration DID, admin DID, and VTA trust bundle are all issued by the VTA via a template render. The wizard skips the DID step when this path is chosen.".into(),
-                    (VtaStepPhase::SelectIntent, 1) => "The mediator keeps the DID you configure in the next step. The VTA only supplies an admin credential used to authenticate against VTA admin APIs.".into(),
-                    (VtaStepPhase::SelectIntent, 2) => "Keys and DIDs are generated locally or stored in cloud secret managers. You are responsible for backup and rotation.".into(),
+                    (VtaStepPhase::SelectIntent, i) => VTA_INTENT_CHOICES
+                        .get(i)
+                        .map(|c| c.info.to_string())
+                        .unwrap_or_default(),
                     (VtaStepPhase::SelectTransport, 0) => "Direct network interaction with a running VTA. Lower friction but requires network reachability and an out-of-band `pnm acl create` step to pre-authorise the wizard against the VTA's ACL.".into(),
                     (VtaStepPhase::SelectTransport, 1) => "Armored sealed-bundle exchange — no network from this host. Suitable for air-gapped or offline deployments, or when the VTA isn't directly reachable.".into(),
                     _ => String::new(),
@@ -2782,22 +3195,10 @@ impl WizardApp {
                             manages publication for you on a registered webvh server."
                         .into();
                 }
-                if self.config.use_vta {
-                    match self.selection_index {
-                        0 => "VTA creates and manages the mediator's DID and keys centrally. Uses the built-in `didcomm-mediator` template. To customise: `pnm did-templates init didcomm-mediator > custom.json`, edit, then upload under the same name — context/global scope shadows the built-in automatically.".into(),
-                        1 => "did:webvh requires a webvh server to host the DID document. Uses the same `didcomm-mediator` template shape as the VTA-managed path, rendered locally — you back up and manage the keys yourself.".into(),
-                        2 => "did:peer is self-contained — no hosting required. Generates random keys that you must back up and manage yourself. Best for local dev and testing.".into(),
-                        3 => "Import a DID you've already created. You'll need to provide the DID string and private key secrets.".into(),
-                        _ => String::new(),
-                    }
-                } else {
-                    match self.selection_index {
-                        0 => "did:webvh requires a webvh server to host the DID document. Uses the `didcomm-mediator` template shape, rendered locally — you back up and manage the keys yourself.".into(),
-                        1 => "did:peer is self-contained — no hosting required. Generates random keys that you must back up and manage yourself. Best for local dev and testing.".into(),
-                        2 => "Import a DID you've already created. You'll need to provide the DID string and private key secrets.".into(),
-                        _ => String::new(),
-                    }
-                }
+                self.did_choices()
+                    .get(self.selection_index)
+                    .map(|c| c.info.to_string())
+                    .unwrap_or_default()
             }
             WizardStep::KeyStorage => {
                 // Validation errors take priority — the operator just
@@ -2811,15 +3212,21 @@ impl WizardApp {
                 {
                     return err.clone();
                 }
-                match self.selection_index {
-                    0 => "Uses the OS keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). Good for desktop development and single-host servers.".into(),
-                    1 => "Store secrets in AWS Secrets Manager. Requires AWS credentials configured. Suitable for AWS production.".into(),
-                    2 => "Store secrets in Google Cloud Secret Manager. Auth via Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS / `gcloud auth application-default login` / GKE workload identity).".into(),
-                    3 => "Store secrets in Azure Key Vault. Auth via Azure CLI / azd developer credentials (`az login`). Sovereign clouds supported via full DNS in the vault field.".into(),
-                    4 => "Store secrets in HashiCorp Vault (KV v2). Token auth via VAULT_TOKEN env var. The mount point must already exist on the server.".into(),
-                    5 => "Secrets written to conf/secrets.json as plaintext. DEV ONLY — anyone with file access can read the private keys. The wizard will require an explicit confirmation before accepting this choice.".into(),
-                    _ => String::new(),
+                match &self.backend_check {
+                    Some(BackendCheck::Running(url)) => {
+                        const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+                        return format!(
+                            "{} Checking the secret backend {url} — reachable, writable, and \
+                             not already holding a mediator…",
+                            SPINNER[self.tick % SPINNER.len()]
+                        );
+                    }
+                    Some(BackendCheck::Failed(e)) if self.key_storage_phase.is_none() => {
+                        return format!("\u{26A0} {e}");
+                    }
+                    _ => {}
                 }
+                KEY_STORAGE_CHOICES.get(self.selection_index).map(|c| c.info.to_string()).unwrap_or_default()
             }
             WizardStep::Security => {
                 if self.security_phase == Some(SecurityPhase::CorsPolicy) {
@@ -2842,12 +3249,7 @@ impl WizardApp {
                         _ => String::new(),
                     }
                 } else {
-                    match self.selection_index {
-                        0 => "Run the mediator behind a reverse proxy (nginx, Caddy, AWS ALB) that terminates TLS. The mediator runs plain HTTP. This is the recommended approach.".into(),
-                        1 => "Provide paths to existing SSL certificate and key files.".into(),
-                        2 => "Generate self-signed certificates for local development. Browsers will show security warnings.".into(),
-                        _ => String::new(),
-                    }
+                    SSL_CHOICES.get(self.selection_index).map(|c| c.info.to_string()).unwrap_or_default()
                 }
             }
             WizardStep::Database => {
@@ -2882,24 +3284,11 @@ impl WizardApp {
                     "Redis connection URL. Use database partitions (e.g. redis://127.0.0.1/1) to isolate data when sharing a Redis instance.".into()
                 }
             }
-            WizardStep::Admin => {
-                if self.config.use_vta {
-                    match self.selection_index {
-                        0 => "Generates a new Ed25519 did:key. The private key will be displayed — save it securely!".into(),
-                        1 => "Paste any DID (did:key, did:peer, did:webvh, etc.) to use as admin.".into(),
-                        2 => "Copy the admin DID from your VTA context.".into(),
-                        3 => "You can configure the admin DID later by editing mediator.toml or via the admin API.".into(),
-                        _ => String::new(),
-                    }
-                } else {
-                    match self.selection_index {
-                        0 => "Generates a new Ed25519 did:key. The private key will be displayed — save it securely!".into(),
-                        1 => "Paste any DID (did:key, did:peer, did:webvh, etc.) to use as admin.".into(),
-                        2 => "You can configure the admin DID later by editing mediator.toml or via the admin API.".into(),
-                        _ => String::new(),
-                    }
-                }
-            }
+            WizardStep::Admin => self
+                .admin_choices()
+                .get(self.selection_index)
+                .map(|c| c.info.to_string())
+                .unwrap_or_default(),
             WizardStep::Output => {
                 "Defaults to `conf/mediator.toml` (relative to the mediator's working \
                  directory). Sibling files — `secrets.json` when file:// is the chosen \
@@ -2912,14 +3301,15 @@ impl WizardApp {
 
     /// Handle Enter key — select current option and advance.
     pub fn select_current(&mut self) {
+        if self.backend_check_running() {
+            return;
+        }
         match self.current_step {
             WizardStep::Deployment => {
-                self.config.deployment_type = match self.selection_index {
-                    0 => DEPLOYMENT_LOCAL.into(),
-                    1 => DEPLOYMENT_SERVER.into(),
-                    2 => DEPLOYMENT_CONTAINER.into(),
-                    _ => return,
+                let Some(choice) = DEPLOYMENT_CHOICES.get(self.selection_index) else {
+                    return;
                 };
+                self.config.deployment_type = choice.value.into();
                 self.apply_deployment_defaults();
                 self.advance();
             }
@@ -2933,46 +3323,43 @@ impl WizardApp {
                     return;
                 }
                 match self.vta_step_phase {
-                    VtaStepPhase::SelectIntent => match self.selection_index {
-                        0 => {
-                            self.vta_intent_choice = Some(VtaIntent::FullSetup);
-                            self.vta_step_phase = VtaStepPhase::SelectTransport;
-                            self.vta_stub_notice = None;
-                            self.selection_index = 0;
+                    VtaStepPhase::SelectIntent => {
+                        let Some(choice) = VTA_INTENT_CHOICES.get(self.selection_index) else {
+                            return;
+                        };
+                        self.vta_stub_notice = None;
+                        match choice.value {
+                            Some(intent @ (VtaIntent::FullSetup | VtaIntent::AdminOnly)) => {
+                                self.vta_intent_choice = Some(intent);
+                                self.vta_step_phase = VtaStepPhase::SelectTransport;
+                                self.selection_index = 0;
+                            }
+                            Some(VtaIntent::OfflineExport) => {
+                                // Pick up state the VTA already provisioned.
+                                // Always offline (the v1 BootstrapRequest has
+                                // no online transport), so the transport
+                                // question is skipped.
+                                self.vta_intent_choice = Some(VtaIntent::OfflineExport);
+                                self.config.use_vta = true;
+                                self.config.vta_mode = VTA_MODE_EXPORT.into();
+                                self.apply_vta_defaults();
+                                self.enter_sealed_handoff_subflow(VtaIntent::OfflineExport);
+                            }
+                            None => {
+                                self.vta_intent_choice = None;
+                                self.discard_vta_session();
+                                self.config.use_vta = false;
+                                self.config.vta_mode = String::new();
+                                self.apply_vta_defaults();
+                                self.advance();
+                            }
                         }
-                        1 => {
-                            self.vta_intent_choice = Some(VtaIntent::AdminOnly);
-                            self.vta_step_phase = VtaStepPhase::SelectTransport;
-                            self.vta_stub_notice = None;
-                            self.selection_index = 0;
-                        }
-                        2 => {
-                            // OfflineExport — pick up state the VTA
-                            // already provisioned. Always offline (the
-                            // v1 sealed_transfer::BootstrapRequest has
-                            // no online transport equivalent), so we
-                            // skip the SelectTransport phase entirely
-                            // and route straight into sealed_handoff.
-                            self.vta_intent_choice = Some(VtaIntent::OfflineExport);
-                            self.vta_stub_notice = None;
-                            self.config.use_vta = true;
-                            self.config.vta_mode = VTA_MODE_EXPORT.into();
-                            self.apply_vta_defaults();
-                            self.enter_sealed_handoff_subflow(VtaIntent::OfflineExport);
-                        }
-                        3 => {
-                            self.vta_intent_choice = None;
-                            self.config.use_vta = false;
-                            self.config.vta_mode = String::new();
-                            self.apply_vta_defaults();
-                            self.advance();
-                        }
-                        _ => {}
-                    },
+                    }
                     VtaStepPhase::SelectTransport => {
-                        let intent = self
-                            .vta_intent_choice
-                            .expect("transport phase implies an intent was picked");
+                        let Some(intent) = self.vta_intent_choice else {
+                            self.vta_step_phase = VtaStepPhase::SelectIntent;
+                            return;
+                        };
                         let transport = match self.selection_index {
                             0 => VtaTransport::Online,
                             1 => VtaTransport::Offline,
@@ -3033,11 +3420,8 @@ impl WizardApp {
                                 // no online transport. Reaching here
                                 // means the operator's selection_index
                                 // landed on the wrong intent variant;
-                                // treat as a wiring bug.
-                                unreachable!(
-                                    "OfflineExport should never reach SelectTransport — \
-                                     SelectIntent routes it directly to sealed_handoff"
-                                );
+                                // a wiring bug: route it the only way it goes.
+                                self.enter_sealed_handoff_subflow(VtaIntent::OfflineExport);
                             }
                         }
                     }
@@ -3078,43 +3462,20 @@ impl WizardApp {
                     self.confirm_webvh_host_choice();
                     return;
                 }
-                if self.config.use_vta {
-                    self.config.did_method = match self.selection_index {
-                        0 => DID_VTA.into(),
-                        1 => DID_WEBVH.into(),
-                        2 => DID_PEER.into(),
-                        3 => DID_IMPORT.into(),
-                        _ => return,
-                    };
-                    // DID_VTA and DID_WEBVH both need the mediator URL so
-                    // the resulting DID document can publish correct
-                    // service endpoints. Skip the prompt when an upstream
-                    // VTA subflow (online ConnectPhase::EnterMediatorUrl
-                    // or sealed SealedPhase::CollectMediatorUrl) already
-                    // captured it — the mediator DID has been minted
-                    // from that value, so re-prompting is redundant.
-                    let url_already_captured =
-                        self.vta_session.is_some() && !self.config.public_url.is_empty();
-                    if (self.selection_index == 0 || self.selection_index == 1)
-                        && !url_already_captured
-                    {
-                        self.mode = InputMode::TextInput;
-                        self.text_input = Input::new(self.config.public_url.clone());
-                        return;
-                    }
-                } else {
-                    self.config.did_method = match self.selection_index {
-                        0 => DID_WEBVH.into(),
-                        1 => DID_PEER.into(),
-                        2 => DID_IMPORT.into(),
-                        _ => return,
-                    };
-                    // For did:webvh, collect the public URL
-                    if self.selection_index == 0 {
-                        self.mode = InputMode::TextInput;
-                        self.text_input = Input::new(self.config.public_url.clone());
-                        return;
-                    }
+                let Some(choice) = self.did_choices().get(self.selection_index).copied() else {
+                    return;
+                };
+                self.config.did_method = choice.value.into();
+                // did:webvh and a VTA-managed DID both need the mediator URL
+                // for the DID document's service endpoints. Skip the prompt
+                // when a VTA sub-flow already captured it — the mediator DID
+                // has been minted from that value.
+                let url_already_captured =
+                    self.vta_session.is_some() && !self.config.public_url.is_empty();
+                if (choice.value == DID_VTA && !url_already_captured) || choice.value == DID_WEBVH {
+                    self.mode = InputMode::TextInput;
+                    self.text_input = Input::new(self.config.public_url.clone());
+                    return;
                 }
                 self.advance();
             }
@@ -3127,8 +3488,12 @@ impl WizardApp {
                         // Yes, encrypt — collect the passphrase.
                         self.enter_key_storage_phase(KeyStoragePhase::FilePassphrase);
                     } else {
-                        // No, plaintext — finish the file:// sub-flow.
+                        // No, plaintext — finish the file:// sub-flow. The
+                        // operator typed the gate phrase and chose this:
+                        // that is the explicit acceptance a recipe records
+                        // as `allow_plaintext_file`.
                         self.config.secret_file_encrypted = false;
+                        self.config.allow_plaintext_file = true;
                         self.exit_key_storage_subflow();
                         self.advance();
                     }
@@ -3161,16 +3526,12 @@ impl WizardApp {
                 if self.key_storage_phase.is_some() {
                     return;
                 }
-                self.config.secret_storage = match self.selection_index {
-                    0 => STORAGE_KEYRING.into(),
-                    1 => STORAGE_AWS.into(),
-                    2 => STORAGE_GCP.into(),
-                    3 => STORAGE_AZURE.into(),
-                    4 => STORAGE_VAULT.into(),
-                    5 => STORAGE_K8S.into(),
-                    6 => STORAGE_FILE.into(),
-                    _ => return,
+                let Some(choice) = KEY_STORAGE_CHOICES.get(self.selection_index) else {
+                    return;
                 };
+                self.config.secret_storage = choice.value.into();
+                // A new pick clears a failed backend check.
+                self.backend_check = None;
                 // Backend with extra config → enter sub-flow. No extra
                 // config → advance straight away.
                 if let Some(phase) = KeyStoragePhase::first_for(&self.config.secret_storage) {
@@ -3228,15 +3589,14 @@ impl WizardApp {
                     self.enter_network_mode_phase();
                     return;
                 }
-                self.config.ssl_mode = match self.selection_index {
-                    0 => SSL_NONE.into(),
-                    1 => SSL_EXISTING.into(),
-                    2 => SSL_SELF_SIGNED.into(),
-                    _ => return,
+                let Some(choice) = SSL_CHOICES.get(self.selection_index) else {
+                    return;
                 };
-                // For existing certs, collect file paths first; the JWT
-                // phase then runs once both paths are saved.
-                if self.selection_index == 1 {
+                self.config.ssl_mode = choice.value.into();
+                // For existing certs, collect file paths first (certificate,
+                // then key); the JWT phase runs once both are saved.
+                if choice.value == SSL_EXISTING {
+                    self.ssl_field = Some(SslField::Cert);
                     self.mode = InputMode::TextInput;
                     self.text_input = Input::new(self.config.ssl_cert_path.clone());
                     return;
@@ -3302,15 +3662,17 @@ impl WizardApp {
                 // `admin_options_include_vta()` agrees. Use that same
                 // predicate to map the selection back to the enum so
                 // a layout change doesn't need two-place updates.
-                let with_vta = self.admin_options_include_vta();
-                self.config.admin_did_mode = match (with_vta, self.selection_index) {
-                    (_, 0) => ADMIN_GENERATE.into(),
-                    (_, 1) => ADMIN_PASTE.into(),
-                    (true, 2) => ADMIN_VTA.into(),
-                    (true, 3) => ADMIN_SKIP.into(),
-                    (false, 2) => ADMIN_SKIP.into(),
-                    _ => return,
+                let Some(choice) = self.admin_choices().get(self.selection_index).copied() else {
+                    return;
                 };
+                self.config.admin_did_mode = choice.value.into();
+                if choice.value == ADMIN_PASTE {
+                    // A real prompt for the DID; `confirm_text_input`
+                    // validates it and advances.
+                    self.mode = InputMode::TextInput;
+                    self.text_input = Input::new(self.config.admin_did.clone());
+                    return;
+                }
                 self.advance();
             }
             WizardStep::Output => {
@@ -3402,10 +3764,14 @@ impl WizardApp {
                 // exit the sub-flow back to the scheme list so the
                 // operator can pick a real backend.
                 if value.eq_ignore_ascii_case(FILE_GATE_PHRASE) {
+                    self.input_error = None;
                     self.enter_key_storage_phase(KeyStoragePhase::FilePath);
                 } else {
                     self.config.secret_storage = String::new();
                     self.exit_key_storage_subflow();
+                    self.input_error = Some(format!(
+                        "file:// not selected: the confirmation must be \"{FILE_GATE_PHRASE}\"."
+                    ));
                 }
             }
             KeyStoragePhase::FilePath => {
@@ -3427,6 +3793,7 @@ impl WizardApp {
                 if value.is_empty() {
                     // Reject empty — Argon2id with an empty passphrase
                     // is trivially brute-forceable.
+                    self.input_error = Some("The passphrase cannot be empty.".into());
                     return;
                 }
                 // Stash the first entry and ask the operator to retype
@@ -3445,6 +3812,7 @@ impl WizardApp {
                     // Same reasoning as the first prompt — empty input
                     // shouldn't silently match an empty pending entry
                     // (the FilePassphrase arm rejects empties).
+                    self.input_error = Some("Type the passphrase again to confirm it.".into());
                     return;
                 }
                 let matched = self
@@ -3473,6 +3841,7 @@ impl WizardApp {
                 self.pending_passphrase = None;
                 self.passphrase_validation_error = None;
                 self.config.secret_file_encrypted = true;
+                self.config.allow_plaintext_file = false;
                 self.exit_key_storage_subflow();
                 self.advance();
             }
@@ -3502,6 +3871,7 @@ impl WizardApp {
                     // sensible default. Reject and keep the operator on
                     // the prompt rather than write `gcp_secrets:///…`
                     // and explode at backend-open time.
+                    self.input_error = Some("A GCP project ID is required.".into());
                     return;
                 }
                 self.config.secret_gcp_project = value;
@@ -3519,6 +3889,7 @@ impl WizardApp {
                     // No default — sovereign-cloud + commercial-cloud
                     // share no host pattern. Force a typed answer
                     // rather than silently writing `azure_keyvault://`.
+                    self.input_error = Some("A vault name or URL is required.".into());
                     return;
                 }
                 self.config.secret_azure_vault = value;
@@ -3531,6 +3902,7 @@ impl WizardApp {
                     // `vault server` listen address is environment-
                     // dependent). No sensible default — force a typed
                     // answer.
+                    self.input_error = Some("A Vault endpoint (host[:port]) is required.".into());
                     return;
                 }
                 self.config.secret_vault_endpoint = value;
@@ -3550,6 +3922,7 @@ impl WizardApp {
             KeyStoragePhase::VaultRole => {
                 if value.is_empty() {
                     // Kubernetes auth needs a role — no sensible default.
+                    self.input_error = Some("A Vault role is required for Kubernetes auth.".into());
                     return;
                 }
                 self.config.secret_vault_role = value;
@@ -3582,6 +3955,7 @@ impl WizardApp {
                 if value.is_empty() {
                     // The Secret name is required — no default that would
                     // be safe to guess across clusters.
+                    self.input_error = Some("A Secret name is required.".into());
                     return;
                 }
                 self.config.secret_k8s_secret_name = value;
@@ -3990,6 +4364,11 @@ impl WizardApp {
 
     /// Handle text input confirmation (Enter in TextInput mode).
     pub fn confirm_text_input(&mut self) {
+        if self.backend_check_running() {
+            return;
+        }
+        // A failed confirm below sets a fresh error.
+        self.input_error = None;
         if self.in_key_storage_subflow() {
             self.confirm_key_storage_phase();
             return;
@@ -4071,18 +4450,27 @@ impl WizardApp {
                     }
                     return;
                 }
-                // First text input: cert path, then key path. After the
-                // key path is saved, drop into the JWT-mode selection
-                // rather than advancing straight to Database.
-                if self.config.ssl_cert_path.is_empty()
-                    || self.config.ssl_cert_path == self.text_input.value()
-                {
-                    self.config.ssl_cert_path = self.text_input.value().to_string();
-                    self.text_input = Input::new(self.config.ssl_key_path.clone());
-                } else {
-                    self.config.ssl_key_path = self.text_input.value().to_string();
-                    self.mode = InputMode::Selecting;
-                    self.enter_jwt_mode_phase();
+                // Certificate path, then key path — tracked explicitly, so
+                // re-editing a saved certificate path cannot land in the key
+                // field. After the key, the JWT-mode selection.
+                let value = self.text_input.value().trim().to_string();
+                if value.is_empty() {
+                    self.input_error = Some("Enter a file path.".into());
+                    return;
+                }
+                self.input_error = None;
+                match self.ssl_field {
+                    Some(SslField::Key) => {
+                        self.config.ssl_key_path = value;
+                        self.ssl_field = None;
+                        self.mode = InputMode::Selecting;
+                        self.enter_jwt_mode_phase();
+                    }
+                    _ => {
+                        self.config.ssl_cert_path = value;
+                        self.ssl_field = Some(SslField::Key);
+                        self.text_input = Input::new(self.config.ssl_key_path.clone());
+                    }
                 }
             }
             WizardStep::Database => {
@@ -4118,6 +4506,20 @@ impl WizardApp {
                 self.mode = InputMode::Selecting;
                 self.advance();
             }
+            WizardStep::Admin => {
+                let value = self.text_input.value().trim().to_string();
+                if !crate::recipe::looks_like_did(&value) {
+                    self.input_error = Some(format!(
+                        "'{value}' is not a DID — expected did:<method>:<id>, e.g. \
+                         did:key:z6Mk…"
+                    ));
+                    return;
+                }
+                self.input_error = None;
+                self.config.admin_did = value;
+                self.mode = InputMode::Selecting;
+                self.advance();
+            }
             WizardStep::Output => {
                 let value = self.text_input.value().trim().to_string();
                 if !value.is_empty() {
@@ -4149,6 +4551,10 @@ impl WizardApp {
                 self.config.ssl_mode = SSL_NONE.into();
                 self.config.database_url = DEFAULT_REDIS_URL.into();
                 self.config.admin_did_mode = ADMIN_GENERATE.into();
+                // A production deployment starts from the template's
+                // restrictive posture (explicit ACL grants); local stays open.
+                self.config.network_mode =
+                    default_network_mode_for(&self.config.deployment_type).into();
             }
             _ => {}
         }
@@ -4224,6 +4630,30 @@ impl WizardApp {
         }
     }
 
+    /// The DID step's options: "Configure via VTA" only when the operator
+    /// picked `FullSetup` on the Vta step (the intent where the VTA mints
+    /// the integration DID). Importing an existing DID is not offered — the
+    /// wizard cannot provision one.
+    pub fn did_choices(&self) -> Vec<Choice<&'static str>> {
+        let mut choices = Vec::with_capacity(3);
+        if self.config.use_vta && self.shows_vta_did_option() {
+            choices.push(DID_CHOICE_VTA);
+        }
+        choices.extend([DID_CHOICE_WEBVH, DID_CHOICE_PEER]);
+        choices
+    }
+
+    /// The Admin step's options, the VTA-credential entry only where the VTA
+    /// intends to issue one for the mediator.
+    pub fn admin_choices(&self) -> Vec<Choice<&'static str>> {
+        let mut choices = vec![ADMIN_CHOICE_GENERATE, ADMIN_CHOICE_PASTE];
+        if self.admin_options_include_vta() {
+            choices.push(ADMIN_CHOICE_VTA);
+        }
+        choices.push(ADMIN_CHOICE_SKIP);
+        choices
+    }
+
     /// Whether the Admin step's option list should include the
     /// "Generate admin DID from VTA" entry.
     ///
@@ -4261,7 +4691,13 @@ impl WizardApp {
             self.vta_step_phase = VtaStepPhase::SelectIntent;
             self.vta_intent_choice = None;
             self.vta_stub_notice = None;
+            // Re-entering the VTA step starts the VTA choice over: a
+            // session from the previous pass must not leak into a
+            // different choice (with a warning that the VTA-side state
+            // remains).
+            self.discard_vta_session();
         }
+        self.input_error = None;
         if self.current_step == WizardStep::Database {
             // Always start the Database step on the backend picker.
             // Re-entry via `go_back` from a later step lands here too,
@@ -4280,6 +4716,17 @@ impl WizardApp {
         // reworking callers. Bounded by `WizardStep::total()` to
         // guarantee termination even if the predicate pathologically
         // fires on every remaining step.
+        // Leaving KeyStorage: check the chosen backend first (reachable,
+        // and not already holding a mediator) on a spawned task; its
+        // result calls `advance` again. Re-checked only when the choice
+        // changed.
+        if self.current_step == WizardStep::KeyStorage && self.live_backend {
+            let url = crate::config_writer::build_backend_url(&self.config);
+            if self.backend_checked_url.as_deref() != Some(url.as_str()) {
+                self.start_backend_check();
+                return;
+            }
+        }
         let mut guard = WizardStep::total();
         loop {
             self.completed.push(self.current_step);
@@ -4355,6 +4802,9 @@ impl WizardApp {
     }
 
     pub fn go_back(&mut self) {
+        if self.backend_check_running() {
+            return;
+        }
         if self.in_key_storage_subflow() {
             self.key_storage_back();
             return;
@@ -4441,8 +4891,18 @@ impl WizardApp {
             }
             return;
         }
+        self.input_error = None;
         match self.mode {
             InputMode::TextInput => {
+                // SSL paths: back from the key path is the certificate path.
+                if self.current_step == WizardStep::Security
+                    && self.ssl_field == Some(SslField::Key)
+                {
+                    self.ssl_field = Some(SslField::Cert);
+                    self.text_input = Input::new(self.config.ssl_cert_path.clone());
+                    return;
+                }
+                self.ssl_field = None;
                 self.mode = InputMode::Selecting;
             }
             InputMode::Confirming => {
@@ -4457,8 +4917,9 @@ impl WizardApp {
             }
             InputMode::Selecting => {
                 if !self.step_back_auto_skipping() {
-                    // Already at the first step — Esc quits the wizard.
-                    self.should_quit = true;
+                    // Already at the first step — Esc quits the wizard
+                    // (after a confirmation when a VTA session exists).
+                    self.request_quit();
                     return;
                 }
                 self.refresh_text_input_mode();
@@ -4626,61 +5087,36 @@ impl WizardApp {
     /// Get the default selection index based on deployment defaults.
     fn default_selection_index(&self) -> usize {
         match self.current_step {
-            WizardStep::Vta => match self.config.vta_mode.as_str() {
-                VTA_MODE_ONLINE => 0,
-                VTA_MODE_SEALED => 1,
-                _ if self.config.use_vta => 0, // VTA enabled but no mode yet
-                _ => 2,                        // No VTA
-            },
+            WizardStep::Vta => {
+                let intent = if !self.config.use_vta {
+                    None
+                } else if self.config.vta_mode == VTA_MODE_EXPORT {
+                    Some(VtaIntent::OfflineExport)
+                } else if self.config.did_method != DID_VTA && !self.config.did_method.is_empty() {
+                    Some(VtaIntent::AdminOnly)
+                } else {
+                    Some(VtaIntent::FullSetup)
+                };
+                index_of(&VTA_INTENT_CHOICES, intent).unwrap_or(0)
+            }
             WizardStep::Protocol => 0, // Start at DIDComm toggle
             WizardStep::Did => {
-                if self.config.use_vta {
-                    match self.config.did_method.as_str() {
-                        DID_VTA => 0,
-                        DID_WEBVH => 1,
-                        DID_PEER => 2,
-                        DID_IMPORT => 3,
-                        _ => 0,
-                    }
-                } else {
-                    match self.config.did_method.as_str() {
-                        DID_WEBVH => 0,
-                        DID_PEER => 1,
-                        DID_IMPORT => 2,
-                        _ => 0,
-                    }
-                }
+                index_of_str(&self.did_choices(), self.config.did_method.as_str()).unwrap_or(0)
             }
-            WizardStep::KeyStorage => match self.config.secret_storage.as_str() {
-                STORAGE_KEYRING => 0,
-                STORAGE_AWS => 1,
-                STORAGE_GCP => 2,
-                STORAGE_AZURE => 3,
-                STORAGE_VAULT => 4,
-                STORAGE_FILE => 5,
-                _ => 0,
-            },
-            WizardStep::Security => match self.config.ssl_mode.as_str() {
-                SSL_EXISTING => 1,
-                SSL_SELF_SIGNED => 2,
-                _ => 0,
-            },
+            WizardStep::KeyStorage => {
+                index_of_str(&KEY_STORAGE_CHOICES, self.config.secret_storage.as_str()).unwrap_or(0)
+            }
+            WizardStep::Security => {
+                index_of_str(&SSL_CHOICES, self.config.ssl_mode.as_str()).unwrap_or(0)
+            }
+            WizardStep::Deployment => {
+                index_of_str(&DEPLOYMENT_CHOICES, self.config.deployment_type.as_str()).unwrap_or(0)
+            }
             WizardStep::Admin => {
-                // Mirror the layout logic in `current_options` /
-                // `select_current`: VTA entry at index 2 only when
-                // `admin_options_include_vta()`. When absent (e.g.
-                // OfflineExport), `ADMIN_VTA` is no longer a valid
-                // stored mode for this flow — fall back to the
-                // generate-new-did:key default rather than pointing
-                // at an option that isn't rendered.
-                let with_vta = self.admin_options_include_vta();
-                match (with_vta, self.config.admin_did_mode.as_str()) {
-                    (_, ADMIN_PASTE) => 1,
-                    (true, ADMIN_VTA) => 2,
-                    (true, ADMIN_SKIP) => 3,
-                    (false, ADMIN_SKIP) => 2,
-                    _ => 0,
-                }
+                // An `ADMIN_VTA` stored for a flow that no longer offers it
+                // (e.g. OfflineExport) falls back to generating a did:key.
+                index_of_str(&self.admin_choices(), self.config.admin_did_mode.as_str())
+                    .unwrap_or(0)
             }
             _ => 0,
         }
@@ -6733,7 +7169,7 @@ mod tests {
         app.config.use_vta = false;
         app.current_step = WizardStep::Did;
         let opts = app.current_options();
-        assert_eq!(opts.len(), 3); // webvh, peer, import
+        assert_eq!(opts.len(), 2); // webvh, peer (no import: #173)
     }
 
     #[test]
@@ -6748,7 +7184,7 @@ mod tests {
         app.config.did_method = DID_VTA.into();
         app.current_step = WizardStep::Did;
         let opts = app.current_options();
-        assert_eq!(opts.len(), 4); // VTA, webvh, peer, import
+        assert_eq!(opts.len(), 3); // VTA, webvh, peer (no import: #173)
     }
 
     #[test]
@@ -6760,7 +7196,7 @@ mod tests {
         let opts = app.current_options();
         // AdminOnly — operator picks their own DID method; the
         // "Configure via VTA" option is suppressed.
-        assert_eq!(opts.len(), 3); // webvh, peer, import
+        assert_eq!(opts.len(), 2); // webvh, peer (no import: #173)
     }
 
     #[test]
@@ -7255,5 +7691,371 @@ mod tests {
         let mut app = WizardApp::new("test.toml".into());
         advance_to(&mut app, WizardStep::Did);
         assert_eq!(app.current_step, WizardStep::Did);
+    }
+
+    // ── #179: one table per step ──────────────────────────────────────
+
+    /// Every option of a table-driven step round-trips: picking index `i`
+    /// stores a value whose default highlight is `i` again.
+    #[test]
+    fn every_table_entry_round_trips_through_its_default_index() {
+        for (i, choice) in KEY_STORAGE_CHOICES.iter().enumerate() {
+            let mut app = WizardApp::new("test.toml".into());
+            app.current_step = WizardStep::KeyStorage;
+            app.selection_index = i;
+            app.select_current();
+            assert_eq!(app.config.secret_storage, choice.value);
+            app.current_step = WizardStep::KeyStorage;
+            assert_eq!(app.default_selection_index(), i, "{}", choice.value);
+            assert_eq!(app.current_options()[i].label, choice.label);
+        }
+        for (i, choice) in DEPLOYMENT_CHOICES.iter().enumerate() {
+            let mut app = WizardApp::new("test.toml".into());
+            app.selection_index = i;
+            app.select_current();
+            assert_eq!(app.config.deployment_type, choice.value);
+            app.current_step = WizardStep::Deployment;
+            assert_eq!(app.default_selection_index(), i);
+        }
+        for (i, choice) in SSL_CHOICES.iter().enumerate() {
+            let mut app = WizardApp::new("test.toml".into());
+            app.current_step = WizardStep::Security;
+            app.selection_index = i;
+            app.select_current();
+            assert_eq!(app.config.ssl_mode, choice.value);
+            assert_eq!(app.default_selection_index(), i);
+        }
+        for use_vta in [false, true] {
+            let mut app = WizardApp::new("test.toml".into());
+            app.config.use_vta = use_vta;
+            app.config.did_method = DID_VTA.into();
+            for (i, choice) in app.did_choices().iter().enumerate() {
+                let mut app = WizardApp::new("test.toml".into());
+                app.config.use_vta = use_vta;
+                app.config.did_method = DID_VTA.into();
+                app.current_step = WizardStep::Did;
+                app.selection_index = i;
+                app.select_current();
+                assert_eq!(app.config.did_method, choice.value);
+                app.current_step = WizardStep::Did;
+                // The highlight lands on the chosen method (the VTA row
+                // itself comes and goes with it).
+                let idx = app.default_selection_index();
+                assert_eq!(app.did_choices()[idx].value, choice.value);
+            }
+            for (i, choice) in app.admin_choices().iter().enumerate() {
+                let mut a = WizardApp::new("test.toml".into());
+                a.config.use_vta = use_vta;
+                a.current_step = WizardStep::Admin;
+                a.selection_index = i;
+                a.select_current();
+                assert_eq!(a.config.admin_did_mode, choice.value);
+                a.current_step = WizardStep::Admin;
+                assert_eq!(a.default_selection_index(), i);
+            }
+        }
+    }
+
+    #[test]
+    fn returning_to_key_storage_after_file_highlights_file_not_k8s() {
+        // Regression: the default-index table had `file:// => 5`, the
+        // Kubernetes row; Enter there switched the backend.
+        let mut app = WizardApp::new("test.toml".into());
+        app.config.secret_storage = STORAGE_FILE.into();
+        app.current_step = WizardStep::KeyStorage;
+        let idx = app.default_selection_index();
+        assert_eq!(KEY_STORAGE_CHOICES[idx].value, STORAGE_FILE);
+    }
+
+    #[test]
+    fn no_vta_is_highlighted_for_a_non_vta_setup() {
+        // Regression: `_ => 2 // No VTA` pointed at offline export.
+        let mut app = WizardApp::new("test.toml".into());
+        app.config.use_vta = false;
+        app.current_step = WizardStep::Vta;
+        let idx = app.default_selection_index();
+        assert_eq!(VTA_INTENT_CHOICES[idx].value, None);
+        assert_eq!(app.current_options()[idx].label, "No VTA");
+    }
+
+    #[test]
+    fn re_editing_the_certificate_path_does_not_overwrite_the_key() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.current_step = WizardStep::Security;
+        app.selection_index = index_of_str(&SSL_CHOICES, SSL_EXISTING).unwrap();
+        app.select_current();
+        app.text_input = Input::new("/tls/a.pem".into());
+        app.confirm_text_input();
+        app.text_input = Input::new("/tls/a.key".into());
+        app.confirm_text_input();
+        assert_eq!(app.security_phase, Some(SecurityPhase::JwtMode));
+
+        // Back on the SSL list, re-pick "existing" and change the cert.
+        app.security_phase = None;
+        app.selection_index = index_of_str(&SSL_CHOICES, SSL_EXISTING).unwrap();
+        app.select_current();
+        app.text_input = Input::new("/tls/b.pem".into());
+        app.confirm_text_input();
+        assert_eq!(app.config.ssl_cert_path, "/tls/b.pem");
+        assert_eq!(
+            app.config.ssl_key_path, "/tls/a.key",
+            "the key must not change"
+        );
+        assert_eq!(app.ssl_field, Some(SslField::Key));
+        assert_eq!(app.mode, InputMode::TextInput);
+    }
+
+    #[test]
+    fn empty_required_inputs_say_why() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.current_step = WizardStep::KeyStorage;
+        app.config.secret_storage = STORAGE_GCP.into();
+        app.enter_key_storage_phase(KeyStoragePhase::GcpProject);
+        app.text_input = Input::new(String::new());
+        app.confirm_text_input();
+        assert_eq!(app.key_storage_phase, Some(KeyStoragePhase::GcpProject));
+        assert!(app.input_error.as_deref().unwrap().contains("GCP project"));
+
+        app.enter_key_storage_phase(KeyStoragePhase::FileGate);
+        app.text_input = Input::new("yes".into());
+        app.confirm_text_input();
+        assert!(
+            app.input_error
+                .as_deref()
+                .unwrap()
+                .contains(FILE_GATE_PHRASE)
+        );
+    }
+
+    #[test]
+    fn re_entering_the_vta_step_discards_the_session_with_a_warning() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.vta_session = Some(VtaSession::admin_only(
+            "mediator".into(),
+            "did:webvh:vta.example.com".into(),
+            None,
+            None,
+            "did:key:z6MkAdmin".into(),
+            "zKey".into(),
+        ));
+        app.current_step = WizardStep::Protocol;
+        assert!(app.step_back_auto_skipping());
+        assert_eq!(app.current_step, WizardStep::Vta);
+        assert!(app.vta_session.is_none());
+        assert!(
+            app.vta_stub_notice
+                .as_deref()
+                .unwrap()
+                .contains("remains on the VTA side")
+        );
+    }
+
+    #[test]
+    fn deployment_info_matches_the_applied_defaults() {
+        // Local stays open; server and container start closed.
+        for (i, expected) in [
+            (0, NETWORK_MODE_OPEN),
+            (1, NETWORK_MODE_CLOSED),
+            (2, NETWORK_MODE_CLOSED),
+        ] {
+            let mut app = WizardApp::new("test.toml".into());
+            app.selection_index = i;
+            app.select_current();
+            assert_eq!(app.config.network_mode, expected);
+            let info = DEPLOYMENT_CHOICES[i].info;
+            assert!(!info.contains("did:peer, inline secrets"));
+            assert!(info.contains(if expected == NETWORK_MODE_OPEN {
+                "open"
+            } else {
+                "closed"
+            }));
+        }
+    }
+
+    // ── #173: admin identity ──────────────────────────────────────────
+
+    #[test]
+    fn pasting_an_admin_did_is_a_real_prompt() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.current_step = WizardStep::Admin;
+        app.selection_index = index_of_str(&app.admin_choices(), ADMIN_PASTE).unwrap();
+        app.select_current();
+        assert_eq!(app.mode, InputMode::TextInput);
+        assert_eq!(app.current_step, WizardStep::Admin);
+
+        app.text_input = Input::new("not-a-did".into());
+        app.confirm_text_input();
+        assert_eq!(app.current_step, WizardStep::Admin, "a bad DID is refused");
+        assert!(app.input_error.is_some());
+
+        app.text_input = Input::new("did:key:z6MkPasted".into());
+        app.confirm_text_input();
+        assert_eq!(app.config.admin_did, "did:key:z6MkPasted");
+        assert_eq!(app.config.admin_did_mode, ADMIN_PASTE);
+        assert_eq!(app.current_step, WizardStep::Output);
+    }
+
+    #[test]
+    fn did_import_is_not_offered() {
+        for use_vta in [false, true] {
+            let mut app = WizardApp::new("test.toml".into());
+            app.config.use_vta = use_vta;
+            app.config.did_method = DID_VTA.into();
+            assert!(app.did_choices().iter().all(|c| c.value != DID_IMPORT));
+        }
+    }
+
+    // ── #158: quitting with a session, Esc during a flight ────────────
+
+    #[test]
+    fn quitting_with_a_vta_session_asks_first() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.request_quit();
+        assert!(app.should_quit, "no session: quit at once");
+
+        let mut app = WizardApp::new("test.toml".into());
+        app.vta_session = Some(VtaSession::admin_only(
+            "mediator".into(),
+            "did:webvh:vta.example.com".into(),
+            None,
+            None,
+            "did:key:z6MkAdmin".into(),
+            "zKey".into(),
+        ));
+        app.request_quit();
+        assert!(!app.should_quit);
+        assert!(app.quit_confirm_pending());
+        app.answer_quit_confirm(false);
+        assert!(!app.should_quit && !app.quit_confirm_pending());
+        app.request_quit();
+        app.answer_quit_confirm(true);
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn esc_during_a_flight_aborts_the_task() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.current_step = WizardStep::Vta;
+        app.enter_vta_subflow(VtaIntent::FullSetup);
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Some(st) = app.vta_connect.as_mut() {
+            st.phase = ConnectPhase::Testing;
+            st.event_rx = Some(rx);
+        }
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        app.vta_task = Some(task);
+        assert!(app.provision_in_flight());
+        app.go_back();
+        tokio::task::yield_now().await;
+        assert!(
+            abort.is_finished(),
+            "the flight must be aborted, not just unheard"
+        );
+        assert!(!app.provision_in_flight());
+    }
+
+    // ── #158: the backend is checked when KeyStorage completes ────────
+
+    async fn settle(app: &mut WizardApp) {
+        for _ in 0..200 {
+            app.drain_background();
+            if !app.backend_check_running() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("backend check did not finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn key_storage_checks_the_backend_before_moving_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets.json");
+        let mut app = WizardApp::new("test.toml".into());
+        app.live_backend = true;
+        app.current_step = WizardStep::KeyStorage;
+        app.config.secret_storage = STORAGE_FILE.into();
+        app.config.secret_file_path = secrets.to_string_lossy().into_owned();
+        app.advance();
+        assert!(app.backend_check_running());
+        assert_eq!(app.current_step, WizardStep::KeyStorage);
+        settle(&mut app).await;
+        assert_eq!(app.current_step, WizardStep::Vta, "{:?}", app.backend_check);
+
+        // A backend that already holds a mediator is refused on the spot.
+        let store = crate::secret_backend::open_secret_backend(
+            &crate::config_writer::build_backend_url(&app.config),
+        )
+        .unwrap();
+        store.store_jwt_secret(b"existing").await.unwrap();
+        let mut app2 = WizardApp::new("test.toml".into());
+        app2.live_backend = true;
+        app2.current_step = WizardStep::KeyStorage;
+        app2.config = app.config.clone();
+        app2.advance();
+        settle(&mut app2).await;
+        assert_eq!(app2.current_step, WizardStep::KeyStorage);
+        assert!(matches!(
+            app2.backend_check,
+            Some(BackendCheck::Failed(ref e)) if e.contains("--force-reprovision")
+        ));
+    }
+
+    // ── #176: every secret backend has its build feature ──────────────
+
+    #[test]
+    fn every_secret_backend_maps_to_its_build_feature() {
+        for (scheme, feature) in [
+            (STORAGE_KEYRING, Some("secrets-keyring")),
+            (STORAGE_AWS, Some("secrets-aws")),
+            (STORAGE_GCP, Some("secrets-gcp")),
+            (STORAGE_AZURE, Some("secrets-azure")),
+            (STORAGE_VAULT, Some("secrets-vault")),
+            (STORAGE_K8S, Some("secrets-k8s")),
+            (STORAGE_FILE, None),
+        ] {
+            let config = WizardConfig {
+                secret_storage: scheme.into(),
+                ..WizardConfig::default()
+            };
+            let features = config.cargo_features();
+            let secret_features: Vec<_> = features
+                .iter()
+                .filter(|f| f.starts_with("secrets-"))
+                .collect();
+            match feature {
+                Some(f) => assert_eq!(secret_features, vec![&f], "{scheme}"),
+                None => assert!(secret_features.is_empty(), "{scheme}"),
+            }
+        }
+        // And the table offers no backend the mapping misses.
+        for choice in KEY_STORAGE_CHOICES {
+            assert!(
+                choice.value == STORAGE_FILE
+                    || WizardConfig {
+                        secret_storage: choice.value.into(),
+                        ..WizardConfig::default()
+                    }
+                    .cargo_features()
+                    .iter()
+                    .any(|f| f.starts_with("secrets-")),
+                "{} has no build feature",
+                choice.value
+            );
+        }
+    }
+
+    #[test]
+    fn keyring_is_flagged_for_containers() {
+        let mut app = WizardApp::new("test.toml".into());
+        app.config.deployment_type = DEPLOYMENT_CONTAINER.into();
+        app.current_step = WizardStep::KeyStorage;
+        let idx = index_of_str(&KEY_STORAGE_CHOICES, STORAGE_KEYRING).unwrap();
+        assert!(
+            app.current_options()[idx]
+                .label
+                .contains("not available inside a container")
+        );
     }
 }

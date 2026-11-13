@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use affinidi_secrets_resolver::secrets::Secret;
 use toml_edit::DocumentMut;
@@ -32,12 +32,89 @@ pub struct GeneratedValues {
     pub ssl_cert_path: Option<String>,
     /// SSL key path (if self-signed was generated)
     pub ssl_key_path: Option<String>,
-    /// `true` when the wizard wrote a `did.jsonl` next to the config —
-    /// either because `did_method = "did:webvh"` (self-hosted webvh) or
-    /// because `did_method = "vta"` returned a serverless mediator DID
-    /// whose log entry the mediator now serves itself. Drives whether
-    /// `[server].did_web_self_hosted` is written into `mediator.toml`.
-    pub did_log_jsonl_written: bool,
+    /// Where the mediator will read the `did.jsonl` the wizard wrote, as a
+    /// `file://` URL ([`runtime_file_url`]) — the file actually written,
+    /// not a path relative to wherever the mediator happens to start.
+    /// `Some` when `did_method = "did:webvh"` (self-hosted webvh) or a
+    /// VTA-managed DID came with a log entry the mediator serves itself.
+    /// Drives `[server].did_web_self_hosted`.
+    pub did_log_path: Option<String>,
+}
+
+/// Where a container deployment mounts the config directory (and so every
+/// file the wizard writes next to `mediator.toml`). The Dockerfile and the
+/// compose file use the same path.
+pub const CONTAINER_CONFIG_DIR: &str = "/etc/mediator/conf";
+
+/// Where a container deployment mounts a `file://` secrets file that lives
+/// outside the config directory.
+pub const CONTAINER_SECRETS_DIR: &str = "/etc/mediator/secrets";
+
+/// `path`, made absolute against the current directory.
+fn absolute(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// The path the mediator sees for a host file the wizard wrote. Outside a
+/// container that is the absolute host path. In a container deployment a
+/// file inside the config directory is under [`CONTAINER_CONFIG_DIR`], and
+/// any other file under [`CONTAINER_SECRETS_DIR`] (the compose file mounts
+/// it there).
+pub fn runtime_path(config: &WizardConfig, host_path: &Path) -> String {
+    let host = absolute(host_path);
+    if config.deployment_type != DEPLOYMENT_CONTAINER {
+        return host.to_string_lossy().into_owned();
+    }
+    let conf_dir = absolute(&config_dir(config));
+    match host.strip_prefix(&conf_dir) {
+        Ok(rel) => format!("{CONTAINER_CONFIG_DIR}/{}", rel.to_string_lossy()),
+        Err(_) => format!(
+            "{CONTAINER_SECRETS_DIR}/{}",
+            host.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+    }
+}
+
+/// [`runtime_path`] as a `file://` URL.
+pub fn runtime_file_url(config: &WizardConfig, host_path: &Path) -> String {
+    format!("file://{}", runtime_path(config, host_path))
+}
+
+/// The host path of the `file://` secrets file, when that is the backend.
+pub fn file_backend_host_path(config: &WizardConfig) -> Option<std::path::PathBuf> {
+    if config.secret_storage != STORAGE_FILE {
+        return None;
+    }
+    let raw = config.secret_file_path.trim();
+    let raw = raw.strip_prefix("file://").unwrap_or(raw);
+    Some(absolute(Path::new(raw)))
+}
+
+/// The `[secrets].backend` URL written into `mediator.toml` — what the
+/// *mediator* opens. Identical to [`build_backend_url`] (what the wizard
+/// opens on this host) except for a `file://` backend in a container
+/// deployment, which points at the in-container path the compose file
+/// mounts the secrets file at.
+pub fn runtime_backend_url(config: &WizardConfig) -> String {
+    match file_backend_host_path(config) {
+        Some(host) if config.deployment_type == DEPLOYMENT_CONTAINER => {
+            let url = format!("file://{}", runtime_path(config, &host));
+            if config.secret_file_encrypted {
+                format!("{url}?encrypt=1")
+            } else {
+                url
+            }
+        }
+        _ => build_backend_url(config),
+    }
 }
 
 /// The default mediator.toml template, embedded at compile time.
@@ -57,13 +134,19 @@ const ATM_FUNCTIONS_LUA: &str = include_str!("../../../conf/atm-functions.lua");
 /// whenever `[secrets].storage` pointed at the same path — which the
 /// default `conf/secrets.json` always does (#354). The legacy write is
 /// gone; nothing reads that format anymore.
-pub fn write_config(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::Result<()> {
+///
+/// Returns the paths written. Both writes are temp + fsync + rename, so an
+/// interrupted run leaves the previous file, never a half-written one.
+pub fn write_config(
+    config: &WizardConfig,
+    generated: &GeneratedValues,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let toml_content = generate_toml(config, generated)?;
 
-    // Ensure parent directory exists
+    // Ensure the parent directory exists (created owner-only).
     let path = Path::new(&config.config_path);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::secure_fs::create_private_dir_all(parent)?;
     }
 
     // mediator.toml carries the `[secrets].backend` URL — vault
@@ -75,9 +158,9 @@ pub fn write_config(config: &WizardConfig, generated: &GeneratedValues) -> anyho
     // Redis Lua functions are public Redis script content — leave
     // at default (world-readable) permissions.
     let lua_path = config_dir(config).join("atm-functions.lua");
-    fs::write(&lua_path, ATM_FUNCTIONS_LUA)?;
+    crate::secure_fs::write_public(&lua_path, ATM_FUNCTIONS_LUA)?;
 
-    Ok(())
+    Ok(vec![path.to_path_buf(), lua_path])
 }
 
 /// Get the config directory from the config path.
@@ -101,7 +184,7 @@ fn generate_toml(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::
     // Write the unified backend URL. The VTA session (if any) landed keys
     // under well-known names inside this backend via `generate_and_write`;
     // the mediator reads them at startup via `MediatorSecrets`.
-    let backend_url = build_backend_url(config);
+    let backend_url = runtime_backend_url(config);
     if let Some(secrets_section) = doc.get_mut("secrets") {
         secrets_section["backend"] = toml_edit::value(&backend_url);
     }
@@ -136,20 +219,23 @@ fn generate_toml(config: &WizardConfig, generated: &GeneratedValues) -> anyhow::
         // Otherwise the line stays commented (template default), which
         // is also the safe outcome when public_url isn't set or the DID
         // shape doesn't expose a host.
-        let should_self_host = generated.did_log_jsonl_written
+        let should_self_host = generated.did_log_path.is_some()
             && self_host_domain_match(&generated.mediator_did, &config.public_url);
         if should_self_host {
             // Point the runtime at the published log target when the recipe
             // set one: every supported `did_log_target` scheme (`s3://`,
             // `aws_parameter_store://`, `file://`) is readable by the
             // runtime's `read_document`, and on ephemeral compute the local
-            // `./conf/did.jsonl` dies with the one-shot setup task while the
+            // `did.jsonl` dies with the one-shot setup task while the
             // published object survives. Without a target, the local copy is
-            // the only source there is.
+            // the only source there is — named by the path it was written
+            // to (or its in-container path), so it does not depend on the
+            // directory the mediator is started from.
             let self_hosted = config
                 .did_log_target
                 .as_deref()
-                .unwrap_or("file://./conf/did.jsonl");
+                .or(generated.did_log_path.as_deref())
+                .unwrap_or_default();
             server["did_web_self_hosted"] = toml_edit::value(self_hosted);
         } else {
             server
@@ -819,7 +905,7 @@ mod tests {
             admin_secret: None,
             ssl_cert_path: None,
             ssl_key_path: None,
-            did_log_jsonl_written: false,
+            did_log_path: None,
         }
     }
 
@@ -1108,32 +1194,43 @@ mod tests {
         }
     }
 
-    /// Config-equivalence guard (mediator T22): the two non-interactive setup
-    /// paths — `--non-interactive` (CLI args → `build_config_from_args`) and
-    /// `--from <recipe>` (`recipe::to_wizard_config`) — must produce the SAME
-    /// `mediator.toml` for the same logical setup, so they can't drift apart.
-    /// Both build on `WizardConfig::default()`, so an equivalent recipe yields a
-    /// byte-identical render.
+    /// Config-equivalence guard (mediator T22): the flag shorthands of
+    /// `--non-interactive` and the same values in a `--from <recipe>` must
+    /// produce the SAME `mediator.toml`. Both now go through one recipe
+    /// (`headless::build`), so this holds by construction; the test keeps it
+    /// that way.
     #[test]
     fn cli_and_recipe_paths_produce_identical_config() {
-        // The non-interactive defaults: local / VTA-online / didcomm / did:vta /
-        // keyring / redis / generate-admin (a bare `Args` applies exactly these).
-        let cli_config =
-            crate::build_config_from_args(&crate::cli::Args::default()).expect("build from args");
+        use clap::Parser;
+        let args = crate::cli::Args::parse_from([
+            "mediator-setup",
+            "--non-interactive",
+            "--did-method",
+            "peer",
+            "--protocol",
+            "didcomm",
+            "--secret-storage",
+            "keyring",
+            "--admin",
+            "generate",
+        ]);
+        let built = crate::headless::build(&args, crate::headless::Mode::Flags).expect("flags");
+        let cli_config = crate::recipe::to_wizard_config(&built.recipe).expect("flags -> config");
 
         // The same setup expressed as a recipe.
         let recipe_toml = r#"
 [deployment]
 type = "local"
 protocols = ["didcomm"]
-use_vta = true
-vta_mode = "online"
 
 [identity]
-did_method = "vta"
+did_method = "did:peer"
 
 [secrets]
-storage = "keyring://affinidi-mediator"
+storage = "keyring://"
+
+[security]
+admin = "generate"
 "#;
         let recipe: crate::recipe::BuildRecipe = toml::from_str(recipe_toml).expect("parse recipe");
         let recipe_config = crate::recipe::to_wizard_config(&recipe).expect("recipe -> config");
@@ -1175,7 +1272,7 @@ storage = "keyring://affinidi-mediator"
             admin_secret: None,
             ssl_cert_path: None,
             ssl_key_path: None,
-            did_log_jsonl_written: false,
+            did_log_path: None,
         };
 
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1278,12 +1375,12 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:mediator.example.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
         assert!(has_active_did_web_self_hosted(&toml));
-        assert!(toml.contains("did_web_self_hosted = \"file://./conf/did.jsonl\""));
+        assert!(toml.contains("did_web_self_hosted = \"file:///srv/conf/did.jsonl\""));
     }
 
     #[test]
@@ -1303,7 +1400,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:mediator.example.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1333,7 +1430,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:webvh.vta-host.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1355,7 +1452,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:webvh.vta-host.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1377,7 +1474,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:mediator.example.com".into(),
-            did_log_jsonl_written: false,
+            did_log_path: None,
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1396,7 +1493,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:mediator.example.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();
@@ -1415,7 +1512,7 @@ storage = "keyring://affinidi-mediator"
         };
         let generated = GeneratedValues {
             mediator_did: "did:webvh:QmScid:mediator.example.com".into(),
-            did_log_jsonl_written: true,
+            did_log_path: Some("file:///srv/conf/did.jsonl".into()),
             ..test_generated()
         };
         let toml = generate_toml(&config, &generated).unwrap();

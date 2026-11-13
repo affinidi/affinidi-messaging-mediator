@@ -129,56 +129,81 @@ fn auto_fallback_target(
     }
 }
 
-/// Phase 1: generate + persist ephemeral key, print ACL command.
+/// The phase-2 command line that finishes the setup phase 1 started.
+fn finalise_command(
+    out_path: &Path,
+    vta_did: Option<&str>,
+    ctx: &str,
+    mediator_url: Option<&str>,
+    did_method: Option<crate::cli::DidMethod>,
+) -> String {
+    let did_method = match did_method {
+        Some(crate::cli::DidMethod::Webvh) => "webvh",
+        Some(crate::cli::DidMethod::Peer) => "peer",
+        _ => "<peer|webvh>",
+    };
+    format!(
+        "mediator-setup --setup-key-file {} \\\n      --vta-did {} --vta-context {ctx} \\\n      \
+         --mediator-url {} --did-method {did_method} \\\n      [--secret-storage <backend> | \
+         --from <recipe.toml>] [--set section.key=value …]",
+        out_path.display(),
+        vta_did.unwrap_or("<vta-did>"),
+        mediator_url.unwrap_or("<https://mediator.example.com>"),
+    )
+}
+
+/// Phase 1: generate + persist ephemeral key, print the context/ACL command
+/// and the phase-2 command that finishes the setup.
 pub async fn run_phase1_init(
     out_path: &Path,
     vta_did: Option<&str>,
     context_id: Option<&str>,
+    mediator_url: Option<&str>,
+    did_method: Option<crate::cli::DidMethod>,
 ) -> anyhow::Result<()> {
     let key = EphemeralSetupKey::generate()?;
     key.persist_to(out_path)?;
 
     let ctx = context_id.unwrap_or(DEFAULT_VTA_CONTEXT);
 
-    println!();
-    println!("  Setup DID (ephemeral):");
-    println!("    {}", key.did);
-    println!();
-    println!("  Key stored at {} (0600)", out_path.display());
-    println!();
-    println!("  Using your Personal Network Manager (PNM) connected to this VTA,");
-    println!("  create the mediator context and grant admin access to the setup DID:");
-    println!();
-    println!(
+    out!();
+    out!("  Setup DID (ephemeral):");
+    out!("    {}", key.did);
+    out!();
+    out!("  Key stored at {} (0600)", out_path.display());
+    out!();
+    out!("  Using your Personal Network Manager (PNM) connected to this VTA,");
+    out!("  create the mediator context and grant admin access to the setup DID:");
+    out!();
+    out!(
         "    pnm contexts create --id {ctx} --name \"Mediator\" \\\n      --admin-did {} --admin-expires {}",
         key.did,
         crate::consts::DEFAULT_VTA_SETUP_EXPIRY,
     );
-    println!();
-    println!("  --name is a human-readable label — change \"Mediator\" to anything");
-    println!("  that fits your naming conventions.");
-    println!();
-    println!("  --admin-expires defaults to 1h. Use 24h, 7d, etc. for longer");
-    println!("  roll-outs; the entry is promoted to permanent on first auth.");
-    println!();
-    println!("  Then finalise with:");
-    let mut finalise = format!(
-        "    mediator-setup --setup-key-file {} --vta-context {ctx}",
-        out_path.display()
+    out!();
+    out!("  --name is a human-readable label — change \"Mediator\" to anything");
+    out!("  that fits your naming conventions.");
+    out!();
+    out!("  --admin-expires defaults to 1h. Use 24h, 7d, etc. for longer");
+    out!("  roll-outs; the entry is promoted to permanent on first auth.");
+    out!();
+    out!("  Then finish the setup — authenticate, store the credential in the");
+    out!("  secret backend, write the mediator config — with:");
+    out!();
+    out!(
+        "    {}",
+        finalise_command(out_path, vta_did, ctx, mediator_url, did_method)
     );
-    if let Some(did) = vta_did {
-        finalise.push_str(&format!(" --vta-did {did}"));
-    } else {
-        finalise.push_str(" --vta-did <vta-did>");
-    }
-    finalise.push_str(" --non-interactive");
-    println!("{finalise}");
-    println!();
+    out!();
+    out!("  In this admin-only flow the setup did:key above becomes the mediator's");
+    out!("  long-term VTA admin credential: phase 2 stores it in the secret backend");
+    out!("  and deletes the key file. The mediator brings its own DID (--did-method).");
+    out!();
     Ok(())
 }
 
-/// Phase 2: reload key + run runner + stream diagnostics to stdout. Exits Ok
-/// only on a successful auth; on failure returns a structured
+/// Phase 2: reload key + run runner + stream diagnostics to stdout. Returns
+/// the admin-only [`crate::vta::VtaSession`] on a successful auth; on failure returns a structured
 /// [`HeadlessVtaError`] that the caller maps to an exit code.
 ///
 /// Auto-fallback: if a DIDComm pre-auth failure happens against a
@@ -192,7 +217,7 @@ pub async fn run_phase2_connect(
     context_id: Option<&str>,
     mediator_url: &str,
     wait_for_acl: Option<u64>,
-) -> Result<(), HeadlessVtaError> {
+) -> Result<crate::vta::VtaSession, HeadlessVtaError> {
     let key = EphemeralSetupKey::load_from(key_path).map_err(|e| HeadlessVtaError {
         tsp: None,
         didcomm: Some(format!("could not load setup key: {e}")),
@@ -201,12 +226,12 @@ pub async fn run_phase2_connect(
     })?;
     let ctx = context_id.unwrap_or(DEFAULT_VTA_CONTEXT);
 
-    println!();
-    println!("  VTA DID:      {vta_did}");
-    println!("  Context:      {ctx}");
-    println!("  Mediator URL: {mediator_url}");
-    println!("  Setup DID:    {}", key.did);
-    println!();
+    out!();
+    out!("  VTA DID:      {vta_did}");
+    out!("  Context:      {ctx}");
+    out!("  Mediator URL: {mediator_url}");
+    out!("  Setup DID:    {}", key.did);
+    out!();
 
     let deadline = wait_for_acl.map(|s| Instant::now() + Duration::from_secs(s));
     let mut attempt = 0u32;
@@ -223,12 +248,12 @@ pub async fn run_phase2_connect(
         attempt += 1;
         if attempt > 1 {
             match force_transport {
-                Some(Protocol::Tsp) => println!("  Retrying TSP (attempt {attempt})…"),
-                Some(Protocol::Rest) => println!("  Falling back to REST (attempt {attempt})…"),
+                Some(Protocol::Tsp) => out!("  Retrying TSP (attempt {attempt})…"),
+                Some(Protocol::Rest) => out!("  Falling back to REST (attempt {attempt})…"),
                 Some(Protocol::DidComm) => {
-                    println!("  Retrying DIDComm (attempt {attempt})…")
+                    out!("  Retrying DIDComm (attempt {attempt})…")
                 }
-                None => println!("  Retrying (attempt {attempt})…"),
+                None => out!("  Retrying (attempt {attempt})…"),
             }
         }
 
@@ -258,7 +283,7 @@ pub async fn run_phase2_connect(
             .await;
         });
 
-        let mut connected = false;
+        let mut connected: Option<crate::vta::VtaSession> = None;
         let mut last_failure: Option<String> = None;
         // The most recent AttemptCompleted in this loop iteration —
         // used to decide auto-fallback after the runner emits Failed.
@@ -267,15 +292,28 @@ pub async fn run_phase2_connect(
         while let Some(event) = rx.recv().await {
             match event {
                 VtaEvent::CheckStart(c) => {
-                    println!("  [..] {}", c.label());
+                    out!("  [..] {}", c.label());
                 }
                 VtaEvent::CheckDone(c, status) => {
-                    println!("  {}", format_check_line(c, &status));
+                    out!("  {}", format_check_line(c, &status));
                 }
-                VtaEvent::Connected { protocol, .. } => {
-                    connected = true;
-                    println!();
-                    println!("  Connected via {}", protocol.label());
+                VtaEvent::Connected {
+                    protocol,
+                    rest_url,
+                    mediator_did,
+                    reply,
+                } => {
+                    // AdminOnly: the setup did:key the operator enrolled is
+                    // the long-term admin credential the reply carries.
+                    connected = Some(crate::vta::VtaSession {
+                        context_id: ctx.to_string(),
+                        vta_did: vta_did.to_string(),
+                        rest_url,
+                        mediator_did,
+                        reply: reply.into(),
+                    });
+                    out!();
+                    out!("  Connected via {}", protocol.label());
                 }
                 VtaEvent::PreflightDone { .. } => {
                     // AdminOnly never emits PreflightDone. Defensive
@@ -309,8 +347,8 @@ pub async fn run_phase2_connect(
         }
         let _ = runner.await;
 
-        if connected {
-            return Ok(());
+        if let Some(session) = connected {
+            return Ok(session);
         }
 
         // Decide what to do next: auto-fallback, retry-on-wait, or terminal.
@@ -354,8 +392,8 @@ pub async fn run_phase2_connect(
             && retryable(&reason)
         {
             let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-            println!();
-            println!("  ACL not yet present — waiting up to {remaining}s more…");
+            out!();
+            out!("  ACL not yet present — waiting up to {remaining}s more…");
             tokio::time::sleep(Duration::from_secs(3)).await;
             // Reset the relevant transport's failure so the retry
             // loop's "attempted" check doesn't block another
@@ -561,9 +599,15 @@ mod tests {
     async fn phase1_writes_a_valid_key_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        run_phase1_init(&path, Some("did:webvh:vta.example.com"), Some("mediator"))
-            .await
-            .unwrap();
+        run_phase1_init(
+            &path,
+            Some("did:webvh:vta.example.com"),
+            Some("mediator"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let reloaded = EphemeralSetupKey::load_from(&path).unwrap();
         assert!(reloaded.did.starts_with("did:key:z6Mk"));
     }
