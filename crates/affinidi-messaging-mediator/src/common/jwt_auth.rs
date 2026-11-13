@@ -9,7 +9,7 @@ use affinidi_messaging_mediator_common::errors::{ErrorResponse, MediatorError};
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 use axum::{
     Json, RequestPartsExt,
-    extract::{FromRef, FromRequestParts},
+    extract::FromRequestParts,
     response::{IntoResponse, Response},
 };
 use axum_extra::{
@@ -18,29 +18,12 @@ use axum_extra::{
 };
 use http::{StatusCode, request::Parts};
 use jsonwebtoken::{TokenData, Validation};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fmt::{Debug, Display},
     net::SocketAddr,
 };
 use tracing::{Level, debug, error, event, info, warn};
-
-// Payload contents of the JWT
-// All times are in seconds since UNIX EPOCH
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokenPayload {
-    pub aud: Vec<String>, // Intended Audience
-    pub client_id: String,
-    pub exp: u64,    // What does this JWT Expire
-    pub iat: u64,    // Issued at this time
-    pub iss: String, // Who issued this JWT?
-    pub jti: String, // JWT ID
-    pub nbf: u64,    // JWT is not valid before this time
-    /// OAuth2 scopes (reserved for future use)
-    pub scp: Vec<String>,
-    pub sub: String, // subject - who this JWT refers to
-}
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -269,8 +252,8 @@ pub(crate) async fn authenticate_token(
     if !affinidi_messaging_mediator_common::did_identity::same_account(&saved_session.did, &did) {
         warn!(
             session_id = %session_id,
-            jwt_did = %did,
-            session_did = %saved_session.did,
+            jwt_did_hash = %did_hash,
+            session_did_hash = %saved_session.did_hash,
             "JWT sub does not match session DID — rejecting"
         );
         return Err(AuthError::InvalidToken);
@@ -278,7 +261,7 @@ pub(crate) async fn authenticate_token(
 
     // Check if ACL is satisfied
     if authz::require_capability(&saved_session.acls, Capability::NotBlocked).is_err() {
-        info!("DID({}) is blocked from connecting", did);
+        info!(did_hash = %did_hash, "DID is blocked from connecting");
         return Err(AuthError::Blocked);
     }
 
@@ -311,41 +294,29 @@ pub(crate) async fn authenticate_token(
     Ok(saved_session)
 }
 
-impl<S> FromRequestParts<S> for Session
-where
-    SharedData: FromRef<S>,
-    S: Send + Sync + Debug,
-{
+// The extractors borrow the router's `SharedData`: extracting it through
+// `FromRef` would clone the whole state on every authenticated request.
+impl FromRequestParts<SharedData> for Session {
     type Rejection = AuthError;
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let state = parts
-            .extract_with_state::<SharedData, _>(_state)
-            .await
-            .map_err(|e| {
-                error!("Couldn't get SharedData state! Reason: {}", e);
-                AuthError::InternalServerError(format!(
-                    "Couldn't get SharedData state! Reason: {e}"
-                ))
-            })?;
-
-        match parts
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &SharedData,
+    ) -> Result<Self, Self::Rejection> {
+        if parts
             .extensions
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0)
+            .is_none()
         {
-            Some(address) => address.to_string(),
-            _ => {
-                // The server was started without connect info: a wiring
-                // fault, not the client's.
-                error!(
-                    "No remote address (ConnectInfo) in request: the router must be served with \
-                     into_make_service_with_connect_info"
-                );
-                return Err(AuthError::InternalServerError(
-                    "Connection information is unavailable".into(),
-                ));
-            }
-        };
+            // The server was started without connect info: a wiring fault,
+            // not the client's.
+            error!(
+                "No remote address (ConnectInfo) in request: the router must be served with \
+                 into_make_service_with_connect_info"
+            );
+            return Err(AuthError::InternalServerError(
+                "Connection information is unavailable".into(),
+            ));
+        }
 
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
@@ -355,7 +326,7 @@ where
                 AuthError::MissingCredentials
             })?;
 
-        authenticate_token(&state, bearer.token()).await
+        authenticate_token(state, bearer.token()).await
     }
 }
 
@@ -504,18 +475,16 @@ fn anonymous_session_for(
 /// secure default keeps rejecting unauthenticated `/inbound` requests.
 pub struct MaybeSession(pub Session);
 
-impl<S> FromRequestParts<S> for MaybeSession
-where
-    SharedData: FromRef<S>,
-    S: Send + Sync + Debug,
-{
+impl FromRequestParts<SharedData> for MaybeSession {
     type Rejection = AuthError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        match Session::from_request_parts(parts, state).await {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        shared: &SharedData,
+    ) -> Result<Self, Self::Rejection> {
+        match Session::from_request_parts(parts, shared).await {
             Ok(session) => Ok(MaybeSession(session)),
             Err(e) => {
-                let shared = SharedData::from_ref(state);
                 let security = &shared.config.security;
                 match anonymous_session_for(
                     &e,

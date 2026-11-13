@@ -2,7 +2,8 @@
 //!
 //! Reads messages from the FORWARD_Q Redis stream and delivers them to remote mediators.
 //! Uses Redis consumer groups for multi-processor coordination:
-//! - XREADGROUP BLOCK 0 for event-driven wake-up (no polling)
+//! - XREADGROUP blocking for at most 5 s, so an idle processor wakes at least that
+//!   often (to notice shutdown and reclaim stale entries) without busy polling
 //! - XACK on successful delivery
 //! - XAUTOCLAIM for recovering stale messages from crashed processors
 //!
@@ -159,7 +160,8 @@ fn decode_tsp_forward(message: &str) -> Option<Vec<u8>> {
 
 /// How long an endpoint may sit idle before its cached state is reaped.
 ///
-/// Must stay comfortably above both the rate tracker's window (10s) and the
+/// Must stay no shorter than the rate tracker's window (`rate_window_seconds`,
+/// 300 s by default, the same as this) and comfortably above the
 /// retry backoff ceiling (`max_backoff_ms`, 60s by default), so that state
 /// still in active use is never dropped out from under a retry.
 const ENDPOINT_IDLE_TTL: Duration = Duration::from_secs(300);
@@ -1980,7 +1982,8 @@ impl ForwardingProcessor {
         if status.is_success() {
             Ok(())
         } else {
-            let body = response.text().await.unwrap_or_default();
+            // Bounded and escaped: the peer is untrusted (#140).
+            let body = super::peer_text::bounded_body(response).await;
             Err(RelayFailure::from_status(
                 status.as_u16(),
                 format!("Remote mediator {inbound_url} returned HTTP {status}: {body}"),
@@ -2405,7 +2408,10 @@ async fn send_and_await_ack(
                 } else {
                     Err(AckFailure::Rejected(format!(
                         "peer refused the relayed message: {} (code {})",
-                        ack.reason.as_deref().unwrap_or("no reason given"),
+                        ack.reason
+                            .as_deref()
+                            .map(super::peer_text::sanitize)
+                            .unwrap_or_else(|| "no reason given".into()),
                         ack.code
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "-".into()),

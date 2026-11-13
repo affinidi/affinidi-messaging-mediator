@@ -408,6 +408,8 @@ pub struct TestMediatorBuilder {
     /// Override for `LimitsConfig.ws_ping_interval_secs`,
     /// `ws_pong_timeout_secs` and `ws_write_timeout_secs`.
     websocket_liveness: Option<(u64, u64, u64)>,
+    /// Override for `LimitsConfig.http_request_timeout_secs`.
+    http_request_timeout_secs: Option<u64>,
     mux_enabled: bool,
     /// Override for `[limits.mux] max_dids_per_connection`.
     mux_max_dids_per_connection: Option<usize>,
@@ -480,6 +482,7 @@ impl Default for TestMediatorBuilder {
             did_rate_limit: None,
             ws_message_rate: None,
             websocket_liveness: None,
+            http_request_timeout_secs: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
             withheld_task_types: Vec::new(),
@@ -809,6 +812,13 @@ impl TestMediatorBuilder {
         write_timeout_secs: u64,
     ) -> Self {
         self.websocket_liveness = Some((ping_interval_secs, pong_timeout_secs, write_timeout_secs));
+        self
+    }
+
+    /// Override `limits.http_request_timeout_secs`, the deadline for one HTTP
+    /// request other than `/ws`. Defaults to the production default (60).
+    pub fn http_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.http_request_timeout_secs = Some(secs);
         self
     }
 
@@ -1235,6 +1245,9 @@ impl TestMediatorBuilder {
             limits.ws_ping_interval_secs = ping;
             limits.ws_pong_timeout_secs = pong;
             limits.ws_write_timeout_secs = write;
+        }
+        if let Some(secs) = self.http_request_timeout_secs {
+            limits.http_request_timeout_secs = secs;
         }
         limits.mux.enabled = self.mux_enabled;
         if let Some(max) = self.mux_max_dids_per_connection {

@@ -85,7 +85,7 @@ pub async fn authentication_challenge(
         let (allowed, known) = authz::authentication_check(&state, &session.did_hash, None).await?;
 
         if !allowed {
-            info!("DID({}) is blocked from connecting", session.did);
+            info!(did_hash = %session.did_hash, "DID is blocked from connecting");
             return Err(MediatorError::problem(
                 25,
                 session.session_id,
@@ -127,7 +127,7 @@ pub async fn authentication_challenge(
             .map_err(MediatorError::opaque_storage)?;
 
         metrics::counter!(crate::common::metrics::names::AUTH_CHALLENGES_TOTAL).increment(1);
-        debug!("Challenge sent to {}", session.did);
+        debug!(did_hash = %session.did_hash, "Challenge sent");
 
         Ok((
             StatusCode::OK,

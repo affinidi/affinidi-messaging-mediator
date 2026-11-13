@@ -20,13 +20,14 @@ use http::StatusCode;
 use regex::Regex;
 use tracing::{Instrument, Level, span, warn};
 
-/// Fetches available messages from the inbox
-/// ACL_MODE: Rquires LOCAL access
+/// Fetches available messages from the session DID's inbox.
+/// ACL_MODE: Requires LOCAL access
 ///
 /// # Parameters
-/// - `session`: Session information
-/// - `folder`: Folder to retrieve messages from
-/// - `did_hash`: sha256 hash of the DID we are checking
+/// - `session`: Session information; the inbox is the session DID's
+/// - `body`: [`FetchOptions`]. `limit` must be between 1 and
+///   `limits.listed_messages`; `start_id`, when given, must be a whole message
+///   id (`<unix millis>-<0..999>`)
 ///
 /// What the response carries is stamped delivered and reported `delivered` —
 /// and, under `FetchDeletePolicy::Optimistic`, deleted — only once the
@@ -42,7 +43,7 @@ pub async fn inbox_fetch_handler(
         Level::DEBUG,
         "inbox_fetch_handler",
         session = session.session_id,
-        session_did = session.did,
+        did_hash = session.did_hash,
         fetch.limit = body.limit,
         fetch.start_id = body.start_id,
         fetch.delete_policy = body.delete_policy.to_string()
@@ -61,13 +62,14 @@ pub async fn inbox_fetch_handler(
         }
 
         // Check options
-        if body.limit< 1 || body.limit > 100 {
+        let max_limit = state.limits().listed_messages;
+        if body.limit < 1 || body.limit > max_limit {
             return Err(MediatorError::problem_with_log(
                 41, session.session_id, None,
                 ProblemReportSorter::Error, ProblemReportScope::Protocol,
                 "api.inbox_fetch.limit",
-                "Invalid limit ({1}). Must be 1-100 in range",
-                vec![body.limit.to_string()], StatusCode::BAD_REQUEST,
+                "Invalid limit ({1}). Must be 1-{2} in range",
+                vec![body.limit.to_string(), max_limit.to_string()], StatusCode::BAD_REQUEST,
                 "Invalid limit",
             )
             .into());
@@ -75,11 +77,7 @@ pub async fn inbox_fetch_handler(
 
         // Check for valid start_id (unixtime in milliseconds including+1 digit so we are ok for another 3,114 years!)
         // Supports up to 999 messages per millisecond
-        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-            Regex::new(r"\d{13,14}-\d{1,3}$").expect("hardcoded regex is valid")
-        });
-        let re = &*RE;
-        if let Some(start_id) = &body.start_id && ! re.is_match(start_id) {
+        if let Some(start_id) = &body.start_id && !is_message_id(start_id) {
                 return Err(MediatorError::problem_with_log(
                     42, session.session_id, None,
                     ProblemReportSorter::Error, ProblemReportScope::Protocol,
@@ -172,4 +170,32 @@ pub async fn inbox_fetch_handler(
     }
     .instrument(_span)
     .await
+}
+
+/// Whether `id` is a whole message id: the UNIX time in milliseconds (13 or 14
+/// digits, good for another 3,000 years) and a 1-3 digit sequence number (up to
+/// 999 messages per millisecond). Anchored at both ends, so an id with
+/// anything before or after it is refused.
+fn is_message_id(id: &str) -> bool {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^\d{13,14}-\d{1,3}$").expect("hardcoded regex is valid")
+    });
+    RE.is_match(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_message_id;
+
+    #[test]
+    fn a_message_id_is_matched_whole() {
+        assert!(is_message_id("1234567890123-1"));
+        assert!(is_message_id("12345678901234-999"));
+        // Junk before the id used to pass: the pattern was anchored only at
+        // the end.
+        assert!(!is_message_id("junk1234567890123-1"));
+        assert!(!is_message_id("1234567890123-1junk"));
+        assert!(!is_message_id("123456789012-1"));
+        assert!(!is_message_id("1234567890123-1000"));
+    }
 }
