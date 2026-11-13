@@ -793,9 +793,19 @@ pub async fn serve_internal(
     if did_rate_limiter.is_enabled() {
         info!(
             "Per-DID rate limiting enabled: {} req/s per DID, burst: {}. Charged per \
-             authenticated HTTP request (including the /ws upgrade); messages on an \
-             established WebSocket are not metered. The mediator and admin DIDs are exempt.",
+             authenticated HTTP request (including the /ws upgrade) and per message on an \
+             established WebSocket. The mediator and admin DIDs are exempt.",
             config.limits.did_rate_limit_per_second, config.limits.did_rate_limit_burst,
+        );
+    }
+    if config.limits.ws_messages_per_second > 0 {
+        info!(
+            "WebSocket message rate: {} msg/s per authenticated socket, burst: {}; a socket \
+             over it is read more slowly, and closed (1008) after {} s over it (0 = never). \
+             The mediator and admin DIDs are exempt.",
+            config.limits.ws_messages_per_second,
+            config.limits.ws_message_burst,
+            config.limits.ws_message_throttle_close_secs,
         );
     }
 

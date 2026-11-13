@@ -102,6 +102,27 @@ pub struct LimitsConfig {
     /// Must be > 0.
     #[serde(default = "defaults::relay_bytes_per_second")]
     pub relay_bytes_per_second: u32,
+    /// Sustained messages per second read from one authenticated WebSocket.
+    /// Every inbound text or binary frame after the upgrade is one message;
+    /// control frames are not counted. A socket over its rate is read more
+    /// slowly (the mediator stops reading until the next message is due).
+    /// 0 = unlimited. When the configuration leaves it unset it inherits
+    /// [`rate_limit_per_ip`](Self::rate_limit_per_ip), so WebSocket messages
+    /// are held to the same rate as HTTP requests.
+    #[serde(default = "defaults::ws_messages_per_second")]
+    pub ws_messages_per_second: u32,
+    /// Messages an authenticated WebSocket may send back-to-back above
+    /// [`ws_messages_per_second`](Self::ws_messages_per_second). 0 is read as 1.
+    /// When the configuration leaves it unset it inherits
+    /// [`rate_limit_burst`](Self::rate_limit_burst).
+    #[serde(default = "defaults::ws_message_burst")]
+    pub ws_message_burst: u32,
+    /// Seconds an authenticated WebSocket may stay continuously over its
+    /// message rate (including the per-DID rate, when enabled) before the
+    /// mediator closes it with 1008. 0 = never close; the socket is only
+    /// slowed.
+    #[serde(default = "defaults::ws_message_throttle_close_secs")]
+    pub ws_message_throttle_close_secs: u64,
     /// Requests per second `/metrics` answers, across all callers. Must be > 0.
     #[serde(default = "defaults::metrics_requests_per_second")]
     pub metrics_requests_per_second: u32,
@@ -146,6 +167,17 @@ mod defaults {
     }
     pub(super) fn metrics_requests_per_second() -> u32 {
         5
+    }
+    /// The per-IP request rate's default (`rate_limit_per_ip`).
+    pub(super) fn ws_messages_per_second() -> u32 {
+        100
+    }
+    /// The per-IP burst's default (`rate_limit_burst`).
+    pub(super) fn ws_message_burst() -> u32 {
+        50
+    }
+    pub(super) fn ws_message_throttle_close_secs() -> u64 {
+        10
     }
 }
 
@@ -372,6 +404,9 @@ impl Default for LimitsConfig {
             relay_frame_burst: defaults::relay_frame_burst(),
             relay_bytes_per_second: defaults::relay_bytes_per_second(),
             metrics_requests_per_second: defaults::metrics_requests_per_second(),
+            ws_messages_per_second: defaults::ws_messages_per_second(),
+            ws_message_burst: defaults::ws_message_burst(),
+            ws_message_throttle_close_secs: defaults::ws_message_throttle_close_secs(),
             ws_ping_interval_secs: DEFAULT_WS_PING_INTERVAL_SECS,
             ws_pong_timeout_secs: DEFAULT_WS_PONG_TIMEOUT_SECS,
             ws_write_timeout_secs: DEFAULT_WS_WRITE_TIMEOUT_SECS,
@@ -480,6 +515,21 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
             eprintln!(
                 "WARN: Could not parse limits.{field} config value, using default: {default}"
             );
+        };
+
+        // The WebSocket message rate inherits the per-IP HTTP rate and burst
+        // when it is not set, and falls back to them when it cannot be read.
+        let per_ip_rate: u32 = raw.rate_limit_per_ip.trim().parse().unwrap_or(100);
+        let per_ip_burst: u32 = raw.rate_limit_burst.trim().parse().unwrap_or(50);
+        let inherit = |field: &str, value: &str, inherited: u32| -> u32 {
+            let value = value.trim();
+            if value.is_empty() {
+                return inherited;
+            }
+            value.parse().unwrap_or_else(|_| {
+                warn_default(field, &inherited.to_string());
+                inherited
+            })
         };
 
         let secs = |field: &str, value: &str, default: u64| -> u64 {
@@ -665,6 +715,20 @@ impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
                 &raw.metrics_requests_per_second,
                 defaults::metrics_requests_per_second(),
             )?,
+            ws_messages_per_second: inherit(
+                "ws_messages_per_second",
+                &raw.ws_messages_per_second,
+                per_ip_rate,
+            ),
+            ws_message_burst: inherit("ws_message_burst", &raw.ws_message_burst, per_ip_burst),
+            ws_message_throttle_close_secs: raw
+                .ws_message_throttle_close_secs
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| {
+                    warn_default("ws_message_throttle_close_secs", "10");
+                    defaults::ws_message_throttle_close_secs()
+                }),
             ws_ping_interval_secs,
             ws_pong_timeout_secs,
             ws_write_timeout_secs,
@@ -764,6 +828,9 @@ mod tests {
         assert_eq!(limits.relay_frame_burst, 100);
         assert_eq!(limits.relay_bytes_per_second, 4_194_304);
         assert_eq!(limits.metrics_requests_per_second, 5);
+        assert_eq!(limits.ws_messages_per_second, 100);
+        assert_eq!(limits.ws_message_burst, 50);
+        assert_eq!(limits.ws_message_throttle_close_secs, 10);
     }
 
     #[test]
@@ -803,6 +870,9 @@ mod tests {
             relay_frame_burst: "9".to_string(),
             relay_bytes_per_second: "65536".to_string(),
             metrics_requests_per_second: "2".to_string(),
+            ws_messages_per_second: "25".to_string(),
+            ws_message_burst: "40".to_string(),
+            ws_message_throttle_close_secs: "0".to_string(),
             ws_ping_interval_secs: "20".to_string(),
             ws_pong_timeout_secs: "50".to_string(),
             ws_write_timeout_secs: "15".to_string(),
@@ -828,12 +898,28 @@ mod tests {
             let err = LimitsConfig::try_from(zeroed).expect_err(field);
             assert!(err.to_string().contains(field), "{field}: {err}");
         }
+        // Unset, the WebSocket message rate inherits the per-IP HTTP rate
+        // and burst (200 / 100 here); "0" turns it off without touching them.
+        let mut inherited = raw.clone();
+        inherited.ws_messages_per_second = String::new();
+        inherited.ws_message_burst = " ".to_string();
+        let inherited = LimitsConfig::try_from(inherited).unwrap();
+        assert_eq!(inherited.ws_messages_per_second, 200);
+        assert_eq!(inherited.ws_message_burst, 100);
+        let mut off = raw.clone();
+        off.ws_messages_per_second = "0".to_string();
+        let off = LimitsConfig::try_from(off).unwrap();
+        assert_eq!(off.ws_messages_per_second, 0);
+        assert_eq!(off.rate_limit_per_ip, 200);
         let limits = LimitsConfig::try_from(raw).unwrap();
         assert_eq!(limits.relay_connections_per_ip, 4);
         assert_eq!(limits.relay_frames_per_second, 7);
         assert_eq!(limits.relay_frame_burst, 9);
         assert_eq!(limits.relay_bytes_per_second, 65_536);
         assert_eq!(limits.metrics_requests_per_second, 2);
+        assert_eq!(limits.ws_messages_per_second, 25);
+        assert_eq!(limits.ws_message_burst, 40);
+        assert_eq!(limits.ws_message_throttle_close_secs, 0);
         assert_eq!(limits.ws_send_buffer, 8_388_608);
         assert_eq!(limits.pubsub_buffer, 4_194_304);
         assert_eq!(limits.ws_ping_interval_secs, 20);
@@ -902,6 +988,9 @@ mod tests {
             relay_frame_burst: "100".to_string(),
             relay_bytes_per_second: "4194304".to_string(),
             metrics_requests_per_second: "5".to_string(),
+            ws_messages_per_second: "fast".to_string(),
+            ws_message_burst: "-3".to_string(),
+            ws_message_throttle_close_secs: "later".to_string(),
             ws_ping_interval_secs: "soon".to_string(),
             ws_pong_timeout_secs: "30".to_string(),
             ws_write_timeout_secs: "-1".to_string(),
@@ -912,6 +1001,11 @@ mod tests {
         assert_eq!(limits.attachments_max_count, 20);
         assert_eq!(limits.crypto_operations_per_message, 1000);
         assert_eq!(limits.relay_connections_per_ip, 10);
+        // An unreadable WebSocket message rate falls back to the per-IP HTTP
+        // rate and burst ("100" / "50" here).
+        assert_eq!(limits.ws_messages_per_second, 100);
+        assert_eq!(limits.ws_message_burst, 50);
+        assert_eq!(limits.ws_message_throttle_close_secs, 10);
         // An unparsable ping interval falls back to 30 s, which lifts the
         // 30 s pong timeout to two intervals.
         assert_eq!(limits.ws_ping_interval_secs, 30);
@@ -954,6 +1048,10 @@ mod tests {
         assert_eq!(limits.ws_ping_interval_secs, 30);
         assert_eq!(limits.ws_pong_timeout_secs, 90);
         assert_eq!(limits.ws_write_timeout_secs, 30);
+        // So does the WebSocket message rate: on, inheriting the per-IP rate.
+        assert_eq!(limits.ws_messages_per_second, 100);
+        assert_eq!(limits.ws_message_burst, 50);
+        assert_eq!(limits.ws_message_throttle_close_secs, 10);
     }
 
     #[test]

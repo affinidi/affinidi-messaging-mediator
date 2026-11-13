@@ -141,6 +141,7 @@ Two signals tell you a budget is too small:
 | Signal | Means | Fix |
 |---|---|---|
 | `ws_live_delivery_dropped_total` rising | A client's send queue or the global byte pool filled | Raise `limits.ws_send_buffer`, or find the slow client |
+| `rate_limited_total{scope="ws"}` rising | Clients sending messages faster than `limits.ws_messages_per_second`; they are slowed, then closed with 1008 | Set `limits.ws_messages_per_second` / `ws_message_burst` (they inherit `rate_limit_per_ip` / `rate_limit_burst` when unset) for legitimate bulk senders |
 | `ws_write_timeouts_total` or `ws_pong_timeouts_total` rising | Clients stopped reading, or went away without closing | Usually the network or the client; raise the timeouts only for links known to stall |
 | `Streaming subscriber lagged` in logs | The pub/sub ring was overwritten before it could be read | Raise `limits.pubsub_buffer` |
 

@@ -363,6 +363,9 @@ pub struct TestMediatorBuilder {
     /// Override for `LimitsConfig.did_rate_limit_per_second` /
     /// `did_rate_limit_burst`.
     did_rate_limit: Option<(u32, u32)>,
+    /// Override for `LimitsConfig.ws_messages_per_second`,
+    /// `ws_message_burst` and `ws_message_throttle_close_secs`.
+    ws_message_rate: Option<(u32, u32, u64)>,
     /// Override for `LimitsConfig.ws_ping_interval_secs`,
     /// `ws_pong_timeout_secs` and `ws_write_timeout_secs`.
     websocket_liveness: Option<(u64, u64, u64)>,
@@ -433,6 +436,7 @@ impl Default for TestMediatorBuilder {
             trust_xff_cidrs: None,
             metrics_access: None,
             did_rate_limit: None,
+            ws_message_rate: None,
             websocket_liveness: None,
             mux_enabled: false,
             mux_max_dids_per_connection: None,
@@ -731,6 +735,16 @@ impl TestMediatorBuilder {
     /// (`0` = disabled). Set small to exercise the `429` in tests.
     pub fn did_rate_limit(mut self, per_second: u32, burst: u32) -> Self {
         self.did_rate_limit = Some((per_second, burst));
+        self
+    }
+
+    /// Override the message rate on authenticated WebSockets:
+    /// `limits.ws_messages_per_second`, `ws_message_burst` and
+    /// `ws_message_throttle_close_secs`. Defaults to the production defaults
+    /// (100, 50, 10). Set small to exercise the slowing and the 1008 close in
+    /// tests; `(0, _, _)` turns the per-socket rate off.
+    pub fn ws_message_rate(mut self, per_second: u32, burst: u32, close_after_secs: u64) -> Self {
+        self.ws_message_rate = Some((per_second, burst, close_after_secs));
         self
     }
 
@@ -1129,6 +1143,11 @@ impl TestMediatorBuilder {
         if let Some((per_second, burst)) = self.did_rate_limit {
             limits.did_rate_limit_per_second = per_second;
             limits.did_rate_limit_burst = burst;
+        }
+        if let Some((per_second, burst, close_after)) = self.ws_message_rate {
+            limits.ws_messages_per_second = per_second;
+            limits.ws_message_burst = burst;
+            limits.ws_message_throttle_close_secs = close_after;
         }
         if let Some((ping, pong, write)) = self.websocket_liveness {
             limits.ws_ping_interval_secs = ping;

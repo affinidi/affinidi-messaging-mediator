@@ -646,11 +646,11 @@ oob_invite_ttl = "86400"
 ### `x-rate-limit-source: mediator`, `Retry-After`, and a JSON body whose
 ### `scope` is "did" (the per-IP limiter's 429 has no `scope`). Counted in
 ### `rate_limited_total{scope="did"}`.
-### NOT METERED: messages sent over an already-established WebSocket. Only the
-### upgrade is charged; an in-session refusal has no HTTP status to carry it and
-### DIDComm defines no rate-limit problem report, so none is sent. A client that
-### sends over its socket is bounded by the upgrade rate and the queue limits,
-### not by this key.
+### Also charged once per message (text or binary frame) on an established
+### WebSocket, so one DID shares one budget across all its sockets. There is no
+### HTTP status mid-session: a message over the rate is held and the socket is
+### read more slowly, then closed with 1008 as described under
+### ws_messages_per_second below.
 ### Never charged: the mediator's own DID, the configured admin_did, and
 ### anonymous inter-mediator relay traffic (it carries no DID; the per-IP limit
 ### still applies).
@@ -664,6 +664,41 @@ oob_invite_ttl = "86400"
 ### Scale: token-bucket depth above the steady per-DID rate; raise to tolerate
 ### bursty authenticated clients once did_rate_limit_per_second is enabled.
 # did_rate_limit_burst = "10"
+
+### Env: LIMIT_WS_MESSAGES_PER_SECOND
+### Messages per second read from one authenticated WebSocket (0 = unlimited).
+### Commented out = inherit rate_limit_per_ip, so WebSocket messages are held to
+### the same rate as HTTP requests (100 by default); set it to override.
+### Every text or binary frame after the upgrade is one message; ping, pong and
+### close frames are not counted. Applies to every authenticated socket,
+### including DID-multiplexing connections (whose members' messages share the
+### one socket's rate); anonymous inter-mediator relay sockets have their own
+### budget (relay_frames_per_second). The mediator's own DID and admin_did are
+### not metered.
+### Over the rate, nothing is dropped: the mediator holds the message and stops
+### reading the socket until it is due, so the client's further messages wait in
+### its own send buffer. Each message that has to wait is counted in
+### `rate_limited_total{scope="ws"}`. A socket that stays over the rate for
+### ws_message_throttle_close_secs is closed with 1008 "message rate limit
+### exceeded".
+### Scale: raise for clients that legitimately send faster for long stretches
+### (bulk senders, busy DID-multiplexing connections). Read when a socket opens.
+# ws_messages_per_second = "100"
+
+### Env: LIMIT_WS_MESSAGE_BURST
+### Messages an authenticated WebSocket may send back-to-back above
+### ws_messages_per_second (token-bucket depth). Commented out = inherit
+### rate_limit_burst (50 by default); set it to override.
+# ws_message_burst = "50"
+
+### Env: LIMIT_WS_MESSAGE_THROTTLE_CLOSE_SECS
+### Seconds an authenticated WebSocket may stay continuously over its message
+### rate (ws_messages_per_second, or did_rate_limit_per_second when that is
+### enabled) before it is closed with 1008. The clock starts at the first
+### message that has to wait and resets when a message arrives within the rate,
+### so a one-off burst is only slowed. 0 = never close (only slow).
+### Default 10.
+# ws_message_throttle_close_secs = "10"
 
 ### Env: LIMIT_WS_SEND_BUFFER
 ### Total bytes of queued live-delivery messages across ALL WebSocket
