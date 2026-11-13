@@ -102,7 +102,7 @@ affinidi-messaging-mediator = { version = "0.52.0", path = "../affinidi-messagin
 ## `issuedAt` on the hand-built Trust Task documents in tests/e2e/trust_tasks.rs.
 chrono = { workspace = true, features = ["clock"] }
 ## Drive the SDK's DIDComm transport as the delivery layer does.
-affinidi-messaging-core = "0.1.11"
+affinidi-messaging-core.workspace = true
 ## Build hand-written authcrypt envelopes for the sender-binding tests.
 affinidi-crypto = { workspace = true, features = ["jose"] }
 affinidi-did-common.workspace = true
