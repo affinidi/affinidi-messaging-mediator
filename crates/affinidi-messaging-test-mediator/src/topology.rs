@@ -11,7 +11,7 @@
  * `/inbound`.
  *
  * This generalises the routing-2.0 double-forward that
- * `tests/cross_mediator_forwarding.rs` previously hand-rolled per test: spawn a
+ * `tests/e2e/cross_mediator_forwarding.rs` previously hand-rolled per test: spawn a
  * mesh, add users on whichever mediators, and [`forward`](TestTopology::forward)
  * a message hop-to-hop.
  *

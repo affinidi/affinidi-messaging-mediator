@@ -25,6 +25,17 @@
 //! All identities are `did:peer:2.*` — the cache-SDK's built-in
 //! `PeerResolver` decodes them locally, so no DNS or network resolution
 //! is needed for any DID involved in the test.
+//!
+//! # Keys
+//!
+//! The SDK's resolver (`env.tdk.secrets_resolver()`) holds the users'
+//! keys and **not** the mediator's; the mediator's resolver holds its own
+//! keys and **not** the users'. A test that must sign or decrypt as the
+//! mediator opts in with [`TestEnvironment::with_mediator_keys`], or builds
+//! the mediator with [`TestMediatorBuilder::share_secrets`]. See
+//! [Key isolation](crate#key-isolation).
+//!
+//! [`TestMediatorBuilder::share_secrets`]: crate::TestMediatorBuilder::share_secrets
 
 use std::sync::Arc;
 
@@ -79,9 +90,12 @@ pub struct TestEnvironment {
     /// Running mediator — exposes endpoint URL, DID, secrets resolver,
     /// shutdown control.
     pub mediator: TestMediatorHandle,
-    /// Shared TDK state. The same secrets resolver is used by the
-    /// mediator (server-side) and the SDK client (client-side); tests
-    /// don't need to ferry secrets between resolvers.
+    /// Shared TDK state. Its secrets resolver is the client side's: it
+    /// holds the keys of every user added here, and the mediator's keys
+    /// only after [`TestEnvironment::with_mediator_keys`] (or on a mediator
+    /// built with [`share_secrets`](crate::TestMediatorBuilder::share_secrets)).
+    /// All users share it, so one user's profile can decrypt another's
+    /// mail; use separate environments where that matters.
     pub tdk: Arc<TDKSharedState>,
     /// SDK client. Tests call protocol methods on this (e.g.
     /// `atm.trust_ping().send_ping(...)`).
@@ -105,8 +119,8 @@ pub struct TestUser {
     /// methods that take a profile.
     pub profile: Arc<ATMProfile>,
     /// User's signing + key-agreement secrets. Already inserted into
-    /// the shared resolver — kept here for tests that want to inspect
-    /// or copy them.
+    /// the SDK's (client-side) resolver — kept here for tests that want
+    /// to inspect or copy them.
     pub secrets: Vec<Secret>,
 }
 
@@ -317,14 +331,14 @@ impl TestEnvironment {
                 .map_err(|e| TestEnvironmentError::Sdk(e.to_string()))?,
         );
 
-        // Make the mediator's signing + key-agreement secrets available
-        // to the same resolver the SDK uses. In a single-process test
-        // there's no real reason to have separate resolvers — and tests
-        // sometimes need to sign on behalf of the mediator (e.g., to
-        // craft a forged outer envelope and verify the mediator
-        // rejects it).
-        let mediator_secrets = mediator.mediator_secrets().to_vec();
-        tdk.secrets_resolver().insert_vec(&mediator_secrets).await;
+        // The mediator's keys stay server-side unless the test asked for
+        // them to be shared (`share_secrets`); see `with_mediator_keys` for
+        // the client-side-only opt-in.
+        if mediator.shares_secrets() {
+            tdk.secrets_resolver()
+                .insert_vec(mediator.mediator_secrets())
+                .await;
+        }
 
         let atm = ATM::new(atm_config, tdk.clone())
             .await
@@ -337,6 +351,24 @@ impl TestEnvironment {
             #[cfg(feature = "tsp")]
             relationship_store,
         })
+    }
+
+    /// Give the SDK's resolver the mediator's private keys, so the test can
+    /// sign or decrypt **as the mediator** — to forge an envelope the
+    /// mediator would have signed and check that the mediator refuses it,
+    /// say.
+    ///
+    /// This deliberately breaks key isolation on the client side: anything
+    /// addressed to the mediator then unpacks in the SDK too, so a
+    /// mis-wrapped envelope can no longer fail the way it would in
+    /// production. Use it only in tests whose subject needs it. The
+    /// mediator's own resolver is unchanged.
+    pub async fn with_mediator_keys(self) -> Self {
+        self.tdk
+            .secrets_resolver()
+            .insert_vec(self.mediator.mediator_secrets())
+            .await;
+        self
     }
 
     /// Record a `Bidirectional` TSP relationship between two users without
@@ -487,6 +519,11 @@ impl TestEnvironment {
     /// ALLOW_ALL account so it can complete the WebSocket upgrade
     /// without needing a separate `local_did` declaration at builder
     /// time.
+    ///
+    /// The user's private keys go into the SDK's resolver only, never the
+    /// mediator's (unless the mediator was built with
+    /// [`share_secrets`](crate::TestMediatorBuilder::share_secrets)) —
+    /// the same rule as [`TestMediatorHandle::add_user`].
     pub async fn add_user(&self, alias: &str) -> Result<TestUser, TestEnvironmentError> {
         self.add_user_with_services(alias, None).await
     }
@@ -568,8 +605,16 @@ impl TestEnvironment {
         })?;
 
         // Make the user's secrets available to the SDK so it can pack
-        // outbound messages and unpack inbound ones.
+        // outbound messages and unpack inbound ones. Client-side only,
+        // as `TestMediatorHandle::add_user` does, unless the mediator was
+        // built to share one resolver.
         self.tdk.secrets_resolver().insert_vec(&secrets).await;
+        if self.mediator.shares_secrets() {
+            self.mediator
+                .server_secrets_resolver()
+                .insert_vec(&secrets)
+                .await;
+        }
 
         // Register the user as a LOCAL, ALLOW_ALL account on the
         // mediator. Without this the WebSocket handler refuses

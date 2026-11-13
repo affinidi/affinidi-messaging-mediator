@@ -1,3 +1,7 @@
+//! **Test fixture only: plain HTTP (no TLS) and an allow-all ACL.** Never
+//! bind it to an interface anyone else can reach; it says so loudly on
+//! start-up when the bind address is not loopback.
+//!
 //! Run the in-process [`TestMediator`] as a **standalone process**, so
 //! out-of-process test clients — a separately-spawned daemon, a client running
 //! inside a Docker container, a CI job on another host — can share one mediator
@@ -54,6 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mediator = builder.spawn().await?;
+    if !mediator.bound_addr().ip().is_loopback() {
+        eprintln!(
+            "\n\
+             ************************************************************************\n\
+             *  TEST FIXTURE — no TLS, allow-all ACL. Not a production mediator.     *\n\
+             *  Bound to {:<59} *\n\
+             *  Any client that can reach this address can register and relay mail. *\n\
+             ************************************************************************\n",
+            mediator.bound_addr().to_string()
+        );
+    }
     println!("MEDIATOR_DID={}", mediator.did());
     println!("MEDIATOR_HTTP={}", mediator.endpoint());
     println!("MEDIATOR_WS={}", mediator.ws_endpoint());

@@ -390,21 +390,24 @@ jobs:
         # A grant change published by another instance reaches this one's
         # connections through Redis pub/sub. Needs the fixture's
         # `redis-backend` feature, which the workspace test job does not set.
+        # Each suite is a module of the fixture's one `e2e` test binary,
+        # selected by name filter; each keeps its own Redis logical DB.
         env:
           REDIS_URL: redis://localhost:6379
         run: |
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend \
-            --test mux_cross_instance \
-            --test mux_two_instances \
-            --test mux_two_processes \
-            --test mux_standing_two_instances \
-            --test mux_admin_two_instances
+            --test e2e -- \
+            mux_cross_instance:: \
+            mux_two_instances:: \
+            mux_two_processes:: \
+            mux_standing_two_instances:: \
+            mux_admin_two_instances::
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend,tsp \
-            --test tsp_mux_two_instances
+            --test e2e -- tsp_mux_two_instances::
 
   redis-conformance-cluster:
     # The same checks against a single-node Valkey cluster (all slots on one
@@ -461,15 +464,16 @@ jobs:
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend \
-            --test mux_cross_instance \
-            --test mux_two_instances \
-            --test mux_two_processes \
-            --test mux_standing_two_instances \
-            --test mux_admin_two_instances
+            --test e2e -- \
+            mux_cross_instance:: \
+            mux_two_instances:: \
+            mux_two_processes:: \
+            mux_standing_two_instances:: \
+            mux_admin_two_instances::
           cargo test \
             -p affinidi-messaging-test-mediator \
             --features redis-backend,tsp \
-            --test tsp_mux_two_instances
+            --test e2e -- tsp_mux_two_instances::
 
   test-mediator-fjall:
     # The e2e suite against the on-disk Fjall backend (each store in its own
@@ -522,10 +526,11 @@ jobs:
       - name: didcomm-service (tsp) against a live mediator
         run: |
           cargo test -p affinidi-messaging-test-mediator --features tsp --locked \
-            --test soft_restart_websocket \
-            --test tsp_live_stream \
-            --test tsp_transport_adapter \
-            --test tsp_invite_then_payload
+            --test e2e -- \
+            soft_restart_websocket:: \
+            tsp_live_stream:: \
+            tsp_transport_adapter:: \
+            tsp_invite_then_payload::
       - name: test-mediator e2e suite with tsp
         run: cargo test -p affinidi-messaging-test-mediator --features tsp --tests --locked
 

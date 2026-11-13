@@ -519,6 +519,7 @@ dependencies = [
  "tracing",
  "trust-tasks-rs 0.38.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

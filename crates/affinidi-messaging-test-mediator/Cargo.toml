@@ -25,7 +25,7 @@ tsp = ["affinidi-messaging-mediator/tsp", "affinidi-messaging-sdk/tsp"]
 ## Spawn the mediator with DIDComm v1 (Aries RFC 0019) support so the e2e suite
 ## can exercise forward ingress, coordinate-mediation and message pickup.
 didcomm-v1 = ["affinidi-messaging-mediator/didcomm-v1", "dep:affinidi-messaging-didcomm-v1"]
-## Compile in `RedisStore` so the size sweep (`tests/size_sweep.rs`) can run
+## Compile in `RedisStore` so the cross-instance tests and the size sweep (`tests/e2e/`) can run
 ## against a real Redis named by `REDIS_URL`. Nothing else here needs Redis.
 redis-backend = [
   "affinidi-messaging-mediator/redis-backend",
@@ -99,7 +99,7 @@ affinidi-messaging-didcomm = "0.15"
 ## The mediator's test-only pause points (`test-hooks`), for the race-window
 ## tests. A dev-dependency, so the fixture library itself never carries them.
 affinidi-messaging-mediator = { version = "0.52.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend", "test-hooks"] }
-## `issuedAt` on the hand-built Trust Task documents in tests/trust_tasks.rs.
+## `issuedAt` on the hand-built Trust Task documents in tests/e2e/trust_tasks.rs.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ## Drive the SDK's DIDComm transport as the delivery layer does.
 affinidi-messaging-core = "0.1.11"
@@ -130,7 +130,7 @@ futures-util = "0.3"
 ## browser scenario can't go through tokio-tungstenite's client, which
 ## errors when it offers a subprotocol the server doesn't echo back).
 tokio = { workspace = true, features = ["io-util"] }
-## The stub remote mediator in `tests/forwarding_processor.rs`.
+## The stub remote mediator in `tests/e2e/forwarding_processor.rs`.
 axum = "0.8"
 ## The didcomm-service tests that run it against a live mediator
 ## (`soft_restart_websocket`, `tsp_*`). They lived in that crate's own tests
