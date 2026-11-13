@@ -65,6 +65,7 @@ pub(crate) async fn run_tui(args: &Args) -> anyhow::Result<()> {
         probe: secret_backend::ProvisionProbe::ReadWrite,
         force_reprovision: args.force_reprovision,
         show_admin_key: args.show_admin_key,
+        file_passphrase: app.file_passphrase.clone(),
     };
     match generate_and_write_with(&app.config, app.vta_session.as_ref(), &options).await {
         Ok(completed) => {

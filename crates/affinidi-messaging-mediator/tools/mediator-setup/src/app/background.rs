@@ -69,12 +69,14 @@ impl WizardApp {
         let url = crate::config_writer::build_backend_url(&self.config);
         let shown = affinidi_messaging_mediator_common::redact::redact_url(&url);
         let force = self.force_reprovision;
+        let passphrase = self.file_passphrase.clone();
         self.backend_check = Some(BackendCheck::Running(shown.clone()));
         let tx = self.background_channel();
         tokio::spawn(async move {
             let result = async {
                 let store = crate::secret_backend::open_and_probe_secret_backend(
                     &url,
+                    passphrase.as_ref(),
                     crate::secret_backend::ProvisionProbe::ReadWrite,
                 )
                 .await
@@ -110,12 +112,13 @@ impl WizardApp {
             return;
         };
         let url = crate::config_writer::build_backend_url(&self.config);
+        let passphrase = self.file_passphrase.clone();
         self.session_persist_status =
             Some("Storing the VTA credential in the secret backend…".into());
         let tx = self.background_channel();
         tokio::spawn(async move {
             let result = async {
-                let store = crate::secret_backend::open_secret_backend(&url)
+                let store = crate::secret_backend::open_secret_backend(&url, passphrase.as_ref())
                     .map_err(|e| format!("{e:#}"))?;
                 crate::secret_backend::store_vta_session(&store, &session)
                     .await

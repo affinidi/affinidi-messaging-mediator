@@ -174,7 +174,7 @@ async fn sweep_stale_bootstrap_seeds(config: &crate::app::WizardConfig) {
     let backend_url = crate::config_writer::build_backend_url(config);
     // Shown in logs and errors with any URL credentials hidden.
     let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
-    let store = match crate::secret_backend::open_secret_backend(&backend_url) {
+    let store = match crate::secret_backend::open_secret_backend(&backend_url, None) {
         Ok(s) => s,
         Err(e) => {
             warn!(
@@ -225,6 +225,7 @@ async fn phase1_emit_request(
     // write round-trip, which fails fast on missing create/write rights.
     let store = crate::secret_backend::open_and_probe_secret_backend(
         &backend_url,
+        None,
         crate::secret_backend::ProvisionProbe::ReadOnly,
     )
     .await?;
@@ -373,7 +374,7 @@ async fn phase2_apply(
     let backend_url = crate::config_writer::build_backend_url(config);
     // Shown in logs and errors with any URL credentials hidden.
     let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
-    let store = crate::secret_backend::open_secret_backend(&backend_url)?;
+    let store = crate::secret_backend::open_secret_backend(&backend_url, None)?;
 
     // Reconstruct a synthetic `SealedHandoffState` keyed to this
     // bundle. The reconstructed state doesn't need the ephemeral
@@ -466,7 +467,7 @@ pub async fn finish_applied(config: &crate::app::WizardConfig, artifacts: &Boots
     if let Some(ref bundle_id_hex) = artifacts.seed_bundle_id {
         let backend_url = crate::config_writer::build_backend_url(config);
         let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
-        match crate::secret_backend::open_secret_backend(&backend_url) {
+        match crate::secret_backend::open_secret_backend(&backend_url, None) {
             Ok(store) => {
                 if let Err(e) = store.delete_bootstrap_seed(bundle_id_hex).await {
                     warn!(

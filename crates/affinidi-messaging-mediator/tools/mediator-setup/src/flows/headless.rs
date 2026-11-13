@@ -186,6 +186,7 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
         probe: secret_backend::ProvisionProbe::ReadOnly,
         force_reprovision,
         show_admin_key: args.show_admin_key,
+        file_passphrase: None,
     };
 
     let completed = if sealed {
@@ -301,6 +302,7 @@ pub(crate) async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow
         probe: secret_backend::ProvisionProbe::ReadOnly,
         force_reprovision: args.force_reprovision,
         show_admin_key: args.show_admin_key,
+        file_passphrase: None,
     };
     let completed = generate_and_write_with(&config, Some(&session), &options).await?;
 

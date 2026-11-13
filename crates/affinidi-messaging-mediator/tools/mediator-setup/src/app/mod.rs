@@ -153,6 +153,10 @@ pub struct WizardApp {
     /// first entry. Cleared on the next successful match or when the
     /// operator backs out of the sub-flow.
     pub passphrase_validation_error: Option<String>,
+    /// The confirmed `file://?encrypt=1` passphrase. Passed to every open
+    /// of the encrypted backend this run makes, instead of being exported
+    /// to the process environment.
+    pub file_passphrase: Option<zeroize::Zeroizing<String>>,
     /// `--force-reprovision`: the operator accepts writing over a backend
     /// that already holds a provisioned mediator. Set by `main` before the
     /// TUI starts; read by the KeyStorage backend check.
@@ -252,6 +256,7 @@ impl WizardApp {
             cors_validation_error: None,
             pending_passphrase: None,
             passphrase_validation_error: None,
+            file_passphrase: None,
             force_reprovision: false,
             live_backend: false,
             backend_check: None,
@@ -286,9 +291,4 @@ impl WizardApp {
 }
 
 #[cfg(test)]
-// The `unsafe` here is only `std::env::remove_var` (unsafe since the 2024
-// edition) on the passphrase variable the wizard exports.
-// SAFETY: the tests that touch it are `#[serial_test::serial(passphrase_env)]`,
-// so no two of them read or write it concurrently.
-#[allow(unsafe_code)]
 mod tests;

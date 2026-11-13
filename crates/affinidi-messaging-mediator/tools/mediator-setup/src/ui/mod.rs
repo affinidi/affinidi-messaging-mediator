@@ -813,9 +813,9 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                          MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE\n\n\
                          Empty input is rejected. Pick something long and high-entropy: \
                          a passphrase-manager entry or a 6+ word diceware string.\n\n\
-                         The wizard exports this passphrase to its own process env so \
-                         it can write the initial entries; you must arrange for the \
-                         mediator to see the same value at boot.",
+                         The wizard uses this passphrase to write the initial \
+                         entries; you must arrange for the mediator to see the same \
+                         value at boot.",
                     ),
                     KeyStoragePhase::FilePassphraseConfirm => (
                         "Confirm file-backend passphrase",

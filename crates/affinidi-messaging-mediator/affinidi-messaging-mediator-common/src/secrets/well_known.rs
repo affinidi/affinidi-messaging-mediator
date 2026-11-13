@@ -21,7 +21,9 @@ use zeroize::Zeroize;
 use crate::secrets::bundle::BundledStore;
 use crate::secrets::envelope::Envelope;
 use crate::secrets::error::{Result, SecretStoreError};
-use crate::secrets::store::{DynSecretStore, open_store, open_store_async};
+use crate::secrets::store::{
+    DynSecretStore, open_store, open_store_async, open_store_with_passphrase,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -369,6 +371,15 @@ impl MediatorSecrets {
     /// the blocking pool (see [`open_store_async`]).
     pub async fn from_url_async(url: &str) -> Result<Self> {
         Ok(Self::new(open_store_async(url).await?))
+    }
+
+    /// [`MediatorSecrets::from_url`] with an explicit `file://?encrypt=1`
+    /// passphrase; see [`open_store_with_passphrase`].
+    pub fn from_url_with_passphrase(
+        url: &str,
+        passphrase: Option<zeroize::Zeroizing<String>>,
+    ) -> Result<Self> {
+        Ok(Self::new(open_store_with_passphrase(url, passphrase)?))
     }
 
     pub fn store(&self) -> &DynSecretStore {

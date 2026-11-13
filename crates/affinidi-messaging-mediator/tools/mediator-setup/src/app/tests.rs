@@ -958,10 +958,9 @@ fn keystorage_file_backend_walks_gate_then_path_then_encrypt_choice() {
 }
 
 #[test]
-#[serial_test::serial(passphrase_env)]
 fn keystorage_file_backend_encrypt_yes_collects_passphrase() {
     // Picking "encrypt" advances to the passphrase prompt, which
-    // rejects empty input and exports the value via env on confirm.
+    // rejects empty input and keeps the value on confirm.
     let mut app = WizardApp::new("test.toml".into());
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 6; // file:// (k8s inserted at 5)
@@ -991,7 +990,7 @@ fn keystorage_file_backend_encrypt_yes_collects_passphrase() {
     );
 
     // First passphrase entry advances to the confirm prompt — sub-flow
-    // is still in progress, env var must NOT be set yet.
+    // is still in progress, the passphrase must NOT be kept yet.
     app.text_input = Input::new("correct horse battery staple".into());
     app.confirm_text_input();
     assert_eq!(
@@ -1004,13 +1003,12 @@ fn keystorage_file_backend_encrypt_yes_collects_passphrase() {
         !app.config.secret_file_encrypted,
         "secret_file_encrypted must not flip until the confirm matches"
     );
-    let key = affinidi_messaging_mediator_common::PASSPHRASE_ENV;
     assert!(
-        std::env::var(key).is_err(),
-        "env var must not be exported until the confirm matches"
+        app.file_passphrase.is_none(),
+        "the passphrase must not be kept until the confirm matches"
     );
 
-    // Matching confirm finishes the sub-flow, sets the env var, and
+    // Matching confirm finishes the sub-flow, keeps the passphrase, and
     // flips secret_file_encrypted.
     app.text_input = Input::new("correct horse battery staple".into());
     app.confirm_text_input();
@@ -1018,19 +1016,17 @@ fn keystorage_file_backend_encrypt_yes_collects_passphrase() {
     assert!(app.config.secret_file_encrypted);
     assert_eq!(app.current_step, WizardStep::Vta);
     assert_eq!(
-        std::env::var(key).ok().as_deref(),
+        app.file_passphrase.as_deref().map(String::as_str),
         Some("correct horse battery staple"),
     );
+    // The wizard never exports it to its own environment.
+    assert!(std::env::var(affinidi_messaging_mediator_common::PASSPHRASE_ENV).is_err());
     // Pending stash must be cleared so a second entry into the
     // sub-flow doesn't see the previous passphrase.
     assert!(app.pending_passphrase.is_none());
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 #[test]
-#[serial_test::serial(passphrase_env)]
 fn keystorage_file_backend_passphrase_mismatch_returns_to_first_screen() {
     // The whole point of the confirm step is to catch typos.
     // Mismatch must:
@@ -1038,7 +1034,7 @@ fn keystorage_file_backend_passphrase_mismatch_returns_to_first_screen() {
     //   2. Clear the stashed first entry (no leak across attempts)
     //   3. Surface an inline error
     //   4. Leave secret_file_encrypted unchanged
-    //   5. Leave the env var unset
+    //   5. Keep no passphrase
     let mut app = WizardApp::new("test.toml".into());
     app.current_step = WizardStep::KeyStorage;
     app.selection_index = 6; // file:// (k8s inserted at 5)
@@ -1072,8 +1068,7 @@ fn keystorage_file_backend_passphrase_mismatch_returns_to_first_screen() {
         "operator must see why Enter sent them back"
     );
     assert!(!app.config.secret_file_encrypted);
-    let key = affinidi_messaging_mediator_common::PASSPHRASE_ENV;
-    assert!(std::env::var(key).is_err());
+    assert!(app.file_passphrase.is_none());
 
     // Re-typing both correctly clears the error and finishes.
     app.text_input = Input::new("third time lucky".into());
@@ -1087,9 +1082,10 @@ fn keystorage_file_backend_passphrase_mismatch_returns_to_first_screen() {
     assert!(!app.in_key_storage_subflow());
     assert!(app.config.secret_file_encrypted);
     assert!(app.passphrase_validation_error.is_none());
-    unsafe {
-        std::env::remove_var(key);
-    }
+    assert_eq!(
+        app.file_passphrase.as_deref().map(String::as_str),
+        Some("third time lucky"),
+    );
 }
 
 #[test]
@@ -2854,6 +2850,7 @@ async fn key_storage_checks_the_backend_before_moving_on() {
     // A backend that already holds a mediator is refused on the spot.
     let store = crate::secret_backend::open_secret_backend(
         &crate::config_writer::build_backend_url(&app.config),
+        None,
     )
     .unwrap();
     store.store_jwt_secret(b"existing").await.unwrap();

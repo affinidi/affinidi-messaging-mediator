@@ -144,23 +144,13 @@ impl WizardApp {
                     self.enter_key_storage_phase(KeyStoragePhase::FilePassphrase);
                     return;
                 }
-                // Export to the env var the encrypted backend reads.
-                // The wizard process is short-lived; the env var dies
-                // with it. Operators who want persistence beyond the
-                // wizard run set the var themselves before starting
-                // the mediator.
-                //
-                // SAFETY: `set_var` is unsafe because another thread may
-                // read the environment at the same time. This runs on the
-                // wizard's UI thread in response to a keypress; the reader is
-                // the encrypted file backend, which this thread opens later.
-                // The residual risk is a library reading some other variable
-                // on a worker thread at this instant, accepted for a
-                // short-lived interactive tool (the operator is typing).
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::set_var(affinidi_messaging_mediator_common::PASSPHRASE_ENV, &value);
-                }
+                // Keep it for opening the encrypted backend: the backend
+                // check, the session persistence and the final provisioning
+                // all hand it over explicitly. Nothing goes into the
+                // process environment, which worker threads read
+                // concurrently. The mediator gets the same value at boot
+                // from MEDIATOR_FILE_BACKEND_PASSPHRASE[_FILE].
+                self.file_passphrase = Some(zeroize::Zeroizing::new(value));
                 self.pending_passphrase = None;
                 self.passphrase_validation_error = None;
                 self.config.secret_file_encrypted = true;

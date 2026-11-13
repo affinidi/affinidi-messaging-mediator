@@ -70,6 +70,9 @@ pub(crate) struct GenerateOptions {
     pub force_reprovision: bool,
     /// Print the generated admin private key (terminal only).
     pub show_admin_key: bool,
+    /// The `file://?encrypt=1` passphrase the TUI collected. `None` reads
+    /// it from the environment, as the headless flows and the mediator do.
+    pub file_passphrase: Option<zeroize::Zeroizing<String>>,
 }
 
 impl GenerateOptions {
@@ -80,6 +83,7 @@ impl GenerateOptions {
             probe,
             force_reprovision: false,
             show_admin_key: false,
+            file_passphrase: None,
         }
     }
 }
@@ -471,6 +475,44 @@ mod generate_and_write_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial_test::serial]
+    async fn an_encrypted_file_backend_takes_the_passphrase_without_the_environment() {
+        // The TUI hands the passphrase it collected to the provisioning
+        // pass; nothing is exported to the process environment (#182).
+        let key = affinidi_messaging_mediator_common::PASSPHRASE_ENV;
+        assert!(
+            std::env::var(key).is_err(),
+            "test needs a clean environment"
+        );
+        let cwd = CwdGuard::new();
+        let dir = cwd.dir().to_path_buf();
+        let config = app::WizardConfig {
+            secret_file_encrypted: true,
+            ..did_peer_config(&dir)
+        };
+        let passphrase = zeroize::Zeroizing::new("a long test passphrase".to_string());
+        let options = GenerateOptions {
+            file_passphrase: Some(passphrase.clone()),
+            ..GenerateOptions::for_tests(false, secret_backend::ProvisionProbe::ReadWrite)
+        };
+
+        generate_and_write_with(&config, None, &options)
+            .await
+            .expect("provisioning with an explicit passphrase")
+            .into_result()
+            .unwrap();
+        assert!(std::env::var(key).is_err(), "nothing is exported");
+
+        let url = config_writer::build_backend_url(&config);
+        assert!(url.ends_with("?encrypt=1"), "{url}");
+        let store = secret_backend::open_secret_backend(&url, Some(&passphrase)).unwrap();
+        assert!(store.load_admin_credential().await.unwrap().is_some());
+        // Without the passphrase (and with none in the environment) the
+        // store cannot be opened.
+        assert!(secret_backend::open_secret_backend(&url, None).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
     async fn generate_and_write_file_backend_on_default_path_survives(/* #354 */) {
         // Regression for #354. The default `[secrets].storage` path is
         // `<config_dir>/secrets.json` — the very path the now-removed
@@ -780,7 +822,7 @@ mod generate_and_write_tests {
         let config = did_peer_config(&dir);
         let session = admin_only_session();
         let url = config_writer::build_backend_url(&config);
-        let store = secret_backend::open_secret_backend(&url).unwrap();
+        let store = secret_backend::open_secret_backend(&url, None).unwrap();
         secret_backend::store_vta_session(&store, &session)
             .await
             .unwrap();
@@ -848,8 +890,9 @@ mod generate_and_write_tests {
         .unwrap();
 
         // The backend's admin credential is the VTA credential…
-        let store = secret_backend::open_secret_backend(&config_writer::build_backend_url(&config))
-            .unwrap();
+        let store =
+            secret_backend::open_secret_backend(&config_writer::build_backend_url(&config), None)
+                .unwrap();
         let cred = store.load_admin_credential().await.unwrap().unwrap();
         assert_eq!(cred.did, session.admin_did());
         // …while mediator.toml's admin_did is the generated one, whose key
@@ -894,8 +937,9 @@ mod generate_and_write_tests {
         .unwrap();
 
         // The update + pre-rotation keys are in their own backend entry.
-        let store = secret_backend::open_secret_backend(&config_writer::build_backend_url(&config))
-            .unwrap();
+        let store =
+            secret_backend::open_secret_backend(&config_writer::build_backend_url(&config), None)
+                .unwrap();
         let keys: generators::did_webvh::WebvhUpdateKeys = store
             .load_entry(WEBVH_UPDATE_KEYS, KIND_WEBVH_UPDATE_KEYS)
             .await

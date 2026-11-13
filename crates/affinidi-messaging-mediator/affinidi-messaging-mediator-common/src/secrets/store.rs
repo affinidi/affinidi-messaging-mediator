@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::secrets::backends;
 use crate::secrets::error::{Result, SecretStoreError};
@@ -162,12 +163,24 @@ pub trait SecretStore: Send + Sync {
 /// dispatched to its concrete implementation; the URL's query parameters
 /// and path structure are interpreted by the backend itself.
 pub fn open_store(url: &str) -> Result<DynSecretStore> {
+    open_store_with_passphrase(url, None)
+}
+
+/// [`open_store`] with the `file://?encrypt=1` passphrase supplied by the
+/// caller rather than read from `MEDIATOR_FILE_BACKEND_PASSPHRASE[_FILE]`.
+/// Lets a multi-threaded process (the setup wizard) hand over a passphrase
+/// it collected without writing it into its own environment. Ignored by
+/// every other backend; `None` behaves exactly like [`open_store`].
+pub fn open_store_with_passphrase(
+    url: &str,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<DynSecretStore> {
     let parsed = parse_url(url)?;
     match &parsed {
         BackendUrl::Keyring { .. } => backends::keyring::open(parsed),
         BackendUrl::File {
             encrypted: true, ..
-        } => backends::file_encrypted::open(parsed),
+        } => backends::file_encrypted::open_with_passphrase(parsed, passphrase),
         BackendUrl::File { .. } => backends::file::open(parsed),
         BackendUrl::Aws { .. } => backends::aws::open(parsed),
         BackendUrl::Gcp { .. } => backends::gcp::open(parsed),
@@ -181,8 +194,19 @@ pub fn open_store(url: &str) -> Result<DynSecretStore> {
 /// time — the encrypted `file://` backend runs Argon2id (64 MiB) and reads
 /// its file — so async callers should use this rather than stall a worker.
 pub async fn open_store_async(url: &str) -> Result<DynSecretStore> {
+    open_store_with_passphrase_async(url, None).await
+}
+
+/// [`open_store_with_passphrase`] on tokio's blocking pool.
+pub async fn open_store_with_passphrase_async(
+    url: &str,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<DynSecretStore> {
     let url = url.to_string();
-    backends::run_blocking("secrets", move || open_store(&url)).await
+    backends::run_blocking("secrets", move || {
+        open_store_with_passphrase(&url, passphrase)
+    })
+    .await
 }
 
 #[cfg(test)]

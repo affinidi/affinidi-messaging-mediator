@@ -41,7 +41,12 @@ pub(crate) async fn open_guarded_backend(
     {
         secure_fs::create_private_dir_all(parent)?;
     }
-    let store = secret_backend::open_and_probe_secret_backend(&backend_url, options.probe).await?;
+    let store = secret_backend::open_and_probe_secret_backend(
+        &backend_url,
+        options.file_passphrase.as_ref(),
+        options.probe,
+    )
+    .await?;
 
     if !options.force_reprovision {
         let mut found = secret_backend::provisioned_well_known_keys(&store)

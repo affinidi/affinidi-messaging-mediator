@@ -195,11 +195,10 @@ pub enum KeyStoragePhase {
     /// advances to [`Self::FilePassphrase`]; "no" finishes the
     /// sub-flow with a plaintext file.
     FileEncryptChoice,
-    /// `file://` — collect the passphrase via a masked prompt. The
-    /// passphrase is exported as `MEDIATOR_FILE_BACKEND_PASSPHRASE`
-    /// for the duration of the wizard process so the secret backend
-    /// can derive its key when `MediatorSecrets::from_url` is called
-    /// in `generate_and_write`.
+    /// `file://` — collect the passphrase via a masked prompt. Once
+    /// confirmed it is kept on `WizardApp::file_passphrase` and handed to
+    /// every open of the encrypted backend (never put in the process
+    /// environment).
     FilePassphrase,
     /// `file://` — re-enter the passphrase to guard against typos. The
     /// first input is stashed on `WizardApp::pending_passphrase`; this
