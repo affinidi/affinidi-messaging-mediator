@@ -885,6 +885,10 @@ mod tests {
 
     /// A `MEDIATOR_`-prefixed name, or the renamed name, wins over the older
     /// one; either alone works.
+    // `set_var` / `remove_var` are `unsafe` (2024 edition).
+    // SAFETY: the two variable names are unique to this test, so no other test
+    // reads or writes them concurrently.
+    #[allow(unsafe_code)]
     #[test]
     fn the_preferred_name_wins_over_the_older_one() {
         // Names no other test (or the environment) sets.
