@@ -1430,6 +1430,8 @@ async fn handle_socket(
         // notices when they let go. An unregistered socket (relay, or no
         // streaming task) keeps its own sender so `rx` simply never yields.
         let _unregistered_tx = (is_relay || state.streaming_task.is_none()).then_some(tx);
+        // The socket's last read of its own account (`refresh_standing`).
+        let mut standing_read: Option<crate::common::standing::StandingRead> = None;
         let mut mux_sweep = tokio::time::interval(Duration::from_secs(30));
         mux_sweep.reset();
         let mut mux_revalidate = tokio::time::interval(Duration::from_secs(
@@ -1656,7 +1658,7 @@ async fn handle_socket(
                                     }
 
                                     if !is_relay {
-                                        refresh_standing(&state, &mut session).await;
+                                        refresh_standing(&state, &mut session, &mut standing_read).await;
                                     }
                                     // Process the message, which also takes care of any storing and live-streaming of the message
                                     state.monitor.received(&session.did_hash, Channel::Websocket, Protocol::DidComm, msg.as_bytes());
@@ -1729,7 +1731,7 @@ async fn handle_socket(
                                     // TSP message; route it to the TSP handler. Other binary frames
                                     // are UTF-8-decoded and handled as DIDComm exactly as before.
                                     if !is_relay {
-                                        refresh_standing(&state, &mut session).await;
+                                        refresh_standing(&state, &mut session, &mut standing_read).await;
                                     }
                                     #[cfg(feature = "tsp")]
                                     if affinidi_tsp::is_tsp(&msg) {
@@ -2917,7 +2919,22 @@ fn _close_frame_reason(why: CloseReason) -> (u16, &'static str) {
 /// matters, one **demoted or blocked** kept its old authority for the rest of
 /// the token's life. This is the same join `get_session` does, applied per
 /// frame. A store failure keeps what the session had, as that join does.
-async fn refresh_standing(state: &SharedData, session: &mut Session) {
+///
+/// Not a store read on *every* frame: `last` is the socket's previous read,
+/// and it stands while no account change has been seen and it is younger
+/// than [`STANDING_FRESH`](crate::common::standing::STANDING_FRESH) (#159;
+/// see `common::standing`). A failed read is not remembered, so the next
+/// frame tries again.
+async fn refresh_standing(
+    state: &SharedData,
+    session: &mut Session,
+    last: &mut Option<crate::common::standing::StandingRead>,
+) {
+    use crate::common::standing::{StandingRead, epoch};
+    if !StandingRead::is_stale(last.as_ref()) {
+        return;
+    }
+    let seen = epoch();
     match state.database.account_get(&session.did_hash).await {
         Ok(Some(account)) => {
             session.account_type = account._type;
@@ -2925,8 +2942,11 @@ async fn refresh_standing(state: &SharedData, session: &mut Session) {
                 affinidi_messaging_mediator_common::types::acls::MediatorACLSet::from_u64(
                     account.acls,
                 );
+            *last = Some(StandingRead::taken(seen));
         }
-        Ok(None) => {}
+        Ok(None) => {
+            *last = Some(StandingRead::taken(seen));
+        }
         Err(e) => warn!(
             "couldn't refresh the account behind session {}: {e}",
             session.session_id

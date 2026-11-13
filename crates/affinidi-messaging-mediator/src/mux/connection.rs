@@ -1135,6 +1135,9 @@ pub fn spawn_standing_pass(state: &SharedData, conn: &Arc<MuxConn>) {
 /// member on every live mux connection on this instance — attach-admitted
 /// members included — and detach it wherever its standing has lapsed.
 pub async fn recheck_member(state: &SharedData, did_hash: &str) {
+    // Open sockets (any connection, not just mux) re-read their own account
+    // on their next frame rather than after `STANDING_FRESH`.
+    crate::common::standing::account_changed();
     for conn in state.mux.all() {
         let member = conn.session.lock().await.get(did_hash).cloned();
         if let Some(m) = member {

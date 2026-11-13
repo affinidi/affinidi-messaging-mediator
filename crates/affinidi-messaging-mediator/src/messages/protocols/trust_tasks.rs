@@ -1157,6 +1157,9 @@ async fn apply_role_change(
             .account_set_role(target_hash, &new_type)
             .await?;
     }
+    // Open sockets, here and on every instance sharing the store, re-read
+    // their account on their next frame (`common::standing`).
+    crate::mux::connection::account_changed(state, target_hash).await;
     Ok(())
 }
 
