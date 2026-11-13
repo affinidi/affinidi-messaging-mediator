@@ -285,6 +285,8 @@ ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12"] }
 ## Constant-time comparison for DID authorization checks
 subtle = "2"
+## Wipes key material (operating keys, the JWT key) from memory on drop
+zeroize = "1"
 
 # ── Serialization & Encoding ────────────────────────────────────────────
 serde = { version = "1", features = ["derive", "rc"] }

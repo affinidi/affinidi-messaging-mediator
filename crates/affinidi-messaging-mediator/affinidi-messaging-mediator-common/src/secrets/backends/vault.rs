@@ -12,9 +12,12 @@
 //!   - `vault://vault.internal/secret/mediator` → mount `secret`,
 //!     namespace `mediator/`.
 //!
-//! Transport: HTTPS against the configured endpoint by default. The
-//! `?insecure=1` query parameter disables TLS verification for local
-//! dev / test only — never use it with production material, which
+//! Transport: always HTTPS against the configured endpoint. A private
+//! CA is trusted with `?ca_cert=<path>` (a PEM bundle; `VAULT_CACERT`
+//! works too). `?insecure=1` disables TLS verification for local dev /
+//! test only: a release build refuses it at open unless
+//! `MEDIATOR_ALLOW_INSECURE_VAULT=1` is set, and every open and login
+//! with it logs a warning. Never use it with production material, which
 //! includes the mediator's admin credential and JWT key.
 //!
 //! Auth (selected by the `?auth=` query parameter, default `token`):
@@ -27,9 +30,11 @@
 //!     `VAULT_SECRET_ID` (optional `?approle_mount=`).
 //!
 //! Auth secrets never appear in the URL. For the renewable methods
-//! (Kubernetes / AppRole) a call that fails with 401/403 triggers a
-//! single re-authentication + retry, so an expired token or rotated
-//! JWT recovers without a restart. Vault Enterprise namespaces are
+//! (Kubernetes / AppRole) a call that fails with 401, or with 403 while
+//! `auth/token/lookup-self` also refuses the token, triggers a single
+//! re-authentication + retry, so an expired token or rotated JWT
+//! recovers without a restart. A 403 for a token that is still valid is
+//! a policy denial and is returned as is, without a login. Vault Enterprise namespaces are
 //! supported via `?namespace=` (`X-Vault-Namespace`).
 //!
 //! Calls go through [`super::super::retry::with_retry`] with
@@ -40,6 +45,8 @@ use crate::secrets::error::{Result, SecretStoreError};
 use crate::secrets::store::DynSecretStore;
 use crate::secrets::url::BackendUrl;
 
+#[cfg(feature = "secrets-vault")]
+use crate::secrets::backends::run_blocking;
 #[cfg(feature = "secrets-vault")]
 use crate::secrets::retry::{RetryPolicy, Retryable, with_retry};
 #[cfg(feature = "secrets-vault")]
@@ -74,6 +81,8 @@ use vaultrs::{
     error::ClientError,
     kv2,
 };
+#[cfg(feature = "secrets-vault")]
+use zeroize::Zeroizing;
 
 const BACKEND_LABEL: &str = "vault";
 
@@ -85,6 +94,18 @@ const VAULT_TOKEN_ENV: &str = "VAULT_TOKEN";
 const VAULT_ROLE_ID_ENV: &str = "VAULT_ROLE_ID";
 #[cfg(feature = "secrets-vault")]
 const VAULT_SECRET_ID_ENV: &str = "VAULT_SECRET_ID";
+
+/// Env var that lets a release build use `vault://…?insecure=1`.
+#[cfg(feature = "secrets-vault")]
+pub const ALLOW_INSECURE_VAULT_ENV: &str = "MEDIATOR_ALLOW_INSECURE_VAULT";
+
+/// Whether `?insecure=1` may be used: always in a debug or test build, and
+/// in a release build only with [`ALLOW_INSECURE_VAULT_ENV`] set to `1` or
+/// `true`.
+#[cfg(feature = "secrets-vault")]
+fn insecure_allowed(debug_build: bool, allow_env: Option<&str>) -> bool {
+    debug_build || allow_env.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
 
 /// How many versions before the new one the first write to a path in a
 /// process destroys. Later writes destroy only the version they
@@ -112,6 +133,7 @@ impl VaultStore {
             auth,
             enterprise_namespace,
             insecure,
+            ca_cert,
         } = url
         else {
             return Err(SecretStoreError::Other(
@@ -131,11 +153,33 @@ impl VaultStore {
                 reason: "vault:// requires a KV v2 mount point as the first path segment".into(),
             });
         }
-        let address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.clone()
-        } else {
-            format!("https://{endpoint}")
-        };
+        // Always HTTPS: `parse_vault` takes the endpoint up to the first
+        // '/', so a scheme can't be given in the URL.
+        let address = format!("https://{endpoint}");
+        if insecure {
+            let debug_build = cfg!(debug_assertions) || cfg!(feature = "test-clock");
+            let allow_env = std::env::var(ALLOW_INSECURE_VAULT_ENV).ok();
+            if !insecure_allowed(debug_build, allow_env.as_deref()) {
+                return Err(SecretStoreError::InvalidUrl {
+                    url: format!("vault://{endpoint}/{mount}"),
+                    reason: format!(
+                        "?insecure=1 disables TLS verification of the Vault server, which \
+                         carries the admin credential, JWT key and Vault token. A release build \
+                         refuses it: trust a private CA with ?ca_cert=<path-to-pem> instead, or \
+                         set {ALLOW_INSECURE_VAULT_ENV}=1 to accept the risk"
+                    ),
+                });
+            }
+            warn_insecure(&address, "opening the backend");
+        }
+        if let Some(ca) = &ca_cert
+            && !std::path::Path::new(ca).is_file()
+        {
+            return Err(SecretStoreError::InvalidUrl {
+                url: format!("vault://{endpoint}/{mount}"),
+                reason: format!("ca_cert '{ca}' is not a readable file"),
+            });
+        }
         Ok(VaultStore {
             address,
             mount,
@@ -143,12 +187,25 @@ impl VaultStore {
             enterprise_namespace,
             auth,
             verify_tls: !insecure,
+            ca_cert,
             client: OnceCell::new(),
             versions: Default::default(),
             swept: Default::default(),
-            destroy_denied_warned: AtomicBool::new(false),
+            destroy_denied: AtomicBool::new(false),
         })
     }
+}
+
+/// Logged at open and at every login while TLS verification is off.
+#[cfg(feature = "secrets-vault")]
+fn warn_insecure(address: &str, when: &str) {
+    warn!(
+        backend = BACKEND_LABEL,
+        address,
+        "TLS certificate verification is DISABLED for the Vault backend (?insecure=1) while \
+         {when}: anyone on the path can impersonate Vault and read the mediator's admin \
+         credential, JWT key and Vault token. Use ?ca_cert=<path> for a private CA."
+    );
 }
 
 #[cfg(not(feature = "secrets-vault"))]
@@ -175,6 +232,8 @@ pub struct VaultStore {
     auth: VaultAuth,
     /// Whether TLS certificates are verified (false only for `insecure=1`).
     verify_tls: bool,
+    /// PEM CA bundle to trust (`?ca_cert=`), replacing `VAULT_CACERT`.
+    ca_cert: Option<String>,
     /// Lazily-authenticated client behind an `RwLock` so a renewable auth
     /// method (Kubernetes / AppRole) can swap in a fresh token when the
     /// current one expires. Authentication happens on first use so a
@@ -187,8 +246,10 @@ pub struct VaultStore {
     versions: std::sync::Mutex<HashMap<String, u64>>,
     /// Paths whose older versions were destroyed since start.
     swept: std::sync::Mutex<HashSet<String>>,
-    /// The missing-`destroy`-right warning is logged once per process.
-    destroy_denied_warned: AtomicBool,
+    /// Set once a destroy is denied (no `update` on the destroy path). The
+    /// policy won't change under a running process, so later writes skip
+    /// the destroy instead of repeating a call that is refused every time.
+    destroy_denied: AtomicBool,
 }
 
 /// Read a required env var, erroring if it is unset or empty.
@@ -235,6 +296,9 @@ impl VaultStore {
     /// before. Best-effort: the write already succeeded, so failures are
     /// logged, not returned.
     async fn destroy_superseded(&self, path: &str, new_version: u64) {
+        if self.destroy_denied.load(Ordering::Relaxed) {
+            return;
+        }
         let first = self.swept.lock().is_ok_and(|swept| !swept.contains(path));
         let oldest = if first {
             new_version.saturating_sub(SWEEP_WINDOW).max(1)
@@ -260,13 +324,13 @@ impl VaultStore {
             Ok(Ok(())) => None,
             Ok(Err(err)) if matches!(api_status(&err), Some(404)) => None,
             Ok(Err(err)) if matches!(api_status(&err), Some(403)) => {
-                if !self.destroy_denied_warned.swap(true, Ordering::Relaxed) {
+                if !self.destroy_denied.swap(true, Ordering::Relaxed) {
                     warn!(
                         path = %format!("{}/destroy/{path}", self.mount),
                         "no update right on the destroy path, so superseded versions \
                          (each a full copy of the stored secrets) stay readable until \
                          the mount's max_versions drops them; grant `update` on \
-                         <mount>/destroy/<prefix>/*"
+                         <mount>/destroy/<prefix>/* and restart. Not tried again until then."
                     );
                 }
                 None
@@ -298,6 +362,9 @@ impl VaultStore {
             .address(&self.address)
             .token(token)
             .verify(self.verify_tls);
+        if let Some(ca) = &self.ca_cert {
+            builder.ca_certs(vec![ca.clone()]);
+        }
         if let Some(ns) = &self.enterprise_namespace {
             builder.namespace(Some(ns.clone()));
         }
@@ -319,6 +386,9 @@ impl VaultStore {
     /// ServiceAccount JWT is re-read on every call so kubelet rotation is
     /// handled transparently.
     async fn authenticate(&self) -> Result<VaultClient> {
+        if !self.verify_tls {
+            warn_insecure(&self.address, "logging in");
+        }
         match &self.auth {
             VaultAuth::Token => {
                 let token = require_env(VAULT_TOKEN_ENV)?;
@@ -329,14 +399,18 @@ impl VaultStore {
                 mount,
                 jwt_path,
             } => {
-                let jwt = std::fs::read_to_string(jwt_path).map_err(|e| {
-                    SecretStoreError::Unreachable {
-                        backend: BACKEND_LABEL,
-                        reason: format!(
-                            "could not read Kubernetes ServiceAccount JWT at '{jwt_path}': {e}"
-                        ),
-                    }
-                })?;
+                let path = jwt_path.clone();
+                let jwt = run_blocking(BACKEND_LABEL, move || {
+                    std::fs::read_to_string(&path)
+                        .map(Zeroizing::new)
+                        .map_err(|e| SecretStoreError::Unreachable {
+                            backend: BACKEND_LABEL,
+                            reason: format!(
+                                "could not read Kubernetes ServiceAccount JWT at '{path}': {e}"
+                            ),
+                        })
+                })
+                .await?;
                 let mut client = self.build_client("")?;
                 let info = kubernetes::login(&client, mount, role, jwt.trim())
                     .await
@@ -376,10 +450,11 @@ impl VaultStore {
     }
 
     /// Run a KV operation with transient-error retries, re-authenticating
-    /// once if it fails with 401/403 and the auth method can obtain a
-    /// fresh token. The outer `Result` carries setup/auth failures; the
-    /// inner one carries the (possibly-retried) API result so callers keep
-    /// their existing 404 handling.
+    /// once if the token was refused (see [`VaultStore::token_rejected`])
+    /// and the auth method can obtain a fresh token. The outer `Result`
+    /// carries setup/auth failures; the inner one carries the
+    /// (possibly-retried) API result so callers keep their existing 404
+    /// handling.
     async fn run<T, F>(&self, label: &str, op: F) -> Result<std::result::Result<T, ClientError>>
     where
         F: for<'a> Fn(&'a VaultClient) -> VaultFut<'a, T>,
@@ -389,25 +464,46 @@ impl VaultStore {
             let guard = cell.read().await;
             with_retry(label, &VaultRetryPolicy, || op(&guard)).await
         };
-        match first {
-            Err(err) if self.auth.is_renewable() && matches!(api_status(&err), Some(401 | 403)) => {
-                match self.authenticate().await {
-                    Ok(fresh) => {
-                        *cell.write().await = fresh;
-                        let guard = cell.read().await;
-                        Ok(with_retry(label, &VaultRetryPolicy, || op(&guard)).await)
-                    }
-                    Err(reauth_err) => {
-                        warn!(
-                            backend = BACKEND_LABEL,
-                            error = %reauth_err,
-                            "vault re-authentication failed after an auth error"
-                        );
-                        Ok(Err(err))
-                    }
-                }
+        let err = match first {
+            Ok(value) => return Ok(Ok(value)),
+            Err(err) => err,
+        };
+        if !self.auth.is_renewable() || !self.token_rejected(cell, &err).await {
+            return Ok(Err(err));
+        }
+        match self.authenticate().await {
+            Ok(fresh) => {
+                *cell.write().await = fresh;
+                let guard = cell.read().await;
+                Ok(with_retry(label, &VaultRetryPolicy, || op(&guard)).await)
             }
-            other => Ok(other),
+            Err(reauth_err) => {
+                warn!(
+                    backend = BACKEND_LABEL,
+                    error = %reauth_err,
+                    "vault re-authentication failed after an auth error"
+                );
+                Ok(Err(err))
+            }
+        }
+    }
+
+    /// Whether `err` means the token itself is no longer accepted, as
+    /// opposed to a policy that doesn't grant this path. A 401 always does.
+    /// Vault answers an expired or revoked token with 403 too, so a 403
+    /// asks `auth/token/lookup-self` (in the `default` policy): only if
+    /// that is refused as well is the token bad. Logging in again for a
+    /// plain permission denial would mint a token and lease (and spend an
+    /// AppRole `secret_id` use) on every such call.
+    async fn token_rejected(&self, cell: &RwLock<VaultClient>, err: &ClientError) -> bool {
+        match api_status(err) {
+            Some(401) => true,
+            Some(403) => {
+                let guard = cell.read().await;
+                let lookup = vaultrs::token::lookup_self(&*guard).await.map(|_| ());
+                lookup_refuses_token(&lookup)
+            }
+            _ => false,
         }
     }
 }
@@ -459,6 +555,17 @@ fn api_status(err: &ClientError) -> Option<u16> {
         } => Some(*code),
         _ => None,
     }
+}
+
+/// Whether a `lookup-self` result says the token is not accepted. A
+/// transport failure says nothing about the token, so it is not taken as
+/// a refusal.
+#[cfg(feature = "secrets-vault")]
+fn lookup_refuses_token(lookup: &std::result::Result<(), ClientError>) -> bool {
+    lookup
+        .as_ref()
+        .err()
+        .is_some_and(|e| matches!(api_status(e), Some(401 | 403)))
 }
 
 /// Vault's answer when a write's `cas` is not the current version.
@@ -725,11 +832,79 @@ mod tests {
             enterprise_namespace: None,
             auth: VaultAuth::Token,
             verify_tls: true,
+            ca_cert: None,
             client: OnceCell::new(),
             versions: Default::default(),
             swept: Default::default(),
-            destroy_denied_warned: AtomicBool::new(false),
+            destroy_denied: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn insecure_is_allowed_in_debug_builds_or_with_the_env_opt_in() {
+        assert!(insecure_allowed(true, None));
+        assert!(!insecure_allowed(false, None));
+        assert!(!insecure_allowed(false, Some("0")));
+        assert!(!insecure_allowed(false, Some("")));
+        assert!(insecure_allowed(false, Some("1")));
+        assert!(insecure_allowed(false, Some("TRUE")));
+    }
+
+    #[test]
+    fn a_missing_ca_cert_file_fails_the_open() {
+        let url = parse_url("vault://vault.internal/secret?ca_cert=/nonexistent/ca.pem").unwrap();
+        assert!(open(url).is_err());
+    }
+
+    #[test]
+    fn a_ca_cert_file_is_accepted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let url = parse_url(&format!(
+            "vault://vault.internal/secret?ca_cert={}",
+            tmp.path().display()
+        ))
+        .unwrap();
+        let store = VaultStore::new(url).unwrap();
+        assert_eq!(store.ca_cert.as_deref(), Some(tmp.path().to_str().unwrap()));
+        assert!(store.settings("t").unwrap().ca_certs.len() == 1);
+    }
+
+    #[test]
+    fn the_address_is_always_https() {
+        let store =
+            VaultStore::new(parse_url("vault://vault.internal:8200/secret").unwrap()).unwrap();
+        assert_eq!(store.address, "https://vault.internal:8200");
+    }
+
+    #[test]
+    fn only_a_refused_lookup_means_the_token_is_bad() {
+        let denied = ClientError::APIError {
+            code: 403,
+            errors: vec!["permission denied".into()],
+        };
+        assert!(lookup_refuses_token(&Err(denied)));
+        assert!(lookup_refuses_token(&Err(unparsed(401))));
+        // Token still valid: the 403 was a policy denial.
+        assert!(!lookup_refuses_token(&Ok(())));
+        // A transport failure says nothing about the token.
+        assert!(!lookup_refuses_token(&Err(ClientError::ResponseEmptyError)));
+        assert!(!lookup_refuses_token(&Err(unparsed(503))));
+    }
+
+    #[tokio::test]
+    async fn a_denied_destroy_is_not_tried_again() {
+        // Once a destroy was refused, later writes skip it: no client is
+        // even built (which, here, would fail for want of VAULT_TOKEN or
+        // hang on the unreachable address).
+        let store = store_from("127.0.0.1:1", "secret/mediator");
+        store.destroy_denied.store(true, Ordering::Relaxed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.destroy_superseded("mediator/k", 5),
+        )
+        .await
+        .expect("returns at once");
+        assert!(store.client.get().is_none(), "no Vault call was made");
     }
 
     /// The 404 for a soft-deleted key: a body without `errors`, which

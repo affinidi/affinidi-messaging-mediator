@@ -32,8 +32,11 @@ use affinidi_did_resolver_cache_sdk::{
     config::{DIDCacheConfig, DIDCacheConfigBuilder},
 };
 use affinidi_messaging_mediator_common::{
-    MediatorSecrets, database::config::DatabaseConfig, did_web::rewrite_did_document_to_web,
-    errors::MediatorError, secrets::open_store,
+    MediatorSecrets,
+    database::config::DatabaseConfig,
+    did_web::rewrite_did_document_to_web,
+    errors::MediatorError,
+    secrets::{open_store_async, parse_url},
 };
 use affinidi_secrets_resolver::ThreadedSecretsResolver;
 use async_convert::{TryFrom, async_trait};
@@ -556,8 +559,9 @@ impl TryFrom<ConfigRaw> for Config {
         // ── Secret backend ──────────────────────────────────────────────
         // Open the unified secret store and probe end-to-end. Failing here
         // with a clear error beats discovering the backend is unreachable
-        // on the first request.
-        let store = open_store(&raw.secrets.backend).map_err(|e| {
+        // on the first request. Opened on the blocking pool: the encrypted
+        // `file://` backend runs Argon2id and reads its file there.
+        let store = open_store_async(&raw.secrets.backend).await.map_err(|e| {
             MediatorError::ConfigError(
                 12,
                 "NA".into(),
@@ -589,7 +593,7 @@ impl TryFrom<ConfigRaw> for Config {
                 ),
             )
         })?;
-        if raw.secrets.backend.starts_with("file://") {
+        if parse_url(&raw.secrets.backend).is_ok_and(|url| url.is_plaintext_file()) {
             warn!(
                 "Secret backend is file:// — secrets are plaintext on disk. \
                  Only use this for local dev/test."

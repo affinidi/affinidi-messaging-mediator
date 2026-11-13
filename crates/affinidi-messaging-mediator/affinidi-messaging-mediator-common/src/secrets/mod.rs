@@ -36,7 +36,7 @@ pub mod well_known;
 pub use bundle::{BundledStore, SECRETS_BUNDLE};
 pub use envelope::{ENVELOPE_VERSION, Envelope};
 pub use error::{Result, SecretStoreError};
-pub use store::{DynSecretStore, SecretStore, open_store};
+pub use store::{DynSecretStore, SecretStore, open_store, open_store_async};
 pub use url::{
     BackendUrl, VAULT_DEFAULT_APPROLE_MOUNT, VAULT_DEFAULT_JWT_PATH, VAULT_DEFAULT_K8S_MOUNT,
     VaultAuth, parse_url,

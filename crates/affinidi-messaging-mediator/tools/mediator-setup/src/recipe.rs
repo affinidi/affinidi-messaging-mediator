@@ -1013,6 +1013,7 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
             auth,
             enterprise_namespace,
             insecure,
+            ca_cert,
         } => {
             config.secret_storage = STORAGE_VAULT.into();
             config.secret_vault_endpoint = endpoint;
@@ -1036,6 +1037,7 @@ pub(crate) fn apply_secrets_storage(raw: &str, config: &mut WizardConfig) -> any
             }
             config.secret_vault_namespace = enterprise_namespace.unwrap_or_default();
             config.secret_vault_insecure = insecure;
+            config.secret_vault_ca_cert = ca_cert.unwrap_or_default();
         }
         BackendUrl::Kubernetes {
             namespace,

@@ -33,8 +33,14 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 pub(crate) struct OperatingSecret {
     /// Key id the secret is filed under (becomes the `Secret`'s id).
     pub key_id: String,
-    /// Multibase-encoded private key material.
+    /// Multibase-encoded private key material. Wiped on drop.
     pub private_key_multibase: String,
+}
+
+impl Drop for OperatingSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key_multibase);
+    }
 }
 
 /// Resolved cross-origin policy for browser clients.
@@ -858,7 +864,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
 
         // ── JWT signing secret ───────────────────────────────────────────
         let jwt_bytes = match secrets.load_jwt_secret().await {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) => zeroize::Zeroizing::new(bytes),
             Ok(None) => {
                 return Err(MediatorError::ConfigError(
                     12,

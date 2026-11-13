@@ -22,12 +22,28 @@ schemas, provisioning without the wizard, `/readyz`, rotation, and HA.
 |--------|-----------|------------|-------|
 | `keyring://<service>` | One OS keychain entry, `mediator_secrets_bundle` | OS-managed | Single host only. Good for desktop dev. |
 | `file:///<absolute-path>` | One JSON file, base64 values | None | Dev only: plaintext on disk. |
-| `file:///<absolute-path>?encrypt=1` | One JSON file, AEAD-sealed | AES-256-GCM, Argon2id-derived key | Needs `MEDIATOR_FILE_BACKEND_PASSPHRASE` or `MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE` at start. |
+| `file:///<absolute-path>?encrypt=1` | One JSON file, AEAD-sealed, whole-file MAC | AES-256-GCM, Argon2id-derived key | Needs `MEDIATOR_FILE_BACKEND_PASSPHRASE` or `MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE` at start. |
 | `aws_secrets://<region>/<prefix>` | One secret, `<prefix>mediator_secrets_bundle` | AWS-managed | |
 | `gcp_secrets://<project>/<prefix>` | One secret, `<prefix>mediator_secrets_bundle`; each write adds a version | Google-managed | Auth: Application Default Credentials. |
 | `azure_keyvault://<vault-name-or-url>` | One secret, `mediator-secrets-bundle` (`_` becomes `-`) | Azure-managed | A bare name means `https://<name>.vault.azure.net`; a full `https://` URL is used as is (sovereign clouds). Auth: `DeveloperToolsCredential` (Azure CLI). |
 | `vault://<endpoint>/<mount>[/<prefix>][?auth=…]` | One KV v2 secret, `<mount>/<prefix>/mediator_secrets_bundle` | Vault-managed | First path segment is the KV v2 mount; the rest is the prefix. See [Vault authentication](#vault-authentication). |
 | `k8s://[<namespace>/]<secret-name>` | One `Secret`; each entry is one `data` key | etcd (enable encryption at rest) | See [Kubernetes Secrets](#kubernetes-secrets). |
+
+`file://` URLs take three slashes and an absolute path. A URL with a host
+(`file://conf/secrets.json`, which would mean `/secrets.json`) is refused.
+`encrypt` accepts `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off` in
+any case; any other value is refused rather than read as plaintext.
+
+Both `file://` backends replace the file atomically (temp file, `fsync`,
+rename), so a crash mid-write leaves the previous store. A store file that
+can't be read or parsed fails every operation; it is never overwritten. The
+encrypted backend starts a new store only when the file is missing: an
+existing empty file is an error. Its file MAC (format version 2) covers the
+header and every entry, so an entry deleted, rolled back or swapped in by
+hand fails the open; replacing the whole file with an older copy is not
+detected. Version 1 files are read and rewritten as version 2 by the next
+write. On-disk Argon2id parameters outside memory 8 MiB..1 GiB, 1..16
+iterations and 1..16 lanes are refused.
 
 **Per-key backends** in this document means keyring, AWS, GCP, Azure and
 Vault: stores that hold one value per secret. On these the mediator packs
@@ -86,11 +102,20 @@ Params for any method:
 
 - `namespace=<ns>`: Vault Enterprise namespace (`X-Vault-Namespace`). Not
   the same as the path prefix.
-- `insecure=1`: skip TLS verification. Dev and test only.
+- `ca_cert=<path>`: a PEM CA bundle to trust for the Vault server, for a
+  private CA. Replaces `VAULT_CACERT` when set.
+- `insecure=1`: skip TLS verification. Dev and test only: a release build
+  refuses to start with it unless `MEDIATOR_ALLOW_INSECURE_VAULT=1` is set,
+  and a warning is logged at open and on every login while it is on.
 
-With `kubernetes` and `approle`, a `401`/`403` triggers one re-login and
-retry, so an expired token or a rotated ServiceAccount JWT recovers without
-a restart.
+The endpoint is always reached over HTTPS.
+
+With `kubernetes` and `approle`, a `401` triggers one re-login and retry, so
+an expired token or a rotated ServiceAccount JWT recovers without a restart.
+Vault also answers an expired token with `403`, so on a `403` the mediator
+asks `auth/token/lookup-self`; only if that is refused too does it log in
+again. A `403` for a token that is still valid is a policy denial and is
+returned without a login.
 
 Example: Kubernetes auth in Vault Enterprise namespace `team-a`, KV v2 mount
 `secret`, prefix `mediator`:
@@ -125,7 +150,8 @@ it the mediator falls back to a soft delete and the key still shows in
 supersedes. Every version of `mediator_secrets_bundle` is a full copy of the
 mediator's secrets, including entries since removed or rotated, so without
 this right they stay readable (`vault kv get -version=N`) until the mount's
-`max_versions` drops them. The mediator logs a warning once and carries on.
+`max_versions` drops them. The mediator logs a warning once and carries on,
+and stops trying to destroy versions until it restarts.
 The first write after a start also destroys up to 100 older versions, so
 history left by an earlier release goes too.
 
