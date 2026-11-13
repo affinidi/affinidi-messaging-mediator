@@ -13,6 +13,7 @@
 //! routes through this same code path internally.
 
 use crate::common::config::{Config, LimitsConfig, ProcessorsConfig, SecurityConfig, helpers};
+use crate::error_codes;
 use affinidi_did_resolver_cache_sdk::config::{DIDCacheConfig, DIDCacheConfigBuilder};
 use affinidi_messaging_mediator_common::{
     MediatorSecrets, database::config::DatabaseConfig, errors::MediatorError, store::MediatorStore,
@@ -165,7 +166,7 @@ impl MediatorHandle {
         match self.server_task.await {
             Ok(result) => result,
             Err(join_err) => Err(MediatorError::InternalError(
-                500,
+                error_codes::INTERNAL_ERROR,
                 "shutdown".into(),
                 format!("Mediator server task panicked: {join_err}"),
             )),
@@ -658,14 +659,14 @@ impl MediatorBuilder {
 fn validate(config: &Config, has_store: bool) -> Result<(), MediatorError> {
     if config.mediator_did.is_empty() {
         return Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "builder".into(),
             "mediator_did is required (call MediatorBuilder::mediator_did)".into(),
         ));
     }
     if config.admin_did.is_empty() {
         return Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "builder".into(),
             "admin_did is required (call MediatorBuilder::admin_did)".into(),
         ));
@@ -674,10 +675,10 @@ fn validate(config: &Config, has_store: bool) -> Result<(), MediatorError> {
         &config.admin_did,
         &config.mediator_did,
     )
-    .map_err(|msg| MediatorError::ConfigError(12, "builder".into(), msg))?;
+    .map_err(|msg| MediatorError::ConfigError(error_codes::CONFIG_ERROR, "builder".into(), msg))?;
     if !has_store && config.database.database_url.is_empty() {
         return Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "builder".into(),
             "database is required (call MediatorBuilder::database with a DatabaseConfig, \
              or supply a pre-built store via MediatorBuilder::store)"

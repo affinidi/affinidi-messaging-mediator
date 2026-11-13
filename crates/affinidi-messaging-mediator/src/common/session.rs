@@ -11,6 +11,7 @@
 //! [`affinidi_messaging_mediator_common::store::types::Session`]; bidirectional
 //! `From` impls bridge the two at the trait/handler boundary.
 
+use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::protocols::mediator::{accounts::AccountType, acls::MediatorACLSet};
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,7 @@ impl TryFrom<&String> for SessionState {
             _ => {
                 warn!("Unknown SessionState: ({})", value);
                 Err(MediatorError::SessionError(
-                    20,
+                    error_codes::SESSION_INVALID_STATE,
                     "NA".into(),
                     format!("Unknown session state: ({value})"),
                 ))

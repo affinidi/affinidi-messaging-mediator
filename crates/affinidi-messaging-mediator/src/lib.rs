@@ -22,6 +22,9 @@ use tasks::supervisor::HealthRegistry;
 use tasks::websocket_streaming::StreamingTask;
 use tokio_util::sync::CancellationToken;
 
+/// The error code registry (see `ERRORS.md`).
+pub use affinidi_messaging_mediator_common::error_codes;
+
 pub mod account_stats;
 pub mod activity;
 pub(crate) mod after_write;

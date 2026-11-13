@@ -42,7 +42,7 @@ pub(crate) fn addressed_to_mediator(
 
     let Some(to) = msg.to.as_ref() else {
         return Err(MediatorError::problem(
-            51,
+            crate::error_codes::INVALID_TO_HEADER,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,
@@ -55,7 +55,7 @@ pub(crate) fn addressed_to_mediator(
     };
     let Some(first) = to.first() else {
         return Err(MediatorError::problem(
-            51,
+            crate::error_codes::INVALID_TO_HEADER,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,
@@ -69,7 +69,7 @@ pub(crate) fn addressed_to_mediator(
     if !affinidi_messaging_mediator_common::did_identity::same_account(first, mediator_did) {
         tracing::debug!("to: ({first}) doesn't match Mediator DID ({mediator_did})");
         return Err(MediatorError::problem_with_log(
-            51,
+            crate::error_codes::INVALID_TO_HEADER,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,

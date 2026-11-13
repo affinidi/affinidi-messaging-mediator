@@ -44,7 +44,7 @@ pub(crate) async fn unpack_auth_message(
         Ok(ok) => ok,
         Err(e) => {
             return Err(MediatorError::problem_with_log(
-                32,
+                crate::error_codes::MESSAGE_UNPACK_FAILED,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -63,7 +63,7 @@ pub(crate) async fn unpack_auth_message(
         debug!("Auth message verified: signed and encrypted")
     } else {
         return Err(MediatorError::problem_with_log(
-            86,
+            crate::error_codes::AUTH_NOT_SIGNED_OR_ENCRYPTED,
             "",
             None,
             ProblemReportSorter::Error,
@@ -118,7 +118,7 @@ pub(super) fn _create_access_token(
     )
     .map_err(|err| {
         MediatorError::problem_with_log(
-            35,
+            crate::error_codes::AUTH_ACCESS_TOKEN_ERROR,
             session_id.to_string(),
             None,
             ProblemReportSorter::Error,
@@ -164,7 +164,7 @@ pub(super) fn _create_refresh_token(
     )
     .map_err(|err| {
         MediatorError::problem_with_log(
-            36,
+            crate::error_codes::AUTH_REFRESH_TOKEN_ERROR,
             session_id.to_string(),
             None,
             ProblemReportSorter::Error,
@@ -237,7 +237,7 @@ pub(super) async fn register_account_after_proof(
 /// The `authentication.blocked` report, shared by every admission refusal.
 fn blocked() -> MediatorError {
     MediatorError::problem(
-        25,
+        crate::error_codes::AUTH_DID_BLOCKED,
         "",
         None,
         ProblemReportSorter::Error,
@@ -252,7 +252,7 @@ fn blocked() -> MediatorError {
 /// The login could not apply the mux unknown-key rule; the client retries.
 pub(super) fn mux_check_failed(e: String) -> MediatorError {
     MediatorError::problem_with_log(
-        14,
+        crate::error_codes::DB_OPERATION_ERROR,
         "",
         None,
         ProblemReportSorter::Error,

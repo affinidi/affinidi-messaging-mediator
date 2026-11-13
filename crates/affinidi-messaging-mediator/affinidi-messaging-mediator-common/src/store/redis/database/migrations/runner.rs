@@ -8,6 +8,7 @@
  */
 
 use super::{MigrationDef, all_migrations};
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::redis::database::Database;
 use crate::store::redis::init::RedisInitConfig;
@@ -176,7 +177,7 @@ async fn get_applied_ids(db: &Database) -> Result<HashSet<u32>, MediatorError> {
         .await
         .map_err(|e| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "migrations".into(),
                 &e,
                 format!("Failed to read {MIGRATIONS_SET_KEY}: {e}"),
@@ -206,7 +207,7 @@ async fn record_migration(db: &Database, id: u32, name: &str) -> Result<(), Medi
         .map(|_| ())
         .map_err(|e| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "migrations".into(),
                 &e,
                 format!("Failed to record migration {id}: {e}"),
@@ -232,7 +233,7 @@ async fn bootstrap_if_needed(
         .await
         .map_err(|e| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "migrations".into(),
                 &e,
                 format!("Failed to check {MIGRATIONS_SET_KEY}: {e}"),
@@ -252,7 +253,7 @@ async fn bootstrap_if_needed(
         .await
         .map_err(|e| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "migrations".into(),
                 &e,
                 format!("Failed to read legacy SCHEMA_VERSION: {e}"),
@@ -298,7 +299,7 @@ async fn bootstrap_if_needed(
             .await
             .map_err(|e| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "migrations".into(),
                     &e,
                     format!("Failed to remove legacy SCHEMA_VERSION: {e}"),

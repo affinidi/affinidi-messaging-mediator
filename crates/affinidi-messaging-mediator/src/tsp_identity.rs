@@ -11,6 +11,7 @@
 //! from `keyAgreement`. No new key management — we derive it on first use from
 //! the configured DID document + secrets resolver.
 
+use crate::error_codes;
 use affinidi_did_common::document::DocumentExt;
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_mediator_common::errors::MediatorError;
@@ -41,7 +42,7 @@ impl MediatorTspIdentity {
             .await
             .map_err(|e| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("couldn't resolve mediator DID {did} to derive its TSP identity: {e}"),
                 )
@@ -53,7 +54,7 @@ impl MediatorTspIdentity {
                 .await
                 .ok_or_else(|| {
                     MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!(
                             "mediator DID {did} has no Ed25519 authentication key for TSP relay"
@@ -65,7 +66,7 @@ impl MediatorTspIdentity {
                 .await
                 .ok_or_else(|| {
                     MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!("mediator DID {did} has no X25519 keyAgreement key for TSP relay"),
                     )

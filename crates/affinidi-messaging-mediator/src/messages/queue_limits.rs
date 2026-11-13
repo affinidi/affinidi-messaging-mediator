@@ -19,6 +19,7 @@
 //! inbox, and the peer sees a silence it cannot distinguish from a dead
 //! mediator.
 
+use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use affinidi_messaging_sdk::protocols::mediator::accounts::Account;
@@ -95,7 +96,7 @@ pub(crate) async fn validate_peer_queue_limit(
             session.did_hash, next_did_hash
         );
         return Err(MediatorError::problem(
-            95,
+            error_codes::PEER_QUEUE_FULL,
             &session.session_id,
             msg_id.map(str::to_string),
             ProblemReportSorter::Error,
@@ -141,7 +142,7 @@ pub(crate) fn validate_sender_queue_limit(
             session.did_hash
         );
         return Err(MediatorError::problem(
-            61,
+            error_codes::SENDER_QUEUE_FULL,
             &session.session_id,
             msg_id.map(str::to_string),
             ProblemReportSorter::Error,
@@ -181,7 +182,7 @@ pub(crate) fn validate_recipient_queue_limit(
             next_did_hash
         );
         return Err(MediatorError::problem(
-            62,
+            error_codes::RECIPIENT_QUEUE_FULL,
             &session.session_id,
             msg_id.map(str::to_string),
             ProblemReportSorter::Error,

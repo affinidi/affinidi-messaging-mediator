@@ -1,5 +1,6 @@
 use crate::common::authz::{self, Capability};
 use crate::common::storage_timeout::with_storage_timeout;
+use crate::error_codes;
 use crate::messages::queue_limits::{
     validate_peer_queue_limit, validate_recipient_queue_limit, validate_sender_queue_limit,
 };
@@ -72,7 +73,7 @@ fn parse_delay_milli(value: Option<&serde_json::Value>, limit_ms: i64) -> Result
 /// and not queued either.
 fn recipient_not_live(session: &Session, msg_id: &str) -> MediatorError {
     MediatorError::problem(
-        99,
+        error_codes::DELIVERY_NOT_LIVE,
         &session.session_id,
         Some(msg_id.to_string()),
         ProblemReportSorter::Warning,
@@ -164,7 +165,7 @@ async fn rewrap_for_relay(
     .map(|(packed, _)| packed)
     .map_err(|e| {
         MediatorError::problem_with_log(
-            47,
+            error_codes::MESSAGE_PACK_ERROR,
             &session.session_id,
             None,
             ProblemReportSorter::Error,
@@ -206,7 +207,7 @@ fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorEr
         Ok(body) => match body.next {
             Some(next_str) => Ok(next_str),
             None => Err(MediatorError::problem(
-                56,
+                error_codes::FORWARD_MISSING_NEXT,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Warning,
@@ -218,7 +219,7 @@ fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorEr
             )),
         },
         Err(e) => Err(MediatorError::problem_with_log(
-            57,
+            error_codes::FORWARD_PARSE_ERROR,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Warning,
@@ -246,7 +247,7 @@ fn decode_first_attachment(
         Some(a) => a,
         None => {
             return Err(MediatorError::problem(
-                59,
+                error_codes::FORWARD_MISSING_ATTACHMENTS,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Warning,
@@ -264,7 +265,7 @@ fn decode_first_attachment(
                 Ok(data) => data,
                 Err(e) => {
                     return Err(MediatorError::problem_with_log(
-                        68,
+                        error_codes::ATTACHMENT_DECODE_ERROR,
                         &session.session_id,
                         Some(msg.id.to_string()),
                         ProblemReportSorter::Warning,
@@ -279,7 +280,7 @@ fn decode_first_attachment(
             },
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    68,
+                    error_codes::ATTACHMENT_DECODE_ERROR,
                     &session.session_id,
                     Some(msg.id.to_string()),
                     ProblemReportSorter::Warning,
@@ -305,7 +306,7 @@ fn decode_first_attachment(
             // path. Tracked as future work in PR #286's
             // follow-up section.
             return Err(MediatorError::problem(
-                66,
+                error_codes::FEATURE_NOT_IMPLEMENTED,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -320,7 +321,7 @@ fn decode_first_attachment(
                 Ok(data) => data,
                 Err(e) => {
                     return Err(MediatorError::problem_with_log(
-                        67,
+                        error_codes::INVALID_ATTACHMENT,
                         &session.session_id,
                         Some(msg.id.to_string()),
                         ProblemReportSorter::Warning,
@@ -336,7 +337,7 @@ fn decode_first_attachment(
         }
     } else if attachment.data.links.is_some() {
         return Err(MediatorError::problem(
-            66,
+            error_codes::FEATURE_NOT_IMPLEMENTED,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -348,7 +349,7 @@ fn decode_first_attachment(
         ));
     } else {
         return Err(MediatorError::problem(
-            67,
+            error_codes::INVALID_ATTACHMENT,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Warning,
@@ -391,7 +392,7 @@ async fn deliver_forward(
         Ok(envelope) => envelope,
         Err(e) => {
             return Err(MediatorError::problem_with_log(
-                37,
+                error_codes::MESSAGE_ENVELOPE_READ,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -445,7 +446,7 @@ async fn deliver_forward(
             .await
         {
             return Err(MediatorError::problem_with_log(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -476,7 +477,7 @@ async fn deliver_forward(
                 metrics::counter!(crate::common::metrics::names::FORWARD_LOOP_DETECTED_TOTAL)
                     .increment(1);
                 return Err(MediatorError::problem_with_log(
-                    94,
+                    error_codes::FORWARD_LOOP_DETECTED,
                     &session.session_id,
                     Some(msg.id.to_string()),
                     ProblemReportSorter::Error,
@@ -535,7 +536,7 @@ async fn deliver_forward(
                 .await
                 .map_err(|e| {
                     MediatorError::problem_with_log(
-                        90,
+                        error_codes::FORWARD_ENQUEUE_ERROR,
                         &session.session_id,
                         Some(msg.id.to_string()),
                         ProblemReportSorter::Error,
@@ -647,7 +648,7 @@ fn unroutable(session: &Session, msg: &Message, reason: &str, retryable: bool) -
             "forward refused: the next hop's mediator could not be resolved"
         );
         MediatorError::problem(
-            74,
+            error_codes::DID_RESOLVE_ERROR,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -741,7 +742,7 @@ async fn check_remote_next_hop(
                 return e;
             }
             MediatorError::problem_with_log(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -790,7 +791,7 @@ async fn resolve_next_account(
             "next hop has no account on this mediator",
         )),
         Err(e) => Err(MediatorError::problem_with_log(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -832,7 +833,7 @@ async fn resolve_forward_sender(
 ) -> Result<ForwardSender, MediatorError> {
     let sender = crate::messages::authenticated_sender(msg, metadata).map_err(|reason| {
         MediatorError::problem_with_log(
-            96,
+            error_codes::SENDER_MISMATCH,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -861,7 +862,7 @@ async fn resolve_forward_sender(
             ),
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     &session.session_id,
                     Some(msg.id.to_string()),
                     ProblemReportSorter::Error,
@@ -878,7 +879,7 @@ async fn resolve_forward_sender(
 
         if authz::require_capability(&from_acls, Capability::SendForwarded).is_err() {
             return Err(MediatorError::problem(
-                60,
+                error_codes::FORWARD_SENDER_DENIED,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -896,7 +897,7 @@ async fn resolve_forward_sender(
         })
     } else if authz::require_capability(&session.acls, Capability::SendForwarded).is_err() {
         Err(MediatorError::problem(
-            60,
+            error_codes::FORWARD_SENDER_DENIED,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -939,7 +940,7 @@ pub(crate) async fn process(
                     let error = generate_error_response(state, session, &msg.id, ProblemReport::new(
                         ProblemReportSorter::Warning,
                         ProblemReportScope::Message,
-                        "message.header.ephemera.invalid".into(),
+                        "message.header.ephemeral.invalid".into(),
                         "Ephemeral header isn't a JSON bool value. Defaults to false and still sends message".into(),
                         vec![],
                         None,
@@ -960,7 +961,7 @@ pub(crate) async fn process(
             attachments.to_owned()
         } else {
             return Err(MediatorError::problem(
-                59,
+                error_codes::FORWARD_MISSING_ATTACHMENTS,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Warning,
@@ -977,7 +978,7 @@ pub(crate) async fn process(
         // Checked before the queue gates, which charge per attachment.
         if attachments.len() != 1 {
             return Err(MediatorError::problem_with_log(
-                63,
+                error_codes::TOO_MANY_ATTACHMENTS,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Warning,
@@ -1042,7 +1043,7 @@ pub(crate) async fn process(
                 state.limits().forward_task_queue
             );
             return Err(MediatorError::problem(
-                64,
+                error_codes::FORWARD_QUEUE_FULL,
                 &session.session_id,
                 Some(msg.id.to_string()),
                 ProblemReportSorter::Error,
@@ -1071,7 +1072,7 @@ pub(crate) async fn process(
                     msg.extra.get("delay_milli")
                 );
                 MediatorError::problem_with_log(
-                    65,
+                    error_codes::FORWARD_INVALID_DELAY,
                     &session.session_id,
                     Some(msg.id.to_string()),
                     ProblemReportSorter::Warning,

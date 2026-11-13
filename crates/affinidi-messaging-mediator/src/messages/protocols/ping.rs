@@ -1,3 +1,4 @@
+use crate::error_codes;
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
@@ -47,7 +48,7 @@ pub(crate) fn process(
         && expires <= now
     {
         return Err(MediatorError::problem_with_log(
-            31,
+            error_codes::MESSAGE_EXPIRED,
             &session.session_id,
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -81,7 +82,7 @@ pub(crate) fn process(
             from.to_owned()
         } else {
             return Err(MediatorError::problem(
-                50,
+                error_codes::ANON_MESSAGE_ERROR,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Warning,

@@ -910,7 +910,7 @@ pub async fn serve_internal(
     if shared_state.config.limits.mux.enabled {
         if !shared_state.database.supports_mux() {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "[limits.mux] enabled = \"true\" but the configured storage backend does not \
                  implement DID multiplexing grants"
@@ -921,7 +921,7 @@ pub async fn serve_internal(
         // mux connection would carry nothing.
         if shared_state.streaming_task.is_none() {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "[limits.mux] enabled = \"true\" but live streaming is disabled; DID \
                  multiplexing needs it"
@@ -963,7 +963,7 @@ pub async fn serve_internal(
         // lookup, so refuse rather than serve a protocol we cannot route.
         if !shared_state.database.supports_v1_routing_keys() {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "[didcomm_v1] is enabled but the configured storage backend does not implement \
                  the v1 routing-key index; DIDComm v1 forwards could not be routed"

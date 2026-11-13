@@ -2,6 +2,7 @@ use super::super::message_inbound::InboundMessage;
 use super::AuthenticationChallenge;
 use super::helpers::{_create_access_token, _create_refresh_token, create_random_string};
 use crate::didcomm_compat::MetaEnvelope;
+use crate::error_codes;
 use crate::{
     SharedData,
     common::session::{Session, SessionState},
@@ -31,7 +32,7 @@ pub async fn authentication_response(
     async move {
         let s = serde_json::to_string(&body).map_err(|e| {
             MediatorError::problem_with_log(
-                37,
+                error_codes::PARSE_ERROR,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -48,7 +49,7 @@ pub async fn authentication_response(
             Ok(envelope) => envelope,
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    28,
+                    error_codes::AUTH_RESPONSE_PARSE,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -68,7 +69,7 @@ pub async fn authentication_response(
             debug!("Auth message verified: signed and encrypted")
         } else {
             return Err(MediatorError::problem_with_log(
-                86,
+                error_codes::AUTH_NOT_SIGNED_OR_ENCRYPTED,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -93,7 +94,7 @@ pub async fn authentication_response(
         // path.
         let Some(from_did) = envelope.from_did.clone() else {
             return Err(MediatorError::problem(
-                29,
+                error_codes::AUTH_INVALID_DID,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -114,7 +115,7 @@ pub async fn authentication_response(
             if msg_from != envelope.from_did.as_ref().unwrap_or(&String::new()) {
                 // Inner and outer envelope don't match
                 return Err(MediatorError::problem(
-                    85,
+                    error_codes::MESSAGE_FROM_INCORRECT,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -128,7 +129,7 @@ pub async fn authentication_response(
             }
         } else {
             return Err(MediatorError::problem(
-                29,
+                error_codes::AUTH_INVALID_DID,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -144,7 +145,7 @@ pub async fn authentication_response(
         // Only accepts AffinidiAuthenticate messages
         match msg.typ.as_str().parse::<MessageType>().map_err(|err| {
             MediatorError::problem_with_log(
-                30,
+                error_codes::MESSAGE_TYPE_INCORRECT,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -159,7 +160,7 @@ pub async fn authentication_response(
             MessageType::AffinidiAuthenticate => (),
             _ => {
                 return Err(MediatorError::problem_with_log(
-                    30,
+                    error_codes::MESSAGE_TYPE_INCORRECT,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -179,7 +180,7 @@ pub async fn authentication_response(
         if let Some(expires) = msg.expires_time {
             if expires <= now {
                 return Err(MediatorError::problem_with_log(
-                    31,
+                    error_codes::MESSAGE_EXPIRED,
                     "",
                     None,
                     ProblemReportSorter::Error,
@@ -195,7 +196,7 @@ pub async fn authentication_response(
         } else {
             // Authentication responses must have an expires_time header
             return Err(MediatorError::problem(
-                92,
+                error_codes::EXPIRES_TIME_MISSING,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -211,7 +212,7 @@ pub async fn authentication_response(
         // Turn message body into Challenge response
         let challenge: AuthenticationChallenge = serde_json::from_value(msg.body).map_err(|e| {
             MediatorError::problem_with_log(
-                28,
+                error_codes::AUTH_RESPONSE_PARSE,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -233,7 +234,14 @@ pub async fn authentication_response(
         {
             Ok(session) => session.into(),
             // The caller has no session yet: the cause stays in the log.
-            Err(e) => return Err(MediatorError::storage_error_opaque(14, "", e).into()),
+            Err(e) => {
+                return Err(MediatorError::storage_error_opaque(
+                    error_codes::DB_OPERATION_ERROR,
+                    "",
+                    e,
+                )
+                .into());
+            }
         };
 
         // check that the DID matches from what was given for the initial challenge request to what was used for the message response
@@ -244,7 +252,7 @@ pub async fn authentication_response(
             )
         {
             return Err(MediatorError::problem_with_log(
-                33,
+                error_codes::AUTH_SESSION_MISMATCH,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -269,7 +277,7 @@ pub async fn authentication_response(
                 .ct_eq(session.challenge.as_bytes()),
         ) {
             return Err(MediatorError::problem(
-                34,
+                error_codes::AUTH_SESSION_INVALID,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -287,7 +295,7 @@ pub async fn authentication_response(
             debug!("Session state valid: ChallengeSent");
         } else {
             return Err(MediatorError::problem(
-                34,
+                error_codes::AUTH_SESSION_INVALID,
                 "",
                 None,
                 ProblemReportSorter::Error,
@@ -366,7 +374,9 @@ pub async fn authentication_response(
             )
             .await
             // Tokens are not issued yet: the cause stays in the log.
-            .map_err(|e| MediatorError::storage_error_opaque(14, "", e))?;
+            .map_err(|e| {
+                MediatorError::storage_error_opaque(error_codes::DB_OPERATION_ERROR, "", e)
+            })?;
 
         // A did:scid account's version floor, persisted now its account exists.
         crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;

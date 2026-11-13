@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::{
     errors::MediatorError,
     store::types::{PubSubRecord, StoredMessageRef},
@@ -224,7 +225,7 @@ impl Database {
                 err
             );
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".into(),
                 &err,
                 format!("redis function clean_start_streaming() failed. Reason: {err}"),
@@ -316,7 +317,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         &err,
                         format!("streaming_owners() failed. Reason: {err}"),
@@ -377,7 +378,7 @@ impl Database {
                     err
                 );
                 return Err(MediatorError::DatabaseError(
-                    24,
+                    error_codes::DB_PUBSUB_PUBLISH,
                     "NA".into(),
                     format!(
                         "publish_live_message() for did_hash({did_hash}) failed to serialize message. Reason: {err}"
@@ -410,7 +411,7 @@ impl Database {
                     err
                 );
                 Err(MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!(
@@ -441,7 +442,7 @@ impl Database {
             .map_err(|err| {
                 error!("streaming_release() for did_hash({did_hash}) from ({stream_uuid}) failed: {err}");
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("streaming_release() for did_hash({did_hash}) failed. Reason: {err}"),
@@ -491,7 +492,7 @@ impl Database {
                     "streaming_claim() for did_hash({did_hash}) on ({stream_uuid}) failed: {err}"
                 );
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("streaming_claim() for did_hash({did_hash}) failed. Reason: {err}"),
@@ -532,7 +533,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("streaming_heartbeat() failed. Reason: {err}"),
@@ -562,7 +563,7 @@ impl Database {
         }
         let flags: Vec<bool> = pipe.query_async(&mut conn).await.map_err(|err| {
             MediatorError::database_from_redis(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".into(),
                 &err,
                 format!("streaming_dead_instances() failed. Reason: {err}"),
@@ -594,7 +595,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &err,
                     format!("streaming_evict() for did_hash({did_hash}) failed. Reason: {err}"),
@@ -622,7 +623,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         &err,
                         format!("streaming_mux_owned() failed. Reason: {err}"),

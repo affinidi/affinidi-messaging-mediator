@@ -1,4 +1,5 @@
 //! Database routines to add/remove/list admin accounts
+use crate::error_codes;
 use crate::errors::{MediatorError, StorageCap};
 use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 use tracing::{Instrument, Level, debug, info, span, warn};
@@ -63,7 +64,7 @@ impl Database {
             }
             Err(err) => {
                 return Err(MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to set up admin account for ({admin_did_hash}). Reason: {err}"),
@@ -108,7 +109,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to check admin account for ({did_hash}). Reason: {err}"),
@@ -154,7 +155,7 @@ impl Database {
             debug!("Adding Admin accounts to the mediator");
             if accounts.len() > 100 {
                 return Err(MediatorError::DatabaseError(
-                    15,
+                    error_codes::ADMIN_ACCOUNTS_ADD_LIMIT,
                     "NA".to_string(),
                     "Number of admin accounts being added exceeds 100".to_string(),
                 ));
@@ -188,7 +189,7 @@ impl Database {
             debug!("Removing Admin accounts from the mediator");
             if accounts.len() > 100 {
                 return Err(MediatorError::DatabaseError(
-                    16,
+                    error_codes::ADMIN_ACCOUNTS_STRIP_LIMIT,
                     "NA".to_string(),
                     "Number of admin accounts being removed exceeds 100".to_string(),
                 ));
@@ -218,7 +219,7 @@ impl Database {
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to remove admin account. Reason: {err}"),

@@ -15,6 +15,7 @@
 //! `parameter_store` module, shared with the `mediator-setup` wizard that
 //! publishes to it, so the string the wizard writes is the string read here.
 
+use crate::error_codes;
 use affinidi_did_common::{Document, DocumentExt, service::Endpoint};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_mediator_common::errors::MediatorError;
@@ -60,7 +61,7 @@ fn require_aws_config<'a>(
 ) -> Result<&'a SdkConfig, MediatorError> {
     aws_config.as_ref().ok_or_else(|| {
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!("{context} requires AWS but AWS SDK was not initialized"),
         )
@@ -70,7 +71,7 @@ fn require_aws_config<'a>(
 fn parse_scheme<'a>(input: &'a str, field_name: &str) -> Result<(&'a str, &'a str), MediatorError> {
     input.split_once("://").ok_or_else(|| {
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!("Invalid `{field_name}` format: expected scheme://path, got '{input}'"),
         )
@@ -108,7 +109,7 @@ pub(crate) async fn read_did_config(
             {
                 let _ = path;
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "aws_parameter_store:// for {field_name} requires the 'aws' feature. Rebuild with: cargo build --features aws"
@@ -118,7 +119,7 @@ pub(crate) async fn read_did_config(
         }
         _ => {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!(
                     "Invalid {field_name} format! Expected did:// or aws_parameter_store:// (got '{did_config}')"
@@ -138,7 +139,7 @@ pub(crate) fn get_hostname(host_name: &str) -> Result<String, MediatorError> {
         Ok(hostname::get()
             .map_err(|e| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Couldn't get hostname. Reason: {e}"),
                 )
@@ -146,7 +147,7 @@ pub(crate) fn get_hostname(host_name: &str) -> Result<String, MediatorError> {
             .into_string()
             .map_err(|e| {
                 MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Couldn't get hostname. Reason: {e:?}"),
                 )
@@ -155,7 +156,7 @@ pub(crate) fn get_hostname(host_name: &str) -> Result<String, MediatorError> {
         Ok(host_name.split_at(9).1.to_string())
     } else {
         Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!(
                 "streaming.uuid = {host_name:?} is not valid: expected \"hostname://\" or \
@@ -175,8 +176,9 @@ pub(crate) async fn aws_parameter_store(
     target: &str,
     aws_config: &SdkConfig,
 ) -> Result<String, MediatorError> {
-    let parsed = parse_parameter_store_target(target)
-        .map_err(|e| MediatorError::ConfigError(12, "NA".into(), e.to_string()))?;
+    let parsed = parse_parameter_store_target(target).map_err(|e| {
+        MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), e.to_string())
+    })?;
     let parameter_name = parsed.name;
 
     // Region in the target wins, so a parameter can live somewhere other
@@ -199,7 +201,7 @@ pub(crate) async fn aws_parameter_store(
         .map_err(|e| {
             error!("Could not get ({parameter_name:?}) parameter. {e:?}");
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Could not get ({parameter_name:?}) parameter. {e:?}"),
             )
@@ -207,7 +209,7 @@ pub(crate) async fn aws_parameter_store(
     let parameter = response.parameter.ok_or_else(|| {
         error!("No parameter string found in response");
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             "No parameter string found in response".into(),
         )
@@ -216,14 +218,14 @@ pub(crate) async fn aws_parameter_store(
     if let Some(_type) = parameter.r#type {
         if _type != ParameterType::String {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 "Expected String parameter type".into(),
             ));
         }
     } else {
         return Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             "Unknown parameter type".into(),
         ));
@@ -235,7 +237,7 @@ pub(crate) async fn aws_parameter_store(
             parameter.name
         );
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!(
                 "Parameter ({:?}) found, but no parameter value found in response",
@@ -252,8 +254,9 @@ pub(crate) async fn aws_parameter_store(
 /// using the shared `SdkConfig`.
 #[cfg(feature = "aws")]
 pub(crate) async fn aws_s3(target: &str, aws_config: &SdkConfig) -> Result<String, MediatorError> {
-    let parsed = parse_s3_target(target)
-        .map_err(|e| MediatorError::ConfigError(12, "NA".into(), e.to_string()))?;
+    let parsed = parse_s3_target(target).map_err(|e| {
+        MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), e.to_string())
+    })?;
 
     // Region in the target wins, so the object can live somewhere other than
     // the region the rest of the SDK defaulted to.
@@ -279,7 +282,7 @@ pub(crate) async fn aws_s3(target: &str, aws_config: &SdkConfig) -> Result<Strin
                 parsed.bucket, parsed.key
             );
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!(
                     "Could not get s3 object (bucket={:?} key={:?}). {e:?}",
@@ -291,7 +294,7 @@ pub(crate) async fn aws_s3(target: &str, aws_config: &SdkConfig) -> Result<Strin
     let bytes = response.body.collect().await.map_err(|e| {
         error!("Could not read s3 object body. {e:?}");
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!("Could not read s3 object body. {e:?}"),
         )
@@ -300,7 +303,7 @@ pub(crate) async fn aws_s3(target: &str, aws_config: &SdkConfig) -> Result<Strin
     String::from_utf8(bytes.to_vec()).map_err(|e| {
         error!("s3 object is not valid UTF-8. {e}");
         MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             format!("s3 object is not valid UTF-8. {e}"),
         )
@@ -338,7 +341,7 @@ pub(crate) async fn read_document(
             {
                 let _ = path;
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     "aws_parameter_store:// requires the 'aws' feature. Rebuild with: cargo build --features aws".into(),
                 ));
@@ -354,7 +357,7 @@ pub(crate) async fn read_document(
             {
                 let _ = path;
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     "s3:// requires the 'aws' feature. Rebuild with: cargo build --features aws"
                         .into(),
@@ -363,7 +366,7 @@ pub(crate) async fn read_document(
         }
         _ => {
             return Err(MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!(
                     "server.did_web_self_hosted = {document_path:?} is not valid: expected \
@@ -497,7 +500,7 @@ pub(crate) async fn assert_operating_secrets_cover_key_agreement(
          Loaded {loaded} secret(s); DID document keyAgreement id(s): {ka_kids:?}"
     );
     Err(MediatorError::ConfigError(
-        12,
+        error_codes::CONFIG_ERROR,
         "NA".into(),
         format!(
             "Mediator cannot decrypt inbound DIDComm: {loaded} operating secret(s) loaded, but \

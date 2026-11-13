@@ -1284,7 +1284,7 @@ mod tests {
 
     fn refusal() -> MediatorError {
         MediatorError::problem(
-            73,
+            crate::error_codes::DELIVERY_REFUSED,
             "s",
             None,
             ProblemReportSorter::Error,
@@ -1319,7 +1319,11 @@ mod tests {
     fn an_internal_failure_is_reported_without_detail() {
         let v = refused_payload(
             b"x",
-            &MediatorError::InternalError(1, "s".into(), "redis down at 10.0.0.1".into()),
+            &MediatorError::InternalError(
+                crate::error_codes::DB_URL_INVALID,
+                "s".into(),
+                "redis down at 10.0.0.1".into(),
+            ),
         );
         assert_eq!(v["code"], "internalError");
         assert!(v.get("reason").is_none());
