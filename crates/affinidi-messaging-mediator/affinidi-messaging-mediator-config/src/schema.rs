@@ -21,6 +21,9 @@ use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw};
 /// replaced.
 #[derive(Serialize, Deserialize)]
 pub struct DatabaseConfigRaw {
+    /// A stored-function library to load in place of the one built into the
+    /// mediator. Absent or empty: the built-in library.
+    #[serde(default)]
     pub functions_file: String,
     pub database_url: String,
     pub database_timeout: String,
@@ -28,6 +31,14 @@ pub struct DatabaseConfigRaw {
     /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
     #[serde(default)]
     pub cluster_mode: String,
+    /// Consecutive failed database commands that open the circuit breaker.
+    /// Absent or unparseable: 5.
+    #[serde(default)]
+    pub circuit_breaker_threshold: String,
+    /// Seconds an open circuit breaker waits before letting a probe command
+    /// through. Absent or unparseable: 10.
+    #[serde(default)]
+    pub circuit_breaker_recovery_secs: String,
 }
 
 impl std::fmt::Debug for DatabaseConfigRaw {
@@ -38,6 +49,11 @@ impl std::fmt::Debug for DatabaseConfigRaw {
             .field("database_timeout", &self.database_timeout)
             .field("scripts_path", &self.scripts_path)
             .field("cluster_mode", &self.cluster_mode)
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field(
+                "circuit_breaker_recovery_secs",
+                &self.circuit_breaker_recovery_secs,
+            )
             .finish()
     }
 }

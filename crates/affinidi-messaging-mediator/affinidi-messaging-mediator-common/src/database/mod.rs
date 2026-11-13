@@ -40,11 +40,20 @@ use tracing::{Level, event, info, warn};
 
 /// The mediator's main Redis connection, chosen by `cluster_mode`.
 ///
-/// Both variants multiplex concurrent commands and reconnect on their own,
-/// and both are cheap to clone.
+/// Both kinds multiplex concurrent commands and reconnect on their own, and
+/// both are cheap to clone. A connection handed out by the store carries its
+/// circuit breaker, and every command sent over it reports its outcome there
+/// (see [`with_breaker`](Self::with_breaker)).
 #[cfg(feature = "redis-backend")]
 #[derive(Clone)]
-pub enum RedisConnection {
+pub struct RedisConnection {
+    link: RedisLink,
+    breaker: Option<std::sync::Arc<crate::circuit_breaker::CircuitBreaker>>,
+}
+
+#[cfg(feature = "redis-backend")]
+#[derive(Clone)]
+enum RedisLink {
     /// Single server (cluster mode disabled).
     Single(ConnectionManager),
     /// Cluster-mode server; routes each command to its slot's node.
@@ -52,11 +61,71 @@ pub enum RedisConnection {
 }
 
 #[cfg(feature = "redis-backend")]
+impl RedisConnection {
+    fn single(conn: ConnectionManager) -> Self {
+        Self {
+            link: RedisLink::Single(conn),
+            breaker: None,
+        }
+    }
+
+    fn cluster(conn: ClusterConnection) -> Self {
+        Self {
+            link: RedisLink::Cluster(conn),
+            breaker: None,
+        }
+    }
+
+    /// This connection, reporting the outcome of every command it sends to
+    /// `breaker`: a connection failure or timeout as a failure, anything else
+    /// (a reply, including an error reply such as a refused write) as a
+    /// success, since the server answered.
+    pub fn with_breaker(
+        mut self,
+        breaker: std::sync::Arc<crate::circuit_breaker::CircuitBreaker>,
+    ) -> Self {
+        self.breaker = Some(breaker);
+        self
+    }
+}
+
+/// Whether `err` says the server could not be reached or did not answer in
+/// time, as opposed to an answer that was an error.
+#[cfg(feature = "redis-backend")]
+pub(crate) fn is_unavailable(err: &redis::RedisError) -> bool {
+    err.is_io_error()
+        || err.is_timeout()
+        || err.is_connection_dropped()
+        || err.is_connection_refusal()
+        || err.is_unrecoverable_error()
+}
+
+#[cfg(feature = "redis-backend")]
+fn record_outcome<T>(
+    breaker: &crate::circuit_breaker::CircuitBreaker,
+    result: &redis::RedisResult<T>,
+) {
+    match result {
+        Err(err) if is_unavailable(err) => breaker.record_failure(),
+        _ => breaker.record_success(),
+    }
+}
+
+#[cfg(feature = "redis-backend")]
 impl ConnectionLike for RedisConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        match self {
-            Self::Single(conn) => conn.req_packed_command(cmd),
-            Self::Cluster(conn) => conn.req_packed_command(cmd),
+        let breaker = self.breaker.clone();
+        let sent = match &mut self.link {
+            RedisLink::Single(conn) => conn.req_packed_command(cmd),
+            RedisLink::Cluster(conn) => conn.req_packed_command(cmd),
+        };
+        match breaker {
+            None => sent,
+            Some(breaker) => Box::pin(async move {
+                let result = sent.await;
+                record_outcome(&breaker, &result);
+                result
+            }),
         }
     }
 
@@ -66,18 +135,86 @@ impl ConnectionLike for RedisConnection {
         offset: usize,
         count: usize,
     ) -> RedisFuture<'a, Vec<Value>> {
-        match self {
-            Self::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
-            Self::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
+        let breaker = self.breaker.clone();
+        let sent = match &mut self.link {
+            RedisLink::Single(conn) => conn.req_packed_commands(pipeline, offset, count),
+            RedisLink::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
+        };
+        match breaker {
+            None => sent,
+            Some(breaker) => Box::pin(async move {
+                let result = sent.await;
+                record_outcome(&breaker, &result);
+                result
+            }),
         }
     }
 
     fn get_db(&self) -> i64 {
-        match self {
-            Self::Single(conn) => conn.get_db(),
-            Self::Cluster(conn) => conn.get_db(),
+        match &self.link {
+            RedisLink::Single(conn) => conn.get_db(),
+            RedisLink::Cluster(conn) => conn.get_db(),
         }
     }
+}
+
+/// How many times start-up tries to reach the database, 10 seconds apart,
+/// before giving up (about five minutes).
+#[cfg(feature = "redis-backend")]
+const CONNECT_ATTEMPTS: u32 = 30;
+
+/// Whether a start-up connection error will not go away by retrying: the
+/// server refused the credentials, or the client configuration is wrong.
+#[cfg(feature = "redis-backend")]
+fn is_fatal_connect_error(err: &redis::RedisError) -> bool {
+    if matches!(
+        err.kind(),
+        redis::ErrorKind::AuthenticationFailed | redis::ErrorKind::InvalidClientConfig
+    ) {
+        return true;
+    }
+    let text = err.to_string();
+    [
+        "WRONGPASS",
+        "NOAUTH",
+        "NOPERM",
+        "invalid password",
+        "invalid username",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// After a failed start-up connection `attempt`: fail at once on an error
+/// retrying cannot fix, fail after [`CONNECT_ATTEMPTS`], else wait 10 seconds
+/// and let the caller try again.
+#[cfg(feature = "redis-backend")]
+async fn retry_or_fail(err: &redis::RedisError, attempt: u32) -> Result<(), MediatorError> {
+    if is_fatal_connect_error(err) {
+        event!(Level::ERROR, "Database refused the connection: {}", err);
+        return Err(storage_config_error(format!(
+            "The database refused the connection ({err}); check database_url's credentials"
+        )));
+    }
+    if attempt >= CONNECT_ATTEMPTS {
+        event!(
+            Level::ERROR,
+            "Couldn't reach the database after {attempt} attempts: {}",
+            err
+        );
+        return Err(MediatorError::DatabaseError(
+            14,
+            "NA".into(),
+            format!("Couldn't reach the database after {attempt} attempts: {err}"),
+        ));
+    }
+    event!(Level::WARN, "Error connecting to database: {}", err);
+    event!(
+        Level::WARN,
+        "Retrying database connection in 10 seconds (attempt {attempt} of {CONNECT_ATTEMPTS})"
+    );
+    sleep(Duration::from_secs(10)).await;
+    Ok(())
 }
 
 /// Low-level Redis connection handler used by the mediator.
@@ -150,22 +287,22 @@ impl DatabaseHandler {
         // Single-server connection first, even in cluster mode: the startup
         // checks need one node's answer, and a cluster client cannot connect
         // to a non-cluster server at all.
+        let mut attempt = 0;
         let single = loop {
+            attempt += 1;
             match client
                 .get_connection_manager_with_config(manager_config.clone())
                 .await
             {
                 Ok(conn) => break conn,
-                Err(err) => {
-                    event!(Level::WARN, "Error connecting to database: {}", err);
-                    event!(Level::WARN, "Retrying database connection in 10 seconds");
-                    sleep(Duration::from_secs(10)).await;
-                }
+                Err(err) => retry_or_fail(&err, attempt).await?,
             }
         };
 
         // Verify connectivity with PING
+        let mut attempt = 0;
         loop {
+            attempt += 1;
             let mut conn = single.clone();
             let pong: Result<String, redis::RedisError> =
                 redis::cmd("PING").query_async(&mut conn).await;
@@ -178,15 +315,7 @@ impl DatabaseHandler {
                     );
                     break;
                 }
-                Err(err) => {
-                    event!(
-                        Level::WARN,
-                        "Can't get connection to database. Reason: {}",
-                        err
-                    );
-                    event!(Level::WARN, "Retrying database connection in 10 seconds");
-                    sleep(Duration::from_secs(10)).await;
-                }
+                Err(err) => retry_or_fail(&err, attempt).await?,
             }
         }
 
@@ -203,9 +332,9 @@ impl DatabaseHandler {
         }
 
         let connection = if config.cluster_mode {
-            RedisConnection::Cluster(Self::connect_cluster(config).await?)
+            RedisConnection::cluster(Self::connect_cluster(config).await?)
         } else {
-            RedisConnection::Single(single)
+            RedisConnection::single(single)
         };
 
         let database = Self {
@@ -310,17 +439,15 @@ impl DatabaseHandler {
                 )
             })?;
 
+        let mut attempt = 0;
         loop {
+            attempt += 1;
             match client.get_async_connection().await {
                 Ok(conn) => {
                     info!("Connected to database in cluster mode");
                     return Ok(conn);
                 }
-                Err(err) => {
-                    event!(Level::WARN, "Error connecting to database cluster: {}", err);
-                    event!(Level::WARN, "Retrying database connection in 10 seconds");
-                    sleep(Duration::from_secs(10)).await;
-                }
+                Err(err) => retry_or_fail(&err, attempt).await?,
             }
         }
     }

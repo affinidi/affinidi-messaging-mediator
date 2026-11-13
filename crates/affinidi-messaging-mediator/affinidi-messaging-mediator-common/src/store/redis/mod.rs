@@ -12,5 +12,6 @@ pub mod database;
 pub mod init;
 pub mod store;
 
+pub use database::handlers::{LibraryLoad, library_version_of};
 pub use init::RedisInitConfig;
 pub use store::RedisStore;

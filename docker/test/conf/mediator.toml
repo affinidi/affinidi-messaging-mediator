@@ -111,8 +111,8 @@ admin_did = "did://did:key:z6MkhnJYiMpUGjvedv1eXZziYsFoi6WYRiidWx6EEwvxy3Ed"
 ### ****************************************************************************************************************************
 [database]
 ### Env: DATABASE_FUNCTIONS_FILE
-### Path to the database functions file
-functions_file = "./conf/atm-functions.lua"
+### Unset: the mediator loads the stored-function library built into it.
+# functions_file = "./conf/atm-functions.lua"
 
 ### Env: DATABASE_URL
 ### URL of the Redis compatible database

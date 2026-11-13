@@ -68,7 +68,7 @@ use sha256::digest;
 ///
 /// Read from the shipped `conf/atm-functions.lua` at compile time, so it can
 /// never drift from the source tree the binary came from.
-const BUILT_AGAINST: &str = include_str!("../../conf/atm-functions.lua");
+pub(crate) const BUILT_AGAINST: &str = include_str!("../../conf/atm-functions.lua");
 
 /// Outcome of comparing the deployment's library against the built-in one.
 ///
@@ -206,6 +206,17 @@ pub fn check_and_report(path: &str) -> LuaIntegrity {
         }
     }
 
+    outcome
+}
+
+/// Publish the outcome for the built-in library, which is loaded when no
+/// `functions_file` is set, or in place of one older than this build's: it
+/// matches by construction.
+pub fn report_built_in() -> LuaIntegrity {
+    let outcome = LuaIntegrity::Match;
+    metrics::gauge!(crate::common::metrics::names::REDIS_FUNCTIONS_MATCH_BUILD)
+        .set(outcome.gauge_value());
+    tracing::info!("loading the stored-function library built into this mediator");
     outcome
 }
 

@@ -1,5 +1,22 @@
 #!lua name=atm
 
+-- The version of this library: raise it with every change to this file. The
+-- mediator embeds this file and loads it at start only over an older (or
+-- unversioned) library; a server already holding a newer one keeps it, so an
+-- older instance restarting during a rolling deploy cannot take functions
+-- away from newer ones. The mediator reads the number from this line.
+local LIBRARY_VERSION = 2
+
+-- How long after its expiry a message record's keys are kept, at most, should
+-- the expiry sweep never reach them (see store_message).
+local RECORD_EXPIRY_GRACE_SECS = 86400
+
+-- library_version
+-- returns LIBRARY_VERSION
+local function library_version(keys, args)
+    return LIBRARY_VERSION
+end
+
 -- Message records
 --
 -- A message id is the hash of the body alone (clients derive it from the
@@ -93,6 +110,41 @@ local function store_message(keys, args)
         return redis.status_reply('STORED')
     end
     local record = keys[1] .. ':' .. args[4]
+    local has_sender = #args >= 5 and args[5] ~= nil and args[5] ~= "ANONYMOUS"
+
+    -- The queue entries first. A script is not rolled back when a command in
+    -- it fails, and XADD is the write here that can be refused, so nothing
+    -- else is written until both entries are in: a refused store leaves no
+    -- counter, body or expiry entry behind. The id is '*': Redis never gives
+    -- an id below the stream's newest, so a clock that steps back (a failover
+    -- to a replica that is behind, an NTP step) cannot refuse the store.
+    local RQ
+    if queue_maxlen > 0 then
+        RQ = redis.pcall('XADD', 'RECEIVE_Q:' .. args[4], 'MAXLEN', '~', queue_maxlen, '*',
+            'MSG_ID', keys[1], 'BYTES', bytes, 'FROM', args[5])
+    else
+        RQ = redis.pcall('XADD', 'RECEIVE_Q:' .. args[4], '*',
+            'MSG_ID', keys[1], 'BYTES', bytes, 'FROM', args[5])
+    end
+    if type(RQ) == 'table' and RQ.err then
+        return RQ
+    end
+
+    local SQ = nil
+    if has_sender then
+        if queue_maxlen > 0 then
+            SQ = redis.pcall('XADD', 'SEND_Q:' .. args[5], 'MAXLEN', '~', queue_maxlen, '*',
+                'MSG_ID', keys[1], 'BYTES', bytes, 'TO', args[4])
+        else
+            SQ = redis.pcall('XADD', 'SEND_Q:' .. args[5], '*',
+                'MSG_ID', keys[1], 'BYTES', bytes, 'TO', args[4])
+        end
+        if type(SQ) == 'table' and SQ.err then
+            -- Take the inbox entry back out, so the refusal leaves nothing.
+            redis.call('XDEL', 'RECEIVE_Q:' .. args[4], RQ)
+            return SQ
+        end
+    end
 
     -- Store message
     redis.call('SET', 'MSG:' .. record, args[1])
@@ -109,32 +161,13 @@ local function store_message(keys, args)
     redis.call('HINCRBY', 'DID:' .. args[4], 'RECEIVE_QUEUE_BYTES', bytes)
     redis.call('HINCRBY', 'DID:' .. args[4], 'RECEIVE_QUEUE_COUNT', 1)
 
-    -- XADD with optional MAXLEN to bound per-DID stream growth
-    local RQ
-    if queue_maxlen > 0 then
-        RQ = redis.call('XADD', 'RECEIVE_Q:' .. args[4], 'MAXLEN', '~', queue_maxlen, time .. '-*',
-            'MSG_ID', keys[1], 'BYTES', bytes, 'FROM', args[5])
-    else
-        RQ = redis.call('XADD', 'RECEIVE_Q:' .. args[4], time .. '-*',
-            'MSG_ID', keys[1], 'BYTES', bytes, 'FROM', args[5])
-    end
-
     -- Update the sender records
-    local SQ = nil
-    if #args >= 5 and args[5] ~= nil and args[5] ~= "ANONYMOUS" then
-        -- Update the sender records
+    if has_sender then
         redis.call('HINCRBY', 'DID:' .. args[5], 'SEND_QUEUE_BYTES', bytes)
         redis.call('HINCRBY', 'DID:' .. args[5], 'SEND_QUEUE_COUNT', 1)
         -- Per-relationship depth: one hash per sender, one field per recipient.
         -- The per-DID total above cannot tell fan-out from flooding; this can.
         redis.call('HINCRBY', 'PEER_Q:' .. args[5], args[4], 1)
-        if queue_maxlen > 0 then
-            SQ = redis.call('XADD', 'SEND_Q:' .. args[5], 'MAXLEN', '~', queue_maxlen, time .. '-*',
-                'MSG_ID', keys[1], 'BYTES', bytes, 'TO', args[4])
-        else
-            SQ = redis.call('XADD', 'SEND_Q:' .. args[5], time .. '-*',
-                'MSG_ID', keys[1], 'BYTES', bytes, 'TO', args[4])
-        end
     end
 
     -- Update message MetaData
@@ -144,6 +177,18 @@ local function store_message(keys, args)
         redis.call('HSET', 'MSG:META:' .. record, 'FROM', args[5], 'SEND_ID', SQ)
     end
     redis.call('SADD', 'MSG:RCPT:' .. keys[1], args[4])
+
+    -- A backstop, not the expiry: the sweeper removes the record at its
+    -- expiry. Should the record ever miss the sweeper (its index entry lost),
+    -- the body and metadata still go a day later rather than never.
+    -- (Only for an expiry Lua can hold exactly: past 1e11 seconds, year 5138,
+    -- there is nothing to back stop.)
+    local expires = tonumber(args[2]) or 0
+    if expires > 0 and expires < 100000000000 then
+        local at = string.format('%d', expires + RECORD_EXPIRY_GRACE_SECS)
+        redis.call('EXPIREAT', 'MSG:' .. record, at)
+        redis.call('EXPIREAT', 'MSG:META:' .. record, at)
+    end
 
     return redis.status_reply('STORED')
 end
@@ -161,16 +206,23 @@ local function remove_record(id, suffix, meta)
     redis.call('HINCRBY', 'GLOBAL', 'DELETED_BYTES', bytes)
     redis.call('HINCRBY', 'GLOBAL', 'DELETED_COUNT', 1)
 
-    -- Remove the receiver records
-    redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_BYTES', -bytes)
-    redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_COUNT', -1)
+    -- Remove the receiver records. An account's counters are only moved
+    -- while the account exists: HINCRBY on a removed account's hash would
+    -- recreate it as a partial, ghost account.
+    if redis.call('EXISTS', 'DID:' .. meta.TO) == 1 then
+        redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_BYTES', -bytes)
+        redis.call('HINCRBY', 'DID:' .. meta.TO, 'RECEIVE_QUEUE_COUNT', -1)
+    end
     redis.call('XDEL', 'RECEIVE_Q:' .. meta.TO, meta.RECEIVE_ID)
 
-    -- Remove the sender records
+    -- Remove the sender records (a removed sender's messages stay queued for
+    -- their recipients, so its account may well be gone by now)
     local outbox = '0'
     if meta.SEND_ID ~= nil then
-        redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_BYTES', -bytes)
-        redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_COUNT', -1)
+        if redis.call('EXISTS', 'DID:' .. meta.FROM) == 1 then
+            redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_BYTES', -bytes)
+            redis.call('HINCRBY', 'DID:' .. meta.FROM, 'SEND_QUEUE_COUNT', -1)
+        end
         -- Per-relationship depth. HDEL at zero so a sender that has messaged
         -- many peers does not keep a field for each of them forever.
         local peer_left = redis.call('HINCRBY', 'PEER_Q:' .. meta.FROM, meta.TO, -1)
@@ -461,13 +513,10 @@ local function get_status_reply(keys, args)
         response.map.queue_count = r.map['length']
     end
 
-    -- Get live streaming status
-    local r = redis.call("HEXISTS", "GLOBAL_STREAMING", keys[1])
-    if r == 0 then
-        response.map.live_delivery = false
-    else
-        response.map.live_delivery = true
-    end
+    -- Live delivery: a registration with live mode on ('<uuid>:TRUE'). A
+    -- socket that is connected but has not turned live mode on is not live.
+    local owner = redis.call('HGET', 'GLOBAL_STREAMING', keys[1])
+    response.map.live_delivery = (owner and string.match(owner, ':TRUE$') ~= nil) or false
 
     return response
 end
@@ -477,3 +526,4 @@ redis.register_function('delete_message', delete_message)
 redis.register_function('fetch_messages', fetch_messages)
 redis.register_function('clean_start_streaming', clean_start_streaming)
 redis.register_function('get_status_reply', get_status_reply)
+redis.register_function{function_name='library_version', callback=library_version, flags={'no-writes'}}

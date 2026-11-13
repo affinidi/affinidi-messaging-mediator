@@ -162,8 +162,8 @@ impl Database {
                     .unwrap_u8()
                     == 1
             {
-                // Update SEND metrics
-                let _ = self.update_send_stats(message.size as i64).await;
+                // The sent counters move when a handover is recorded, not
+                // on a read (see `MediatorStore::count_sent`).
                 Ok(Some(message))
             } else {
                 // Requesting DID is neither sender nor receiver

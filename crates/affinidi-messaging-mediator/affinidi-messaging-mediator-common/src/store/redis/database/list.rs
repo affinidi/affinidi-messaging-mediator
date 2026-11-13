@@ -38,6 +38,10 @@ impl Database {
             } else {
                 ("-", "+")
             };
+            // The same bounds every backend accepts; anything else is
+            // refused here rather than passed to XRANGE.
+            crate::store::ops::parse_range_bound(start, false)?;
+            crate::store::ops::parse_range_bound(end, true)?;
 
             let db_response: Value = redis::cmd("XRANGE")
                 .arg(&key)

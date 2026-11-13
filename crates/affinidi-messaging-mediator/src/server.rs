@@ -365,39 +365,66 @@ pub async fn serve_internal(
                 error!("Error initializing database: {e}");
                 e
             })?;
-            if let Some(functions_file) = &config.database.functions_file {
-                info!(
-                    "Loading LUA scripts into the database from file: {}",
-                    functions_file
-                );
-                // Before loading, not after: the interesting failure is a file
-                // from another release, which loads perfectly and then does
-                // less than this build expects. Reporting it first means the
-                // warning sits directly above the "Loaded LUA scripts"
-                // success line it qualifies.
-                //
-                // Held for `/readyz` — the supervisor that owns the health
-                // registry does not exist yet at this point.
-                // Cluster mode never loads the library (`load_scripts`
-                // returns early), so a mismatched file there is harmless and
-                // must not mark the mediator degraded.
-                if !config.database.cluster_mode {
-                    lua_integrity_outcome = Some(crate::common::lua_integrity::check_and_report(
-                        functions_file,
-                    ));
+            // The stored-function library: the one compiled into this build,
+            // unless `functions_file` names another. An override older than
+            // the built-in library is a stale copy (the failure this used to
+            // invite: it loads cleanly and does less than this build
+            // expects), so the built-in library is loaded in its place.
+            // `load_library` then keeps a newer library already on the
+            // server, so an older instance restarting in a rolling deploy
+            // cannot replace the functions newer instances run.
+            let built_in = crate::common::lua_integrity::BUILT_AGAINST;
+            let functions_file = config
+                .database
+                .functions_file
+                .as_deref()
+                .filter(|path| !path.trim().is_empty());
+            let (library, origin) = match functions_file {
+                Some(functions_file) => {
+                    let source = std::fs::read_to_string(functions_file).map_err(|err| {
+                        error!("Couldn't read database.functions_file ({functions_file}): {err}");
+                        MediatorError::ConfigError(
+                            error_codes::CONFIG_ERROR,
+                            "NA".into(),
+                            format!(
+                                "Couldn't read database.functions_file ({functions_file}). Reason: {err}"
+                            ),
+                        )
+                    })?;
+                    let theirs = affinidi_messaging_mediator_common::store::redis::library_version_of(&source);
+                    let ours = affinidi_messaging_mediator_common::store::redis::library_version_of(built_in);
+                    if theirs < ours {
+                        error!(
+                            "database.functions_file ({functions_file}) holds stored-function library version {theirs}, older than this build's version {ours}; loading the built-in library instead. Remove functions_file, or point it at this release's conf/atm-functions.lua"
+                        );
+                        None
+                    } else {
+                        // Held for `/readyz` — the supervisor that owns the
+                        // health registry does not exist yet at this point.
+                        // Cluster mode never loads the library, so a
+                        // mismatched file there is harmless and must not mark
+                        // the mediator degraded.
+                        if !config.database.cluster_mode {
+                            lua_integrity_outcome = Some(
+                                crate::common::lua_integrity::check_and_report(functions_file),
+                            );
+                        }
+                        Some((source, functions_file.to_string()))
+                    }
                 }
-                store.load_scripts(functions_file).await.map_err(|e| {
-                    error!("Failed to load LUA scripts: {e}");
-                    e
-                })?;
-            } else {
-                error!("LUA scripts file is required but not specified in the configuration");
-                return Err(MediatorError::ConfigError(
-                    error_codes::CONFIG_ERROR,
-                    "NA".into(),
-                    "LUA scripts file is required but not specified in the configuration".into(),
-                ));
+                None => None,
             }
+            .unwrap_or_else(|| {
+                if !config.database.cluster_mode {
+                    lua_integrity_outcome =
+                        Some(crate::common::lua_integrity::report_built_in());
+                }
+                (built_in.to_string(), "the built-in library".to_string())
+            });
+            store.load_library(&library, &origin).await.map_err(|e| {
+                error!("Failed to load LUA scripts: {e}");
+                e
+            })?;
             let s: Arc<dyn MediatorStore> = Arc::new(store);
             s
         }

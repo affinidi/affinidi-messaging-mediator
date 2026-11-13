@@ -102,7 +102,8 @@ impl Database {
         listed.arg("ADMINS").arg(did_hash);
         let mut role = redis::cmd("HGET");
         role.arg(self.keys().did(did_hash)).arg("ROLE_TYPE");
-        let (exists, role_type): (u32, u32) = self
+        // A DID with no record has no role: not an admin (not an error).
+        let (exists, role_type): (u32, Option<u32>) = self
             .query_pair(&mut con, listed, role)
             .await
             .map_err(|err| {
@@ -114,7 +115,9 @@ impl Database {
                 )
             })?;
 
-        if exists == 1 {
+        if exists == 1
+            && let Some(role_type) = role_type
+        {
             match role_type.into() {
                 AccountType::RootAdmin => Ok(true),
                 AccountType::Admin => Ok(true),
