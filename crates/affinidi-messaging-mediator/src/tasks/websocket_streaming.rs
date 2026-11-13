@@ -326,7 +326,7 @@ pub(crate) struct Redeliveries {
 
 impl Redeliveries {
     /// Whether a drain is running for `did_hash`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "memory-backend"))]
     pub(crate) fn contains(&self, did_hash: &str) -> bool {
         self.running.contains_key(did_hash)
     }
