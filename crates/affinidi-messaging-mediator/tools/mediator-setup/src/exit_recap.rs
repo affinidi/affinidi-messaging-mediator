@@ -28,7 +28,7 @@ use crate::vta::{VtaReply, VtaSession};
 /// mode disabled), and only on the interactive success path.
 pub fn print_exit_recap(config: &WizardConfig, session: Option<&VtaSession>) {
     let now = chrono::Utc::now().to_rfc3339();
-    print!("{}", build_recap(config, session, &now));
+    out_inline!("{}", build_recap(config, session, &now));
 }
 
 /// Build the recap string. Pure — separated from the IO so tests
@@ -115,25 +115,36 @@ fn push_next_steps(out: &mut String, config: &WizardConfig, session: Option<&Vta
     }
     let _ = writeln!(
         out,
-        "  3. Re-run with --uninstall <config> to roll back this setup."
+        "  3. To roll back this setup: mediator-setup --uninstall --config {}",
+        config.config_path
     );
     let _ = writeln!(out);
 }
 
+/// The `mediator.toml` keys worth sharing, in `mediator.toml`'s own shape
+/// (and TOML-escaped), so the block can be pasted into one.
 fn push_toml_block(out: &mut String, config: &WizardConfig) {
-    let _ = writeln!(out, "## Snippet for sharing");
-    let _ = writeln!(out, "```toml");
-    if !config.public_url.is_empty() {
-        let _ = writeln!(out, "[mediator]");
-        let _ = writeln!(out, "public_url = \"{}\"", config.public_url);
-        if !config.listen_address.is_empty() {
-            let _ = writeln!(out, "listen_address = \"{}\"", config.listen_address);
-        }
-        let _ = writeln!(out);
+    let mut server = toml::Table::new();
+    if !config.listen_address.is_empty() {
+        server.insert(
+            "listen_address".into(),
+            config.listen_address.clone().into(),
+        );
     }
-    let backend_url = crate::config_writer::build_backend_url(config);
-    let _ = writeln!(out, "[secrets]");
-    let _ = writeln!(out, "backend = \"{backend_url}\"");
+    let mut secrets = toml::Table::new();
+    secrets.insert(
+        "backend".into(),
+        crate::config_writer::runtime_backend_url(config).into(),
+    );
+    let mut doc = toml::Table::new();
+    if !server.is_empty() {
+        doc.insert("server".into(), server.into());
+    }
+    doc.insert("secrets".into(), secrets.into());
+
+    let _ = writeln!(out, "## Snippet for sharing (mediator.toml)");
+    let _ = writeln!(out, "```toml");
+    let _ = write!(out, "{}", toml::to_string(&doc).unwrap_or_default());
     let _ = writeln!(out, "```");
     let _ = writeln!(out);
 }
@@ -262,11 +273,10 @@ mod tests {
         let parsed: toml::Value = toml::from_str(toml_text)
             .unwrap_or_else(|e| panic!("TOML block did not parse: {e}\n--- TOML ---\n{toml_text}"));
         // Spot-check the round-trip values
-        let mediator = parsed.get("mediator").expect("[mediator] section");
-        assert_eq!(
-            mediator.get("public_url").and_then(|v| v.as_str()).unwrap(),
-            "https://mediator.example.com"
-        );
+        // Only keys mediator.toml has: no `[mediator]` table.
+        assert!(parsed.get("mediator").is_none());
+        let server = parsed.get("server").expect("[server] section");
+        assert!(server.get("listen_address").is_some());
         let secrets = parsed.get("secrets").expect("[secrets] section");
         assert!(
             secrets

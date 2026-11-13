@@ -1,7 +1,7 @@
 # ============================================================================
 # TEST-ONLY mediator build recipe for the docker-compose.test.yml stack (TI3).
 #
-# Drives `affinidi-messaging-mediator-setup --from this-file --non-interactive`
+# Drives `mediator-setup --from this-file`
 # to generate a fixed, reproducible mediator identity + config under
 # `docker/test/conf/`. The generated `secrets.json` is committed and is
 # **TEST-ONLY** — never reuse these keys anywhere real.
@@ -27,6 +27,9 @@ public_url = "http://localhost:7037"
 # Local file backend (conf/secrets.json) — the only container-friendly option
 # here; keyring/cloud backends don't fit a self-contained test image.
 storage = "file://"
+# A plaintext file outside a local deployment must be accepted explicitly;
+# these keys are test-only.
+allow_plaintext_file = true
 
 [security]
 ssl = "none"

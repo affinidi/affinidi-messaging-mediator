@@ -29,6 +29,11 @@ pub fn generate_did_peer(
         keys.push((PeerKeyRole::Verification, KeyType::P256));
         keys.push((PeerKeyRole::Encryption, KeyType::P256));
     }
+    // `--key-suite secp256k1` used to be accepted and silently dropped here.
+    if key_suites.contains(&KeySuite::Secp256k1) {
+        keys.push((PeerKeyRole::Verification, KeyType::Secp256k1));
+        keys.push((PeerKeyRole::Encryption, KeyType::Secp256k1));
+    }
 
     let services = service_uri
         .as_deref()
@@ -147,6 +152,23 @@ mod tests {
         use affinidi_secrets_resolver::secrets::KeyType;
         assert!(matches!(secrets[2].get_key_type(), KeyType::P256));
         assert!(matches!(secrets[3].get_key_type(), KeyType::P256));
+    }
+
+    #[test]
+    fn secp256k1_suite_is_not_dropped() {
+        // Regression (#193): `--key-suite secp256k1` was accepted and
+        // silently ignored for did:peer.
+        let (did, secrets) = generate_did_peer(None, &[KeySuite::Secp256k1], false).unwrap();
+        assert_eq!(did.matches(".V").count(), 2);
+        assert_eq!(did.matches(".E").count(), 2);
+        assert_eq!(secrets.len(), 4);
+        use affinidi_secrets_resolver::secrets::KeyType;
+        assert!(matches!(secrets[2].get_key_type(), KeyType::Secp256k1));
+        assert!(matches!(secrets[3].get_key_type(), KeyType::Secp256k1));
+
+        let (_, both) =
+            generate_did_peer(None, &[KeySuite::P256, KeySuite::Secp256k1], false).unwrap();
+        assert_eq!(both.len(), 6);
     }
 
     #[test]

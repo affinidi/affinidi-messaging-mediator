@@ -86,6 +86,11 @@ pub struct BootstrapArtifacts {
     /// ephemeral pubkey, nonce, and VP framing) — safe to leave
     /// behind on a failure, but cleaner to delete on success.
     pub request_path: Option<PathBuf>,
+    /// Phase 2: the bundle id whose ephemeral seed stays in the backend
+    /// until the setup is fully written, then is deleted by
+    /// [`finish_applied`]. `None` for the TUI flow, which keeps its seed
+    /// in memory.
+    pub seed_bundle_id: Option<String>,
 }
 
 /// Operator choices that steer [`dispatch`].
@@ -427,18 +432,10 @@ async fn phase2_apply(
         anyhow::anyhow!("open_with_digest reported success but produced no session")
     })?;
 
-    // Seed has served its purpose. Best-effort delete so the index
-    // doesn't carry stale entries. Failure here doesn't abort phase 2
-    // — the mediator boot config is already valid at this point and
-    // the sweeper will eventually reap the entry on a future run.
-    if let Err(e) = store.delete_bootstrap_seed(&bundle_id_hex).await {
-        warn!(
-            bundle_id = %bundle_id_hex,
-            backend = %backend_shown,
-            error = %e,
-            "phase-2 seed delete failed; the sweeper will retry later",
-        );
-    }
+    // The seed stays in the backend until the whole setup is written
+    // (`finish_applied`): if anything after the unseal fails, the same
+    // bundle can be opened again on the next run instead of the VTA
+    // handoff having to be repeated.
 
     // Probe the bundle_id-keyed request filename next to the bundle.
     // Best-effort — we only use this to clean up after a successful
@@ -450,22 +447,53 @@ async fn phase2_apply(
         admin_did = %session.admin_did(),
         integration_did = session.integration_did().unwrap_or("(none)"),
         backend = %backend_shown,
-        "Sealed-handoff phase 2 complete — bundle applied, seed removed"
+        "Sealed-handoff phase 2 — bundle opened"
     );
 
     Ok(HeadlessOutcome::Applied {
         session,
-        artifacts: BootstrapArtifacts { request_path },
+        artifacts: BootstrapArtifacts {
+            request_path,
+            seed_bundle_id: Some(bundle_id_hex),
+        },
     })
 }
 
+/// After a phase-2 setup has been written in full: delete the ephemeral
+/// seed from the backend and the request file from disk. Best-effort — a
+/// failure is logged; the sweeper reaps a stale seed on a later run.
+pub async fn finish_applied(config: &crate::app::WizardConfig, artifacts: &BootstrapArtifacts) {
+    if let Some(ref bundle_id_hex) = artifacts.seed_bundle_id {
+        let backend_url = crate::config_writer::build_backend_url(config);
+        let backend_shown = affinidi_messaging_mediator_common::redact::redact_url(&backend_url);
+        match crate::secret_backend::open_secret_backend(&backend_url) {
+            Ok(store) => {
+                if let Err(e) = store.delete_bootstrap_seed(bundle_id_hex).await {
+                    warn!(
+                        bundle_id = %bundle_id_hex,
+                        backend = %backend_shown,
+                        error = %e,
+                        "phase-2 seed delete failed; the sweeper will retry later",
+                    );
+                } else {
+                    info!(bundle_id = %bundle_id_hex, "Setup written — ephemeral seed removed");
+                }
+            }
+            Err(e) => warn!(
+                backend = %backend_shown,
+                error = %e,
+                "could not reopen the backend to remove the ephemeral seed; the sweeper will \
+                 retry later",
+            ),
+        }
+    }
+    cleanup_artifacts(artifacts);
+}
+
 /// Remove the request JSON. Called from both the non-interactive path
-/// (phase 2 success) and the TUI path (post-Complete). Best-effort —
-/// any I/O failure logs a warning but doesn't abort the caller; the
+/// (via [`finish_applied`]) and the TUI path (post-Complete). Best-effort
+/// — any I/O failure logs a warning but doesn't abort the caller; the
 /// mediator config is already written at this point.
-///
-/// The ephemeral HPKE seed is no longer a file — it's removed
-/// directly from the secret backend at the end of `phase2_apply`.
 pub fn cleanup_artifacts(artifacts: &BootstrapArtifacts) {
     if let Some(ref p) = artifacts.request_path {
         remove_best_effort(p, "bootstrap request");
@@ -578,6 +606,7 @@ mod tests {
 
         cleanup_artifacts(&BootstrapArtifacts {
             request_path: Some(req.clone()),
+            seed_bundle_id: None,
         });
 
         assert!(!req.exists(), "request file should be removed");
@@ -591,6 +620,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         cleanup_artifacts(&BootstrapArtifacts {
             request_path: Some(tmp.path().join("does-not-exist.json")),
+            seed_bundle_id: None,
         });
     }
 
@@ -1031,31 +1061,41 @@ mod tests {
         .await
         .expect("phase 2 must succeed when seed + bundle align");
 
-        match outcome {
-            HeadlessOutcome::Applied { session, .. } => {
+        let artifacts = match outcome {
+            HeadlessOutcome::Applied { session, artifacts } => {
                 assert_eq!(session.admin_did(), "did:key:z6MkAdminHappy");
                 assert_eq!(session.vta_did, "did:webvh:vta.example.com");
+                artifacts
             }
             HeadlessOutcome::RequestEmitted { .. } => {
                 panic!("dispatch took the phase-1 branch despite --bundle being set");
             }
-        }
+        };
 
-        // Seed must have been removed from the backend on successful
-        // apply — re-running phase 2 would otherwise rehydrate the
-        // same secret and waste backend storage forever. Re-open the
-        // backend handle so any in-process index cache from before
-        // dispatch is invalidated; the file-backed store persists
-        // through both handles.
+        // The seed survives the unseal: if writing the setup failed now, the
+        // next run must still be able to open the same bundle. Re-open the
+        // backend handle so no in-process cache answers.
+        let still_there = MediatorSecrets::from_url(&backend_url)
+            .expect("re-open backend post-dispatch")
+            .load_bootstrap_seed(&bundle_id_hex)
+            .await
+            .expect("load_bootstrap_seed");
+        assert!(
+            still_there.is_some(),
+            "the seed must outlive phase 2 until the setup is written"
+        );
+
+        // Once the setup is written, `finish_applied` removes it.
+        finish_applied(&config, &artifacts).await;
         let backend_store_after =
-            MediatorSecrets::from_url(&backend_url).expect("re-open backend post-dispatch");
+            MediatorSecrets::from_url(&backend_url).expect("re-open backend post-finish");
         let after = backend_store_after
             .load_bootstrap_seed(&bundle_id_hex)
             .await
             .expect("load_bootstrap_seed");
         assert!(
             after.is_none(),
-            "seed must be deleted from backend on phase-2 success"
+            "seed must be deleted from backend once the setup is written"
         );
     }
 

@@ -59,6 +59,36 @@ pub struct DidWebvhResult {
     /// The DID document log entry in JSONL form, ready for the operator to
     /// host at the webvh URL.
     pub did_doc: String,
+    /// The keys that control the log: without them the DID can never be
+    /// updated, rotated or moved. Stored in the secret backend under
+    /// [`crate::consts::WEBVH_UPDATE_KEYS`], apart from the operating keys.
+    pub update_keys: WebvhUpdateKeys,
+}
+
+/// The two keys that control a locally generated did:webvh log.
+///
+/// - `update_key` is the log's current `updateKeys` entry.
+/// - `next_key` is the pre-rotation key: the first log entry commits to its
+///   hash (`nextKeyHashes`), so the next update must be signed by it and
+///   must commit to a fresh next key in turn.
+///
+/// Both carry a `did:key:<pk>#<pk>` id, the verification-method shape
+/// `didwebvh-rs` signs log entries with. Serialised as-is into the secret
+/// backend entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WebvhUpdateKeys {
+    pub update_key: Secret,
+    pub next_key: Secret,
+}
+
+/// An Ed25519 key with the `did:key:<pk>#<pk>` id a log-entry signer needs.
+fn webvh_signing_key(label: &str) -> anyhow::Result<Secret> {
+    let mut key = Secret::generate_ed25519(None, None);
+    let public = key
+        .get_public_keymultibase()
+        .map_err(|e| anyhow::anyhow!("Failed to get {label} public key: {e}"))?;
+    key.id = format!("did:key:{public}#{public}");
+    Ok(key)
 }
 
 /// Generate a did:webvh DID for the mediator.
@@ -266,27 +296,30 @@ pub async fn generate_did_webvh_as(
     }
 
     // ── Authorization + pre-rotation ───────────────────────────────
-    let mut auth_key = Secret::generate_ed25519(None, None);
+    // Both keys are returned to the caller and stored: they are the only
+    // way to update, rotate or move the DID later.
+    let auth_key = webvh_signing_key("authorization")?;
     let auth_pubkey = auth_key
         .get_public_keymultibase()
         .map_err(|e| anyhow::anyhow!("Failed to get authorization public key: {e}"))?;
-    auth_key.id = format!("did:key:{auth_pubkey}#{auth_pubkey}");
 
-    let next_auth_key = Secret::generate_ed25519(None, None);
-    let next_auth_pubkey = next_auth_key
-        .get_public_keymultibase()
-        .map_err(|e| anyhow::anyhow!("Failed to get next authorization public key: {e}"))?;
+    let next_auth_key = webvh_signing_key("next authorization")?;
+    // Pre-rotation commits to the *hash* of the next key's multibase — what
+    // the resolver checks the next entry's signer against.
+    let next_auth_hash = next_auth_key
+        .get_public_keymultibase_hash()
+        .map_err(|e| anyhow::anyhow!("Failed to hash the next authorization key: {e}"))?;
 
     let parameters = Parameters {
         update_keys: Some(Arc::new(vec![auth_pubkey.into()])),
         portable: Some(true),
-        next_key_hashes: Some(Arc::new(vec![next_auth_pubkey.into()])),
+        next_key_hashes: Some(Arc::new(vec![next_auth_hash.into()])),
         ..Default::default()
     };
 
     let config = CreateDIDConfig::builder()
         .address(address)
-        .authorization_key(auth_key)
+        .authorization_key(auth_key.clone())
         .did_document(did_document)
         .parameters(parameters)
         .also_known_as_scid(identity.scid_also_known_as)
@@ -348,6 +381,10 @@ pub async fn generate_did_webvh_as(
         did: presented_did,
         secrets,
         did_doc,
+        update_keys: WebvhUpdateKeys {
+            update_key: auth_key,
+            next_key: next_auth_key,
+        },
     })
 }
 
@@ -532,6 +569,91 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// #150: the generated log can actually be updated with the keys the
+    /// wizard stores. The keys go through the same JSON round-trip as the
+    /// secret-backend entry; the update is a pre-rotation step — signed by
+    /// the committed next key, committing to a fresh one — and the
+    /// two-entry log validates end to end.
+    #[tokio::test]
+    async fn the_stored_keys_perform_a_log_update() {
+        use didwebvh_rs::log_entry::LogEntry;
+        use didwebvh_rs::prelude::{DIDWebVHState, Multibase};
+
+        let result = generate_did_webvh(
+            "https://mediator.example.com",
+            "https://mediator.example.com/mediator/v1",
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        // What the secret backend holds, and what an operator reads back.
+        let stored = serde_json::to_vec(&result.update_keys).unwrap();
+        let keys: WebvhUpdateKeys = serde_json::from_slice(&stored).unwrap();
+
+        // The first entry commits to the next key's hash, not its pubkey.
+        let first: Value = serde_json::from_str(&result.did_doc).unwrap();
+        let committed = first["parameters"]["nextKeyHashes"][0].as_str().unwrap();
+        assert_eq!(
+            committed,
+            keys.next_key.get_public_keymultibase_hash().unwrap()
+        );
+        assert_ne!(committed, keys.next_key.get_public_keymultibase().unwrap());
+        assert_eq!(
+            first["parameters"]["updateKeys"][0].as_str().unwrap(),
+            keys.update_key.get_public_keymultibase().unwrap()
+        );
+
+        // Load the log and validate it.
+        let entry = LogEntry::deserialize_string(&result.did_doc, None).unwrap();
+        let mut state = DIDWebVHState::from_log_entries(vec![entry]);
+        state.validate().unwrap().assert_complete().unwrap();
+
+        // One update: rotate to the pre-committed key, committing to a new one.
+        let fresh_next = webvh_signing_key("test next").unwrap();
+        let mut params = state
+            .log_entries()
+            .last()
+            .unwrap()
+            .validated_parameters
+            .clone();
+        params.update_keys = Some(Arc::new(vec![Multibase::new(
+            keys.next_key.get_public_keymultibase().unwrap(),
+        )]));
+        params.next_key_hashes = Some(Arc::new(vec![Multibase::new(
+            fresh_next.get_public_keymultibase_hash().unwrap(),
+        )]));
+        let doc = state.log_entries().last().unwrap().get_state().clone();
+        state
+            .create_log_entry(None, &doc, &params, &keys.next_key)
+            .await
+            .expect("the stored next key must authorise the update");
+
+        // The two-entry log re-validates from scratch.
+        let entries: Vec<LogEntry> = state
+            .log_entries()
+            .iter()
+            .map(|e| e.log_entry.clone())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        let mut replay = DIDWebVHState::from_log_entries(entries);
+        replay.validate().unwrap().assert_complete().unwrap();
+
+        // A key that was never committed to cannot sign the update.
+        let mut state = DIDWebVHState::from_log_entries(vec![
+            LogEntry::deserialize_string(&result.did_doc, None).unwrap(),
+        ]);
+        state.validate().unwrap().assert_complete().unwrap();
+        let stranger = webvh_signing_key("stranger").unwrap();
+        assert!(
+            state
+                .create_log_entry(None, &doc, &params, &stranger)
+                .await
+                .is_err()
+        );
     }
 
     /// By default the log lists its did:scid alias, and the mediator is
