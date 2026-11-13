@@ -24,11 +24,20 @@
 //!   bus as local ones, so every subscription's membership filter, its
 //!   non-administrator narrowing (made at subscribe) and its standing check
 //!   apply to it unchanged.
+//! - **Losses are visible to subscribers.** Events an instance could not
+//!   hand over or publish are counted and announced in a [`Record::Lost`]
+//!   once publishing works again; a receiver that lagged on the channel
+//!   counts what it missed. Either way the count is added to the
+//!   `membershipDropped` of every opted-in subscription on the receiving
+//!   instance (an upper bound: the lost events' filters cannot be known).
 //! - **Redis down degrades to local only.** A failed publish is counted
 //!   (`cause="publish"`) and logged once per outage; a lost subscription
 //!   ends the task with an error, so the supervisor restarts it and readiness
 //!   shows it degraded meanwhile (R6.2). While it is down nothing is offered
-//!   (no announcement is current), and local events are unaffected.
+//!   (no announcement is current), local events are unaffected, and each
+//!   opted-in batch says so under `ext["com.affinidi.mediator"]` with
+//!   `membershipCoverage: "thisInstance"` (event 0.3 allows a batch-level
+//!   `ext`; it has no member of its own for this).
 //!
 //! The events carry no instance tag: `messaging/monitor/event` 0.3's
 //! `MonitorMembershipEvent` admits no further members.
@@ -38,7 +47,7 @@
 //! announcement scheme with a record kind of their own.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use affinidi_messaging_mediator_common::time::unix_timestamp_millis;
@@ -70,6 +79,13 @@ pub(crate) struct Fanout {
     remote_until_ms: AtomicU64,
     /// A membership subscription opened here: announce it now.
     announce: Notify,
+    /// Membership events this instance owes the others but could not hand
+    /// over (overflow) or publish: reported in the next [`Record::Lost`].
+    unsent: AtomicU64,
+    /// The store spans processes, so a fan-out task should be running.
+    expected: AtomicBool,
+    /// The fan-out task is running (subscribed, hand-off installed).
+    live: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -90,7 +106,16 @@ impl Fanout {
         };
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
             metrics::counter!(MONITOR_FANOUT_DROPPED_TOTAL, "cause" => "overflow").increment(1);
+            self.unsent.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether this instance's subscribers see only this instance's
+    /// membership events right now: the store spans processes but the
+    /// fan-out task is not running (it lost its subscription, or has not
+    /// opened it yet).
+    pub(crate) fn degraded(&self) -> bool {
+        self.expected.load(Ordering::Relaxed) && !self.live.load(Ordering::Relaxed)
     }
 
     /// A subscription here opted in to membership events.
@@ -112,12 +137,14 @@ struct Installed<'a>(&'a Fanout);
 impl<'a> Installed<'a> {
     fn new(fanout: &'a Fanout, tx: mpsc::Sender<Arc<MembershipEvent>>) -> Self {
         *fanout.out.write().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        fanout.live.store(true, Ordering::Relaxed);
         Installed(fanout)
     }
 }
 
 impl Drop for Installed<'_> {
     fn drop(&mut self) {
+        self.0.live.store(false, Ordering::Relaxed);
         self.0.remote_until_ms.store(0, Ordering::Relaxed);
         *self.0.out.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -133,6 +160,8 @@ enum Record {
     Query { origin: String },
     /// A membership event emitted on `origin`.
     Membership { origin: String, event: WireEvent },
+    /// `origin` emitted `count` membership events it could not publish.
+    Lost { origin: String, count: u64 },
 }
 
 /// A [`MembershipEvent`] on the channel.
@@ -229,6 +258,7 @@ impl TrafficMonitor {
             Record::Listening { origin }
             | Record::Query { origin }
             | Record::Membership { origin, .. }
+            | Record::Lost { origin, .. }
                 if origin == me =>
             {
                 false
@@ -238,6 +268,10 @@ impl TrafficMonitor {
                 false
             }
             Record::Query { .. } => self.has_membership_subscribers(),
+            Record::Lost { count, .. } => {
+                self.membership_lost(count);
+                false
+            }
             Record::Membership { event, .. } => {
                 match event.into_event() {
                     Some(event) => {
@@ -294,11 +328,30 @@ impl Publisher<'_> {
     }
 }
 
+/// Tell the other instances' subscribers how many of this instance's
+/// membership events they missed, so it shows in their `membershipDropped`.
+/// Kept for the next try if the publish fails.
+async fn report_unsent(monitor: &TrafficMonitor, publisher: &mut Publisher<'_>, me: &str) {
+    let count = monitor.fanout.unsent.swap(0, Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    let record = Record::Lost {
+        origin: me.to_string(),
+        count,
+    };
+    if !publisher.publish(&record).await {
+        monitor.fanout.unsent.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
 /// The fan-out task: run under the task supervisor while mux is enabled and
 /// the store spans processes. Returns `Err` only when the subscription
 /// cannot be opened or is lost, so the supervisor restarts it and readiness
 /// shows it degraded; local membership events go on meanwhile.
 pub async fn run(state: SharedData) -> Result<(), String> {
+    // Degraded until subscribed (and again whenever this returns).
+    state.monitor.fanout.expected.store(true, Ordering::Relaxed);
     let scope =
         affinidi_messaging_mediator_common::did_identity::did_hash(&state.config.mediator_did);
     let Some(mut inbound) = state
@@ -308,6 +361,11 @@ pub async fn run(state: SharedData) -> Result<(), String> {
         .map_err(|e| format!("monitor fan-out subscription failed: {e}"))?
     else {
         debug!("store is single-process; no monitor events to share between instances");
+        state
+            .monitor
+            .fanout
+            .expected
+            .store(false, Ordering::Relaxed);
         state.shutdown_token.cancelled().await;
         return Ok(());
     };
@@ -338,6 +396,9 @@ pub async fn run(state: SharedData) -> Result<(), String> {
                     warn!(missed, "monitor fan-out fell behind; other instances' membership events were missed");
                     metrics::counter!(MONITOR_FANOUT_DROPPED_TOTAL, "cause" => "lagged")
                         .increment(missed);
+                    // Records, not all of them events: an upper bound, as a
+                    // subscription's own lag on the local bus is counted.
+                    monitor.membership_lost(missed);
                     false
                 }
                 Err(RecvError::Closed) => {
@@ -352,10 +413,15 @@ pub async fn run(state: SharedData) -> Result<(), String> {
                 if !publisher.publish(&record).await {
                     metrics::counter!(MONITOR_FANOUT_DROPPED_TOTAL, "cause" => "publish")
                         .increment(1);
+                    monitor.fanout.unsent.fetch_add(1, Ordering::Relaxed);
                 }
+                report_unsent(&monitor, &mut publisher, &me).await;
                 false
             }
-            _ = beacon.tick() => monitor.has_membership_subscribers(),
+            _ = beacon.tick() => {
+                report_unsent(&monitor, &mut publisher, &me).await;
+                monitor.has_membership_subscribers()
+            }
             _ = monitor.fanout.announce.notified() => monitor.has_membership_subscribers(),
         };
         if announce {
@@ -462,6 +528,46 @@ mod tests {
         }
         assert!(!monitor.fanout.wanted());
         monitor.emit_membership(|| panic!("nobody listens"));
+    }
+
+    #[test]
+    fn unsent_events_are_counted_and_lost_reports_ignore_their_origin() {
+        let monitor = TrafficMonitor::new();
+        let (tx, _out) = mpsc::channel(1);
+        let _installed = Installed::new(&monitor.fanout, tx);
+        monitor.fanout.heard_listener();
+        monitor.emit_membership(event);
+        monitor.emit_membership(event);
+        monitor.emit_membership(event);
+        assert_eq!(
+            monitor.fanout.unsent.load(Ordering::Relaxed),
+            2,
+            "overflow is owed"
+        );
+
+        let own = serde_json::to_string(&Record::Lost {
+            origin: "me".into(),
+            count: 5,
+        })
+        .unwrap();
+        assert!(!monitor.receive("me", &own));
+    }
+
+    #[test]
+    fn degraded_only_while_the_expected_task_is_down() {
+        let monitor = TrafficMonitor::new();
+        assert!(
+            !monitor.fanout.degraded(),
+            "single-process: nothing expected"
+        );
+        monitor.fanout.expected.store(true, Ordering::Relaxed);
+        assert!(monitor.fanout.degraded());
+        let (tx, _out) = mpsc::channel(1);
+        {
+            let _installed = Installed::new(&monitor.fanout, tx);
+            assert!(!monitor.fanout.degraded());
+        }
+        assert!(monitor.fanout.degraded(), "the task ended");
     }
 
     #[test]

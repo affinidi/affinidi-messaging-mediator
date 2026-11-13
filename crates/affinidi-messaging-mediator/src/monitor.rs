@@ -786,6 +786,9 @@ struct Subscription {
     /// Whether its tap opted in to membership events, kept beside the
     /// settings so the fan-out task can ask without taking their lock.
     membership: Arc<AtomicBool>,
+    /// Membership events other instances' reports say this subscription
+    /// may have missed; taken into `membershipDropped` at the next flush.
+    membership_lost: Arc<AtomicU64>,
     settings: Arc<Mutex<Settings>>,
     cancel: CancellationToken,
     sent: Arc<AtomicU64>,
@@ -973,6 +976,16 @@ impl TrafficMonitor {
         }
     }
 
+    /// Count `n` membership events lost on the way from another instance
+    /// against every subscription here that opted in.
+    fn membership_lost(&self, n: u64) {
+        for s in self.subscriptions.iter() {
+            if s.membership.load(Ordering::Relaxed) {
+                s.membership_lost.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Whether any subscription here has opted in to membership events.
     fn has_membership_subscribers(&self) -> bool {
         self.subscriptions
@@ -1052,11 +1065,13 @@ impl TrafficMonitor {
         let cancel = CancellationToken::new();
         let sent = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
+        let membership_lost = Arc::new(AtomicU64::new(0));
         self.subscriptions.insert(
             id.clone(),
             Subscription {
                 owner_did_hash: owner_did_hash.to_string(),
                 membership: Arc::new(AtomicBool::new(tap.membership.is_some())),
+                membership_lost: membership_lost.clone(),
                 settings: settings.clone(),
                 cancel: cancel.clone(),
                 sent: sent.clone(),
@@ -1082,6 +1097,8 @@ impl TrafficMonitor {
             dropped,
             rx: self.tx.subscribe(),
             membership_rx: self.membership_tx.subscribe(),
+            membership_lost,
+            fanout: self.fanout.clone(),
             subscriptions: self.subscriptions.clone(),
         };
         tokio::spawn(task.run());
@@ -1174,6 +1191,9 @@ struct DeliveryTask {
     dropped: Arc<AtomicU64>,
     rx: broadcast::Receiver<Arc<TrafficEvent>>,
     membership_rx: broadcast::Receiver<Arc<MembershipEvent>>,
+    /// See [`Subscription::membership_lost`].
+    membership_lost: Arc<AtomicU64>,
+    fanout: Arc<fanout::Fanout>,
     subscriptions: Arc<DashMap<String, Subscription>>,
 }
 
@@ -1299,6 +1319,8 @@ impl DeliveryTask {
                     if expired {
                         break;
                     }
+                    pending.membership_dropped +=
+                        self.membership_lost.swap(0, Ordering::Relaxed);
                     if !pending.is_empty() || last_sent.elapsed() >= HEARTBEAT {
                         if !self.deliver_if_standing(&mut pending, &mut seq).await {
                             break;
@@ -1506,6 +1528,13 @@ impl DeliveryTask {
         if membership && version == EventVersion::V0_3 {
             payload["membership"] = json!(pending.membership);
             payload["membershipDropped"] = json!(pending.membership_dropped);
+            // Event 0.3 has no member for it; its batch-level `ext` carries
+            // that this instance cannot hear the others' changes right now.
+            if self.fanout.degraded() {
+                payload["ext"] = json!({
+                    "com.affinidi.mediator": { "membershipCoverage": "thisInstance" }
+                });
+            }
         }
         let doc = json!({
             "id": format!("urn:uuid:{}", Uuid::new_v4()),
@@ -1989,6 +2018,18 @@ mod tests {
         });
         serde_json::from_value::<Payload>(batch.clone())
             .unwrap_or_else(|e| panic!("not an event 0.3 batch: {e}\n{batch:#}"));
+        // A batch saying the fan-out is down (see `fanout`) is one too.
+        let mut degraded = batch;
+        degraded["ext"] = json!({
+            "com.affinidi.mediator": { "membershipCoverage": "thisInstance" }
+        });
+        let parsed = serde_json::from_value::<Payload>(degraded.clone())
+            .unwrap_or_else(|e| panic!("not an event 0.3 batch: {e}\n{degraded:#}"));
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap()["ext"],
+            degraded["ext"],
+            "the ext survives the typed payload"
+        );
     }
 
     #[test]

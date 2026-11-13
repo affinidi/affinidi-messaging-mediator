@@ -21,6 +21,14 @@
   see that instance's events, a failed publish is logged once per outage, and
   a lost subscription restarts the `monitor_fanout` task under the supervisor
   (readiness shows it degraded meanwhile).
+- Subscribers can see what was lost. Events an instance could not hand over
+  or publish are reported to the others once publishing works again, and a
+  receiver that fell behind on the channel counts what it missed; either
+  count is added to `membershipDropped` of every opted-in subscription on the
+  receiving instance (an upper bound: the lost events' filters are unknown).
+  While the fan-out task is down, each opted-in event 0.3 batch carries
+  `ext["com.affinidi.mediator"].membershipCoverage = "thisInstance"`: the
+  subscriber is seeing only its own instance's changes.
 
 ### Added — monitor fan-out metrics
 

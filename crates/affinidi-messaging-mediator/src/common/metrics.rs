@@ -182,7 +182,9 @@ pub mod names {
     /// counter: Mux membership events this instance did not share with the
     /// other instances' monitor subscribers (label `cause`): `overflow` when
     /// the bounded hand-off to the publishing task was full, `publish` when
-    /// the store refused the publish (Redis down). Local subscribers still see
+    /// the store refused the publish (Redis down), `lagged` when this
+    /// instance fell behind reading the channel (counted in records, so an
+    /// upper bound). Local subscribers still see
     /// every one of them. Normally 0; a steady rate means other instances'
     /// monitors miss changes made here.
     pub const MONITOR_FANOUT_DROPPED_TOTAL: &str = "monitor_fanout_dropped_total";

@@ -159,18 +159,18 @@ async fn grant(env: &TestEnvironment, member: &TestUser, principal: &TestUser) {
         .expect("stop member websocket");
 }
 
-/// The membership events of subscription `sub` reaching `user`'s live
-/// stream until `done` holds over them, or `deadline` passes.
-async fn membership_until(
+/// The batch payloads of subscription `sub` reaching `user`'s live stream
+/// until `done` holds over their membership events, or `deadline` passes.
+async fn batches_until(
     env: &TestEnvironment,
     user: &TestUser,
     sub: &Value,
     deadline: Duration,
     done: impl Fn(&[Value]) -> bool,
 ) -> Vec<Value> {
-    let mut seen = Vec::new();
+    let mut seen: Vec<Value> = Vec::new();
     let until = tokio::time::Instant::now() + deadline;
-    while tokio::time::Instant::now() < until && !done(&seen) {
+    while tokio::time::Instant::now() < until && !done(&membership_of(&seen)) {
         let Some((message, _)) = env
             .atm
             .message_pickup()
@@ -181,15 +181,18 @@ async fn membership_until(
             continue;
         };
         if message.body["type"] == EVENT_V0_3 && message.body["payload"]["subscriptionId"] == *sub {
-            seen.extend(
-                message.body["payload"]["membership"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            seen.push(message.body["payload"].clone());
         }
     }
     seen
+}
+
+/// The membership events across `batches`.
+fn membership_of(batches: &[Value]) -> Vec<Value> {
+    batches
+        .iter()
+        .flat_map(|b| b["membership"].as_array().cloned().unwrap_or_default())
+        .collect()
 }
 
 fn attached<'a>(events: &'a [Value], member: &str) -> Vec<&'a Value> {
@@ -254,17 +257,16 @@ async fn a_monitor_on_one_instance_sees_members_attach_on_another() {
     .await;
     assert_eq!(body["type"], format!("{SUBSCRIBE_V0_2}#response"), "{body}");
     let sub = body["payload"]["subscriptionId"].clone();
-    // A announces its subscriber at once; give the announcement the moment
-    // it takes to reach B (well inside B's 10 s beacon period).
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     // Stored before either principal connects: each connection carries its
     // grant on connect (`attached`, reason `connect`).
     grant(&env, &remote_member, &remote_principal).await;
     grant(&env, &local_member, &local_principal).await;
 
     // The remote principal authenticates through A and opens its mux socket
-    // on B with that token.
+    // on B with that token. A announced its subscriber when it opened, but
+    // nothing here can see when B heard it, so the connect is repeated (a
+    // fresh connection, a fresh `attached`) until A reports one, within a
+    // bounded deadline. Each connection's event must arrive at most once.
     let tokens = env
         .tdk
         .authentication()
@@ -276,53 +278,96 @@ async fn a_monitor_on_one_instance_sees_members_attach_on_another() {
         )
         .await
         .expect("authenticate through A");
-    let request = ClientRequestBuilder::new(b_ws)
-        .with_sub_protocol("didcomm-mux")
-        .with_sub_protocol(format!("bearer.{}", tokens.access_token));
-    let (mut ws, _) = connect_async(request).await.expect("B accepts A's token");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let Some(Ok(Message::Text(t))) = ws.next().await else {
-                panic!("socket closed before ready");
-            };
-            let (msg, _) = env.atm.unpack(t.as_str()).await.expect("unpack");
-            if msg.body["type"] == MUX_EVENT && msg.body["payload"]["event"] == "ready" {
-                break;
+    let remote_hash = remote_member.did_hash();
+    let local_hash = local_member.did_hash();
+    let deadline = tokio::time::Instant::now() + common::EVENT_WAIT;
+    let mut batches = Vec::new();
+    let mut attempts = 0;
+    let _ws = loop {
+        attempts += 1;
+        let request = ClientRequestBuilder::new(b_ws.clone())
+            .with_sub_protocol("didcomm-mux")
+            .with_sub_protocol(format!("bearer.{}", tokens.access_token));
+        let (mut ws, _) = connect_async(request).await.expect("B accepts A's token");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let Some(Ok(Message::Text(t))) = ws.next().await else {
+                    panic!("socket closed before ready");
+                };
+                let (msg, _) = env.atm.unpack(t.as_str()).await.expect("unpack");
+                if msg.body["type"] == MUX_EVENT && msg.body["payload"]["event"] == "ready" {
+                    break;
+                }
             }
+        })
+        .await
+        .expect("ready on B");
+        batches.extend(
+            batches_until(&env, &admin, &sub, Duration::from_secs(3), |e| {
+                !attached(e, &remote_hash).is_empty()
+            })
+            .await,
+        );
+        if !attached(&membership_of(&batches), &remote_hash).is_empty() {
+            break ws;
         }
-    })
-    .await
-    .expect("ready on B");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no attach on B reached A's monitor in {attempts} connections"
+        );
+        let _ = ws.close(None).await;
+    };
 
     // The local principal connects to A.
     env.atm
         .profile_enable_mux_websocket(&local_principal.profile)
         .await
         .expect("mux websocket on A");
-
-    let remote_hash = remote_member.did_hash();
-    let local_hash = local_member.did_hash();
-    let mut events = membership_until(&env, &admin, &sub, common::EVENT_WAIT, |e| {
-        !attached(e, &remote_hash).is_empty() && !attached(e, &local_hash).is_empty()
-    })
-    .await;
+    batches.extend(
+        batches_until(&env, &admin, &sub, common::EVENT_WAIT, |e| {
+            !attached(e, &local_hash).is_empty()
+        })
+        .await,
+    );
     // Anything still in flight, to count duplicates.
-    events.extend(membership_until(&env, &admin, &sub, Duration::from_secs(3), |_| false).await);
+    batches.extend(batches_until(&env, &admin, &sub, Duration::from_secs(3), |_| false).await);
+    let events = membership_of(&batches);
 
     let remote = attached(&events, &remote_hash);
-    assert_eq!(remote.len(), 1, "B's change seen on A, once: {events:#?}");
-    let remote = remote[0];
-    assert_eq!(remote["principal"], remote_principal.did_hash().as_str());
-    assert_eq!(remote["reason"], "connect", "{remote}");
-    assert_eq!(remote["wire"], "didcomm");
-    assert_eq!(remote["source"], "grant");
-    assert!(remote["sessionId"].is_string(), "{remote}");
-    assert!(remote["occurredAt"].is_string(), "{remote}");
+    let mut sessions: Vec<&str> = remote
+        .iter()
+        .map(|e| e["sessionId"].as_str().expect("sessionId"))
+        .collect();
+    let seen = sessions.len();
+    sessions.sort();
+    sessions.dedup();
+    assert_eq!(
+        sessions.len(),
+        seen,
+        "each of B's connections seen on A once: {events:#?}"
+    );
+    assert!(
+        seen <= attempts,
+        "{seen} events from {attempts} connections"
+    );
+    for e in &remote {
+        assert_eq!(e["principal"], remote_principal.did_hash().as_str());
+        assert_eq!(e["reason"], "connect", "{e}");
+        assert_eq!(e["wire"], "didcomm");
+        assert_eq!(e["source"], "grant");
+        assert!(e["occurredAt"].is_string(), "{e}");
+    }
+    // The batch that brought B's event came while the fan-out was up, so
+    // it does not claim this-instance-only coverage.
+    let carrying = batches
+        .iter()
+        .find(|b| !attached(&membership_of(std::slice::from_ref(b)), &remote_hash).is_empty())
+        .unwrap();
+    assert!(carrying.get("ext").is_none(), "{carrying:#}");
 
     assert_eq!(
         attached(&events, &local_hash).len(),
         1,
         "A's own change seen once, not again from the channel: {events:#?}"
     );
-    drop(ws);
 }
