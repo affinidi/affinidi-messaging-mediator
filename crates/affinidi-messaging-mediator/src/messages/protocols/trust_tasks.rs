@@ -144,7 +144,12 @@ pub(crate) async fn process(
     })?;
 
     let now_secs = state.clock.unix_secs();
-    let Some(response_value) = consume(
+    let sender_did = vid_of(&sender_kid);
+    let request_type = doc.type_uri.to_string();
+    // A request that asks to be refused with a `trust-task-error` document
+    // is answered with one, in place of the problem report.
+    let refusing = crate::messages::protocols::trust_task_error::Refusing::asked_by(&doc);
+    let consumed = consume(
         doc,
         &message.body,
         state,
@@ -153,18 +158,24 @@ pub(crate) async fn process(
         now_secs,
         TaskTransport::DidComm,
     )
-    .await?
-    else {
+    .await;
+    let response_value = match consumed {
+        Ok(Some(v)) => v,
         // identity_mismatch with no transport sender → emit nothing.
-        return Ok(ProcessMessageResponse::default());
+        Ok(None) => return Ok(ProcessMessageResponse::default()),
+        Err(e) => match &refusing {
+            Some(r) => match r.document(&e, session, &sender_did, state).await {
+                Some(doc) => doc,
+                None => return Err(e),
+            },
+            None => return Err(e),
+        },
     };
-    let sender_did = vid_of(&sender_kid);
-    // The answer to `messaging/mux/ack` goes to the connection only, never
-    // stored (`mux::tasks::ACK_RESPONSE_TYPE`): a stored one would need
-    // acknowledging in turn. Lost with the connection, it is recovered by
-    // asking again.
-    let push_only = response_value.get("type").and_then(Value::as_str)
-        == Some(crate::mux::tasks::ACK_RESPONSE_TYPE);
+    // The answer to `messaging/mux/ack`, or its refusal, goes to the
+    // connection only, never stored (`mux::tasks::answer_is_pushed`): a
+    // stored one would need acknowledging in turn. Lost with the connection,
+    // it is recovered by asking again.
+    let push_only = crate::mux::tasks::answer_is_pushed(&response_value, &request_type);
 
     // Pack the response back through the mediator's existing outbound path.
     // `thid` threads it to the request so the caller's live-stream correlates it.
@@ -2408,6 +2419,32 @@ pub(crate) fn tt_problem(
     )
 }
 
+/// A mux task's request-level refusal as a problem report. An
+/// `epochMismatch` carries the epoch in force as its first argument, which a
+/// `trust-task-error` turns into `details.currentEpoch`
+/// ([`trust_task_error`](crate::messages::protocols::trust_task_error)); the comment says it too, for older clients.
+fn task_refusal(session: &Session, e: crate::mux::tasks::TaskError) -> MediatorError {
+    let args = e
+        .current_epoch
+        .map(|c| vec![c.to_string()])
+        .unwrap_or_default();
+    MediatorError::problem(
+        37,
+        &session.session_id,
+        None,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        &e.code,
+        &e.message,
+        args,
+        if e.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+    )
+}
+
 /// Serve a connection-independent `messaging/mux/*` task (design §4).
 ///
 /// Off unless `limits.mux.enabled`, in which case the type is unsupported, as
@@ -2446,18 +2483,7 @@ async fn consume_mux(
         now: now.timestamp().max(0) as u64,
     };
     let payload = &doc.payload;
-    let refused = |e: tasks::TaskError| {
-        tt_problem(
-            session,
-            &e.code,
-            e.message,
-            if e.retryable {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-        )
-    };
+    let refused = |e: tasks::TaskError| task_refusal(session, e);
 
     // attach / detach act on the connection the request arrived on.
     let conn = || {
@@ -2741,27 +2767,7 @@ async fn consume_mux_admin(
         root: roles::is_root(session.account_type),
         root_admin_hash: &root_admin_hash,
     };
-    let refused = |e: tasks::TaskError| {
-        let args = e
-            .current_epoch
-            .map(|c| vec![c.to_string()])
-            .unwrap_or_default();
-        MediatorError::problem(
-            37,
-            &session.session_id,
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            &e.code,
-            &e.message,
-            args,
-            if e.retryable {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-        )
-    };
+    let refused = |e: tasks::TaskError| task_refusal(session, e);
 
     fn respond<P, R>(
         doc: &TrustTask<Value>,

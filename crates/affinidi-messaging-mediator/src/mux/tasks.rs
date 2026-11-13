@@ -778,6 +778,17 @@ mod tests {
 /// answer to that, without end (spec, consumer rule 4). Both wires.
 pub const ACK_RESPONSE_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1#response";
 
+/// The type of a `messaging/mux/ack` request.
+pub const ACK_TYPE: &str = "https://trusttasks.org/spec/messaging/mux/ack/0.1";
+
+/// Whether `answer` goes to the connection only, never stored: the answer to
+/// `messaging/mux/ack`, or the `trust-task-error` refusing one, for the same
+/// reason. `request_type` is the type of the request it answers.
+pub fn answer_is_pushed(answer: &Value, request_type: &str) -> bool {
+    answer.get("type").and_then(Value::as_str) == Some(ACK_RESPONSE_TYPE)
+        || request_type == ACK_TYPE
+}
+
 /// `messaging/mux/ack`: delete the frames named, as the connection's
 /// principal may (its own, and each member's while the member holds
 /// `delete`). An acknowledgement: it removes only a copy held for the
