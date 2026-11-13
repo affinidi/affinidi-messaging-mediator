@@ -1,0 +1,71 @@
+# Keeps the SHA-pinned actions and digest-pinned base images moving, and the
+# lockfile's third-party crates current, without a PR per bump.
+#
+# Deliberately NOT managed here: the ecosystem crates (affinidi-*,
+# trust-tasks-*, vta-*, didwebvh-rs). Their requirements move with coordinated
+# releases across repositories (CLAUDE.md, "TDK dependencies"), not on a
+# schedule.
+#
+# Commit subjects use `chore(deps)` / `ci(deps)` / `build(deps)` to satisfy the
+# conventional-subject rule. Dependabot does not sign off its commits (DCO): a
+# maintainer signs off when merging, or the DCO check exempts dependabot[bot].
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: build
+      include: scope
+    ignore:
+      # The builder's Rust version is the toolchain pin (rust-toolchain.toml,
+      # held equal by scripts/check-release-guards.py); it moves with a
+      # toolchain bump, not here. Digest updates of the same tag still come.
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+    groups:
+      base-images:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    # Lockfile only: requirement floors in the manifests stay where the code
+    # needs them; this just moves Cargo.lock within them.
+    versioning-strategy: lockfile-only
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      - dependency-name: "affinidi-*"
+      - dependency-name: "trust-tasks-*"
+      - dependency-name: "vta-*"
+      - dependency-name: "didwebvh-rs"
+    groups:
+      # One PR a month for routine bumps, and one per advisory batch.
+      cargo-routine:
+        applies-to: version-updates
+        update-types: [minor, patch]
+        patterns: ["*"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]

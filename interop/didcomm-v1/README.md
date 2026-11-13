@@ -12,7 +12,7 @@ the same setting.
 
 ```sh
 cd interop/didcomm-v1
-npm install
+npm ci             # installs exactly what package-lock.json records
 npm run generate   # writes the Credo-built requests to the test-mediator fixtures
 cargo test -p affinidi-messaging-test-mediator --features didcomm-v1 --tests
 npm run generate   # re-run: now also parses the mediator's replies through Credo
