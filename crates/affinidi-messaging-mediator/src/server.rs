@@ -567,7 +567,7 @@ pub async fn serve_internal(
     let monitor = crate::monitor::TrafficMonitor::new();
 
     // Message expiry sweep — non-load-bearing housekeeping. Runs against
-    // any backend via `MediatorStore::sweep_expired_messages`. The
+    // any backend via `MessageStore::sweep_expired_messages`. The
     // standalone `message_expiry_cleanup` binary in mediator-processors
     // keeps its own direct-Redis loop for distributed deployments. Sweep
     // errors are logged and the next tick retries; the supervisor restarts

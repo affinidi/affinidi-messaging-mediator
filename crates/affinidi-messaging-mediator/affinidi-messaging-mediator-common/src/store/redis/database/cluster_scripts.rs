@@ -395,7 +395,7 @@ return 1
 
 /// Message slot: record one handover of a recipient's copy, in both modes
 /// (single-node uses it too; it is not part of the function library, for
-/// the reason `MediatorStore::mark_delivered` gives). Writes nothing when
+/// the reason `MessageStore::mark_delivered` gives). Writes nothing when
 /// the recipient holds no copy, so a mark racing a delete never recreates
 /// the metadata hash.
 ///

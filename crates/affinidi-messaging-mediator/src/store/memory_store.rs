@@ -11,11 +11,13 @@
 //!   so SDK cursor handling is identical).
 //! - **TTL**: native (Redis) and lazy (here). Sessions and OOB invites
 //!   have an `expires_at` field; reads return `None` (or an error) for
-//!   expired entries and remove them on access. A periodic external
-//!   sweep is unnecessary — the store stays correct without one.
-//! - **Atomicity**: every public method holds the inner mutex for the
-//!   whole call, so composite ops (`store_message`, `delete_message`,
-//!   `account_remove`) are atomic by construction.
+//!   expired entries and remove them on access. Reads keep the store
+//!   correct; `sweep_expired_sessions` reclaims what is never read again.
+//! - **Atomicity**: each method holds the inner mutex for its whole call,
+//!   so `store_message`, `delete_message_in`, `account_update` and
+//!   `access_list_update` are atomic. Methods built from other methods —
+//!   `account_remove`, `setup_admin_account`, the purges — take it once
+//!   per step and are not.
 //! - **Pub/sub**: in-process only via [`broadcast::channel`].
 //!   `streaming_publish_message` calls succeed even with no
 //!   subscribers — matching Redis' fire-and-forget `PUBLISH`.
@@ -251,7 +253,7 @@ struct MemoryState {
     /// by `sweep_expired_messages`.
     receipts: HashMap<(String, String), HashMap<String, (OutboxReceipt, u64)>>,
     /// `(recipient_hash, msg_id) -> until_secs`: the recipient removed its own
-    /// copy itself. See `MediatorStore::acknowledged`. Pruned by
+    /// copy itself. See `MessageStore::acknowledged`. Pruned by
     /// `sweep_expired_messages`.
     acknowledged: HashMap<(String, String), u64>,
 
@@ -270,7 +272,7 @@ struct MemoryState {
 
     // ─── DIDComm v1 routing keys ────────────────────────────────────
     /// base58 routing verkey → `(owning DID, its hash)`. A verkey binds to at
-    /// most one DID; see `MediatorStore::v1_routing_key_bind`. Both forms are
+    /// most one DID; see `V1RoutingKeyStore::v1_routing_key_bind`. Both forms are
     /// kept because forward ingress needs the DID while account removal works
     /// from the hash.
     v1_routing_keys: HashMap<String, (String, String)>,
@@ -493,7 +495,7 @@ impl MemoryStore {
     /// Publish one live-streaming record into this instance's broadcast
     /// channel. `verbatim` marks the body as the frame itself rather than a
     /// notification to drain the stored inbox (see
-    /// `MediatorStore::streaming_publish_verbatim`).
+    /// `StreamingStore::streaming_publish_verbatim`).
     async fn publish_record(
         &self,
         did_hash: &str,

@@ -41,12 +41,14 @@ pub trait MediatorStoreExt: MediatorStore {
     /// and the metadata record atomically.
     ///
     /// When the message has a recorded sender, also leaves that sender an
-    /// [`OutboxReceipt`] saying why it left ([`ops::removal_reason`]), kept for
-    /// [`OUTBOX_RECEIPT_TTL`] and read by
+    /// [`OutboxReceipt`](crate::store::OutboxReceipt) saying why it left ([`ops::removal_reason`](crate::store::ops::removal_reason)), kept for
+    /// [`OUTBOX_RECEIPT_TTL`](crate::store::OUTBOX_RECEIPT_TTL) and read by
     /// [`sent_message_states`](crate::store::MessageStore::sent_message_states). Every removal goes
     /// through here — a recipient's acknowledgement, a fetch with delete, a
-    /// purge, the expiry sweep, account removal — which is what makes the
-    /// receipt a complete record rather than a sample.
+    /// purge, the expiry sweep, account removal. The in-process backends write
+    /// the receipt with the removal; Redis writes it just after, best-effort,
+    /// so a failure there leaves that copy's answer `Unknown` rather than
+    /// failing a removal that already happened.
     async fn delete_message(
         &self,
         message_hash: &str,
@@ -147,14 +149,12 @@ pub trait MediatorStoreExt: MediatorStore {
     /// Fetch messages and record that they were handed over.
     ///
     /// The delivery paths call this rather than [`fetch_messages`] so the
-    /// marking lives in one place. There are five call sites — REST fetch, the
-    /// websocket handler, the streaming task, message-pickup and v1 mediation
-    /// — and a stamp that five callers have to remember is a stamp that will be
-    /// missing from the sixth.
+    /// marking lives in one place: a stamp that every delivery path has to
+    /// remember is a stamp that will be missing from the next one.
     ///
-    /// Marking failures are swallowed by [`mark_delivered`]'s contract, so this
-    /// returns exactly what `fetch_messages` returned. A pickup that succeeded
-    /// is not failed because its bookkeeping did not.
+    /// A backend that cannot record the stamp answers [`mark_delivered`] with
+    /// an empty report rather than an error, so a pickup is not failed by
+    /// bookkeeping it could not do; a storage error is still returned.
     ///
     /// [`fetch_messages`]: crate::store::MessageStore::fetch_messages
     /// [`mark_delivered`]: crate::store::MessageStore::mark_delivered
@@ -280,7 +280,7 @@ pub trait MediatorStoreExt: MediatorStore {
     /// [`purge_folder`](Self::purge_folder), deleting with `by`'s authority.
     ///
     /// The authority decides the outbox receipt each sender gets (see
-    /// [`ops::removal_reason`]): a purge by the folder's owner reads as
+    /// [`ops::removal_reason`](crate::store::ops::removal_reason)): a purge by the folder's owner reads as
     /// `collected` (inbox) or `withdrawn` (outbox), while one the mediator
     /// does on someone else's behalf — an admin purging another account, or
     /// account removal — must pass [`DeletionAuthority::Admin`] so senders see

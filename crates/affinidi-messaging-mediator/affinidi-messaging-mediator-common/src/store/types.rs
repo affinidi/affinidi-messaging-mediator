@@ -86,7 +86,7 @@ pub struct Session {
     /// record.
     ///
     /// Session **storage** lifetime is controlled solely by the `ttl`
-    /// argument to `MediatorStore::put_session`: Redis applies it via
+    /// argument to `SessionStore::put_session`: Redis applies it via
     /// `EXPIRE` (and doesn't even persist this field), while Fjall and
     /// memory store their own expiry derived from that `ttl` and reclaim
     /// lapsed records via lazy reads plus the background
@@ -97,13 +97,13 @@ pub struct Session {
     /// Hash of the most recently issued refresh token. Used to enforce
     /// one-time-use semantics on refresh: the handler hands the presented
     /// token's hash and its replacement to
-    /// `MediatorStore::rotate_refresh_token_hash`, which swaps them only if
+    /// `SessionStore::rotate_refresh_token_hash`, which swaps them only if
     /// the presented one is current. `None` until the first refresh token is
     /// issued (i.e., for `ChallengeSent` sessions pre-auth).
     pub refresh_token_hash: Option<String>,
 }
 
-/// Outcome of `MediatorStore::rotate_refresh_token_hash`.
+/// Outcome of `SessionStore::rotate_refresh_token_hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshRotation {
     /// The presented hash was the current one and has been replaced.
@@ -294,7 +294,7 @@ pub struct ForwardQueueEntry {
     pub not_before_ms: u128,
 }
 
-/// One page of a [`forward_queue_autoclaim`](crate::store::MediatorStore::forward_queue_autoclaim)
+/// One page of a [`forward_queue_autoclaim`](crate::store::ForwardQueueStore::forward_queue_autoclaim)
 /// scan.
 #[derive(Clone, Debug, Default)]
 pub struct ForwardQueueClaimPage {
@@ -422,7 +422,7 @@ impl MetadataStats {
     }
 }
 
-/// Counter that [`MediatorStore::stats_increment`](crate::store::MediatorStore::stats_increment) understands. Adding a
+/// Counter that [`StatsStore::stats_increment`](crate::store::StatsStore::stats_increment) understands. Adding a
 /// variant requires teaching every backend to recognise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatCounter {
@@ -643,7 +643,7 @@ impl OutboxReceipt {
 }
 
 /// Where a message the requester sent now stands, as
-/// [`MediatorStore::sent_message_states`](crate::store::MediatorStore::sent_message_states)
+/// [`MessageStore::sent_message_states`](crate::store::MessageStore::sent_message_states)
 /// answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -662,11 +662,11 @@ pub enum SentMessageState {
 
 /// The recipient-side facts a delivery gate needs, resolved in one lookup.
 ///
-/// Returned by [`MediatorStore::delivery_decision`]. Existence is carried by
+/// Returned by [`AclStore::delivery_decision`]. Existence is carried by
 /// the `Option` around this struct, so a caller that would otherwise call
 /// `account_exists` separately does not need to.
 ///
-/// [`MediatorStore::delivery_decision`]: crate::store::MediatorStore::delivery_decision
+/// [`AclStore::delivery_decision`]: crate::store::AclStore::delivery_decision
 #[derive(Clone, Debug)]
 pub struct DeliveryDecision {
     /// The recipient's stored ACL set — check capabilities against this.
@@ -688,7 +688,7 @@ pub enum StreamingKind {
     Mux,
 }
 
-/// How [`MediatorStore::streaming_claim`](super::MediatorStore::streaming_claim)
+/// How [`StreamingStore::streaming_claim`](super::StreamingStore::streaming_claim)
 /// treats an entry another instance owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamingWrite {
@@ -701,7 +701,7 @@ pub enum StreamingWrite {
     Update,
 }
 
-/// [`MediatorStore::streaming_claim`](super::MediatorStore::streaming_claim)'s
+/// [`StreamingStore::streaming_claim`](super::StreamingStore::streaming_claim)'s
 /// answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamingClaim {

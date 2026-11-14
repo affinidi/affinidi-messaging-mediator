@@ -184,7 +184,7 @@ pub struct RedisStore {
     pub(crate) handler: DatabaseHandler,
     circuit_breaker: Arc<CircuitBreaker>,
     lua_scripts_path: Option<String>,
-    /// The library source [`MediatorStore::initialize`] loads, when given
+    /// The library source [`StoreLifecycle::initialize`] loads, when given
     /// (see [`with_library`](Self::with_library)); else the file at
     /// `lua_scripts_path`.
     library_source: Option<(Arc<str>, String)>,
@@ -210,7 +210,7 @@ impl RedisStore {
     /// Construct a new `RedisStore` from a connected `DatabaseHandler`.
     ///
     /// `lua_scripts_path` should match `config.database.functions_file`
-    /// from the mediator config. When `None`, [`MediatorStore::initialize`]
+    /// from the mediator config. When `None`, [`StoreLifecycle::initialize`]
     /// returns an error — the Redis backend cannot operate without its
     /// Lua functions loaded.
     pub fn new(
@@ -237,7 +237,7 @@ impl RedisStore {
     }
 
     /// Load `source` (an `atm-functions.lua` library; `origin` names it in
-    /// the log) on [`MediatorStore::initialize`], rather than reading the
+    /// the log) on [`StoreLifecycle::initialize`], rather than reading the
     /// file at `lua_scripts_path`. The mediator passes the library compiled
     /// into it, so the library it loads is always the one it was built with.
     pub fn with_library(mut self, source: impl Into<Arc<str>>, origin: impl Into<String>) -> Self {
@@ -682,7 +682,7 @@ impl MessageStore for RedisStore {
         // mark racing a delete or the expiry sweeper cannot recreate the
         // metadata hash as an orphan — `HSETNX`/`HINCRBY` would create it on
         // a missing key. The script is not part of the function library, for
-        // the reasons on `MediatorStore::mark_delivered`.
+        // the reasons on `MessageStore::mark_delivered`.
         //
         // `HSETNX` on the first-delivery stamp is what makes the stamp itself
         // idempotent: the first handover wins and a redelivery leaves it

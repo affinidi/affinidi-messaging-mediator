@@ -43,13 +43,13 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     ) -> Result<String, MediatorError>;
 
     /// Delete the records of `message_hash` that `scope` names
-    /// ([`ops::select_records`] gives the rules, which every backend follows).
+    /// ([`ops::select_records`](crate::store::ops::select_records) gives the rules, which every backend follows).
     ///
     /// Each chosen record is removed exactly once with its queue entries,
     /// counters and expiry entry, and leaves its sender a receipt, as
     /// [`delete_message`](crate::store::MediatorStoreExt::delete_message) describes. Returns
     /// `not_found` when no record is in scope (or `message_hash` is not a
-    /// message id, [`ops::is_message_id`]), `permission_denied` when `by` may
+    /// message id, [`ops::is_message_id`](crate::store::ops::is_message_id)), `permission_denied` when `by` may
     /// not remove one that is. On success, the copies removed. Several records are removed together
     /// where the backend can (one Lua call, one Fjall batch, one lock), and
     /// otherwise each on its own, never leaving one half-removed.
@@ -69,7 +69,7 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     ///
     /// Every backend records this when an owner's delete removes the copy
     /// held for that owner, and keeps it until the copy's own expiry (or
-    /// [`ACKNOWLEDGED_FALLBACK_TTL`] for a copy stored without one): no
+    /// [`ACKNOWLEDGED_FALLBACK_TTL`](crate::store::ACKNOWLEDGED_FALLBACK_TTL) for a copy stored without one): no
     /// redelivery of that copy can arrive later. Removals by the sender or
     /// the mediator (withdrawal, expiry, admin, account removal) record
     /// nothing. A client delete uses it to tell a repeated acknowledgement
@@ -77,7 +77,7 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError>;
 
     /// The receipts `from_did_hash` holds for the copies of `msg_id` removed
-    /// within [`OUTBOX_RECEIPT_TTL`], one per recipient:
+    /// within [`OUTBOX_RECEIPT_TTL`](crate::store::OUTBOX_RECEIPT_TTL), one per recipient:
     /// `(recipient, receipt)`. Receipts are per recipient, so one copy's
     /// removal never stands for another's.
     async fn outbox_receipts(
@@ -89,13 +89,13 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// Where each of `msg_ids` stands for `sender_did_hash`, in the order asked
     /// (`messaging/message/status/0.1`). An id the sender stored for several
     /// recipients answers for all of its copies, held and removed
-    /// ([`ops::sent_message_state`]).
+    /// ([`ops::sent_message_state`](crate::store::ops::sent_message_state)).
     ///
     /// A held message answers `Queued` or `Delivered`, and a removed one
     /// answers from its receipt, but only when `sender_did_hash` is the
     /// message's recorded sender: anything else is `Unknown`, identically, so
     /// the answer cannot be used to learn whether another account's message
-    /// exists. See [`ops::sent_message_state`].
+    /// exists. See [`ops::sent_message_state`](crate::store::ops::sent_message_state).
     async fn sent_message_states(
         &self,
         sender_did_hash: &str,
@@ -189,7 +189,7 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// The record's expiry becomes the deadline, and an index entry is
     /// **added** for it; the original entry is left. Every sweeper removes a
     /// record only from an entry at or after the record's current expiry
-    /// ([`ops::expiry_entry_is_due`]), so the deadline's entry removes it and
+    /// ([`ops::expiry_entry_is_due`](crate::store::ops::expiry_entry_is_due)), so the deadline's entry removes it and
     /// the original, reached later, finds it gone (`already_deleted`) and is
     /// dropped. The same rule keeps an entry left by an earlier copy of the
     /// same bytes for the same recipient from removing a later copy early.
@@ -301,7 +301,7 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
 
     /// How many messages `from_hash` currently has queued **for `to_hash`
     /// specifically** — the per-relationship counterpart to the per-DID
-    /// totals on [`Account`].
+    /// totals on [`Account`](crate::types::accounts::Account).
     ///
     /// This exists because a per-DID send total cannot tell fan-out from
     /// flooding. A community sending one membership card each to two hundred

@@ -111,7 +111,7 @@ impl Keys {
     }
 
     /// That `to` removed its own copy of a message itself
-    /// (`MediatorStore::acknowledged`): a flag that expires with the copy.
+    /// (`MessageStore::acknowledged`): a flag that expires with the copy.
     /// Keyed under the recipient, in its account's slot.
     pub fn acknowledged(self, to_hash: &str, message_hash: &str) -> String {
         [&self.tagged("ACKED:", to_hash), ":", message_hash].concat()

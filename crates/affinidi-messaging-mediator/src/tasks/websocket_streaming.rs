@@ -26,7 +26,7 @@
  Both are at-least-once, consistent with the message-pickup delete-to-ack
  contract. Disabling live delivery deliberately does *not* redeliver.
 
- The notification stream comes from `MediatorStore::streaming_subscribe`,
+ The notification stream comes from `StreamingStore::streaming_subscribe`,
  so the task runs unchanged whether the backend is Redis pub/sub,
  Fjall's in-process broadcast, or the test MemoryStore.
 */

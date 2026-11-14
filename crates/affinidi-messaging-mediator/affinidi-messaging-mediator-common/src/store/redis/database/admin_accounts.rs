@@ -132,13 +132,13 @@ impl Database {
     /// Adds up to 100 admin accounts to the mediator
     /// - `accounts` - The list of accounts to add
     ///
-    /// Superseded by [`MediatorStore::add_admin_accounts`] (default
+    /// Superseded by [`MediatorStoreExt::add_admin_accounts`] (default
     /// impl loops over [`setup_admin_account`]); kept as a Redis-
     /// specific helper for operator tooling that may want a single
     /// pipelined batch.
     ///
-    /// [`MediatorStore::add_admin_accounts`]: crate::store::MediatorStore::add_admin_accounts
-    /// [`setup_admin_account`]: crate::store::MediatorStore::setup_admin_account
+    /// [`MediatorStoreExt::add_admin_accounts`]: crate::store::MediatorStoreExt::add_admin_accounts
+    /// [`setup_admin_account`]: crate::store::AccountStore::setup_admin_account
     #[allow(dead_code)]
     pub(crate) async fn add_admin_accounts(
         &self,

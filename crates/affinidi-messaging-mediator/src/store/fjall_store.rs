@@ -14,35 +14,50 @@
 //! layout, which is unchanged. Each keyspace carries its own memtable,
 //! so the count here is also the process's memtable count.
 //!
-//! - `messages`           — `{msg_id}:{to_did_hash}` → message body (UTF-8),
-//!   one row per recipient of a body. Also carries the per-message metadata
-//!   (`bytes`, peer DID hashes, timestamp, expiry), so `get_message_metadata`
-//!   reads it directly; there is no separate metadata keyspace. A row keyed
-//!   by the bare `msg_id` was written before rows were per recipient and is
-//!   still read for its recipient (see `record_key`).
-//! - `inbox`              — `{did_hash}:{stream_id}` → inbox entry
-//! - `outbox`             — `{did_hash}:{stream_id}` → outbox entry
-//! - `expiry`             — `{expires_at_secs}{messages key}` → empty
+//! Keys are byte strings. `‖` is concatenation with **no** separator, which
+//! is sound only because DID hashes are fixed-length (see the store module's
+//! "Keys and DID hashes"); `0xFF` and `0x00` are literal separator bytes, and
+//! `be16` is a stream id as two big-endian `u64`s (`ms`, `seq`).
+//!
+//! - `messages`           — `msg_id ‖ ":" ‖ to_did_hash` → the stored record
+//!   (body and metadata: `bytes`, peer DID hashes, timestamp, expiry,
+//!   delivery state), one row per recipient of a body; there is no separate
+//!   metadata keyspace. A row keyed by the bare `msg_id` was written before
+//!   rows were per recipient and is still read for its recipient (see
+//!   `record_key`).
+//! - `inbox`, `outbox`    — `did_hash ‖ be16` → stream entry
+//! - `expiry`             — `expires_at (be u64) ‖ messages key` → empty
 //! - `sessions`           — `session_id` → JSON-serialised [`Session`]
 //! - `accounts`           — `did_hash` → JSON-serialised account record.
 //!   Carries the ACL bitmask inline, so there is no separate ACL keyspace.
-//! - `access_lists`       — `{did_hash}:{member_did_hash}` → empty
-//! - `admins`             — `did_hash` → role flag (1=Admin,
-//!   2=RootAdmin, 3=Mediator)
+//! - `access_lists`       — `did_hash ‖ member_did_hash` → empty
+//! - `admins`             — `did_hash` → empty; membership of the admin set
+//! - `v1_routing_keys`    — base58 verkey → the bound DID
 //! - `mux_records`        — member `did_hash` → JSON mux grant record
-//! - `mux_principals`     — `{principal_hash} 0xFF {member_did_hash}` → empty
+//! - `mux_principals`     — `principal_hash 0xFF member_did_hash` → empty
 //! - `oob_invites`        — `oob_id` → JSON `{ invite_b64, did_hash,
 //!   expires_at }`
 //! - `trust_task_claims`  — claim key → JSON `{ digest, retain_until }`; the
 //!   Trust Task duplicate-execution record, swept once `retain_until` passes
 //! - `scid_sources`       — did:scid account hash → the resolver's serialised
 //!   source record (sources and latest verified log version, VTI-KEY-162)
-//! - `forward_queue`      — `stream_id` → JSON-serialised
-//!   [`ForwardQueueEntry`]
-//! - `forward_pending`    — `{group}:{stream_id}` → claim metadata
-//! - `globals`            — counter name → `i64` little-endian
-//! - `audit_log`          — `{stream_id}` → JSON-serialised
-//!   [`AuditLogEntry`]; ascending by insertion (oldest-first), bounded ring
+//! - `forward_queue`      — `be16` → JSON-serialised [`ForwardQueueEntry`]
+//! - `forward_pending`    — `group 0x00 be16` → claim metadata
+//! - `peer_queue`         — `from_hash 0xFF to_hash` → `u32` messages queued
+//!   for that one recipient
+//! - `outbox_receipts`    — `from_hash 0xFF msg_id ":" to_hash` → why that
+//!   copy left the queue; also `"ACK\0" to_hash 0xFF msg_id` → until when an
+//!   acknowledgement is remembered
+//! - `outbox_receipt_expiry` — `expires_at (be u64) ‖ receipt key` → empty
+//! - `globals`            — counters (`i64` little-endian) and, by prefix,
+//!   `STATS:{did_hash}` (account counters), `ACTIVITY:{R|A}:{did_hash}`,
+//!   `FWD_LAST:{group}` (a consumer group's read cursor) and
+//!   `CONFIG_OVERRIDES`
+//! - `audit_log`          — `be16` → JSON-serialised [`AuditLogEntry`];
+//!   ascending by insertion (oldest-first), bounded ring
+//!
+//! That is 21 keyspaces. A data directory from before the streaming registry
+//! moved to memory also has `streaming_clients`, dropped at open.
 //!
 //! # In-process state
 //!
@@ -128,8 +143,8 @@ const PUBSUB_BROADCAST_CAPACITY: usize = 32;
 /// Memory tuning for the embedded Fjall database.
 ///
 /// Fjall's stock defaults are sized for a general-purpose embedded store, not
-/// for a service that opens 15 keyspaces: 64 MiB of memtable *per keyspace*
-/// would permit ~896 MiB of write buffer on its own. These values come from
+/// for a service that opens 21 keyspaces: 64 MiB of memtable *per keyspace*
+/// would permit over a GiB of write buffer on its own. These values come from
 /// `[storage.fjall]`.
 #[derive(Clone, Copy, Debug)]
 pub struct FjallTuning {
@@ -193,8 +208,11 @@ const KEYSPACE_WRITE_WEIGHTS: &[(&str, u32)] = &[
     // Per-session and per-account rows: steady but small.
     (PARTITION_SESSIONS, 4),
     (PARTITION_ACCOUNTS, 2),
-    (PARTITION_STREAMING_CLIENTS, 2),
     (PARTITION_AUDIT_LOG, 2),
+    // Small rows written on every message stored or removed.
+    (PARTITION_PEER_QUEUE, 2),
+    (PARTITION_OUTBOX_RECEIPTS, 2),
+    (PARTITION_OUTBOX_RECEIPT_EXPIRY, 1),
     // Cold: written on admin action only.
     (PARTITION_ACCESS_LISTS, 1),
     (PARTITION_ADMINS, 1),
@@ -202,6 +220,8 @@ const KEYSPACE_WRITE_WEIGHTS: &[(&str, u32)] = &[
     (PARTITION_MUX_RECORDS, 1),
     (PARTITION_MUX_PRINCIPALS, 1),
     (PARTITION_OOB_INVITES, 1),
+    (PARTITION_TRUST_TASK_CLAIMS, 1),
+    (PARTITION_SCID_SOURCES, 1),
     (PARTITION_GLOBALS, 1),
 ];
 
@@ -245,8 +265,6 @@ const PARTITION_GLOBALS: &str = "globals";
 /// `globals` key holding the `config/patch` overrides, a JSON object.
 const CONFIG_OVERRIDES_KEY: &str = "CONFIG_OVERRIDES";
 
-/// `globals` key holding one of an account's activity times (a big-endian
-/// `u64` of Unix seconds). One key per [`ActivityKind`], so recording one
 /// `globals` key holding an account's lifetime counters, a JSON
 /// [`AccountStats`]. One key per account: a bump is one read-modify-write
 /// under the write lock, which is also what keeps it consistent with the
@@ -255,6 +273,8 @@ fn stats_key(did_hash: &str) -> String {
     format!("STATS:{did_hash}")
 }
 
+/// `globals` key holding one of an account's activity times (a big-endian
+/// `u64` of Unix seconds). One key per [`ActivityKind`], so recording one
 /// never rewrites the other. `None` for a kind this store does not keep.
 fn activity_key(kind: ActivityKind, did_hash: &str) -> Option<String> {
     let tag = match kind {
@@ -307,7 +327,7 @@ fn outbox_receipt_copy_key(from: &str, msg_id: &str, to: &str) -> Vec<u8> {
 }
 
 /// Key of the record that `to` removed its own copy of `msg_id` itself
-/// (`MediatorStore::acknowledged`): `"ACK\0" || to || 0xFF || msg_id`. Kept in
+/// (`MessageStore::acknowledged`): `"ACK\0" || to || 0xFF || msg_id`. Kept in
 /// the `outbox_receipts` keyspace, which the receipt sweep prunes through
 /// `outbox_receipt_expiry`; a sender hash is hex, so no receipt key starts
 /// with `ACK\0`.
@@ -357,7 +377,7 @@ pub struct FjallStore {
     access_lists: Keyspace,
     admins: Keyspace,
     /// base58 routing verkey -> owning account's DID hash. See
-    /// `MediatorStore::v1_routing_key_bind`.
+    /// `V1RoutingKeyStore::v1_routing_key_bind`.
     v1_routing_keys: Keyspace,
     mux_records: Keyspace,
     mux_principals: Keyspace,
@@ -411,7 +431,7 @@ pub struct FjallStore {
     /// Probe-driven circuit breaker. The embedded store has no
     /// per-request connection chokepoint like the Redis backend, so the
     /// breaker is driven by a cheap point read in
-    /// [`circuit_breaker_state`](MediatorStore::circuit_breaker_state):
+    /// [`circuit_breaker_state`](StoreLifecycle::circuit_breaker_state):
     /// disk errors trip it open and `/readyz` degrades accordingly.
     circuit_breaker: CircuitBreaker,
 }
@@ -607,7 +627,7 @@ impl StoredAccount {
 /// lazily on read — Fjall has no native TTL, so expired sessions
 /// linger on disk until they're either touched (lazy expiry in
 /// `get_session`) or reclaimed by the background
-/// [`sweep_expired_sessions`](MediatorStore::sweep_expired_sessions)
+/// [`sweep_expired_sessions`](SessionStore::sweep_expired_sessions)
 /// pass.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredSession {
@@ -746,7 +766,7 @@ impl FjallStore {
     /// Publish one live-streaming record into this instance's broadcast
     /// channel. `verbatim` marks the body as the frame itself rather than a
     /// notification to drain the stored inbox (see
-    /// `MediatorStore::streaming_publish_verbatim`).
+    /// `StreamingStore::streaming_publish_verbatim`).
     async fn publish_record(
         &self,
         did_hash: &str,
@@ -2376,15 +2396,10 @@ impl SessionStore for FjallStore {
         Ok(())
     }
 
-    /// Override the trait default's `get_session → mutate → put_session
-    /// → delete_session` sequence with a single atomic batch. The
-    /// default leaves a brief window where both the old
-    /// (`ChallengeSent`) and new (`Authenticated`) session keys exist —
-    /// and if the process crashes between the put and the delete, the
-    /// old key lingers until lazy expiry or the session sweeper reaps
-    /// it. Doing the promote-and-rename as one `db.batch()` removes that
-    /// window: the new key appears and the old one disappears together
-    /// or not at all.
+    /// The promote-and-rename as one `db.batch()` under the write lock: the
+    /// new (`Authenticated`) key appears and the old (`ChallengeSent`) one
+    /// disappears together or not at all, so the two never coexist, even
+    /// across a crash.
     async fn update_session_authenticated(
         &self,
         old_session_id: &str,

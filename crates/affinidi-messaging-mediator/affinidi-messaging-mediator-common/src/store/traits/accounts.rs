@@ -43,13 +43,23 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     /// the FORWARD_Q are intentionally left alone — letting them flush
     /// is preferable to a queue scan, and the protocol exposes no
     /// option to override.
+    ///
+    /// Not atomic: each step is its own write. The account is blocked first,
+    /// so a failure part-way leaves it blocked with its record in place, and
+    /// running the removal again resumes it
+    /// ([`purge_left_messages`](crate::store::purge_left_messages)).
     async fn account_remove(
         &self,
         session: &Session,
         did_hash: &str,
     ) -> Result<bool, MediatorError>;
 
-    /// List up to 100 accounts using a server-side cursor.
+    /// List up to `limit` (at most 100) accounts from `cursor` (`0` to
+    /// start); the returned cursor continues the listing, `0` when it is
+    /// done. The cursor is backend-specific: an offset on Fjall and memory,
+    /// an `SSCAN` cursor on Redis, which may return more than `limit` in a
+    /// page and may repeat an account across pages, so a caller collecting
+    /// the whole listing de-duplicates.
     async fn account_list(
         &self,
         cursor: u32,
@@ -59,7 +69,9 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     /// Change an account's role type. When promoting to `Admin` /
     /// `RootAdmin` / `Mediator` the backend also adds the DID to the
     /// admin set; when demoting back to `Standard` it removes from the
-    /// admin set. Atomic with respect to the role + admin-set update.
+    /// admin set. Atomic on every backend but Redis in cluster mode, where
+    /// the global `ADMINS` set is a separate step ordered so a failure never
+    /// grants more than either end state.
     async fn account_set_role(
         &self,
         did_hash: &str,

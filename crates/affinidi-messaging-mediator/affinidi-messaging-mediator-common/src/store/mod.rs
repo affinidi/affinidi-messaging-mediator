@@ -1,9 +1,41 @@
-//! Storage backend trait for the Affinidi Messaging Mediator.
+//! Storage backend traits for the Affinidi Messaging Mediator.
 //!
-//! [`MediatorStore`] is the semantic interface every backend must satisfy.
-//! It is shaped from the *consumer* perspective — what the mediator's
-//! request handlers, background tasks, and processors actually need —
-//! rather than wrapping any one backend's primitives.
+//! [`MediatorStore`] is the semantic interface every backend satisfies. It
+//! is shaped from the *consumer* perspective — what the mediator's request
+//! handlers, background tasks, and processors actually need — rather than
+//! wrapping any one backend's primitives.
+//!
+//! # Trait layout
+//!
+//! `MediatorStore` is a facade with no methods of its own: it is the sum of
+//! the capability traits, and every type implementing all of them is a
+//! `MediatorStore`.
+//!
+//! | Trait                  | Covers                                                        |
+//! |------------------------|---------------------------------------------------------------|
+//! | [`StoreLifecycle`]     | start-up, health, shutdown, circuit breaker, process scope    |
+//! | [`MessageStore`]       | message records, inbox/outbox, delivery state, receipts, expiry sweep |
+//! | [`SessionStore`]       | sessions and refresh tokens                                   |
+//! | [`AccountStore`]       | accounts, roles, queue limits, admins, activity, counters     |
+//! | [`AclStore`]           | ACLs, access lists, the delivery decision                     |
+//! | [`StatsStore`]         | the mediator-wide counters                                    |
+//! | [`ForwardQueueStore`]  | the forwarding queue                                          |
+//! | [`StreamingStore`]     | live-streaming registry and pub/sub                           |
+//! | [`MuxStore`]           | DID multiplexing grants                                       |
+//! | [`V1RoutingKeyStore`]  | the DIDComm v1 routing-key index                              |
+//! | [`AuditStore`]         | the audit log                                                 |
+//! | [`AuxiliaryStore`]     | OOB invitations, Trust Task claims, did:scid sources, config overrides |
+//!
+//! Methods have no defaults, except where the default is correct for every
+//! backend and overriding it is only an optimisation (`get_messages`,
+//! `delivery_states`, `streaming_owners`), so a backend cannot silently
+//! inherit a no-op. A single-process backend opts out of cross-process
+//! coordination explicitly ([`single_process`]). Algorithms built on the
+//! capabilities and the same for every backend — purges, fair pickup,
+//! delivery recording — are in [`MediatorStoreExt`], which no backend
+//! overrides. The decisions and state transitions the in-process backends
+//! share are in [`ops`]; Redis does the same in Lua, and the
+//! `store_conformance` suite holds all three to one behaviour.
 //!
 //! # Backend selection
 //!
@@ -29,10 +61,47 @@
 //!
 //! # Atomicity
 //!
-//! Every method is atomic at its own scope: a single trait method either
-//! succeeds in full or fails leaving no partial state. Composite operations
-//! that span multiple methods are not transactional — callers must accept
-//! that intermediate states are observable.
+//! Not every method is atomic, and callers must not assume it. What each
+//! backend guarantees:
+//!
+//! - **Memory**: each method holds the state lock for its whole call, so
+//!   single-record methods are atomic. Composites built from other methods
+//!   (`account_remove`, the purges) take it once per step.
+//! - **Fjall**: writes go through one batch under the write lock per
+//!   method, so single-record methods are atomic, crash included.
+//!   Composites, as for memory, are a batch per step.
+//! - **Redis**: a method is one stored function or script where it can be.
+//!   A script that fails part-way is **not** rolled back: Redis keeps the
+//!   writes made before the failure. The `account_update` and
+//!   `access_list_update` scripts carry a `#!lua` shebang,
+//!   so an out-of-memory server refuses them whole instead. With cluster
+//!   mode on, an operation whose keys span slots runs as ordered steps (each
+//!   atomic), in an order chosen so an interruption is resumable or harmless
+//!   — never more privilege, never a message listed that is not stored.
+//!
+//! Atomic on every backend: `store_message` and `delete_message_in` for one
+//! record (Redis cluster mode: ordered, lease-guarded steps), the session
+//! promotion and refresh rotation, `account_create`, `access_list_add`,
+//! [`account_update`](AccountStore::account_update) and
+//! [`access_list_update`](AclStore::access_list_update) (Redis cluster mode:
+//! the global `ADMINS` set is a separate, ordered step), the mux record CAS,
+//! and the forward-queue finish.
+//!
+//! Not atomic, by design: `account_remove` (block, purge, then remove; a
+//! failure leaves the account blocked, and running it again resumes), the
+//! purges (paged, each message removed on its own, reported in
+//! [`PurgeReport`]), `mark_delivered` (best-effort bookkeeping; on Redis one
+//! write per message), and the outbox receipt a removal leaves on Redis
+//! (written after the delete, best-effort: a failure is logged and the
+//! sender's answer for that copy is `Unknown`).
+//!
+//! # Keys and DID hashes
+//!
+//! Backends build keys by concatenating DID hashes, mostly without a
+//! separator (the `peer_queue`, mux principal and receipt keys use `0xFF`).
+//! That relies on every DID hash being the 64-character hex SHA-256 the
+//! mediator computes: fixed-length, so one hash is never a prefix of another.
+//! The store does not check this; callers must only pass such hashes.
 //!
 //! # Error model
 //!
@@ -67,7 +136,7 @@ pub const MAX_FAIR_WINDOW: usize = 500;
 /// [`DeliveryState::attempts`](crate::store::types::DeliveryState::attempts).
 pub const POISON_ATTEMPTS: u32 = 5;
 
-/// Metric names emitted by [`MediatorStore::fetch_messages_delivering`].
+/// Metric names emitted by [`MediatorStoreExt::fetch_messages_delivering`].
 ///
 /// Defined here, beside the code that emits them, and re-exported from the
 /// mediator's own `metrics::names` where every other metric is documented —
@@ -85,7 +154,7 @@ pub mod delivery_metrics {
     pub const DELIVERED_EXPIRY_ADVANCED: &str = "messages_delivered_expiry_advanced_total";
 }
 
-/// What one [`mark_delivered`](MediatorStore::mark_delivered) call did.
+/// What one [`mark_delivered`](MessageStore::mark_delivered) call did.
 ///
 /// Returned rather than logged so the caller decides what to do with it — the
 /// shared fetch wrapper turns it into counters, and a backend that records
@@ -140,11 +209,11 @@ pub(crate) fn publish_delivery_metrics(report: &DeliveryMarkReport) {
 /// shorter.
 pub const MAX_PURGE_SCAN: usize = 10_000;
 
-/// Which messages a [`purge_folder_filtered`](MediatorStore::purge_folder_filtered)
+/// Which messages a [`purge_folder_filtered`](MediatorStoreExt::purge_folder_filtered)
 /// call should remove.
 ///
 /// An empty filter matches everything, which is what the unfiltered
-/// [`purge_folder`](MediatorStore::purge_folder) already does faster — so a
+/// [`purge_folder`](MediatorStoreExt::purge_folder) already does faster — so a
 /// caller with nothing to narrow by should use that instead.
 #[derive(Debug, Default, Clone)]
 pub struct PurgeFilter {
@@ -214,7 +283,7 @@ pub fn purge_left_messages(did_hash: &str, report: &PurgeReport) -> Result<(), M
 /// Messages one purge page lists and deletes together.
 const PURGE_PAGE: u32 = 100;
 
-/// The purge every backend runs ([`MediatorStore::purge_folder_by`]): one
+/// The purge every backend runs ([`MediatorStoreExt::purge_folder_by`]): one
 /// algorithm, so the backends cannot disagree on what a purge does.
 ///
 /// - Pages through the folder by cursor (the exclusive successor of the
@@ -430,7 +499,7 @@ pub fn session_not_awaiting_answer(session_id: &str) -> MediatorError {
 pub const OUTBOX_RECEIPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long an acknowledgement is remembered
-/// ([`MediatorStore::acknowledged`]) for a copy whose own expiry is not
+/// ([`MessageStore::acknowledged`]) for a copy whose own expiry is not
 /// known: one stored with no expiry, or by an earlier build that did not
 /// record it. The default `limits.message_expiry_seconds`.
 pub const ACKNOWLEDGED_FALLBACK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -462,7 +531,7 @@ pub enum TrustTaskClaim {
 
 /// Told of each message the expiry sweep removes: its id, and its metadata as
 /// it was just before the delete. See
-/// [`MediatorStore::sweep_expired_messages_observed`].
+/// [`MessageStore::sweep_expired_messages_observed`].
 pub type OnExpired<'a> = &'a (dyn Fn(&str, &MessageMetaData) + Send + Sync);
 
 // ─── Traits ──────────────────────────────────────────────────────────────────

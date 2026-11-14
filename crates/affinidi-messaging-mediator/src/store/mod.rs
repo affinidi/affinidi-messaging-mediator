@@ -5,9 +5,8 @@
 //! - `redis_store` (`redis-backend`): multi-mediator clusters with
 //!   cross-process pub/sub. Wraps the existing `Database` + Lua flow.
 //! - `fjall_store` (`fjall-backend`): single-node persistence, embedded
-//!   LSM. Lands in a later commit.
-//! - `memory_store` (`memory-backend`): tests-only, in-process. Lands
-//!   in a later commit.
+//!   LSM.
+//! - `memory_store` (`memory-backend`): tests-only, in-process.
 //!
 //! [`MediatorStore`]: affinidi_messaging_mediator_common::store::MediatorStore
 

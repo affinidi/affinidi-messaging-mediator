@@ -315,7 +315,7 @@ impl HandedOver {
 }
 
 /// Fetch messages to hand over, without recording anything: the same selection
-/// [`MediatorStore::fetch_messages_delivering`] makes (fair round-robin for a
+/// [`MediatorStoreExt::fetch_messages_delivering`] makes (fair round-robin for a
 /// fresh pickup when configured, stream order when paging), but neither
 /// stamping nor deleting — the caller records the handover with
 /// [`HandedOver::completion`] once the reply is written.
@@ -323,7 +323,7 @@ impl HandedOver {
 /// `options.delete_policy` is ignored: a delete is the caller's to make after
 /// the write.
 ///
-/// [`MediatorStore::fetch_messages_delivering`]: affinidi_messaging_mediator_common::store::MediatorStore::fetch_messages_delivering
+/// [`MediatorStoreExt::fetch_messages_delivering`]: affinidi_messaging_mediator_common::store::MediatorStoreExt::fetch_messages_delivering
 pub(crate) async fn fetch_for_handover(
     state: &crate::SharedData,
     session_id: &str,

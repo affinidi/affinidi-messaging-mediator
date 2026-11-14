@@ -28,11 +28,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// A `ChallengeSent` session may have no account yet (accounts are
     /// created once the challenge is answered) and is returned with default
     /// ACLs. Any other session whose DID has no account fails with
-    /// [`account_gone`]; a DID record without a role or ACLs is not an
+    /// [`account_gone`](crate::store::account_gone); a DID record without a role or ACLs is not an
     /// account. An empty `did` skips the join (store-internal use).
     ///
     /// A session that does not exist (or has expired) fails with
-    /// [`session_not_found`]. Every other error is a storage failure.
+    /// [`session_not_found`](crate::store::session_not_found). Every other error is a storage failure.
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError>;
 
     /// Delete a session record (logout, account removal).
@@ -65,7 +65,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
 
     /// Promote a `ChallengeSent` session to `Authenticated` under
     /// `new_session_id`, recording the refresh-token hash, and count it in
-    /// [`StatCounter::SessionsSuccess`].
+    /// [`StatCounter::SessionsSuccess`](crate::store::StatCounter::SessionsSuccess).
     ///
     /// One atomic step: the challenge session must still exist and still be
     /// waiting for its answer (a challenge is answered once), else

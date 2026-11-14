@@ -8,7 +8,7 @@
 //!
 //! Only meaningful for Redis-backed mediator deployments. The mediator
 //! also runs an in-process expiry sweep
-//! (via `MediatorStore::sweep_expired_messages`) that works against any
+//! (via `MessageStore::sweep_expired_messages`) that works against any
 //! backend — Memory and Fjall don't need this binary because they're
 //! single-process by design.
 //!
@@ -21,7 +21,7 @@
 //! It stops on SIGINT or SIGTERM, between sweeps.
 //!
 //! [`RedisStore`]: affinidi_messaging_mediator_common::store::redis::RedisStore
-//! [`sweep_expired_messages`]: affinidi_messaging_mediator_common::store::MediatorStore::sweep_expired_messages
+//! [`sweep_expired_messages`]: affinidi_messaging_mediator_common::store::MessageStore::sweep_expired_messages
 
 use affinidi_messaging_mediator_common::{
     database::DatabaseHandler,

@@ -392,11 +392,11 @@ return 1
     /// - `did_hash` - SHA256 hash of the DID
     /// - `_type` - AccountType to change to
     ///
-    /// Superseded by [`MediatorStore::account_set_role`]; kept here as
+    /// Superseded by [`AccountStore::account_set_role`]; kept here as
     /// a Redis-specific helper in case operator tooling needs the
     /// legacy entry point.
     ///
-    /// [`MediatorStore::account_set_role`]: crate::store::MediatorStore::account_set_role
+    /// [`AccountStore::account_set_role`]: crate::store::AccountStore::account_set_role
     #[allow(dead_code)]
     pub(crate) async fn account_change_type(
         &self,

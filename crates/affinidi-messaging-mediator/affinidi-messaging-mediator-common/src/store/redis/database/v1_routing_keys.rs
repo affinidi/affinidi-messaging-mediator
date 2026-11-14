@@ -3,7 +3,7 @@
 //! DIDComm v1 addresses a forward's destination by **base58 Ed25519 verkey**,
 //! while every routing, ACL, and storage decision in this mediator is keyed by
 //! DID hash. This index is the bridge. See
-//! [`MediatorStore::v1_routing_key_bind`](crate::store::MediatorStore::v1_routing_key_bind)
+//! [`V1RoutingKeyStore::v1_routing_key_bind`](crate::store::V1RoutingKeyStore::v1_routing_key_bind)
 //! for the security contract it has to uphold.
 //!
 //! Two keys per binding, mirroring how `ACCESS_LIST:` pairs with `KNOWN_DIDS`:

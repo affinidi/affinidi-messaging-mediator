@@ -1,9 +1,11 @@
 //! Backend-agnostic decision logic for the store layer.
 //!
 //! The storage backends reduce to persistence primitives; the *decisions*
-//! they share — authorization checks and the like — live here as pure,
-//! unit-tested functions so they cannot drift between backends. `FjallStore`
-//! and `MemoryStore` previously each carried their own copy of these checks.
+//! they share — authorization checks, record selection — and the *state
+//! transitions* — the delivery stamp, queue limits, access-list updates —
+//! live here as pure, unit-tested functions so they cannot drift between
+//! backends. `FjallStore` and `MemoryStore` each call them and only load and
+//! store their own record shapes.
 //!
 //! The Redis backend performs the equivalent checks server-side in Lua and is
 //! necessarily separate (Lua can't call Rust), so these functions cover the
@@ -324,7 +326,7 @@ pub fn delete_permission_denied(message_hash: &str, request_msg_id: Option<&str>
     )
 }
 
-/// One bound of a [`list_messages`](crate::store::MediatorStore::list_messages)
+/// One bound of a [`list_messages`](crate::store::MessageStore::list_messages)
 /// range, as `(ms, seq)`: `-` (the start of the stream), `+` (its end), a
 /// stream id `<ms>-<seq>`, or a bare `<ms>`, which as a start means
 /// `<ms>-0` and as an end `<ms>-<max>` (Redis's reading). Anything else is

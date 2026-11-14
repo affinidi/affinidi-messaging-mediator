@@ -141,7 +141,7 @@ impl DatabaseHandler {
                     let mut copies = Vec::with_capacity(removed.len());
                     for record in removed {
                         // The recipient removing its own copy is an
-                        // acknowledgement (`MediatorStore::acknowledged`).
+                        // acknowledgement (`MessageStore::acknowledged`).
                         if admin_did_hash.is_none() && record.to == did_hash {
                             self.record_acknowledged(
                                 &mut conn,

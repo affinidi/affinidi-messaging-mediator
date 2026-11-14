@@ -19,7 +19,7 @@
 //!    received the same bytes), the one whose copy was handed over first is
 //!    acknowledged first, then session order ([`ack_order`]);
 //! 2. otherwise, if an owner already acknowledged its own copy of this id
-//!    ([`MediatorStore::acknowledged`], kept until that copy would have
+//!    ([`MessageStore::acknowledged`], kept until that copy would have
 //!    expired), the delete is a repeated acknowledgement — a redelivered
 //!    message deleted twice — and answers not found: the copy it was for is
 //!    gone, and withdrawing would remove another recipient's;
