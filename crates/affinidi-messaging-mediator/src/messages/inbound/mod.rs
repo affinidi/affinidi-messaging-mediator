@@ -91,38 +91,3 @@ pub(crate) async fn handle_inbound(
         ))
     }
 }
-
-/// Ensure an opaque envelope's claimed sender matches the session DID.
-///
-/// The mediator holds no key for the envelope it is being handed, so the sender
-/// here is only a claim — the JWE `skid` header for DIDComm direct delivery, the
-/// cleartext CESR sender field for TSP. In both cases it is also the value that
-/// feeds the recipient's access-list lookup, so on an authenticated session it
-/// has to be pinned to the DID that authenticated.
-///
-/// Only the caller can decide whether the session is one that can be matched
-/// against: an anonymous inter-mediator relay hop has no session DID, and is
-/// exempted at the call site rather than here.
-#[cfg(any(feature = "didcomm", feature = "tsp"))]
-pub(super) fn check_direct_delivery_session_match(
-    session: &Session,
-    claimed_sender: Option<&str>,
-) -> Result<(), MediatorError> {
-    if claimed_sender == Some(session.did.as_str()) {
-        return Ok(());
-    }
-
-    let claimed = claimed_sender.unwrap_or("anonymous");
-    Err(MediatorError::problem_with_log(
-        error_codes::SESSION_DID_MISMATCH,
-        &session.session_id,
-        None,
-        ProblemReportSorter::Error,
-        ProblemReportScope::Protocol,
-        "authorization.did.session_mismatch",
-        "Sender DID ({1}) doesn't match session DID",
-        vec![claimed.to_string()],
-        StatusCode::BAD_REQUEST,
-        format!("Direct-delivery envelope sender ({claimed}) doesn't match session DID"),
-    ))
-}

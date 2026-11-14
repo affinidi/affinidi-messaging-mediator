@@ -8,14 +8,9 @@ use crate::messages::MessageHandler;
 use crate::messages::protocols::relay_peer_trusted;
 use crate::messages::protocols::routing::rewrap_inner_attachment;
 use crate::messages::store::store_message;
-use crate::{
-    SharedData,
-    common::authz::{self, Capability},
-    common::session::Session,
-};
+use crate::{SharedData, common::authz, common::session::Session};
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::tasks::forwarding::RelayMode;
-use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 use affinidi_messaging_sdk::messages::{
     problem_report::{ProblemReportScope, ProblemReportSorter},
     sending::InboundMessageResponse,
@@ -23,9 +18,11 @@ use affinidi_messaging_sdk::messages::{
 use http::StatusCode;
 use tracing::{Instrument, debug, span};
 
-use crate::messages::{ProcessMessageResponse, WrapperType};
-
-use super::check_direct_delivery_session_match;
+use crate::messages::delivery_gate::{
+    Ingress, Sender, authorize_local_delivery, check_claimed_sender, is_mediator_did,
+};
+use crate::messages::store::store_envelope;
+use affinidi_messaging_sdk::messages::sending::InboundMessageList;
 
 #[cfg(feature = "didcomm")]
 pub(super) async fn handle_inbound_didcomm(
@@ -82,7 +79,7 @@ pub(super) async fn handle_inbound_didcomm(
 
         match &envelope.to_did {
             Some(to_did) => {
-                if to_did == &state.config.mediator_did {
+                if is_mediator_did(state, to_did) {
                     // Message is to the mediator
                     let unpacked = match pre_unpacked.take() {
                         Some(unpacked) => Ok(unpacked),
@@ -198,42 +195,13 @@ pub(super) async fn handle_inbound_didcomm(
                     debug!("Message processed successfully");
                     store_message(state, session, &response, &metadata).await
                 } else {
-                    // this is a direct delivery method
-                    if !state.config.security.local_direct_delivery_allowed {
-                        return Err(MediatorError::problem(
-                            error_codes::DIRECT_DELIVERY_DISABLED,
-                            &session.session_id,
-                            None,
-                            ProblemReportSorter::Warning,
-                            ProblemReportScope::Message,
-                            "direct_delivery.denied",
-                            "Mediator is not accepting direct delivery of DIDComm messages. They must be wrapped in a forwarding envelope",
-                            vec![],
-                            StatusCode::FORBIDDEN,
-                        ));
-                    }
-
-                    let from_hash = envelope
-                        .from_did
-                        .as_ref()
-                        .map(affinidi_messaging_mediator_common::did_identity::did_hash);
-
-                    // Order matters on this branch. Every check about the
-                    // *sender* — session binding, its SEND_MESSAGES bit, the
-                    // anonymous-sender policy — runs before anything about the
-                    // recipient is read, so its answer is the same whichever
-                    // DID the envelope is addressed to. Only then is the
-                    // recipient looked up, and every recipient-side refusal
-                    // (unknown, may not receive, access list) is the one
-                    // uniform `delivery_refused`. Checking the recipient first
-                    // would let a sender tell a served DID from an unknown one
-                    // by which of the two kinds of answer came back. The TSP
-                    // branch orders its checks the same way.
-
-                    // The mediator cannot decrypt a direct-delivery envelope, so the
-                    // claimed sender (JWE `skid` header) is unverified. When
-                    // session/sender matching is enforced, bind it to the
-                    // authenticated session DID before it is trusted for ACL checks.
+                    // Direct delivery: an envelope sealed to a local recipient,
+                    // which the mediator stores without opening.
+                    //
+                    // The mediator cannot decrypt it, so the claimed sender (JWE
+                    // `skid` header) is unverified. When session/sender matching
+                    // is enforced, bind it to the authenticated session DID
+                    // before it is trusted for ACL checks.
                     //
                     // Skipped for unauthenticated sessions, exactly as the forward
                     // branch above skips it: an inter-mediator relay hop arrives on
@@ -246,12 +214,11 @@ pub(super) async fn handle_inbound_didcomm(
                     //
                     // The cost is real and worth naming: on a blind relay hop the
                     // claimed sender stays unverified, and it is that claimed sender
-                    // which `delivery_decision` below receives as `from_hash` for the
-                    // recipient's access-list verdict. A relaying peer can therefore
-                    // present any sender DID it likes. This is inherent to blind
-                    // relay — by construction the receiving mediator cannot see who
-                    // relayed — not something this guard gives away: the alternative
-                    // is refusing the hop, which is the bug being fixed.
+                    // the delivery gate evaluates the recipient's access list
+                    // against. A relaying peer can therefore present any sender DID
+                    // it likes. This is inherent to blind relay — by construction
+                    // the receiving mediator cannot see who relayed — not something
+                    // this guard gives away: the alternative is refusing the hop.
                     // [`RelayMode::Rewrap`] plus `relay_trusted_mediators` is the
                     // posture for deployments that need the peer authenticated.
                     //
@@ -260,12 +227,13 @@ pub(super) async fn handle_inbound_didcomm(
                     // vouched for frames this socket presents in its name. The
                     // frame is then the member's from here on — its queue limits,
                     // its stats — as on its own connection.
+                    let claimed = envelope.from_did.as_deref();
                     let member;
                     let session = if state.config.security.force_session_did_match && session.authenticated {
-                        match check_direct_delivery_session_match(session, envelope.from_did.as_deref()) {
+                        match check_claimed_sender(session, claimed, claimed.unwrap_or("anonymous"), None) {
                             Ok(()) => session,
                             Err(refused) => {
-                                member = match envelope.from_did.as_deref() {
+                                member = match claimed {
                                     Some(did) => crate::mux::connection::sender_session(state, session, did).await,
                                     None => None,
                                 };
@@ -279,93 +247,25 @@ pub(super) async fn handle_inbound_didcomm(
                         session
                     };
 
-                    // Check if the message will pass ACL Checks
-                    if let Some(from_hash) = from_hash.as_deref() {
-                        let from_acls = authz::effective_acls(state, from_hash).await?;
-
-                        if authz::require_capability(&from_acls, Capability::SendMessages).is_err() {
-                            return Err(MediatorError::problem(
-                                error_codes::AUTH_SEND_DENIED,
-                                &session.session_id,
-                                None,
-                                ProblemReportSorter::Error,
-                                ProblemReportScope::Protocol,
-                                "authorization.send",
-                                "Sender DID is not authorized to send messages through this mediator",
-                                vec![],
-                                StatusCode::FORBIDDEN,
-                            ));
-                        }
-                    } else if !state.config.security.local_direct_delivery_allow_anon {
-                        return Err(MediatorError::problem(
-                            error_codes::ANON_MESSAGE_ERROR,
-                            &session.session_id,
-                            None,
-                            ProblemReportSorter::Warning,
-                            ProblemReportScope::Message,
-                            "message.anonymous",
-                            "Anonymous direct delivery is not allowed by this mediator",
-                            vec![],
-                            StatusCode::FORBIDDEN,
-                        ));
-                    }
-                    // Everything the recipient side needs — existence, ACL bits
-                    // and the access-list verdict — comes from one lookup. The
-                    // three facts all derive from the same stored record, so
-                    // asking for them separately cost three reads of it.
-                    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
-                    let Some(recipient) = state
-                        .database
-                        .delivery_decision(&to_hash, from_hash.as_deref())
-                        .await?
-                    else {
-                        return Err(crate::messages::delivery_refused(
-                            session,
-                            None,
-                            "direct-delivery recipient is not known on this mediator",
-                        ));
-                    };
-
-                    // Recipient-side gates, both answered from the single
-                    // lookup above. RECEIVE_MESSAGES mirrors the sender's
-                    // SEND_MESSAGES check: a DID whose ACLs withhold it does
-                    // not accept directly-delivered messages at all, whoever
-                    // the sender is. Checked before the access list because it
-                    // is the coarser of the two.
-                    if authz::require_capability(&recipient.acls, Capability::ReceiveMessages)
-                        .is_err()
-                    {
-                        return Err(crate::messages::delivery_refused(
-                            session,
-                            None,
-                            "recipient is not authorized to receive messages through this mediator",
-                        ));
-                    }
-
-                    if !recipient.access_list_allows {
-                        return Err(crate::messages::delivery_refused(
-                            session,
-                            None,
-                            "delivery blocked by the recipient's access list",
-                        ));
-                    }
-
-                    let data = ProcessMessageResponse {
-                        handed_over: None,
-                        store_message: true,
-                        force_live_delivery: false,
-                        forward_message: false,
-                        data: WrapperType::Envelope(
-                            to_did.into(),
-                            message.into(),
-                            state.clock.unix_secs()
-                                + state.limits().message_expiry_seconds,
-                        ),
-                    };
+                    let sender = claimed.map_or(Sender::Anonymous, Sender::Claimed);
+                    let delivery =
+                        authorize_local_delivery(state, session, sender, to_did, Ingress::Direct).await?;
 
                     debug!("Direct delivery message from({:?}) to({}) msg_hash({})", envelope.from_did, to_did, envelope.sha256_hash);
 
-                    store_message(state, session, &data, &UnpackMetadata::default()).await
+                    let msg_id = store_envelope(
+                        state,
+                        session,
+                        to_did,
+                        &delivery.from_did_hash,
+                        message,
+                        state.clock.unix_secs() + state.limits().message_expiry_seconds,
+                        false,
+                    )
+                    .await?;
+                    let mut stored = InboundMessageList::default();
+                    stored.messages.push((to_did.to_string(), msg_id));
+                    Ok(InboundMessageResponse::Stored(stored))
                 }
             }
             _ =>   Err(MediatorError::problem_with_log(
@@ -419,7 +319,11 @@ async fn peel_relay_rewrap_layers(
             Ok(e) => e,
             Err(_) => return Ok((current, floor, None)),
         };
-        if envelope.to_did.as_deref() != Some(state.config.mediator_did.as_str()) {
+        if !envelope
+            .to_did
+            .as_deref()
+            .is_some_and(|to| is_mediator_did(state, to))
+        {
             return Ok((current, floor, None));
         }
         let (msg, meta) = match envelope
@@ -528,33 +432,18 @@ fn check_session_sender_match(
     msg_id: &str,
     sender_kid: &Option<&String>,
 ) -> Result<(), MediatorError> {
-    if let Some(kid) = sender_kid
-        && let Some((did, _fragment)) = kid.split_once('#')
-        && affinidi_messaging_mediator_common::did_identity::same_account(did, &session.did)
-    {
-        return Ok(());
-    }
-
-    let sender_display = sender_kid.map(|s| s.as_str()).unwrap_or("anonymous");
-
-    Err(MediatorError::problem_with_log(
-        error_codes::SESSION_DID_MISMATCH,
-        &session.session_id,
-        Some(msg_id.to_string()),
-        ProblemReportSorter::Error,
-        ProblemReportScope::Protocol,
-        "authorization.did.session_mismatch",
-        "Sender DID ({1}) doesn't match session DID",
-        vec![sender_display.to_string()],
-        StatusCode::BAD_REQUEST,
-        format!("Sender DID ({sender_display}) doesn't match session DID"),
-    ))
+    let did = sender_kid
+        .and_then(|kid| kid.split_once('#'))
+        .map(|(did, _fragment)| did);
+    let shown = sender_kid.map_or("anonymous", |kid| kid.as_str());
+    check_claimed_sender(session, did, shown, Some(msg_id))
 }
 
 #[cfg(test)]
 #[cfg(feature = "didcomm")]
 mod tests {
     use super::*;
+    use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
 
     // --- check_session_sender_match tests ---
     // The function accepts a sender_kid (key ID like "did:...#key-N") and
@@ -641,7 +530,7 @@ mod tests {
         }
     }
 
-    // --- check_direct_delivery_session_match tests ---
+    // --- check_claimed_sender (direct delivery) tests ---
     // The direct-delivery sibling of the above: it compares the whole claimed
     // sender DID (from the JWE `skid`) against the session DID, with no key
     // fragment involved.
@@ -649,21 +538,35 @@ mod tests {
     #[test]
     fn direct_delivery_sender_matching_session_ok() {
         let session = make_session("did:example:alice");
-        assert!(check_direct_delivery_session_match(&session, Some("did:example:alice")).is_ok());
+        assert!(
+            check_claimed_sender(
+                &session,
+                Some("did:example:alice"),
+                "did:example:alice",
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn direct_delivery_wrong_sender_rejected() {
         let session = make_session("did:example:alice");
         assert!(
-            check_direct_delivery_session_match(&session, Some("did:example:mallory")).is_err()
+            check_claimed_sender(
+                &session,
+                Some("did:example:mallory"),
+                "did:example:mallory",
+                None
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn direct_delivery_anonymous_sender_rejected() {
         let session = make_session("did:example:alice");
-        assert!(check_direct_delivery_session_match(&session, None).is_err());
+        assert!(check_claimed_sender(&session, None, "anonymous", None).is_err());
     }
 
     /// The bug this guard fixes: an inter-mediator relay hop arrives on the
@@ -679,10 +582,22 @@ mod tests {
         };
         assert!(!relay_session.authenticated);
         assert!(
-            check_direct_delivery_session_match(&relay_session, Some("did:example:alice")).is_err()
+            check_claimed_sender(
+                &relay_session,
+                Some("did:example:alice"),
+                "did:example:alice",
+                None
+            )
+            .is_err()
         );
         assert!(
-            check_direct_delivery_session_match(&relay_session, Some("did:example:bob")).is_err()
+            check_claimed_sender(
+                &relay_session,
+                Some("did:example:bob"),
+                "did:example:bob",
+                None
+            )
+            .is_err()
         );
     }
 

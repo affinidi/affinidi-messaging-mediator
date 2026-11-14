@@ -11,6 +11,7 @@ use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use http::StatusCode;
 
 use super::tsp::{deliver_opaque, resolve_tsp_vid, tsp_problem};
+use crate::messages::delivery_gate::{Ingress, Sender};
 
 /// What the mediator does with one step of a routed TSP message addressed to it.
 #[cfg(feature = "tsp")]
@@ -107,7 +108,15 @@ pub(super) async fn forward_to_next(
         // Local delivery works entirely on hashes and persists no plaintext
         // VID, so it satisfies §5.3.3 without needing to know which kind of
         // destination this is.
-        deliver_opaque(state, session, next, from_vid, bytes).await
+        deliver_opaque(
+            state,
+            session,
+            next,
+            Sender::Verified(from_vid),
+            bytes,
+            Ingress::Relayed,
+        )
+        .await
     } else {
         forward_tsp_remote(state, session, next, from_vid, bytes, destination).await
     }

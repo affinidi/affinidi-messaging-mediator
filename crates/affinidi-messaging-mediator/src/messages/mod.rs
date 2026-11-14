@@ -127,6 +127,8 @@ use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
 pub(crate) mod client_delete;
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+pub(crate) mod delivery_gate;
 #[cfg(feature = "didcomm")]
 pub mod error_response;
 pub mod inbound;

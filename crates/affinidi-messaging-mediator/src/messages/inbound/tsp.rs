@@ -19,9 +19,11 @@ use affinidi_tsp::MetaEnvelope as TspMetaEnvelope;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use http::StatusCode;
 
-use super::check_direct_delivery_session_match;
 use super::check_message_size;
 use super::tsp_relay::{Destination, RoutePlan, forward_to_next, plan_route_step};
+use crate::messages::delivery_gate::{
+    Ingress, Sender, authorize_local_delivery, check_claimed_sender, is_mediator_did,
+};
 
 /// Handle an inbound TSP message, sniffed at ingress by its CESR magic byte.
 ///
@@ -68,7 +70,7 @@ pub(crate) async fn handle_inbound_tsp(
     // exactly as the DIDComm paths do. A TSP envelope names its sender in the
     // clear and the mediator does not decrypt it here, so `meta.sender` is a
     // claim; it is also what feeds the recipient's access-list lookup in
-    // `deliver_opaque`, so on an authenticated session it has to be pinned to
+    // the delivery gate, so on an authenticated session it has to be pinned to
     // the session DID or the access list is evaluated against an attacker-chosen
     // VID. This is the TSP twin of the DIDComm direct-delivery bypass fixed in
     // mediator 0.15.5.
@@ -116,8 +118,7 @@ pub(crate) async fn handle_inbound_tsp(
     let mut member_refusal = None;
     if state.config.security.force_session_did_match
         && session.authenticated
-        && let Err(refused) =
-            check_direct_delivery_session_match(session, Some(meta.sender.as_str()))
+        && let Err(refused) = check_claimed_sender(session, Some(&meta.sender), &meta.sender, None)
     {
         member = crate::mux::connection::sender_session(state, session, &meta.sender).await;
         if member.is_none() {
@@ -133,57 +134,25 @@ pub(crate) async fn handle_inbound_tsp(
     //     recipient to pick up (Direct/Routed/Nested/Control are all just carried).
     //   * receiver == this mediator → we hold the key, so unpack to learn the kind
     //     and act as the relay hop (Routed) / metadata-privacy intermediary (Nested).
-    if !affinidi_messaging_mediator_common::did_identity::same_account(
-        &meta.receiver,
-        &state.config.mediator_did,
-    ) {
+    if !is_mediator_did(state, &meta.receiver) {
         // Opaque delivery is a send: a member admitted above sends it as itself.
         let session = member.as_ref().unwrap_or(session);
-        // Direct delivery, and subject to the same two gates the DIDComm
-        // direct-delivery branch applies. `docs/acls.md` §6 documents this flow
-        // as "Direct delivery (DIDComm and TSP)" and has always promised both.
+        // Direct delivery, through the same gate as DIDComm direct delivery
+        // (`docs/acls.md` §6, "Direct delivery (DIDComm and TSP)"): the
+        // operator's direct-delivery policy, then the sender's own
+        // SEND_MESSAGES, then the recipient.
         //
-        // The policy gate first: an operator who turns direct delivery off wants
-        // everything to arrive inside a routing envelope, so the relay layer can
-        // audit, scrub metadata, or inspect it. TSP ignoring this switch meant
-        // any TSP-capable sender walked straight past that control.
-        //
-        // Note there is no TSP analogue of `local_direct_delivery_allow_anon`:
-        // that hatch exists because a DIDComm envelope can be anon-packed with no
-        // sender at all, whereas a TSP envelope always names its sender in the
-        // clear. There is no anonymous TSP case to admit.
-        if !state.config.security.local_direct_delivery_allowed {
-            return Err(tsp_problem(
-                session,
-                error_codes::DIRECT_DELIVERY_DISABLED,
-                "direct_delivery.denied",
-                "Mediator is not accepting direct delivery of TSP messages. They must be \
-                 relayed through a routing envelope"
-                    .to_string(),
-                StatusCode::FORBIDDEN,
-            ));
-        }
-
-        // Then the sender's own SEND_MESSAGES, distinct from the session's: the
-        // WebSocket ingress gates only on LOCAL at upgrade, so without this a DID
-        // whose SEND_MESSAGES was revoked could still post TSP frames over a
-        // socket.
-        let from_acls = authz::effective_acls(
+        // There is no anonymous TSP case for `local_direct_delivery_allow_anon`
+        // to admit: a TSP envelope always names its sender in the clear.
+        return deliver_opaque(
             state,
-            &affinidi_messaging_mediator_common::did_identity::did_hash(&meta.sender),
+            session,
+            &meta.receiver,
+            Sender::Claimed(&meta.sender),
+            raw,
+            Ingress::Direct,
         )
-        .await?;
-        if authz::require_capability(&from_acls, Capability::SendMessages).is_err() {
-            return Err(tsp_problem(
-                session,
-                error_codes::AUTH_SEND_DENIED,
-                "authorization.send",
-                "Sender DID is not authorized to send messages through this mediator".to_string(),
-                StatusCode::FORBIDDEN,
-            ));
-        }
-
-        return deliver_tsp_local(state, session, &meta.sender, raw).await;
+        .await;
     }
 
     let identity = state.tsp_identity().await?;
@@ -399,7 +368,17 @@ pub(crate) async fn handle_inbound_tsp(
                     to_vid,
                     from_vid,
                     inner,
-                } => deliver_opaque(state, session, &to_vid, &from_vid, &inner).await,
+                } => {
+                    deliver_opaque(
+                        state,
+                        session,
+                        &to_vid,
+                        Sender::Verified(&from_vid),
+                        &inner,
+                        Ingress::Relayed,
+                    )
+                    .await
+                }
             }
         }
 
@@ -630,14 +609,12 @@ async fn dispatch_tsp_trust_task(
     .await
 }
 
-/// Deliver a TSP message to the local recipient named in *its own envelope*:
-/// parse the envelope for its receiver and hand off to [`deliver_opaque`].
+/// Deliver a TSP message addressed to the mediator to the local account named
+/// in *its own envelope* (the mediator's own): parse the envelope for its
+/// receiver and hand off to [`deliver_opaque`].
 ///
 /// `from_vid` is supplied by the caller rather than read from `bytes`: it is
-/// the sender the caller vouches for. On the relay and to-mediator arms that
-/// is the sender `unpack` verified; on pass-through it is the envelope sender,
-/// bound to the session DID when `force_session_did_match` is on and the
-/// session is authenticated.
+/// the sender `unpack` verified for the layer.
 #[cfg(feature = "tsp")]
 pub(super) async fn deliver_tsp_local(
     state: &SharedData,
@@ -654,61 +631,38 @@ pub(super) async fn deliver_tsp_local(
             StatusCode::BAD_REQUEST,
         )
     })?;
-    deliver_opaque(state, session, &meta.receiver, from_vid, bytes).await
+    deliver_opaque(
+        state,
+        session,
+        &meta.receiver,
+        Sender::Verified(from_vid),
+        bytes,
+        Ingress::Relayed,
+    )
+    .await
 }
 
-/// Deliver an opaque message to a known local recipient: check the recipient is a
-/// local account, apply its access-list against `from_vid`, then store the bytes
-/// for pickup. The bytes are **not** parsed — this is the TSP↔DIDComm bridge
-/// primitive. A routed relay carries an opaque inner (which may be a DIDComm
-/// message) and delivers it to the route's named recipient, who recognises and
-/// handles it natively on pickup; the mediator never reads it. `from_vid` is the
-/// authenticated sender the mediator routes on (the routing-layer sender for a
-/// relayed message, or the envelope sender for Direct), against which the
-/// recipient's access-list is applied. A remote recipient never reaches here:
-/// [`forward_to_next`] sends it to [`forward_tsp_remote`] instead.
+/// Deliver an opaque message to a local recipient: pass the delivery gate, then
+/// store the bytes for pickup. The bytes are **not** parsed — this is the
+/// TSP↔DIDComm bridge primitive. A routed relay carries an opaque inner (which
+/// may be a DIDComm message) and delivers it to the route's named recipient, who
+/// recognises and handles it natively on pickup; the mediator never reads it.
+///
+/// `sender` is who the caller vouches for: the sender `unpack` verified on a
+/// relay or to-mediator arm, the envelope's claim on pass-through. The
+/// recipient's access list is applied against it, and the gate decides who the
+/// stored message is attributed to. A remote recipient never reaches here:
+/// [`forward_to_next`] sends it to `forward_tsp_remote` instead.
 #[cfg(feature = "tsp")]
 pub(super) async fn deliver_opaque(
     state: &SharedData,
     session: &Session,
     to_vid: &str,
-    from_vid: &str,
+    sender: Sender<'_>,
     bytes: &[u8],
+    ingress: Ingress,
 ) -> Result<InboundMessageResponse, MediatorError> {
-    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_vid);
-    let from_hash = affinidi_messaging_mediator_common::did_identity::did_hash(from_vid);
-
-    // Recipient-side ACL checks, mirroring DIDComm direct delivery: existence,
-    // RECEIVE_MESSAGES and the access-list verdict all come from one lookup.
-    // The mediator routes on the authenticated sender and the recipient
-    // verifies the (opaque) message end-to-end on pickup.
-    let Some(recipient) = state
-        .database
-        .delivery_decision(&to_hash, Some(&from_hash))
-        .await?
-    else {
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "recipient is not local to this mediator",
-        ));
-    };
-
-    if authz::require_capability(&recipient.acls, Capability::ReceiveMessages).is_err() {
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "recipient is not authorized to receive messages through this mediator",
-        ));
-    }
-
-    if !recipient.access_list_allows {
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "delivery blocked by the recipient's access list",
-        ));
-    }
+    let delivery = authorize_local_delivery(state, session, sender, to_vid, ingress).await?;
 
     // Store in the form the recipient's protocol expects, so a pickup client can
     // recognise and decode it. A TSP message is stored as base64url(qb2) = its
@@ -730,21 +684,21 @@ pub(super) async fn deliver_opaque(
             })?
             .to_string()
     };
-    // Stored as sent by `from_vid` — the sender the caller vouches for — not
-    // the session: on a relay hop the session is the relaying peer (often the
-    // anonymous relay session, with no DID at all), and the queue gates, the
-    // stats and the sender recorded on the message are about who sent it.
+    // Attributed as the gate decided: on a relay hop the session is the
+    // relaying peer (often the anonymous relay session, with no DID at all),
+    // so the verified sender is who the queue gates, the stats and the sender
+    // recorded on the message are about.
     let msg_id = crate::messages::store::store_envelope(
         state,
         session,
         to_vid,
-        &from_hash,
+        &delivery.from_did_hash,
         &encoded,
         state.clock.unix_secs() + state.limits().message_expiry_seconds,
         false,
     )
     .await?;
-    tracing::debug!(%to_vid, %from_vid, "TSP/bridged message stored for local recipient");
+    tracing::debug!(%to_vid, ?sender, "TSP/bridged message stored for local recipient");
     let mut stored = affinidi_messaging_sdk::messages::sending::InboundMessageList::default();
     stored.messages.push((to_vid.to_string(), msg_id));
     Ok(InboundMessageResponse::Stored(stored))
