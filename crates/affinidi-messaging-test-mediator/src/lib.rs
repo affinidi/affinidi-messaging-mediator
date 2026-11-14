@@ -421,6 +421,8 @@ pub struct TestMediatorBuilder {
     mux_max_dids_per_connection: Option<usize>,
     /// See [`TestMediatorBuilder::withhold_task_types`].
     withheld_task_types: Vec<String>,
+    /// See [`TestMediatorBuilder::wake_config`].
+    wake_config: Option<affinidi_messaging_mediator::common::config::WakeConfig>,
     /// See [`TestMediatorBuilder::streaming_liveness`].
     streaming_liveness:
         Option<affinidi_messaging_mediator::tasks::websocket_streaming::StreamingLiveness>,
@@ -492,6 +494,7 @@ impl Default for TestMediatorBuilder {
             mux_enabled: false,
             mux_max_dids_per_connection: None,
             withheld_task_types: Vec::new(),
+            wake_config: None,
             streaming_liveness: None,
             queue_send_limit_per_peer: None,
             message_size: None,
@@ -856,6 +859,16 @@ impl TestMediatorBuilder {
         S: Into<String>,
     {
         self.withheld_task_types = type_uris.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace `[processors.wake]` (the `messaging/wake/request` limits), to
+    /// reach a rule without waiting out the production rate limits.
+    pub fn wake_config(
+        mut self,
+        config: affinidi_messaging_mediator::common::config::WakeConfig,
+    ) -> Self {
+        self.wake_config = Some(config);
         self
     }
 
@@ -1283,6 +1296,9 @@ impl TestMediatorBuilder {
             processors.forwarding.ws_threshold_msgs_per_10s = threshold;
         }
         processors.message_expiry_cleanup.enabled = self.enable_message_expiry;
+        if let Some(wake) = &self.wake_config {
+            processors.wake = wake.clone();
+        }
 
         // Default to a fresh in-memory store. Tests that want a
         // shared or persistent backend pass their own via `store()`.

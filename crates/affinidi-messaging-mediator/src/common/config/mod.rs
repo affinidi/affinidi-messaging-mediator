@@ -198,6 +198,7 @@ impl ValidatedConfig {
             forwarding,
             message_expiry_cleanup: raw.processors.message_expiry_cleanup.clone().try_into()?,
             session_expiry_cleanup: raw.processors.session_expiry_cleanup.clone().try_into()?,
+            wake: raw.processors.wake.clone().try_into()?,
         };
         if let Some(storage) = &raw.storage {
             settings::storage(storage).map_err(config_error)?;

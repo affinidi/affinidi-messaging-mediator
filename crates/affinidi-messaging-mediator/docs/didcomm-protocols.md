@@ -313,6 +313,17 @@ The SDK sends every one of them through `atm.trust_tasks()`.
 | Operations   | `messaging/ping`, `messaging/stats/show`, `messaging/monitor/{subscribe,unsubscribe}`                              |
 | Mediator     | `audit/list`, `config/{show,patch,reload}`                                                                          |
 | DID mux      | `messaging/mux/{grant,list,update,revoke,revoke-all,attach,detach,ack,connections}`, `messaging/mux/{admin-list,admin-revoke,admin-revoke-all}` |
+| Wake         | `messaging/wake/set` (an account's own push gateway handle), `messaging/wake/request` (any sender with queued mail) |
+
+`messaging/wake/request` is the one task a sender with **no account** here may
+send the mediator: it usually arrives relayed by the sender's own mediator.
+It needs an authenticated envelope and a proof made for `authentication`, never
+creates an account, and is answered `{}` whatever the mediator decided. The
+mediator rings only for fresh, undelivered mail that sender queued for an
+offline account that set a handle, at most once per message, within the
+`[processors.wake]` limits; it rings the gateway as itself with `push/wake/0.2`
+over DIDComm. Outcomes are counted in `wake_requests_total{outcome}` and
+`wake_rings_total{outcome}`.
 
 The former `https://didcomm.org/mediator/1.0/*` admin, account and ACL
 protocols are not served; a message of those types is refused as unknown.

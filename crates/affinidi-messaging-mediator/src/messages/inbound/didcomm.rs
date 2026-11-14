@@ -145,6 +145,17 @@ pub(super) async fn handle_inbound_didcomm(
                         Err(reason) => return Err(sender_mismatch(session, &msg.id, &reason)),
                     };
 
+                    // The two messages a sender with no account here may
+                    // send the mediator: a wake request and a push gateway's
+                    // answer to a ring. Handled before the session checks
+                    // below, which they would fail by design: they usually
+                    // arrive relayed by the sender's own mediator.
+                    if let Some(response) =
+                        crate::wake::didcomm::intercept(state, session, &msg, sender_did.as_deref()).await?
+                    {
+                        return store_message(state, session, &response, &metadata).await;
+                    }
+
                     // Does the sender identity match the session DID?
                     // The sender can be identified by JWS signing (sign_from) or
                     // authcrypt encryption (encrypted_from_kid).

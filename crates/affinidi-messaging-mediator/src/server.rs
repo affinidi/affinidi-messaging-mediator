@@ -422,9 +422,19 @@ pub async fn serve_internal(
         tsp_identity: Arc::new(tokio::sync::OnceCell::new()),
         #[cfg(feature = "didcomm-v1")]
         didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
+        wake: Default::default(),
     };
 
     start_mux(&shared_state, &supervisor)?;
+    // Armed wake requests are evaluated again every few seconds, for a
+    // message another instance stored; a message stored here wakes them at
+    // once. Holds nothing durable, so a restart only drops armed requests.
+    if shared_state.config.processors.wake.enabled {
+        tokio::spawn(crate::wake::request::rearm_loop(
+            shared_state.clone(),
+            shutdown_token.clone(),
+        ));
+    }
     #[cfg(feature = "didcomm-v1")]
     check_didcomm_v1(&shared_state).await?;
 

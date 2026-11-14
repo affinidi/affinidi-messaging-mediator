@@ -273,6 +273,13 @@ fn stats_key(did_hash: &str) -> String {
     format!("STATS:{did_hash}")
 }
 
+/// `globals` key holding an account's wake record (`messaging/wake/set`).
+/// One key per account, replaced whole on every set and removed with the
+/// account.
+fn wake_key(did_hash: &str) -> String {
+    format!("WAKE:{did_hash}")
+}
+
 /// `globals` key holding one of an account's activity times (a big-endian
 /// `u64` of Unix seconds). One key per [`ActivityKind`], so recording one
 /// never rewrites the other. `None` for a kind this store does not keep.
@@ -2759,6 +2766,7 @@ impl AccountStore for FjallStore {
         }
         batch.remove(&self.globals, stats_key(did_hash).as_bytes());
         batch.remove(&self.scid_sources, did_hash.as_bytes());
+        batch.remove(&self.globals, wake_key(did_hash).as_bytes());
         // Delete all access-list entries for this DID.
         let prefix = did_hash.as_bytes();
         for guard in self.access_lists.prefix(prefix) {
@@ -4385,6 +4393,35 @@ impl AuxiliaryStore for FjallStore {
             records.push(String::from_utf8_lossy(&value).into_owned());
         }
         Ok(records)
+    }
+
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError> {
+        // Under the write lock, as `account_remove` is: a set racing the
+        // account's removal must not leave a record behind it.
+        let _guard = self.write_lock.lock().await;
+        let key = wake_key(did_hash);
+        match record {
+            Some(record) => self
+                .globals
+                .insert(key.as_bytes(), record.as_bytes())
+                .map_err(|e| Self::db_err("wake_handle_set", e)),
+            None => self
+                .globals
+                .remove(key.as_bytes())
+                .map_err(|e| Self::db_err("wake_handle_set:remove", e)),
+        }
+    }
+
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
+        let value = self
+            .globals
+            .get(wake_key(did_hash).as_bytes())
+            .map_err(|e| Self::db_err("wake_handle_get", e))?;
+        Ok(value.map(|v| String::from_utf8_lossy(&v).into_owned()))
     }
 
     async fn oob_discovery_store(

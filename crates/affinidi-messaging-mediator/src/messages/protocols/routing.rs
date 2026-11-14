@@ -596,6 +596,80 @@ async fn deliver_forward(
     Ok(())
 }
 
+/// Send a message this mediator authored, already packed for `to_did`, to
+/// wherever `to_did` collects its mail: its inbox here when this mediator is
+/// its mediator, otherwise the mediator its DID document names, through the
+/// forwarding processor exactly as a relayed forward is.
+///
+/// Used for the messages the mediator originates towards a party that may
+/// hold no account here — a `messaging/wake/request` answer to a requester on
+/// another mediator, a `push/wake` to a push gateway. A recipient this
+/// mediator would deliver locally but that has no account is not stored for:
+/// a reply never creates an inbox (`messaging/wake/request` "Receiving the
+/// request").
+///
+/// `Ok` means stored locally or accepted by the forwarding queue, never
+/// delivered (R1.1).
+pub(crate) async fn send_as_mediator(
+    state: &SharedData,
+    to_did: &str,
+    packed: &str,
+    expires_at: u64,
+) -> Result<(), MediatorError> {
+    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(to_did);
+    let session = Session {
+        session_id: "mediator".to_string(),
+        ..Default::default()
+    };
+    match classify_next_hop(state, to_did).await {
+        NextHop::Local => {
+            if !state.database.account_exists(&to_hash).await? {
+                debug!(%to_did, "mediator message not stored: the recipient has no account here");
+                return Ok(());
+            }
+            crate::messages::store::store_system_message(state, packed, &to_hash, expires_at)
+                .await
+                .map(|_| ())
+        }
+        NextHop::Remote(RemoteHop { endpoint, relay_to }) => {
+            let relay_message = match state.config.processors.forwarding.relay_mode {
+                RelayMode::Blind => packed.to_string(),
+                RelayMode::Rewrap => {
+                    rewrap_for_relay(state, &session, packed, &relay_to, 1).await?
+                }
+            };
+            let entry = ForwardQueueEntry {
+                stream_id: String::new(),
+                message: relay_message,
+                to_did_hash: to_hash,
+                from_did_hash: state.config.mediator_did_hash.clone(),
+                // No problem reports: the mediator has no inbox of its own
+                // that anything reads.
+                from_did: String::new(),
+                to_did: to_did.to_string(),
+                endpoint_url: endpoint,
+                received_at_ms: state.clock.unix_millis(),
+                delay_milli: 0,
+                expires_at,
+                retry_count: 0,
+                hop_count: 1,
+                not_before_ms: 0,
+            };
+            state
+                .database
+                .forward_queue_enqueue(&entry, state.limits().forward_task_queue)
+                .await?;
+            metrics::counter!(crate::common::metrics::names::MESSAGES_FORWARDED_TOTAL).increment(1);
+            Ok(())
+        }
+        NextHop::Unroutable { reason, .. } => Err(MediatorError::InternalError(
+            crate::error_codes::FORWARD_ENQUEUE_ERROR,
+            "mediator".into(),
+            format!("no route to {to_did}: {reason}"),
+        )),
+    }
+}
+
 /// Where a forward to a remote next hop is relayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteHop {
@@ -1221,7 +1295,7 @@ fn classify_endpoint(
 }
 
 /// Every `DIDCommMessaging` endpoint URI in `doc`, in document order.
-fn didcomm_endpoints(doc: &Document) -> Vec<String> {
+pub(crate) fn didcomm_endpoints(doc: &Document) -> Vec<String> {
     doc.service
         .iter()
         .filter(|service| service.type_.contains(&"DIDCommMessaging".to_string()))

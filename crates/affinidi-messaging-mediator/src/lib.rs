@@ -53,6 +53,7 @@ pub mod task_specs {
 pub mod tasks;
 #[cfg(feature = "tsp")]
 pub mod tsp_identity;
+pub mod wake;
 
 /// Install `jsonwebtoken`'s `aws_lc_rs` crypto provider as the process-wide
 /// default, idempotently.
@@ -157,6 +158,9 @@ pub struct SharedData {
     #[cfg(feature = "didcomm-v1")]
     pub didcomm_v1_identity:
         Arc<tokio::sync::OnceCell<didcomm_v1_identity::MediatorDidCommV1Identity>>,
+    /// This instance's `messaging/wake/*` state: rate limits, armed requests
+    /// and rings awaiting a gateway's answer (see [`wake`]).
+    pub wake: Arc<wake::WakeService>,
 }
 
 impl SharedData {

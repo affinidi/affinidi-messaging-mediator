@@ -459,6 +459,24 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         "PROCESSOR_SESSION_EXPIRY_CLEANUP_ENABLED"
     );
 
+    env_override!(config.processors.wake.enabled, "PROCESSOR_WAKE_ENABLED");
+    env_override!(
+        config.processors.wake.pair_per_minute,
+        "PROCESSOR_WAKE_PAIR_PER_MINUTE"
+    );
+    env_override!(
+        config.processors.wake.pair_per_day,
+        "PROCESSOR_WAKE_PAIR_PER_DAY"
+    );
+    env_override!(
+        config.processors.wake.addressee_coalesce_seconds,
+        "PROCESSOR_WAKE_ADDRESSEE_COALESCE_SECONDS"
+    );
+    env_override!(
+        config.processors.wake.addressee_per_hour,
+        "PROCESSOR_WAKE_ADDRESSEE_PER_HOUR"
+    );
+
     env_override!(config.secrets.backend, "MEDIATOR_SECRETS_BACKEND");
     env_override_opt!(config.secrets.cache_ttl, "MEDIATOR_SECRETS_CACHE_TTL");
 }

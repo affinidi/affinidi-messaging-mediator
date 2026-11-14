@@ -82,6 +82,24 @@ pub trait AuxiliaryStore: Send + Sync + std::fmt::Debug {
     /// seeding the resolver at boot.
     async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError>;
 
+    /// Replace the wake record held for the account `did_hash` with `record`,
+    /// or remove it when `record` is `None` (`messaging/wake/set`). `record` is
+    /// the mediator's serialised wake record, opaque here. One record per
+    /// account: a set supersedes the previous one whole, and no history is
+    /// kept. Removing the account removes its record (Consumer rule 7).
+    ///
+    /// A store that cannot keep it must refuse a set: the account must not
+    /// believe it is wakeable when nothing was kept.
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError>;
+
+    /// The wake record [`Self::wake_handle_set`] stored for `did_hash`, if
+    /// any.
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError>;
+
     /// The mediator's stored configuration overrides, as a JSON object of
     /// `key → value` (keys like `limits.queued_send_messages_hard`), or `None`
     /// when none have been stored. Written by `config/patch` and layered over
