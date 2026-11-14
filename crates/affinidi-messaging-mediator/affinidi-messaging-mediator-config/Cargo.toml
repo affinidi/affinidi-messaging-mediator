@@ -43,3 +43,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

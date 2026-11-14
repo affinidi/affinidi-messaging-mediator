@@ -1,8 +1,83 @@
-//! Affinidi Messaging Mediator
+//! Affinidi Messaging Mediator.
 //!
-//! A DIDComm/TSP messaging mediator that routes, stores, and forwards messages
-//! on behalf of connected agents. Requires at least one of the `didcomm` or `tsp`
-//! features to be enabled.
+//! A [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/) and
+//! [Trust Spanning Protocol](https://trustoverip.github.io/tswg-tsp-specification/)
+//! mediator: it authenticates agents, stores their messages, forwards them to
+//! other mediators and delivers them over REST and WebSocket.
+//!
+//! This crate is both the `mediator` binary and a library. Operators run the
+//! binary (see the [README] and the setup wizard in this repository); the
+//! library is for running a mediator inside another process.
+//!
+//! # Embedding
+//!
+//! [`builder::MediatorBuilder`] starts a mediator from values set in code: no
+//! TOML file, no working-directory assumptions, and no global tracing
+//! subscriber or signal handlers unless asked for.
+//! [`builder::MediatorBuilder::start`] returns a [`builder::MediatorHandle`]
+//! carrying the bound URLs, the mediator DID, and `shutdown()` / `join()`.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use affinidi_messaging_mediator::builder::MediatorBuilder;
+//! use affinidi_messaging_mediator_common::database::config::DatabaseConfig;
+//! use affinidi_secrets_resolver::ThreadedSecretsResolver;
+//! use tokio_util::sync::CancellationToken;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! affinidi_messaging_mediator::install_jwt_crypto_provider();
+//!
+//! // The resolver must hold the mediator's signing and key-agreement
+//! // secrets (for `mediator_did`) before `start` is called.
+//! let (secrets, _resolver_task) = ThreadedSecretsResolver::new(None).await;
+//!
+//! let database = DatabaseConfig {
+//!     database_url: "redis://127.0.0.1/".into(),
+//!     ..Default::default()
+//! };
+//!
+//! let handle = MediatorBuilder::new(Arc::new(secrets))
+//!     .mediator_did("did:peer:2.Vz6Mk...")
+//!     .admin_did("did:key:z6Mk...")
+//!     .database(database)
+//!     .start(CancellationToken::new())
+//!     .await?;
+//! println!("mediator {} on {}", handle.mediator_did, handle.http_endpoint);
+//!
+//! handle.shutdown();
+//! handle.join().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! With the `memory-backend` or `fjall-backend` feature,
+//! `MediatorBuilder::memory_store()` or `MediatorBuilder::fjall_path()`
+//! replaces the Redis database. For integration tests,
+//! [`affinidi-messaging-test-mediator`](https://docs.rs/affinidi-messaging-test-mediator)
+//! does all of this, identities included, in one call.
+//!
+//! # Features
+//!
+//! At least one of `didcomm` and `tsp` must be enabled, and one storage
+//! backend (`redis-backend`, `fjall-backend` or `memory-backend`). The
+//! defaults (`didcomm`, `tsp`, `redis-backend`, `jemalloc`, `vta`) suit the
+//! binary; an embedding application usually turns them off and lists what it
+//! needs. `jemalloc` affects only the binary: the library never installs an
+//! allocator. The [README] lists every feature, including the `secrets-*`
+//! backends.
+//!
+//! # Public API
+//!
+//! The supported library surface is [`builder`], the configuration types in
+//! [`common::config`], the storage backends in [`store`], the generated
+//! [`task_specs`], [`error_codes`], [`SharedData`] and
+//! [`install_jwt_crypto_provider`]. The other modules are public only so the
+//! binary, the test mediator and this crate's integration tests can reach
+//! them; they are hidden from these docs and may change in any release.
+//!
+//! [README]: https://github.com/affinidi/affinidi-messaging-mediator/blob/main/crates/affinidi-messaging-mediator/README.md
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
 compile_error!("At least one of the `didcomm` or `tsp` features must be enabled");
@@ -25,22 +100,33 @@ use tokio_util::sync::CancellationToken;
 /// The error code registry (see `ERRORS.md`).
 pub use affinidi_messaging_mediator_common::error_codes;
 
+#[doc(hidden)]
 pub mod account_stats;
+#[doc(hidden)]
 pub mod activity;
 pub(crate) mod after_write;
 pub mod builder;
+#[doc(hidden)]
 pub mod commands;
 pub mod common;
 #[cfg(feature = "didcomm")]
+#[doc(hidden)]
 pub mod didcomm_compat;
 #[cfg(feature = "didcomm-v1")]
+#[doc(hidden)]
 pub mod didcomm_v1_identity;
+#[doc(hidden)]
 pub mod handlers;
+#[doc(hidden)]
 pub mod messages;
+#[doc(hidden)]
 pub mod monitor;
 /// DID multiplexing: one connection carrying many DIDs.
+#[doc(hidden)]
 pub mod mux;
+#[doc(hidden)]
 pub mod scid_sources;
+#[doc(hidden)]
 pub mod server;
 pub mod store;
 /// The Trust Task types this mediator serves, generated at build time from the
@@ -50,8 +136,10 @@ pub mod store;
 pub mod task_specs {
     include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));
 }
+#[doc(hidden)]
 pub mod tasks;
 #[cfg(feature = "tsp")]
+#[doc(hidden)]
 pub mod tsp_identity;
 
 /// Install `jsonwebtoken`'s `aws_lc_rs` crypto provider as the process-wide

@@ -344,3 +344,25 @@ metrics-util = { version = "0.20", default-features = false, features = ["debugg
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Every feature but the test-only `test-hooks`, so the storage and secret
+# backends appear in the docs with their feature badges.
+features = [
+  "didcomm",
+  "didcomm-v1",
+  "tsp",
+  "redis-backend",
+  "fjall-backend",
+  "memory-backend",
+  "secrets-keyring",
+  "secrets-aws",
+  "secrets-gcp",
+  "secrets-azure",
+  "secrets-vault",
+  "secrets-k8s",
+  "aws",
+  "vta",
+]
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

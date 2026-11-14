@@ -422,7 +422,7 @@ async fn _live_stream(
 /// - session: Session
 /// - response: ProcessMessageResponse
 /// - metadata: UnpackMetadata
-/// - expires_at: Option<u64>
+/// - expires_at: `Option<u64>`
 ///   - None: use default expiry
 ///   - Some: use the provided expiry time in seconds
 #[cfg(feature = "didcomm")]

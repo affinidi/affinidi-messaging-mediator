@@ -20,6 +20,7 @@
 //!
 //! Client crates (the SDK, third-party tooling) should depend on
 //! `affinidi-messaging-mediator-types` rather than this crate.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The protocol types, from `affinidi-messaging-mediator-types`. Re-exported
 /// here so `affinidi_messaging_mediator_common::types::*` paths keep working.
