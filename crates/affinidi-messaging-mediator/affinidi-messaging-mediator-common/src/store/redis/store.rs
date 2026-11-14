@@ -16,10 +16,6 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::database::keys::Keys;
 use crate::error_codes;
 use crate::store::redis::database::cluster_scripts::MARK_DELIVERED;
-use crate::store::redis::database::{
-    forwarding::ForwardQueueEntry as InnerForwardEntry, stats::MetadataStats as InnerMetadataStats,
-    store::MessageMetaData as InnerMessageMetaData,
-};
 use crate::store::{
     DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope,
     OUTBOX_RECEIPT_TTL, OutboxReceipt, POISON_ATTEMPTS, RemovedCopy, SentMessageState,
@@ -54,8 +50,7 @@ use crate::{
     store::{
         DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
         InboxStatusReply, MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session,
-        SessionState, SessionSweepReport, StatCounter, StoreHealth, StreamingClientState,
-        TrustTaskClaim,
+        SessionSweepReport, StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -513,99 +508,6 @@ impl std::fmt::Debug for RedisStore {
         f.debug_struct("RedisStore")
             .field("circuit_breaker", &self.circuit_breaker_state())
             .finish()
-    }
-}
-
-// ─── Type conversions ───────────────────────────────────────────────────────
-//
-// The `mediator-common::store::types` module defines a fresh set of
-// types that mirror the legacy ones in `crate::store::redis::database::*`. The
-// duplication is intentional during the migration: legacy call sites
-// still use the legacy types, the trait uses the new types, and the
-// store impl converts at the boundary. Commit 6 unifies them.
-
-fn session_state_into_new(s: SessionState) -> SessionState {
-    s
-}
-
-fn session_state_into_old(s: SessionState) -> SessionState {
-    s
-}
-
-fn session_into_new(inner: Session, refresh_token_hash: Option<String>) -> Session {
-    Session {
-        session_id: inner.session_id,
-        challenge: inner.challenge,
-        state: session_state_into_new(inner.state),
-        did: inner.did,
-        did_hash: inner.did_hash,
-        authenticated: inner.authenticated,
-        acls: inner.acls,
-        account_type: inner.account_type,
-        expires_at: inner.expires_at,
-        refresh_token_hash,
-    }
-}
-
-fn fwd_entry_into_new(inner: InnerForwardEntry) -> ForwardQueueEntry {
-    ForwardQueueEntry {
-        stream_id: inner.stream_id,
-        message: inner.message,
-        to_did_hash: inner.to_did_hash,
-        from_did_hash: inner.from_did_hash,
-        from_did: inner.from_did,
-        to_did: inner.to_did,
-        endpoint_url: inner.endpoint_url,
-        received_at_ms: inner.received_at_ms,
-        delay_milli: inner.delay_milli,
-        expires_at: inner.expires_at,
-        retry_count: inner.retry_count,
-        hop_count: inner.hop_count,
-        not_before_ms: inner.not_before_ms,
-    }
-}
-
-fn fwd_entry_into_old(new: &ForwardQueueEntry) -> InnerForwardEntry {
-    InnerForwardEntry {
-        stream_id: new.stream_id.clone(),
-        message: new.message.clone(),
-        to_did_hash: new.to_did_hash.clone(),
-        from_did_hash: new.from_did_hash.clone(),
-        from_did: new.from_did.clone(),
-        to_did: new.to_did.clone(),
-        endpoint_url: new.endpoint_url.clone(),
-        received_at_ms: new.received_at_ms,
-        delay_milli: new.delay_milli,
-        expires_at: new.expires_at,
-        retry_count: new.retry_count,
-        hop_count: new.hop_count,
-        not_before_ms: new.not_before_ms,
-    }
-}
-
-fn message_meta_into_new(inner: InnerMessageMetaData) -> MessageMetaData {
-    MessageMetaData {
-        bytes: inner.bytes,
-        to_did_hash: inner.to_did_hash,
-        from_did_hash: inner.from_did_hash,
-        timestamp: inner.timestamp,
-    }
-}
-
-fn stats_into_new(inner: InnerMetadataStats) -> MetadataStats {
-    MetadataStats {
-        received_bytes: inner.received_bytes,
-        sent_bytes: inner.sent_bytes,
-        deleted_bytes: inner.deleted_bytes,
-        received_count: inner.received_count,
-        sent_count: inner.sent_count,
-        deleted_count: inner.deleted_count,
-        websocket_open: inner.websocket_open,
-        websocket_close: inner.websocket_close,
-        sessions_created: inner.sessions_created,
-        sessions_success: inner.sessions_success,
-        oob_invites_created: inner.oob_invites_created,
-        oob_invites_claimed: inner.oob_invites_claimed,
     }
 }
 
@@ -1156,10 +1058,8 @@ impl MessageStore for RedisStore {
         recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
-        let inner = self
-            .get_message_metadata(recipient_did_hash, message_hash)
-            .await?;
-        Ok(message_meta_into_new(inner))
+        self.get_message_metadata(recipient_did_hash, message_hash)
+            .await
     }
 
     async fn list_messages(
@@ -1506,7 +1406,7 @@ impl SessionStore for RedisStore {
             .arg("challenge")
             .arg(&session.challenge)
             .arg("state")
-            .arg(session_state_into_old(session.state).to_string())
+            .arg(session.state.to_string())
             .arg("did")
             .arg(&session.did);
         if let Some(hash) = &session.refresh_token_hash {
@@ -1530,9 +1430,12 @@ impl SessionStore for RedisStore {
     }
 
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
-        let inner = self.get_session(session_id, did).await?;
-        let refresh = self.get_refresh_token_hash(session_id).await?;
-        Ok(session_into_new(inner, refresh))
+        let session = self.get_session(session_id, did).await?;
+        let refresh_token_hash = self.get_refresh_token_hash(session_id).await?;
+        Ok(Session {
+            refresh_token_hash,
+            ..session
+        })
     }
 
     /// Override the trait default with the legacy atomic RENAME path.
@@ -1973,8 +1876,7 @@ impl AclStore for RedisStore {
 #[async_trait]
 impl StatsStore for RedisStore {
     async fn get_global_stats(&self) -> Result<MetadataStats, MediatorError> {
-        let inner = self.get_db_metadata().await?;
-        Ok(stats_into_new(inner))
+        self.get_db_metadata().await
     }
 
     async fn stats_increment(&self, counter: StatCounter, by: i64) -> Result<(), MediatorError> {
@@ -2005,8 +1907,7 @@ impl ForwardQueueStore for RedisStore {
         entry: &ForwardQueueEntry,
         max_len: usize,
     ) -> Result<String, MediatorError> {
-        let inner = fwd_entry_into_old(entry);
-        self.forward_queue_enqueue_with_limit(&inner, max_len).await
+        self.forward_queue_enqueue_with_limit(entry, max_len).await
     }
 
     async fn forward_queue_len(&self) -> Result<usize, MediatorError> {
@@ -2052,7 +1953,7 @@ impl ForwardQueueStore for RedisStore {
             }
             other => other?,
         };
-        Ok(inner.into_iter().map(fwd_entry_into_new).collect())
+        Ok(inner)
     }
 
     async fn forward_queue_ack(
@@ -2104,7 +2005,7 @@ impl ForwardQueueStore for RedisStore {
             )
             .await?;
         Ok(ForwardQueueClaimPage {
-            entries: entries.into_iter().map(fwd_entry_into_new).collect(),
+            entries,
             next_cursor: (next != "0-0").then_some(next),
         })
     }

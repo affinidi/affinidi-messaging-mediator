@@ -2,76 +2,11 @@ use super::Database;
 use crate::error_codes;
 use crate::errors::MediatorError;
 use itertools::Itertools;
-use num_format::{Locale, ToFormattedString};
 use redis::{Value, from_redis_value};
-use std::fmt::{self, Display, Formatter};
 use tracing::{Level, debug, event};
 
-/// Statistics for the mediator
-#[derive(Default, Debug)]
-pub struct MetadataStats {
-    pub received_bytes: i64,      // Total number of bytes processed
-    pub sent_bytes: i64,          // Total number of bytes sent
-    pub deleted_bytes: i64,       // Total number of bytes deleted
-    pub received_count: i64,      // Total number of messages received
-    pub sent_count: i64,          // Total number of messages sent
-    pub deleted_count: i64,       // Total number of messages deleted
-    pub websocket_open: i64,      // Total number of websocket connections opened
-    pub websocket_close: i64,     // Total number of websocket connections closed
-    pub sessions_created: i64,    // Total number of sessions created
-    pub sessions_success: i64,    // Total number of sessions successfully authenticated
-    pub oob_invites_created: i64, // Total number of out-of-band invites created
-    pub oob_invites_claimed: i64, // Total number of out-of-band invites claimed
-}
-
-impl Display for MetadataStats {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            r#"
-    Message counts: recv({}) sent({}) deleted({}) queued({})
-    Storage: received({}), sent({}), deleted({}), current_queued({})
-    Connections: ws_open({}) ws_close({}) ws_current({}) :: sessions_created({}), sessions_authenticated({})
-    OOB Invites: created({}) claimed({})
-            "#,
-            self.received_count.to_formatted_string(&Locale::en),
-            self.sent_count.to_formatted_string(&Locale::en),
-            self.deleted_count.to_formatted_string(&Locale::en),
-            (self.received_count - self.deleted_count).to_formatted_string(&Locale::en),
-            self.received_bytes.to_formatted_string(&Locale::en),
-            self.sent_bytes.to_formatted_string(&Locale::en),
-            self.deleted_bytes.to_formatted_string(&Locale::en),
-            (self.received_bytes - self.deleted_bytes).to_formatted_string(&Locale::en),
-            self.websocket_open.to_formatted_string(&Locale::en),
-            self.websocket_close.to_formatted_string(&Locale::en),
-            (self.websocket_open - self.websocket_close).to_formatted_string(&Locale::en),
-            self.sessions_created.to_formatted_string(&Locale::en),
-            self.sessions_success.to_formatted_string(&Locale::en),
-            self.oob_invites_created.to_formatted_string(&Locale::en),
-            self.oob_invites_claimed.to_formatted_string(&Locale::en)
-        )
-    }
-}
-
-impl MetadataStats {
-    /// Calculate the delta between two MetadataStats
-    pub fn delta(&self, previous: &MetadataStats) -> MetadataStats {
-        MetadataStats {
-            received_bytes: self.received_bytes - previous.received_bytes,
-            sent_bytes: self.sent_bytes - previous.sent_bytes,
-            deleted_bytes: self.deleted_bytes - previous.deleted_bytes,
-            received_count: self.received_count - previous.received_count,
-            sent_count: self.sent_count - previous.sent_count,
-            deleted_count: self.deleted_count - previous.deleted_count,
-            websocket_open: self.websocket_open - previous.websocket_open,
-            websocket_close: self.websocket_close - previous.websocket_close,
-            sessions_created: self.sessions_created - previous.sessions_created,
-            sessions_success: self.sessions_success - previous.sessions_success,
-            oob_invites_created: self.oob_invites_created - previous.oob_invites_created,
-            oob_invites_claimed: self.oob_invites_claimed - previous.oob_invites_claimed,
-        }
-    }
-}
+/// The global counters, as the store trait reports them.
+pub use crate::store::types::MetadataStats;
 
 impl Database {
     /// Retrieves metadata statistics that are global to the mediator database
