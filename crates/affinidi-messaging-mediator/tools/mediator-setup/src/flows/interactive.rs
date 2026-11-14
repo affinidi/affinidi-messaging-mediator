@@ -5,15 +5,14 @@ use std::{io, path::Path};
 
 use crate::app::{AdminMode, VtaMode};
 use crate::app::{WizardApp, WizardConfig};
+#[cfg(feature = "vta")]
+use crate::bootstrap_headless;
 use crate::cli::{self, Args};
 use crate::flows::print_banner;
 use crate::install::offer_build_and_guidance;
 use crate::provision::{GenerateOptions, generate_and_write_with};
 use crate::tui::event_loop::{restore_terminal, run_event_loop, setup_terminal};
-use crate::{
-    bootstrap_headless, config_writer, exit, exit_recap, recipe, reprovision, secret_backend,
-    secure_fs,
-};
+use crate::{config_writer, exit, exit_recap, recipe, reprovision, secret_backend, secure_fs};
 
 /// The interactive wizard.
 pub(crate) async fn run_tui(args: &Args) -> anyhow::Result<()> {
@@ -71,6 +70,7 @@ pub(crate) async fn run_tui(args: &Args) -> anyhow::Result<()> {
         Ok(completed) => {
             // Clean up the sealed-handoff request file if the setup went
             // through that flow. No-op otherwise.
+            #[cfg(feature = "vta")]
             if let Some(ref artefacts) = app.tui_bootstrap_artifacts {
                 bootstrap_headless::cleanup_artifacts(artefacts);
             }

@@ -22,6 +22,7 @@ use crate::{config_writer, exit, generators, recipe, vta};
 /// the DID document as verification methods, so a mediator that stored only the
 /// first two would advertise a key it cannot use — and the failure surfaces at
 /// a peer as an unverifiable signature, a long way from here.
+#[cfg(feature = "vta")]
 pub(crate) fn did_key_material_to_secrets(
     material: &vta_sdk::sealed_transfer::template_bootstrap::DidKeyMaterialV2,
 ) -> anyhow::Result<Vec<affinidi_secrets_resolver::secrets::Secret>> {
@@ -67,6 +68,7 @@ pub(crate) fn did_key_material_to_secrets(
 /// Both helpers feed into the same downstream sink (`provision_secrets`
 /// in `secrets/mod.rs`); the duplication is in *iteration shape*
 /// only, not in per-key handling.
+#[cfg(feature = "vta")]
 pub(crate) fn secret_entries_to_secrets(
     entries: &[vta_sdk::did_secrets::SecretEntry],
 ) -> anyhow::Result<Vec<affinidi_secrets_resolver::secrets::Secret>> {
@@ -96,6 +98,7 @@ pub(crate) fn secret_entries_to_secrets(
 /// own via the Did step), so there's nothing for the VTA cache to
 /// seed. `TemplateBootstrap` and `ContextProvision` replies both map
 /// to a bundle; their shapes differ but the target is unified.
+#[cfg(feature = "vta")]
 pub(crate) fn build_did_secrets_bundle(
     session: &vta::VtaSession,
 ) -> Option<vta_sdk::did_secrets::DidSecretsBundle> {
@@ -195,27 +198,6 @@ pub(crate) fn did_peer_service_url(public_url: &str, api_prefix: &str) -> Option
     } else {
         combine_url_prefix(public_url, api_prefix)
     })
-}
-
-#[cfg(test)]
-mod did_peer_service_url_tests {
-    use super::did_peer_service_url;
-
-    #[test]
-    fn appends_default_api_prefix_for_host_root_public_url() {
-        assert_eq!(
-            did_peer_service_url("https://mediator.example.com", "/mediator/v1/"),
-            Some("https://mediator.example.com/mediator/v1".into())
-        );
-    }
-
-    #[test]
-    fn does_not_double_append_existing_api_prefix() {
-        assert_eq!(
-            did_peer_service_url("https://mediator.example.com/mediator/v1/", "/mediator/v1/"),
-            Some("https://mediator.example.com/mediator/v1".into())
-        );
-    }
 }
 
 /// Phase 2 — pure-ish value computation. Branches on `did_method`,
@@ -353,6 +335,11 @@ pub(crate) async fn mint_did_material(
             webvh_update_keys = Some(result.update_keys);
             (result.did, result.secrets, Some(result.did_doc), None)
         }
+        #[cfg(not(feature = "vta"))]
+        Some(DidMethod::Vta) => {
+            return Err(exit::error(exit::NO_VTA_SESSION, vta::VTA_UNAVAILABLE));
+        }
+        #[cfg(feature = "vta")]
         Some(DidMethod::Vta) => {
             // VTA-managed DID: two reply shapes carry it.
             // - `Full(ProvisionResultV2)` — fresh template render
@@ -460,6 +447,7 @@ pub(crate) async fn mint_did_material(
 }
 
 #[cfg(test)]
+#[cfg(feature = "vta")]
 mod cache_bundle_tests {
     use super::build_did_secrets_bundle;
     use crate::vta::VtaSession;
@@ -597,5 +585,26 @@ mod cache_bundle_tests {
             "did:webvh:mediator.example.com#key-0"
         );
         assert_eq!(bundle.secrets[1].private_key_multibase, "zKa");
+    }
+}
+
+#[cfg(test)]
+mod did_peer_service_url_tests {
+    use super::did_peer_service_url;
+
+    #[test]
+    fn appends_default_api_prefix_for_host_root_public_url() {
+        assert_eq!(
+            did_peer_service_url("https://mediator.example.com", "/mediator/v1/"),
+            Some("https://mediator.example.com/mediator/v1".into())
+        );
+    }
+
+    #[test]
+    fn does_not_double_append_existing_api_prefix() {
+        assert_eq!(
+            did_peer_service_url("https://mediator.example.com/mediator/v1/", "/mediator/v1/"),
+            Some("https://mediator.example.com/mediator/v1".into())
+        );
     }
 }

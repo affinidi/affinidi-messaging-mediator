@@ -18,14 +18,20 @@ path = "src/main.rs"
 
 [features]
 ## Default: DIDComm v2 and TSP protocol support + Redis storage backend +
-## jemalloc, plus VTA-backed key management.
+## jemalloc. VTA-backed key management (`vta`) is NOT in the default set for
+## this release: see the `vta` feature.
 ## AWS integration is opt-in: use --features aws when deploying to AWS.
-default = ["didcomm", "tsp", "redis-backend", "jemalloc", "vta"]
+default = ["didcomm", "tsp", "redis-backend", "jemalloc"]
 
 ## VTA-backed key management — the mediator fetches its operating secrets from
 ## a Verifiable Trust Agent at boot, refreshes them periodically, and offers
-## `mediator rotate-admin`. ON by default: this is how the VTA-linked
-## deployment works, and turning it off changes what the binary can do.
+## `mediator rotate-admin`.
+##
+## UNAVAILABLE IN THIS RELEASE, and therefore not in `default`. `vta-sdk` is
+## out of the dependency graph (see the commented-out dependency below), so
+## enabling this feature stops the build with a `compile_error!` that says
+## so. Step 3 of the release order restores `dep:vta-sdk` here and puts
+## `vta` back into `default`.
 ##
 ## It exists to be turned OFF by *library* consumers, and that is the point.
 ## `vta-sdk` lives in the VTI workspace, which depends on this crate back
@@ -47,7 +53,7 @@ default = ["didcomm", "tsp", "redis-backend", "jemalloc", "vta"]
 ## Self-hosted mediators (operating secrets from the unified secret backend's
 ## well-known entry) are unaffected either way — that path never touches
 ## `vta-sdk`.
-vta = ["dep:vta-sdk"]
+vta = []  # step 3: vta = ["dep:vta-sdk"]
 
 ## Use jemalloc as the binary's global allocator (see the dependency comment).
 ## On by default: with the system allocator the process holds its RSS high-water
@@ -190,8 +196,16 @@ affinidi-did-common.workspace = true
 affinidi-secrets-resolver.workspace = true
 ## Shared background-task supervision (restart-on-failure + health registry)
 affinidi-task-utils = "0.1"
+## STEP 3 OF THE VTA RELEASE ORDER: `vta-sdk` is out of the dependency graph
+## for this release. Every published vta-sdk (<= 0.88.x) pulls
+## trust-tasks-proof 0.36/0.37, which no longer compiles once
+## affinidi-data-integrity unifies to 0.8.7 (its public `KeyType` moved to
+## affinidi-crypto 0.3). The order is: (1) this release ships without
+## vta-sdk, (2) VTI releases vta-sdk on SDK 0.47 / TDK 0.45, (3) this
+## workspace restores the dependency below and `vta`'s `dep:vta-sdk`.
+##
 ## VTA SDK for centralized DID/key management via Verifiable Trust Agent.
-## Optional, behind the default-on `vta` feature — see that feature's comment
+## Optional, behind the `vta` feature — see that feature's comment
 ## for why the optionality matters more than the version range does.
 ##
 ## Tightened back to a plain caret now that the release it was waiting on has
@@ -201,7 +215,7 @@ affinidi-task-utils = "0.1"
 ## a second `trust-tasks-rs` (0.2.57, from vta-sdk 0.21.6) in this workspace's
 ## lockfile long after everything else had moved to 0.9. A bounded range is a
 ## tax that comes due silently; prefer a caret and move it deliberately.
-vta-sdk = { workspace = true, features = ["integration"], optional = true }
+# vta-sdk = { workspace = true, features = ["integration"], optional = true }
 
 # ── Web Framework ────────────────────────────────────────────────────────
 axum = { workspace = true, features = ["ws"] }
@@ -362,7 +376,7 @@ features = [
   "secrets-vault",
   "secrets-k8s",
   "aws",
-  "vta",
+  # step 3: "vta",
 ]
 rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
 rustc-args = ["--cfg", "tracing_unstable"]

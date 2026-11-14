@@ -28,6 +28,7 @@ impl SelectionOption {
 
     /// Mark an option disabled — renders dimmed, ignored by the
     /// keyboard handler.
+    #[cfg_attr(not(feature = "vta"), allow(dead_code))]
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self

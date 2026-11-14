@@ -16,7 +16,10 @@
 use std::fmt;
 
 pub const GENERIC: u8 = 1;
+// Exit codes stay assigned without the `vta` feature; nothing returns them.
+#[cfg_attr(not(feature = "vta"), allow(dead_code))]
 pub const VTA_NO_TRANSPORT: u8 = 2;
+#[cfg_attr(not(feature = "vta"), allow(dead_code))]
 pub const VTA_POST_AUTH: u8 = 3;
 pub const REFUSED_EXISTING: u8 = 4;
 pub const NO_VTA_SESSION: u8 = 5;

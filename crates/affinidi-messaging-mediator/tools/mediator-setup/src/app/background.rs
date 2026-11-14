@@ -3,6 +3,7 @@
 
 use tokio::sync::mpsc::unbounded_channel;
 
+#[cfg(feature = "vta")]
 use crate::vta::ConnectPhase;
 
 use super::{BackendCheck, BackgroundEvent, InputMode, WizardApp, WizardStep};
@@ -43,12 +44,18 @@ impl WizardApp {
 
     /// A provision flight is running on a spawned task.
     pub fn provision_in_flight(&self) -> bool {
-        self.vta_connect
+        #[cfg(feature = "vta")]
+        return self
+            .vta_connect
             .as_ref()
-            .is_some_and(|s| s.phase == ConnectPhase::Testing && s.event_rx.is_some())
+            .is_some_and(|s| s.phase == ConnectPhase::Testing && s.event_rx.is_some());
+        // No provision flight exists without the `vta` feature.
+        #[cfg(not(feature = "vta"))]
+        false
     }
 
     /// Stop the spawned provision flight, if any.
+    #[cfg(feature = "vta")]
     pub(super) fn abort_vta_task(&mut self) {
         if let Some(task) = self.vta_task.take() {
             task.abort();
@@ -104,6 +111,7 @@ impl WizardApp {
     /// Store the VTA session's admin credential and key cache in the
     /// secret backend now, so a quit or a later failure does not lose what
     /// the VTA already minted.
+    #[cfg(feature = "vta")]
     pub(super) fn persist_session(&mut self) {
         if !self.live_backend {
             return;
@@ -164,9 +172,11 @@ impl WizardApp {
                 self.mode = InputMode::Selecting;
                 self.selection_index = self.default_selection_index();
             }
+            #[cfg(feature = "vta")]
             BackgroundEvent::SessionPersisted(Ok(url)) => {
                 self.session_persist_status = Some(format!("VTA credential stored in {url}."));
             }
+            #[cfg(feature = "vta")]
             BackgroundEvent::SessionPersisted(Err(e)) => {
                 self.session_persist_status = Some(format!(
                     "Could not store the VTA credential yet ({e}); it is written again at \
@@ -181,7 +191,10 @@ impl WizardApp {
     /// VTA-side state stays, and so does a credential already stored.
     pub(super) fn discard_vta_session(&mut self) {
         if self.vta_session.take().is_some() {
-            self.tui_bootstrap_artifacts = None;
+            #[cfg(feature = "vta")]
+            {
+                self.tui_bootstrap_artifacts = None;
+            }
             self.vta_stub_notice = Some(
                 "The previous VTA session was discarded. What the VTA did for it (a minted \
                  DID, a used setup ACL) remains on the VTA side, and a credential already \

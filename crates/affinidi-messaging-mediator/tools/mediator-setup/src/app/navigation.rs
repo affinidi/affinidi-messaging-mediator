@@ -172,6 +172,8 @@ impl WizardApp {
     /// progress-panel jump if they want to inspect it.
     pub(super) fn should_auto_skip_step(&self) -> bool {
         match self.current_step {
+            // No VTA session, so no VTA-minted DID, without the `vta` feature.
+            #[cfg(feature = "vta")]
             WizardStep::Did => {
                 self.config.use_vta
                     && self.config.did_method == Some(DidMethod::Vta)
@@ -209,8 +211,8 @@ impl WizardApp {
         // can be re-defaulted without a stale pick.
         if self.current_step == WizardStep::Vta
             && self.vta_step_phase == VtaStepPhase::SelectTransport
-            && self.vta_connect.is_none()
-            && self.sealed_handoff.is_none()
+            && !self.in_vta_subflow()
+            && !self.in_sealed_handoff_subflow()
         {
             self.vta_step_phase = VtaStepPhase::SelectIntent;
             self.vta_intent_choice = None;
@@ -439,10 +441,13 @@ impl WizardApp {
         if self.mode != InputMode::TextInput {
             return;
         }
+        #[cfg(feature = "vta")]
         let preserve_newlines = matches!(
             self.sealed_handoff.as_ref().map(|s| s.phase),
             Some(crate::sealed_handoff::SealedPhase::AwaitingBundle)
         );
+        #[cfg(not(feature = "vta"))]
+        let preserve_newlines = false;
         let cleaned: String = raw
             .chars()
             .filter(|c| {

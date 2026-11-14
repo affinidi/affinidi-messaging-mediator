@@ -24,7 +24,10 @@ mod navigation;
 mod security;
 mod step;
 mod validate;
+#[cfg(feature = "vta")]
 mod vta_flow;
+#[cfg(not(feature = "vta"))]
+mod vta_flow_unavailable;
 
 pub use choices::{
     Choice, DEPLOYMENT_CHOICES, KEY_STORAGE_CHOICES, SSL_CHOICES, VTA_INTENT_CHOICES, index_of,
@@ -41,8 +44,11 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tui_input::Input;
 
 use crate::discovery::{DiscoveryEvent, DiscoveryState};
+#[cfg(feature = "vta")]
 use crate::sealed_handoff::SealedHandoffState;
-use crate::vta::{VtaConnectState, VtaIntent, VtaSession};
+#[cfg(feature = "vta")]
+use crate::vta::VtaConnectState;
+use crate::vta::{VtaIntent, VtaSession};
 
 /// The main wizard application state.
 pub struct WizardApp {
@@ -77,6 +83,7 @@ pub struct WizardApp {
     pub did_phase: Option<DidPhase>,
     /// Ephemeral state for the online-VTA connection sub-flow. Present only
     /// while the operator is stepping through the sub-phases of the Vta step.
+    #[cfg(feature = "vta")]
     pub vta_connect: Option<VtaConnectState>,
     /// Optional CLI-provided VTA DID that pre-fills the first sub-flow
     /// text field. Kept on the app (not on `VtaConnectState`) so repeated
@@ -85,11 +92,13 @@ pub struct WizardApp {
     /// Optional CLI-provided context id override for the sub-flow.
     pub vta_context_prefill: Option<String>,
     /// Captured VTA session — set when the Connected phase advances, read
-    /// by the config-writing step to provision the mediator's DID.
+    /// by the config-writing step to provision the mediator's DID. Always
+    /// `None` without the `vta` feature (`VtaSession` has no values then).
     pub vta_session: Option<VtaSession>,
     /// Ephemeral state for the air-gapped sealed-handoff sub-flow.
     /// Present only while the operator is on that sub-flow's screens;
     /// extracted into `vta_session` and dropped on completion.
+    #[cfg(feature = "vta")]
     pub sealed_handoff: Option<SealedHandoffState>,
     /// Snapshot of on-disk artefact paths captured at the moment the
     /// sealed-handoff sub-flow transitions out of `Complete`. Used
@@ -98,6 +107,7 @@ pub struct WizardApp {
     /// non-interactive `--from` path does via
     /// [`crate::bootstrap_headless::cleanup_artifacts`]. `None`
     /// when the setup didn't go through the sealed-handoff flow.
+    #[cfg(feature = "vta")]
     pub tui_bootstrap_artifacts: Option<crate::bootstrap_headless::BootstrapArtifacts>,
     /// Which of the two top-level picker questions is on screen. Reset
     /// to [`VtaStepPhase::SelectIntent`] whenever the operator enters
@@ -179,6 +189,7 @@ pub struct WizardApp {
     pub session_persist_status: Option<String>,
     /// The spawned provision flight, so Esc can stop it rather than just
     /// stop listening to it.
+    #[cfg(feature = "vta")]
     vta_task: Option<tokio::task::JoinHandle<()>>,
     /// Ctrl+C / F10 / Esc-on-first-step was pressed while a VTA session
     /// exists: a y/n confirmation is on screen.
@@ -216,6 +227,7 @@ pub enum BackgroundEvent {
     /// The backend check finished: `Ok` with the URL it covered.
     BackendChecked(Result<String, String>),
     /// Persisting the VTA session finished.
+    #[cfg(feature = "vta")]
     SessionPersisted(Result<String, String>),
 }
 
@@ -240,11 +252,14 @@ impl WizardApp {
             security_phase: None,
             database_phase: Some(DatabasePhase::SelectBackend),
             did_phase: None,
+            #[cfg(feature = "vta")]
             vta_connect: None,
             vta_did_prefill: None,
             vta_context_prefill: None,
             vta_session: None,
+            #[cfg(feature = "vta")]
             sealed_handoff: None,
+            #[cfg(feature = "vta")]
             tui_bootstrap_artifacts: None,
             vta_step_phase: VtaStepPhase::SelectIntent,
             vta_intent_choice: None,
@@ -263,6 +278,7 @@ impl WizardApp {
             backend_checked_url: None,
             background_rx: None,
             session_persist_status: None,
+            #[cfg(feature = "vta")]
             vta_task: None,
             quit_confirm: false,
             input_error: None,
@@ -272,6 +288,7 @@ impl WizardApp {
     }
 
     /// Lift the online sub-flow's connection onto `vta_session`.
+    #[cfg(feature = "vta")]
     fn capture_connected_session(&mut self) {
         if let Some(state) = self.vta_connect.as_ref()
             && let Some(conn) = state.connection.as_ref()

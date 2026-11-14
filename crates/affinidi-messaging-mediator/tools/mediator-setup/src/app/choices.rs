@@ -115,7 +115,19 @@ pub const KEY_STORAGE_CHOICES: [Choice<SecretScheme>; 7] = [
     },
 ];
 
+/// The VTA step's first question without the `vta` feature: only "No VTA".
+/// vta-sdk is out of the dependency graph for this release, so no VTA flow
+/// can run; the step stays, saying so (see `VTA_UNAVAILABLE`).
+#[cfg(not(feature = "vta"))]
+pub const VTA_INTENT_CHOICES: [Choice<Option<VtaIntent>>; 1] = [Choice {
+    value: None,
+    label: "No VTA (VTA integration is unavailable in this release)",
+    help: "Manage keys and DIDs independently (local dev, cloud secret stores).",
+    info: crate::vta::VTA_UNAVAILABLE,
+}];
+
 /// The VTA step's first question. `None` is "No VTA".
+#[cfg(feature = "vta")]
 pub const VTA_INTENT_CHOICES: [Choice<Option<VtaIntent>>; 4] = [
     Choice {
         value: Some(VtaIntent::FullSetup),

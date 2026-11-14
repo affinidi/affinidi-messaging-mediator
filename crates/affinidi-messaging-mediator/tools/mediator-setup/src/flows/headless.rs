@@ -5,13 +5,15 @@ use std::path::Path;
 
 use crate::app::WizardConfig;
 use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
+#[cfg(feature = "vta")]
+use crate::bootstrap_headless;
 use crate::cli::Args;
 use crate::consts::*;
 use crate::flows::print_banner;
 use crate::install::{install_or_print_commands, print_final_summary};
 use crate::provision::{GenerateOptions, generate_and_write_with};
 use crate::ui::labels::label_of;
-use crate::{bootstrap_headless, config_writer, exit, headless, recipe, secret_backend, vta};
+use crate::{config_writer, exit, headless, recipe, secret_backend, vta};
 
 /// A human description of what the admin choice will produce.
 pub(crate) fn admin_summary(config: &WizardConfig) -> String {
@@ -157,6 +159,12 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
              (deployment.use_vta = true with vta_mode = \"sealed-mint\" or \"sealed-export\")"
         );
     }
+    // Without the `vta` feature no VTA mode can run: refuse before anything
+    // is generated or written.
+    #[cfg(not(feature = "vta"))]
+    if config.use_vta {
+        return Err(exit::error(exit::NO_VTA_SESSION, vta::VTA_UNAVAILABLE));
+    }
     if config.use_vta && !sealed {
         return Err(exit::error(
             exit::NO_VTA_SESSION,
@@ -189,6 +197,14 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
         file_passphrase: None,
     };
 
+    #[cfg(not(feature = "vta"))]
+    let completed = {
+        // `sealed` implies `use_vta`, refused above.
+        debug_assert!(!sealed);
+        out!("  Generating cryptographic material...\n");
+        generate_and_write_with(&config, None, &options).await?
+    };
+    #[cfg(feature = "vta")]
     let completed = if sealed {
         use bootstrap_headless::HeadlessOutcome;
         let outcome = bootstrap_headless::dispatch(
@@ -244,8 +260,16 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
     completed.into_result()
 }
 
+/// `--setup-key-file` without the `vta` feature: refused, the VTA flows are
+/// not built in this release.
+#[cfg(not(feature = "vta"))]
+pub(crate) async fn run_setup_key_phase2(_args: &Args, _key_path: &Path) -> anyhow::Result<()> {
+    Err(exit::error(exit::NO_VTA_SESSION, vta::VTA_UNAVAILABLE))
+}
+
 /// `--setup-key-file`: authenticate to the VTA with the phase-1 did:key,
 /// then provision the mediator with the resulting admin-only session.
+#[cfg(feature = "vta")]
 pub(crate) async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow::Result<()> {
     let vta_did = vta::cli::validate_phase2_args(&args.vta_did)?;
     let mediator_url = args.mediator_url.as_deref().ok_or_else(|| {
@@ -331,6 +355,7 @@ pub(crate) async fn run_setup_key_phase2(args: &Args, key_path: &Path) -> anyhow
 /// writes the request file. Mirrors the interactive TUI's
 /// `primary_command` screen but addressed to an operator looking at
 /// a shell prompt rather than a ratatui panel.
+#[cfg(feature = "vta")]
 pub(crate) fn print_phase1_next_steps(
     recipe_path: &str,
     request_path: &std::path::Path,

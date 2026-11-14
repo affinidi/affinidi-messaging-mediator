@@ -1,10 +1,13 @@
+#[cfg(feature = "vta")]
 pub mod diagnostics;
 pub mod discovery;
 pub mod info_box;
+#[cfg(feature = "vta")]
 pub mod instructions;
 pub mod labels;
 pub mod progress;
 pub mod prompt;
+#[cfg(feature = "vta")]
 pub mod recovery;
 pub mod selection;
 pub mod summary;
@@ -128,7 +131,9 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 /// `main::handle_key_event` actually binds in this state.
 pub fn help_text(app: &WizardApp) -> String {
     use crate::app::{FocusPanel, KeyStoragePhase};
+    #[cfg(feature = "vta")]
     use crate::sealed_handoff::SealedPhase;
+    #[cfg(feature = "vta")]
     use crate::vta::ConnectPhase;
 
     const QUIT: &str = "Ctrl+C/F10 Quit";
@@ -147,12 +152,25 @@ pub fn help_text(app: &WizardApp) -> String {
         return keys.join("  ");
     }
 
-    let sealed_phase = app
-        .sealed_handoff
-        .as_ref()
-        .filter(|_| app.in_sealed_handoff_subflow())
-        .map(|s| s.phase);
-    let vta_phase = app.vta_connect.as_ref().map(|s| s.phase.clone());
+    // Which VTA sub-flow screen is up: (sealed request generated, DIDs to
+    // copy, ACL command to copy). None of them exist without `vta`.
+    #[cfg(feature = "vta")]
+    let (request_generated, dids_to_copy, acl_to_copy) = {
+        let sealed_phase = app
+            .sealed_handoff
+            .as_ref()
+            .filter(|_| app.in_sealed_handoff_subflow())
+            .map(|s| s.phase);
+        let vta_phase = app.vta_connect.as_ref().map(|s| s.phase.clone());
+        (
+            sealed_phase == Some(SealedPhase::RequestGenerated),
+            sealed_phase == Some(SealedPhase::Complete)
+                || vta_phase == Some(ConnectPhase::Connected),
+            vta_phase == Some(ConnectPhase::AwaitingAcl),
+        )
+    };
+    #[cfg(not(feature = "vta"))]
+    let (request_generated, dids_to_copy, acl_to_copy) = (false, false, false);
 
     match app.mode {
         InputMode::TextInput => {
@@ -183,7 +201,7 @@ pub fn help_text(app: &WizardApp) -> String {
                 ]);
             }
             FocusPanel::Content => {
-                if sealed_phase == Some(SealedPhase::RequestGenerated) {
+                if request_generated {
                     keys.extend([
                         "\u{2191}\u{2193}/PgUp/PgDn Scroll",
                         "c Copy request",
@@ -199,12 +217,10 @@ pub fn help_text(app: &WizardApp) -> String {
                     } else {
                         keys.push("Enter Select");
                     }
-                    if sealed_phase == Some(SealedPhase::Complete)
-                        || vta_phase == Some(ConnectPhase::Connected)
-                    {
+                    if dids_to_copy {
                         keys.push("m/a/v Copy DIDs");
                     }
-                    if vta_phase == Some(ConnectPhase::AwaitingAcl) {
+                    if acl_to_copy {
                         keys.push("c Copy command");
                     }
                     keys.push("\u{2190} Steps");
@@ -334,12 +350,14 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
     // top/bottom split would squeeze the producer commands into six
     // lines and clip them. Branch before the split so we keep a
     // single Rect to work with.
+    #[cfg(feature = "vta")]
     if let Some(state) = app.sealed_handoff.as_ref()
         && state.phase == crate::sealed_handoff::SealedPhase::RequestGenerated
     {
         render_sealed_request(frame, area, state);
         return;
     }
+    #[cfg(feature = "vta")]
     if let Some(state) = app.sealed_handoff.as_ref()
         && state.phase == crate::sealed_handoff::SealedPhase::Complete
     {
@@ -360,6 +378,7 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
     // Sealed-handoff sub-flow takes precedence over the regular Vta
     // selection list — the operator is mid-cryptography and shouldn't
     // see the scheme picker behind a backdrop.
+    #[cfg(feature = "vta")]
     if let Some(state) = app.sealed_handoff.as_ref() {
         use crate::sealed_handoff::SealedPhase;
         match state.phase {
@@ -622,6 +641,7 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
         }
     }
 
+    #[cfg(feature = "vta")]
     if let (Some(state), Some(phase)) = (app.vta_connect.as_ref(), app.vta_phase()) {
         use crate::vta::ConnectPhase;
         match phase {
@@ -1173,6 +1193,7 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
 /// once inside a single bordered `Paragraph`. No ANSI escape string
 /// processing — ratatui renders `Style`d spans directly, so we get
 /// real bold / color instead of literal `\x1b[1m` bleeding through.
+#[cfg(feature = "vta")]
 fn render_sealed_request(
     frame: &mut Frame,
     area: Rect,
@@ -1379,6 +1400,7 @@ fn render_sealed_request(
 /// Field order is mediator → admin → VTA so the operator's eye lands
 /// on the DID they're most likely to need next (the mediator's own
 /// identity) without having to scan past unrelated material.
+#[cfg(feature = "vta")]
 fn render_sealed_complete(
     frame: &mut Frame,
     area: Rect,
@@ -1552,6 +1574,7 @@ fn render_sealed_complete(
 /// `BootstrapRequest` produces (four `"key": value,` lines plus
 /// outer `{` / `}`). Anything unexpected falls back to muted
 /// text — no panics.
+#[cfg(feature = "vta")]
 fn highlight_json_line(
     raw: &str,
     key_style: Style,
