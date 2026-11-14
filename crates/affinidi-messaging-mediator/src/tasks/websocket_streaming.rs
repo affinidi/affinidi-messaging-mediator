@@ -15,7 +15,7 @@
 
  - **A duplicate replaces an existing session.** A notification published
    in the instant the old socket is torn down would otherwise be stranded
-   on a socket nobody is reading. See issue #374.
+   on a socket nobody is reading. See issue affinidi-tdk-rs#374.
  - **A socket enables live delivery.** Messages that arrived between
    registration and activation were stored and not pushed, because the
    client was not live when they landed. Under load that window is wide
@@ -66,7 +66,7 @@ use tracing::{Instrument, Level, debug, error, info, span, warn};
 
 /// A duplicate replacement arriving within this window of the previous
 /// registration for the same DID is counted as socket *churn* (the
-/// flip-flop signal in issue #374).
+/// flip-flop signal in issue affinidi-tdk-rs#374).
 const CHURN_WINDOW: Duration = Duration::from_secs(5);
 
 /// Consecutive in-window replacements for one DID before the duel damper in
@@ -1271,7 +1271,7 @@ impl StreamingTask {
         // once the test ran 6-way concurrent on a loaded runner.
         //
         // Reuses the redelivery already written for socket replacement
-        // (issue #374): fetched `DoNotDelete`, at-least-once, idempotent by
+        // (issue affinidi-tdk-rs#374): fetched `DoNotDelete`, at-least-once, idempotent by
         // message id, one drain per DID at a time (`Redeliveries`). A client
         // that already had a message simply sees it again and deletes it as
         // usual.
@@ -1631,7 +1631,7 @@ impl StreamingTask {
 
     /// Make `entry` the DID's live entry, record it, and — when it took the
     /// slot from another socket — redeliver the inbox to it, since a message in
-    /// flight to the displaced socket would otherwise be stranded (#374).
+    /// flight to the displaced socket would otherwise be stranded (affinidi-tdk-rs#374).
     #[allow(clippy::too_many_arguments)]
     async fn install(
         &self,
@@ -2922,7 +2922,7 @@ mod tests {
         );
     }
 
-    /// Issue #374: a duplicate connect for a DID with an in-flight (stored but
+    /// Issue affinidi-tdk-rs#374: a duplicate connect for a DID with an in-flight (stored but
     /// not yet delivered) message must close the old socket *and* redeliver the
     /// stored message to the surviving socket.
     #[tokio::test]
@@ -3983,7 +3983,7 @@ mod tests {
             _ => panic!("expected Superseded"),
         }
         assert_eq!(clients.get(&digest(did)).unwrap().session_id, "direct");
-        // The direct socket gets the inbox, as for any replacement (#374).
+        // The direct socket gets the inbox, as for any replacement (affinidi-tdk-rs#374).
         let cmd = next_cmd(&mut d_rx).await;
         assert!(matches!(cmd.cmd, WebSocketCommands::Message(ref m) if m == "in-flight"));
         assert_eq!(cmd.did_hash.as_deref(), Some(digest(did).as_str()));

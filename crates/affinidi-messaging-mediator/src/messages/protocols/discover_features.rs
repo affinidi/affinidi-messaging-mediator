@@ -98,7 +98,7 @@ pub(crate) fn process(
 /// verkey→account mapping itself. That is exactly the mapping a v2 DID makes
 /// unnecessary.
 ///
-/// External transport bindings rely on this (issue #755).
+/// External transport bindings rely on this (issue affinidi-tdk-rs#755).
 /// `coordinate_mediation_is_not_advertised` below exists so that adding v2
 /// mediation is a deliberate act — amending a contract others have built on —
 /// rather than an incidental change that silently invalidates it.
@@ -116,7 +116,7 @@ pub(crate) const ADVERTISED_PROTOCOLS: &[&str] = &[
 mod advertised_protocol_tests {
     use super::ADVERTISED_PROTOCOLS;
 
-    /// The contract answered in issue #755: DIDComm v2 on this mediator is
+    /// The contract answered in issue affinidi-tdk-rs#755: DIDComm v2 on this mediator is
     /// DID-addressed and has no keylist, so a v2 client — a `did:key` client in
     /// particular — has nothing to register before it can receive.
     ///
@@ -138,7 +138,7 @@ mod advertised_protocol_tests {
             offending.is_empty(),
             "v2 coordinate-mediation is now advertised ({offending:?}), but \
              docs/mediation-and-routing.md tells clients v2 needs no keylist. Amend the \
-             documented contract and notify the consumers relying on it (issue #755) \
+             documented contract and notify the consumers relying on it (issue affinidi-tdk-rs#755) \
              before letting this land."
         );
     }

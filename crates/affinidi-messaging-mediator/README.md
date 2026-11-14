@@ -11,6 +11,17 @@ participants.
 
 ## Quick start
 
+The setup wizard is not published on crates.io: run it, and the mediator,
+from a checkout of this repository, with the **repository root** as the
+working directory. The wizard writes `conf/` relative to where it runs, and
+the mediator reads `conf/mediator.toml` relative to where it runs. Never run
+the wizard from this crate's directory: its default output path would
+overwrite the annotated template tracked in `conf/mediator.toml` here.
+
+The [root README](../../README.md#getting-started) has the shortest path
+(file secrets, did:peer, no prompts); this section covers the wizard's
+choices.
+
 ### 1. Start Redis (skip for Fjall)
 
 Fjall is embedded and keeps its data in a local directory, so it needs no
@@ -18,7 +29,7 @@ sidecar. For Redis:
 
 ```bash
 docker run --name=redis-local --publish=6379:6379 --hostname=redis \
-  --restart=on-failure --detach redis:latest
+  --restart=on-failure --detach redis:7-alpine
 ```
 
 ### 2. Run the setup wizard
@@ -39,6 +50,12 @@ It asks for:
 6. **Database**: a Redis URL, or a Fjall data directory (single node).
 7. **Admin account**: generate a did:key, paste an existing one, or skip.
 
+The default build of the wizard compiles every secret backend, including the
+AWS, GCP and Azure SDKs. If you only need some, build it with
+`--no-default-features --features <backends>` (for example
+`cargo run --locked -p affinidi-messaging-mediator-setup --no-default-features --features secrets-keyring`;
+`file://` is always available).
+
 It writes:
 
 - `conf/mediator.toml`, the full configuration. It holds no secrets.
@@ -57,6 +74,17 @@ backend you chose (the wizard's default, `keyring://`, needs
 cargo build --release --locked -p affinidi-messaging-mediator --features secrets-keyring
 cargo run --release --locked -p affinidi-messaging-mediator --features secrets-keyring -- -c conf/mediator.toml
 ```
+
+### 4. Check it works
+
+```bash
+curl -s http://localhost:7037/mediator/v1/livez    # {"status":"alive"}
+curl -s http://localhost:7037/mediator/v1/readyz   # "status":"ready" once storage and secrets answer
+```
+
+`mediator healthcheck` does the same `livez` check from the command line (the
+container image uses it). [docs/operations.md](docs/operations.md) describes
+both routes, `/metrics` and the rest of the operational surface.
 
 ## Non-interactive setup (CI/CD)
 
@@ -130,7 +158,7 @@ storage backend, and add back `vta` and `jemalloc` if you want them.
 | Feature | Default | Description |
 |---|---|---|
 | `didcomm` | Yes | DIDComm v2. |
-| `tsp` | Yes | Trust Spanning Protocol. Run it with `didcomm`: TSP authenticates over the DIDComm session, so a TSP-only build has no auth path. |
+| `tsp` | Yes | Trust Spanning Protocol. Works with or without `didcomm`: a TSP-only build (`--no-default-features --features tsp,<storage backend>`) authenticates clients with `POST /tsp/authenticate`, and CI builds and tests it. |
 | `didcomm-v1` | No | Accepts DIDComm v1 (Aries) forwards alongside v2. Implies `didcomm`. |
 
 **TSP endpoint advertisement.** Other mediators can route TSP to this one
@@ -205,6 +233,20 @@ graph TD
     MED --- ACL["Access Control<br/>Lists (ACLs)"]
     MED --- PROC["Processors<br/>(Forwarding, Expiry)"]
 ```
+
+[docs/architecture.md](docs/architecture.md) maps the code: the crates, the
+mediator's modules, and the path a message takes from the inbound request to
+storage, live delivery or forwarding, and deletion.
+
+## DID multiplexing
+
+One authenticated WebSocket can carry live delivery, pickup and sending for
+many DIDs, each of which signs a grant or attach statement allowing it. It is
+off by default (`[limits.mux] enabled`), and served over DIDComm
+(`didcomm-mux` subprotocol) and raw TSP (`tsp-mux`).
+[docs/multiplexing.md](docs/multiplexing.md) covers enabling it, the
+subprotocols, grants and scopes, the `messaging/mux/*` Trust Tasks, limits,
+metrics and running several instances.
 
 ## Prerequisites
 
@@ -357,6 +399,10 @@ from the balancer's (usually private) address, so add the balancer's ranges to
 | [mediation-and-routing.md](docs/mediation-and-routing.md) | Addressing: v2 is DID-addressed, v1 is keylist-addressed, and what gates reachability. |
 | [multi-mediator.md](docs/multi-mediator.md) | Federating mediators: relay hops, blind vs rewrap, config and ACLs. |
 | [memory-tuning.md](docs/memory-tuning.md) | Memory use and throughput knobs for Fjall and Redis. |
+| [multiplexing.md](docs/multiplexing.md) | DID multiplexing: grants, scopes, the `didcomm-mux` and `tsp-mux` subprotocols, limits, metrics. |
+| [operations.md](docs/operations.md) | Health and readiness probes, `/metrics` and its catalogue, logs, shutdown, the `mediator` subcommands. |
+| [architecture.md](docs/architecture.md) | Crate and module map, and a message's lifecycle through the code. |
+| [delivery-rules.md](../../docs/delivery-rules.md) | The R-numbered delivery and contract rules cited in code and the changelog. |
 | [ERRORS.md](ERRORS.md) | Error codes. |
 
 ## Managing the mediator

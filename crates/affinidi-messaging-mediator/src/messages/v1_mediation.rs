@@ -20,7 +20,7 @@
 //! from its authenticated verkey. Deterministic, needs no extra state, and it
 //! is the same identifier Aries uses for a connection's keys.
 //!
-//! Provisioning deliberately mirrors [`crate::handlers::authenticate::response`]
+//! Provisioning deliberately mirrors `crate::handlers::authenticate::response`
 //! rather than inventing a second policy: an unknown account is created with
 //! `global_acl_default`, unless `mediator_acl_mode` is `explicit_allow`, in
 //! which case mediation is denied. One admission gate, two entry points.

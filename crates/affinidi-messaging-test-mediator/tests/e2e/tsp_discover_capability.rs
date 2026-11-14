@@ -1,4 +1,4 @@
-//! End-to-end coverage of **proactive** TSP capability discovery (issue #576):
+//! End-to-end coverage of **proactive** TSP capability discovery (issue affinidi-tdk-rs#576):
 //! a sender learns a peer speaks TSP from a DIDComm Discover Features 2.0
 //! disclosure — *before* any relationship or observed inbound TSP — so the
 //! next `atm.send_to` upgrades DIDComm → TSP.
@@ -26,7 +26,7 @@ async fn disclosure_for_query(
     features.calculate_disclosure(&query_body)
 }
 
-/// The headline #576 behaviour: alice discovers bob's TSP capability via a
+/// The headline affinidi-tdk-rs#576 behaviour: alice discovers bob's TSP capability via a
 /// Discover Features query/disclosure round-trip, with no prior relationship or
 /// inbound TSP, and her next `send_to` upgrades to TSP.
 #[tokio::test]

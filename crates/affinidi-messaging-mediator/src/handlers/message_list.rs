@@ -66,7 +66,7 @@ pub async fn message_list_handler(
         // is allowed only for that DID. Multi-DID listing (one session
         // owner aggregating across several DIDs) would need a session-
         // owner concept above the DID and an owner→DIDs index in the
-        // store; tracked in PR #286's follow-up section.
+        // store; tracked in PR affinidi-tdk-rs#286's follow-up section.
         if session
             .did_hash
             .as_bytes()

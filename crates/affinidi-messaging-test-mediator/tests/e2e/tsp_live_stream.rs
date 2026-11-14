@@ -114,7 +114,7 @@ async fn tsp_frame_is_delivered_over_the_multiplexed_live_stream() {
     service_handle
         // 60s, not 15s: one connect attempt can spend 10s in the service's
         // `profile_add` timeout on a loaded CI runner, so a flat 15s budget
-        // fits barely one retry (#611). Returns immediately when healthy.
+        // fits barely one retry (affinidi-tdk-rs#611). Returns immediately when healthy.
         .wait_connected(LISTENER_ID, Duration::from_secs(60))
         .await
         .expect("service connects to mediator");

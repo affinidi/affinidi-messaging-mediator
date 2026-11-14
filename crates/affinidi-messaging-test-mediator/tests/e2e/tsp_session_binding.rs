@@ -11,7 +11,7 @@
 //! frame sent on a socket authenticated as DID A, with envelope sender DID E,
 //! was forwarded normally.
 //!
-//! The file also covers the *policy* gate on the same branch (#757): TSP direct
+//! The file also covers the *policy* gate on the same branch (affinidi-tdk-rs#757): TSP direct
 //! delivery ignored `security.local_direct_delivery_allowed`, so an operator who
 //! had turned direct delivery off — to force everything through a routing
 //! envelope the relay layer can audit — got no such enforcement for TSP.
@@ -31,7 +31,7 @@
 use crate::common::inbox_len;
 use affinidi_messaging_test_mediator::{AccessListModeType, TestEnvironment, TestMediator, acl};
 
-/// The regression for #754: a frame whose envelope sender is not the session
+/// The regression for affinidi-tdk-rs#754: a frame whose envelope sender is not the session
 /// DID is refused.
 ///
 /// Mallory packs the message — so it is a genuinely well-formed TSP envelope
@@ -230,7 +230,7 @@ async fn force_session_did_match_off_still_accepts_a_mismatched_sender() {
     env.shutdown().await.expect("shutdown");
 }
 
-/// The gate closed for #757: TSP direct delivery is subject to
+/// The gate closed for affinidi-tdk-rs#757: TSP direct delivery is subject to
 /// `local_direct_delivery_allowed`, which it previously ignored entirely.
 ///
 /// An operator turns direct delivery off so everything arrives inside a routing

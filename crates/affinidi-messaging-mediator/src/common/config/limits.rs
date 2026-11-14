@@ -208,7 +208,7 @@ mod defaults {
 }
 
 /// DID multiplexing: one authenticated connection carrying live delivery and
-/// pickup for many DIDs. See `design-docs/mediator-did-multiplexing-design.md`.
+/// pickup for many DIDs. See `docs/multiplexing.md` in this crate.
 ///
 /// **Off by default, and never turned on by an upgrade.** Everything about mux
 /// is opt-in (design §5.8): an absent table or an absent or empty `enabled`

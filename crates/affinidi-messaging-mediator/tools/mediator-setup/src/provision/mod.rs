@@ -366,12 +366,12 @@ mod generate_and_write_tests {
 
         // No legacy `<config_dir>/secrets.json` array is written anymore:
         // the unified backend is the sole owner of secret persistence
-        // (#354). The wizard used to emit an `affinidi_secrets_resolver`
+        // (affinidi-tdk-rs#354). The wizard used to emit an `affinidi_secrets_resolver`
         // array here that clobbered the unified file on the default path.
         let legacy_secrets = dir.join("conf").join("secrets.json");
         assert!(
             !legacy_secrets.exists(),
-            "wizard must not write a legacy secrets.json array (#354)"
+            "wizard must not write a legacy secrets.json array (affinidi-tdk-rs#354)"
         );
 
         // Phase: admin-monitor.json — TDKProfile-shaped JSON for
@@ -513,8 +513,8 @@ mod generate_and_write_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial_test::serial]
-    async fn generate_and_write_file_backend_on_default_path_survives(/* #354 */) {
-        // Regression for #354. The default `[secrets].storage` path is
+    async fn generate_and_write_file_backend_on_default_path_survives(/* affinidi-tdk-rs#354 */) {
+        // Regression for affinidi-tdk-rs#354. The default `[secrets].storage` path is
         // `<config_dir>/secrets.json` — the very path the now-removed
         // legacy writer hard-coded. Point the file:// backend there and
         // assert the unified `{"entries": …}` envelope survives instead
@@ -560,7 +560,7 @@ mod generate_and_write_tests {
 
         // The unified envelope is a JSON object keyed by `entries`; the
         // clobbered legacy form was a top-level array. Asserting the
-        // object shape is what would have caught #354.
+        // object shape is what would have caught affinidi-tdk-rs#354.
         assert!(
             json.get("entries").and_then(|e| e.as_object()).is_some(),
             "secrets file must be the unified {{\"entries\": …}} envelope, not a legacy array: {text}"

@@ -41,7 +41,7 @@ pub(super) async fn report_refusal(
 /// The problem report for a socket the streaming task is closing.
 ///
 /// One report per [`CloseReason`], because the three are not the same event and
-/// a client can only act on the difference. Until #1028 every one of them sent
+/// a client can only act on the difference. Until affinidi-tdk-rs#1028 every one of them sent
 /// `duplicate-channel` / "a new duplicate connection has caused this websocket
 /// to terminate" — true of [`CloseReason::Replaced`], and the exact inverse of
 /// what happened on the other two.

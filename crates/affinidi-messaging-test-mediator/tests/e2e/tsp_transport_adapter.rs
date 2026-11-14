@@ -4,7 +4,7 @@
 //! A TSP frame is handed to the adapter's `tsp_to_inbound` as the **qb64** stored
 //! string (base64url of qb2 — `-E…` *text*), so it must `atm.tsp().unpack(profile,
 //! packed)` (base64url-decodes first), NOT `unpack_bytes(packed.as_bytes())`.
-//! Before sdk 0.18.59 (#627) it did the latter, fed the ASCII `-E…` bytes into the
+//! Before sdk 0.18.59 (affinidi-tdk-rs#627) it did the latter, fed the ASCII `-E…` bytes into the
 //! CESR parser, failed with `missing -E envelope wrapper`, and dropped the frame —
 //! so the VTA never answered TSP trust-pings. On the old code this times out; on
 //! the fix it passes. Drives the SDK's `DidCommTransport` directly — the coverage

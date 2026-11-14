@@ -1,8 +1,10 @@
 //! DID multiplexing (mux) grant storage.
 //!
 //! A **grant** is a member DID's signed statement that a *principal* may
-//! collect its messages over the principal's own connection. See the design
-//! note `design-docs/mediator-did-multiplexing-design.md` (§4.4, §5, §6).
+//! collect its messages over the principal's own connection. The feature is
+//! described in the mediator crate's `docs/multiplexing.md`; "design §N" in
+//! these comments cites the internal design note it was built from, which is
+//! not published.
 //!
 //! # Why the rules live here and not in each backend
 //!

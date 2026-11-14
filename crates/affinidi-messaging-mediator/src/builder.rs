@@ -26,6 +26,10 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::filter::LevelFilter;
 use url::Url;
 
+/// The streaming task's liveness timings, set with
+/// [`MediatorBuilder::streaming_liveness`].
+pub use crate::tasks::websocket_streaming::StreamingLiveness;
+
 // ─── Public types ────────────────────────────────────────────────────────────
 
 /// TLS termination mode for the listener.
@@ -446,10 +450,7 @@ impl MediatorBuilder {
     /// heartbeat lasts, and how often it rechecks which instance streams each
     /// DID it carries. The defaults suit production; shorter ones make a test
     /// that kills an instance quick.
-    pub fn streaming_liveness(
-        mut self,
-        liveness: crate::tasks::websocket_streaming::StreamingLiveness,
-    ) -> Self {
+    pub fn streaming_liveness(mut self, liveness: StreamingLiveness) -> Self {
         self.config.streaming_liveness = liveness;
         self
     }

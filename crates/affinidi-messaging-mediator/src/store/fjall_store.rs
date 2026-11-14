@@ -151,7 +151,7 @@ pub struct FjallTuning {
     /// Block cache (read-side), in bytes.
     pub block_cache: u64,
     /// Total memtable budget across all keyspaces, in bytes. Split by
-    /// [`KEYSPACE_WRITE_WEIGHTS`].
+    /// `KEYSPACE_WRITE_WEIGHTS`.
     pub write_buffer: u64,
     /// Journal ceiling, in bytes. The only *effective* global bound on unflushed
     /// memory — see the field docs on the config type.

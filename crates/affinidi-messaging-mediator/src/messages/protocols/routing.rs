@@ -327,7 +327,7 @@ fn decode_first_attachment(
             // than forward untrusted signed payloads. Most
             // DIDComm clients use base64-encoded encrypted
             // attachments instead, which don't require this
-            // path. Tracked as future work in PR #286's
+            // path. Tracked as future work in PR affinidi-tdk-rs#286's
             // follow-up section.
             return Err(MediatorError::problem(
                 error_codes::FEATURE_NOT_IMPLEMENTED,

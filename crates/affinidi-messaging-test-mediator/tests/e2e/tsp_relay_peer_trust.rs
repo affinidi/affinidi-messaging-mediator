@@ -1,5 +1,5 @@
 //! `processors.forwarding.relay_trusted_mediators` applied to TSP relay hops
-//! (issue #758).
+//! (issue affinidi-tdk-rs#758).
 //!
 //! Until now the allowlist was DIDComm-only, so a TSP deployment that needed its
 //! relaying peer authenticated had no lever at all. It does now, and TSP gets a

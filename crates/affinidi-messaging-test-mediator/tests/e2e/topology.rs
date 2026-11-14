@@ -1,7 +1,7 @@
 //! TI1 — multi-mediator [`TestTopology`] fixture.
 //!
 //! These are the first consumers of the topology fixture and the home for the
-//! pending #385/#388 relay e2e: a two-hop forward over the memory backend, and
+//! pending affinidi-tdk-rs#385/#388 relay e2e: a two-hop forward over the memory backend, and
 //! a rewrap-mode relay that must preserve the inner (recipient-addressed)
 //! envelope end to end. Both run as plain `#[tokio::test]` with no Redis and no
 //! external network — every identity is `did:peer`, so the only real socket
@@ -62,7 +62,7 @@ async fn two_hop_forward_delivers_over_memory_backend() {
     topology.shutdown().await.expect("shutdown topology");
 }
 
-/// Relay-REWRAP envelope preservation (#388): in rewrap mode each mediator
+/// Relay-REWRAP envelope preservation (affinidi-tdk-rs#388): in rewrap mode each mediator
 /// re-encrypts the inter-mediator hop from itself to the next mediator, hiding
 /// the original sender on the wire — but the inner authcrypt addressed to Bob is
 /// preserved, so Bob still decrypts Alice's original content. (The on-wire

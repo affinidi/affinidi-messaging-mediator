@@ -18,8 +18,10 @@ path = "src/main.rs"
 ## Default build speaks every secret backend the mediator runtime
 ## supports. Operators who want a slimmer binary can disable default
 ## features and select only the backends they need, e.g.
-## `cargo install affinidi-messaging-mediator-setup \
+## `cargo run -p affinidi-messaging-mediator-setup \
 ##     --no-default-features --features secrets-aws`.
+## The wizard is not published on crates.io (`publish = false`): run it from
+## a checkout of this repository.
 default = [
   "secrets-keyring",
   "secrets-aws",
@@ -50,9 +52,8 @@ affinidi-messaging-mediator-config = { version = "0.52.0", path = "../../affinid
 ## CIDR parsing for recipe `[output].trust_xff_cidrs`.
 ipnet.workspace = true
 # ── TUI Framework ────────────────────────────────────────────────────────
-## Workspace-wide pin — ratatui 0.29 carries `unicode-width = "=0.2.0"`
-## so every workspace consumer of ratatui (here, text-client,
-## mediator-console) must move together. Bumped in coordination.
+## Workspace-wide pin: every consumer of ratatui (the wizard and
+## mediator-console) moves together (root Cargo.toml).
 ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 tui-input = { version = "0.15", features = ["ratatui-crossterm"] }
@@ -129,7 +130,7 @@ rand.workspace = true
 # ── Clipboard ────────────────────────────────────────────────────────────
 ## `arboard` copies the bootstrap request JSON onto the system clipboard
 ## so operators don't have to fight terminal mouse selection across the
-## wizard's two-panel layout. Same crate + pattern as `openvtc-cli2`.
+## wizard's two-panel layout.
 arboard = "3"
 
 # ── Crypto / SSL ─────────────────────────────────────────────────────────

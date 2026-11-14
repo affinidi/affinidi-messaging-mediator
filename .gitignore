@@ -20,20 +20,6 @@ environments.json
 # lockfile, so this constrains only builds of this repository.
 **/environments.json*
 
-docs/*
-# Architecture Decision Records are first-class, tracked docs.
-!docs/adr/
-# Security audit-readiness / threat-model docs are tracked.
-!docs/security/
-# Consumer migration guides are tracked.
-!docs/migration/
-# Testing guide + composed-stack docs are tracked.
-!docs/testing/
-# TSP usage cookbook is tracked.
-!docs/tsp/
-# Release runbooks for publishes that can't just be "merge and let CI run".
-!docs/release/
-
 # mediator-setup wizard generated artifacts (may land in any directory).
 # admin-monitor.json holds the admin Ed25519 private key; did.jsonl and
 # did-web.json are the minted identity. .dockerignore mirrors these.
@@ -54,8 +40,6 @@ docs/*
 
 # Superego
 .superego/
-CLAUDE.md
-/docs/ssi-comparison-infographic.html
 
 # Local agent state (Claude Code, etc.)
 .claude/

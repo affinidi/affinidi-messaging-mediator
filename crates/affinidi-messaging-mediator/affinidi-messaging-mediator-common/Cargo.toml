@@ -279,3 +279,18 @@ linux-keyutils-keyring-store = { version = "1", optional = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# Every feature but the test-only `test-clock`.
+features = [
+  "server",
+  "redis-backend",
+  "secrets-keyring",
+  "secrets-aws",
+  "secrets-gcp",
+  "secrets-azure",
+  "secrets-vault",
+  "secrets-k8s",
+]
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

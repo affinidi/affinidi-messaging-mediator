@@ -10,10 +10,12 @@ name: publish-images
 # The image is a full `cargo build --release`, so it is NOT built on every push —
 # it runs only when it can pay for itself:
 #   * release tag `vX.Y.Z` / `vX.Y.Z-rc.N`
-#                           -> build, verify, publish. release-tag.yml creates
-#                              the tag and dispatches this workflow on it (a tag
-#                              made with GITHUB_TOKEN triggers no `push` run);
-#                              a tag pushed by a person triggers `push: tags`.
+#                           -> build, verify, publish, through `push: tags`.
+#                              release-tag.yml creates the tag with the
+#                              release-bot app's token, which (unlike a tag
+#                              made with GITHUB_TOKEN) triggers that `push`
+#                              run exactly as a tag pushed by a person does;
+#                              nothing dispatches this workflow.
 #   * workflow_dispatch     -> build, verify, publish. On a release tag it
 #                              publishes only that tag's version. On `main` or
 #                              `release/*` it publishes only a dev version,

@@ -10,10 +10,12 @@ Please do not open a public GitHub issue for a suspected vulnerability.
 
 ## Supported versions
 
-Security fixes are backported to the newest two GA releases (N and N-1) and
-released as patches from their `release/<major.minor>` branches — crates on
-crates.io and images on `ghcr.io/affinidi/messaging-mediator`. See
-[RELEASES.md](RELEASES.md) for the schedule and the current status of each
-release. Versions up to `0.41.x` were released from
+A release is supported for 90 days after its GA, and the newest GA release
+is always supported. Security fixes are backported to every supported
+release and released as patches from its `release/<major.minor>` branch —
+crates on crates.io and images on `ghcr.io/affinidi/messaging-mediator`. A
+fix that needs a breaking change ships only in the next release, and the
+advisory says so. See [RELEASES.md](RELEASES.md#support) for the policy and
+the schedule table for each release's "Supported until" date. Versions up to `0.41.x` were released from
 [affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs) and are not
 patched from this repository.

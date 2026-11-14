@@ -287,7 +287,7 @@ pub struct SecurityConfig {
     // constructing a `SecurityConfig` had to name `EncodingKey`/`DecodingKey`,
     // so it had to compile against the same `jsonwebtoken` major we did. Bumping
     // it was then source-breaking for consumers rather than routine currency,
-    // which is how mediator 0.20.11 nearly shipped a break as a patch (#770).
+    // which is how mediator 0.20.11 nearly shipped a break as a patch (affinidi-tdk-rs#770).
     //
     // Build them with [`SecurityConfig::set_jwt_keys_from_pkcs8`] instead, which
     // takes bytes and keeps the dependency private.
@@ -442,7 +442,7 @@ impl SecurityConfig {
     /// `jsonwebtoken` types, and taking bytes here keeps that crate a *private*
     /// dependency of this one. While the fields were public a consumer had to
     /// name `EncodingKey`/`DecodingKey` to build a `SecurityConfig`, which made
-    /// every `jsonwebtoken` major bump source-breaking for consumers (#770).
+    /// every `jsonwebtoken` major bump source-breaking for consumers (affinidi-tdk-rs#770).
     ///
     /// Both keys come from the one document: the signing key is the PKCS#8
     /// itself, the verification key is the public half derived from it, so they

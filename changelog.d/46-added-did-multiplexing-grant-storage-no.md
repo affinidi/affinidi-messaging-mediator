@@ -1,8 +1,8 @@
 ### Added — DID multiplexing grant storage (no behaviour change yet)
 
 - Storage for DID multiplexing grants: a member DID's signed permission for a
-  *principal* connection to collect its messages (design:
-  `design-docs/mediator-did-multiplexing-design.md`). Every grant rule (epoch,
+  *principal* connection to collect its messages (see
+  `crates/affinidi-messaging-mediator/docs/multiplexing.md`). Every grant rule (epoch,
   replay floor, quotas, narrow-only updates, unknown-key suspension, expiry)
   lives once, in `affinidi-messaging-mediator-common::store::mux`; the Redis,
   Fjall and memory backends implement only a versioned compare-and-swap of a

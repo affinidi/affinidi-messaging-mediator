@@ -83,7 +83,7 @@ pub fn encode_oob_invite(invite: &Message) -> Result<String, MediatorError> {
 // Only the fjall and memory backends call this harness (the Redis path has
 // its own integration tests). Gating it to those features keeps it from being
 // dead code — and tripping `-D warnings` — under a redis-backend-only build
-// such as the coverage job (#351).
+// such as the coverage job (affinidi-tdk-rs#351).
 #[cfg(all(test, any(feature = "fjall-backend", feature = "memory-backend")))]
 pub(crate) mod auth_flow_harness {
     use affinidi_messaging_mediator_common::store::{Session, SessionState, prelude::*};

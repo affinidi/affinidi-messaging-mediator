@@ -143,3 +143,8 @@ affinidi-tdk-common.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

@@ -1,3 +1,18 @@
+//! The `mediator` binary.
+//!
+//! `mediator [-c conf/mediator.toml]` runs the server from a configuration
+//! file (written by `mediator-setup`; every `### Env:` key in the annotated
+//! template can be overridden from the environment). Subcommands:
+//!
+//! - `mediator healthcheck` GETs the configured `livez` route and exits 0 when
+//!   it answers 2xx (the container image's `HEALTHCHECK`);
+//! - `mediator rotate-admin [--dry-run]` rotates the admin credential of a
+//!   VTA-linked deployment (`vta` feature).
+//!
+//! The library half of this crate (`MediatorBuilder`) runs the same server
+//! inside another process. See `docs/operations.md` for the probe routes,
+//! metrics and shutdown behaviour.
+
 use affinidi_messaging_mediator::commands;
 use affinidi_messaging_mediator::server::start;
 use clap::{Parser, Subcommand};
