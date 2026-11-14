@@ -1,10 +1,10 @@
 //! Top-level raw config schema (`[server]`, `[streaming]`, `[did_resolver]`,
 //! `[secrets]`, `[storage]`, and the `ConfigRaw` root).
 
-use affinidi_messaging_mediator_common::redact::redact_url;
+use crate::redact::redact_url;
 use serde::{Deserialize, Serialize};
 
-use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw};
+use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw, defaults};
 
 /// `[database]` section schema (raw, all-strings TOML form).
 ///
@@ -55,6 +55,23 @@ impl std::fmt::Debug for DatabaseConfigRaw {
                 &self.circuit_breaker_recovery_secs,
             )
             .finish()
+    }
+}
+
+/// Every key at its [`defaults::database`](crate::defaults::database) value.
+/// `functions_file` is empty (the built-in stored-function library) and the
+/// optional keys are empty, as an absent key leaves them.
+impl Default for DatabaseConfigRaw {
+    fn default() -> Self {
+        Self {
+            functions_file: String::new(),
+            database_url: defaults::database::DATABASE_URL.to_string(),
+            database_timeout: defaults::database::DATABASE_TIMEOUT.to_string(),
+            scripts_path: None,
+            cluster_mode: String::new(),
+            circuit_breaker_threshold: String::new(),
+            circuit_breaker_recovery_secs: String::new(),
+        }
     }
 }
 
@@ -125,7 +142,8 @@ pub struct StreamingConfig {
 /// DID resolver configuration.
 ///
 /// The conversion to the runtime `DIDCacheConfig` lives in the mediator
-/// (`crate::common::config::did_resolver_cache_config`) so this crate stays
+/// (`crate::common::config::did_resolver_cache_config`, from the typed
+/// [`settings::did_resolver`](crate::settings::did_resolver)) so this crate stays
 /// free of the DID-resolver SDK.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DIDResolverConfig {
@@ -134,6 +152,21 @@ pub struct DIDResolverConfig {
     pub cache_ttl: String,
     pub network_timeout: String,
     pub network_limit: String,
+}
+
+/// Every key at its [`defaults::did_resolver`](crate::defaults::did_resolver)
+/// value; no resolver `address` (resolve locally).
+impl Default for DIDResolverConfig {
+    fn default() -> Self {
+        use defaults::did_resolver as d;
+        Self {
+            address: None,
+            cache_capacity: d::CACHE_CAPACITY.to_string(),
+            cache_ttl: d::CACHE_TTL.to_string(),
+            network_timeout: d::NETWORK_TIMEOUT_MS.to_string(),
+            network_limit: d::NETWORK_LIMIT.to_string(),
+        }
+    }
 }
 
 /// `[secrets]` config section — the unified secret-storage backend.
@@ -233,23 +266,24 @@ pub struct DidCommV1ConfigRaw {
     pub max_routing_keys_per_account: u32,
 }
 
-/// Default for `[didcomm_v1] max_routing_keys_per_account`.
-///
-/// Room for a wallet with a few hundred connections; `keylist-query` returns
-/// the whole list in one reply, so this also bounds that reply.
-pub const DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT: u32 = 256;
+/// Default for `[didcomm_v1] max_routing_keys_per_account`: kept as a name
+/// for existing users; the value is
+/// [`defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT`].
+pub const DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT: u32 =
+    defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT;
 
 fn default_max_v1_routing_keys_per_account() -> u32 {
-    DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT
+    defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT
 }
 
 impl Default for DidCommV1ConfigRaw {
     fn default() -> Self {
+        use defaults::didcomm_v1 as d;
         Self {
-            enabled: false,
-            allow_unauthenticated_forwards: false,
-            allow_unproven_routing_keys: false,
-            max_routing_keys_per_account: DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT,
+            enabled: d::ENABLED,
+            allow_unauthenticated_forwards: d::ALLOW_UNAUTHENTICATED_FORWARDS,
+            allow_unproven_routing_keys: d::ALLOW_UNPROVEN_ROUTING_KEYS,
+            max_routing_keys_per_account: d::MAX_ROUTING_KEYS_PER_ACCOUNT,
         }
     }
 }
@@ -329,22 +363,19 @@ pub struct FjallConfig {
 }
 
 fn default_fjall_durability() -> String {
-    "buffered".to_string()
+    defaults::fjall::DURABILITY.to_string()
 }
 
-/// 16 MiB.
 fn default_fjall_block_cache() -> String {
-    "16777216".to_string()
+    defaults::fjall::BLOCK_CACHE.to_string()
 }
 
-/// 32 MiB, split across keyspaces by write weight.
 fn default_fjall_write_buffer() -> String {
-    "33554432".to_string()
+    defaults::fjall::WRITE_BUFFER.to_string()
 }
 
-/// 128 MiB.
 fn default_fjall_max_journal() -> String {
-    "134217728".to_string()
+    defaults::fjall::MAX_JOURNAL.to_string()
 }
 
 impl Default for FjallConfig {

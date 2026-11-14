@@ -13,11 +13,24 @@ use serde::{Deserialize, Serialize};
 use super::config_error;
 
 /// Processor configuration for the mediator
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessorsConfig {
     pub forwarding: ForwardingConfig,
     pub message_expiry_cleanup: MessageExpiryCleanupConfig,
     pub session_expiry_cleanup: SessionExpiryCleanupConfig,
+}
+
+/// The config crate's defaults table: `ForwardingConfig::default()` reads it
+/// directly, the cleanup sections through the same conversions a file goes
+/// through.
+impl Default for ProcessorsConfig {
+    fn default() -> Self {
+        Self {
+            forwarding: ForwardingConfig::default(),
+            message_expiry_cleanup: MessageExpiryCleanupConfig::default(),
+            session_expiry_cleanup: SessionExpiryCleanupConfig::default(),
+        }
+    }
 }
 
 /// Configuration for the in-process message expiry sweep. The standalone
@@ -31,7 +44,8 @@ pub struct MessageExpiryCleanupConfig {
 
 impl Default for MessageExpiryCleanupConfig {
     fn default() -> Self {
-        MessageExpiryCleanupConfig { enabled: true }
+        Self::try_from(MessageExpiryCleanupConfigRaw::default())
+            .expect("the built-in cleanup default is valid")
     }
 }
 
@@ -56,7 +70,8 @@ pub struct SessionExpiryCleanupConfig {
 
 impl Default for SessionExpiryCleanupConfig {
     fn default() -> Self {
-        SessionExpiryCleanupConfig { enabled: true }
+        Self::try_from(SessionExpiryCleanupConfigRaw::default())
+            .expect("the built-in cleanup default is valid")
     }
 }
 
@@ -172,6 +187,21 @@ mod tests {
         assert!(!config.accept_invalid_certs);
         assert_eq!(config.max_hops, 10);
         assert!(config.blocked_forwarding.is_empty());
+    }
+
+    /// The raw section's defaults (the table written as the strings a file
+    /// holds) read through the strict conversion as `ForwardingConfig::default()`
+    /// (the table read directly): a file that states only defaults runs as a
+    /// mediator built in code does.
+    #[test]
+    fn the_raw_forwarding_defaults_read_as_the_default() {
+        let read = forwarding_config_from_raw(ForwardingConfigRaw::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&read).unwrap(),
+            serde_json::to_value(ForwardingConfig::default()).unwrap()
+        );
+        assert!(MessageExpiryCleanupConfig::default().enabled);
+        assert!(SessionExpiryCleanupConfig::default().enabled);
     }
 
     #[test]

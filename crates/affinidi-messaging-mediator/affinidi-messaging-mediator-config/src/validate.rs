@@ -9,7 +9,7 @@
 //! The mediator wires these into its `validate_config(&Config)` orchestrator,
 //! which maps hard failures to `MediatorError` and logs the warnings.
 
-use affinidi_messaging_mediator_common::types::acls::{AccessListModeType, MediatorACLSet};
+use affinidi_messaging_mediator_types::acls::{AccessListModeType, MediatorACLSet};
 
 /// Warn when this mediator relays inter-mediator forwards *implicitly* — i.e.
 /// `global_acl_default` grants `SEND_FORWARDED` (so anonymous `/inbound`
@@ -47,7 +47,7 @@ pub fn warn_implicit_relay(
 fn did_account_form(did: &str) -> String {
     let did = did.trim();
     let did = did.strip_prefix("did://").unwrap_or(did);
-    let did = affinidi_messaging_mediator_common::did_identity::account_did(did);
+    let did = crate::did_identity::account_did(did);
     let end = did.find(['?', '#']).unwrap_or(did.len());
     let did = &did[..end];
     let mut parts = did.splitn(3, ':');

@@ -32,11 +32,12 @@ pub mod did_web;
 
 pub mod error_codes;
 
-/// The account a DID names, and its hash. Pure, always built: every place
-/// the mediator keys storage, sessions or access control by a DID goes
-/// through it, so a did:scid identity is one account whether or not the
-/// DID URL it presents carries a `src` locator.
-pub mod did_identity;
+/// The account a DID names, and its hash. Every place the mediator keys
+/// storage, sessions or access control by a DID goes through it, so a did:scid
+/// identity is one account whether or not the DID URL it presents carries a
+/// `src` locator. Lives in `affinidi-messaging-mediator-config` (whose
+/// validation needs it); re-exported so these paths keep working.
+pub use affinidi_messaging_mediator_config::did_identity;
 
 /// `aws_parameter_store://` target parsing. Pure (no AWS SDK), always
 /// built: shared by the mediator runtime (reading `mediator_did` from a
@@ -56,10 +57,12 @@ pub mod s3_target;
 /// rule governs every path any of them reads.
 pub mod config_path;
 
-/// Hiding the credentials in a URL before it is printed. Pure (`std` only),
-/// always built: shared by the config structs' `Debug`, the storage startup
-/// errors and the `config/show` Trust Task, so they all hide the same part.
-pub mod redact;
+/// Hiding the credentials in a URL before it is printed: shared by the config
+/// structs' `Debug`, the storage startup errors and the `config/show` Trust
+/// Task, so they all hide the same part. Lives in
+/// `affinidi-messaging-mediator-config` (whose schema `Debug` impls need it);
+/// re-exported so these paths keep working.
+pub use affinidi_messaging_mediator_config::redact;
 
 #[cfg(feature = "server")]
 pub mod circuit_breaker;

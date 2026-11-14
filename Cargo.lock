@@ -532,7 +532,7 @@ name = "affinidi-messaging-mediator-common"
 version = "0.52.0"
 dependencies = [
  "aes-gcm",
- "affinidi-did-common",
+ "affinidi-messaging-mediator-config",
  "affinidi-messaging-mediator-types",
  "affinidi-net-guard",
  "ahash",
@@ -587,10 +587,13 @@ dependencies = [
 name = "affinidi-messaging-mediator-config"
 version = "0.52.0"
 dependencies = [
- "affinidi-messaging-mediator-common",
+ "affinidi-did-common",
+ "affinidi-messaging-mediator-types",
+ "humantime",
  "ipnet",
  "serde",
  "serde_ignored",
+ "sha256",
  "tempfile",
  "thiserror 2.0.21",
  "toml",

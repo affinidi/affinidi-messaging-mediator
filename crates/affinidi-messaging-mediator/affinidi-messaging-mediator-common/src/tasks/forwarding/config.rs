@@ -9,6 +9,7 @@
 //! parser layer for backward compatibility with operator-supplied
 //! all-strings TOML.
 
+use affinidi_messaging_mediator_config::defaults::forwarding as defaults;
 use ahash::AHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -132,41 +133,75 @@ pub struct ForwardingConfig {
 }
 
 fn default_max_concurrent_endpoints() -> usize {
-    32
+    defaults::MAX_CONCURRENT_ENDPOINTS
 }
 
 fn default_delivery_timeout_seconds() -> u64 {
-    90
+    defaults::DELIVERY_TIMEOUT_SECONDS
 }
 
 fn default_reclaim_idle_seconds() -> u64 {
-    180
+    defaults::RECLAIM_IDLE_SECONDS
 }
 
+/// Every value from the config crate's `defaults::forwarding` table.
 impl Default for ForwardingConfig {
     fn default() -> Self {
         ForwardingConfig {
-            enabled: true,
-            future_time_limit: 86400,
-            external_forwarding: true,
-            report_errors: true,
+            enabled: defaults::ENABLED,
+            future_time_limit: defaults::FUTURE_TIME_LIMIT,
+            external_forwarding: defaults::EXTERNAL_FORWARDING,
+            report_errors: defaults::REPORT_ERRORS,
             blocked_forwarding: HashSet::new(),
-            rate_window_seconds: 300,
-            ws_threshold_msgs_per_10s: 1,
-            ws_idle_timeout_seconds: 60,
-            batch_size: 50,
-            max_retries: 5,
-            initial_backoff_ms: 1000,
-            max_backoff_ms: 60000,
+            rate_window_seconds: defaults::RATE_WINDOW_SECONDS,
+            ws_threshold_msgs_per_10s: defaults::WS_THRESHOLD_MSGS_PER_10S,
+            ws_idle_timeout_seconds: defaults::WS_IDLE_TIMEOUT_SECONDS,
+            batch_size: defaults::BATCH_SIZE,
+            max_retries: defaults::MAX_RETRIES,
+            initial_backoff_ms: defaults::INITIAL_BACKOFF_MS,
+            max_backoff_ms: defaults::MAX_BACKOFF_MS,
             max_concurrent_endpoints: default_max_concurrent_endpoints(),
             delivery_timeout_seconds: default_delivery_timeout_seconds(),
             reclaim_idle_seconds: default_reclaim_idle_seconds(),
-            consumer_group: "forwarding".to_string(),
-            accept_invalid_certs: false,
-            max_hops: 10,
-            relay_mode: RelayMode::Blind,
+            consumer_group: defaults::CONSUMER_GROUP.to_string(),
+            accept_invalid_certs: defaults::ACCEPT_INVALID_CERTS,
+            max_hops: defaults::MAX_HOPS,
+            relay_mode: RelayMode::default(),
             relay_trusted_mediators: HashSet::new(),
             blocked_forwarding_late: Arc::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RelayMode::default()` is the table's `relay_mode`, written as the file
+    /// writes it.
+    #[test]
+    fn the_default_relay_mode_is_the_table_value() {
+        assert_eq!(
+            serde_json::to_value(RelayMode::default()).unwrap(),
+            serde_json::Value::from(defaults::RELAY_MODE)
+        );
+    }
+
+    /// The standalone forwarding processor reads this type straight from its
+    /// own TOML: a key it leaves out that has a serde default takes the same
+    /// value as `ForwardingConfig::default()`.
+    #[test]
+    fn absent_serde_defaulted_keys_take_the_default() {
+        let full = serde_json::to_value(ForwardingConfig::default()).unwrap();
+        let mut partial = full.as_object().unwrap().clone();
+        for key in [
+            "max_concurrent_endpoints",
+            "delivery_timeout_seconds",
+            "reclaim_idle_seconds",
+        ] {
+            partial.remove(key);
+        }
+        let read: ForwardingConfig = serde_json::from_value(partial.into()).unwrap();
+        assert_eq!(serde_json::to_value(read).unwrap(), full);
     }
 }

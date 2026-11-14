@@ -1,5 +1,6 @@
 //! Raw `[limits]` config schema.
 //!
+//! Every default is a [`defaults::limits`](crate::defaults::limits) value.
 //! The resolved `LimitsConfig` (typed numbers) and the
 //! `LimitsConfigRaw → LimitsConfig` conversion stay in the mediator.
 
@@ -130,125 +131,112 @@ pub struct MuxConfigRaw {
 
 impl Default for MuxConfigRaw {
     fn default() -> Self {
+        use crate::defaults::mux as d;
         Self {
-            enabled: "false".into(),
-            max_dids_per_connection: "1000".into(),
-            max_grants_per_principal: "5000".into(),
-            max_grants_per_did: "16".into(),
-            max_grant_lifetime_secs: "2592000".into(),
-            max_attach_lifetime_secs: "86400".into(),
-            revalidate_interval_secs: "900".into(),
-            max_channel_slots: "512".into(),
-            dead_retention_secs: "604800".into(),
+            enabled: d::ENABLED.to_string(),
+            max_dids_per_connection: d::MAX_DIDS_PER_CONNECTION.to_string(),
+            max_grants_per_principal: d::MAX_GRANTS_PER_PRINCIPAL.to_string(),
+            max_grants_per_did: d::MAX_GRANTS_PER_DID.to_string(),
+            max_grant_lifetime_secs: d::MAX_GRANT_LIFETIME_SECS.to_string(),
+            max_attach_lifetime_secs: d::MAX_ATTACH_LIFETIME_SECS.to_string(),
+            revalidate_interval_secs: d::REVALIDATE_INTERVAL_SECS.to_string(),
+            max_channel_slots: d::MAX_CHANNEL_SLOTS.to_string(),
+            dead_retention_secs: d::DEAD_RETENTION_SECS.to_string(),
         }
     }
 }
 
-/// Off. Enabling this shortens how long a delivered-but-unacknowledged message
-/// survives, which is a reduction in durability, so it is never turned on by an
-/// upgrade — only by an operator who has read what it does.
-fn default_delivered_expiry_seconds() -> String {
-    "0".to_string()
+/// Every key at its [`defaults::limits`](crate::defaults::limits) value,
+/// including the keys a file must state. `ws_messages_per_second` and
+/// `ws_message_burst` are left empty, as an absent key leaves them: empty
+/// inherits the per-IP rate.
+impl Default for LimitsConfigRaw {
+    fn default() -> Self {
+        use crate::defaults::limits as d;
+        Self {
+            attachments_max_count: d::ATTACHMENTS_MAX_COUNT.to_string(),
+            crypto_operations_per_message: d::CRYPTO_OPERATIONS_PER_MESSAGE.to_string(),
+            deleted_messages: d::DELETED_MESSAGES.to_string(),
+            forward_task_queue: d::FORWARD_TASK_QUEUE.to_string(),
+            http_size: d::HTTP_SIZE.to_string(),
+            listed_messages: d::LISTED_MESSAGES.to_string(),
+            local_max_acl: d::LOCAL_MAX_ACL.to_string(),
+            message_expiry_seconds: d::MESSAGE_EXPIRY_SECONDS.to_string(),
+            delivered_expiry_seconds: default_delivered_expiry_seconds(),
+            pickup_round_robin: default_pickup_round_robin(),
+            message_size: d::MESSAGE_SIZE.to_string(),
+            queued_send_messages_per_peer: default_queued_send_messages_per_peer(),
+            queued_send_messages_soft: d::QUEUED_SEND_MESSAGES_SOFT.to_string(),
+            queued_send_messages_hard: d::QUEUED_SEND_MESSAGES_HARD.to_string(),
+            queued_receive_messages_soft: d::QUEUED_RECEIVE_MESSAGES_SOFT.to_string(),
+            queued_receive_messages_hard: d::QUEUED_RECEIVE_MESSAGES_HARD.to_string(),
+            to_keys_per_recipient: d::TO_KEYS_PER_RECIPIENT.to_string(),
+            to_recipients: d::TO_RECIPIENTS.to_string(),
+            ws_size: d::WS_SIZE.to_string(),
+            access_list_limit: d::ACCESS_LIST_LIMIT.to_string(),
+            oob_invite_ttl: d::OOB_INVITE_TTL.to_string(),
+            rate_limit_per_ip: default_rate_limit_per_ip(),
+            rate_limit_burst: default_rate_limit_burst(),
+            max_websocket_connections: default_max_websocket_connections(),
+            max_websocket_connections_per_did: default_max_websocket_connections_per_did(),
+            did_rate_limit_per_second: default_did_rate_limit_per_second(),
+            did_rate_limit_burst: default_did_rate_limit_burst(),
+            ws_send_buffer: default_ws_send_buffer(),
+            pubsub_buffer: default_pubsub_buffer(),
+            relay_connections_per_ip: default_relay_connections_per_ip(),
+            relay_frames_per_second: default_relay_frames_per_second(),
+            relay_frame_burst: default_relay_frame_burst(),
+            relay_bytes_per_second: default_relay_bytes_per_second(),
+            ws_messages_per_second: String::new(),
+            ws_message_burst: String::new(),
+            ws_message_throttle_close_secs: default_ws_message_throttle_close_secs(),
+            metrics_requests_per_second: default_metrics_requests_per_second(),
+            ws_ping_interval_secs: default_ws_ping_interval_secs(),
+            ws_pong_timeout_secs: default_ws_pong_timeout_secs(),
+            ws_write_timeout_secs: default_ws_write_timeout_secs(),
+            http_header_read_timeout_secs: default_http_header_read_timeout_secs(),
+            http_request_timeout_secs: default_http_request_timeout_secs(),
+            max_http_connections: default_max_http_connections(),
+            mux: MuxConfigRaw::default(),
+        }
+    }
 }
 
-/// On. Unlike the delivered-expiry shortening, this destroys nothing and
-/// changes only the interleaving between senders — order within a sender is
-/// preserved, and a recipient talking to one peer sees no change at all.
-fn default_pickup_round_robin() -> String {
-    "true".to_string()
+/// Serde defaults for the optional `[limits]` keys: each the
+/// [`defaults::limits`](crate::defaults::limits) value as the string the file
+/// holds.
+macro_rules! string_defaults {
+    ($($fn_name:ident => $value:ident),* $(,)?) => {
+        $(
+            fn $fn_name() -> String {
+                crate::defaults::limits::$value.to_string()
+            }
+        )*
+    };
 }
 
-/// 50 — the per-relationship outbound cap. A sender may hold this many
-/// messages for any one recipient; beyond that it is flooding that peer, not
-/// serving it. Defaulted (rather than required) so an existing `mediator.toml`
-/// keeps loading without an edit.
-fn default_queued_send_messages_per_peer() -> String {
-    "50".to_string()
-}
-
-fn default_rate_limit_per_ip() -> String {
-    "100".to_string()
-}
-
-/// 32 MiB — aggregate ceiling across every live WebSocket send queue.
-fn default_ws_send_buffer() -> String {
-    "33554432".to_string()
-}
-
-/// 16 MiB — the live-delivery pub/sub ring. Divided by `message_size` to get
-/// the ring's slot count, so this is a true byte ceiling.
-fn default_pubsub_buffer() -> String {
-    "16777216".to_string()
-}
-/// 10 — a relaying mediator pools one socket per endpoint, so ten covers a
-/// handful of peers sharing one egress address.
-fn default_relay_connections_per_ip() -> String {
-    "10".to_string()
-}
-fn default_relay_frames_per_second() -> String {
-    "50".to_string()
-}
-fn default_relay_frame_burst() -> String {
-    "100".to_string()
-}
-/// 4 MiB/s. A single frame larger than this is still admitted (the byte bucket
-/// is always at least `ws_size` deep), it just uses up the allowance.
-fn default_relay_bytes_per_second() -> String {
-    "4194304".to_string()
-}
-/// 10 s over the rate before the socket is closed.
-fn default_ws_message_throttle_close_secs() -> String {
-    "10".to_string()
-}
-/// 5 — a Prometheus scrape is one request every 10-60 s per scraper.
-fn default_metrics_requests_per_second() -> String {
-    "5".to_string()
-}
-
-/// 30 s between pings.
-fn default_ws_ping_interval_secs() -> String {
-    "30".to_string()
-}
-
-/// 90 s — three ping intervals of silence before a socket is treated as gone.
-fn default_ws_pong_timeout_secs() -> String {
-    "90".to_string()
-}
-
-/// 30 s for one write to complete.
-fn default_ws_write_timeout_secs() -> String {
-    "30".to_string()
-}
-
-/// 30 s to send a request's headers (and the most an idle HTTP/1 keep-alive
-/// connection is held).
-fn default_http_header_read_timeout_secs() -> String {
-    "30".to_string()
-}
-
-/// 60 s for one request.
-fn default_http_request_timeout_secs() -> String {
-    "60".to_string()
-}
-
-/// Twice the default WebSocket cap, so HTTP requests still get connections
-/// while every WebSocket slot is taken.
-fn default_max_http_connections() -> String {
-    "20000".to_string()
-}
-
-fn default_rate_limit_burst() -> String {
-    "50".to_string()
-}
-fn default_max_websocket_connections() -> String {
-    "10000".to_string()
-}
-fn default_max_websocket_connections_per_did() -> String {
-    "100".to_string()
-}
-fn default_did_rate_limit_per_second() -> String {
-    "0".to_string()
-}
-fn default_did_rate_limit_burst() -> String {
-    "10".to_string()
+string_defaults! {
+    default_delivered_expiry_seconds => DELIVERED_EXPIRY_SECONDS,
+    default_pickup_round_robin => PICKUP_ROUND_ROBIN,
+    default_queued_send_messages_per_peer => QUEUED_SEND_MESSAGES_PER_PEER,
+    default_rate_limit_per_ip => RATE_LIMIT_PER_IP,
+    default_rate_limit_burst => RATE_LIMIT_BURST,
+    default_max_websocket_connections => MAX_WEBSOCKET_CONNECTIONS,
+    default_max_websocket_connections_per_did => MAX_WEBSOCKET_CONNECTIONS_PER_DID,
+    default_did_rate_limit_per_second => DID_RATE_LIMIT_PER_SECOND,
+    default_did_rate_limit_burst => DID_RATE_LIMIT_BURST,
+    default_ws_send_buffer => WS_SEND_BUFFER,
+    default_pubsub_buffer => PUBSUB_BUFFER,
+    default_relay_connections_per_ip => RELAY_CONNECTIONS_PER_IP,
+    default_relay_frames_per_second => RELAY_FRAMES_PER_SECOND,
+    default_relay_frame_burst => RELAY_FRAME_BURST,
+    default_relay_bytes_per_second => RELAY_BYTES_PER_SECOND,
+    default_ws_message_throttle_close_secs => WS_MESSAGE_THROTTLE_CLOSE_SECS,
+    default_metrics_requests_per_second => METRICS_REQUESTS_PER_SECOND,
+    default_ws_ping_interval_secs => WS_PING_INTERVAL_SECS,
+    default_ws_pong_timeout_secs => WS_PONG_TIMEOUT_SECS,
+    default_ws_write_timeout_secs => WS_WRITE_TIMEOUT_SECS,
+    default_http_header_read_timeout_secs => HTTP_HEADER_READ_TIMEOUT_SECS,
+    default_http_request_timeout_secs => HTTP_REQUEST_TIMEOUT_SECS,
+    default_max_http_connections => MAX_HTTP_CONNECTIONS,
 }

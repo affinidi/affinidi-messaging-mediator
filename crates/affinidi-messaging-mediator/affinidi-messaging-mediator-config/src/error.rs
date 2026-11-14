@@ -29,6 +29,10 @@ pub enum ConfigError {
         /// What the setting accepts, e.g. `a whole number of 0 or more`.
         expected: String,
     },
+    /// Settings that each read but do not work together (e.g. a Fjall backend
+    /// with no data directory). The message names the settings involved.
+    #[error("{0}")]
+    Inconsistent(String),
 }
 
 impl ConfigError {

@@ -116,15 +116,17 @@ test-clock = [
 # ── Always-on ───────────────────────────────────────────────────────
 ## The protocol types, re-exported as `types`. They live in their own crate
 ## so the client SDK can depend on them without depending on this one.
-affinidi-messaging-mediator-types = "0.1"
+affinidi-messaging-mediator-types.workspace = true
 ## Used by the always-built helpers (`did_web`, `parameter_store`, …) and
 ## the `server` modules.
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
 thiserror.workspace = true
-## The account a DID names (`did_identity`): a did:scid DID URL's `src`
-## locator is not part of the identity. Needs 0.4.4 (the `scid` module).
-affinidi-did-common.workspace = true
+## The configuration schema and its defaults table: `DatabaseConfig` and
+## `ForwardingConfig` take their defaults from it, and `redact` and
+## `did_identity` live there (re-exported here). Lean: serde, toml and logging,
+## no server stack.
+affinidi-messaging-mediator-config = { version = "0.52.0", path = "../affinidi-messaging-mediator-config" }
 sha256.workspace = true
 
 # ── Secrets module: core (gated on `server`) ────────────────────────

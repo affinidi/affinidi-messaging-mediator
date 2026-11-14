@@ -484,27 +484,28 @@ impl SecurityConfig {
     }
 
     pub(crate) fn default(secrets_resolver: Arc<ThreadedSecretsResolver>) -> Self {
+        use affinidi_messaging_mediator_config::defaults::security as defaults;
         let (jwt_encoding_key, jwt_decoding_key) = ephemeral_jwt_keys();
         SecurityConfig {
             mediator_acl_mode: AccessListModeType::ExplicitDeny,
             global_acl_default: MediatorACLSet::default(),
-            local_direct_delivery_allowed: false,
-            local_direct_delivery_allow_anon: false,
+            local_direct_delivery_allowed: defaults::LOCAL_DIRECT_DELIVERY_ALLOWED,
+            local_direct_delivery_allow_anon: defaults::LOCAL_DIRECT_DELIVERY_ALLOW_ANON,
             mediator_secrets: secrets_resolver,
-            use_ssl: true,
+            use_ssl: defaults::USE_SSL,
             ssl_certificate_file: None,
             ssl_key_file: None,
             jwt_encoding_key,
             jwt_decoding_key,
-            jwt_access_expiry: 900,
-            jwt_refresh_expiry: 86_400,
+            jwt_access_expiry: defaults::JWT_ACCESS_EXPIRY,
+            jwt_refresh_expiry: defaults::JWT_REFRESH_EXPIRY,
             cors_allow_origin: build_cors_layer(&CorsOriginPolicy::None),
             cors_origins: CorsOriginPolicy::None,
-            block_anonymous_outer_envelope: true,
-            force_session_did_match: true,
-            block_remote_admin_msgs: true,
+            block_anonymous_outer_envelope: defaults::BLOCK_ANONYMOUS_OUTER_ENVELOPE,
+            force_session_did_match: defaults::FORCE_SESSION_DID_MATCH,
+            block_remote_admin_msgs: defaults::BLOCK_REMOTE_ADMIN_MSGS,
             trust_task_verification: TrustTaskVerification::Warn,
-            enable_inter_mediator_relay: false,
+            enable_inter_mediator_relay: defaults::ENABLE_INTER_MEDIATOR_RELAY,
             tsp_auth_accept_unbound_until: None,
         }
     }
@@ -543,8 +544,11 @@ pub(crate) trait SecurityConfigRawExt {
     /// Read every file-only `[security]` value strictly, and check the ones
     /// that must agree.
     fn values(&self) -> Result<SecurityValues, MediatorError>;
+    /// Build the runtime config from `values` (this section's
+    /// [`values`](Self::values)), loading the secrets it needs.
     async fn convert(
         &self,
+        values: SecurityValues,
         secrets_resolver: Arc<ThreadedSecretsResolver>,
         secrets: &MediatorSecrets,
         vta_bundle: Option<&[OperatingSecret]>,
@@ -775,7 +779,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             enable_inter_mediator_relay: values::boolean_or(
                 "security.enable_inter_mediator_relay",
                 &self.enable_inter_mediator_relay,
-                false,
+                affinidi_messaging_mediator_config::defaults::security::ENABLE_INTER_MEDIATOR_RELAY,
             )
             .map_err(err)?,
             // A security setting that doesn't parse is a hard error, not a
@@ -803,13 +807,16 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     ///
     /// The JWT secret is always loaded from the backend's `JWT_SECRET`
     /// well-known entry — no inline `string://` path.
+    ///
+    /// `values` is what [`values`](Self::values) read from `self`; the file is
+    /// not read a second time.
     async fn convert(
         &self,
+        values: SecurityValues,
         secrets_resolver: Arc<ThreadedSecretsResolver>,
         secrets: &MediatorSecrets,
         vta_bundle: Option<&[OperatingSecret]>,
     ) -> Result<SecurityConfig, MediatorError> {
-        let values = self.values()?;
         let mut config = SecurityConfig {
             mediator_acl_mode: values.mediator_acl_mode,
             global_acl_default: values.global_acl_default,

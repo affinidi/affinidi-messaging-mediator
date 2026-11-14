@@ -39,12 +39,17 @@ use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     secrets::{open_store_async, parse_url},
 };
-use affinidi_messaging_mediator_config::{ConfigError, values};
+use affinidi_messaging_mediator_config::{
+    ConfigError, defaults,
+    settings::{self, DidResolverSettings},
+    values,
+};
 use affinidi_secrets_resolver::ThreadedSecretsResolver;
 use async_convert::{TryFrom, async_trait};
 #[cfg(feature = "aws")]
 use aws_config::{self, BehaviorVersion, Region};
 use didwebvh_rs::log_entry::LogEntry;
+use security::SecurityValues;
 #[cfg(feature = "vta")]
 use vta_sdk::credentials::CredentialBundle;
 
@@ -79,53 +84,35 @@ pub(crate) fn config_error_msg(msg: String) -> MediatorError {
     MediatorError::ConfigError(crate::common::error_codes::CONFIG_ERROR, "NA".into(), msg)
 }
 
-/// The DID resolver's network timeout when none is configured, in
-/// **milliseconds** (the SDK's unit).
-const DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS: u32 = 5_000;
-
-/// Build the runtime [`DIDCacheConfig`] from the raw [`DIDResolverConfig`]
-/// schema. Was `DIDResolverConfig::convert`; became a free function when the
-/// raw type relocated to `affinidi-messaging-mediator-config` (inherent impls
-/// must live in the type's crate, and this conversion pulls the DID-resolver
-/// SDK, which the schema crate avoids).
-///
-/// Every number is read strictly. `network_timeout` is in milliseconds; an
-/// unreadable value used to fall back to `5` — five milliseconds, not the
-/// 5000 the template ships.
-fn did_resolver_cache_config(raw: &DIDResolverConfig) -> Result<DIDCacheConfig, MediatorError> {
-    let num = |key: &str, value: &str| -> Result<u32, MediatorError> {
-        values::number(&format!("did_resolver.{key}"), value).map_err(config_error)
-    };
+/// Build the runtime [`DIDCacheConfig`] from the typed `[did_resolver]`
+/// settings (read by [`settings::did_resolver`]; this conversion stays here
+/// because it pulls the DID-resolver SDK, which the config crate avoids).
+fn did_resolver_cache_config(settings: &DidResolverSettings) -> DIDCacheConfig {
     let mut config = DIDCacheConfigBuilder::default()
-        .with_cache_capacity(num("cache_capacity", &raw.cache_capacity)?)
-        .with_cache_ttl(num("cache_ttl", &raw.cache_ttl)?)
-        .with_network_timeout(
-            values::number_at_least("did_resolver.network_timeout", &raw.network_timeout, 1)
-                .map_err(config_error)?,
-        )
-        .with_network_cache_limit_count(num("network_limit", &raw.network_limit)?);
-
-    if let Some(address) = &raw.address {
+        .with_cache_capacity(settings.cache_capacity)
+        .with_cache_ttl(settings.cache_ttl)
+        .with_network_timeout(settings.network_timeout_ms)
+        .with_network_cache_limit_count(settings.network_limit);
+    if let Some(address) = &settings.address {
         config = config.with_network_mode(address);
     }
-
-    Ok(config.build())
+    config.build()
 }
 
 /// Build the runtime [`DatabaseConfig`] from the raw `[database]` schema.
 /// `DatabaseConfigRaw` lives in the config crate and `DatabaseConfig` in
 /// mediator-common, so this is a free function (the orphan rule forbids a
 /// `TryFrom` impl here). `database_timeout` (whole seconds, at least 1),
-/// `cluster_mode` (`true`/`false`, absent is `false`) and the circuit-breaker
-/// tuning (`circuit_breaker_threshold`, at least 1, absent is 5;
-/// `circuit_breaker_recovery_secs`, absent is 10) are read strictly. An empty
+/// `cluster_mode` (`true`/`false`) and the circuit-breaker tuning
+/// (`circuit_breaker_threshold` at least 1) are read strictly; an absent
+/// optional key takes its [`defaults::database`] value. An empty
 /// `functions_file` means the built-in stored-function library.
 fn database_config_from_raw(
     raw: &affinidi_messaging_mediator_config::DatabaseConfigRaw,
 ) -> Result<DatabaseConfig, MediatorError> {
     let functions_file = raw.functions_file.trim();
     let circuit_breaker_threshold = if raw.circuit_breaker_threshold.trim().is_empty() {
-        5
+        defaults::database::CIRCUIT_BREAKER_THRESHOLD
     } else {
         values::number_at_least(
             "database.circuit_breaker_threshold",
@@ -143,137 +130,104 @@ fn database_config_from_raw(
             1,
         )
         .map_err(config_error)?,
-        cluster_mode: values::boolean_or("database.cluster_mode", &raw.cluster_mode, false)
-            .map_err(config_error)?,
+        cluster_mode: values::boolean_or(
+            "database.cluster_mode",
+            &raw.cluster_mode,
+            defaults::database::CLUSTER_MODE,
+        )
+        .map_err(config_error)?,
         circuit_breaker_threshold,
         circuit_breaker_recovery_secs: values::number_or(
             "database.circuit_breaker_recovery_secs",
             &raw.circuit_breaker_recovery_secs,
-            10,
+            defaults::database::CIRCUIT_BREAKER_RECOVERY_SECS,
         )
         .map_err(config_error)?,
     })
 }
 
-/// The legal `log_level` values.
-const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
-
-/// `log_level`, read strictly: an unknown level used to become INFO.
-fn log_level_from(raw: &str) -> Result<LevelFilter, MediatorError> {
-    Ok(
-        match values::one_of("log_level", raw, LOG_LEVELS).map_err(config_error)? {
-            "trace" => LevelFilter::TRACE,
-            "debug" => LevelFilter::DEBUG,
-            "warn" => LevelFilter::WARN,
-            "error" => LevelFilter::ERROR,
-            _ => LevelFilter::INFO,
-        },
-    )
-}
-
-/// `streaming.uuid` must be `hostname://` or `string://<id>`.
-fn check_streaming_uuid(raw: &str) -> Result<(), MediatorError> {
-    if raw.starts_with("hostname://") || raw.starts_with("string://") {
-        Ok(())
-    } else {
-        Err(config_error(ConfigError::invalid(
-            "streaming.uuid",
-            raw,
-            "\"hostname://\" or \"string://<id>\"",
-        )))
-    }
-}
-
-/// Check every setting in `raw` that can be checked from the file alone —
-/// no secret backend, no network — exactly as the conversion to [`Config`]
-/// reads it, and return the `[limits]` it gives.
+/// Every setting `mediator.toml` decides on its own, each read once and
+/// strictly: the first of the two steps that turn a [`ConfigRaw`] into a
+/// [`Config`].
 ///
-/// Run first thing at startup, so a bad value stops the mediator before it
-/// opens a secret backend or contacts a VTA, and by `config/reload`, so a
-/// reload that would not survive a restart fails and changes nothing (#112).
-pub(crate) fn validate_raw(raw: &ConfigRaw) -> Result<LimitsConfig, MediatorError> {
-    use security::SecurityConfigRawExt;
-
-    affinidi_messaging_mediator_config::validate::check_secrets_backend(&raw.secrets.backend)
-        .map_err(config_error_msg)?;
-    secrets_cache_ttl(raw.secrets.cache_ttl.as_deref())?;
-    log_level_from(&raw.log_level)?;
-    values::boolean("log_json", &raw.log_json).map_err(config_error)?;
-    let streaming =
-        values::boolean("streaming.enabled", &raw.streaming.enabled).map_err(config_error)?;
-    if streaming {
-        check_streaming_uuid(&raw.streaming.uuid)?;
-    }
-    did_resolver_cache_config(&raw.did_resolver)?;
-    database_config_from_raw(&raw.database)?;
-    raw.security.values()?;
-    processors::forwarding_config_from_raw(raw.processors.forwarding.clone())?;
-    helpers::parse_blocked_forwarding_dids(&raw.processors.forwarding.blocked_forwarding_dids)?;
-    MessageExpiryCleanupConfig::try_from(raw.processors.message_expiry_cleanup.clone())?;
-    SessionExpiryCleanupConfig::try_from(raw.processors.session_expiry_cleanup.clone())?;
-    if let Some(storage) = &raw.storage {
-        check_storage(storage)?;
-    }
-    LimitsConfig::try_from(raw.limits.clone())
+/// Building this opens nothing and contacts nothing, so it runs first thing
+/// at startup — a bad value stops the mediator before a secret backend is
+/// opened or a VTA contacted — and on `config/reload`, so a reload that would
+/// not survive a restart fails and changes nothing (#112). The second step,
+/// [`ValidatedConfig::resolve`], takes these values as they are and adds what
+/// needs the outside world: the secret backend, the VTA, the DID documents.
+pub(crate) struct ValidatedConfig {
+    log_level: LevelFilter,
+    log_json: bool,
+    streaming_enabled: bool,
+    did_resolver_config: DIDCacheConfig,
+    database: DatabaseConfig,
+    security: SecurityValues,
+    /// Forwarding block-list DIDs are only parsed here; their endpoints are
+    /// resolved in [`ValidatedConfig::resolve`].
+    processors: ProcessorsConfig,
+    limits: LimitsConfig,
+    didcomm_v1: DidCommV1Config,
+    /// The VTA bundle cache's maximum age, `0` for never.
+    #[cfg_attr(not(feature = "vta"), allow(dead_code))]
+    secrets_cache_ttl_secs: u64,
 }
 
-/// `[secrets] cache_ttl` in seconds: `None` when unset (the caller's
-/// default), `Some(0)` for "never expires", otherwise a humantime duration
-/// such as `"30d"` or `"12h"`. An unreadable value used to fall back to the
-/// default with a warning.
-fn secrets_cache_ttl(raw: Option<&str>) -> Result<Option<u64>, MediatorError> {
-    match raw.map(str::trim) {
-        None | Some("") => Ok(None),
-        Some("0") => Ok(Some(0)),
-        Some(ttl) => humantime::parse_duration(ttl)
-            .map(|d| Some(d.as_secs()))
-            .map_err(|e| {
-                config_error(ConfigError::invalid(
-                    "secrets.cache_ttl",
-                    ttl,
-                    format!("a duration such as \"30d\" or \"12h\", or \"0\" for never ({e})"),
-                ))
-            }),
-    }
-}
+impl ValidatedConfig {
+    /// Read and check every setting in `raw` that can be checked from the
+    /// file alone, exactly as the running mediator uses it.
+    pub(crate) fn from_raw(raw: &ConfigRaw) -> Result<Self, MediatorError> {
+        use security::SecurityConfigRawExt;
 
-/// `[storage]`: a backend this mediator knows, and readable Fjall tuning.
-fn check_storage(storage: &StorageConfig) -> Result<(), MediatorError> {
-    let backend = values::one_of("storage.backend", &storage.backend, &["redis", "fjall"])
-        .map_err(config_error)?;
-    if backend == "fjall"
-        && storage
-            .data_dir
-            .as_deref()
-            .is_none_or(|d| d.trim().is_empty())
-    {
-        return Err(config_error_msg(
-            "storage.data_dir (env STORAGE_DATA_DIR) is required when storage.backend is \
-             \"fjall\""
-                .into(),
-        ));
-    }
-    if let Some(fjall) = &storage.fjall {
-        for (key, value) in [
-            ("storage.fjall.block_cache", &fjall.block_cache),
-            ("storage.fjall.write_buffer", &fjall.write_buffer),
-            ("storage.fjall.max_journal", &fjall.max_journal),
-        ] {
-            values::number::<u64>(key, value).map_err(config_error)?;
+        affinidi_messaging_mediator_config::validate::check_secrets_backend(&raw.secrets.backend)
+            .map_err(config_error_msg)?;
+        let secrets_cache_ttl_secs =
+            settings::secrets_cache_ttl_or_default(raw.secrets.cache_ttl.as_deref())
+                .map_err(config_error)?;
+        let log_level = settings::log_level(&raw.log_level).map_err(config_error)?;
+        let log_json = settings::log_json(&raw.log_json).map_err(config_error)?;
+        let streaming_enabled = settings::streaming(&raw.streaming).map_err(config_error)?;
+        let did_resolver_config = did_resolver_cache_config(
+            &settings::did_resolver(&raw.did_resolver).map_err(config_error)?,
+        );
+        let database = database_config_from_raw(&raw.database)?;
+        let security = raw.security.values()?;
+        let forwarding = processors::forwarding_config_from_raw(raw.processors.forwarding.clone())?;
+        helpers::parse_blocked_forwarding_dids(&raw.processors.forwarding.blocked_forwarding_dids)?;
+        let processors = ProcessorsConfig {
+            forwarding,
+            message_expiry_cleanup: raw.processors.message_expiry_cleanup.clone().try_into()?,
+            session_expiry_cleanup: raw.processors.session_expiry_cleanup.clone().try_into()?,
+        };
+        if let Some(storage) = &raw.storage {
+            settings::storage(storage).map_err(config_error)?;
         }
-        values::one_of(
-            "storage.fjall.durability",
-            &fjall.durability,
-            &["buffered", "sync"],
-        )
-        .map_err(config_error)?;
+        let limits = LimitsConfig::try_from(raw.limits.clone())?;
+        let didcomm_v1 = raw
+            .didcomm_v1
+            .clone()
+            .map(DidCommV1Config::from)
+            .unwrap_or_default();
+        Ok(Self {
+            log_level,
+            log_json,
+            streaming_enabled,
+            did_resolver_config,
+            database,
+            security,
+            processors,
+            limits,
+            didcomm_v1,
+            secrets_cache_ttl_secs,
+        })
     }
-    Ok(())
 }
 
-/// Default VTA cache TTL when `[secrets].cache_ttl` is not set.
-#[cfg(feature = "vta")]
-const DEFAULT_CACHE_TTL_SECS: u64 = 30 * 86_400; // 30 days
+/// [`ValidatedConfig::from_raw`], keeping only the `[limits]` it gives: what
+/// `config/reload` applies.
+pub(crate) fn validate_raw(raw: &ConfigRaw) -> Result<LimitsConfig, MediatorError> {
+    ValidatedConfig::from_raw(raw).map(|validated| validated.limits)
+}
 
 /// Typed `[didcomm_v1]` settings. See
 /// [`DidCommV1ConfigRaw`](affinidi_messaging_mediator_config::DidCommV1ConfigRaw)
@@ -476,12 +430,9 @@ impl Config {
     }
 
     fn default(secrets_resolver: Arc<ThreadedSecretsResolver>) -> Self {
-        let did_resolver_config = DIDCacheConfigBuilder::default()
-            .with_cache_capacity(1000)
-            .with_cache_ttl(300)
-            .with_network_timeout(DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS)
-            .with_network_cache_limit_count(100)
-            .build();
+        // Every default below is the config crate's `defaults` table, read
+        // through the same conversion a file goes through.
+        let did_resolver_config = did_resolver_cache_config(&DidResolverSettings::default());
 
         Config {
             log_level: LevelFilter::INFO,
@@ -498,7 +449,7 @@ impl Config {
             metrics_allow_cidrs: default_metrics_allow_cidrs(),
             metrics_bearer_token: None,
             database: DatabaseConfig::default(),
-            streaming_enabled: true,
+            streaming_enabled: defaults::streaming::ENABLED,
             streaming_uuid: "".into(),
             streaming_liveness: Default::default(),
             withheld_task_types: Vec::new(),
@@ -519,11 +470,7 @@ impl Config {
             #[cfg(feature = "vta")]
             vta_refresher: None,
             security: SecurityConfig::default(secrets_resolver),
-            processors: ProcessorsConfig {
-                forwarding: ForwardingConfig::default(),
-                message_expiry_cleanup: MessageExpiryCleanupConfig::default(),
-                session_expiry_cleanup: SessionExpiryCleanupConfig::default(),
-            },
+            processors: ProcessorsConfig::default(),
             limits: LimitsConfig::default(),
             tags: HashMap::from([("app".to_string(), "mediator".to_string())]),
         }
@@ -677,12 +624,21 @@ fn print_vta_recovery_playbook(context: &str) {
 impl TryFrom<ConfigRaw> for Config {
     type Error = MediatorError;
 
+    /// The two steps: `ValidatedConfig::from_raw` (the file alone, nothing
+    /// opened) then `ValidatedConfig::resolve` (secrets, VTA, DIDs).
     async fn try_from(raw: ConfigRaw) -> Result<Self, Self::Error> {
-        // Every value the file alone decides, checked before anything is
-        // opened or contacted. The conversions below read the same values the
-        // same way; this only moves the failure ahead of the side effects.
-        validate_raw(&raw)?;
+        ValidatedConfig::from_raw(&raw)?.resolve(raw).await
+    }
+}
 
+impl ValidatedConfig {
+    /// The second step from a [`ConfigRaw`] to a [`Config`]: open the secret
+    /// backend, run the VTA integration, read the mediator and admin DIDs,
+    /// load the self-hosted DID document, resolve the forwarding block list
+    /// and check the cross-field invariants. Every file-only value comes from
+    /// `self` as the first step read it; `raw` supplies only what this step
+    /// resolves.
+    async fn resolve(self, raw: ConfigRaw) -> Result<Config, MediatorError> {
         // Lazy AWS initialization — only load AWS SDK config when an AWS scheme
         // is actually used in the configuration. This avoids the 3+ second IMDS
         // timeout on non-AWS machines.
@@ -846,9 +802,8 @@ impl TryFrom<ConfigRaw> for Config {
                 },
             };
 
-            // Cache TTL — 30 days when unset, `0` means no expiry.
-            let ttl_secs = secrets_cache_ttl(raw.secrets.cache_ttl.as_deref())?
-                .unwrap_or(DEFAULT_CACHE_TTL_SECS);
+            // Cache TTL — the default when unset, `0` means no expiry.
+            let ttl_secs = self.secrets_cache_ttl_secs;
             let cache = vta_cache::MediatorSecretCache::new(mediator_secrets.clone(), ttl_secs);
 
             // Two-line bootstrap narrative: what we're *attempting* first,
@@ -963,8 +918,8 @@ impl TryFrom<ConfigRaw> for Config {
         };
 
         let mut config = Config {
-            log_level: log_level_from(&raw.log_level)?,
-            log_json: values::boolean("log_json", &raw.log_json).map_err(config_error)?,
+            log_level: self.log_level,
+            log_json: self.log_json,
             listen_address: raw.server.listen_address,
             mediator_did,
             admin_did: read_did_config(&raw.server.admin_did, &aws_config, "admin_did").await?,
@@ -978,10 +933,9 @@ impl TryFrom<ConfigRaw> for Config {
                 .server
                 .metrics_bearer_token
                 .filter(|token| !token.0.is_empty()),
-            database: database_config_from_raw(&raw.database)?,
-            streaming_enabled: values::boolean("streaming.enabled", &raw.streaming.enabled)
-                .map_err(config_error)?,
-            did_resolver_config: did_resolver_cache_config(&raw.did_resolver)?,
+            database: self.database,
+            streaming_enabled: self.streaming_enabled,
+            did_resolver_config: self.did_resolver_config,
             api_prefix: {
                 let normalized = helpers::normalize_api_prefix(&raw.server.api_prefix);
                 if normalized != raw.server.api_prefix {
@@ -996,19 +950,14 @@ impl TryFrom<ConfigRaw> for Config {
             security: raw
                 .security
                 .convert(
+                    self.security,
                     secrets_resolver.clone(),
                     &mediator_secrets,
                     operating_secrets.as_deref(),
                 )
                 .await?,
-            processors: ProcessorsConfig {
-                forwarding: processors::forwarding_config_from_raw(
-                    raw.processors.forwarding.clone(),
-                )?,
-                message_expiry_cleanup: raw.processors.message_expiry_cleanup.clone().try_into()?,
-                session_expiry_cleanup: raw.processors.session_expiry_cleanup.clone().try_into()?,
-            },
-            limits: raw.limits.try_into()?,
+            processors: self.processors,
+            limits: self.limits,
             tags,
             secrets_backend_url: raw.secrets.backend.clone(),
             secrets_backend: mediator_secrets.clone(),
@@ -1016,11 +965,7 @@ impl TryFrom<ConfigRaw> for Config {
             // server::serve_internal inspects it to decide between the
             // legacy Redis path and the embedded Fjall path.
             storage: raw.storage.clone(),
-            didcomm_v1: raw
-                .didcomm_v1
-                .clone()
-                .map(DidCommV1Config::from)
-                .unwrap_or_default(),
+            didcomm_v1: self.didcomm_v1,
             // Operating keys come either from the VTA (when integration
             // is active) or from the unified backend's well-known
             // `mediator_operating_secrets` entry (self-hosted). The
@@ -1571,9 +1516,9 @@ pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, Mediator
     // The two settings logging itself is built from, checked before it is:
     // an unknown level used to become INFO, and an unreadable `log_json`
     // was reported only on stderr.
-    let log_level =
-        values::one_of("log_level", &config.log_level, LOG_LEVELS).map_err(config_error)?;
-    let log_json = values::boolean("log_json", &config.log_json).map_err(config_error)?;
+    let log_level = values::one_of("log_level", &config.log_level, settings::LOG_LEVELS)
+        .map_err(config_error)?;
+    let log_json = settings::log_json(&config.log_json).map_err(config_error)?;
 
     // setup logging/tracing framework
     let filter = if env::var("RUST_LOG").is_ok() {
@@ -1835,13 +1780,15 @@ mod validate_raw_tests {
 
     #[test]
     fn the_secrets_cache_ttl_is_read_strictly() {
-        assert_eq!(secrets_cache_ttl(None).unwrap(), None);
-        assert_eq!(secrets_cache_ttl(Some("")).unwrap(), None);
-        assert_eq!(secrets_cache_ttl(Some("0")).unwrap(), Some(0));
-        assert_eq!(secrets_cache_ttl(Some("12h")).unwrap(), Some(43_200));
-        let err = secrets_cache_ttl(Some("30 days please"))
-            .unwrap_err()
-            .to_string();
+        let mut raw = parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("conf/mediator.toml"));
+        raw.secrets.backend = "file:///var/lib/mediator/secrets.json".into();
+        for (ttl, secs) in [(None, 30 * 86_400), (Some(""), 30 * 86_400), (Some("0"), 0)] {
+            raw.secrets.cache_ttl = ttl.map(str::to_string);
+            let validated = ValidatedConfig::from_raw(&raw).unwrap();
+            assert_eq!(validated.secrets_cache_ttl_secs, secs, "{ttl:?}");
+        }
+        raw.secrets.cache_ttl = Some("30 days please".into());
+        let err = validate_raw(&raw).unwrap_err().to_string();
         assert!(err.contains("secrets.cache_ttl"), "{err}");
     }
 
@@ -1878,7 +1825,26 @@ mod validate_raw_tests {
     /// is 5000 ms, not 5.
     #[test]
     fn the_default_resolver_timeout_is_in_milliseconds() {
-        assert_eq!(DEFAULT_RESOLVER_NETWORK_TIMEOUT_MS, 5_000);
+        assert_eq!(defaults::did_resolver::NETWORK_TIMEOUT_MS, 5_000);
+        assert_eq!(DidResolverSettings::default().network_timeout_ms, 5_000);
+    }
+
+    /// The headless `Config` (what `MediatorBuilder` and the test mediator
+    /// start from) takes every file-backed default from the config crate's
+    /// table.
+    #[tokio::test]
+    async fn the_headless_defaults_are_the_config_table() {
+        let resolver = Arc::new(ThreadedSecretsResolver::new(None).await.0);
+        let config = Config::headless(resolver);
+        assert_eq!(
+            format!("{:?}", config.did_resolver_config),
+            format!(
+                "{:?}",
+                did_resolver_cache_config(&DidResolverSettings::default())
+            )
+        );
+        assert_eq!(config.limits.message_size, defaults::limits::MESSAGE_SIZE);
+        assert_eq!(config.streaming_enabled, defaults::streaming::ENABLED);
     }
 
     #[test]

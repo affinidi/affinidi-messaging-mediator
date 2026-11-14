@@ -1,32 +1,21 @@
+//! The typed `[database]` settings the Redis handler runs with.
+//!
+//! The mediator reads `mediator.toml`'s all-strings `[database]` section with
+//! the raw schema in `affinidi-messaging-mediator-config` (its
+//! `DatabaseConfigRaw`) and converts it to this type. The standalone processors
+//! deserialize this type directly from their own TOML. Either way a value is
+//! read strictly: one that does not read is an error, never a default.
+//!
+//! [`DatabaseConfig::default`] takes its values from the config crate's
+//! `defaults::database` table.
+
 use serde::{Deserialize, Serialize};
 
 use std::fmt;
 
-use crate::errors::MediatorError;
-use crate::redact::redact_url;
+use affinidi_messaging_mediator_config::defaults::database as defaults;
 
-/// Database Struct contains database and storage of messages related configuration details
-///
-/// `database_pool_size` was removed in favour of the multiplexed
-/// connection; `#[serde(default, skip_serializing)]` on an ignored
-/// field silently drops pre-0.14 config files that still set it
-/// rather than hard-failing on an unknown key.
-#[derive(Serialize, Deserialize)]
-pub struct DatabaseConfigRaw {
-    pub functions_file: String,
-    pub database_url: String,
-    pub database_timeout: String,
-    pub scripts_path: Option<String>,
-    /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
-    #[serde(default)]
-    pub cluster_mode: String,
-    /// Silently absorbed — pre-0.14 config files set this; the
-    /// multiplexed Redis connection doesn't use a pool. The field
-    /// stays in the raw struct so deserialisation doesn't error on
-    /// unknown keys; it's not round-tripped on serialise.
-    #[serde(default, skip_serializing, rename = "database_pool_size")]
-    _ignored_pool_size: Option<serde_json::Value>,
-}
+use crate::redact::redact_url;
 
 /// `Debug` is written by hand so `database_url` prints with its credentials
 /// replaced (see [`redact_url`]): the startup log prints the whole config.
@@ -47,18 +36,6 @@ pub struct DatabaseConfig {
     pub circuit_breaker_recovery_secs: u64,
 }
 
-impl fmt::Debug for DatabaseConfigRaw {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DatabaseConfigRaw")
-            .field("functions_file", &self.functions_file)
-            .field("database_url", &redact_url(&self.database_url))
-            .field("database_timeout", &self.database_timeout)
-            .field("scripts_path", &self.scripts_path)
-            .field("cluster_mode", &self.cluster_mode)
-            .finish_non_exhaustive()
-    }
-}
-
 impl fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DatabaseConfig")
@@ -75,20 +52,30 @@ impl fmt::Debug for DatabaseConfig {
     }
 }
 
+/// Every value from the `defaults::database` table, except `functions_file`:
+/// `./atm-functions.lua` (relative to the config file), a library file to
+/// load. The raw schema's default for that key is empty, which the mediator
+/// reads as its built-in library; here `None` means no library at all, which
+/// a Redis store without one refuses, so this default names a file.
 impl Default for DatabaseConfig {
     fn default() -> Self {
         DatabaseConfig {
             functions_file: Some("./atm-functions.lua".into()),
-            database_url: "redis://127.0.0.1/".into(),
-            database_timeout: 2,
-            cluster_mode: false,
-            circuit_breaker_threshold: 5,
-            circuit_breaker_recovery_secs: 10,
+            database_url: defaults::DATABASE_URL.into(),
+            database_timeout: defaults::DATABASE_TIMEOUT,
+            cluster_mode: defaults::CLUSTER_MODE,
+            circuit_breaker_threshold: defaults::CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_recovery_secs: defaults::CIRCUIT_BREAKER_RECOVERY_SECS,
         }
     }
 }
 
 /// Reads `cluster_mode` written either as `true` or as `"true"`.
+///
+/// The string form is read as `mediator.toml`'s `[database] cluster_mode` is:
+/// `true` or `false`, ignoring case and surrounding space, and empty means
+/// `false`. Anything else is refused, not guessed at — a typo must not pick a
+/// client that does not match the server.
 fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -96,48 +83,22 @@ fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<b
         Bool(bool),
         Text(String),
     }
-    Ok(match Flag::deserialize(deserializer)? {
-        Flag::Bool(value) => value,
-        Flag::Text(text) => parse_cluster_mode(&text),
-    })
-}
-
-/// Parses `[database] cluster_mode`, ignoring case and surrounding space:
-/// `true`/`false`, `1`/`0`, `yes`/`no` or `on`/`off`. Absent (empty) is
-/// `false`; any other value is warned about and taken as `false`, and the
-/// startup check then refuses a cluster-mode server, so a typo can't go
-/// unnoticed.
-pub fn parse_cluster_mode(raw: &str) -> bool {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "false" | "0" | "no" | "off" => false,
-        "true" | "1" | "yes" | "on" => true,
-        _ => {
-            tracing::warn!(
-                "Could not parse database.cluster_mode value '{raw}', using default: false"
-            );
-            false
-        }
-    }
-}
-
-impl std::convert::TryFrom<DatabaseConfigRaw> for DatabaseConfig {
-    type Error = MediatorError;
-
-    fn try_from(raw: DatabaseConfigRaw) -> Result<Self, Self::Error> {
-        Ok(DatabaseConfig {
-            functions_file: Some(raw.functions_file),
-            database_url: raw.database_url,
-            database_timeout: raw.database_timeout.parse().unwrap_or(2),
-            cluster_mode: parse_cluster_mode(&raw.cluster_mode),
-            circuit_breaker_threshold: 5,
-            circuit_breaker_recovery_secs: 10,
-        })
+    match Flag::deserialize(deserializer)? {
+        Flag::Bool(value) => Ok(value),
+        Flag::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "" | "false" => Ok(false),
+            "true" => Ok(true),
+            _ => Err(serde::de::Error::custom(format!(
+                "database.cluster_mode = {:?} is not valid: expected \"true\" or \"false\"",
+                text.trim()
+            ))),
+        },
     }
 }
 
 #[cfg(test)]
 mod debug_tests {
-    use super::{DatabaseConfig, DatabaseConfigRaw};
+    use super::DatabaseConfig;
 
     #[test]
     fn debug_hides_database_url_credentials() {
@@ -150,16 +111,6 @@ mod debug_tests {
                 assert!(!text.contains("pw"), "{text}");
                 assert!(text.contains("redis://***@h/"), "{text}");
             }
-
-            let raw: DatabaseConfigRaw = serde_json::from_value(serde_json::json!({
-                "functions_file": "f",
-                "database_url": url,
-                "database_timeout": "2",
-                "scripts_path": null,
-            }))
-            .unwrap();
-            let text = format!("{raw:#?}");
-            assert!(!text.contains("pw"), "{text}");
         }
     }
 }
@@ -168,32 +119,50 @@ mod debug_tests {
 mod cluster_mode_tests {
     use super::DatabaseConfig;
 
-    fn parse(field: &str) -> bool {
+    fn parse(field: &str) -> Result<bool, serde_json::Error> {
         let text = format!(
             r#"{{"functions_file":"f","database_url":"redis://x/","database_timeout":2,
                "circuit_breaker_threshold":5,"circuit_breaker_recovery_secs":10{field}}}"#
         );
-        serde_json::from_str::<DatabaseConfig>(&text)
-            .unwrap()
-            .cluster_mode
+        serde_json::from_str::<DatabaseConfig>(&text).map(|c| c.cluster_mode)
     }
 
     #[test]
     fn cluster_mode_accepts_bool_and_string() {
-        assert!(parse(r#","cluster_mode":true"#));
-        assert!(parse(r#","cluster_mode":"true""#));
-        assert!(!parse(r#","cluster_mode":"false""#));
-        assert!(!parse(r#","cluster_mode":false"#));
-        assert!(!parse(""));
+        assert!(parse(r#","cluster_mode":true"#).unwrap());
+        assert!(parse(r#","cluster_mode":"true""#).unwrap());
+        assert!(!parse(r#","cluster_mode":"false""#).unwrap());
+        assert!(!parse(r#","cluster_mode":false"#).unwrap());
+        assert!(!parse("").unwrap());
+        assert!(!parse(r#","cluster_mode":"""#).unwrap());
     }
 
     #[test]
-    fn cluster_mode_ignores_case_and_accepts_common_spellings() {
-        for on in ["True", "TRUE", " true ", "1", "yes", "On"] {
-            assert!(super::parse_cluster_mode(on), "{on:?} is on");
+    fn cluster_mode_ignores_case_and_space() {
+        for on in ["True", "TRUE", " true "] {
+            assert!(
+                parse(&format!(r#","cluster_mode":"{on}""#)).unwrap(),
+                "{on:?}"
+            );
         }
-        for off in ["False", "0", "no", "OFF", "", "maybe"] {
-            assert!(!super::parse_cluster_mode(off), "{off:?} is off");
+        for off in ["False", " FALSE "] {
+            assert!(
+                !parse(&format!(r#","cluster_mode":"{off}""#)).unwrap(),
+                "{off:?}"
+            );
+        }
+    }
+
+    /// Read as `mediator.toml` reads it: anything but `true`/`false` is
+    /// refused, where it used to be guessed at (`yes` on, `maybe` off).
+    #[test]
+    fn an_unreadable_cluster_mode_is_refused() {
+        for bad in ["yes", "1", "on", "maybe", "ture"] {
+            let err = parse(&format!(r#","cluster_mode":"{bad}""#)).unwrap_err();
+            assert!(
+                err.to_string().contains("database.cluster_mode"),
+                "{bad}: {err}"
+            );
         }
     }
 }
