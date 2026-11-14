@@ -83,9 +83,7 @@ impl WizardApp {
             let total = WizardStep::total();
             let (suffix, desc): (&str, &str) = match self.vta_step_phase {
                 #[cfg(not(feature = "vta"))]
-                VtaStepPhase::SelectIntent => {
-                    ("Unavailable in this release", crate::vta::VTA_UNAVAILABLE)
-                }
+                VtaStepPhase::SelectIntent => ("Not in this build", crate::vta::VTA_UNAVAILABLE),
                 #[cfg(feature = "vta")]
                 VtaStepPhase::SelectIntent => (
                     "What from VTA?",

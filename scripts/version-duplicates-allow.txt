@@ -9,7 +9,6 @@
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
 #
-# No entries: the four vta-sdk 0.77 duplicates (affinidi-messaging-sdk,
-# affinidi-tdk, trust-tasks-proof, trust-tasks-rs) left with vta-sdk itself,
-# which is out of the graph until VTI releases it on SDK 0.47 / TDK 0.45
-# (changelog.d/sdk-0-47-without-vta.md). Re-adding it must not bring them back.
+# No entries. vta-sdk is on the same affinidi-messaging-sdk / affinidi-tdk /
+# trust-tasks line as the direct requirements, so it adds no second copy; a
+# vta-sdk bump that does is the thing to fix, not to list here.

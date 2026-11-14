@@ -54,7 +54,8 @@ The default build of the wizard compiles every secret backend, including the
 AWS, GCP and Azure SDKs. If you only need some, build it with
 `--no-default-features --features <backends>` (for example
 `cargo run --locked -p affinidi-messaging-mediator-setup --no-default-features --features secrets-keyring`;
-`file://` is always available).
+`file://` is always available). Add `vta` to keep the VTA flows: without it the
+wizard offers only "No VTA".
 
 It writes:
 
@@ -216,17 +217,12 @@ cargo build --locked -p affinidi-messaging-mediator
 # Single node: Fjall + OS keyring
 cargo build --locked -p affinidi-messaging-mediator \
   --no-default-features \
-  --features didcomm,tsp,fjall-backend,secrets-keyring,jemalloc
+  --features didcomm,tsp,fjall-backend,secrets-keyring,jemalloc,vta
 
 # Cluster with AWS Secrets Manager
 cargo build --locked -p affinidi-messaging-mediator \
   --features secrets-aws
 ```
-
-The `vta` feature (VTA-backed key management) is not in the default set and
-cannot be enabled in this release: vta-sdk returns once it is released on
-affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45. See
-`changelog.d/sdk-0-47-without-vta.md`.
 
 ## Architecture
 

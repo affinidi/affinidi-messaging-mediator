@@ -62,14 +62,11 @@ affinidi-tsp = "0.3"
 didwebvh-rs = "0.8.2"
 trust-tasks-proof = { version = "0.39.0", default-features = false }
 trust-tasks-rs = { version = "0.39.0", default-features = false }
-# STEP 3 OF THE VTA RELEASE ORDER: `vta-sdk` is out of the dependency graph
-# for this release. Every published vta-sdk (<= 0.88.x) pulls
-# trust-tasks-proof 0.36/0.37, which no longer compiles once
-# affinidi-data-integrity unifies to 0.8.7 (its public `KeyType` moved to
-# affinidi-crypto 0.3). The order is: (1) this release ships without
-# vta-sdk, (2) VTI releases vta-sdk on SDK 0.47 / TDK 0.45, (3) this
-# workspace restores the dependency below and `vta`'s `dep:vta-sdk`.
-# vta-sdk = "0.77"
+# vta-sdk on the same line as the requirements above (affinidi-messaging-sdk
+# 0.47 / affinidi-tdk 0.45 / trust-tasks 0.39 / affinidi-crypto 0.3), so
+# every affinidi-* and trust-tasks-* crate still resolves once.
+# TODO: set to the published vta-sdk version on that line.
+vta-sdk = "0.89"
 
 # ── AWS SDK ──────────────────────────────────────────────────────────────
 aws-config = "1.13"
