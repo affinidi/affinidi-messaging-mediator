@@ -419,11 +419,14 @@ impl WizardApp {
         if self.in_vta_subflow() {
             // Errors here mean the ephemeral key generator failed — surface
             // as a transient error on the sub-flow state, not a panic.
+            #[cfg(feature = "vta")]
             if let Err(e) = self.vta_subflow_confirm_text()
                 && let Some(st) = self.vta_connect.as_mut()
             {
                 st.last_error = Some(e.to_string());
             }
+            #[cfg(not(feature = "vta"))]
+            let _ = self.vta_subflow_confirm_text();
             return;
         }
         if self.in_sealed_handoff_subflow() && self.sealed_handoff_confirm_text() {
@@ -584,11 +587,22 @@ impl WizardApp {
         let Some(deployment) = self.config.deployment_type else {
             return;
         };
-        self.config.use_vta = true;
-        self.config.vta_mode = Some(VtaMode::Online);
         self.config.didcomm_enabled = true;
         self.config.tsp_enabled = true;
-        self.config.did_method = Some(DidMethod::Vta);
+        // VTA-managed by default — except without the `vta` feature, where
+        // no VTA flow exists and the mediator's own did:peer is the default.
+        #[cfg(feature = "vta")]
+        {
+            self.config.use_vta = true;
+            self.config.vta_mode = Some(VtaMode::Online);
+            self.config.did_method = Some(DidMethod::Vta);
+        }
+        #[cfg(not(feature = "vta"))]
+        {
+            self.config.use_vta = false;
+            self.config.vta_mode = None;
+            self.config.did_method = Some(DidMethod::Peer);
+        }
         // The unified secret backend is independent of VTA mode —
         // pick a sensible default per platform; the operator
         // refines it on the KeyStorage step.

@@ -1,8 +1,12 @@
 use super::config::MEDIATOR_DEFAULT_FEATURES;
 use super::*;
-use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
+#[cfg(feature = "vta")]
+use crate::app::VtaMode;
+use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode};
 use crate::consts::*;
-use crate::vta::{ConnectPhase, VtaIntent, VtaSession};
+use crate::vta::VtaIntent;
+#[cfg(feature = "vta")]
+use crate::vta::{ConnectPhase, VtaSession};
 
 // ── Fjall data-directory validation ────────────────────────────────
 
@@ -158,7 +162,7 @@ fn cargo_features_default_matches_crate_defaults() {
     let cfg = WizardConfig::default();
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "tsp", "redis-backend", "jemalloc", "vta"]
+        vec!["didcomm", "tsp", "redis-backend", "jemalloc"]
     );
     assert!(!cfg.needs_explicit_features());
 }
@@ -184,11 +188,13 @@ fn mediator_default_features_match_the_mediator_crate() {
     assert_eq!(actual, expected);
 }
 
-/// Every explicit feature list the wizard renders keeps `vta`: without it
-/// the mediator silently skips the VTA integration a VTA-linked config
-/// relies on.
+/// Every explicit feature list the wizard renders keeps `jemalloc`, and none
+/// asks for the mediator's `vta` feature, which cannot be built in this
+/// release (vta-sdk is out of the dependency graph). Step 3 of the release
+/// order puts `vta` back: then every list must keep it again, or the mediator
+/// silently skips the VTA integration a VTA-linked config relies on.
 #[test]
-fn explicit_feature_lists_keep_vta_and_jemalloc() {
+fn explicit_feature_lists_keep_jemalloc_and_leave_out_vta() {
     for cfg in [
         WizardConfig {
             storage_backend: "fjall".into(),
@@ -205,7 +211,7 @@ fn explicit_feature_lists_keep_vta_and_jemalloc() {
     ] {
         assert!(cfg.needs_explicit_features());
         let f = cfg.cargo_features();
-        assert!(f.contains(&"vta") && f.contains(&"jemalloc"), "{f:?}");
+        assert!(!f.contains(&"vta") && f.contains(&"jemalloc"), "{f:?}");
     }
 }
 
@@ -222,7 +228,7 @@ fn cargo_features_fjall_backend_emits_fjall_feature() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "tsp", "fjall-backend", "jemalloc", "vta"]
+        vec!["didcomm", "tsp", "fjall-backend", "jemalloc"]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -241,14 +247,7 @@ fn cargo_features_redis_with_secret_backend_keeps_redis() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec![
-            "didcomm",
-            "tsp",
-            "redis-backend",
-            "jemalloc",
-            "vta",
-            "secrets-aws"
-        ]
+        vec!["didcomm", "tsp", "redis-backend", "jemalloc", "secrets-aws"]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -267,7 +266,6 @@ fn cargo_features_fjall_with_secret_backend_uses_fjall() {
             "tsp",
             "fjall-backend",
             "jemalloc",
-            "vta",
             "secrets-vault"
         ]
     );
@@ -294,7 +292,7 @@ fn cargo_features_didcomm_only_leaves_tsp_out() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "redis-backend", "jemalloc", "vta"]
+        vec!["didcomm", "redis-backend", "jemalloc"]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -736,6 +734,7 @@ fn paste_text_strips_newlines_and_tabs() {
     assert_eq!(app.text_input.value(), "did:webvh:example.com");
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn paste_text_preserves_newlines_on_awaiting_bundle() {
     // Sealed-handoff armor requires newlines between its BEGIN/END
@@ -758,6 +757,7 @@ fn paste_text_preserves_newlines_on_awaiting_bundle() {
     assert!(app.text_input.value().contains("-----END"));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn paste_text_still_strips_newlines_outside_awaiting_bundle() {
     // Other sealed-handoff phases (CollectContext, CollectMediatorUrl,
@@ -861,7 +861,8 @@ fn deployment_defaults_set_correctly() {
     app.select_current();
 
     assert_eq!(app.config.deployment_type, Some(Deployment::Local));
-    assert!(app.config.use_vta);
+    // VTA-managed by default, unless the VTA flows are not built.
+    assert_eq!(app.config.use_vta, cfg!(feature = "vta"));
     assert!(app.config.didcomm_enabled);
     assert_eq!(app.config.ssl_mode, Some(SslMode::None));
     assert_eq!(app.config.database_url, DEFAULT_REDIS_URL);
@@ -1734,6 +1735,7 @@ fn advance_to(app: &mut WizardApp, target: WizardStep) {
 /// Walk the two-question Vta picker: pick "Full setup" (intent) then
 /// "Online" (transport). After this call the wizard is inside the
 /// online-VTA sub-flow at `ConnectPhase::EnterDid`.
+#[cfg(feature = "vta")]
 fn pick_full_setup_online(app: &mut WizardApp) {
     app.selection_index = 0;
     app.select_current(); // SelectIntent → FullSetup
@@ -1744,6 +1746,7 @@ fn pick_full_setup_online(app: &mut WizardApp) {
 /// Walk the two-question Vta picker: pick "Admin credential only"
 /// (intent) then "Sealed handoff" (transport). After this call the
 /// wizard is inside the sealed-handoff sub-flow.
+#[cfg(feature = "vta")]
 fn pick_admin_only_sealed(app: &mut WizardApp) {
     app.selection_index = 1;
     app.select_current(); // SelectIntent → AdminOnly
@@ -1751,6 +1754,7 @@ fn pick_admin_only_sealed(app: &mut WizardApp) {
     app.select_current(); // SelectTransport → Offline (enters sub-flow)
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_yes_then_online_enters_subflow() {
     let mut app = WizardApp::new("test.toml".into());
@@ -1774,6 +1778,7 @@ fn vta_yes_then_online_enters_subflow() {
     assert_eq!(app.config.admin_did_mode, Some(AdminMode::Vta));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_subflow_collects_did_then_context_then_instructions() {
     let mut app = WizardApp::new("test.toml".into());
@@ -1809,6 +1814,7 @@ fn vta_subflow_collects_did_then_context_then_instructions() {
     assert!(acl.contains("--admin-expires 1h"));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_subflow_back_rewinds_phases() {
     let mut app = WizardApp::new("test.toml".into());
@@ -1836,6 +1842,7 @@ fn vta_subflow_back_rewinds_phases() {
     assert_eq!(app.current_step, WizardStep::Vta);
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn vta_subflow_awaiting_acl_enter_starts_testing() {
     // Pressing Enter on the AwaitingAcl instructions kicks off the
@@ -1859,6 +1866,7 @@ async fn vta_subflow_awaiting_acl_enter_starts_testing() {
     assert_eq!(st.diagnostics.len(), crate::vta::DiagCheck::all().len());
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn vta_subflow_connected_enter_advances_past_vta_step() {
     use crate::vta::{DiagStatus, Protocol, VtaEvent};
@@ -1895,6 +1903,7 @@ async fn vta_subflow_connected_enter_advances_past_vta_step() {
     assert!(!app.in_vta_subflow());
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn vta_subflow_failure_routes_to_recovery_prompt() {
     use crate::vta::VtaEvent;
@@ -1925,6 +1934,7 @@ async fn vta_subflow_failure_routes_to_recovery_prompt() {
     assert!(opts[3].label.contains("Back"));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn recovery_back_returns_to_awaiting_acl() {
     use crate::vta::VtaEvent;
@@ -1953,6 +1963,7 @@ async fn recovery_back_returns_to_awaiting_acl() {
     );
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn recovery_offline_transitions_to_sealed_handoff_with_carry_over() {
     use crate::vta::VtaEvent;
@@ -1996,6 +2007,7 @@ async fn recovery_offline_transitions_to_sealed_handoff_with_carry_over() {
     );
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_sealed_handoff_sets_defaults_and_enters_subflow() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2022,6 +2034,7 @@ fn vta_sealed_handoff_sets_defaults_and_enters_subflow() {
     assert!(app.in_sealed_handoff_subflow());
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_no_clears_vta_options() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2079,6 +2092,7 @@ fn did_options_hide_vta_when_admin_only_intent_chosen() {
     assert_eq!(opts.len(), 2); // webvh, peer (no import: #173)
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_step_select_intent_has_four_options() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2089,6 +2103,7 @@ fn vta_step_select_intent_has_four_options() {
     assert_eq!(opts.len(), 4); // FullSetup, AdminOnly, OfflineExport, No VTA
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_intent_offline_export_skips_transport_phase() {
     // OfflineExport is always offline (no online transport for the
@@ -2112,6 +2127,7 @@ fn vta_intent_offline_export_skips_transport_phase() {
     assert_eq!(st.intent, VtaIntent::OfflineExport);
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_step_select_transport_has_two_options_after_intent_pick() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2126,6 +2142,7 @@ fn vta_step_select_transport_has_two_options_after_intent_pick() {
     assert!(opts[0].label.starts_with("Online"));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_step_go_back_from_transport_rewinds_to_intent() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2140,6 +2157,7 @@ fn vta_step_go_back_from_transport_rewinds_to_intent() {
     assert_eq!(app.current_step, WizardStep::Vta);
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_full_setup_offline_enters_sealed_subflow_with_correct_intent() {
     // Slice 3: FullSetup + Offline is no longer a stub — it enters
@@ -2163,6 +2181,7 @@ fn vta_full_setup_offline_enters_sealed_subflow_with_correct_intent() {
     assert_eq!(app.config.vta_mode, Some(VtaMode::SealedMint));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn vta_admin_only_online_enters_vta_subflow_with_correct_intent() {
     // Slice 4: AdminOnly + Online is no longer a stub — it
@@ -2201,6 +2220,7 @@ fn vta_step_re_entry_resets_picker_phase() {
     assert!(app.vta_stub_notice.is_none());
 }
 
+#[cfg(feature = "vta")]
 // Helpers for the webvh-picker tests below.
 fn sample_webvh_server(id: &str, label: Option<&str>) -> vta_sdk::webvh::WebvhServerRecord {
     use chrono::Utc;
@@ -2213,6 +2233,7 @@ fn sample_webvh_server(id: &str, label: Option<&str>) -> vta_sdk::webvh::WebvhSe
     }
 }
 
+#[cfg(feature = "vta")]
 /// Drive the wizard far enough to have a `vta_connect` sub-flow
 /// with a setup key + context id in place, then fake a preflight
 /// with the supplied server catalogue. Returns the wizard ready
@@ -2245,6 +2266,7 @@ fn prime_full_setup_picker(servers: Vec<vta_sdk::webvh::WebvhServerRecord>) -> W
     app
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_picker_auto_dispatches_serverless_when_catalogue_empty() {
     // 0 registered servers → wizard skips the picker entirely and
@@ -2258,6 +2280,7 @@ async fn webvh_picker_auto_dispatches_serverless_when_catalogue_empty() {
     assert!(st.webvh_server_choice.is_none());
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_picker_auto_picks_single_entry() {
     // 1 registered server → wizard auto-selects it, commits the
@@ -2274,6 +2297,7 @@ async fn webvh_picker_auto_picks_single_entry() {
     assert!(matches!(app.mode, InputMode::TextInput));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_picker_waits_when_catalogue_has_multiple_entries() {
     // 2+ registered servers → stay on `PickWebvhServer`; no
@@ -2295,6 +2319,7 @@ async fn webvh_picker_waits_when_catalogue_has_multiple_entries() {
     assert!(opts[2].label.contains("backup-1"));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_picker_serverless_selection_commits_none_choice() {
     let servers = vec![
@@ -2318,6 +2343,7 @@ async fn webvh_picker_serverless_selection_commits_none_choice() {
     assert_eq!(st.phase, ConnectPhase::Testing);
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_picker_server_selection_routes_through_path_prompt() {
     // Picking a real server commits the choice, but the provision
@@ -2339,6 +2365,7 @@ async fn webvh_picker_server_selection_routes_through_path_prompt() {
     assert!(matches!(app.mode, InputMode::TextInput));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_path_prompt_blank_dispatches_with_none() {
     // Blank input on `EnterWebvhPath` means "server auto-assigns".
@@ -2361,6 +2388,7 @@ async fn webvh_path_prompt_blank_dispatches_with_none() {
     assert!(matches!(app.mode, InputMode::Selecting));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_path_prompt_captures_trimmed_value() {
     // Non-blank input lands on state verbatim (trimmed) and then
@@ -2378,6 +2406,7 @@ async fn webvh_path_prompt_captures_trimmed_value() {
     assert!(matches!(app.mode, InputMode::Selecting));
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn webvh_path_back_nav_returns_to_picker_without_losing_path() {
     // Typing a path and then backing out lands on the picker with
@@ -2405,6 +2434,7 @@ async fn webvh_path_back_nav_returns_to_picker_without_losing_path() {
     assert_eq!(st.webvh_server_choice.as_deref(), Some("prod-1"));
 }
 
+#[cfg(feature = "vta")]
 /// Drive the wizard to the point where online FullSetup has
 /// received a synthetic `Connected` event with a full provision
 /// reply. Leaves `current_step == Vta`, phase `Connected`,
@@ -2439,6 +2469,7 @@ fn prime_full_setup_connected() -> WizardApp {
     app
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn did_step_auto_skipped_on_full_setup_online() {
     // After VTA FullSetup provisions the DID, the Did step has
@@ -2497,6 +2528,7 @@ fn admin_options_include_vta_on_full_setup() {
     assert!(opts.iter().any(|o| o.label.contains("VTA")));
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn did_step_auto_skipped_on_offline_export() {
     // OfflineExport's ContextProvision reply carries the
@@ -2549,6 +2581,7 @@ fn did_step_auto_skipped_on_offline_export() {
     );
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn did_step_back_nav_skips_past_on_full_setup_online() {
     // Coming back the other way should land on Protocol, not on
@@ -2647,6 +2680,7 @@ fn returning_to_key_storage_after_file_highlights_file_not_k8s() {
     assert_eq!(KEY_STORAGE_CHOICES[idx].value, SecretScheme::File);
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn no_vta_is_highlighted_for_a_non_vta_setup() {
     // Regression: `_ => 2 // No VTA` pointed at offline export.
@@ -2707,6 +2741,7 @@ fn empty_required_inputs_say_why() {
     );
 }
 
+#[cfg(feature = "vta")]
 #[test]
 fn re_entering_the_vta_step_discards_the_session_with_a_warning() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2777,6 +2812,7 @@ fn pasting_an_admin_did_is_a_real_prompt() {
 
 // ── #158: quitting with a session, Esc during a flight ────────────
 
+#[cfg(feature = "vta")]
 #[test]
 fn quitting_with_a_vta_session_asks_first() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2802,6 +2838,7 @@ fn quitting_with_a_vta_session_asks_first() {
     assert!(app.should_quit);
 }
 
+#[cfg(feature = "vta")]
 #[tokio::test]
 async fn esc_during_a_flight_aborts_the_task() {
     let mut app = WizardApp::new("test.toml".into());
@@ -2928,4 +2965,67 @@ fn keyring_is_flagged_for_containers() {
             .label
             .contains("not available inside a container")
     );
+}
+
+// ── Without the `vta` feature: the VTA step offers only "No VTA" ───
+
+#[cfg(not(feature = "vta"))]
+#[test]
+fn without_vta_the_vta_step_offers_only_no_vta_and_says_why() {
+    let mut app = WizardApp::new("test.toml".into());
+    app.selection_index = 0;
+    app.select_current(); // Deployment → KeyStorage
+    // The deployment defaults no longer pick a VTA-managed setup.
+    assert!(!app.config.use_vta);
+    assert_eq!(app.config.did_method, Some(DidMethod::Peer));
+    advance_to(&mut app, WizardStep::Vta);
+    assert_eq!(app.vta_step_phase, VtaStepPhase::SelectIntent);
+
+    let opts = app.current_options();
+    assert_eq!(opts.len(), 1);
+    assert!(opts[0].label.starts_with("No VTA"), "{}", opts[0].label);
+    assert_eq!(app.default_selection_index(), 0);
+    assert_eq!(app.current_info_text(), crate::vta::VTA_UNAVAILABLE);
+    assert!(
+        app.current_step_data()
+            .description
+            .contains("unavailable in this release"),
+        "{}",
+        app.current_step_data().description
+    );
+
+    app.select_current();
+    assert_eq!(app.current_step, WizardStep::Protocol);
+    assert!(!app.config.use_vta);
+    assert!(app.config.vta_mode.is_none());
+    assert!(!app.in_vta_subflow());
+    assert!(!app.in_sealed_handoff_subflow());
+}
+
+#[cfg(not(feature = "vta"))]
+#[test]
+fn without_vta_a_vta_intent_is_refused_with_the_reason() {
+    let mut app = WizardApp::new("test.toml".into());
+    advance_to(&mut app, WizardStep::Vta);
+    for intent in [
+        VtaIntent::FullSetup,
+        VtaIntent::AdminOnly,
+        VtaIntent::OfflineExport,
+    ] {
+        app.enter_vta_subflow(intent);
+        assert!(!app.config.use_vta);
+        assert_eq!(
+            app.vta_stub_notice.as_deref(),
+            Some(crate::vta::VTA_UNAVAILABLE)
+        );
+        app.vta_stub_notice = None;
+        app.enter_sealed_handoff_subflow(intent);
+        assert!(!app.config.use_vta);
+        assert_eq!(
+            app.vta_stub_notice.as_deref(),
+            Some(crate::vta::VTA_UNAVAILABLE)
+        );
+        assert!(!app.in_sealed_handoff_subflow());
+        assert_eq!(app.current_step, WizardStep::Vta);
+    }
 }

@@ -426,8 +426,8 @@ impl WizardConfig {
     ///
     /// Always emits exactly one storage backend feature
     /// (`redis-backend` or `fjall-backend`), the protocols chosen, and the
-    /// mediator's other defaults (`jemalloc`, `vta`), which the wizard never
-    /// turns off. Callers pair it with `--no-default-features` whenever it
+    /// mediator's other defaults (`jemalloc`), which the wizard never turns
+    /// off. Callers pair it with `--no-default-features` whenever it
     /// differs from [`MEDIATOR_DEFAULT_FEATURES`], so it has to be complete:
     /// a feature missing here is missing from the binary. That is how
     /// wizard-built mediators lost `vta` — and with it the VTA integration a
@@ -457,11 +457,11 @@ impl WizardConfig {
             _ => "redis-backend",
         });
 
-        // Defaults no wizard choice removes. `vta` is needed by every
-        // VTA-linked deployment, and costs a non-VTA one nothing but a
-        // dependency; `jemalloc` is the allocator the mediator ships with.
+        // Defaults no wizard choice removes: `jemalloc` is the allocator the
+        // mediator ships with. The mediator's `vta` feature cannot be built in
+        // this release (vta-sdk is out of the dependency graph) and is not a
+        // mediator default; step 3 of the release order puts `vta` back here.
         features.push("jemalloc");
-        features.push("vta");
 
         // `file://` needs no feature: the file backend is always built.
         if let Some(feature) = self.secret_storage.and_then(SecretScheme::cargo_feature) {
@@ -488,8 +488,7 @@ impl WizardConfig {
 /// The mediator crate's `default` features, which
 /// [`WizardConfig::needs_explicit_features`] compares against. Must match
 /// `affinidi-messaging-mediator/Cargo.toml`; a test reads that file to hold it.
-pub const MEDIATOR_DEFAULT_FEATURES: [&str; 5] =
-    ["didcomm", "tsp", "redis-backend", "jemalloc", "vta"];
+pub const MEDIATOR_DEFAULT_FEATURES: [&str; 4] = ["didcomm", "tsp", "redis-backend", "jemalloc"];
 
 impl Default for WizardConfig {
     fn default() -> Self {

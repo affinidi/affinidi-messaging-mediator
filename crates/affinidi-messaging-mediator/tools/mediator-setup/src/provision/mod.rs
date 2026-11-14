@@ -176,7 +176,9 @@ pub(crate) async fn generate_and_write_with(
 #[cfg(test)]
 mod generate_and_write_tests {
     use super::*;
-    use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode, VtaMode};
+    #[cfg(feature = "vta")]
+    use crate::app::VtaMode;
+    use crate::app::{AdminMode, Deployment, DidMethod, SecretScheme, SslMode};
     use crate::consts::*;
     use crate::{config_writer, recipe, reprovision};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -734,6 +736,7 @@ mod generate_and_write_tests {
         assert!(unified_text.contains(affinidi_messaging_mediator_common::ADMIN_CREDENTIAL));
     }
 
+    #[cfg(feature = "vta")]
     fn admin_only_session() -> vta::VtaSession {
         vta::VtaSession::admin_only(
             "mediator".into(),
@@ -812,6 +815,7 @@ mod generate_and_write_tests {
         );
     }
 
+    #[cfg(feature = "vta")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial_test::serial]
     async fn entries_this_run_already_persisted_do_not_trip_the_guard() {
@@ -838,6 +842,7 @@ mod generate_and_write_tests {
 
     // ── #173: the admin choice is honoured with a VTA session ─────────
 
+    #[cfg(feature = "vta")]
     #[tokio::test]
     async fn generated_admin_is_separate_from_the_vta_credential() {
         let dir = tempfile::tempdir().unwrap();
@@ -871,6 +876,7 @@ mod generate_and_write_tests {
         assert_eq!(exit::code_of(&err), exit::NO_VTA_SESSION);
     }
 
+    #[cfg(feature = "vta")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial_test::serial]
     async fn vta_flow_with_generated_admin_writes_the_separate_admin() {

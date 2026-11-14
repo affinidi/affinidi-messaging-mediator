@@ -82,6 +82,17 @@
 #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
 compile_error!("At least one of the `didcomm` or `tsp` features must be enabled");
 
+// `vta-sdk` is out of the dependency graph for this release: no published
+// vta-sdk builds against affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45 yet.
+// The feature stays defined so the release order is visible; step 3 (re-adding
+// vta-sdk once VTI releases it on the new line) removes this guard.
+#[cfg(feature = "vta")]
+compile_error!(
+    "the `vta` feature is unavailable in this release: vta-sdk is not in the \
+     dependency graph until it is released on affinidi-messaging-sdk 0.47 / \
+     affinidi-tdk 0.45 (see changelog.d/sdk-0-47-without-vta.md)"
+);
+
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_mediator_common::store::prelude::*;
 #[cfg(feature = "didcomm")]

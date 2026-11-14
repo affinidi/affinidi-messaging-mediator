@@ -136,7 +136,7 @@ axum.workspace = true
 ## (`soft_restart_websocket`, `tsp_*`). They lived in that crate's own tests
 ## until the mediator moved out of affinidi-tdk-rs; a dev-dependency there on
 ## this crate would make a cross-repository cycle, so they run here instead.
-affinidi-messaging-didcomm-service = { version = "0.31.0", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.32.0", features = ["tsp"] }
 ## `affinidi_tdk::messaging::ATM` for the TSP transport-adapter test.
 affinidi-tdk = { workspace = true, features = ["did-peer", "messaging"] }
 affinidi-tdk-common.workspace = true

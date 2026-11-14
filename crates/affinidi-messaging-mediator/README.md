@@ -216,12 +216,17 @@ cargo build --locked -p affinidi-messaging-mediator
 # Single node: Fjall + OS keyring
 cargo build --locked -p affinidi-messaging-mediator \
   --no-default-features \
-  --features didcomm,tsp,fjall-backend,secrets-keyring,jemalloc,vta
+  --features didcomm,tsp,fjall-backend,secrets-keyring,jemalloc
 
 # Cluster with AWS Secrets Manager
 cargo build --locked -p affinidi-messaging-mediator \
   --features secrets-aws
 ```
+
+The `vta` feature (VTA-backed key management) is not in the default set and
+cannot be enabled in this release: vta-sdk returns once it is released on
+affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45. See
+`changelog.d/sdk-0-47-without-vta.md`.
 
 ## Architecture
 

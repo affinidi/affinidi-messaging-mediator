@@ -38,6 +38,7 @@ impl VtaMode {
     /// How the interactive summary names the mode. The TUI's mint handoff
     /// is shown as `sealed`, as it always was; the intent shown beside it
     /// says what the VTA does. (Headless output prints [`VtaMode::as_str`].)
+    #[cfg(feature = "vta")]
     pub fn label(self) -> &'static str {
         match self {
             Self::Online => "online",

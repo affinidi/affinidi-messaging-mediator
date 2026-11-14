@@ -16,7 +16,9 @@
 //! variant + the [`VtaReply::ContextExport`] reply variant are local
 //! TUI-state extensions for the offline sealed-handoff flow.
 
+#[cfg(feature = "vta")]
 use vta_sdk::context_provision::ContextProvisionBundle;
+#[cfg(feature = "vta")]
 use vta_sdk::provision_client::{
     AdminCredentialReply, ProvisionResultV2, VtaIntent as SdkVtaIntent, VtaReply as SdkVtaReply,
 };
@@ -43,6 +45,7 @@ pub enum VtaIntent {
     OfflineExport,
 }
 
+#[cfg(feature = "vta")]
 impl VtaIntent {
     /// Project this intent onto the SDK's intent enum. Returns `None`
     /// for [`VtaIntent::OfflineExport`] — that variant never reaches an
@@ -77,6 +80,7 @@ pub enum VtaTransport {
 /// SDK's [`SdkVtaReply`] shape so a successful online run can be lifted
 /// without re-shaping; `ContextExport` is the offline-only variant the
 /// SDK does not represent.
+#[cfg(feature = "vta")]
 #[derive(Clone, Debug)]
 pub enum VtaReply {
     /// Full template-bootstrap reply. The VTA minted the mediator's
@@ -96,6 +100,7 @@ pub enum VtaReply {
     ContextExport(Box<ContextProvisionBundle>),
 }
 
+#[cfg(feature = "vta")]
 impl From<SdkVtaReply> for VtaReply {
     fn from(reply: SdkVtaReply) -> Self {
         match reply {

@@ -164,6 +164,18 @@ pub struct StoredVtaSession {
 /// session as soon as it connects so a later failure or quit does not lose
 /// a DID the VTA has already minted. Idempotent: writing the same session
 /// twice stores the same values.
+///
+/// Without the `vta` feature there is no session to store.
+#[cfg(not(feature = "vta"))]
+pub async fn store_vta_session(
+    _store: &MediatorSecrets,
+    session: &crate::vta::VtaSession,
+) -> anyhow::Result<StoredVtaSession> {
+    match *session {}
+}
+
+/// See the stand-in above; this is the `vta` build's implementation.
+#[cfg(feature = "vta")]
 pub async fn store_vta_session(
     store: &MediatorSecrets,
     session: &crate::vta::VtaSession,

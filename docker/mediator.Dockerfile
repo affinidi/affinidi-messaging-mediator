@@ -24,8 +24,9 @@
 ARG PORT=7037
 
 # Both binaries in ONE cargo invocation, so the dependency graph is compiled
-# once: didcomm, tsp, redis-backend, jemalloc and vta come from the mediator's
-# defaults, plus secrets-aws (which pulls in the `aws` feature required by
+# once: didcomm, tsp, redis-backend and jemalloc come from the mediator's
+# defaults (no `vta`: vta-sdk is out of the graph for this release, so the
+# image has no VTA integration), plus secrets-aws (which pulls in the `aws` feature required by
 # aws_secrets:// / aws_parameter_store://); mediator-setup gets only the AWS
 # backends the cloud deployment uses. `--no-default-features` applies to both
 # packages, which is why the mediator's `default` is named explicitly.

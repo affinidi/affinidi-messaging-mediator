@@ -3,7 +3,9 @@
 
 use crate::app::{Deployment, SecretScheme};
 use crate::ui::selection::SelectionOption;
-use crate::vta::{ConnectPhase, VtaIntent};
+#[cfg(feature = "vta")]
+use crate::vta::ConnectPhase;
+use crate::vta::VtaIntent;
 
 use super::{
     BackendCheck, Choice, DEPLOYMENT_CHOICES, DatabasePhase, DidPhase, KEY_STORAGE_CHOICES,
@@ -17,6 +19,7 @@ impl WizardApp {
     /// a sub-flow that has its own narrative (e.g. online-VTA).
     pub fn current_step_data(&self) -> StepData {
         let default = self.current_step.step_data();
+        #[cfg(feature = "vta")]
         if let Some(phase) = self.vta_phase() {
             let num = self.current_step.step_number();
             let total = WizardStep::total();
@@ -73,12 +76,17 @@ impl WizardApp {
         // operator is currently answering so the header stays useful
         // alongside the option list.
         if self.current_step == WizardStep::Vta
-            && self.vta_connect.is_none()
-            && self.sealed_handoff.is_none()
+            && !self.in_vta_subflow()
+            && !self.in_sealed_handoff_subflow()
         {
             let num = self.current_step.step_number();
             let total = WizardStep::total();
             let (suffix, desc): (&str, &str) = match self.vta_step_phase {
+                #[cfg(not(feature = "vta"))]
+                VtaStepPhase::SelectIntent => {
+                    ("Unavailable in this release", crate::vta::VTA_UNAVAILABLE)
+                }
+                #[cfg(feature = "vta")]
                 VtaStepPhase::SelectIntent => (
                     "What from VTA?",
                     "Decide whether the VTA should mint your mediator's DID (Full setup), \
@@ -125,6 +133,7 @@ impl WizardApp {
         match self.current_step {
             WizardStep::Deployment => DEPLOYMENT_CHOICES.iter().map(Choice::option).collect(),
             WizardStep::Vta => {
+                #[cfg(feature = "vta")]
                 if let Some(phase) = self.vta_phase() {
                     let Some(st) = self.vta_connect.as_ref() else {
                         return vec![];
@@ -528,6 +537,7 @@ impl WizardApp {
         match self.current_step {
             WizardStep::Deployment => DEPLOYMENT_CHOICES.get(self.selection_index).map(|c| c.info.to_string()).unwrap_or_default(),
             WizardStep::Vta => {
+                #[cfg(feature = "vta")]
                 if let Some(phase) = self.vta_phase() {
                     return match phase {
                         ConnectPhase::EnterDid => {

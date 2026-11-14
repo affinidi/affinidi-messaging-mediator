@@ -9,12 +9,7 @@
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
 #
-# The four below share one cause: vta-sdk 0.77 (the mediator's default `vta`
-# feature, and mediator-setup) depends on affinidi-tdk 0.36, which brings
-# affinidi-messaging-sdk 0.44 and trust-tasks 0.36 beside the direct
-# requirements (sdk 0.46, tdk 0.43, trust-tasks 0.38). Cleared by a vta-sdk
-# release on affinidi-tdk 0.43 and a bump of the `vta-sdk` requirement here.
-affinidi-messaging-sdk 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> sdk 0.44
-affinidi-tdk 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36
-trust-tasks-proof 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> trust-tasks 0.36
-trust-tasks-rs 2027-01-31 vta-sdk 0.77 -> affinidi-tdk 0.36 -> trust-tasks 0.36
+# No entries: the four vta-sdk 0.77 duplicates (affinidi-messaging-sdk,
+# affinidi-tdk, trust-tasks-proof, trust-tasks-rs) left with vta-sdk itself,
+# which is out of the graph until VTI releases it on SDK 0.47 / TDK 0.45
+# (changelog.d/sdk-0-47-without-vta.md). Re-adding it must not bring them back.

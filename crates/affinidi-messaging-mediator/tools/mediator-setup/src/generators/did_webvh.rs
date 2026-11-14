@@ -22,6 +22,7 @@ use didwebvh_rs::{
     parameters::Parameters,
 };
 use serde_json::json;
+#[cfg(feature = "vta")]
 use vta_sdk::did_templates::{TemplateVars, load_embedded};
 
 use crate::cli::KeySuite;
@@ -105,6 +106,135 @@ fn webvh_signing_key(label: &str) -> anyhow::Result<Secret> {
 /// Should be the mediator's full public URL including any HTTP API
 /// prefix (`https://mediator.example.com/mediator/v1`) so clients
 /// resolving the DID hit the actual mediator routes.
+/// The opt-in P-256 verification methods (`#key-2` signing, `#key-3` key
+/// agreement), with `{DID}` sentinels.
+struct P256Methods {
+    signing: serde_json::Value,
+    key_agreement: serde_json::Value,
+}
+
+/// Render the mediator's DID document from vta-sdk's built-in
+/// `didcomm-mediator` template — the one a VTA renders server-side.
+#[cfg(feature = "vta")]
+fn render_mediator_document(
+    service_url: &str,
+    signing_mb: &str,
+    ka_mb: &str,
+    p256: Option<P256Methods>,
+) -> anyhow::Result<serde_json::Value> {
+    let template = load_embedded("didcomm-mediator")
+        .map_err(|e| anyhow::anyhow!("Failed to load mediator template: {e}"))?;
+    let mut vars = TemplateVars::new();
+    vars.insert_string("URL", service_url);
+    vars.insert_string("SIGNING_KEY_MB", signing_mb);
+    vars.insert_string("KA_KEY_MB", ka_mb);
+    if let Some(p256) = p256 {
+        vars.insert("VM_P256_SIGNING", p256.signing);
+        vars.insert("VM_P256_KA", p256.key_agreement);
+        vars.insert_string("AUTH_P256", "{DID}#key-2");
+        vars.insert_string("ASSERTION_P256", "{DID}#key-2");
+        vars.insert_string("KEYAGREEMENT_P256", "{DID}#key-3");
+    }
+    // `{DID}` is a sentinel — we declare it as "provided" so the renderer
+    // doesn't flag it as unresolved; `didwebvh-rs` substitutes the actual
+    // DID string after SCID computation.
+    vars.insert_string("DID", "{DID}");
+    template
+        .render(&vars)
+        .map_err(|e| anyhow::anyhow!("Failed to render mediator template: {e}"))
+}
+
+/// Build the mediator's DID document without vta-sdk.
+///
+/// vta-sdk (and with it the built-in `didcomm-mediator` template) is out of
+/// the dependency graph for this release, so this produces the document that
+/// template renders with the same inputs: `#key-0` signing, `#key-1` key
+/// agreement, optional P-256 `#key-2` / `#key-3`, a `DIDCommMessaging`
+/// service on `URL` and on the derived WebSocket URL, and the `#auth`
+/// service. No `#tsp` service — the caller adds or strips it. Step 3 of the
+/// release order (vta-sdk back in the graph) can drop this in favour of the
+/// template again.
+#[cfg(not(feature = "vta"))]
+fn render_mediator_document(
+    service_url: &str,
+    signing_mb: &str,
+    ka_mb: &str,
+    p256: Option<P256Methods>,
+) -> anyhow::Result<serde_json::Value> {
+    // The template's WS_URL convention: swap the scheme and append `/ws`.
+    let ws_url = if let Some(rest) = service_url.strip_prefix("https://") {
+        format!("wss://{}/ws", rest.trim_end_matches('/'))
+    } else if let Some(rest) = service_url.strip_prefix("http://") {
+        format!("ws://{}/ws", rest.trim_end_matches('/'))
+    } else {
+        anyhow::bail!(
+            "Failed to render mediator template: missing required variables: WS_URL \
+             (the service URL `{service_url}` is not http(s))"
+        );
+    };
+
+    let mut verification_method = vec![
+        json!({
+            "id": "{DID}#key-0",
+            "type": "Multikey",
+            "controller": "{DID}",
+            "publicKeyMultibase": signing_mb,
+        }),
+        json!({
+            "id": "{DID}#key-1",
+            "type": "Multikey",
+            "controller": "{DID}",
+            "publicKeyMultibase": ka_mb,
+        }),
+    ];
+    let mut authentication = vec![json!("{DID}#key-0")];
+    let mut assertion_method = vec![json!("{DID}#key-0")];
+    let mut key_agreement = vec![json!("{DID}#key-1")];
+    if let Some(p256) = p256 {
+        verification_method.push(p256.signing);
+        verification_method.push(p256.key_agreement);
+        authentication.push(json!("{DID}#key-2"));
+        assertion_method.push(json!("{DID}#key-2"));
+        key_agreement.push(json!("{DID}#key-3"));
+    }
+
+    Ok(json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/multikey/v1",
+            "https://didcomm.org/messaging/v2"
+        ],
+        "id": "{DID}",
+        "verificationMethod": verification_method,
+        "authentication": authentication,
+        "assertionMethod": assertion_method,
+        "keyAgreement": key_agreement,
+        "service": [
+            {
+                "id": "{DID}#service",
+                "type": ["DIDCommMessaging"],
+                "serviceEndpoint": [
+                    {
+                        "accept": ["didcomm/v2"],
+                        "routingKeys": [],
+                        "uri": service_url
+                    },
+                    {
+                        "accept": ["didcomm/v2"],
+                        "routingKeys": [],
+                        "uri": ws_url
+                    }
+                ]
+            },
+            {
+                "id": "{DID}#auth",
+                "type": ["Authentication"],
+                "serviceEndpoint": format!("{service_url}/authenticate")
+            }
+        ]
+    }))
+}
+
 #[cfg(test)]
 pub async fn generate_did_webvh(
     address: &str,
@@ -207,60 +337,42 @@ pub async fn generate_did_webvh_as(
             None
         };
 
-    // ── Render template ─────────────────────────────────────────────
-    let template = load_embedded("didcomm-mediator")
-        .map_err(|e| anyhow::anyhow!("Failed to load mediator template: {e}"))?;
-    let mut vars = TemplateVars::new();
+    // ── Render the DID document ────────────────────────────────────
+    // Opt-in P-256 verification methods. The objects keep the `{DID}`
+    // sentinel — didwebvh-rs resolves it across the whole document after SCID
+    // computation. When no P-256 suite is requested the slots stay pruned.
+    let p256_methods = match (p256_signing.as_ref(), p256_key_agreement.as_ref()) {
+        (Some(p256_sign), Some(p256_ka)) => {
+            let p256_sign_mb = p256_sign
+                .get_public_keymultibase()
+                .map_err(|e| anyhow::anyhow!("Failed to get P-256 signing public key: {e}"))?;
+            let p256_ka_mb = p256_ka.get_public_keymultibase().map_err(|e| {
+                anyhow::anyhow!("Failed to get P-256 key-agreement public key: {e}")
+            })?;
+            Some(P256Methods {
+                signing: json!({
+                    "id": "{DID}#key-2",
+                    "type": "Multikey",
+                    "controller": "{DID}",
+                    "publicKeyMultibase": p256_sign_mb,
+                }),
+                key_agreement: json!({
+                    "id": "{DID}#key-3",
+                    "type": "Multikey",
+                    "controller": "{DID}",
+                    "publicKeyMultibase": p256_ka_mb,
+                }),
+            })
+        }
+        _ => None,
+    };
     // Service endpoints land on the operator's full URL (host + api prefix).
     // The DID identifier itself comes from `address` via `CreateDIDConfig`
     // below, so the two are correctly decoupled — clients resolving the
     // DID look up `/.well-known/did.jsonl` then dial the service URLs
     // they find inside.
-    vars.insert_string("URL", service_url);
-    vars.insert_string("SIGNING_KEY_MB", &signing_mb);
-    vars.insert_string("KA_KEY_MB", &ka_mb);
-    // Opt-in P-256 verification methods. The supplied objects keep the
-    // `{DID}` sentinel — didwebvh-rs resolves it across the whole document
-    // after SCID computation, including these var-injected methods (they
-    // are not recursively re-substituted by the template renderer). When no
-    // P-256 suite is requested these vars stay unset and the renderer prunes
-    // the corresponding null slots.
-    if let (Some(p256_sign), Some(p256_ka)) = (p256_signing.as_ref(), p256_key_agreement.as_ref()) {
-        let p256_sign_mb = p256_sign
-            .get_public_keymultibase()
-            .map_err(|e| anyhow::anyhow!("Failed to get P-256 signing public key: {e}"))?;
-        let p256_ka_mb = p256_ka
-            .get_public_keymultibase()
-            .map_err(|e| anyhow::anyhow!("Failed to get P-256 key-agreement public key: {e}"))?;
-        vars.insert(
-            "VM_P256_SIGNING",
-            json!({
-                "id": "{DID}#key-2",
-                "type": "Multikey",
-                "controller": "{DID}",
-                "publicKeyMultibase": p256_sign_mb,
-            }),
-        );
-        vars.insert(
-            "VM_P256_KA",
-            json!({
-                "id": "{DID}#key-3",
-                "type": "Multikey",
-                "controller": "{DID}",
-                "publicKeyMultibase": p256_ka_mb,
-            }),
-        );
-        vars.insert_string("AUTH_P256", "{DID}#key-2");
-        vars.insert_string("ASSERTION_P256", "{DID}#key-2");
-        vars.insert_string("KEYAGREEMENT_P256", "{DID}#key-3");
-    }
-    // `{DID}` is a sentinel — we declare it as "provided" so the renderer
-    // doesn't flag it as unresolved; `didwebvh-rs` substitutes the actual
-    // DID string after SCID computation.
-    vars.insert_string("DID", "{DID}");
-    let mut did_document = template
-        .render(&vars)
-        .map_err(|e| anyhow::anyhow!("Failed to render mediator template: {e}"))?;
+    let mut did_document =
+        render_mediator_document(service_url, &signing_mb, &ka_mb, p256_methods)?;
 
     // ── TSP service, matched to the operator's choice ───────────────
     // did:webvh binds the document to the DID (SCID), so the mediator runtime

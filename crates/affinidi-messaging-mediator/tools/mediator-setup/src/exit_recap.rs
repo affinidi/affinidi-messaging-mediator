@@ -21,7 +21,9 @@
 use std::fmt::Write as _;
 
 use crate::app::WizardConfig;
-use crate::vta::{VtaReply, VtaSession};
+#[cfg(feature = "vta")]
+use crate::vta::VtaReply;
+use crate::vta::VtaSession;
 
 /// Print the operator-facing recap to stdout. Called from `main.rs`
 /// after the TUI has restored the terminal (alt-screen left, raw
@@ -49,6 +51,15 @@ fn push_header(out: &mut String, timestamp: &str) {
     let _ = writeln!(out);
 }
 
+/// Without the `vta` feature there is never a session to report.
+#[cfg(not(feature = "vta"))]
+fn push_vta_section(_out: &mut String, session: Option<&VtaSession>) {
+    if let Some(session) = session {
+        match *session {}
+    }
+}
+
+#[cfg(feature = "vta")]
 fn push_vta_section(out: &mut String, session: Option<&VtaSession>) {
     let Some(session) = session else { return };
     let _ = writeln!(out, "## VTA Integration");
@@ -189,6 +200,7 @@ fn push_selection_hint(out: &mut String) {
 mod tests {
     use super::*;
     use crate::app::WizardConfig;
+    #[cfg(feature = "vta")]
     use crate::vta::VtaSession;
 
     const TS: &str = "2026-04-26T12:00:00+00:00";
@@ -202,6 +214,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vta")]
     fn admin_only_session() -> VtaSession {
         VtaSession::admin_only(
             "mediator".into(),
@@ -213,6 +226,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "vta")]
     fn full_setup_session() -> VtaSession {
         VtaSession::full(
             "mediator".into(),
@@ -223,6 +237,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "vta")]
     #[test]
     fn full_setup_recap_renders_all_sections() {
         let r = build_recap(&config_minimal(), Some(&full_setup_session()), TS);
@@ -241,6 +256,7 @@ mod tests {
         assert!(r.contains("```toml"));
     }
 
+    #[cfg(feature = "vta")]
     #[test]
     fn admin_only_recap_omits_mediator_did_line() {
         let r = build_recap(&config_minimal(), Some(&admin_only_session()), TS);
@@ -264,7 +280,10 @@ mod tests {
 
     #[test]
     fn toml_block_parses_round_trip() {
+        #[cfg(feature = "vta")]
         let r = build_recap(&config_minimal(), Some(&full_setup_session()), TS);
+        #[cfg(not(feature = "vta"))]
+        let r = build_recap(&config_minimal(), None, TS);
         // Extract the fenced TOML block.
         let start = r.find("```toml\n").expect("toml fence start present");
         let after_fence = &r[start + "```toml\n".len()..];
