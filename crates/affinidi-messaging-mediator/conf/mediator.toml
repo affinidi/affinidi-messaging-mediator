@@ -896,16 +896,17 @@ oob_invite_ttl = "86400"
 ### One authenticated WebSocket (the "principal") carrying live delivery and
 ### pickup for many DIDs, so a client with many DIDs does not need one
 ### connection each. Each DID proves it allows this, either per connection or
-### with a stored, signed grant. Design:
-### design-docs/mediator-did-multiplexing-design.md
+### with a stored, signed grant. See docs/multiplexing.md.
 ###
 ### OFF unless enabled here. Absent or empty leaves it off; "true" turns it
 ### on; any value other than "true"/"false" refuses to start. Needs
-### [streaming] enabled; the mediator refuses to start otherwise. DIDComm clients open a mux connection with the `didcomm-mux`
-### WebSocket subprotocol (the provisional `affinidi-mux` is still accepted);
-### raw-TSP clients offer `tsp`, `tsp-ack`, `tsp-mux`, in that order.
-### Several instances behind one Redis: a revoke handled by one instance
-### reaches another's connections within 30 s (the member sweep).
+### [streaming] enabled; the mediator refuses to start otherwise. DIDComm
+### clients open a mux connection with the `didcomm-mux` WebSocket
+### subprotocol (the provisional `affinidi-mux` is still accepted); raw-TSP
+### clients offer `tsp`, `tsp-ack`, `tsp-mux`, in that order.
+### Several instances behind one store: a revoke handled by one instance is
+### published to the others, which drop the member at once; if that message
+### is lost, the periodic member sweep applies it within 30 s.
 # [limits.mux]
 ### Env: LIMIT_MUX_ENABLED
 # enabled = "false"

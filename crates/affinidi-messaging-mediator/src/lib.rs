@@ -62,7 +62,7 @@ pub mod tsp_identity;
 /// `jsonwebtoken::…::install_default()` against its own copy of the crate
 /// installs nothing for the copy this mediator verifies tokens with. While the
 /// JWT key fields were public that mismatch was at least a compile error;
-/// now that `jsonwebtoken` is a private dependency (#770) it would be a silent
+/// now that `jsonwebtoken` is a private dependency (affinidi-tdk-rs#770) it would be a silent
 /// runtime failure instead, so the installation has to be callable from here.
 ///
 /// Errors from an already-installed provider are ignored.

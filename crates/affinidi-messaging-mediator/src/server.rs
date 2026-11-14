@@ -373,7 +373,7 @@ pub async fn serve_internal(
     // The advertised set is the mediator's public protocol contract and lives in
     // one place, next to the tests that pin it. Notably it carries no
     // coordinate-mediation entry: v2 routing is DID-addressed and needs no
-    // keylist (issue #755, `docs/mediation-and-routing.md`).
+    // keylist (issue affinidi-tdk-rs#755, `docs/mediation-and-routing.md`).
     let discover_features = Arc::new(DiscoverFeatures {
         protocols: crate::messages::protocols::discover_features::ADVERTISED_PROTOCOLS
             .iter()

@@ -27,7 +27,8 @@ heading, then bullets or paragraphs. One file may hold several entries.
 Kind is one of **Breaking**, **Changed**, **Fixed**, **Added**, **Removed**,
 **Deprecated** or **Security**; the free text after the dash says what changed.
 Behavioural changes to delivery, ack or auth semantics are breaking for
-consumers even when no signature changes (R3.6): say so in the entry.
+consumers even when no signature changes (R3.6, see
+[docs/delivery-rules.md](../docs/delivery-rules.md)): say so in the entry.
 
 `python3 scripts/changelog_fragments.py --check` validates the fragments (the
 `release guards` CI job runs it).

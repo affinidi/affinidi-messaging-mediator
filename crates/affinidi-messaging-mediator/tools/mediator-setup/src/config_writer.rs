@@ -133,7 +133,7 @@ const ATM_FUNCTIONS_LUA: &str = include_str!("../../../conf/atm-functions.lua");
 /// legacy `affinidi_secrets_resolver`-format array to
 /// `<config_dir>/secrets.json`; that clobbered the unified backend file
 /// whenever `[secrets].storage` pointed at the same path — which the
-/// default `conf/secrets.json` always does (#354). The legacy write is
+/// default `conf/secrets.json` always does (affinidi-tdk-rs#354). The legacy write is
 /// gone; nothing reads that format anymore.
 ///
 /// Returns the paths written. Both writes are temp + fsync + rename, so an
@@ -467,7 +467,7 @@ fn url_host(url: &str) -> Option<String> {
 /// authority=`conf`, path=`/secrets.json` — the mediator opens `/secrets.json`
 /// at the filesystem root, silently writing outside the working directory as
 /// root and failing the backend probe with `permission denied` for everyone
-/// else (#350).
+/// else (affinidi-tdk-rs#350).
 ///
 /// A correct local URL needs an empty authority and an absolute path:
 /// `file:///<abs>` (three slashes). We get there by resolving the path to
@@ -623,7 +623,7 @@ mod tests {
     fn build_backend_url_file_relative_resolves_to_absolute_three_slash() {
         // A relative path must be resolved against the CWD into a
         // three-slash `file:///<abs>` URL — a bare `file://conf/secrets.json`
-        // is RFC-malformed (authority=`conf`) and opens `/secrets.json` (#350).
+        // is RFC-malformed (authority=`conf`) and opens `/secrets.json` (affinidi-tdk-rs#350).
         let cfg = WizardConfig {
             secret_storage: Some(SecretScheme::File),
             secret_file_path: "conf/secrets.json".into(),
@@ -1649,7 +1649,7 @@ admin = "generate"
         // `vta://` are no longer storage backends (string:// dropped;
         // vta:// is a key *source*, not a store).
         // The file:// backend resolves its (default, relative) path against
-        // the CWD into a three-slash absolute URL (#350), so compute the
+        // the CWD into a three-slash absolute URL (affinidi-tdk-rs#350), so compute the
         // expected value the same way rather than hard-coding it.
         // Same lock the `CwdGuard`s take: this reads the process-wide current
         // directory, which another test would otherwise be free to relocate

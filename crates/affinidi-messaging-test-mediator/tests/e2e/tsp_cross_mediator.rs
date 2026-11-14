@@ -1,4 +1,4 @@
-//! Cross-mediator TSP delivery for service-less (`did:key`-style) peers (#577 P1).
+//! Cross-mediator TSP delivery for service-less (`did:key`-style) peers (affinidi-tdk-rs#577 P1).
 //!
 //! - The metadata-private carriage primitive (`send_nested_routed`) delivers a
 //!   Nested-wrapped Direct message across two mediators, with the recipient

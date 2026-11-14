@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 const REPORT_PROBLEM_TYPE: &str = "https://didcomm.org/report-problem/2.0/problem-report";
 const LISTENER_ID: &str = "vta-main";
 
-/// Connect gate for loaded CI runners (#611). A single `connect()` attempt
+/// Connect gate for loaded CI runners (affinidi-tdk-rs#611). A single `connect()` attempt
 /// may legitimately spend up to 10s inside the service's `profile_add`
 /// timeout, and the test's restart policy backs off 1–2s between attempts —
 /// so the old flat 15s budget fit barely one and a half attempts, and one

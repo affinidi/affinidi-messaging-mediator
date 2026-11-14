@@ -40,7 +40,7 @@ env:
   RUSTDOCFLAGS: "-D warnings --cfg tracing_unstable"
   # File and line numbers in backtraces without full debug info. A full-debug
   # test build of the mediator graph was near the hosted runner's disk in
-  # affinidi-tdk-rs (#940). Set via the profile rather than RUSTFLAGS so every
+  # affinidi-tdk-rs#940. Set via the profile rather than RUSTFLAGS so every
   # job keeps the same RUSTFLAGS fingerprint.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # Native deps come from .github/actions/native-deps in every job.

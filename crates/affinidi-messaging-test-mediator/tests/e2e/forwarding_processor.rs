@@ -12,7 +12,7 @@
 //! graph (`scripts/check-test-clock-isolation.sh`), so these tests live here,
 //! in the fixture crate that enables it, rather than in the mediator. There
 //! they went unrun: the mediator never enabled the feature, so all five timed
-//! out on deliveries the guard refused, from #819 on.
+//! out on deliveries the guard refused, from affinidi-tdk-rs#819 on.
 //!
 //! Run with: `cargo test -p affinidi-messaging-test-mediator --test e2e -- forwarding_processor::`
 

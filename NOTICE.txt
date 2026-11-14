@@ -2,16 +2,16 @@ This License does not grant permission to use the trade names, trademarks, servi
 
 ---
 
-## Third-party material reproduced in this repository
+## Third-party material in this repository
 
-`crates/identity/did-methods/did-pkh/tests/did-*.jsonld` — 19 DID Document
-fixtures reproduced verbatim from the `did-pkh` crate (v0.3.2) of the
-spruceid/ssi project, licensed Apache-2.0. They are used unmodified as
-conformance vectors for the in-tree `affinidi-did-pkh` resolver. See
-`crates/identity/did-methods/did-pkh/tests/ATTRIBUTION.md`.
+This repository reproduces no third-party source code. Its dependencies are
+taken from crates.io (and, for the developer-only interop checks under
+`interop/`, from npm) under their own licences; `deny.toml` lists the
+licences the build accepts.
 
-The `affinidi-did-ethr`, `affinidi-did-jwk` and `affinidi-did-pkh` crates are
-independent implementations, written against the published DID method
-specifications. They reproduce no upstream source code; the test vectors
-embedded in `affinidi-did-ethr` are derived from the same Apache-2.0 spruceid
-test suite and from the did:ethr method specification.
+`crates/affinidi-messaging-mediator/trust-tasks/` holds copies of Trust Task
+specification bundles published by the Trust Tasks registry
+(https://trusttasks.org). `crates/affinidi-messaging-mediator/trust-tasks.lock`
+records the registry URL and the SHA-256 digest of each bundle. They are
+reproduced unmodified and remain under the terms the registry publishes them
+with.

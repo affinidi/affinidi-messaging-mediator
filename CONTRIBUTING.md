@@ -98,7 +98,10 @@ git rebase --signoff origin/main
    binary (`scripts/check-test-clock-isolation.sh`).
 5. **Comments explain WHY, not WHAT.** Reserve `///` and `//` for the
    non-obvious — a subtle invariant, a reason for an unusual ordering, a
-   reference to an incident or upstream issue.
+   reference to an incident or upstream issue. Qualify an issue in another
+   repository (`affinidi-tdk-rs#754`); a bare `#NNN` means this one. Rule
+   numbers such as "(R1.1)" refer to
+   [docs/delivery-rules.md](docs/delivery-rules.md).
 6. **No `unsafe`** in production code without a sign-off in the PR description.
    The workspace sets `unsafe_code = "deny"`: a new site needs
    `#[allow(unsafe_code)]` and a `// SAFETY:` comment saying why it is sound,
@@ -108,7 +111,8 @@ git rebase --signoff origin/main
    (clippy's `unwrap_used` cannot tell the two apart); reviewers check it.
 8. **Transport semantics are API.** Changes to send / ack / reconnect / delivery
    behaviour are breaking for consumers even when signatures do not change:
-   call them out in a `changelog.d/` fragment.
+   call them out in a `changelog.d/` fragment (R3.6 in
+   [docs/delivery-rules.md](docs/delivery-rules.md)).
 9. **Clippy is clean under every feature combination CI builds**, with
    `-D warnings`: the default set, `--all-features`, TSP-only, and each
    storage and secrets backend.

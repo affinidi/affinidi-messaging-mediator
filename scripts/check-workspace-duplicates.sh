@@ -4,10 +4,12 @@
 #
 # WHY THIS EXISTS
 #
-# A workspace member that another crate depends on *by version* (rather than by
-# path) is only redirected to local source if it is listed in the root
-# `[patch.crates-io]`. Miss the entry and cargo silently resolves the published
-# copy **alongside** the local one. Two things then go wrong, both quietly:
+# Every internal dependency in this workspace names a path, so cargo builds
+# members from local source. But a crates.io crate that depends on one of our
+# crates *by version* (e.g. `vta-sdk` on the mediator crates) makes cargo
+# resolve the published copy **alongside** the local one. This workspace takes
+# no `[patch.crates-io]` (CLAUDE.md, "TDK dependencies"), so nothing redirects
+# that copy. Two things then go wrong, both quietly:
 #
 #   1. Local changes to that crate do not take effect in workspace builds. You
 #      edit source, rebuild, and nothing happens.
@@ -21,25 +23,16 @@
 #      obviously does implement the trait — because the trait came from the
 #      other copy.
 #
-# External consumers make this worse: a crates.io crate that depends on our
-# crates (e.g. `vta-sdk`) drags the registry copies in even when every internal
-# reference uses a path.
-#
-# This has bitten repeatedly, and the symptom never points at the cause:
-#   * `did-example`                (PR #629)
-#   * `affinidi-messaging-core`    (PR #630) — spent a long time written off as
-#                                   an unrelated, unfixable `vta-sdk` failure
-#   * `affinidi-vc`, `affinidi-sd-jwt`, `affinidi-oid4vc-core`,
-#     `affinidi-openid4vci`, `affinidi-openid4vp`,
-#     `affinidi-messaging-delivery` (all found by this script's first run)
+# This guard comes from affinidi-tdk-rs, where the same failure bit repeatedly
+# and the symptom never pointed at the cause (affinidi-tdk-rs#629 for
+# `did-example`, affinidi-tdk-rs#630 for `affinidi-messaging-core`, and six
+# more crates found by the script's first run there).
 #
 # WHAT IT CHECKS
 #
 # The *symptom*, not the cause: any package whose name is a workspace member and
-# which also appears in the resolved graph with a registry source. That catches
-# both a missing `[patch.crates-io]` entry and a patch entry whose version no
-# longer satisfies an external consumer's requirement — the two ways a redirect
-# falls through — with no false positives from members nothing depends on.
+# which also appears in the resolved graph with a registry source, with no false
+# positives from members nothing depends on.
 #
 # It ALSO checks the ecosystem crates this workspace shares types with — any
 # registry crate named `affinidi-*`, `trust-tasks-*`, `vta-*` or `didwebvh-rs` —
@@ -91,7 +84,7 @@ PY
 
 # --all-features: a duplicate reached only through an optional dependency is
 # still a duplicate. Without it the guard resolved default features only and
-# missed one: during the data-integrity 0.8 wave (#917), affinidi-tdk's
+# missed one: during the data-integrity 0.8 wave (affinidi-tdk-rs#917), affinidi-tdk's
 # optional `did-scid` pulled a registry did-scid 0.2.8 beside the workspace's
 # 0.3.0, under every --all-features build, and the guard reported clean.
 metadata="$(cargo metadata --format-version 1 --all-features)"
@@ -124,13 +117,13 @@ Local edits to these crates will not take effect in workspace builds, and having
 two copies of their types in the graph produces mismatched-type or unsatisfied-
 trait errors that point anywhere but here.
 
-Fix: add each to '[patch.crates-io]' in the root Cargo.toml, e.g.
-
-  <crate-name> = { path = "crates/<crate-name>" }
-
-Then confirm with:
+Find what pulls each registry copy in with:
 
   cargo tree --workspace --all-features -i "registry+https://github.com/rust-lang/crates.io-index#<crate>@<version>"
+
+Fix it at the source: move that dependency to a release that accepts this
+workspace's version, or drop it. Do NOT add a '[patch.crates-io]' entry: this
+workspace takes none (CLAUDE.md, "TDK dependencies").
 
 If a duplicate genuinely cannot be resolved from this repository — an external
 consumer pinning an incompatible version range, say — add it to

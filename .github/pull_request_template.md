@@ -19,7 +19,7 @@ Write "none" if there is none.
 - [ ] Any new `unsafe` has `#[allow(unsafe_code)]`, a `// SAFETY:` comment, and a sign-off request below
 - [ ] No version bumps by hand, no git/path dependencies on TDK crates
 
-### Pre-merge checklist (VTI stack development guide, section 9)
+### Pre-merge checklist (rules in [docs/delivery-rules.md](../docs/delivery-rules.md))
 
 - [ ] No new reqwest::Client::new() / bare fetch(); all clients have finite timeouts (R1.2)
 - [ ] No lock held across a network await (R1.3)

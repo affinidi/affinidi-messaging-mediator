@@ -8,7 +8,7 @@
 //! locally to Bob. Each mediator only ever decrypts its own layer.
 //!
 //! This exercises the forwarding *processor* delivering across
-//! mediators — the path PR #399 unblocked on non-Redis backends. Before
+//! mediators — the path PR affinidi-tdk-rs#399 unblocked on non-Redis backends. Before
 //! that change, mediator A's forwarding processor was compiled out on
 //! the memory backend, so the outer forward was enqueued to `FORWARD_Q`
 //! and never delivered; Bob would time out. Running this on the default
@@ -237,7 +237,7 @@ async fn send_double_forward(
         .expect("wrap outer forward");
 
     // 5. Send the outer forward to the sender's own mediator. From here the
-    //    forwarding processor (running on the memory backend thanks to #399)
+    //    forwarding processor (running on the memory backend thanks to affinidi-tdk-rs#399)
     //    relays the inner forward to the recipient's mediator's /inbound,
     //    which stores it for the recipient and live-delivers it.
     sender_env
@@ -249,7 +249,7 @@ async fn send_double_forward(
 }
 
 /// Alice on mediator A sends to Bob on mediator B; the message must arrive
-/// having traversed both mediators. This is the core regression for #399.
+/// having traversed both mediators. This is the core regression for affinidi-tdk-rs#399.
 #[tokio::test]
 async fn cross_mediator_forward_delivers_over_memory_backend() {
     init_tracing();

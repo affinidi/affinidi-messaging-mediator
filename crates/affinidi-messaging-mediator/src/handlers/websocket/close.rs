@@ -83,7 +83,7 @@ mod close_reason_tests {
 
     /// A refused newcomer must not be told it was replaced.
     ///
-    /// This is the whole defect. Before #1028 the refusal path reused the
+    /// This is the whole defect. Before affinidi-tdk-rs#1028 the refusal path reused the
     /// eviction path's close frame, so a client that had been kept *out* was
     /// told its connection had been taken *over* — and, having nothing truthful
     /// to render, showed a transport error. OpenVTC reported it as a network
