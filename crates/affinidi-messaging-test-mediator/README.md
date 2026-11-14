@@ -64,14 +64,14 @@ Anywhere you need an in-process mediator for tests:
 
 ## Quick start
 
-```toml
-# Cargo.toml
-[dev-dependencies]
-# The same major.minor as the mediator you test against: the mediator's
-# crates are released together, under one version.
-affinidi-messaging-test-mediator = "0.52"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```sh
+cargo add --dev affinidi-messaging-test-mediator
+cargo add --dev tokio --features macros,rt-multi-thread
 ```
+
+Use the same `major.minor` as the mediator you test against: the
+mediator's crates are released together, under one version, and every
+`0.x` minor is a breaking release.
 
 ```rust,ignore
 use affinidi_messaging_test_mediator::TestMediator;
