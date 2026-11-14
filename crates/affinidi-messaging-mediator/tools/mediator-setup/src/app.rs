@@ -447,6 +447,8 @@ pub struct WizardConfig {
     pub secret_vault_namespace: String,
     /// Skip TLS verification for `vault://` (dev/test only).
     pub secret_vault_insecure: bool,
+    /// PEM CA bundle to trust for `vault://` (`?ca_cert=`). Empty → none.
+    pub secret_vault_ca_cert: String,
     /// Kubernetes namespace for the `k8s://` backend. Empty → resolved
     /// from the in-pod ServiceAccount / kubeconfig at connect time.
     pub secret_k8s_namespace: String,
@@ -648,6 +650,7 @@ impl Default for WizardConfig {
             secret_vault_approle_mount: String::new(),
             secret_vault_namespace: String::new(),
             secret_vault_insecure: false,
+            secret_vault_ca_cert: String::new(),
             secret_k8s_namespace: String::new(),
             secret_k8s_secret_name: DEFAULT_K8S_SECRET_NAME.into(),
             secret_file_encrypted: false,

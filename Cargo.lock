@@ -499,6 +499,7 @@ dependencies = [
  "url",
  "uuid",
  "vta-sdk",
+ "zeroize",
 ]
 
 [[package]]

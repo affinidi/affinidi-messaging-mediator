@@ -16,11 +16,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::secrets::bundle::BundledStore;
 use crate::secrets::envelope::Envelope;
 use crate::secrets::error::{Result, SecretStoreError};
-use crate::secrets::store::{DynSecretStore, open_store};
+use crate::secrets::store::{DynSecretStore, open_store, open_store_async};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -105,7 +106,10 @@ const KIND_ADMIN_CREDENTIAL: &str = "admin-credential";
 ///
 /// `context` is the VTA context this mediator lives in (defaults to
 /// `"mediator"` if missing). Ignored for self-hosted credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts the private key, and dropping the credential wipes it
+/// from memory, so its fields can't be moved out — clone them instead.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdminCredential {
     pub did: String,
     pub private_key_multibase: String,
@@ -130,6 +134,27 @@ pub struct AdminCredential {
 fn default_context() -> String {
     "mediator".into()
 }
+
+impl std::fmt::Debug for AdminCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCredential")
+            .field("did", &self.did)
+            .field("private_key_multibase", &REDACTED)
+            .field("vta_did", &self.vta_did)
+            .field("vta_url", &self.vta_url)
+            .field("context", &self.context)
+            .finish()
+    }
+}
+
+impl Drop for AdminCredential {
+    fn drop(&mut self) {
+        self.private_key_multibase.zeroize();
+    }
+}
+
+/// What a redacting `Debug` impl prints in place of secret material.
+const REDACTED: &str = "<redacted>";
 
 impl AdminCredential {
     fn validate(&self, key: &str) -> Result<()> {
@@ -202,7 +227,9 @@ impl AdminCredential {
 
 const KIND_VTA_BUNDLE: &str = "vta-cached-bundle";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` shows the timestamps but never the bundle (operating private
+/// keys) or its HMAC.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VtaCachedBundle {
     pub fetched_at: u64,
     pub ttl_secs: u64,
@@ -215,6 +242,17 @@ pub struct VtaCachedBundle {
     /// `vta_sdk::did_secrets::DidSecretsBundle` (which lives downstream).
     /// Consumers parse it with `serde_json::from_value`.
     pub bundle: serde_json::Value,
+}
+
+impl std::fmt::Debug for VtaCachedBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VtaCachedBundle")
+            .field("fetched_at", &self.fetched_at)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("hmac", &REDACTED)
+            .field("bundle", &REDACTED)
+            .finish()
+    }
 }
 
 impl VtaCachedBundle {
@@ -325,6 +363,12 @@ impl MediatorSecrets {
     /// Convenience: open a store from a URL and wrap it in one call.
     pub fn from_url(url: &str) -> Result<Self> {
         Ok(Self::new(open_store(url)?))
+    }
+
+    /// [`MediatorSecrets::from_url`] for async callers: opens the store on
+    /// the blocking pool (see [`open_store_async`]).
+    pub async fn from_url_async(url: &str) -> Result<Self> {
+        Ok(Self::new(open_store_async(url).await?))
     }
 
     pub fn store(&self) -> &DynSecretStore {
@@ -765,9 +809,23 @@ pub(crate) const KIND_SEED_INDEX: &str = "bootstrap-seed-index";
 
 /// Envelope-inner payload for a bootstrap seed. `seed_b64` carries the
 /// raw 32-byte Ed25519 seed encoded as URL-safe base64 (no padding).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct EphemeralSeedPayload {
     seed_b64: String,
+}
+
+impl std::fmt::Debug for EphemeralSeedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralSeedPayload")
+            .field("seed_b64", &REDACTED)
+            .finish()
+    }
+}
+
+impl Drop for EphemeralSeedPayload {
+    fn drop(&mut self) {
+        self.seed_b64.zeroize();
+    }
 }
 
 /// One entry in the bootstrap sweep index.
@@ -1052,10 +1110,8 @@ mod tests {
 
         // Rotate to a different admin credential — the HMAC no longer
         // matches, so load should treat the cache as absent.
-        let rotated = AdminCredential {
-            private_key_multibase: "z-different-key".into(),
-            ..sample_admin()
-        };
+        let mut rotated = sample_admin();
+        rotated.private_key_multibase = "z-different-key".into();
         secrets.store_admin_credential(&rotated).await.unwrap();
         assert!(secrets.load_vta_cached_bundle().await.unwrap().is_none());
     }
