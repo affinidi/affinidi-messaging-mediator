@@ -19,8 +19,11 @@ const SWEEP_AT: usize = 10_000;
 /// live entries are already bounded by the wake-capable accounts times their
 /// budgets; this is a hard ceiling on top. Past it, the entry whose day
 /// window started first is dropped. That only resets one requester's budget
-/// for one addressee: the addressee's own coalescing and hourly budget still
-/// hold.
+/// for one addressee (a requester minting enough DIDs could reset its own):
+/// the addressee's own coalescing and hourly budget still hold, because the
+/// addressee counters are never evicted. They are keyed by addressee only, and
+/// an addressee entry is only made for a local account with a wake handle that
+/// was rung, so they are bounded by those accounts, not by requesters.
 const MAX_PAIRS: usize = 100_000;
 
 const MINUTE: u64 = 60;
@@ -193,6 +196,37 @@ mod tests {
         assert!(
             l.pairs
                 .contains_key(&("newcomer".to_string(), "d".to_string()))
+        );
+    }
+
+    /// Evicting a pair at the ceiling resets only that requester's pair
+    /// budget: the addressee's hourly budget is never evicted, so a requester
+    /// that churns the pair map still cannot ring past it.
+    #[test]
+    fn pair_eviction_does_not_lift_the_addressee_budget() {
+        let mut l = Limiter::default();
+        let c = WakeConfig {
+            addressee_coalesce_seconds: 0,
+            addressee_per_hour: 2,
+            ..config()
+        };
+        const T: u64 = 1_800_000_000;
+        assert_eq!(l.try_ring(&c, "a", "victim", T), Ok(()));
+        assert_eq!(l.try_ring(&c, "b", "victim", T + 1), Ok(()));
+        // However the pair map is churned, eviction only ever removes pair
+        // entries; take the extreme case where every pair has been evicted.
+        while !l.pairs.is_empty() {
+            l.evict_oldest_pair();
+        }
+        assert!(l.addressees.contains_key("victim"));
+        // Fresh pair budgets, but the victim's hourly budget is spent.
+        assert_eq!(
+            l.try_ring(&c, "a", "victim", T + 2),
+            Err(Limited::Addressee)
+        );
+        assert_eq!(
+            l.try_ring(&c, "fresh", "victim", T + 3),
+            Err(Limited::Addressee)
         );
     }
 
