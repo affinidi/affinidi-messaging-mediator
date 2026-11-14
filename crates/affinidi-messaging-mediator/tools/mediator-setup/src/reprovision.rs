@@ -121,10 +121,7 @@ struct Manifest {
 
 /// Where the manifest for `config_path` lives.
 pub fn manifest_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(MANIFEST_FILE)
+    crate::config_writer::dir_of(config_path).join(MANIFEST_FILE)
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -172,7 +169,7 @@ const COMPANION_FILES: &[&str] = &[
 
 /// Every file uninstall should remove for the setup at `config_path`.
 fn files_to_remove(config_path: &Path, backend_url: Option<&str>) -> Vec<PathBuf> {
-    let dir = config_path.parent().unwrap_or(Path::new("."));
+    let dir = crate::config_writer::dir_of(config_path);
     let mut files: BTreeSet<PathBuf> = read_manifest(&manifest_path(config_path)).files;
     files.insert(absolute(config_path));
     for name in COMPANION_FILES {

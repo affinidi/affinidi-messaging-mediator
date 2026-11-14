@@ -2,6 +2,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod info_box;
 pub mod instructions;
+pub mod labels;
 pub mod progress;
 pub mod prompt;
 pub mod recovery;
@@ -15,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
+use crate::app::DidMethod;
 use crate::app::{InputMode, WizardApp};
 
 /// Draw a gradient border around a rect, with colors fading from purple to blue.
@@ -811,9 +813,9 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                          MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE\n\n\
                          Empty input is rejected. Pick something long and high-entropy: \
                          a passphrase-manager entry or a 6+ word diceware string.\n\n\
-                         The wizard exports this passphrase to its own process env so \
-                         it can write the initial entries; you must arrange for the \
-                         mediator to see the same value at boot.",
+                         The wizard uses this passphrase to write the initial \
+                         entries; you must arrange for the mediator to see the same \
+                         value at boot.",
                     ),
                     KeyStoragePhase::FilePassphraseConfirm => (
                         "Confirm file-backend passphrase",
@@ -978,8 +980,10 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
             // endpoints. Route both through the compact prompt widget.
             if app.current_step == crate::app::WizardStep::Did
                 && app.did_phase.is_none()
-                && (app.config.did_method == crate::consts::DID_WEBVH
-                    || app.config.did_method == crate::consts::DID_VTA)
+                && matches!(
+                    app.config.did_method,
+                    Some(DidMethod::Webvh | DidMethod::Vta)
+                )
             {
                 prompt::render_prompt(
                     frame,

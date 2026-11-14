@@ -128,7 +128,19 @@ const VERIFIER_PLAINTEXT: [u8; 32] = [0u8; 32];
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub(crate) fn open(url: BackendUrl) -> Result<DynSecretStore> {
+#[cfg(test)]
+fn open(url: BackendUrl) -> Result<DynSecretStore> {
+    open_with_passphrase(url, None)
+}
+
+/// Open the encrypted store with the passphrase given by the caller, or,
+/// for `None`, the one the environment ladder supplies. The
+/// passphrase is trimmed the same way an environment value is, so both
+/// derive the same key.
+pub(crate) fn open_with_passphrase(
+    url: BackendUrl,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<DynSecretStore> {
     let BackendUrl::File { path, encrypted } = url else {
         return Err(SecretStoreError::Other(
             "internal error: encrypted file backend received non-file URL".into(),
@@ -139,7 +151,10 @@ pub(crate) fn open(url: BackendUrl) -> Result<DynSecretStore> {
             "internal error: encrypted file backend received plaintext URL".into(),
         ));
     }
-    let passphrase = load_passphrase()?;
+    let passphrase = match passphrase {
+        Some(given) => normalise_passphrase(given, "the passphrase given")?,
+        None => load_passphrase()?,
+    };
     let store = EncryptedFileStore::open(PathBuf::from(path), passphrase)?;
     Ok(Arc::new(store))
 }
@@ -172,15 +187,7 @@ fn load_passphrase() -> Result<Zeroizing<String>> {
         return Ok(trimmed);
     }
     if let Ok(raw) = std::env::var(PASSPHRASE_ENV) {
-        let raw = Zeroizing::new(raw);
-        let trimmed = Zeroizing::new(raw.trim().to_string());
-        if trimmed.is_empty() {
-            return Err(SecretStoreError::BackendUnavailable {
-                backend: BACKEND_LABEL,
-                reason: format!("{PASSPHRASE_ENV} is set but empty"),
-            });
-        }
-        return Ok(trimmed);
+        return normalise_passphrase(Zeroizing::new(raw), PASSPHRASE_ENV);
     }
     Err(SecretStoreError::BackendUnavailable {
         backend: BACKEND_LABEL,
@@ -191,6 +198,19 @@ fn load_passphrase() -> Result<Zeroizing<String>> {
              file backend."
         ),
     })
+}
+
+/// Trim a passphrase and refuse an empty one. `source` names where it came
+/// from in the error.
+fn normalise_passphrase(raw: Zeroizing<String>, source: &str) -> Result<Zeroizing<String>> {
+    let trimmed = Zeroizing::new(raw.trim().to_string());
+    if trimmed.is_empty() {
+        return Err(SecretStoreError::BackendUnavailable {
+            backend: BACKEND_LABEL,
+            reason: format!("{source} is set but empty"),
+        });
+    }
+    Ok(trimmed)
 }
 
 /// Persistent on-disk representation. The version field gates
@@ -912,6 +932,34 @@ mod tests {
         unsafe {
             std::env::remove_var(PASSPHRASE_ENV);
         }
+    }
+
+    #[test]
+    fn a_given_passphrase_needs_no_environment_and_matches_it() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var(PASSPHRASE_ENV);
+            std::env::remove_var(PASSPHRASE_FILE_ENV);
+        }
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.json");
+        // Surrounding whitespace is trimmed, as it is from the environment.
+        let store = open_with_passphrase(url_for(&path), Some(pass(" given phrase \n"))).unwrap();
+        block_on(async { store.put("k", b"v").await.unwrap() });
+
+        // The environment ladder derives the same key from the same phrase.
+        unsafe {
+            std::env::set_var(PASSPHRASE_ENV, "given phrase");
+        }
+        let reopened = open(url_for(&path)).unwrap();
+        block_on(async {
+            assert_eq!(reopened.get("k").await.unwrap().as_deref(), Some(&b"v"[..]));
+        });
+        unsafe {
+            std::env::remove_var(PASSPHRASE_ENV);
+        }
+
+        assert!(open_with_passphrase(url_for(&path), Some(pass("  "))).is_err());
     }
 
     #[test]

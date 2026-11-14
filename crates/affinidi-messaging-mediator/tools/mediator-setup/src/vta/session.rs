@@ -152,7 +152,7 @@ impl VtaSession {
     /// Borrow the [`ContextProvisionBundle`] when the reply is
     /// [`VtaReply::ContextExport`]. Sibling to [`Self::as_full_provision`]
     /// — `main.rs::generate_and_write` walks both accessors when the
-    /// `did_method` is `DID_VTA` and picks whichever is present.
+    /// `did_method` is `DidMethod::Vta` and picks whichever is present.
     pub fn as_context_export(&self) -> Option<&ContextProvisionBundle> {
         match &self.reply {
             VtaReply::ContextExport(b) => Some(b),

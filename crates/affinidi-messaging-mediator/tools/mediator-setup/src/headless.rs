@@ -16,7 +16,8 @@
 
 use toml::{Table, Value};
 
-use crate::cli::{Args, DeploymentType, DidMethod, Protocol, SslMode};
+use crate::app;
+use crate::cli::{Args, Protocol};
 use crate::recipe::BuildRecipe;
 
 /// Which headless entry point is building the recipe.
@@ -84,15 +85,10 @@ pub fn build(args: &Args, mode: Mode) -> anyhow::Result<HeadlessRecipe> {
         )?;
     }
     if let Some(d) = args.deployment {
-        let v = match d {
-            DeploymentType::Local => "local",
-            DeploymentType::Server => "server",
-            DeploymentType::Container => "container",
-        };
         set(
             &mut table,
             "deployment.type",
-            v.into(),
+            app::Deployment::from(d).recipe_value().into(),
             Some("--deployment"),
             &mut notes,
         )?;
@@ -111,15 +107,10 @@ pub fn build(args: &Args, mode: Mode) -> anyhow::Result<HeadlessRecipe> {
         )?;
     }
     if let Some(m) = args.did_method {
-        let v = match m {
-            DidMethod::Peer => "did:peer",
-            DidMethod::Webvh => "did:webvh",
-            DidMethod::Vta => "vta",
-        };
         set(
             &mut table,
             "identity.did_method",
-            v.into(),
+            app::DidMethod::from(m).recipe_value().into(),
             Some("--did-method"),
             &mut notes,
         )?;
@@ -178,7 +169,7 @@ pub fn build(args: &Args, mode: Mode) -> anyhow::Result<HeadlessRecipe> {
         set(
             &mut table,
             "secrets.storage",
-            s.to_string().into(),
+            app::SecretScheme::from(s).prefix().into(),
             Some("--secret-storage"),
             &mut notes,
         )?;
@@ -193,14 +184,10 @@ pub fn build(args: &Args, mode: Mode) -> anyhow::Result<HeadlessRecipe> {
         )?;
     }
     if let Some(ssl) = args.ssl {
-        let v = match ssl {
-            SslMode::None => "none",
-            SslMode::SelfSigned => "self-signed",
-        };
         set(
             &mut table,
             "security.ssl",
-            v.into(),
+            app::SslMode::from(ssl).recipe_value().into(),
             Some("--ssl"),
             &mut notes,
         )?;
@@ -218,7 +205,7 @@ pub fn build(args: &Args, mode: Mode) -> anyhow::Result<HeadlessRecipe> {
         set(
             &mut table,
             "security.admin",
-            admin.recipe_value().into(),
+            app::AdminMode::from(admin).recipe_value().into(),
             Some("--admin"),
             &mut notes,
         )?;

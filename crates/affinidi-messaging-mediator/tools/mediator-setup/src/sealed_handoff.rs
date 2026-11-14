@@ -740,14 +740,7 @@ impl SealedHandoffState {
     }
 
     fn set_clipboard(&mut self, text: String, label: &str) {
-        match crate::clipboard::copy_to_clipboard(&text) {
-            Ok(method) => {
-                self.clipboard_status = Some(format!("Copied {label} via {}", method.label()));
-            }
-            Err(e) => {
-                self.clipboard_status = Some(format!("Clipboard unavailable: {e}"));
-            }
-        }
+        self.clipboard_status = Some(crate::clipboard::copy_with_status(&text, label));
     }
 
     /// Bundle id (16 raw bytes → base64url) used in display text. Stable

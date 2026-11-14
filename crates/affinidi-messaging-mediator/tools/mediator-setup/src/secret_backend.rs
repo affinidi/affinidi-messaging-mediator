@@ -13,12 +13,20 @@
 //! in.
 
 use affinidi_messaging_mediator_common::MediatorSecrets;
+use zeroize::Zeroizing;
 
 /// Open the unified secret backend at `backend_url` (no liveness probe).
 /// Prefer [`open_and_probe_secret_backend`] when you want to fail fast on a
 /// misconfigured/unreachable store before doing real work.
-pub fn open_secret_backend(backend_url: &str) -> anyhow::Result<MediatorSecrets> {
-    MediatorSecrets::from_url(backend_url)
+///
+/// `file_passphrase` is the `file://?encrypt=1` passphrase the TUI
+/// collected; `None` (every headless flow) reads it from
+/// `MEDIATOR_FILE_BACKEND_PASSPHRASE[_FILE]` as the mediator does.
+pub fn open_secret_backend(
+    backend_url: &str,
+    file_passphrase: Option<&Zeroizing<String>>,
+) -> anyhow::Result<MediatorSecrets> {
+    MediatorSecrets::from_url_with_passphrase(backend_url, file_passphrase.cloned())
         .map_err(|e| anyhow::anyhow!("open secret backend '{backend_url}': {e}"))
 }
 
@@ -79,9 +87,10 @@ fn effective_probe(backend_url: &str, requested: ProvisionProbe) -> ProvisionPro
 /// callers always pass `ReadWrite` and are unaffected.
 pub async fn open_and_probe_secret_backend(
     backend_url: &str,
+    file_passphrase: Option<&Zeroizing<String>>,
     probe: ProvisionProbe,
 ) -> anyhow::Result<MediatorSecrets> {
-    let store = open_secret_backend(backend_url)?;
+    let store = open_secret_backend(backend_url, file_passphrase)?;
     let probe = effective_probe(backend_url, probe);
     let result = match probe {
         ProvisionProbe::ReadWrite => store.probe().await,
@@ -190,7 +199,7 @@ pub async fn store_vta_session(
     // back to this cache on any failure, so first boot survives VTA
     // unavailability. TTL `0` = no expiry: the runtime overwrites it with a
     // fresh snapshot on every successful VTA contact.
-    let cached_keys = match crate::build_did_secrets_bundle(session) {
+    let cached_keys = match crate::provision::mint::build_did_secrets_bundle(session) {
         Some(bundle) => {
             let json = serde_json::to_value(&bundle)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize cached VTA bundle: {e}"))?;
@@ -229,7 +238,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let url = format!("file://{}", dir.path().join("secrets.json").display());
         assert!(
-            open_secret_backend(&url).is_ok(),
+            open_secret_backend(&url, None).is_ok(),
             "a file:// backend URL should open"
         );
     }

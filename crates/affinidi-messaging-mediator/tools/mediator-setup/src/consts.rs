@@ -1,18 +1,6 @@
-/// Deployment type display strings
-pub const DEPLOYMENT_LOCAL: &str = "Local development";
-pub const DEPLOYMENT_SERVER: &str = "Headless server";
-pub const DEPLOYMENT_CONTAINER: &str = "Container";
+use crate::app::Deployment;
 
-/// DID method display strings
-pub const DID_VTA: &str = "VTA managed";
-pub const DID_WEBVH: &str = "did:webvh";
-pub const DID_PEER: &str = "did:peer";
-/// The retired "Import existing DID" choice: no longer offered (the wizard
-/// cannot provision an imported mediator DID) and refused if it arrives.
-#[cfg(test)]
-pub const DID_IMPORT: &str = "Import existing";
-
-/// Secret storage schemes
+/// Secret storage scheme prefixes (see [`crate::app::SecretScheme`])
 pub const STORAGE_STRING: &str = "string://";
 pub const STORAGE_FILE: &str = "file://";
 pub const STORAGE_KEYRING: &str = "keyring://";
@@ -32,11 +20,6 @@ pub const STORAGE_BACKEND_FJALL: &str = "fjall";
 /// Default backend when neither the wizard nor the recipe specify one.
 /// Matches the historical out-of-the-box experience (Redis sidecar).
 pub const DEFAULT_STORAGE_BACKEND: &str = STORAGE_BACKEND_REDIS;
-
-/// SSL mode display strings
-pub const SSL_NONE: &str = "No SSL (TLS proxy)";
-pub const SSL_EXISTING: &str = "Existing certificates";
-pub const SSL_SELF_SIGNED: &str = "Self-signed";
 
 /// Network mode display strings. Drives the trio of `[security]`
 /// keys the wizard writes (`mediator_acl_mode`, `global_acl_default`,
@@ -59,10 +42,10 @@ pub const DEFAULT_NETWORK_MODE: &str = NETWORK_MODE_OPEN;
 /// template's restrictive posture: every cross-DID exchange needs an
 /// explicit ACL grant. Either can be overridden (TUI Security step, recipe
 /// `[security].network_mode`, `--set security.network_mode=…`).
-pub fn default_network_mode_for(deployment_type: &str) -> &'static str {
-    match deployment_type {
-        DEPLOYMENT_SERVER | DEPLOYMENT_CONTAINER => NETWORK_MODE_CLOSED,
-        _ => NETWORK_MODE_OPEN,
+pub fn default_network_mode_for(deployment: Option<Deployment>) -> &'static str {
+    match deployment {
+        Some(Deployment::Server | Deployment::Container) => NETWORK_MODE_CLOSED,
+        Some(Deployment::Local) | None => NETWORK_MODE_OPEN,
     }
 }
 
@@ -96,12 +79,6 @@ pub const CORS_MODE_LIST: &str = "list";
 /// default when `cors_allow_origin` is unset.
 pub const DEFAULT_CORS_MODE: &str = CORS_MODE_NONE;
 
-/// Admin DID mode display strings
-pub const ADMIN_GENERATE: &str = "Generate did:key";
-pub const ADMIN_PASTE: &str = "Paste existing";
-pub const ADMIN_VTA: &str = "Copy from VTA";
-pub const ADMIN_SKIP: &str = "Skip";
-
 /// VTA connectivity modes.
 ///
 /// `online` is the default — the mediator's setup wizard authenticates
@@ -133,18 +110,6 @@ pub const VTA_MODE_SEALED_EXPORT: &str = "sealed-export";
 /// the mint/export split used the single value `"sealed"`. New code
 /// should write [`VTA_MODE_SEALED_MINT`] directly.
 pub const VTA_MODE_SEALED_LEGACY: &str = "sealed";
-/// Legacy alias retained for call sites that still check
-/// `VTA_MODE_SEALED`. Value equals [`VTA_MODE_SEALED_LEGACY`]
-/// (the string `"sealed"`). Prefer [`VTA_MODE_SEALED_MINT`] in new
-/// code — this constant only appears where we compare against
-/// recipes that haven't been rewritten to the split values yet.
-pub const VTA_MODE_SEALED: &str = VTA_MODE_SEALED_LEGACY;
-/// Legacy alias for [`VTA_MODE_SEALED_EXPORT`]. Retained because
-/// earlier wizard commits shipped it as the field name on
-/// `WizardConfig.vta_mode`. New code should write
-/// [`VTA_MODE_SEALED_EXPORT`]; the recipe loader normalises both
-/// values onto the canonical form.
-pub const VTA_MODE_EXPORT: &str = VTA_MODE_SEALED_EXPORT;
 
 /// Default values
 pub const DEFAULT_CONFIG_PATH: &str = "conf/mediator.toml";

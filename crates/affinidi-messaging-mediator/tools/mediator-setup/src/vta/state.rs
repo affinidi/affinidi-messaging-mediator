@@ -396,14 +396,7 @@ impl VtaConnectState {
     /// arboard fallback) and renders the operator-facing status
     /// line on `clipboard_status`.
     fn copy_text_to_clipboard(&mut self, text: &str, label: &str) {
-        match crate::clipboard::copy_to_clipboard(text) {
-            Ok(method) => {
-                self.clipboard_status = Some(format!("Copied {label} via {}", method.label()));
-            }
-            Err(e) => {
-                self.clipboard_status = Some(format!("Clipboard unavailable: {e}"));
-            }
-        }
+        self.clipboard_status = Some(crate::clipboard::copy_with_status(text, label));
     }
 
     /// Apply a single event from the runner task. Drives phase transitions

@@ -3,15 +3,15 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
+use crate::app::{AdminMode, Deployment, DidMethod, SslMode, VtaMode};
 use crate::{
     app::WizardConfig,
     config_writer::build_backend_url,
     consts::{
-        ADMIN_GENERATE, ADMIN_PASTE, ADMIN_SKIP, ADMIN_VTA, CORS_MODE_ANY, CORS_MODE_LIST,
-        CORS_MODE_NONE, JWT_MODE_GENERATE, NETWORK_MODE_CLOSED, NETWORK_MODE_OPEN, SSL_EXISTING,
-        SSL_SELF_SIGNED, STORAGE_BACKEND_FJALL,
+        CORS_MODE_ANY, CORS_MODE_LIST, CORS_MODE_NONE, JWT_MODE_GENERATE, NETWORK_MODE_CLOSED,
+        NETWORK_MODE_OPEN, STORAGE_BACKEND_FJALL,
     },
-    ui::theme,
+    ui::{labels::label_of, theme},
     vta::{VtaReply, VtaSession},
 };
 
@@ -55,7 +55,7 @@ pub fn render_summary(
     add_field(
         &mut lines,
         "  Type",
-        &config.deployment_type,
+        label_of(config.deployment_type, Deployment::label),
         label_style,
         value_style,
     );
@@ -81,7 +81,11 @@ pub fn render_summary(
             Some(VtaReply::ContextExport(_)) => "offline export of pre-provisioned state",
             None => "pending", // Vta step not completed yet (shouldn't show on Summary in practice)
         };
-        format!("Enabled — {} ({})", intent_label, config.vta_mode)
+        format!(
+            "Enabled — {} ({})",
+            intent_label,
+            label_of(config.vta_mode, VtaMode::label)
+        )
     } else {
         "Disabled".into()
     };
@@ -108,7 +112,7 @@ pub fn render_summary(
     add_field(
         &mut lines,
         "  DID Method",
-        &config.did_method,
+        label_of(config.did_method, DidMethod::label),
         label_style,
         value_style,
     );
@@ -143,7 +147,7 @@ pub fn render_summary(
         );
     }
     // did:scid presentation — only surfaced when it differs from the default.
-    if config.did_method == crate::consts::DID_WEBVH {
+    if config.did_method == Some(DidMethod::Webvh) {
         if config.present_as_scid {
             add_field(
                 &mut lines,
@@ -188,19 +192,20 @@ pub fn render_summary(
     // SSL line: when the operator brought their own certs, surface the
     // paths so the review reflects the configured files rather than
     // just "Existing certificates".
-    let ssl_display = if config.ssl_mode == SSL_EXISTING
+    let ssl_label = label_of(config.ssl_mode, SslMode::label);
+    let ssl_display = if config.ssl_mode == Some(SslMode::Existing)
         && (!config.ssl_cert_path.is_empty() || !config.ssl_key_path.is_empty())
     {
         format!(
             "{} ({} / {})",
-            config.ssl_mode,
+            ssl_label,
             empty_or(&config.ssl_cert_path, "—"),
             empty_or(&config.ssl_key_path, "—"),
         )
-    } else if config.ssl_mode == SSL_SELF_SIGNED {
-        format!("{} (generated into conf/keys/)", config.ssl_mode)
+    } else if config.ssl_mode == Some(SslMode::SelfSigned) {
+        format!("{ssl_label} (generated into conf/keys/)")
     } else {
-        config.ssl_mode.clone()
+        ssl_label.to_string()
     };
     add_field(
         &mut lines,
@@ -366,18 +371,17 @@ fn network_mode_display(mode: &str) -> String {
 /// What the admin choice will actually produce (#173): the generated key is
 /// separate from a VTA credential; reusing the VTA credential is said so.
 fn admin_display(config: &WizardConfig, vta_session: Option<&VtaSession>) -> String {
-    match config.admin_did_mode.as_str() {
-        ADMIN_GENERATE if config.use_vta => {
+    match config.admin_did_mode {
+        Some(AdminMode::Generate) if config.use_vta => {
             "Generate did:key (separate from the VTA credential)".into()
         }
-        ADMIN_GENERATE => "Generate did:key".into(),
-        ADMIN_VTA => match vta_session {
+        Some(AdminMode::Generate) => "Generate did:key".into(),
+        Some(AdminMode::Vta) => match vta_session {
             Some(s) => format!("VTA-issued credential {}", s.admin_did()),
             None => "VTA-issued credential".into(),
         },
-        ADMIN_PASTE => format!("Existing DID {}", config.admin_did),
-        ADMIN_SKIP | "" => "Skip (none)".into(),
-        other => other.to_string(),
+        Some(AdminMode::Paste) => format!("Existing DID {}", config.admin_did),
+        Some(AdminMode::Skip) | None => "Skip (none)".into(),
     }
 }
 
@@ -413,17 +417,16 @@ fn cors_policy_display(config: &WizardConfig) -> String {
 ///   - Other VTA paths → No (VTA / different webvh server hosts)
 ///   - did:peer / did:key → field is irrelevant — return None
 fn self_host_did_decision(config: &WizardConfig) -> Option<&'static str> {
-    use crate::consts::{DID_PEER, DID_VTA, DID_WEBVH};
-    if config.did_method == DID_PEER {
+    if config.did_method == Some(DidMethod::Peer) {
         return None;
     }
-    if config.did_method == DID_WEBVH {
+    if config.did_method == Some(DidMethod::Webvh) {
         // The self-host generator runs whenever did:webvh is picked
         // (no explicit "self-host vs hosted" sub-step), so the wizard
         // always activates the line. Show that intent on the review.
         return Some("Yes — mediator serves /.well-known/did.jsonl");
     }
-    if config.did_method == DID_VTA {
+    if config.did_method == Some(DidMethod::Vta) {
         // Without the minted DID we can't pre-compute the host match —
         // the actual decision lands in `config_writer::generate_toml`
         // after `mint_artefacts`. Communicate the heuristic instead.
@@ -444,18 +447,18 @@ fn empty_or<'a>(value: &'a str, placeholder: &'a str) -> &'a str {
 mod tests {
     use super::*;
     use crate::consts::{
-        ADMIN_GENERATE, DEFAULT_FJALL_DATA_DIR, DEFAULT_LISTEN_ADDR, DEFAULT_REDIS_URL, DID_PEER,
-        DID_VTA, DID_WEBVH, JWT_MODE_PROVIDE, SSL_NONE, STORAGE_BACKEND_REDIS,
+        DEFAULT_FJALL_DATA_DIR, DEFAULT_LISTEN_ADDR, DEFAULT_REDIS_URL, JWT_MODE_PROVIDE,
+        STORAGE_BACKEND_REDIS,
     };
 
     fn base_config() -> WizardConfig {
         WizardConfig {
-            deployment_type: "Local development".into(),
-            did_method: DID_PEER.into(),
-            ssl_mode: SSL_NONE.into(),
+            deployment_type: Some(Deployment::Local),
+            did_method: Some(DidMethod::Peer),
+            ssl_mode: Some(SslMode::None),
             network_mode: NETWORK_MODE_OPEN.into(),
             jwt_mode: JWT_MODE_GENERATE.into(),
-            admin_did_mode: ADMIN_GENERATE.into(),
+            admin_did_mode: Some(AdminMode::Generate),
             listen_address: DEFAULT_LISTEN_ADDR.into(),
             api_prefix: "/mediator/v1/".into(),
             storage_backend: STORAGE_BACKEND_REDIS.into(),
@@ -494,7 +497,7 @@ mod tests {
     fn self_host_did_decision_did_peer_is_none() {
         // did:peer needs no /.well-known route — the row is hidden.
         let cfg = WizardConfig {
-            did_method: DID_PEER.into(),
+            did_method: Some(DidMethod::Peer),
             ..base_config()
         };
         assert!(self_host_did_decision(&cfg).is_none());
@@ -503,7 +506,7 @@ mod tests {
     #[test]
     fn self_host_did_decision_did_webvh_is_yes() {
         let cfg = WizardConfig {
-            did_method: DID_WEBVH.into(),
+            did_method: Some(DidMethod::Webvh),
             ..base_config()
         };
         assert!(matches!(self_host_did_decision(&cfg), Some(s) if s.starts_with("Yes")));
@@ -514,7 +517,7 @@ mod tests {
         // Operator can't see the actual decision until after the VTA
         // mints the DID. The Summary should explain why, not lie.
         let cfg = WizardConfig {
-            did_method: DID_VTA.into(),
+            did_method: Some(DidMethod::Vta),
             ..base_config()
         };
         let s = self_host_did_decision(&cfg).expect("VTA path should produce a row");

@@ -78,7 +78,7 @@ CMD ["mediator", "-c", "{CONTAINER_CONFIG_DIR}/{config_name}"]
 
     // Build context: the workspace root, relative to the compose file.
     let output_abs = absolute(output_dir);
-    let workspace = crate::find_workspace_root();
+    let workspace = crate::install::find_workspace_root();
     let (context, dockerfile_in_context) = match &workspace {
         Some(root) => (
             relative_path(&output_abs, root),
@@ -277,6 +277,7 @@ fn listen_port(listen_address: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{Deployment, SecretScheme};
     use std::fs;
 
     #[test]
@@ -352,7 +353,7 @@ mod tests {
         // binary still has its backend.
         let dir = tempfile::tempdir().unwrap();
         let cfg = WizardConfig {
-            secret_storage: "aws_secrets://".into(),
+            secret_storage: Some(SecretScheme::Aws),
             ..Default::default()
         };
         generate_dockerfile(&cfg, dir.path()).unwrap();
@@ -406,8 +407,8 @@ mod tests {
         let outside = dir.path().join("vault").join("keys.json");
         let cfg = WizardConfig {
             config_path: conf.join("prod.toml").to_string_lossy().into_owned(),
-            deployment_type: crate::consts::DEPLOYMENT_CONTAINER.into(),
-            secret_storage: crate::consts::STORAGE_FILE.into(),
+            deployment_type: Some(Deployment::Container),
+            secret_storage: Some(SecretScheme::File),
             secret_file_path: outside.to_string_lossy().into_owned(),
             ..Default::default()
         };
