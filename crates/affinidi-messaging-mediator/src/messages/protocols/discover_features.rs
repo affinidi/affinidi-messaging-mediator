@@ -22,25 +22,9 @@ pub(crate) fn process(
         session_id = session.session_id.as_str()
     )
     .entered();
-    let now = state.clock.unix_secs();
 
-    if let Some(expires) = msg.expires_time
-        && expires <= now
-    {
-        return Err(MediatorError::problem_with_log(
-            error_codes::MESSAGE_EXPIRED,
-            session.session_id.to_string(),
-            Some(msg.id.to_string()),
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "message.expired",
-            "Message has expired: {1}",
-            vec![expires.to_string()],
-            StatusCode::BAD_REQUEST,
-            "Message has expired",
-        ));
-    }
-
+    // Expiry is checked once for every message to the mediator, before
+    // dispatch (`MessageHandler::process`).
     let to = super::addressed_to_mediator(
         msg,
         &state.config.mediator_did,

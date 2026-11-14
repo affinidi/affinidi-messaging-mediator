@@ -69,6 +69,32 @@ fn parse_delay_milli(value: Option<&serde_json::Value>, limit_ms: i64) -> Result
     }
 }
 
+/// A store failure while handling forward `msg`: 503, so the sender retries.
+fn storage_error(session: &Session, msg: &Message, e: &impl std::fmt::Display) -> MediatorError {
+    storage_error_with_log(session, msg, e, format!("Database transaction error: {e}"))
+}
+
+/// [`storage_error`] with a log line naming what failed.
+fn storage_error_with_log(
+    session: &Session,
+    msg: &Message,
+    e: &impl std::fmt::Display,
+    log: String,
+) -> MediatorError {
+    MediatorError::problem_with_log(
+        error_codes::DB_OPERATION_ERROR,
+        &session.session_id,
+        Some(msg.id.to_string()),
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "me.res.storage.error",
+        "Database transaction error: {1}",
+        vec![e.to_string()],
+        StatusCode::SERVICE_UNAVAILABLE,
+        log,
+    )
+}
+
 /// An ephemeral forward whose recipient has no live stream: not delivered,
 /// and not queued either.
 fn recipient_not_live(session: &Session, msg_id: &str) -> MediatorError {
@@ -444,16 +470,10 @@ async fn deliver_forward(
             .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
             .await
         {
-            return Err(MediatorError::problem_with_log(
-                error_codes::DB_OPERATION_ERROR,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "me.res.storage.error",
-                "Database transaction error: {1}",
-                vec![e.to_string()],
-                StatusCode::SERVICE_UNAVAILABLE,
+            return Err(storage_error_with_log(
+                session,
+                msg,
+                &e,
                 format!("Couldn't publish an ephemeral message to its live stream: {e}"),
             ));
         }
@@ -740,18 +760,7 @@ async fn check_remote_next_hop(
             if e.is_storage_cap() {
                 return e;
             }
-            MediatorError::problem_with_log(
-                error_codes::DB_OPERATION_ERROR,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "me.res.storage.error",
-                "Database transaction error: {1}",
-                vec![e.to_string()],
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Database transaction error: {e}"),
-            )
+            storage_error(session, msg, &e)
         })?;
     let has_list = account.is_some_and(|a| a.access_list_count > 0);
     if has_list
@@ -789,18 +798,7 @@ async fn resolve_next_account(
             Some(msg.id.to_string()),
             "next hop has no account on this mediator",
         )),
-        Err(e) => Err(MediatorError::problem_with_log(
-            error_codes::DB_OPERATION_ERROR,
-            &session.session_id,
-            Some(msg.id.to_string()),
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.error",
-            "Database transaction error: {1}",
-            vec![e.to_string()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Database transaction error: {e}"),
-        )),
+        Err(e) => Err(storage_error(session, msg, &e)),
     }
 }
 
@@ -860,18 +858,7 @@ async fn resolve_forward_sender(
                 false,
             ),
             Err(e) => {
-                return Err(MediatorError::problem_with_log(
-                    error_codes::DB_OPERATION_ERROR,
-                    &session.session_id,
-                    Some(msg.id.to_string()),
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.error",
-                    "Database transaction error: {1}",
-                    vec![e.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Database transaction error: {e}"),
-                ));
+                return Err(storage_error(session, msg, &e));
             }
         };
         let from_acls = MediatorACLSet::from_u64(from_account.acls);
