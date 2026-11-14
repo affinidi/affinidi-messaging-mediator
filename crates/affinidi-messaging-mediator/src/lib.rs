@@ -141,6 +141,7 @@ pub mod tasks;
 #[cfg(feature = "tsp")]
 #[doc(hidden)]
 pub mod tsp_identity;
+#[doc(hidden)]
 pub mod wake;
 
 /// Install `jsonwebtoken`'s `aws_lc_rs` crypto provider as the process-wide
