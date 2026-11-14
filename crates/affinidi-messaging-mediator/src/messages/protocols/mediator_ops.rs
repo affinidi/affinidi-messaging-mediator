@@ -1273,9 +1273,50 @@ pub(crate) async fn consume_message_delete(
         .map_err(serialize_err)
 }
 
+/// The latest arrival (Unix ms, inclusive) a purge selection taken at
+/// `selected_at_ms` may include: the selection instant itself, narrowed by
+/// `olderThanSeconds` (measured back from it) and by `storedBefore`. The
+/// store stamps arrivals in milliseconds, so `storedBefore` is floored to
+/// one: a message stamped in that millisecond is "at" the instant. An
+/// instant before the epoch selects nothing.
+fn purge_bound_ms(
+    selected_at_ms: u64,
+    older_than_seconds: Option<u64>,
+    stored_before: Option<DateTime<Utc>>,
+) -> u64 {
+    let mut bound = selected_at_ms;
+    if let Some(secs) = older_than_seconds {
+        bound = bound.min(selected_at_ms.saturating_sub(secs.saturating_mul(1_000)));
+    }
+    if let Some(at) = stored_before {
+        bound = bound.min(u64::try_from(at.timestamp_millis()).unwrap_or(0));
+    }
+    bound
+}
+
+/// `storedBefore` for an audit entry.
+fn stored_before_label(stored_before: Option<DateTime<Utc>>) -> String {
+    stored_before.map_or_else(
+        || "any".to_string(),
+        |at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+}
+
 /// Handle `messaging/queue/purge`: remove every message in one account queue,
-/// optionally only those exchanged with one counterparty or older than an
-/// age — or, with `dryRun`, report what would go and remove nothing.
+/// optionally only those exchanged with one counterparty, older than an age
+/// or stored at or before an instant (`storedBefore`) — or, with `dryRun`,
+/// report what would go and remove nothing.
+///
+/// A narrowed purge or a dry run takes its selection at one instant: nothing
+/// stored after it is counted or removed. A confirming purge that sends
+/// `storedBefore` no later than its dry run's instant can therefore never
+/// remove a message the operator was not shown.
+///
+/// The response does not carry that instant as `selectedAt` yet: every
+/// published `affinidi-messaging-sdk` (0.47.0 and older) parses this
+/// response with unknown members denied, so adding the member would make
+/// every existing client's purge fail. It is added once an SDK that knows it
+/// has shipped (#122).
 ///
 /// Self (with `local`) or admin; a privileged account's queue needs a
 /// rootAdmin. Undelivered messages are gone, not returned to their senders.
@@ -1325,6 +1366,7 @@ pub(crate) async fn consume_queue_purge(
     let dry_run = payload.dry_run.unwrap_or(false);
     let peer = payload.peer.as_ref().map(|p| p.to_string());
     let older_than = payload.older_than_seconds;
+    let stored_before = payload.stored_before;
 
     // Purging your own queue is your own removal (collected / withdrawn);
     // purging someone else's is the mediator's (discarded), so its senders
@@ -1339,15 +1381,14 @@ pub(crate) async fn consume_queue_purge(
         }
     };
 
-    let report = if peer.is_some() || older_than.is_some() || dry_run {
+    // Every narrowed purge and every dry run is bounded by the instant its
+    // selection is taken: a message stored while the walk runs is neither
+    // counted nor removed.
+    let report = if peer.is_some() || older_than.is_some() || stored_before.is_some() || dry_run {
+        let selected_at_ms = u64::try_from(state.clock.unix_millis()).unwrap_or(u64::MAX);
         let filter = PurgeFilter {
             peer: peer.clone(),
-            arrived_before_ms: older_than.map(|secs| {
-                state
-                    .clock
-                    .unix_millis()
-                    .saturating_sub(u128::from(secs) * 1_000) as u64
-            }),
+            arrived_before_ms: Some(purge_bound_ms(selected_at_ms, older_than, stored_before)),
             dry_run,
         };
         state
@@ -1376,10 +1417,11 @@ pub(crate) async fn consume_queue_purge(
                     AuditAction::QueuePurge,
                     format!(
                         "outcome partial: purge of the {} queue failed and may have removed some \
-                         messages (peer: {}, older than: {}s): {e}",
+                         messages (peer: {}, older than: {}s, stored before: {}): {e}",
                         if matches!(folder, Folder::Outbox) { "send" } else { "receive" },
                         peer.as_deref().unwrap_or("any"),
                         older_than.map_or_else(|| "any".to_string(), |s| s.to_string()),
+                        stored_before_label(stored_before),
                     ),
                 )
                 .await;
@@ -1406,11 +1448,12 @@ pub(crate) async fn consume_queue_purge(
             &target,
             AuditAction::QueuePurge,
             format!(
-                "purged {} message(s), {} bytes from the {queue_name} queue (peer: {}, older than: {}s){}",
+                "purged {} message(s), {} bytes from the {queue_name} queue (peer: {}, older than: {}s, stored before: {}){}",
                 report.count,
                 report.bytes,
                 peer.as_deref().unwrap_or("any"),
                 older_than.map_or_else(|| "any".to_string(), |s| s.to_string()),
+                stored_before_label(stored_before),
                 if report.failed > 0 || report.truncated {
                     format!("; {} failed, truncated: {}", report.failed, report.truncated)
                 } else {
@@ -1858,6 +1901,44 @@ mod tests {
     use super::*;
     use crate::tasks::queue_survey::QueueSurvey;
     use queue::list::v0_1::PayloadSort;
+
+    #[test]
+    fn a_purge_selection_is_bounded_by_its_instant_age_and_stored_before() {
+        let at = 1_700_000_000_500u64;
+        let instant = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
+        // No narrowing: the selection instant itself.
+        assert_eq!(purge_bound_ms(at, None, None), at);
+        // An age is measured back from the instant.
+        assert_eq!(purge_bound_ms(at, Some(10), None), at - 10_000);
+        // storedBefore earlier than the instant narrows; later does not widen.
+        assert_eq!(
+            purge_bound_ms(at, None, Some(instant(at as i64 - 7))),
+            at - 7
+        );
+        assert_eq!(
+            purge_bound_ms(at, None, Some(instant(at as i64 + 60_000))),
+            at
+        );
+        // Combined: the tighter of the two.
+        assert_eq!(
+            purge_bound_ms(at, Some(1), Some(instant(at as i64 - 5_000))),
+            at - 5_000
+        );
+        assert_eq!(
+            purge_bound_ms(at, Some(10), Some(instant(at as i64 - 5_000))),
+            at - 10_000
+        );
+        // Sub-millisecond precision floors to the store's millisecond.
+        let fine = DateTime::parse_from_rfc3339("2023-11-14T22:13:20.123999Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            purge_bound_ms(u64::MAX, None, Some(fine)),
+            fine.timestamp_millis() as u64
+        );
+        // Before the epoch: nothing.
+        assert_eq!(purge_bound_ms(at, None, Some(instant(-1))), 0);
+    }
 
     fn account(did: &str, recv: u32, recv_limit: i32, oldest: Option<u64>) -> AccountQueues {
         AccountQueues {
