@@ -1077,6 +1077,26 @@ relay_trusted_mediators = ""
 ### Enable the message expiry cleanup processor
 enabled = "true"
 
+[processors.wake]
+### Ringing an account's device when a sender with mail queued for it asks
+### (messaging/wake/request). The account gives its own push gateway handle with
+### messaging/wake/set; the mediator rings that gateway as itself, and only for
+### fresh, undelivered mail the requester queued. Every key is optional.
+###
+### Env: PROCESSOR_WAKE_ENABLED
+### "false" never rings, and answers every messaging/wake/set wakeCapable: false.
+enabled = "true"
+### Env: PROCESSOR_WAKE_PAIR_PER_MINUTE / PROCESSOR_WAKE_PAIR_PER_DAY
+### Rings one requester may cause for one addressee, per minute and per day.
+pair_per_minute = "1"
+pair_per_day = "10"
+### Env: PROCESSOR_WAKE_ADDRESSEE_COALESCE_SECONDS
+### Further rings for one addressee within this many seconds coalesce into the first.
+addressee_coalesce_seconds = "15"
+### Env: PROCESSOR_WAKE_ADDRESSEE_PER_HOUR
+### Rings one addressee may receive per hour, whoever asks.
+addressee_per_hour = "30"
+
 [processors.session_expiry_cleanup]
 ### Env: PROCESSOR_SESSION_EXPIRY_CLEANUP_ENABLED
 ### Reclaim expired session records on backends without native TTL

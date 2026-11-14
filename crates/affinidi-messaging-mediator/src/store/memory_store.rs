@@ -298,6 +298,8 @@ struct MemoryState {
     trust_task_claims: HashMap<String, (String, u64)>,
     /// did:scid account hash → serialised source record (VTI-KEY-162).
     scid_sources: HashMap<String, String>,
+    /// account hash → serialised wake record (`messaging/wake/set`).
+    wake_handles: HashMap<String, String>,
 
     // ─── Forward queue ──────────────────────────────────────────────
     forward_queue: BTreeMap<StreamId, ForwardQueueEntry>,
@@ -1530,6 +1532,7 @@ impl AccountStore for MemoryStore {
         state.activity.remove(did_hash);
         state.stats.remove(did_hash);
         state.scid_sources.remove(did_hash);
+        state.wake_handles.remove(did_hash);
         state.access_lists.remove(did_hash);
         state.admins.remove(did_hash);
         state.known_dids.retain(|d| d != did_hash);
@@ -2616,6 +2619,29 @@ impl AuxiliaryStore for MemoryStore {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        match record {
+            Some(record) => {
+                state
+                    .wake_handles
+                    .insert(did_hash.to_string(), record.to_string());
+            }
+            None => {
+                state.wake_handles.remove(did_hash);
+            }
+        }
+        Ok(())
+    }
+
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
+        Ok(self.state.lock().await.wake_handles.get(did_hash).cloned())
     }
 
     async fn oob_discovery_store(

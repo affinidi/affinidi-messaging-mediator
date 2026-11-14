@@ -90,6 +90,7 @@ mod tsp_session_binding;
 mod tsp_transport_adapter;
 mod tsp_websocket;
 mod unprocessable_live_frames;
+mod wake;
 mod websocket_expired_token;
 mod websocket_limits;
 mod websocket_liveness;

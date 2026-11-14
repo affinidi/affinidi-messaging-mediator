@@ -189,6 +189,43 @@ pub(crate) async fn accept(
     }
 }
 
+/// [`accept`] for a task whose acceptance does not bend to
+/// [`TrustTaskVerification::Warn`]: every failure refuses it.
+///
+/// For `messaging/wake/request`, which is accepted from senders that hold no
+/// account here: its verified proof is what names the requester the mediator
+/// rate-limits and compares with the stored mail's sender, so a request whose
+/// proof did not verify has no requester to act for.
+pub(crate) async fn accept_strict(
+    doc: &TrustTask<Value>,
+    raw: &Value,
+    policy: SpecPolicy,
+    sender_did: &str,
+    now: DateTime<Utc>,
+    state: &SharedData,
+    session: &Session,
+) -> Result<(), MediatorError> {
+    let verifier = proof_verifier(state.did_resolver.clone());
+    let outcome = match check(doc, raw, policy, sender_did, now, &verifier).await {
+        Ok(()) => claim(doc, policy, sender_did, now, state).await,
+        Err(rejection) => Err(rejection),
+    };
+    outcome.map_err(|rejection| {
+        metrics::counter!(
+            "trust_task_acceptance_failures_total",
+            "reason" => rejection.metric_reason(),
+            "mode" => "enforce",
+        )
+        .increment(1);
+        tt_problem(
+            session,
+            rejection.code(),
+            rejection.detail(),
+            rejection.status(),
+        )
+    })
+}
+
 /// The checks themselves, in §7.2 order. First failure wins.
 ///
 /// `doc` is the parsed document; `raw` is the JSON exactly as received, which

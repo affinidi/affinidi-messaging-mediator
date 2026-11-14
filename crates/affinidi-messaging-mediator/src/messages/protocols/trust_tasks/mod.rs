@@ -323,7 +323,9 @@ async fn consume_task(
     // The §7.2 acceptance checks (freshness, issuer binding, proof, spec
     // policy) for every management task. `ping` keeps its own pipeline: it is
     // not consequential, and it answers an identity mismatch with silence.
-    if task != ServedTask::Ping {
+    // A wake request runs its own acceptance, which no verification mode
+    // relaxes (`wake::request::handle`).
+    if !matches!(task, ServedTask::Ping | ServedTask::WakeRequest) {
         trust_task_verify::accept(
             &doc,
             raw,
@@ -584,6 +586,20 @@ async fn consume_task(
         ServedTask::MuxAdminList | ServedTask::MuxAdminRevoke | ServedTask::MuxAdminRevokeAll => {
             consume_mux_admin(task, &doc, state, session, &mediator_did, now).await?
         }
+        ServedTask::WakeSet => {
+            crate::wake::set::consume_wake_set(
+                downcast(&doc, session)?,
+                state,
+                session,
+                &mediator_did,
+                now,
+            )
+            .await?
+        }
+        ServedTask::WakeRequest => {
+            crate::wake::request::handle(state, session, doc.clone(), raw, &sender_did, false)
+                .await?
+        }
     };
 
     // Answer in the version that was asked for, before signing.
@@ -678,6 +694,11 @@ served_tasks! {
     MuxAdminList => crate::task_specs::messaging::mux::admin_list::v0_1::Payload,
     MuxAdminRevoke => crate::task_specs::messaging::mux::admin_revoke::v0_1::Payload,
     MuxAdminRevokeAll => crate::task_specs::messaging::mux::admin_revoke_all::v0_1::Payload,
+    WakeSet => crate::task_specs::messaging::wake::set::v0_1::Payload,
+    // Over DIDComm a wake request is taken before the session checks, from
+    // any authenticated sender (`wake::didcomm`); this arm serves an
+    // account's request over TSP.
+    WakeRequest => crate::task_specs::messaging::wake::request::v0_1::Payload,
 }
 
 impl ServedTask {
@@ -840,7 +861,7 @@ pub(crate) fn validate_tt_basic<P>(
 /// this conversion — the builder starts each required member as
 /// `Err("no value supplied for …")`. Every call below therefore sets its
 /// required members explicitly and lets only optional ones default.
-fn build<T, B>(builder: B) -> Result<T, MediatorError>
+pub(crate) fn build<T, B>(builder: B) -> Result<T, MediatorError>
 where
     B: TryInto<T>,
     B::Error: std::fmt::Display,

@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::defaults::{cleanup, forwarding as fwd};
+use crate::defaults::{cleanup, forwarding as fwd, wake};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessorsConfigRaw {
@@ -18,6 +18,63 @@ pub struct ProcessorsConfigRaw {
     // written before the session sweeper existed still parse.
     #[serde(default)]
     pub session_expiry_cleanup: SessionExpiryCleanupConfigRaw,
+    /// `[processors.wake]`: ringing an account's device on a sender's
+    /// `messaging/wake/request`. Absent: enabled, with the specification's
+    /// recommended limits.
+    #[serde(default)]
+    pub wake: WakeConfigRaw,
+}
+
+/// `[processors.wake]` (raw, all-strings TOML form). Every key is optional;
+/// the defaults are the limits `messaging/wake/request/0.1` Consumer rule 7
+/// recommends.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WakeConfigRaw {
+    /// Whether this mediator rings devices at all. `"false"` answers every
+    /// `messaging/wake/set` with `wakeCapable: false` and never rings.
+    #[serde(default = "default_wake_enabled")]
+    pub enabled: String,
+    /// Rings one requester may cause for one addressee per minute.
+    #[serde(default = "default_wake_pair_per_minute")]
+    pub pair_per_minute: String,
+    /// Rings one requester may cause for one addressee per day.
+    #[serde(default = "default_wake_pair_per_day")]
+    pub pair_per_day: String,
+    /// Seconds within which further rings for one addressee are coalesced
+    /// into the first.
+    #[serde(default = "default_wake_addressee_coalesce_seconds")]
+    pub addressee_coalesce_seconds: String,
+    /// Rings one addressee may receive per hour, whoever asks.
+    #[serde(default = "default_wake_addressee_per_hour")]
+    pub addressee_per_hour: String,
+}
+
+impl Default for WakeConfigRaw {
+    fn default() -> Self {
+        WakeConfigRaw {
+            enabled: default_wake_enabled(),
+            pair_per_minute: default_wake_pair_per_minute(),
+            pair_per_day: default_wake_pair_per_day(),
+            addressee_coalesce_seconds: default_wake_addressee_coalesce_seconds(),
+            addressee_per_hour: default_wake_addressee_per_hour(),
+        }
+    }
+}
+
+fn default_wake_enabled() -> String {
+    wake::ENABLED.to_string()
+}
+fn default_wake_pair_per_minute() -> String {
+    wake::PAIR_PER_MINUTE.to_string()
+}
+fn default_wake_pair_per_day() -> String {
+    wake::PAIR_PER_DAY.to_string()
+}
+fn default_wake_addressee_coalesce_seconds() -> String {
+    wake::ADDRESSEE_COALESCE_SECONDS.to_string()
+}
+fn default_wake_addressee_per_hour() -> String {
+    wake::ADDRESSEE_PER_HOUR.to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

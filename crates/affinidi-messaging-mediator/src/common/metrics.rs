@@ -274,6 +274,25 @@ pub mod names {
     /// sends the message again over REST.
     pub const RELAY_FRAMES_THROTTLED_TOTAL: &str = "relay_frames_throttled_total";
 
+    // ── Wake ────────────────────────────────────────────────────────────────
+
+    /// counter: `messaging/wake/request` outcomes (label `outcome`): `rung`;
+    /// `armed` (its messages are not stored yet), then `arm_expired` or a
+    /// later outcome; `no_account`, `no_handle`, `gateway_refused` (the
+    /// gateway answered `notAllowed`); `not_queued`, `delivered`, `stale`,
+    /// `foreign_sender`, `blocked`, `online`, `already_rung`; `rate_limited`,
+    /// `coalesced`, `addressee_limited`, `requester_rate_limited`;
+    /// `disabled`, `arm_full`, `ring_failed`, `error`. Aggregate only, by
+    /// design: the requester is answered `{}` whatever happened, and this is
+    /// the only place the outcome shows.
+    pub const WAKE_REQUESTS_TOTAL: &str = "wake_requests_total";
+    /// counter: `push/wake` rings sent to gateways and their answers (label
+    /// `outcome`): `sent`, `send_failed`, then `answered`,
+    /// `token_unregistered` (the handle was dropped) or `not_allowed` (this
+    /// mediator is not on the handle's allowlist; not rung again until the
+    /// account sets a handle).
+    pub const WAKE_RINGS_TOTAL: &str = "wake_rings_total";
+
     // ── Queue depth ─────────────────────────────────────────────────────────
     //
     // Sampled once per statistics cycle by `tasks::queue_survey`. Until these

@@ -75,6 +75,8 @@ async fn _store_message(
     }
     state.activity.received(state, to_did_hash).await;
     crate::account_stats::count_stored(state, from_did_hash, to_did_hash, data).await;
+    // A wake request that arrived before this message may be waiting for it.
+    crate::wake::request::on_stored(state, to_did_hash, &msg_id);
     Ok(msg_id)
 }
 

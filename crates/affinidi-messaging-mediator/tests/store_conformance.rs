@@ -2222,6 +2222,51 @@ async fn check_scid_sources(store: Arc<dyn MediatorStore>) {
     );
 }
 
+/// Wake records (`messaging/wake/set`): one per account, replaced whole by a
+/// later set, removed by a clear, and removed with the account (Consumer
+/// rule 7).
+async fn check_wake_handles(store: Arc<dyn MediatorStore>) {
+    assert_eq!(store.wake_handle_get("wake-a").await.unwrap(), None);
+    // Clearing what was never set is not an error.
+    store.wake_handle_set("wake-a", None).await.unwrap();
+
+    store
+        .wake_handle_set("wake-a", Some(r#"{"h":1}"#))
+        .await
+        .unwrap();
+    store
+        .wake_handle_set("wake-b", Some(r#"{"h":"b"}"#))
+        .await
+        .unwrap();
+    store
+        .wake_handle_set("wake-a", Some(r#"{"h":2}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.wake_handle_get("wake-a").await.unwrap().as_deref(),
+        Some(r#"{"h":2}"#)
+    );
+
+    store.wake_handle_set("wake-a", None).await.unwrap();
+    assert_eq!(store.wake_handle_get("wake-a").await.unwrap(), None);
+
+    store
+        .account_add("wake-b", &allow_all(), None)
+        .await
+        .expect("account_add");
+    store
+        .wake_handle_set("wake-b", Some(r#"{"h":"b2"}"#))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .account_remove(&admin_session("admin_hash"), "wake-b")
+            .await
+            .expect("account_remove")
+    );
+    assert_eq!(store.wake_handle_get("wake-b").await.unwrap(), None);
+}
+
 /// Admin set-up (twice: it runs on every start) → demote → promote → bulk
 /// promote and strip → removing an admin account. Demotion must take effect.
 async fn check_admin_roles(store: Arc<dyn MediatorStore>) {
@@ -4885,6 +4930,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_receipts_are_per_recipient(store.clone()).await;
     check_non_ids_name_nothing(store.clone()).await;
     check_scid_sources(store.clone()).await;
+    check_wake_handles(store.clone()).await;
     check_expiry_sweep_reports_each_message(store.clone()).await;
     check_config_overrides(store.clone()).await;
     check_outbox_receipts(store.clone()).await;
@@ -4997,6 +5043,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn scid_sources() {
                 check_scid_sources(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn wake_handles() {
+                check_wake_handles(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn expiry_sweep_reports_each_message() {

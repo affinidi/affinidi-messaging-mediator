@@ -68,6 +68,10 @@ use tracing::{debug, warn};
 /// The key holding the mediator's `config/patch` overrides, a JSON object.
 const CONFIG_OVERRIDES_KEY: &str = "MEDIATOR_CONFIG_OVERRIDES";
 
+/// The hash holding each account's wake record (`messaging/wake/set`), keyed
+/// by DID hash. One key, so it is slot-safe in cluster mode.
+const WAKE_HANDLES_KEY: &str = "WAKE_HANDLES";
+
 /// Rebuild [`AccountStats`] from the stored hash. A missing field is a
 /// counter never touched, which is zero.
 fn stats_from_hash(fields: HashMap<String, i64>) -> AccountStats {
@@ -1605,6 +1609,14 @@ impl AccountStore for RedisStore {
             {
                 warn!("account {did_hash} removed, but not its did:scid source record: {e}");
             }
+            if let Err(e) = redis::cmd("HDEL")
+                .arg(WAKE_HANDLES_KEY)
+                .arg(did_hash)
+                .exec_async(&mut conn)
+                .await
+            {
+                warn!("account {did_hash} removed, but not its wake handle: {e}");
+            }
         }
         Ok(removed)
     }
@@ -2717,6 +2729,51 @@ impl AuxiliaryStore for RedisStore {
                     "NA".into(),
                     &e,
                     format!("scid_source_list: {e}"),
+                )
+            })
+    }
+
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let cmd = match record {
+            Some(record) => {
+                let mut cmd = redis::cmd("HSET");
+                cmd.arg(WAKE_HANDLES_KEY).arg(did_hash).arg(record);
+                cmd
+            }
+            None => {
+                let mut cmd = redis::cmd("HDEL");
+                cmd.arg(WAKE_HANDLES_KEY).arg(did_hash);
+                cmd
+            }
+        };
+        cmd.exec_async(&mut conn).await.map_err(|e| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                &e,
+                format!("wake_handle_set: {e}"),
+            )
+        })
+    }
+
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("HGET")
+            .arg(WAKE_HANDLES_KEY)
+            .arg(did_hash)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("wake_handle_get: {e}"),
                 )
             })
     }

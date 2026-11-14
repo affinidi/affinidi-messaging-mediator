@@ -147,6 +147,19 @@ pub mod forwarding {
     pub const RELAY_MODE: &str = "blind";
 }
 
+/// `[processors.wake]`: the limits `messaging/wake/request/0.1` Consumer
+/// rule 7 recommends. Waking is on by default: nothing rings unless an
+/// account sets a handle and the handle's gateway allowlist names this
+/// mediator.
+pub mod wake {
+    pub const ENABLED: bool = true;
+    pub const PAIR_PER_MINUTE: u32 = 1;
+    pub const PAIR_PER_DAY: u32 = 10;
+    /// Seconds.
+    pub const ADDRESSEE_COALESCE_SECONDS: u64 = 15;
+    pub const ADDRESSEE_PER_HOUR: u32 = 30;
+}
+
 /// `[processors.*_cleanup]`.
 pub mod cleanup {
     pub const MESSAGE_EXPIRY_ENABLED: bool = true;

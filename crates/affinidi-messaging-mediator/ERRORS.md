@@ -297,3 +297,15 @@ under the conditions its specification gives.
 | `messaging/queue/purge` | `messaging/queue/purge:unknownAccount` | No | The named account does not exist at this mediator. |
 | `messaging/queue/purge` | `messaging/queue/purge:rootAdminRequired` | No | The target account holds the admin, rootAdmin, or mediator role, and purging a privileged account's queue requires the requester to be a rootAdmin. |
 | `messaging/queue/status` | `messaging/queue/status:unknownAccount` | No | The named account does not exist at this mediator. |
+
+### Codes the mediator receives
+
+The mediator rings a device's push gateway with `push/wake/0.2` when a
+`messaging/wake/request` qualifies. It never sends these codes; it reads them
+in the gateway's answer to a ring.
+
+| Task | Trust Task Code | Retryable? | What the mediator does |
+| :--- | :-------------- | :--------: | :--------------------- |
+| `push/wake` | `push/wake:unknownHandle` | No | Nothing: the account's handle is kept until the account sets another. |
+| `push/wake` | `push/wake:notAllowed` | No | Stops ringing the handle (this mediator is not on its allowlist) until the account sets a handle again. The framework's `permissionDenied` is read the same way. |
+| `push/wake` | `push/wake:tokenUnregistered` | No | Drops the account's handle. The gateway may also send it as the `tokenUnregistered` status of a `push/wake#response`, which is read the same way. |

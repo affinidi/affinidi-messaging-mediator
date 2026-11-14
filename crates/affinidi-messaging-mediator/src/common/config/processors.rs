@@ -5,7 +5,8 @@ use affinidi_messaging_mediator_common::tasks::forwarding::RelayMode;
 // stay here. `ForwardingConfig` is a mediator-common type, so its conversion is
 // a free fn (`forwarding_config_from_raw`) rather than a `TryFrom` (orphan rule).
 use affinidi_messaging_mediator_config::{
-    ForwardingConfigRaw, MessageExpiryCleanupConfigRaw, SessionExpiryCleanupConfigRaw, values,
+    ForwardingConfigRaw, MessageExpiryCleanupConfigRaw, SessionExpiryCleanupConfigRaw,
+    WakeConfigRaw, values,
 };
 use ahash::AHashSet as HashSet;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,60 @@ pub struct ProcessorsConfig {
     pub forwarding: ForwardingConfig,
     pub message_expiry_cleanup: MessageExpiryCleanupConfig,
     pub session_expiry_cleanup: SessionExpiryCleanupConfig,
+    pub wake: WakeConfig,
+}
+
+/// Ringing an account's device on a sender's `messaging/wake/request`
+/// (`[processors.wake]`). The defaults are the limits the specification
+/// recommends (`messaging/wake/request/0.1` Consumer rule 7).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WakeConfig {
+    /// Whether this mediator rings at all.
+    pub enabled: bool,
+    /// Rings one requester may cause for one addressee per minute.
+    pub pair_per_minute: u32,
+    /// Rings one requester may cause for one addressee per day.
+    pub pair_per_day: u32,
+    /// Seconds within which further rings for one addressee coalesce into
+    /// the first.
+    pub addressee_coalesce_seconds: u64,
+    /// Rings one addressee may receive per hour, whoever asks.
+    pub addressee_per_hour: u32,
+}
+
+impl Default for WakeConfig {
+    fn default() -> Self {
+        Self::try_from(WakeConfigRaw::default()).expect("the built-in wake default is valid")
+    }
+}
+
+impl std::convert::TryFrom<WakeConfigRaw> for WakeConfig {
+    type Error = MediatorError;
+
+    fn try_from(raw: WakeConfigRaw) -> Result<Self, Self::Error> {
+        fn key(field: &str) -> String {
+            format!("processors.wake.{field}")
+        }
+        // A zero limit would make waking impossible while still answering
+        // `wakeCapable: true`; `enabled = "false"` is how to turn it off.
+        fn at_least_one<T>(field: &str, value: &str) -> Result<T, MediatorError>
+        where
+            T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy + From<u8>,
+        {
+            values::number_at_least(&key(field), value, T::from(1)).map_err(config_error)
+        }
+        Ok(WakeConfig {
+            enabled: values::boolean(&key("enabled"), &raw.enabled).map_err(config_error)?,
+            pair_per_minute: at_least_one("pair_per_minute", &raw.pair_per_minute)?,
+            pair_per_day: at_least_one("pair_per_day", &raw.pair_per_day)?,
+            addressee_coalesce_seconds: values::number(
+                &key("addressee_coalesce_seconds"),
+                &raw.addressee_coalesce_seconds,
+            )
+            .map_err(config_error)?,
+            addressee_per_hour: at_least_one("addressee_per_hour", &raw.addressee_per_hour)?,
+        })
+    }
 }
 
 /// The config crate's defaults table: `ForwardingConfig::default()` reads it
@@ -29,6 +84,7 @@ impl Default for ProcessorsConfig {
             forwarding: ForwardingConfig::default(),
             message_expiry_cleanup: MessageExpiryCleanupConfig::default(),
             session_expiry_cleanup: SessionExpiryCleanupConfig::default(),
+            wake: WakeConfig::default(),
         }
     }
 }
