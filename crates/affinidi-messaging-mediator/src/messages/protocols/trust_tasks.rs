@@ -111,7 +111,7 @@ impl ProofVerifier for NoProof {
 
 /// Consume an inbound Trust Tasks envelope and produce the response.
 /// The DIDComm binding: a Trust Task carried in a DIDComm envelope, answered
-/// in one. The TSP binding is `inbound::dispatch_tsp_trust_task`.
+/// in one. The TSP binding is `inbound::tsp::dispatch_tsp_trust_task`.
 #[cfg(feature = "didcomm")]
 pub(crate) async fn process(
     message: &Message,

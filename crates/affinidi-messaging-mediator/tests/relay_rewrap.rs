@@ -1,7 +1,7 @@
 //! Integration test for inter-mediator relay re-wrapping (`RelayMode::Rewrap`).
 //!
 //! Exercises the cryptographic round-trip of the re-wrap layer that
-//! `routing::rewrap_for_relay` builds and `inbound::peel_relay_rewrap_layers`
+//! `routing::rewrap_for_relay` builds and `inbound::didcomm::peel_relay_rewrap_layers`
 //! peels, using real authcrypt over the `did:peer` fixtures in `common.rs`.
 //! Here `ALICE_DID` plays the **relaying** mediator and `BOB_DID` the
 //! **receiving** mediator.
