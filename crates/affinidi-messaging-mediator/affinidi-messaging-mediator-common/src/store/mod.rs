@@ -365,11 +365,12 @@ pub mod single_process;
 pub mod redis;
 
 pub use types::{
-    DeletionAuthority, DeliveryDecision, DeliveryState, ExpiryReport, ForwardQueueClaimPage,
-    ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageRef, MessageScope, MetadataStats,
-    OutboxReceipt, PubSubRecord, RefreshRotation, RemovalReason, RemovedCopy, SentMessageState,
-    Session, SessionClaims, SessionState, SessionSweepReport, StatCounter, StoreHealth,
-    StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind, StreamingWrite,
+    AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, DeletionAuthority, DeliveryDecision,
+    DeliveryState, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply,
+    MessageMetaData, MessageRef, MessageScope, MetadataStats, OutboxReceipt, PubSubRecord,
+    RefreshRotation, RemovalReason, RemovedCopy, SentMessageState, Session, SessionClaims,
+    SessionState, SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClaim,
+    StreamingClientState, StreamingKind, StreamingWrite,
 };
 
 /// The error every backend's `get_session` returns for a session past the

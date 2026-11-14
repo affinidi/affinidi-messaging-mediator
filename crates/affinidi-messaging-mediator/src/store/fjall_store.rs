@@ -84,10 +84,10 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageScope,
-        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        RefreshRotation, RemovalReason, RemovedCopy, SentMessageState, Session, SessionState,
-        SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
-        TrustTaskClaim, acknowledged_until, ops, prelude::*,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, PubSubRecord, RefreshRotation,
+        RemovalReason, RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport,
+        StatCounter, StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim,
+        acknowledged_until, ops, prelude::*,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -1771,33 +1771,20 @@ impl MessageStore for FjallStore {
                 // Deleted between the read and here — nothing to stamp.
                 continue;
             };
-            let first_delivery = stored.first_delivered_at_ms.is_none();
-            report.bytes += stored.bytes;
-            if first_delivery {
-                report.first_delivered += 1;
-            } else {
-                report.redelivered += 1;
-                if stored.delivery_attempts >= POISON_ATTEMPTS {
-                    report.poison_suspected += 1;
-                }
-            }
-            stored.first_delivered_at_ms.get_or_insert(now_ms);
-            stored.delivery_attempts = stored.delivery_attempts.saturating_add(1);
-
-            // Only the first delivery brings the deadline forward, and only
-            // when it is genuinely sooner. A redelivery must not keep pushing
-            // it out, and a message that already expires sooner keeps its own
-            // deadline — a client-set expiry is a promise this must not extend.
-            if first_delivery && delivered_ttl_secs > 0 {
-                let deadline = now_ms / 1_000 + delivered_ttl_secs;
-                if stored.expires_at == 0 || deadline < stored.expires_at {
-                    // The record's expiry is now the deadline. The new entry
-                    // is added and the original left: the sweeper drops it as
-                    // stale (`ops::expiry_entry_is_due`) or finds it gone.
-                    stored.expires_at = deadline;
-                    batch.insert(&self.expiry, expiry_key(deadline, &key), Vec::<u8>::new());
-                    report.expiry_advanced += 1;
-                }
+            let bytes = stored.bytes;
+            let moved = ops::stamp_delivery(
+                ops::DeliveryFields {
+                    first_delivered_at_ms: &mut stored.first_delivered_at_ms,
+                    attempts: &mut stored.delivery_attempts,
+                    expires_at: &mut stored.expires_at,
+                },
+                bytes,
+                now_ms,
+                delivered_ttl_secs,
+                &mut report,
+            );
+            if let Some(deadline) = moved {
+                batch.insert(&self.expiry, expiry_key(deadline, &key), Vec::<u8>::new());
             }
 
             batch.insert(&self.messages, key.as_bytes(), Self::encode(&stored)?);
@@ -2856,16 +2843,8 @@ impl AccountStore for FjallStore {
             Some(v) => Self::decode(&v)?,
             None => StoredAccount::default(),
         };
-        match send_queue_limit {
-            Some(-2) => record.queue_send_limit = None,
-            Some(n) => record.queue_send_limit = Some(n),
-            None => {}
-        }
-        match receive_queue_limit {
-            Some(-2) => record.queue_receive_limit = None,
-            Some(n) => record.queue_receive_limit = Some(n),
-            None => {}
-        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, receive_queue_limit);
         self.accounts
             .insert(did_hash.as_bytes(), Self::encode(&record)?)
             .map_err(|e| Self::db_err("account_change_queue_limits:insert", e))?;
@@ -3159,14 +3138,7 @@ impl AclStore for FjallStore {
     ) -> Result<MediatorAccessListAddResponse, MediatorError> {
         let _guard = self.write_lock.lock().await;
         let current = self.access_list_count_inner(did_hash)?;
-        let mut truncated = false;
-        let to_add: Vec<String> = if current + hashes.len() > access_list_limit {
-            truncated = true;
-            let allowed = access_list_limit.saturating_sub(current);
-            hashes.iter().take(allowed).cloned().collect()
-        } else {
-            hashes.to_vec()
-        };
+        let (to_add, truncated) = ops::admit_to_access_list(current, hashes, access_list_limit);
         let mut batch = self.db.batch();
         for h in &to_add {
             let mut k = did_hash.as_bytes().to_vec();

@@ -39,10 +39,10 @@ use affinidi_messaging_mediator_common::{
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
         ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageScope,
-        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
-        RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport,
-        StatCounter, StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim,
-        acknowledged_until, ops, prelude::*,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, PubSubRecord, RefreshRotation,
+        RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, acknowledged_until,
+        ops, prelude::*,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -845,33 +845,20 @@ impl MessageStore for MemoryStore {
             let Some(record) = state.messages.get_mut(&key) else {
                 continue;
             };
-            let first_delivery = record.first_delivered_at_ms.is_none();
-            report.bytes += record.bytes;
-            if first_delivery {
-                report.first_delivered += 1;
-            } else {
-                report.redelivered += 1;
-                if record.delivery_attempts >= POISON_ATTEMPTS {
-                    report.poison_suspected += 1;
-                }
-            }
-            record.first_delivered_at_ms.get_or_insert(now_ms);
-            record.delivery_attempts = record.delivery_attempts.saturating_add(1);
-
-            // Only the first delivery brings the deadline forward, and only
-            // when it is genuinely sooner. A redelivery must not keep pushing
-            // it out, and a message that already expires sooner keeps its own
-            // deadline — a client-set expiry is a promise this must not extend.
-            if first_delivery && delivered_ttl_secs > 0 {
-                let deadline = now_ms / 1_000 + delivered_ttl_secs;
-                if record.expires_at == 0 || deadline < record.expires_at {
-                    // The record's expiry is now the deadline. The new slot is
-                    // added and the original left: the sweeper drops it as
-                    // stale (`ops::expiry_entry_is_due`), or finds it gone.
-                    record.expires_at = deadline;
-                    state.index_expiry(deadline, &key);
-                    report.expiry_advanced += 1;
-                }
+            let bytes = record.bytes;
+            let moved = ops::stamp_delivery(
+                ops::DeliveryFields {
+                    first_delivered_at_ms: &mut record.first_delivered_at_ms,
+                    attempts: &mut record.delivery_attempts,
+                    expires_at: &mut record.expires_at,
+                },
+                bytes,
+                now_ms,
+                delivered_ttl_secs,
+                &mut report,
+            );
+            if let Some(deadline) = moved {
+                state.index_expiry(deadline, &key);
             }
         }
         Ok(report)
@@ -1584,16 +1571,8 @@ impl AccountStore for MemoryStore {
     ) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
         let record = state.accounts.entry(did_hash.to_string()).or_default();
-        match send_queue_limit {
-            Some(-2) => record.queue_send_limit = None,
-            Some(n) => record.queue_send_limit = Some(n),
-            None => {}
-        }
-        match receive_queue_limit {
-            Some(-2) => record.queue_receive_limit = None,
-            Some(n) => record.queue_receive_limit = Some(n),
-            None => {}
-        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, receive_queue_limit);
         Ok(())
     }
 
@@ -1802,15 +1781,7 @@ impl AclStore for MemoryStore {
     ) -> Result<MediatorAccessListAddResponse, MediatorError> {
         let mut state = self.state.lock().await;
         let list = state.access_lists.entry(did_hash.to_string()).or_default();
-        let current = list.len();
-        let mut truncated = false;
-        let to_add: Vec<String> = if current + hashes.len() > access_list_limit {
-            truncated = true;
-            let allowed = access_list_limit.saturating_sub(current);
-            hashes.iter().take(allowed).cloned().collect()
-        } else {
-            hashes.to_vec()
-        };
+        let (to_add, truncated) = ops::admit_to_access_list(list.len(), hashes, access_list_limit);
         for h in &to_add {
             if !list.iter().any(|d| d == h) {
                 list.push(h.clone());
@@ -2652,7 +2623,7 @@ impl AuxiliaryStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use affinidi_messaging_mediator_common::store::SessionState;
+    use affinidi_messaging_mediator_common::store::{POISON_ATTEMPTS, SessionState};
 
     /// Parity with `fjall_store`: the two backends must agree on per-relationship
     /// accounting, or the gate built on it behaves differently depending on

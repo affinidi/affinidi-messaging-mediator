@@ -13,7 +13,8 @@
 use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::{
-    DeletionAuthority, MessageScope, OutboxReceipt, RemovalReason, SentMessageState,
+    AccessListUpdate, AccessListUpdateOutcome, DeletionAuthority, MessageScope, OutboxReceipt,
+    RemovalReason, SentMessageState,
 };
 use crate::types::acls::{AccessListModeType, MediatorACLSet};
 use crate::types::problem_report::{ProblemReportScope, ProblemReportSorter};
@@ -364,9 +365,255 @@ pub fn is_delete_not_found(err: &MediatorError) -> bool {
     )
 }
 
+// ─── Shared state transitions ──────────────────────────────────────────────
+//
+// The in-process backends hold their records differently (typed maps under
+// one lock; encoded values in Fjall keyspaces) but change them the same way.
+// The change itself lives here, once; each backend only loads and stores.
+
+/// The delivery fields of one stored record, borrowed for
+/// [`stamp_delivery`].
+pub struct DeliveryFields<'a> {
+    pub first_delivered_at_ms: &'a mut Option<u64>,
+    pub attempts: &'a mut u32,
+    /// Unix seconds; `0` means no expiry.
+    pub expires_at: &'a mut u64,
+}
+
+/// Record one handover of a record of `bytes` bytes at `now_ms`, as
+/// [`MessageStore::mark_delivered`](crate::store::MessageStore::mark_delivered)
+/// describes: stamp the first delivery if unset, bump the attempts, count it
+/// in `report`, and — on the first delivery only, and only when it is sooner
+/// — bring the expiry forward to `now + delivered_ttl_secs`.
+///
+/// Returns the new expiry when it moved, so the caller indexes it. The
+/// original expiry entry is left: the sweeper drops it as stale
+/// ([`expiry_entry_is_due`]) or finds the record gone.
+pub fn stamp_delivery(
+    record: DeliveryFields<'_>,
+    bytes: usize,
+    now_ms: u64,
+    delivered_ttl_secs: u64,
+    report: &mut crate::store::DeliveryMarkReport,
+) -> Option<u64> {
+    let first_delivery = record.first_delivered_at_ms.is_none();
+    report.bytes += bytes;
+    if first_delivery {
+        report.first_delivered += 1;
+    } else {
+        report.redelivered += 1;
+        if *record.attempts >= crate::store::POISON_ATTEMPTS {
+            report.poison_suspected += 1;
+        }
+    }
+    record.first_delivered_at_ms.get_or_insert(now_ms);
+    *record.attempts = record.attempts.saturating_add(1);
+
+    // Only the first delivery brings the deadline forward, and only when it
+    // is genuinely sooner. A redelivery must not keep pushing it out, and a
+    // message that already expires sooner keeps its own deadline — a
+    // client-set expiry is a promise this must not extend.
+    if first_delivery && delivered_ttl_secs > 0 {
+        let deadline = now_ms / 1_000 + delivered_ttl_secs;
+        if *record.expires_at == 0 || deadline < *record.expires_at {
+            *record.expires_at = deadline;
+            report.expiry_advanced += 1;
+            return Some(deadline);
+        }
+    }
+    None
+}
+
+/// Apply one requested queue limit to the stored one: `None` leaves it,
+/// `-2` resets it to the mediator default (no stored limit), anything else
+/// is stored as given (`-1` is unlimited).
+pub fn apply_queue_limit(stored: &mut Option<i32>, requested: Option<i32>) {
+    match requested {
+        Some(-2) => *stored = None,
+        Some(n) => *stored = Some(n),
+        None => {}
+    }
+}
+
+/// The hashes of `requested` an access list holding `current` entries admits
+/// under `limit`, and whether the request was cut short. When it would not
+/// fit, the first `limit - current` are admitted. Every backend's add follows
+/// this (Redis in its script).
+pub fn admit_to_access_list(
+    current: usize,
+    requested: &[String],
+    limit: usize,
+) -> (Vec<String>, bool) {
+    if current + requested.len() > limit {
+        let room = limit.saturating_sub(current);
+        (requested.iter().take(room).cloned().collect(), true)
+    } else {
+        (requested.to_vec(), false)
+    }
+}
+
+/// How an [`AccessListUpdate`] changes a list: the entries to write and to
+/// drop, and what to report.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AccessListPlan {
+    /// Entries to add that are not listed now, each once.
+    pub insert: Vec<String>,
+    /// Entries listed now that the update drops.
+    pub delete: Vec<String>,
+    pub outcome: AccessListUpdateOutcome,
+}
+
+/// Plan `update` against the list `current` (each entry once): `clear`, then
+/// `add` admitted by [`admit_to_access_list`], then `remove`. The backend
+/// applies the plan's `insert` and `delete` in one atomic write.
+pub fn plan_access_list_update(
+    current: &[String],
+    update: &AccessListUpdate,
+    limit: usize,
+) -> AccessListPlan {
+    use std::collections::HashSet;
+    let before: HashSet<&str> = current.iter().map(String::as_str).collect();
+    let mut after: HashSet<String> = if update.clear {
+        HashSet::new()
+    } else {
+        current.iter().cloned().collect()
+    };
+    let (added, truncated) = admit_to_access_list(after.len(), &update.add, limit);
+    after.extend(added.iter().cloned());
+    let removed: Vec<String> = update
+        .remove
+        .iter()
+        .filter(|h| after.remove(h.as_str()))
+        .cloned()
+        .collect();
+
+    let mut insert = Vec::new();
+    for h in &added {
+        if after.contains(h) && !before.contains(h.as_str()) && !insert.contains(h) {
+            insert.push(h.clone());
+        }
+    }
+    let delete = current
+        .iter()
+        .filter(|h| !after.contains(h.as_str()))
+        .cloned()
+        .collect();
+    AccessListPlan {
+        insert,
+        delete,
+        outcome: AccessListUpdateOutcome {
+            added,
+            truncated,
+            removed,
+            count: after.len(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hashes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_plan_clears_then_adds_then_removes() {
+        let plan = plan_access_list_update(
+            &hashes(&["a", "b"]),
+            &AccessListUpdate {
+                clear: true,
+                add: hashes(&["b", "c", "d"]),
+                remove: hashes(&["d", "d", "a"]),
+            },
+            10,
+        );
+        assert_eq!(plan.outcome.added, hashes(&["b", "c", "d"]));
+        assert!(!plan.outcome.truncated);
+        // `a` went with the clear, so only `d` was listed to remove, once.
+        assert_eq!(plan.outcome.removed, hashes(&["d"]));
+        assert_eq!(plan.outcome.count, 2);
+        assert_eq!(plan.insert, hashes(&["c"]));
+        assert_eq!(plan.delete, hashes(&["a"]));
+    }
+
+    #[test]
+    fn a_plan_admits_adds_against_the_list_the_clear_left() {
+        let current = hashes(&["a", "b", "c"]);
+        let add = hashes(&["x", "y", "z"]);
+        let kept = plan_access_list_update(
+            &current,
+            &AccessListUpdate {
+                add: add.clone(),
+                ..Default::default()
+            },
+            4,
+        );
+        assert_eq!(kept.outcome.added, hashes(&["x"]));
+        assert!(kept.outcome.truncated);
+        assert_eq!(kept.outcome.count, 4);
+
+        let cleared = plan_access_list_update(
+            &current,
+            &AccessListUpdate {
+                clear: true,
+                add,
+                ..Default::default()
+            },
+            4,
+        );
+        assert!(!cleared.outcome.truncated);
+        assert_eq!(cleared.outcome.count, 3);
+        assert_eq!(cleared.delete, current);
+    }
+
+    #[test]
+    fn a_first_delivery_stamps_and_brings_the_expiry_forward() {
+        let (mut first, mut attempts, mut expires) = (None, 0, 10_000u64);
+        let mut report = crate::store::DeliveryMarkReport::default();
+        let moved = stamp_delivery(
+            DeliveryFields {
+                first_delivered_at_ms: &mut first,
+                attempts: &mut attempts,
+                expires_at: &mut expires,
+            },
+            7,
+            1_000_000,
+            60,
+            &mut report,
+        );
+        assert_eq!(moved, Some(1_060));
+        assert_eq!((first, attempts, expires), (Some(1_000_000), 1, 1_060));
+        assert_eq!((report.first_delivered, report.bytes), (1, 7));
+
+        // A redelivery keeps the first stamp and the deadline.
+        let moved = stamp_delivery(
+            DeliveryFields {
+                first_delivered_at_ms: &mut first,
+                attempts: &mut attempts,
+                expires_at: &mut expires,
+            },
+            7,
+            2_000_000,
+            60,
+            &mut report,
+        );
+        assert_eq!(moved, None);
+        assert_eq!((first, attempts, expires), (Some(1_000_000), 2, 1_060));
+        assert_eq!(report.redelivered, 1);
+    }
+
+    #[test]
+    fn a_reset_queue_limit_clears_the_stored_one() {
+        let mut stored = Some(5);
+        apply_queue_limit(&mut stored, None);
+        assert_eq!(stored, Some(5));
+        apply_queue_limit(&mut stored, Some(-1));
+        assert_eq!(stored, Some(-1));
+        apply_queue_limit(&mut stored, Some(-2));
+        assert_eq!(stored, None);
+    }
 
     #[test]
     fn range_bounds_parse_the_same_everywhere() {

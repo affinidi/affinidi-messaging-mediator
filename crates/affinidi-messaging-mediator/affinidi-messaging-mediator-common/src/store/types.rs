@@ -785,3 +785,52 @@ impl StoreHealth {
         }
     }
 }
+
+/// One change to an existing account, applied by
+/// [`AccountStore::account_update`](crate::store::AccountStore::account_update)
+/// as a single atomic step: every member lands, or none does.
+///
+/// A member left `None` is left unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct AccountUpdate {
+    /// Replace the ACL bitmask.
+    pub acls: Option<MediatorACLSet>,
+    /// The send-queue limit: `-1` unlimited, `-2` reset to the mediator
+    /// default, `n` an explicit cap.
+    pub send_queue_limit: Option<i32>,
+    /// The receive-queue limit, as [`send_queue_limit`](Self::send_queue_limit).
+    pub receive_queue_limit: Option<i32>,
+    /// Set the role, and admin-set membership with it: an admin role
+    /// ([`AccountType::is_admin`]) is listed as an admin, any other is not.
+    pub role: Option<AccountType>,
+}
+
+/// One change to an account's access list, applied by
+/// [`AclStore::access_list_update`](crate::store::AclStore::access_list_update)
+/// as a single atomic step in the fixed order `clear`, `add`, `remove`, so
+/// `clear` with `add` replaces the list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessListUpdate {
+    /// Empty the list first.
+    pub clear: bool,
+    /// DID hashes to add, up to the access-list limit.
+    pub add: Vec<String>,
+    /// DID hashes to remove, after the additions.
+    pub remove: Vec<String>,
+}
+
+/// What an [`AccessListUpdate`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessListUpdateOutcome {
+    /// The hashes from [`AccessListUpdate::add`] admitted under the limit, in
+    /// the order asked (including any already listed), as `access_list_add`
+    /// reports them.
+    pub added: Vec<String>,
+    /// Whether `add` was cut short by the limit.
+    pub truncated: bool,
+    /// The hashes from [`AccessListUpdate::remove`] that were listed and are
+    /// now gone, each once, in the order asked.
+    pub removed: Vec<String>,
+    /// Entries in the list after the update.
+    pub count: usize,
+}
