@@ -298,7 +298,8 @@ pub(crate) enum ProcessMessageResponse {
     /// store and nothing to answer.
     Forwarded,
     /// The handler produced nothing to send (a ping that asked for no
-    /// response, a Trust Task ping answered with silence).
+    /// response, a Trust Task ping answered with silence). A success:
+    /// `InboundMessageResponse::Empty` over REST, no frame over a WebSocket.
     Nothing,
 }
 
