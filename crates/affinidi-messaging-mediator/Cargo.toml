@@ -160,7 +160,7 @@ affinidi-crypto = { workspace = true, optional = true, features = ["jose"] }
 ## Optional: Trust Spanning Protocol (activated by `tsp` feature)
 affinidi-tsp = { workspace = true, optional = true }
 ## Multibase/multicodec encoding helpers (needed by didcomm for key encoding)
-affinidi-encoding = { version = "0.1", optional = true }
+affinidi-encoding = { version = "0.1.6", optional = true }
 ## Shared types: DatabaseHandler, errors, config structs, secret storage.
 ## Backend features are enabled below via the mediator's own cargo features
 ## so operators only compile the backends their deployment needs.
@@ -336,7 +336,7 @@ tikv-jemallocator = { version = "0.7", optional = true }
 [dev-dependencies]
 ## The `/tsp/authenticate` unit test builds a `did:key` multikey; without
 ## `didcomm` nothing else pulls this in.
-affinidi-encoding = "0.1"
+affinidi-encoding = "0.1.6"
 lazy_static = "1"
 ## `FjallStore` smoke tests open a temp directory.
 tempfile.workspace = true

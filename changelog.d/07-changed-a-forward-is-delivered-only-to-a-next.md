@@ -1,10 +1,13 @@
-### Changed — a forward is delivered only to a next hop that has an account
+### Breaking — a forward is delivered only to a next hop that has an account
 
 - A forward never creates an account. A local next hop with no account on
   this mediator is refused with `73 delivery.refused`; it used to be
   registered with `global_acl_default`, in either `mediator_acl_mode`. A
   recipient gets its account by authenticating (or from an admin) before
-  forwards to it are accepted.
+  forwards to it are accepted. A sender that forwards to an address before
+  that address has first connected (for example a freshly minted DID) is now
+  refused and must wait for the recipient's first connection, or retry
+  (R3.6).
 - A forward from a DID with no account here is still checked against the
   least-privilege relay ACL (`SEND_FORWARDED` only, if `global_acl_default`
   grants it), but that DID is no longer registered. Its queued messages
