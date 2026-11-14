@@ -25,8 +25,10 @@ public_url = "http://localhost:7037"
 
 [secrets]
 # Plain file backend inside the volume (/etc/mediator/conf/secrets.json).
-# Fine for a local playground; not for production.
+# Fine for a local playground; not for production. A container deployment
+# refuses plaintext keys unless told otherwise, so the quickstart says so.
 storage = "file://"
+allow_plaintext_file = true
 
 [security]
 ssl = "none"
