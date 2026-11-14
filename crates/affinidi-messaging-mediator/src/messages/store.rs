@@ -1,5 +1,6 @@
 use crate::SharedData;
 use crate::common::session::Session;
+use crate::error_codes;
 #[cfg(feature = "didcomm")]
 use crate::messages::MessageHandler;
 #[cfg(feature = "didcomm")]
@@ -126,7 +127,7 @@ pub(crate) async fn store_message(
                     // Pack the message for the next recipient(s)
                     let Some(to_dids) = &message.to else {
                         return Err(MediatorError::problem(
-                            75,
+                            error_codes::MESSAGE_RECIPIENTS_MISSING,
                             &session.session_id,
                             Some(message.id.to_string()),
                             ProblemReportSorter::Error,
@@ -145,7 +146,7 @@ pub(crate) async fn store_message(
 
                     if to_dids.len() > state.limits().to_recipients {
                         return Err(MediatorError::problem_with_log(
-                            76,
+                            error_codes::MESSAGE_RECIPIENTS_TOO_MANY,
                             &session.session_id,
                             Some(message.id.to_string()),
                             ProblemReportSorter::Error,
@@ -310,7 +311,7 @@ pub(crate) async fn store_message(
 
         error!("No message to return");
         Err(MediatorError::problem(
-            77,
+            error_codes::MESSAGE_STORE_ERROR,
             &session.session_id,
             None,
             ProblemReportSorter::Error,

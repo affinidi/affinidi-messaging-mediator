@@ -41,6 +41,7 @@
 //! mediator's error type. The error variants carry enough context for
 //! request handlers to map them to HTTP/DIDComm problem reports.
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::types::{
     accounts::{
@@ -218,7 +219,7 @@ pub fn purge_left_messages(did_hash: &str, report: &PurgeReport) -> Result<(), M
         return Ok(());
     }
     Err(MediatorError::DatabaseError(
-        14,
+        error_codes::DB_OPERATION_ERROR,
         "NA".into(),
         format!(
             "Account ({did_hash}) is blocked but not removed: {} of its queued messages could not be deleted; retry the removal",
@@ -390,7 +391,7 @@ pub use types::{
 /// removed, so its sessions are over and the client must authenticate again.
 pub fn account_gone(session_id: &str) -> MediatorError {
     MediatorError::Unauthorized(
-        20,
+        error_codes::SESSION_INVALID_STATE,
         session_id.into(),
         "The session's account no longer exists; please re-authenticate".into(),
     )
@@ -402,7 +403,7 @@ pub fn account_gone(session_id: &str) -> MediatorError {
 /// client's token outlived its session and it must authenticate again.
 pub fn session_not_found(session_id: &str) -> MediatorError {
     MediatorError::Unauthorized(
-        21,
+        error_codes::AUTH_SESSION_INVALID,
         session_id.into(),
         "Session not found or expired; please re-authenticate".into(),
     )
@@ -412,7 +413,13 @@ pub fn session_not_found(session_id: &str) -> MediatorError {
 /// `get_session`: the session is over, and the client must authenticate
 /// again. Anything else from `get_session` is a storage failure.
 pub fn is_session_over(err: &MediatorError) -> bool {
-    matches!(err, MediatorError::Unauthorized(20 | 21, ..))
+    matches!(
+        err,
+        MediatorError::Unauthorized(
+            error_codes::SESSION_INVALID_STATE | error_codes::AUTH_SESSION_INVALID,
+            ..
+        )
+    )
 }
 
 /// The error `update_session_authenticated` returns when the challenge
@@ -420,7 +427,7 @@ pub fn is_session_over(err: &MediatorError) -> bool {
 /// already answered). The client must ask for a new challenge.
 pub fn session_not_awaiting_answer(session_id: &str) -> MediatorError {
     MediatorError::SessionError(
-        14,
+        error_codes::DB_OPERATION_ERROR,
         session_id.into(),
         format!("Session ({session_id}) is not waiting for a challenge answer"),
     )
@@ -1368,7 +1375,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         }
         self.account_get(did_hash).await?.ok_or_else(|| {
             MediatorError::InternalError(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 "NA".to_string(),
                 format!("account {did_hash} was removed while it was being added"),
             )
@@ -1453,7 +1460,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     /// already holds it is idempotent and succeeds.
     async fn v1_routing_key_bind(&self, _verkey: &str, _did: &str) -> Result<(), MediatorError> {
         Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             "this storage backend does not implement DIDComm v1 routing keys".into(),
         ))
@@ -1481,7 +1488,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         _did: &str,
     ) -> Result<bool, MediatorError> {
         Err(MediatorError::ConfigError(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             "this storage backend does not implement DIDComm v1 routing keys".into(),
         ))
@@ -1530,7 +1537,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         _index: &mux::MuxIndexDelta,
     ) -> Result<bool, MediatorError> {
         Err(MediatorError::NotImplemented(
-            12,
+            error_codes::CONFIG_ERROR,
             "NA".into(),
             "this storage backend does not implement DID multiplexing".into(),
         ))
@@ -1819,7 +1826,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ) -> Result<TrustTaskClaim, MediatorError> {
         let _ = (key, digest, retain_until, now);
         Err(MediatorError::InternalError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             "this store keeps no Trust Task duplicate-execution record".into(),
         ))
@@ -1849,7 +1856,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
         let _ = (did_hash, record);
         Err(MediatorError::InternalError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             "this store keeps no did:scid source records".into(),
         ))
@@ -1958,7 +1965,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError> {
         let _ = overrides;
         Err(MediatorError::InternalError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             "this store cannot keep configuration overrides".into(),
         ))
@@ -2308,7 +2315,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
     ) -> Result<(), MediatorError> {
         let _ = (did_hash, mediator_uuid, message);
         Err(MediatorError::InternalError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             "this store cannot publish a verbatim frame".into(),
         ))
@@ -2482,7 +2489,7 @@ pub trait MediatorStore: Send + Sync + std::fmt::Debug {
         // atomic rename override this (the delete below and a second
         // caller's read can still interleave here).
         let mut session = match self.get_session(old_session_id, did).await {
-            Err(MediatorError::Unauthorized(21, ..)) => {
+            Err(MediatorError::Unauthorized(error_codes::AUTH_SESSION_INVALID, ..)) => {
                 return Err(session_not_awaiting_answer(old_session_id));
             }
             other => other?,
@@ -2638,7 +2645,7 @@ mod tests {
             },
             || async move {
                 Err(MediatorError::DatabaseError(
-                    14,
+                    crate::error_codes::DB_OPERATION_ERROR,
                     "sess".into(),
                     "simulated write failure".into(),
                 ))
@@ -2665,7 +2672,7 @@ mod tests {
             "new",
             || async {
                 Err::<(), _>(MediatorError::DatabaseError(
-                    14,
+                    crate::error_codes::DB_OPERATION_ERROR,
                     "sess".into(),
                     "simulated delete failure".into(),
                 ))

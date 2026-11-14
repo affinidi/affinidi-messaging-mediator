@@ -1,5 +1,6 @@
 use super::Database;
 use crate::database::RedisConnection;
+use crate::error_codes;
 use crate::errors::{MediatorError, StorageCap};
 use redis::Value;
 use std::fs::read_to_string;
@@ -57,7 +58,7 @@ impl Database {
         }
         let lua_scripts = read_to_string(scripts_path).map_err(|err| {
             MediatorError::ConfigError(
-                2,
+                error_codes::DB_CONFIG_INVALID,
                 "Initialization".into(),
                 format!("Couldn't ready database functions_file ({scripts_path}). Reason: {err}"),
             )
@@ -81,7 +82,7 @@ impl Database {
             // No such function: no library, or one that predates versions.
             Err(err) if err.to_string().contains("Function not found") => Ok(0),
             Err(err) => Err(MediatorError::database_from_redis(
-                14,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "Initialization".into(),
                 &err,
                 format!("Couldn't read the stored-function library version: {err}"),
@@ -163,7 +164,7 @@ impl Database {
                     err
                 );
                 Err(MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "Initialization".into(),
                     &err,
                     format!("Loading LUA scripts, received database error: {err}"),

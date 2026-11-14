@@ -10,6 +10,7 @@
 //! in-process Rust backends; the conformance suite (`store_conformance`) is
 //! what keeps Redis aligned with them.
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::{
     DeletionAuthority, MessageScope, OutboxReceipt, RemovalReason, SentMessageState,
@@ -294,7 +295,7 @@ pub const DELETE_PERMISSION_DENIED: &str = "database.message.delete.permission_d
 /// mediator as a real refusal.
 pub fn delete_not_found(message_hash: &str, request_msg_id: Option<&str>) -> MediatorError {
     MediatorError::problem(
-        10,
+        error_codes::MESSAGE_NOT_FOUND,
         "NA",
         request_msg_id.map(str::to_string),
         ProblemReportSorter::Warning,
@@ -310,7 +311,7 @@ pub fn delete_not_found(message_hash: &str, request_msg_id: Option<&str>) -> Med
 /// message — see [`delete_message_permitted`].
 pub fn delete_permission_denied(message_hash: &str, request_msg_id: Option<&str>) -> MediatorError {
     MediatorError::problem(
-        10,
+        error_codes::MESSAGE_DELETE_DENIED,
         "NA",
         request_msg_id.map(str::to_string),
         ProblemReportSorter::Warning,
@@ -330,7 +331,7 @@ pub fn delete_permission_denied(message_hash: &str, request_msg_id: Option<&str>
 pub fn parse_range_bound(bound: &str, is_end: bool) -> Result<(u64, u64), MediatorError> {
     let refuse = || {
         MediatorError::RequestDataError(
-            22,
+            crate::error_codes::DB_METADATA_PARSE_ERROR,
             "NA".into(),
             format!("Invalid message range bound ({bound}): expected -, +, <ms> or <ms>-<seq>"),
         )

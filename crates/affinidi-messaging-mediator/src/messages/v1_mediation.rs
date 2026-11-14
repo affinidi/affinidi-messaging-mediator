@@ -25,6 +25,7 @@
 //! `global_acl_default`, unless `mediator_acl_mode` is `explicit_allow`, in
 //! which case mediation is denied. One admission gate, two entry points.
 
+use crate::error_codes;
 use affinidi_messaging_didcomm_v1::identity::Verkey;
 use affinidi_messaging_didcomm_v1::message::MessageV1;
 use affinidi_messaging_didcomm_v1::protocols::coordinate_mediation as cm;
@@ -129,7 +130,7 @@ async fn client_account(
             );
             return Err(v1_problem(
                 session,
-                25,
+                error_codes::AUTH_DID_BLOCKED,
                 "authorization.blocked",
                 "This mediator does not accept mediation requests from unknown clients".to_string(),
                 StatusCode::FORBIDDEN,
@@ -194,7 +195,7 @@ async fn coordinate_mediation(
             let updates = cm::parse_keylist_update(msg).map_err(|e| {
                 v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.keylist",
                     format!("malformed keylist-update: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -204,7 +205,7 @@ async fn coordinate_mediation(
             if updates.len() > MAX_KEYLIST_UPDATES {
                 return Err(v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.keylist",
                     format!(
                         "keylist-update lists {} updates, exceeding the maximum of \
@@ -274,7 +275,7 @@ async fn coordinate_mediation(
         | cm::CoordinateMediation::KeylistUpdateResponse
         | cm::CoordinateMediation::Keylist => Err(v1_problem(
             session,
-            37,
+            error_codes::DIDCOMM_V1_MALFORMED,
             "message.didcomm_v1.unexpected",
             format!(
                 "`{}` is a mediator-to-client message; the mediator does not accept it",
@@ -286,7 +287,7 @@ async fn coordinate_mediation(
         // `CoordinateMediation` is `#[non_exhaustive]`.
         _ => Err(v1_problem(
             session,
-            37,
+            error_codes::PROTOCOL_UNSUPPORTED,
             "message.didcomm_v1.unsupported",
             format!("unsupported coordinate-mediation message `{}`", msg.typ),
             StatusCode::BAD_REQUEST,
@@ -739,7 +740,7 @@ async fn message_pickup(
             let ids = mp::parse_messages_received(msg).map_err(|e| {
                 v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.messages_received",
                     format!("malformed messages-received: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -749,7 +750,7 @@ async fn message_pickup(
             if ids.len() > MAX_ACK_IDS {
                 return Err(v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.messages_received",
                     format!(
                         "messages-received lists {} ids, exceeding the maximum of {MAX_ACK_IDS}",
@@ -808,7 +809,7 @@ async fn message_pickup(
         // Mediator-to-client messages.
         mp::MessagePickup::Status | mp::MessagePickup::Delivery => Err(v1_problem(
             session,
-            37,
+            error_codes::DIDCOMM_V1_MALFORMED,
             "message.didcomm_v1.unexpected",
             format!(
                 "`{}` is a mediator-to-client message; the mediator does not accept it",
@@ -819,7 +820,7 @@ async fn message_pickup(
 
         _ => Err(v1_problem(
             session,
-            37,
+            error_codes::PROTOCOL_UNSUPPORTED,
             "message.didcomm_v1.unsupported",
             format!("unsupported message-pickup message `{}`", msg.typ),
             StatusCode::BAD_REQUEST,
@@ -848,7 +849,7 @@ fn mediator_endpoint(state: &SharedData) -> String {
 fn v1_build_error(session: &Session, error: impl std::fmt::Display) -> MediatorError {
     v1_problem(
         session,
-        37,
+        error_codes::MESSAGE_PACK_ERROR,
         "message.didcomm_v1.build",
         format!("couldn't build the DIDComm v1 reply: {error}"),
         StatusCode::INTERNAL_SERVER_ERROR,

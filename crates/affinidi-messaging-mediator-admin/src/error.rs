@@ -181,7 +181,10 @@ pub(crate) fn explain_refusal(
         "permission denied: only an administrator account may manage stored grants".into()
     } else if code.ends_with("permissionDenied") || code.contains("unauthorized") {
         format!("permission denied: {comment}")
-    } else if code.ends_with("protocol.trust_task.unsupported") {
+    } else if code.ends_with("unsupportedType")
+        || code.ends_with("unsupportedVersion")
+        || code.ends_with("protocol.trust_task.unsupported")
+    {
         format!(
             "the mediator does not serve this task — mux is not enabled there, or it \
              predates affinidi-messaging-mediator 0.52.0 ({comment})"

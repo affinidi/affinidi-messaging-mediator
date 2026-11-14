@@ -26,6 +26,7 @@ mod runner;
 
 pub(crate) use runner::run_pending_migrations;
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::redis::database::Database;
 use crate::store::redis::init::RedisInitConfig;
@@ -51,7 +52,7 @@ impl MigrationDef {
             2 => m002_lua_perf_optimizations::up(db, config).await,
             3 => m003_backfill_role_type::up(db, config).await,
             _ => Err(MediatorError::InternalError(
-                17,
+                error_codes::INTERNAL_ERROR,
                 "migrations".into(),
                 format!("Unknown migration ID: {}", self.id),
             )),

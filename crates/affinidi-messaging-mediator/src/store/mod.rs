@@ -65,7 +65,7 @@ pub fn oob_expires_at(invite: &Message, oob_invite_ttl: u64, now: u64) -> u64 {
 pub fn encode_oob_invite(invite: &Message) -> Result<String, MediatorError> {
     let json = serde_json::to_string(invite).map_err(|err| {
         MediatorError::InternalError(
-            19,
+            crate::error_codes::PARSE_ERROR,
             "oob".into(),
             format!("serialize OOB invite failed: {err}"),
         )

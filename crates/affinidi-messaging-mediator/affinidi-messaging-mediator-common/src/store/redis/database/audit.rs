@@ -4,6 +4,7 @@
 //! the head (index 0), so the list is naturally newest-first, and `LTRIM` after
 //! each push bounds it to [`AUDIT_LOG_MAX_ENTRIES`] — a fixed-size ring.
 
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList};
 use tracing::{Instrument, Level, span};
@@ -23,7 +24,7 @@ impl Database {
         async move {
             let json = serde_json::to_string(entry).map_err(|e| {
                 MediatorError::InternalError(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     format!("audit_log_record: serialise failed: {e}"),
                 )
@@ -45,7 +46,7 @@ impl Database {
                 .await
                 .map_err(|e| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         &e,
                         format!("audit_log_record failed: {e}"),
@@ -86,7 +87,7 @@ impl Database {
                 .await
                 .map_err(|e| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         &e,
                         format!("audit_log_list failed at cursor ({cursor}): {e}"),
@@ -97,7 +98,7 @@ impl Database {
             for item in &items {
                 let entry: AuditLogEntry = serde_json::from_str(item).map_err(|e| {
                     MediatorError::InternalError(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".into(),
                         format!("audit_log_list: deserialise failed: {e}"),
                     )

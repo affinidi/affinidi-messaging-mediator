@@ -1,3 +1,4 @@
+use crate::error_codes;
 use crate::{
     SharedData,
     common::session::Session,
@@ -27,7 +28,7 @@ pub(crate) fn process(
         && expires <= now
     {
         return Err(MediatorError::problem_with_log(
-            31,
+            error_codes::MESSAGE_EXPIRED,
             session.session_id.to_string(),
             Some(msg.id.to_string()),
             ProblemReportSorter::Error,
@@ -51,7 +52,7 @@ pub(crate) fn process(
         from.to_owned()
     } else {
         return Err(MediatorError::problem(
-            50,
+            error_codes::ANON_MESSAGE_ERROR,
             session.session_id.to_string(),
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,
@@ -75,7 +76,7 @@ pub(crate) fn process(
         Ok(response) => response,
         Err(e) => {
             return Err(MediatorError::problem_with_log(
-                89,
+                error_codes::DISCOVER_FEATURES_PARSE,
                 session.session_id.to_string(),
                 Some(msg.id.clone()),
                 ProblemReportSorter::Warning,

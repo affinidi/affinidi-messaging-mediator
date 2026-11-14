@@ -31,6 +31,7 @@
 //!
 //! [`MediatorStore::v1_routing_key_bind`]: affinidi_messaging_mediator_common::store::MediatorStore::v1_routing_key_bind
 
+use crate::error_codes;
 use affinidi_messaging_didcomm_v1::envelope::{
     self, EnvelopeProtection, ProtectedHeader, RecipientKey,
 };
@@ -122,7 +123,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
         if !state.config.didcomm_v1.enabled {
             return Err(v1_problem(
                 session,
-                37,
+                error_codes::PROTOCOL_UNSUPPORTED,
                 "protocol.unsupported",
                 "DIDComm v1 is not enabled on this mediator".to_string(),
                 StatusCode::BAD_REQUEST,
@@ -142,7 +143,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
         let opened = envelope::open(raw, &keys).map_err(|e| {
             v1_problem(
                 session,
-                37,
+                error_codes::DIDCOMM_V1_MALFORMED,
                 "message.didcomm_v1.unpack",
                 format!("couldn't open the DIDComm v1 envelope addressed to this mediator: {e}"),
                 StatusCode::BAD_REQUEST,
@@ -159,7 +160,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
             .map_err(|e| {
                 v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.malformed",
                     format!("DIDComm v1 payload is not a valid message: {e}"),
                     StatusCode::BAD_REQUEST,
@@ -174,7 +175,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
             let EnvelopeProtection::Authcrypt { sender_verkey } = opened.protection else {
                 return Err(v1_problem(
                     session,
-                    37,
+                    error_codes::DIDCOMM_V1_MALFORMED,
                     "message.didcomm_v1.anonymous_request",
                     "coordinate-mediation and message-pickup requests must be authcrypt'd: an \
                      anonymous request names no client to answer for"
@@ -199,7 +200,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
         if !forward::is_forward(&message) {
             return Err(v1_problem(
                 session,
-                37,
+                error_codes::DIDCOMM_V1_MALFORMED,
                 "message.didcomm_v1.not_forward",
                 format!(
                     "the mediator only accepts DIDComm v1 `routing/1.0/forward` messages, got `{}`",
@@ -212,7 +213,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
         let to_verkey = forward::destination(&message).map_err(|e| {
             v1_problem(
                 session,
-                37,
+                error_codes::DIDCOMM_V1_MALFORMED,
                 "message.didcomm_v1.destination",
                 format!("forward has no usable `to` verkey: {e}"),
                 StatusCode::BAD_REQUEST,
@@ -221,7 +222,7 @@ pub(crate) async fn handle_inbound_didcomm_v1(
         let inner = forward::extract_payload(&message).map_err(|e| {
             v1_problem(
                 session,
-                37,
+                error_codes::DIDCOMM_V1_MALFORMED,
                 "message.didcomm_v1.payload",
                 format!("forward has no usable `msg` payload: {e}"),
                 StatusCode::BAD_REQUEST,
@@ -326,7 +327,7 @@ async fn pack_v1_reply(
     .map_err(|e| {
         v1_problem(
             session,
-            37,
+            error_codes::MESSAGE_PACK_ERROR,
             "message.didcomm_v1.pack",
             format!("couldn't pack the DIDComm v1 reply: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,

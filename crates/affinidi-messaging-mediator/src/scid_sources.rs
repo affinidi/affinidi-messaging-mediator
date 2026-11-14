@@ -22,6 +22,7 @@
 //! The store holds at most one record per account (plus the mediator's own),
 //! each at most [`MAX_RECORD_BYTES`]; removing an account removes its record.
 
+use crate::error_codes;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use affinidi_did_resolver_cache_sdk::{
@@ -60,7 +61,7 @@ pub async fn seed(
 ) -> Result<usize, MediatorError> {
     let records = store.scid_source_list().await.map_err(|e| {
         MediatorError::DatabaseError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             format!("did:scid source records could not be read: {e}"),
         )
@@ -98,11 +99,15 @@ async fn write(
         return Ok(false);
     }
     let json = serde_json::to_string(record).map_err(|e| {
-        MediatorError::InternalError(14, "NA".into(), format!("did:scid source record: {e}"))
+        MediatorError::InternalError(
+            error_codes::DB_OPERATION_ERROR,
+            "NA".into(),
+            format!("did:scid source record: {e}"),
+        )
     })?;
     if json.len() > MAX_RECORD_BYTES {
         return Err(MediatorError::InternalError(
-            14,
+            error_codes::DB_OPERATION_ERROR,
             "NA".into(),
             format!("did:scid source record is {} bytes", json.len()),
         ));

@@ -1,3 +1,4 @@
+use crate::error_codes;
 use affinidi_messaging_mediator_common::{MediatorSecrets, errors::MediatorError};
 // `SecurityConfigRaw` (the raw TOML schema) now lives in the config crate; the
 // conversion to the runtime `SecurityConfig` stays here as an extension trait
@@ -450,7 +451,7 @@ impl SecurityConfig {
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|err| {
             tracing::error!("Could not create JWT key pair. {err}");
             MediatorError::ConfigError(
-                12,
+                error_codes::CONFIG_ERROR,
                 "NA".into(),
                 format!("Could not create JWT key pair. {err}"),
             )
@@ -600,7 +601,8 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     /// exactly as before this matcher existed (so existing exact-origin
     /// configs are unaffected).
     fn parse_origin_matcher(token: &str) -> Result<OriginMatcher, MediatorError> {
-        let config_err = |msg: String| MediatorError::ConfigError(12, "NA".into(), msg);
+        let config_err =
+            |msg: String| MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg);
 
         // No '*' ⇒ an exact origin. It must be what a browser sends in
         // `Origin` — `scheme://host[:port]`, nothing after it — or it could
@@ -688,11 +690,11 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
         let err = |e: affinidi_messaging_mediator_config::ConfigError| {
             let msg = e.to_string();
             tracing::error!("{msg}");
-            MediatorError::ConfigError(12, "NA".into(), msg)
+            MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg)
         };
         let msg_err = |msg: String| {
             tracing::error!("{msg}");
-            MediatorError::ConfigError(12, "NA".into(), msg)
+            MediatorError::ConfigError(error_codes::CONFIG_ERROR, "NA".into(), msg)
         };
         let flag = |field: &str, value: &str| {
             values::boolean(&format!("security.{field}"), value).map_err(err)
@@ -865,7 +867,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                     Secret::from_multibase(&entry.private_key_multibase, Some(&entry.key_id))
                         .map_err(|e| {
                             MediatorError::ConfigError(
-                                12,
+                                error_codes::CONFIG_ERROR,
                                 "NA".into(),
                                 format!(
                                     "Could not decode VTA operating secret '{}': {e}",
@@ -897,7 +899,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                 }
                 Ok(None) => {
                     return Err(MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!(
                             "No operating secrets found. In self-hosted mode, the backend must \
@@ -910,7 +912,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
                 Err(err) => {
                     tracing::error!("Could not load operating secrets: {err}");
                     return Err(MediatorError::ConfigError(
-                        12,
+                        error_codes::CONFIG_ERROR,
                         "NA".into(),
                         format!("Could not load operating secrets: {err}"),
                     ));
@@ -923,7 +925,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             Ok(Some(bytes)) => zeroize::Zeroizing::new(bytes),
             Ok(None) => {
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!(
                         "JWT signing secret is missing from the backend (well-known key \
@@ -934,7 +936,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             }
             Err(err) => {
                 return Err(MediatorError::ConfigError(
-                    12,
+                    error_codes::CONFIG_ERROR,
                     "NA".into(),
                     format!("Could not load JWT signing secret: {err}"),
                 ));

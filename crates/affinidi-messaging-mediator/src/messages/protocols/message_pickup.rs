@@ -4,6 +4,7 @@
  * NOTE: All messages generated from this protocol are ephemeral and are not stored in the database
  * They are fire and forget messages
  */
+use crate::error_codes;
 use affinidi_messaging_didcomm::message::{Attachment, Message};
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
@@ -96,7 +97,7 @@ pub(crate) async fn status_request(
                         recipient_did
                     );
                     return Err(MediatorError::problem_with_log(
-                        52,
+                        error_codes::SESSION_DID_MISMATCH,
                         &session.session_id,
                         Some(msg.id.clone()),
                         ProblemReportSorter::Error,
@@ -171,7 +172,7 @@ async fn generate_status_reply(
                 return e;
             }
             MediatorError::problem_with_log(
-                14,
+                error_codes::DB_OPERATION_ERROR,
                 &session.session_id,
                 Some(thid.to_string()),
                 ProblemReportSorter::Error,
@@ -264,7 +265,7 @@ pub(crate) async fn toggle_live_delivery(
                 Ok(body) => body.live_delivery,
                 Err(e) => {
                     return Err(MediatorError::problem_with_log(
-                        54,
+                        error_codes::MESSAGE_BODY_PARSE_ERROR,
                         &session.session_id,
                         Some(msg.id.clone()),
                         ProblemReportSorter::Warning,
@@ -290,7 +291,7 @@ pub(crate) async fn toggle_live_delivery(
         // answered with a status claiming it is on (R6.2).
         if live_delivery && state.streaming_task.is_none() {
             return Err(MediatorError::problem(
-                55,
+                error_codes::STREAMING_SIGNAL_ERROR,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Error,
@@ -317,7 +318,7 @@ pub(crate) async fn toggle_live_delivery(
                     .await
                     .map_err(|e| {
                         MediatorError::problem_with_log(
-                            55,
+                            error_codes::STREAMING_SIGNAL_ERROR,
                             &session.session_id,
                             Some(msg.id.clone()),
                             ProblemReportSorter::Error,
@@ -344,7 +345,7 @@ pub(crate) async fn toggle_live_delivery(
                     .await
                     .map_err(|e| {
                         MediatorError::problem_with_log(
-                            55,
+                            error_codes::STREAMING_SIGNAL_ERROR,
                             &session.session_id,
                             Some(msg.id.clone()),
                             ProblemReportSorter::Error,
@@ -532,7 +533,7 @@ pub(crate) async fn messages_received(
         let message_id_list: Vec<String> = _parse_message_received_body(session, msg)?;
         if message_id_list.len() > MAX_RECEIVED_IDS {
             return Err(MediatorError::problem_with_log(
-                53,
+                error_codes::INVALID_LIMIT,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Warning,
@@ -686,7 +687,7 @@ fn _parse_message_received_body(
             Ok(body) => body.message_id_list,
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    54,
+                    error_codes::MESSAGE_BODY_PARSE_ERROR,
                     &session.session_id,
                     Some(msg.id.clone()),
                     ProblemReportSorter::Warning,
@@ -714,7 +715,7 @@ fn _parse_and_validate_delivery_request_body(
             Ok(body) => (body.recipient_did, body.limit),
             Err(e) => {
                 return Err(MediatorError::problem_with_log(
-                    54,
+                    error_codes::MESSAGE_BODY_PARSE_ERROR,
                     &session.session_id,
                     Some(msg.id.clone()),
                     ProblemReportSorter::Warning,
@@ -735,7 +736,7 @@ fn _parse_and_validate_delivery_request_body(
         )
     {
         return Err(MediatorError::problem_with_log(
-            52,
+            error_codes::SESSION_DID_MISMATCH,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Error,
@@ -750,7 +751,7 @@ fn _parse_and_validate_delivery_request_body(
 
     if !(MIN_RETRIEVED_MSGS..=MAX_RETRIEVED_MSGS).contains(&limit) {
         return Err(MediatorError::problem_with_log(
-            53,
+            error_codes::INVALID_LIMIT,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,
@@ -780,7 +781,7 @@ fn _validate_msg(
     // Message can not be anonymous
     if msg.from.is_none() {
         return Err(MediatorError::problem(
-            50,
+            error_codes::ANON_MESSAGE_ERROR,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,
@@ -800,7 +801,7 @@ fn _validate_msg(
                 header
             );
             return Err(MediatorError::problem_with_log(
-                49,
+                error_codes::PICKUP_RETURN_ROUTE_ERROR,
                 &session.session_id,
                 Some(msg.id.clone()),
                 ProblemReportSorter::Warning,
@@ -815,7 +816,7 @@ fn _validate_msg(
     } else {
         debug!("return_route: extra-header does not exist!");
         return Err(MediatorError::problem(
-            49,
+            error_codes::PICKUP_RETURN_ROUTE_ERROR,
             &session.session_id,
             Some(msg.id.clone()),
             ProblemReportSorter::Warning,

@@ -1,32 +1,43 @@
 //! Refusing a Trust Task with a `trust-task-error` document (Trust Tasks SPEC
 //! §8) instead of a DIDComm problem report.
 //!
+//! Every Trust Task refusal carries a Trust Task error code: one of the
+//! framework's standard codes (SPEC §8.3: `permissionDenied`,
+//! `malformedRequest`, `unavailable`, …) or a `<task>:<code>` the task's
+//! specification declares (`messaging/account/get:unknownAccount`). Handlers
+//! refuse with [`tt_problem`](super::trust_tasks::tt_problem), and
+//! [`normalize`] turns anything else a handler's helpers return (a storage
+//! failure, an authorization check shared with DIDComm) into the standard
+//! code that says the same thing, at the one boundary every transport passes
+//! through ([`consume`](super::trust_tasks::consume)).
+//!
+//! A refusal is sent as a `trust-task-error` document, signed by the mediator
+//! as a response is, over whichever transport carried the request (DIDComm
+//! over REST or WebSocket, TSP, a mux connection). It falls back to a problem
+//! report `e.p.<code>`, with the same code, only where no document can be
+//! sent:
+//!
+//! - the request is not a Trust Task document (there is no `id` or `type` to
+//!   answer), or it arrived without an authenticated sender;
+//! - the sender is not the session's own authenticated DID (a relay-only
+//!   session, or a TSP frame signed by another DID). A document costs a
+//!   signature and a stored message, as a response does, and a sender that
+//!   could never get a response must not be able to make the mediator sign
+//!   and store anything;
+//! - the document could not be built or signed: the refusal is then never
+//!   lost to its own encoding.
+//!
 //! The DIDComm binding is explicit that a problem report is not an error
-//! response (`didcomm/0.2` §4.1): it names a DIDComm message, not a document,
-//! and carries none of `inResponseTo`, `retryable` or the `details` a
-//! specification declares for its codes (`currentEpoch` for
-//! `messaging/mux/revoke-all:epochMismatch`). This mediator has always
-//! answered with problem reports, and its clients match on their codes, so
-//! the document is sent only to a request that asks for it, with the
-//! top-level member [`ERROR_FORMAT_MEMBER`] (SPEC §4.2 allows additional
-//! top-level members; the proof covers it). Every other request is refused as
-//! before.
+//! response (`didcomm/0.2` §4.1), which is why the document is the answer.
+//! A request may still carry `x-errorFormat: trust-task-error` (SDK 0.46
+//! sends it); it is no longer needed.
 //!
-//! What a refusal says is decided where it was always decided, as a
-//! [`MediatorError`]. This module only changes its form:
-//!
-//! - A code a specification declares (`messaging/mux/…:…`) or a standard code
-//!   is sent as it is, with the `details` its specification declares where
-//!   the refusal carries them (the problem report's `args`).
-//! - The mediator's own codes (`authorization.admin_required`,
-//!   `message.trust_task.stale`, …) are not valid `trust-task-error` codes.
-//!   They are translated into the standard code that says the same thing,
-//!   and the original goes in `details.mediatorCode`, so a client that
-//!   matched it can still.
-//! - An internal failure says only that there was one: its text stays in the
-//!   log, as it does for an HTTP client.
+//! An internal failure says only that there was one: its text stays in the
+//! log, as it does for an HTTP client.
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
+use http::StatusCode;
 use serde_json::{Value, json};
 use std::str::FromStr;
 use trust_tasks_rs::{ErrorPayload, StandardCode, TrustTask, TrustTaskCode};
@@ -34,25 +45,14 @@ use uuid::Uuid;
 
 use crate::SharedData;
 use crate::common::session::Session;
+use crate::error_codes;
 use crate::messages::protocols::trust_task_sign;
-
-/// Top-level request member asking for refusals as `trust-task-error`
-/// documents. The same name as the SDK's `ERROR_FORMAT_MEMBER`.
-pub(crate) const ERROR_FORMAT_MEMBER: &str = "x-errorFormat";
-
-/// The value of [`ERROR_FORMAT_MEMBER`] that asks for them.
-pub(crate) const ERROR_FORMAT_DOCUMENT: &str = "trust-task-error";
-
-/// The `details` member naming the mediator's own code for a refusal it
-/// translated into a standard one.
-pub(crate) const MEDIATOR_CODE_DETAIL: &str = "mediatorCode";
 
 /// `message` is bounded by the `trust-task-error` schema.
 const MESSAGE_MAX: usize = 1024;
 
 /// What a refusal needs from the request it refuses, kept before the
-/// request is consumed. Only a request that asked for `trust-task-error`
-/// documents has one.
+/// request is consumed.
 pub(crate) struct Refusing {
     /// The request without its payload: the builders read its `id`, `type`,
     /// `threadId` and `ceremony`.
@@ -60,17 +60,13 @@ pub(crate) struct Refusing {
 }
 
 impl Refusing {
-    /// `Some` when `doc` asks to be refused with a `trust-task-error`.
-    pub(crate) fn asked_by(doc: &TrustTask<Value>) -> Option<Self> {
-        if doc.extra.get(ERROR_FORMAT_MEMBER).and_then(Value::as_str) != Some(ERROR_FORMAT_DOCUMENT)
-        {
-            return None;
-        }
+    /// Keep what a refusal of `doc` needs.
+    pub(crate) fn of(doc: &TrustTask<Value>) -> Self {
         let mut request = TrustTask::new(doc.id.clone(), doc.type_uri.clone(), Value::Null);
         request.thread_id = doc.thread_id.clone();
         request.parent_thread_id = doc.parent_thread_id.clone();
         request.ceremony = doc.ceremony.clone();
-        Some(Self { request })
+        Self { request }
     }
 
     /// The `trust-task-error` refusing the request with `e`, from the
@@ -78,17 +74,11 @@ impl Refusing {
     /// also the address SPEC §8.1 requires under `identityMismatch`), signed
     /// as a success response is.
     ///
-    /// `None` when `e` has no form here, or the document could not be built
-    /// or signed: the request is then refused as before, with `e`, so a
-    /// refusal is never lost to its own encoding.
-    ///
-    /// `None` too, so the request is refused with a problem report on the
-    /// connection, unless `session` is an authenticated session of
-    /// `sender_did`: the one case in which the request could have succeeded.
-    /// A document costs a signature and a stored message, as a response does;
-    /// a sender that could never get a response (a relay-only session, or a
-    /// TSP frame signed by another DID than the session's) must not be able
-    /// to make the mediator sign and store anything.
+    /// `None` when `e` is not a refusal of the task (a session or transport
+    /// failure), when `session` is not an authenticated session of
+    /// `sender_did`, or when the document could not be built or signed: the
+    /// request is then refused with `e` as a problem report (see the module
+    /// documentation).
     pub(crate) async fn document(
         &self,
         e: &MediatorError,
@@ -143,6 +133,68 @@ fn is_server_side(e: &MediatorError) -> bool {
     }
 }
 
+/// `e` as a refusal under a Trust Task error code, so the problem report a
+/// transport falls back to carries the same code a `trust-task-error` would.
+///
+/// A refusal that already carries one is returned as it is. Any other
+/// refusal becomes the standard code that says the same thing (a storage
+/// failure `unavailable`, a shared authorization check `permissionDenied`,
+/// an internal error `internalError` with its text kept for the log only).
+/// A session or transport failure, which is not a refusal of the task, is
+/// left as it is.
+pub(crate) fn normalize(e: MediatorError) -> MediatorError {
+    if let MediatorError::MediatorError(_, _, _, report, _, _) = &e
+        && error_codes::trust_task_code(descriptor(&report.code)).is_some()
+    {
+        return e;
+    }
+    let Some(payload) = error_payload(&e) else {
+        return e;
+    };
+    let code = payload.code.to_string();
+    let message = payload.message.clone().unwrap_or_default();
+    let (session, msg_id, status) = match &e {
+        MediatorError::MediatorError(_, session, msg_id, _, status, _) => {
+            (session.clone(), msg_id.clone(), *status)
+        }
+        MediatorError::PermissionError(_, session, _) => {
+            (session.clone(), None, StatusCode::FORBIDDEN.as_u16())
+        }
+        MediatorError::ACLDenied(..) => (String::new(), None, StatusCode::FORBIDDEN.as_u16()),
+        MediatorError::RequestDataError(_, session, _)
+        | MediatorError::ParseError(_, session, ..) => {
+            (session.clone(), None, StatusCode::BAD_REQUEST.as_u16())
+        }
+        MediatorError::DatabaseError(_, session, _) => (
+            session.clone(),
+            None,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        ),
+        MediatorError::InternalError(_, session, _)
+        | MediatorError::ErrorHandlingError(_, session, _)
+        | MediatorError::ConfigError(_, session, _)
+        | MediatorError::MessagePackError(_, session, _) => (
+            session.clone(),
+            None,
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        ),
+        _ => return e,
+    };
+    tracing::debug!(code, cause = %e, "Trust Task refusal under its Trust Task code");
+    MediatorError::problem_with_log(
+        error_codes::trust_task_code(&code).unwrap_or(error_codes::TT_TASK_FAILED),
+        session,
+        msg_id,
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        &code,
+        &message,
+        vec![],
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        e.to_string(),
+    )
+}
+
 /// The `trust-task-error` payload for `e`. `None` for a failure this module
 /// leaves in its old form (a session or transport failure, which is not a
 /// refusal of the task).
@@ -150,16 +202,14 @@ pub(crate) fn error_payload(e: &MediatorError) -> Option<ErrorPayload> {
     let (payload, message) = match e {
         MediatorError::MediatorError(_, _, _, report, status, _) => {
             let descriptor = descriptor(&report.code);
-            let payload = match TrustTaskCode::from_str(descriptor) {
-                Ok(code) => {
-                    let payload = ErrorPayload::new(code);
-                    match declared_details(descriptor, &report.args) {
-                        Some(details) => payload.with_details(details),
-                        None => payload,
-                    }
-                }
-                Err(_) => ErrorPayload::new(translate(descriptor, *status))
-                    .with_details(json!({ MEDIATOR_CODE_DETAIL: descriptor })),
+            let code = match TrustTaskCode::from_str(descriptor) {
+                Ok(code) if error_codes::trust_task_code(descriptor).is_some() => code,
+                _ => TrustTaskCode::Standard(translate(descriptor, *status)),
+            };
+            let server_side = matches!(code, TrustTaskCode::Standard(StandardCode::InternalError));
+            let payload = match declared_details(descriptor, &report.args) {
+                Some(details) => ErrorPayload::new(code).with_details(details),
+                None => ErrorPayload::new(code),
             };
             let payload = if retryable_status(*status) {
                 payload.with_retryable(true)
@@ -171,6 +221,7 @@ pub(crate) fn error_payload(e: &MediatorError) -> Option<ErrorPayload> {
                 TrustTaskCode::Standard(StandardCode::IdentityMismatch) => {
                     "in-band identity does not match the transport-authenticated sender".to_string()
                 }
+                _ if server_side => "internal error".to_string(),
                 _ => report.interpolation(),
             };
             (payload, message)
@@ -233,36 +284,28 @@ fn declared_details(code: &str, args: &[String]) -> Option<Value> {
     }
 }
 
-/// The standard code for one of the mediator's own codes.
+/// The standard code for a refusal raised outside the Trust Task handlers
+/// (a storage cap, an authorization check shared with DIDComm), by what its
+/// problem code and status say.
 fn translate(descriptor: &str, status: u16) -> StandardCode {
     match descriptor {
-        "protocol.trust_task.unsupported" => StandardCode::UnsupportedType,
-        "message.trust_task.stale" => StandardCode::Expired,
-        "message.trust_task.identity_mismatch" => StandardCode::IdentityMismatch,
-        "message.trust_task.proof_required" => StandardCode::ProofRequired,
-        "message.trust_task.proof_invalid" => StandardCode::ProofInvalid,
-        "message.trust_task.id_conflict" => StandardCode::IdConflict,
-        "message.trust_task.unavailable" => StandardCode::Unavailable,
-        "message.trust_task.rejected" | "message.trust_task.malformed" => {
-            StandardCode::MalformedRequest
-        }
-        d if d.starts_with("authorization.") || d.ends_with(".protected") => {
+        d if d.starts_with("authorization.") || d.starts_with("authentication.") => {
             StandardCode::PermissionDenied
         }
+        d if d.starts_with("me.res.storage.") => StandardCode::Unavailable,
         _ => match status {
-            400 | 413 | 422 => StandardCode::MalformedRequest,
+            400 | 404 | 409 | 413 | 422 => StandardCode::MalformedRequest,
             401 | 403 => StandardCode::PermissionDenied,
-            429 | 502 | 503 | 504 => StandardCode::Unavailable,
+            429 | 502 | 503 | 504 | 507 => StandardCode::Unavailable,
             501 => StandardCode::UnsupportedType,
-            500 => StandardCode::InternalError,
-            _ => StandardCode::TaskFailed,
+            _ => StandardCode::InternalError,
         },
     }
 }
 
 /// Statuses the mediator gives a refusal worth sending again.
 fn retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 502 | 503 | 504)
+    matches!(status, 429 | 502 | 503 | 504 | 507)
 }
 
 fn bounded(mut message: String) -> String {
@@ -281,14 +324,10 @@ fn bounded(mut message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use affinidi_messaging_sdk::messages::problem_report::{
-        ProblemReportScope, ProblemReportSorter,
-    };
-    use http::StatusCode;
 
     fn problem(code: &str, args: Vec<String>, status: StatusCode) -> MediatorError {
         MediatorError::problem(
-            37,
+            crate::error_codes::trust_task_code(code).unwrap_or(crate::error_codes::INTERNAL_ERROR),
             "s1",
             None,
             ProblemReportSorter::Error,
@@ -347,45 +386,96 @@ mod tests {
     }
 
     #[test]
-    fn a_mediator_code_is_translated_and_kept_in_details() {
+    fn a_standard_code_is_sent_as_it_is() {
+        for code in [
+            "permissionDenied",
+            "malformedRequest",
+            "unsupportedType",
+            "expired",
+        ] {
+            let p = wire(error_payload(&problem(code, vec![], StatusCode::FORBIDDEN)).unwrap());
+            assert_eq!(p["code"], code);
+            assert!(
+                p.get("details").is_none(),
+                "{code}: no mediatorCode any more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_from_shared_code_gets_the_standard_code_that_says_the_same() {
         let cases = [
             (
-                "authorization.admin_required",
+                "authorization.sender.mismatch",
                 StatusCode::FORBIDDEN,
                 "permissionDenied",
             ),
             (
-                "protocol.trust_task.unsupported",
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupportedType",
+                "me.res.storage.full",
+                StatusCode::INSUFFICIENT_STORAGE,
+                "unavailable",
             ),
             (
-                "message.trust_task.stale",
-                StatusCode::BAD_REQUEST,
-                "expired",
-            ),
-            (
-                "message.trust_task.proof_required",
-                StatusCode::BAD_REQUEST,
-                "proofRequired",
-            ),
-            (
-                "account.remove.protected",
-                StatusCode::FORBIDDEN,
-                "permissionDenied",
-            ),
-            ("account.not_found", StatusCode::NOT_FOUND, "taskFailed"),
-            (
-                "storageError",
+                "me.res.storage.busy",
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
             ),
+            (
+                "something.else",
+                StatusCode::BAD_REQUEST,
+                "malformedRequest",
+            ),
         ];
-        for (legacy, status, standard) in cases {
-            let p = wire(error_payload(&problem(legacy, vec![], status)).unwrap());
-            assert_eq!(p["code"], standard, "{legacy}");
-            assert_eq!(p["details"][MEDIATOR_CODE_DETAIL], legacy);
+        for (shared, status, standard) in cases {
+            let e = MediatorError::problem(
+                crate::error_codes::INTERNAL_ERROR,
+                "s1",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                shared,
+                "the comment",
+                vec![],
+                status,
+            );
+            let p = wire(error_payload(&e).unwrap());
+            assert_eq!(p["code"], standard, "{shared}");
+            let MediatorError::MediatorError(number, _, _, report, s, _) = normalize(e) else {
+                panic!("a refusal stays a problem report");
+            };
+            assert_eq!(report.code, format!("e.p.{standard}"), "{shared}");
+            assert_eq!(Some(number), crate::error_codes::trust_task_code(standard));
+            assert_eq!(s, status.as_u16());
         }
+    }
+
+    #[test]
+    fn normalize_keeps_a_trust_task_code_and_its_arguments() {
+        let e = problem(
+            "messaging/mux/revoke-all:epochMismatch",
+            vec!["3".into()],
+            StatusCode::BAD_REQUEST,
+        );
+        let MediatorError::MediatorError(number, _, _, report, ..) = normalize(e) else {
+            panic!("unchanged");
+        };
+        assert_eq!(number, crate::error_codes::TT_DECLARED);
+        assert_eq!(report.args, vec!["3".to_string()]);
+    }
+
+    #[test]
+    fn a_malformed_payload_is_a_400_malformed_request() {
+        let e = normalize(MediatorError::RequestDataError(
+            crate::error_codes::TT_MALFORMED_REQUEST,
+            "s1".into(),
+            "invalid ACL payload".into(),
+        ));
+        let MediatorError::MediatorError(number, _, _, report, status, _) = e else {
+            panic!("a problem report");
+        };
+        assert_eq!(number, crate::error_codes::TT_MALFORMED_REQUEST);
+        assert_eq!(report.code, "e.p.malformedRequest");
+        assert_eq!(status, 400);
     }
 
     #[test]
@@ -405,15 +495,15 @@ mod tests {
     #[test]
     fn an_identity_mismatch_names_no_identity() {
         let e = MediatorError::problem(
-            37,
+            crate::error_codes::TT_IDENTITY_MISMATCH,
             "s1",
             None,
             ProblemReportSorter::Error,
             ProblemReportScope::Protocol,
-            "message.trust_task.identity_mismatch",
+            "identityMismatch",
             "issuer did:example:alice is not the sender did:example:mallory",
             vec![],
-            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
         );
         let p = wire(error_payload(&e).unwrap());
         assert_eq!(p["code"], "identityMismatch");
@@ -424,7 +514,7 @@ mod tests {
     fn an_internal_failure_keeps_its_text_out_of_the_answer() {
         let p = wire(
             error_payload(&MediatorError::DatabaseError(
-                1,
+                crate::error_codes::DB_OPERATION_ERROR,
                 "s1".into(),
                 "redis://10.0.0.5:6379 refused".into(),
             ))
@@ -433,30 +523,29 @@ mod tests {
         assert_eq!(p["code"], "unavailable");
         assert_eq!(p["retryable"], true);
         assert!(!p["message"].as_str().unwrap().contains("redis"));
+
+        let e = normalize(MediatorError::InternalError(
+            crate::error_codes::INTERNAL_ERROR,
+            "s1".into(),
+            "secret detail".into(),
+        ));
+        let MediatorError::MediatorError(_, _, _, report, status, _) = e else {
+            panic!("a problem report");
+        };
+        assert_eq!(report.code, "e.p.internalError");
+        assert_eq!(status, 500);
+        assert!(!report.comment.contains("secret"));
     }
 
     #[test]
     fn a_session_failure_keeps_its_old_form() {
-        assert!(
-            error_payload(&MediatorError::SessionError(1, "s1".into(), "gone".into())).is_none()
+        let e = MediatorError::SessionError(
+            crate::error_codes::SESSION_INVALID_STATE,
+            "s1".into(),
+            "gone".into(),
         );
-    }
-
-    #[test]
-    fn only_a_request_that_asks_is_refused_with_a_document() {
-        let mut doc: TrustTask<Value> = serde_json::from_value(json!({
-            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
-            "type": "https://trusttasks.org/spec/messaging/mux/revoke-all/0.1",
-            "payload": {}
-        }))
-        .unwrap();
-        assert!(Refusing::asked_by(&doc).is_none());
-        doc.extra
-            .insert(ERROR_FORMAT_MEMBER.into(), json!(ERROR_FORMAT_DOCUMENT));
-        assert!(Refusing::asked_by(&doc).is_some());
-        doc.extra
-            .insert(ERROR_FORMAT_MEMBER.into(), json!("something-else"));
-        assert!(Refusing::asked_by(&doc).is_none());
+        assert!(error_payload(&e).is_none());
+        assert!(matches!(normalize(e), MediatorError::SessionError(..)));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Handles scanning, adding and removing DID accounts from the mediator
 use super::Database;
+use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::types::{DeletionAuthority, Session};
 use crate::types::{
@@ -57,7 +58,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to check account existence. Reason: {err}"),
@@ -90,7 +91,7 @@ impl Database {
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to get account details. Reason: {err}"),
@@ -160,7 +161,7 @@ return 1
             .await
             .map_err(|err| {
                 MediatorError::database_from_redis(
-                    14,
+                    error_codes::DB_OPERATION_ERROR,
                     "NA".to_string(),
                     &err,
                     format!("Failed to add account. Reason: {err}"),
@@ -180,7 +181,7 @@ return 1
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to list account. Reason: {err}"),
@@ -223,13 +224,13 @@ return 1
             if let Some(current) = &current {
                 if current._type == AccountType::Mediator {
                     return Err(MediatorError::InternalError(
-                        18,
+                        error_codes::PROTECTED_ACCOUNT_ERROR,
                         "NA".to_string(),
                         "Cannot remove the mediator account".to_string(),
                     ));
                 } else if current._type == AccountType::RootAdmin {
                     return Err(MediatorError::InternalError(
-                        18,
+                        error_codes::PROTECTED_ACCOUNT_ERROR,
                         "NA".to_string(),
                         "Cannot remove the root admin account".to_string(),
                     ));
@@ -293,7 +294,7 @@ return 1
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to remove DID ({did_hash}) records. Reason: {err}"),
@@ -332,7 +333,7 @@ return 1
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to scan access list at cursor ({cursor}). Reason: {err}"),
@@ -352,7 +353,7 @@ return 1
             let did_results: Vec<HashMap<String, String>> =
                 self.query_each(&mut con, did_query).await.map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to get DID details. Reason: {err}"),
@@ -364,7 +365,7 @@ return 1
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to get DID access list count. Reason: {err}"),
@@ -422,7 +423,7 @@ return 1
                 .await
                 .map_err(|err| {
                     MediatorError::database_from_redis(
-                        14,
+                        error_codes::DB_OPERATION_ERROR,
                         "NA".to_string(),
                         &err,
                         format!("Failed to change account type. Reason: {err}"),
@@ -495,7 +496,7 @@ return 1
                     .await
                     .map_err(|err| {
                         MediatorError::database_from_redis(
-                            14,
+                            error_codes::DB_OPERATION_ERROR,
                             "NA".to_string(),
                             &err,
                             format!("Failed to change queue limit ({queue_name}). Reason: {err}"),
@@ -511,7 +512,7 @@ return 1
                     .await
                     .map_err(|err| {
                         MediatorError::database_from_redis(
-                            23,
+                            error_codes::DB_OPERATION_ERROR,
                             "NA".to_string(),
                             &err,
                             format!("Failed to change queue limit ({queue_name}). Reason: {err}"),

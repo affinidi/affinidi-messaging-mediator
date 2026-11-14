@@ -74,14 +74,14 @@ impl Rejection {
     /// Stable problem-report code for this rejection.
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Rejection::Stale(_) => "message.trust_task.stale",
-            Rejection::IdentityMismatch { .. } => "message.trust_task.identity_mismatch",
-            Rejection::ProofRequired => "message.trust_task.proof_required",
-            Rejection::ProofInvalid(_) => "message.trust_task.proof_invalid",
-            Rejection::PolicyViolation(_) => "message.trust_task.rejected",
-            Rejection::Duplicate => "message.trust_task.duplicate",
-            Rejection::IdConflict => "message.trust_task.id_conflict",
-            Rejection::RecordUnavailable(_) => "message.trust_task.unavailable",
+            Rejection::Stale(_) => "expired",
+            Rejection::IdentityMismatch { .. } => "identityMismatch",
+            Rejection::ProofRequired => "proofRequired",
+            Rejection::ProofInvalid(_) => "proofInvalid",
+            Rejection::PolicyViolation(_) => "malformedRequest",
+            Rejection::Duplicate => "idConflict",
+            Rejection::IdConflict => "idConflict",
+            Rejection::RecordUnavailable(_) => "unavailable",
         }
     }
 
