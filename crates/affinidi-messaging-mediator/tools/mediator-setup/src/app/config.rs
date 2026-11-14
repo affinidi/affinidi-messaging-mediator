@@ -365,7 +365,7 @@ pub struct WizardConfig {
     /// `cors_mode == "list"`. Each entry is an exact, scheme-qualified
     /// origin (`https://app.affinidi.com`) or a leftmost-label sub-domain
     /// wildcard (`https://*.affinidi.com`). Validated by
-    /// [`validate_cors_domains`] before the wizard accepts it.
+    /// [`validate_cors_domains`](super::validate::validate_cors_domains) before the wizard accepts it.
     pub cors_domains: String,
     pub database_url: String,
     /// Storage backend the generated `mediator.toml` selects:
