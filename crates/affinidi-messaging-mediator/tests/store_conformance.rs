@@ -3624,6 +3624,99 @@ async fn check_purge_reports(store: Arc<dyn MediatorStore>) {
     assert_eq!(queue_counters(&store, to).await.0, 0);
 }
 
+/// A filtered purge's arrival bound (`arrived_before_ms`, what
+/// `messaging/queue/purge`'s `storedBefore` and `olderThanSeconds` become)
+/// is inclusive, combines with `peer`, and is the same for a dry run and the
+/// real purge: a purge bounded at a dry run's instant removes only what that
+/// dry run could have counted, never a message stored after it.
+async fn check_purge_arrival_bound(store: Arc<dyn MediatorStore>) {
+    use affinidi_messaging_mediator_common::store::{DeletionAuthority, PurgeFilter};
+    use affinidi_messaging_mediator_common::types::messages::Folder;
+    let to = "did_hash_purge_bound_to";
+    let (p1, p2) = ("did_hash_purge_bound_p1", "did_hash_purge_bound_p2");
+    store
+        .account_add(to, &allow_all(), None)
+        .await
+        .expect("account_add");
+    let stamp = |n: &str| format!("{{\"protected\":\"purge-bound-{n}\"}}");
+    store
+        .store_message("s", &stamp("a"), to, Some(p1), NEVER, 0)
+        .await
+        .expect("store a");
+    store
+        .store_message("s", &stamp("b"), to, Some(p2), NEVER, 0)
+        .await
+        .expect("store b");
+    // The bound: the later arrival of the first two, read back from the
+    // store's own stamps (the stores stamp arrivals; the test cannot).
+    let listed = store
+        .list_messages(to, Folder::Inbox, None, 100)
+        .await
+        .expect("list");
+    let bound = listed
+        .iter()
+        .map(|e| e.timestamp)
+        .max()
+        .expect("two listed");
+    // Stored strictly after the bound: past the millisecond the bound names.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    store
+        .store_message("s", &stamp("c"), to, Some(p1), NEVER, 0)
+        .await
+        .expect("store c");
+
+    let filter = |peer: Option<&str>, dry_run: bool| PurgeFilter {
+        peer: peer.map(str::to_string),
+        arrived_before_ms: Some(bound),
+        dry_run,
+    };
+    let owner = DeletionAuthority::Owner {
+        did_hash: to.to_string(),
+    };
+
+    let all = store
+        .purge_folder_filtered_by(to, Folder::Inbox, &filter(None, true), owner.clone())
+        .await
+        .expect("dry run");
+    assert_eq!(all.count, 2, "at or before the bound, not after it");
+    assert_eq!(all.scanned, 3);
+
+    let one = store
+        .purge_folder_filtered_by(to, Folder::Inbox, &filter(Some(p1), true), owner.clone())
+        .await
+        .expect("dry run with a peer");
+    assert_eq!(one.count, 1, "the bound and the peer both narrow");
+
+    let purged = store
+        .purge_folder_filtered_by(to, Folder::Inbox, &filter(Some(p1), false), owner.clone())
+        .await
+        .expect("purge");
+    assert_eq!(
+        purged.count, 1,
+        "the real purge removes what the dry run counted"
+    );
+    assert_eq!(purged.failed, 0);
+    let left = store
+        .list_messages(to, Folder::Inbox, None, 100)
+        .await
+        .expect("list after");
+    assert_eq!(
+        left.len(),
+        2,
+        "the other peer's message and the later one stay"
+    );
+    assert!(
+        left.iter().any(|e| e.timestamp > bound),
+        "the message stored after the bound survives a purge of its peer"
+    );
+
+    // Tidy, so the shared Redis DB 0 sequence sees an empty inbox.
+    store
+        .purge_folder("s", to, Folder::Inbox)
+        .await
+        .expect("purge the rest");
+}
+
 /// A removed account stays removed while its sent messages are delivered and
 /// deleted afterwards; and `account_add`'s queue limit is kept as both
 /// limits.
@@ -4782,6 +4875,7 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     check_forward_queue_delayed_entry_survives_its_reader(store.clone()).await;
     check_forward_queue_ack_and_delete(store.clone()).await;
     check_purge_reports(store.clone()).await;
+    check_purge_arrival_bound(store.clone()).await;
     check_removed_sender_stays_removed(store.clone()).await;
     check_shared_semantics(store.clone()).await;
     check_same_body_for_two_recipients(store.clone()).await;
@@ -5019,6 +5113,10 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn purge_reports() {
                 check_purge_reports(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn purge_arrival_bound() {
+                check_purge_arrival_bound(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn removed_sender_stays_removed() {
