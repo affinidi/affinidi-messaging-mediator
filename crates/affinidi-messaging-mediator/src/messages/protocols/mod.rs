@@ -89,9 +89,14 @@ pub(crate) fn addressed_to_mediator(
 ///
 /// An empty allowlist accepts any peer (the relay capability is still gated by
 /// ACLs); a non-empty list admits only its members, and rejects an anonymous
-/// (`None`) peer outright.
+/// (`None`) peer outright. Membership is by account
+/// ([`same_account`](affinidi_messaging_mediator_common::did_identity::same_account)),
+/// so a did:scid peer is recognised whichever `src` locator either side names.
 pub(crate) fn relay_peer_trusted(allow: &ahash::AHashSet<String>, from: Option<&str>) -> bool {
-    allow.is_empty() || matches!(from, Some(did) if allow.contains(did))
+    use affinidi_messaging_mediator_common::did_identity::same_account;
+    allow.is_empty()
+        || matches!(from, Some(did) if allow.contains(did)
+            || allow.iter().any(|trusted| same_account(trusted, did)))
 }
 
 #[cfg(test)]
@@ -116,5 +121,16 @@ mod tests {
         assert!(!relay_peer_trusted(&allow, Some("did:peer:stranger")));
         // A non-empty allowlist rejects an anonymous relaying peer.
         assert!(!relay_peer_trusted(&allow, None));
+    }
+
+    #[test]
+    fn relay_peer_trusted_matches_by_account() {
+        let allow = allowlist(&["did:scid:vh:1:QmPeer?src=peer.example"]);
+        assert!(relay_peer_trusted(&allow, Some("did:scid:vh:1:QmPeer")));
+        assert!(relay_peer_trusted(
+            &allow,
+            Some("did:scid:vh:1:QmPeer?src=moved.example")
+        ));
+        assert!(!relay_peer_trusted(&allow, Some("did:scid:vh:1:QmOther")));
     }
 }

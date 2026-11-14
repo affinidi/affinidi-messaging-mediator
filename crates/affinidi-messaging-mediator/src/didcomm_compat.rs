@@ -1,8 +1,8 @@
-//! Compatibility module that bridges the old `affinidi-messaging-didcomm` API
-//! with the new `affinidi-messaging-didcomm` crate.
+//! The mediator's adapter over the `affinidi-messaging-didcomm` crate.
 //!
-//! Provides `MetaEnvelope`, `unpack`, and `pack_encrypted` functionality
-//! that the mediator previously obtained from the legacy DIDComm crate.
+//! Provides `MetaEnvelope` (routing headers read without decrypting),
+//! `unpack`, and `pack_encrypted`, shaped the way the mediator's inbound and
+//! outbound paths use them.
 //!
 //! ## Cost
 //!

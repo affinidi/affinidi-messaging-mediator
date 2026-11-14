@@ -127,6 +127,8 @@ use http::StatusCode;
 #[cfg(feature = "didcomm")]
 use protocols::{message_pickup, routing};
 pub(crate) mod client_delete;
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+pub(crate) mod delivery_gate;
 #[cfg(feature = "didcomm")]
 pub mod error_response;
 pub mod inbound;
@@ -255,6 +257,11 @@ impl MessageType {
 
 /// Type of message wrapper we are dealing with
 /// used when storing messages in the database
+#[deprecated(
+    note = "no longer used by the mediator: a handler's outcome is `ProcessMessageResponse`; \
+            removed at the next breaking release"
+)]
+#[allow(deprecated)]
 #[derive(Debug, Default)]
 pub enum WrapperType {
     /// to_did, message, expires_at
@@ -264,18 +271,35 @@ pub enum WrapperType {
     #[default]
     None,
 }
-#[derive(Debug, Default)]
+/// What handling a DIDComm message addressed to the mediator produced, and so
+/// what [`store::store_message`] does with it.
+#[derive(Debug)]
 #[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
-pub(crate) struct ProcessMessageResponse {
-    pub store_message: bool,
-    pub force_live_delivery: bool, // Will force a live delivery attempt.
-    pub forward_message: bool, // Set to true if the message was forwarded. Means we don't need to store it.
-    pub data: WrapperType,
-    /// Stored messages this reply hands to their recipient (a Message Pickup
-    /// `delivery`). Recorded — stamped delivered, reported `delivered` — only
-    /// once the reply is packed and handed to a transport, never by the
-    /// handler that built it (R1.1); see [`crate::after_write`].
-    pub handed_over: Option<crate::after_write::HandedOver>,
+pub(crate) enum ProcessMessageResponse {
+    /// A reply the mediator authored, packed for and stored in the inbox of
+    /// each of its recipients (and live-pushed where a socket is live).
+    #[cfg(feature = "didcomm")]
+    Reply(Box<Message>),
+    /// A reply packed for the session's own DID and returned to the caller —
+    /// the REST body, or a live push — but never stored.
+    #[cfg(feature = "didcomm")]
+    EphemeralReply {
+        message: Box<Message>,
+        /// Push to a socket that has not enabled live delivery as well.
+        force_live_delivery: bool,
+        /// Stored messages this reply hands to their recipient (a Message
+        /// Pickup `delivery`). Recorded — stamped delivered, reported
+        /// `delivered` — only once the reply is packed and handed to a
+        /// transport, never by the handler that built it (R1.1); see
+        /// [`crate::after_write`].
+        handed_over: Option<crate::after_write::HandedOver>,
+    },
+    /// The message was a forward, accepted for delivery or relay: nothing to
+    /// store and nothing to answer.
+    Forwarded,
+    /// The handler produced nothing to send (a ping that asked for no
+    /// response, a Trust Task ping answered with silence).
+    Nothing,
 }
 
 /// Options for packing a message

@@ -45,11 +45,13 @@ pub(crate) fn generate_error_response(
         .extra
         .insert("ack".into(), json!([thid.to_owned()]));
 
-    Ok(ProcessMessageResponse {
-        handed_over: None,
-        store_message,
-        force_live_delivery: false,
-        data: super::WrapperType::Message(Box::new(error_msg)),
-        forward_message: false,
+    Ok(if store_message {
+        ProcessMessageResponse::Reply(Box::new(error_msg))
+    } else {
+        ProcessMessageResponse::EphemeralReply {
+            message: Box::new(error_msg),
+            force_live_delivery: false,
+            handed_over: None,
+        }
     })
 }

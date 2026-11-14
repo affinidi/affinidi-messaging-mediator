@@ -25,9 +25,9 @@
 //!
 //! v1 has no DID anywhere in the envelope. The `to` is a bare Ed25519 verkey,
 //! resolved to a local account through the store's routing-key index (see
-//! [`V1RoutingKeyStore::v1_routing_key_bind`]). Until the coordinate-mediation
-//! protocol lands there is no client-facing way to create those bindings, so a
-//! forward for an unbound verkey is refused as "not local".
+//! [`V1RoutingKeyStore::v1_routing_key_bind`]), whose bindings a client makes
+//! with coordinate-mediation `keylist-update` (see `v1_mediation`). A forward
+//! for an unbound verkey is refused as "not local".
 //!
 //! [`V1RoutingKeyStore::v1_routing_key_bind`]: affinidi_messaging_mediator_common::store::V1RoutingKeyStore::v1_routing_key_bind
 
@@ -39,20 +39,18 @@ use affinidi_messaging_didcomm_v1::identity::Verkey;
 use affinidi_messaging_didcomm_v1::protocols::forward;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::messages::{
-    compat::UnpackMetadata,
     problem_report::{ProblemReportScope, ProblemReportSorter},
-    sending::InboundMessageResponse,
+    sending::{InboundMessageList, InboundMessageResponse},
 };
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use http::StatusCode;
-use tracing::{Instrument, Level, debug, span, warn};
+use tracing::{Instrument, Level, debug, span};
 
 use crate::SharedData;
-use crate::common::authz::{self, Capability};
 use crate::common::session::Session;
-use crate::messages::store::store_message;
-use crate::messages::{ProcessMessageResponse, WrapperType};
+use crate::messages::delivery_gate::{Ingress, Sender, authorize_local_delivery};
+use crate::messages::store::store_envelope;
 
 /// Whether `body` is a DIDComm **v1** envelope.
 ///
@@ -237,7 +235,8 @@ pub(crate) async fn handle_inbound_didcomm_v1(
     .await
 }
 
-/// Resolve `to_verkey` to a local account, apply its ACLs, and store `inner`.
+/// Resolve `to_verkey` to a local account, pass the delivery gate, and store
+/// `inner`.
 async fn deliver_v1_forward(
     state: &SharedData,
     session: &Session,
@@ -254,56 +253,31 @@ async fn deliver_v1_forward(
         ));
     };
 
-    let to_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&to_did);
-
     // The forward is anonymous by construction, so there is no sender to apply
-    // an access list against — `None` makes the recipient's access-list check
-    // evaluate on its mode alone, exactly as the TSP relay path does.
-    let Some(recipient) = state.database.delivery_decision(&to_hash, None).await? else {
-        warn!(
-            %to_verkey,
-            "v1 routing key resolves to a DID with no account record; treating as unknown"
-        );
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "no local account is bound to that DIDComm v1 routing key",
-        ));
-    };
-
-    if authz::require_capability(&recipient.acls, Capability::ReceiveMessages).is_err() {
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "recipient is not authorized to receive messages through this mediator",
-        ));
-    }
-
-    if !recipient.access_list_allows {
-        return Err(crate::messages::delivery_refused(
-            session,
-            None,
-            "delivery blocked by the recipient's access list",
-        ));
-    }
+    // an access list against: the recipient's access list is evaluated on its
+    // mode alone, and the stored message is attributed to the session that
+    // handed it over.
+    let delivery =
+        authorize_local_delivery(state, session, Sender::Anonymous, &to_did, Ingress::Relayed)
+            .await?;
 
     // Stored verbatim as the JSON text the recipient's v1 agent expects. A
     // pickup client tells it apart from a v2 envelope the same way this handler
     // did — see `is_didcomm_v1`.
-    let data = ProcessMessageResponse {
-        handed_over: None,
-        store_message: true,
-        force_live_delivery: false,
-        forward_message: false,
-        data: WrapperType::Envelope(
-            to_did.clone(),
-            inner.to_string(),
-            state.clock.unix_secs() + state.limits().message_expiry_seconds,
-        ),
-    };
-
+    let msg_id = store_envelope(
+        state,
+        session,
+        &to_did,
+        &delivery.from_did_hash,
+        inner,
+        state.clock.unix_secs() + state.limits().message_expiry_seconds,
+        false,
+    )
+    .await?;
     debug!(%to_verkey, %to_did, "DIDComm v1 forward stored for local recipient");
-    store_message(state, session, &data, &UnpackMetadata::default()).await
+    let mut stored = InboundMessageList::default();
+    stored.messages.push((to_did, msg_id));
+    Ok(InboundMessageResponse::Stored(stored))
 }
 
 /// Authcrypt a reply from the mediator's routing key back to the client.

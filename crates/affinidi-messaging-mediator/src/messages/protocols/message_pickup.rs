@@ -229,12 +229,10 @@ async fn generate_status_reply(
 
         debug!("status message =\n{:?}", status_msg);
 
-        Ok(ProcessMessageResponse {
-            handed_over: None,
-            store_message: false,
+        Ok(ProcessMessageResponse::EphemeralReply {
+            message: Box::new(status_msg),
             force_live_delivery,
-            data: crate::messages::WrapperType::Message(Box::new(status_msg)),
-            forward_message: false,
+            handed_over: None,
         })
     }
     .instrument(_span)
@@ -488,11 +486,9 @@ pub(crate) async fn delivery_request(
 
             debug!("delivery message =\n{:?}", response_msg);
 
-            Ok(ProcessMessageResponse {
-                store_message: false,
+            Ok(ProcessMessageResponse::EphemeralReply {
+                message: Box::new(response_msg),
                 force_live_delivery: false,
-                data: crate::messages::WrapperType::Message(Box::new(response_msg)),
-                forward_message: false,
                 handed_over: Some(handed_over),
             })
         } else {

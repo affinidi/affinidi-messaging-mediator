@@ -13,7 +13,7 @@ use crate::{
     SharedData,
     common::session::Session,
     messages::{
-        ProcessMessageResponse, WrapperType,
+        ProcessMessageResponse,
         error_response::generate_error_response,
         store::{store_forwarded_message, store_message},
     },
@@ -67,6 +67,32 @@ fn parse_delay_milli(value: Option<&serde_json::Value>, limit_ms: i64) -> Result
             _ => Err(()),
         },
     }
+}
+
+/// A store failure while handling forward `msg`: 503, so the sender retries.
+fn storage_error(session: &Session, msg: &Message, e: &impl std::fmt::Display) -> MediatorError {
+    storage_error_with_log(session, msg, e, format!("Database transaction error: {e}"))
+}
+
+/// [`storage_error`] with a log line naming what failed.
+fn storage_error_with_log(
+    session: &Session,
+    msg: &Message,
+    e: &impl std::fmt::Display,
+    log: String,
+) -> MediatorError {
+    MediatorError::problem_with_log(
+        error_codes::DB_OPERATION_ERROR,
+        &session.session_id,
+        Some(msg.id.to_string()),
+        ProblemReportSorter::Error,
+        ProblemReportScope::Protocol,
+        "me.res.storage.error",
+        "Database transaction error: {1}",
+        vec![e.to_string()],
+        StatusCode::SERVICE_UNAVAILABLE,
+        log,
+    )
 }
 
 /// An ephemeral forward whose recipient has no live stream: not delivered,
@@ -199,7 +225,6 @@ pub(crate) fn rewrap_inner_attachment(mediator_did: &str, msg: &Message) -> Opti
     String::from_utf8(bytes).ok()
 }
 
-/// Process a forward message, run checks and then if accepted place into FORWARD_TASKS stream
 /// Parse the `next` hop DID from a routing-2.0 forward body.
 fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorError> {
     match ForwardRequest::deserialize(&msg.body) {
@@ -445,16 +470,10 @@ async fn deliver_forward(
             .streaming_publish_message(next_did_hash, &stream_uuid, data, false)
             .await
         {
-            return Err(MediatorError::problem_with_log(
-                error_codes::DB_OPERATION_ERROR,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "me.res.storage.error",
-                "Database transaction error: {1}",
-                vec![e.to_string()],
-                StatusCode::SERVICE_UNAVAILABLE,
+            return Err(storage_error_with_log(
+                session,
+                msg,
+                &e,
                 format!("Couldn't publish an ephemeral message to its live stream: {e}"),
             ));
         }
@@ -741,18 +760,7 @@ async fn check_remote_next_hop(
             if e.is_storage_cap() {
                 return e;
             }
-            MediatorError::problem_with_log(
-                error_codes::DB_OPERATION_ERROR,
-                &session.session_id,
-                Some(msg.id.to_string()),
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "me.res.storage.error",
-                "Database transaction error: {1}",
-                vec![e.to_string()],
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Database transaction error: {e}"),
-            )
+            storage_error(session, msg, &e)
         })?;
     let has_list = account.is_some_and(|a| a.access_list_count > 0);
     if has_list
@@ -790,18 +798,7 @@ async fn resolve_next_account(
             Some(msg.id.to_string()),
             "next hop has no account on this mediator",
         )),
-        Err(e) => Err(MediatorError::problem_with_log(
-            error_codes::DB_OPERATION_ERROR,
-            &session.session_id,
-            Some(msg.id.to_string()),
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.res.storage.error",
-            "Database transaction error: {1}",
-            vec![e.to_string()],
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Database transaction error: {e}"),
-        )),
+        Err(e) => Err(storage_error(session, msg, &e)),
     }
 }
 
@@ -861,18 +858,7 @@ async fn resolve_forward_sender(
                 false,
             ),
             Err(e) => {
-                return Err(MediatorError::problem_with_log(
-                    error_codes::DB_OPERATION_ERROR,
-                    &session.session_id,
-                    Some(msg.id.to_string()),
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.res.storage.error",
-                    "Database transaction error: {1}",
-                    vec![e.to_string()],
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Database transaction error: {e}"),
-                ));
+                return Err(storage_error(session, msg, &e));
             }
         };
         let from_acls = MediatorACLSet::from_u64(from_account.acls);
@@ -919,6 +905,8 @@ async fn resolve_forward_sender(
     }
 }
 
+/// Process a forward message: run the checks and, if it is accepted, deliver
+/// it to a local recipient or place it on the forwarding queue for a remote one.
 pub(crate) async fn process(
     msg: &Message,
     metadata: &UnpackMetadata,
@@ -1130,9 +1118,7 @@ pub(crate) async fn process(
             }
         };
 
-        // Forward is good, lets process the attachments and add to the queues
-        // First step is to determine if the next hop is local to the mediator or remote?
-        //if next_did_doc.service
+        // The forward is accepted: decode its attachment for the queue.
 
         let data = decode_first_attachment(msg, session, attachments)?;
 
@@ -1165,13 +1151,7 @@ pub(crate) async fn process(
         )
         .await?;
 
-        Ok(ProcessMessageResponse {
-            handed_over: None,
-            store_message: false,
-            force_live_delivery: false,
-            forward_message: true,
-            data: WrapperType::None,
-        })
+        Ok(ProcessMessageResponse::Forwarded)
     }
     .instrument(_span)
     .await

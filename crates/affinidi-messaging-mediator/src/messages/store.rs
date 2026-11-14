@@ -1,24 +1,25 @@
 use crate::SharedData;
 use crate::common::session::Session;
-use crate::error_codes;
-#[cfg(feature = "didcomm")]
-use crate::messages::MessageHandler;
-#[cfg(feature = "didcomm")]
-use crate::messages::PackOptions;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::{StoredMessageRef, prelude::*};
-#[cfg(feature = "didcomm")]
-use affinidi_messaging_sdk::messages::compat::PackEncryptedMetadata;
-use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
-use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
 use affinidi_messaging_sdk::messages::sending::{InboundMessageList, InboundMessageResponse};
-use http::StatusCode;
 use std::sync::Arc;
-#[cfg(feature = "didcomm")]
-use tracing::trace;
-use tracing::{Instrument, debug, error, span, warn};
+use tracing::{debug, warn};
 
-use super::{ProcessMessageResponse, WrapperType};
+#[cfg(feature = "didcomm")]
+use super::ProcessMessageResponse;
+#[cfg(feature = "didcomm")]
+use crate::error_codes;
+#[cfg(feature = "didcomm")]
+use crate::messages::{MessageHandler, PackOptions};
+#[cfg(feature = "didcomm")]
+use affinidi_messaging_sdk::messages::compat::{PackEncryptedMetadata, UnpackMetadata};
+#[cfg(feature = "didcomm")]
+use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
+#[cfg(feature = "didcomm")]
+use http::StatusCode;
+#[cfg(feature = "didcomm")]
+use tracing::{Instrument, error, span, trace};
 
 /// Store `data` for `to_did_hash`, then publish the live notification.
 ///
@@ -98,232 +99,221 @@ pub(crate) async fn store_system_message(
     .await
 }
 
-/// Stores a message in the mediator's database
-/// handles a lot of higher order logic for storing messages
-/// - state: SharedData
-/// - session: Session
-/// - response: ProcessMessageResponse
-/// - metadata: UnpackMetadata
-#[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
+/// Act on what a DIDComm handler produced (see [`ProcessMessageResponse`]):
+/// store a reply in its recipients' inboxes, pack an ephemeral reply for the
+/// caller, or report a forward. `metadata` is the request's unpack metadata,
+/// which shapes how a reply is packed.
+#[cfg(feature = "didcomm")]
 pub(crate) async fn store_message(
     state: &SharedData,
     session: &Session,
     response: &ProcessMessageResponse,
-    #[cfg_attr(not(feature = "didcomm"), allow(unused_variables))] metadata: &UnpackMetadata,
+    metadata: &UnpackMetadata,
 ) -> Result<InboundMessageResponse, MediatorError> {
     let _span = span!(tracing::Level::DEBUG, "store_message",);
 
     async move {
-        if response.forward_message {
-            return Ok(InboundMessageResponse::Forwarded);
-        }
-
-        if response.store_message {
-            let mut stored_messages = InboundMessageList::default();
-            match &response.data {
-                WrapperType::None => {}
-                #[cfg(feature = "didcomm")]
-                WrapperType::Message(message) => {
-                    // Pack the message for the next recipient(s)
-                    let Some(to_dids) = &message.to else {
-                        return Err(MediatorError::problem(
-                            error_codes::MESSAGE_RECIPIENTS_MISSING,
-                            &session.session_id,
-                            Some(message.id.to_string()),
-                            ProblemReportSorter::Error,
-                            ProblemReportScope::Protocol,
-                            "message.recipients.missing",
-                            "Message has no recipients",
-                            vec![],
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                    };
-                    debug!(
-                        "response to_dids: count({}) vec({:?})",
-                        to_dids.len(),
-                        to_dids
-                    );
-
-                    if to_dids.len() > state.limits().to_recipients {
-                        return Err(MediatorError::problem_with_log(
-                            error_codes::MESSAGE_RECIPIENTS_TOO_MANY,
-                            &session.session_id,
-                            Some(message.id.to_string()),
-                            ProblemReportSorter::Error,
-                            ProblemReportScope::Protocol,
-                            "message.recipients.too_many",
-                            "Message has too many recipients ({1}). Max: {2}",
-                            vec![
-                                to_dids.len().to_string(),
-                                state.limits().to_recipients.to_string(),
-                            ],
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "Message has too many recipients ({}). Max: {}",
-                                to_dids.len(),
-                                state.limits().to_recipients
-                            ),
-                        ));
-                    }
-
-                    let expires_at = if let Some(expires_at) = message.expires_time {
-                        let now = state.clock.unix_secs();
-
-                        if expires_at > now + state.limits().message_expiry_seconds {
-                            now + state.limits().message_expiry_seconds
-                        } else {
-                            expires_at
-                        }
-                    } else {
-                        state.clock.unix_secs() + state.limits().message_expiry_seconds
-                    };
-
-                    // A reply to several recipients answers with what was
-                    // stored and the per-recipient failures; one stored
-                    // nowhere is a failure, not a success with a list of
-                    // errors the sender has to dig out (R1.1).
-                    let mut first_error: Option<MediatorError> = None;
-                    for recipient in to_dids {
-                        let (packed, _): (String, PackEncryptedMetadata) = message
-                            .pack(
-                                &session.session_id,
-                                recipient,
-                                &state.config.mediator_did,
-                                metadata,
-                                &*state.config.security.mediator_secrets,
-                                &state.did_resolver,
-                                &PackOptions {
-                                    to_keys_per_recipient_limit: state
-                                        .config
-                                        .limits
-                                        .to_keys_per_recipient,
-                                    forward: true,
-                                },
-                            )
-                            .await?;
-
-                        match _store_message(
-                            state,
-                            &session.session_id,
-                            response.force_live_delivery,
-                            &packed,
-                            &affinidi_messaging_mediator_common::did_identity::did_hash(recipient),
-                            Some(&state.config.mediator_did_hash),
-                            expires_at,
-                        )
-                        .await
-                        {
-                            Ok(msg_id) => {
-                                debug!(
-                                    "message id({}) stored successfully recipient({})",
-                                    msg_id, recipient
-                                );
-                                stored_messages
-                                    .messages
-                                    .push((recipient.to_string(), msg_id));
-                            }
-                            Err(e) => {
-                                warn!("error storing message recipient({}): {:?}", recipient, e);
-                                stored_messages
-                                    .errors
-                                    .push((recipient.to_string(), e.to_string()));
-                                first_error.get_or_insert(e);
-                            }
-                        }
-                    }
-                    if stored_messages.messages.is_empty()
-                        && let Some(e) = first_error
-                    {
-                        return Err(e);
-                    }
-                }
-                WrapperType::Envelope(to_did, message, expiry) => {
-                    // Message is already packed, likely a direct delivery from
-                    // a client. Its sender is the session's DID.
-                    let msg_id = store_envelope(
-                        state,
-                        session,
-                        to_did,
-                        &session.did_hash,
-                        message,
-                        *expiry,
-                        response.force_live_delivery,
+        match response {
+            ProcessMessageResponse::Forwarded => Ok(InboundMessageResponse::Forwarded),
+            ProcessMessageResponse::Reply(message) => {
+                store_reply(state, session, message, metadata).await
+            }
+            ProcessMessageResponse::EphemeralReply {
+                message,
+                force_live_delivery,
+                handed_over,
+            } => {
+                let (packed, meta) = message
+                    .pack(
+                        &session.session_id,
+                        &session.did,
+                        &state.config.mediator_did,
+                        metadata,
+                        &*state.config.security.mediator_secrets,
+                        &state.did_resolver,
+                        &PackOptions {
+                            to_keys_per_recipient_limit: state.limits().to_keys_per_recipient,
+                            forward: true,
+                        },
                     )
                     .await?;
-                    stored_messages.messages.push((to_did.to_string(), msg_id));
-                }
-            }
-
-            return Ok(InboundMessageResponse::Stored(stored_messages));
-        }
-
-        // Ephemeral message handling (DIDComm only)
-        #[cfg(feature = "didcomm")]
-        if let WrapperType::Message(message) = &response.data {
-            let (packed, meta) = message
-                .pack(
-                    &session.session_id,
-                    &session.did,
-                    &state.config.mediator_did,
-                    metadata,
-                    &*state.config.security.mediator_secrets,
-                    &state.did_resolver,
-                    &PackOptions {
-                        to_keys_per_recipient_limit: state.limits().to_keys_per_recipient,
-                        forward: true,
-                    },
-                )
-                .await?;
-            trace!("Ephemeral message packed (meta):\n{:#?}", meta);
-            trace!("Ephemeral message (msg):\n{:#?}", packed);
-            // Live stream the message?
-            let pushed = match state
-                .database
-                .streaming_is_client_live(&session.did_hash, response.force_live_delivery)
-                .await
-            {
-                Some(stream_uuid) => {
-                    _live_stream(
-                        &state.database,
-                        &session.did_hash,
-                        &stream_uuid,
-                        &packed,
-                        response.force_live_delivery,
-                    )
+                trace!("Ephemeral message packed (meta):\n{:#?}", meta);
+                trace!("Ephemeral message (msg):\n{:#?}", packed);
+                // Live stream the message?
+                let pushed = match state
+                    .database
+                    .streaming_is_client_live(&session.did_hash, *force_live_delivery)
                     .await
+                {
+                    Some(stream_uuid) => {
+                        _live_stream(
+                            &state.database,
+                            &session.did_hash,
+                            &stream_uuid,
+                            &packed,
+                            *force_live_delivery,
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                // The reply is packed; what it hands over is recorded once it is
+                // written: with the REST body when it came over REST, else now
+                // if the live stream took it, else not at all (R1.1).
+                if let Some(handed_over) = handed_over {
+                    crate::after_write::defer_or_run(
+                        handed_over
+                            .clone()
+                            .completion(state, crate::monitor::current_channel()),
+                        pushed,
+                    )
+                    .await;
                 }
-                None => false,
-            };
-            // The reply is packed; what it hands over is recorded once it is
-            // written: with the REST body when it came over REST, else now
-            // if the live stream took it, else not at all (R1.1).
-            if let Some(handed_over) = &response.handed_over {
-                crate::after_write::defer_or_run(
-                    handed_over
-                        .clone()
-                        .completion(state, crate::monitor::current_channel()),
-                    pushed,
-                )
-                .await;
+                Ok(InboundMessageResponse::Ephemeral(packed))
             }
-            return Ok(InboundMessageResponse::Ephemeral(packed));
+            // Kept as the refusal it has always been: a DIDComm ping that
+            // asked for no response is answered with this error today.
+            ProcessMessageResponse::Nothing => {
+                error!("No message to return");
+                Err(MediatorError::problem(
+                    error_codes::MESSAGE_STORE_ERROR,
+                    &session.session_id,
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "me.storage.message.error",
+                    "Expected a message to store, instead got None",
+                    vec![],
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ))
+            }
         }
-
-        error!("No message to return");
-        Err(MediatorError::problem(
-            error_codes::MESSAGE_STORE_ERROR,
-            &session.session_id,
-            None,
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "me.storage.message.error",
-            "Expected a message to store, instead got None",
-            vec![],
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ))
     }
     .instrument(_span)
     .await
+}
+
+/// Pack a reply the mediator authored for each of its recipients and store it
+/// in their inboxes. Answers with what was stored and the per-recipient
+/// failures; a reply stored nowhere is the first failure.
+#[cfg(feature = "didcomm")]
+async fn store_reply(
+    state: &SharedData,
+    session: &Session,
+    message: &affinidi_messaging_didcomm::message::Message,
+    metadata: &UnpackMetadata,
+) -> Result<InboundMessageResponse, MediatorError> {
+    let mut stored_messages = InboundMessageList::default();
+    // Pack the message for the next recipient(s)
+    let Some(to_dids) = &message.to else {
+        return Err(MediatorError::problem(
+            error_codes::MESSAGE_RECIPIENTS_MISSING,
+            &session.session_id,
+            Some(message.id.to_string()),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "message.recipients.missing",
+            "Message has no recipients",
+            vec![],
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    };
+    debug!(
+        "response to_dids: count({}) vec({:?})",
+        to_dids.len(),
+        to_dids
+    );
+
+    if to_dids.len() > state.limits().to_recipients {
+        return Err(MediatorError::problem_with_log(
+            error_codes::MESSAGE_RECIPIENTS_TOO_MANY,
+            &session.session_id,
+            Some(message.id.to_string()),
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            "message.recipients.too_many",
+            "Message has too many recipients ({1}). Max: {2}",
+            vec![
+                to_dids.len().to_string(),
+                state.limits().to_recipients.to_string(),
+            ],
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Message has too many recipients ({}). Max: {}",
+                to_dids.len(),
+                state.limits().to_recipients
+            ),
+        ));
+    }
+
+    let expires_at = if let Some(expires_at) = message.expires_time {
+        let now = state.clock.unix_secs();
+
+        if expires_at > now + state.limits().message_expiry_seconds {
+            now + state.limits().message_expiry_seconds
+        } else {
+            expires_at
+        }
+    } else {
+        state.clock.unix_secs() + state.limits().message_expiry_seconds
+    };
+
+    // A reply to several recipients answers with what was
+    // stored and the per-recipient failures; one stored
+    // nowhere is a failure, not a success with a list of
+    // errors the sender has to dig out (R1.1).
+    let mut first_error: Option<MediatorError> = None;
+    for recipient in to_dids {
+        let (packed, _): (String, PackEncryptedMetadata) = message
+            .pack(
+                &session.session_id,
+                recipient,
+                &state.config.mediator_did,
+                metadata,
+                &*state.config.security.mediator_secrets,
+                &state.did_resolver,
+                &PackOptions {
+                    to_keys_per_recipient_limit: state.config.limits.to_keys_per_recipient,
+                    forward: true,
+                },
+            )
+            .await?;
+
+        match _store_message(
+            state,
+            &session.session_id,
+            false,
+            &packed,
+            &affinidi_messaging_mediator_common::did_identity::did_hash(recipient),
+            Some(&state.config.mediator_did_hash),
+            expires_at,
+        )
+        .await
+        {
+            Ok(msg_id) => {
+                debug!(
+                    "message id({}) stored successfully recipient({})",
+                    msg_id, recipient
+                );
+                stored_messages
+                    .messages
+                    .push((recipient.to_string(), msg_id));
+            }
+            Err(e) => {
+                warn!("error storing message recipient({}): {:?}", recipient, e);
+                stored_messages
+                    .errors
+                    .push((recipient.to_string(), e.to_string()));
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if stored_messages.messages.is_empty()
+        && let Some(e) = first_error
+    {
+        return Err(e);
+    }
+    Ok(InboundMessageResponse::Stored(stored_messages))
 }
 
 /// Store an already-packed message (a direct delivery, a TSP or bridged

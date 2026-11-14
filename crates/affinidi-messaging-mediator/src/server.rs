@@ -26,6 +26,7 @@ use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 #[cfg(feature = "redis-backend")]
 use affinidi_messaging_mediator_common::database::DatabaseHandler;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::store::MediatorStore;
 use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
@@ -279,7 +280,7 @@ pub async fn start(config_path: &str) -> Result<(), MediatorError> {
 /// Returns once the listener is bound. The actual server runs in a
 /// `tokio::spawn`-ed task whose handle lives on [`MediatorHandle`].
 pub async fn serve_internal(
-    #[cfg_attr(not(feature = "tsp"), allow(unused_mut))] mut config: Config,
+    mut config: Config,
     opts: StartOpts,
     shutdown_token: CancellationToken,
     pre_built_store: Option<Arc<dyn affinidi_messaging_mediator_common::store::MediatorStore>>,
@@ -294,13 +295,194 @@ pub async fn serve_internal(
         install_production_tracing(*ansi, *log_json, *log_level)?;
     }
 
+    let BuiltStore {
+        store,
+        #[cfg(feature = "redis-backend")]
+        lua_integrity,
+    } = build_store(&config, pre_built_store).await?;
+
+    // Optional signal handler — cancels the same token the caller
+    // provided so the embedded path's caller-driven cancellation and
+    // the binary's signal-driven cancellation share a code path.
+    if opts.install_signal_handlers {
+        let signal_token = shutdown_token.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Shutdown signal received, initiating graceful shutdown...");
+            signal_token.cancel();
+        });
+    }
+
+    let metrics_handle = metrics::init_metrics();
+
+    // All long-lived background tasks run under a supervisor: a task that
+    // errors or panics is restarted with capped backoff (never fail-fast —
+    // the mediator keeps serving and the fault is logged + surfaced via
+    // /readyz), and each task's health is published for the readiness probe.
+    // The supervisor owns cancellation, so the task bodies below are plain
+    // loops with no shutdown `select!` — it aborts them on shutdown.
+    let supervisor = TaskSupervisor::new(shutdown_token.clone());
+
+    #[cfg(feature = "redis-backend")]
+    report_lua_integrity(&supervisor, lua_integrity.as_ref());
+
+    // The mediator's own account and the configured root admin, on every
+    // backend. The Redis bootstrap has always seeded them in
+    // `initialize_redis`; a Fjall or memory store, or one an embedding
+    // application passes in, never was. So the configured `admin_did`
+    // authenticated as a standard account, and had none of its rights.
+    // Idempotent: an existing account keeps its ACLs and only has its role set.
+    seed_privileged_accounts(store.as_ref(), &config).await?;
+
+    let live_limits = apply_stored_overrides(store.as_ref(), &mut config).await;
+
+    // The traffic monitor, shared by the data plane (through `SharedData`),
+    // the streaming task's inbox redelivery, the forwarding processor and the
+    // expiry sweep below.
+    let monitor = crate::monitor::TrafficMonitor::new();
+
+    let Background {
+        queue_snapshot,
+        streaming_task,
+    } = spawn_background(
+        &supervisor,
+        &store,
+        &config,
+        &clock,
+        &live_limits,
+        &monitor,
+        &shutdown_token,
+    );
+
+    let did_resolver = build_did_resolver(&mut config).await?;
+
+    // did:scid floors survive a restart (VTI-KEY-162): seed what was stored,
+    // before any connection is accepted, then persist every change for an
+    // account's did:scid (or our own) as the resolver verifies it.
+    crate::scid_sources::seed(&*store, &did_resolver).await?;
+    let _scid_source_writer = crate::scid_sources::persist(
+        store.clone(),
+        &did_resolver,
+        &config.mediator_did,
+        shutdown_token.clone(),
+    );
+
+    spawn_forwarding(&supervisor, &store, &config, &monitor, &did_resolver);
+
+    #[cfg(feature = "didcomm")]
+    // The advertised set is the mediator's public protocol contract and lives in
+    // one place, next to the tests that pin it. Notably it carries no
+    // coordinate-mediation entry: v2 routing is DID-addressed and needs no
+    // keylist (issue #755, `docs/mediation-and-routing.md`).
+    let discover_features = Arc::new(DiscoverFeatures {
+        protocols: crate::messages::protocols::discover_features::ADVERTISED_PROTOCOLS
+            .iter()
+            .map(|p| p.to_string())
+            .collect(),
+        ..Default::default()
+    });
+
+    let did_rate_limiter = did_rate_limiter(&config);
+    did_rate_limiter.spawn_gc(shutdown_token.clone());
+    log_rate_limits(&config, &did_rate_limiter);
+
+    let mediator_did = config.mediator_did.clone();
+    let admin_did = config.admin_did.clone();
+    let api_prefix = config.api_prefix.clone();
+
+    let self_authorities = local_authorities(&config);
+
+    let shared_state = SharedData {
+        live_limits,
+        config: Arc::new(config.clone()),
+        service_start_timestamp: chrono::Utc::now(),
+        did_resolver,
+        database: store,
+        mux: Default::default(),
+        streaming_task,
+        #[cfg(feature = "didcomm")]
+        discover_features,
+        active_websocket_count: Arc::new(AtomicUsize::new(0)),
+        ws_connections_per_did: Arc::new(dashmap::DashMap::new()),
+        relay_connections_per_ip: Arc::new(dashmap::DashMap::new()),
+        relay_client_ip: relay_client_ip_extractor(&config.trust_xff_cidrs)?,
+        readiness: Arc::new(crate::handlers::readiness::ReadinessCache::new(
+            crate::handlers::readiness::REFRESH_INTERVAL,
+        )),
+        did_rate_limiter,
+        shutdown_token: shutdown_token.clone(),
+        self_authorities: Arc::new(self_authorities),
+        trust_task_keys: Default::default(),
+        component_health: supervisor.registry(),
+        clock,
+        queue_snapshot,
+        monitor,
+        activity: Default::default(),
+        #[cfg(feature = "tsp")]
+        tsp_identity: Arc::new(tokio::sync::OnceCell::new()),
+        #[cfg(feature = "didcomm-v1")]
+        didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
+    };
+
+    start_mux(&shared_state, &supervisor)?;
+    #[cfg(feature = "didcomm-v1")]
+    check_didcomm_v1(&shared_state).await?;
+
+    // What the server task waits for after the HTTP server has stopped (see
+    // `wait_for_shutdown`).
+    let open_sockets = shared_state.active_websocket_count.clone();
+    let task_health = shared_state.component_health.clone();
+
+    let app = build_router(
+        &config,
+        &api_prefix,
+        shared_state,
+        metrics_handle,
+        &shutdown_token,
+    )?;
+    let (std_listener, bound_addr) = bind_listener(&config, opts.listener)?;
+    let (server_task, scheme, ws_scheme) = serve(
+        app,
+        std_listener,
+        opts.tls,
+        &config.limits,
+        &shutdown_token,
+        open_sockets,
+        task_health,
+    )?;
+    let (http_endpoint, ws_endpoint) = endpoints(scheme, ws_scheme, bound_addr, &api_prefix)?;
+
+    Ok(MediatorHandle::__from_internals(
+        http_endpoint,
+        ws_endpoint,
+        bound_addr,
+        mediator_did,
+        admin_did,
+        shutdown_token,
+        server_task,
+    ))
+}
+
+/// The store the mediator runs on, initialised, and (on Redis) the outcome of
+/// the stored-function integrity check, for `/readyz`.
+struct BuiltStore {
+    store: Arc<dyn MediatorStore>,
+    #[cfg(feature = "redis-backend")]
+    lua_integrity: Option<crate::common::lua_integrity::LuaIntegrity>,
+}
+
+/// Initialise the caller's store, or bootstrap a Redis one from
+/// `config.database`.
+async fn build_store(
+    #[cfg_attr(not(feature = "redis-backend"), allow(unused_variables))] config: &Config,
+    pre_built_store: Option<Arc<dyn MediatorStore>>,
+) -> Result<BuiltStore, MediatorError> {
     // When the caller supplies a pre-built store (Memory, Fjall, or
     // any future backend), skip the Redis-specific bootstrap entirely
     // and let the trait-based code path own the lifecycle. Background
     // tasks (statistics, expiry sweep, forwarding processor, websocket
     // streaming) all consume `Arc<dyn MediatorStore>`, so they run
     // unchanged regardless of which backend is in use.
-    use affinidi_messaging_mediator_common::store::prelude::*;
     // Outcome of the stored-function integrity check, published to `/readyz`
     // once the supervisor that owns the health registry exists. `None` on any
     // build or backend where there are no stored functions to check.
@@ -440,28 +622,46 @@ pub async fn serve_internal(
         }
     };
 
-    // Optional signal handler — cancels the same token the caller
-    // provided so the embedded path's caller-driven cancellation and
-    // the binary's signal-driven cancellation share a code path.
-    if opts.install_signal_handlers {
-        let signal_token = shutdown_token.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            info!("Shutdown signal received, initiating graceful shutdown...");
-            signal_token.cancel();
-        });
+    Ok(BuiltStore {
+        store,
+        #[cfg(feature = "redis-backend")]
+        lua_integrity: lua_integrity_outcome,
+    })
+}
+
+/// Log the per-DID and per-socket message rate limits in force.
+fn log_rate_limits(config: &Config, did_rate_limiter: &DidRateLimiter) {
+    if did_rate_limiter.is_enabled() {
+        info!(
+            "Per-DID rate limiting enabled: {} req/s per DID, burst: {}. Charged per \
+             authenticated HTTP request (including the /ws upgrade) and per message on an \
+             established WebSocket. The mediator and admin DIDs are exempt.",
+            config.limits.did_rate_limit_per_second, config.limits.did_rate_limit_burst,
+        );
     }
+    if config.limits.ws_messages_per_second > 0 {
+        info!(
+            "WebSocket message rate: {} msg/s per authenticated socket, burst: {}; a socket \
+             over it is read more slowly, and closed (1008) after {} s over it (0 = never). \
+             The mediator and admin DIDs are exempt.",
+            config.limits.ws_messages_per_second,
+            config.limits.ws_message_burst,
+            config.limits.ws_message_throttle_close_secs,
+        );
+    } else {
+        warn!(
+            "WebSocket message rate limiting is OFF (limits.ws_messages_per_second = 0): \
+             messages on an authenticated WebSocket are not rate limited per socket."
+        );
+    }
+}
 
-    let metrics_handle = metrics::init_metrics();
-
-    // All long-lived background tasks run under a supervisor: a task that
-    // errors or panics is restarted with capped backoff (never fail-fast —
-    // the mediator keeps serving and the fault is logged + surfaced via
-    // /readyz), and each task's health is published for the readiness probe.
-    // The supervisor owns cancellation, so the task bodies below are plain
-    // loops with no shutdown `select!` — it aborts them on shutdown.
-    let supervisor = TaskSupervisor::new(shutdown_token.clone());
-
+/// Publish a failed stored-function integrity check on `/readyz`.
+#[cfg(feature = "redis-backend")]
+fn report_lua_integrity(
+    supervisor: &TaskSupervisor,
+    lua_integrity_outcome: Option<&crate::common::lua_integrity::LuaIntegrity>,
+) {
     // Surface the stored-function integrity check on `/readyz`.
     //
     // `load_bearing: false` is the whole argument for checking rather than
@@ -470,8 +670,7 @@ pub async fn serve_internal(
     // and an operator sees the condition on a dashboard. A `Restarting` state
     // is the registry's only way to say "not healthy" for something that is
     // not a restartable task; the `last_error` beside it says what it means.
-    #[cfg(feature = "redis-backend")]
-    if let Some(outcome) = &lua_integrity_outcome
+    if let Some(outcome) = lua_integrity_outcome
         && !outcome.is_healthy()
     {
         use crate::tasks::supervisor::{ComponentHealth, ComponentState};
@@ -498,15 +697,14 @@ pub async fn serve_internal(
             },
         );
     }
+}
 
-    // The mediator's own account and the configured root admin, on every
-    // backend. The Redis bootstrap has always seeded them in
-    // `initialize_redis`; a Fjall or memory store, or one an embedding
-    // application passes in, never was. So the configured `admin_did`
-    // authenticated as a standard account, and had none of its rights.
-    // Idempotent: an existing account keeps its ACLs and only has its role set.
-    seed_privileged_accounts(store.as_ref(), &config).await?;
-
+/// Layer the stored `config/patch` overrides over the file/env limits, and
+/// return the live limits that later patches update.
+async fn apply_stored_overrides(
+    store: &dyn MediatorStore,
+    config: &mut Config,
+) -> crate::common::config::overrides::LiveLimits {
     // Stored `config/patch` overrides, layered over the file/env limits before
     // anything below reads them. A stale override is logged and skipped, never
     // fatal.
@@ -528,9 +726,27 @@ pub async fn serve_internal(
         }
         Err(e) => warn!("Couldn't read stored configuration overrides: {e}"),
     }
-    let live_limits =
-        crate::common::config::overrides::LiveLimits::new(baseline_limits, config.limits.clone());
+    crate::common::config::overrides::LiveLimits::new(baseline_limits, config.limits.clone())
+}
 
+/// What the background tasks hand the data plane.
+struct Background {
+    queue_snapshot: QueueSnapshotCell,
+    streaming_task: Option<StreamingTask>,
+}
+
+/// Spawn the supervised background tasks that need nothing but the store:
+/// statistics, the expiry sweeps, the VTA secrets refresh and the streaming
+/// task.
+fn spawn_background(
+    supervisor: &TaskSupervisor,
+    store: &Arc<dyn MediatorStore>,
+    config: &Config,
+    clock: &Arc<dyn affinidi_messaging_mediator_common::types::clock::Clock>,
+    live_limits: &crate::common::config::overrides::LiveLimits,
+    monitor: &crate::monitor::TrafficMonitor,
+    #[cfg_attr(not(feature = "vta"), allow(unused_variables))] shutdown_token: &CancellationToken,
+) -> Background {
     // Statistics task — non-load-bearing (metrics only). Runs against any
     // backend via the trait. It also publishes each queue survey for the
     // `messaging/queue/list` and `messaging/stats/show` Trust Tasks.
@@ -560,11 +776,6 @@ pub async fn serve_internal(
             }
         });
     }
-
-    // The traffic monitor, shared by the data plane (through `SharedData`),
-    // the streaming task's inbox redelivery, the forwarding processor and the
-    // expiry sweep below.
-    let monitor = crate::monitor::TrafficMonitor::new();
 
     // Message expiry sweep — non-load-bearing housekeeping. Runs against
     // any backend via `MessageStore::sweep_expired_messages`. The
@@ -695,7 +906,7 @@ pub async fn serve_internal(
 
     let streaming_task = if config.streaming_enabled {
         Some(StreamingTask::spawn_supervised(
-            &supervisor,
+            supervisor,
             store.clone(),
             &config.streaming_uuid,
             ws_send_budget.clone(),
@@ -705,6 +916,15 @@ pub async fn serve_internal(
         None
     };
 
+    Background {
+        queue_snapshot,
+        streaming_task,
+    }
+}
+
+/// The DID resolver, with the mediator's own document preloaded. On a TSP
+/// build the document is first made to advertise the TSP endpoint.
+async fn build_did_resolver(config: &mut Config) -> Result<DIDCacheClient, MediatorError> {
     let mut did_resolver = DIDCacheClient::new(config.did_resolver_config.clone())
         .await
         .map_err(|e| {
@@ -721,13 +941,13 @@ pub async fn serve_internal(
     // owned `config`, so it covers both the config-file and builder paths before the
     // document is preloaded + served below.
     #[cfg(feature = "tsp")]
-    crate::common::config::apply_tsp_did_advertisement(&mut config);
+    crate::common::config::apply_tsp_did_advertisement(config);
 
     // Inverse guard for TSP-less builds: some DID templates advertise a
     // `TSPTransport` service unconditionally, which would mislead peers into
     // routing TSP to a mediator that can't handle it. Warn if so.
     #[cfg(not(feature = "tsp"))]
-    crate::common::config::warn_if_tsp_advertised_without_feature(&config);
+    crate::common::config::warn_if_tsp_advertised_without_feature(config);
 
     // Preload the mediator's own DID document so it can pack/unpack DIDComm
     // messages without hitting the network (did:web/did:webvh self-resolution
@@ -747,17 +967,17 @@ pub async fn serve_internal(
         }
     }
 
-    // did:scid floors survive a restart (VTI-KEY-162): seed what was stored,
-    // before any connection is accepted, then persist every change for an
-    // account's did:scid (or our own) as the resolver verifies it.
-    crate::scid_sources::seed(&*store, &did_resolver).await?;
-    let _scid_source_writer = crate::scid_sources::persist(
-        store.clone(),
-        &did_resolver,
-        &config.mediator_did,
-        shutdown_token.clone(),
-    );
+    Ok(did_resolver)
+}
 
+/// Spawn the forwarding processor, when external forwarding is enabled.
+fn spawn_forwarding(
+    supervisor: &TaskSupervisor,
+    store: &Arc<dyn MediatorStore>,
+    config: &Config,
+    monitor: &crate::monitor::TrafficMonitor,
+    #[cfg_attr(not(feature = "didcomm"), allow(unused_variables))] did_resolver: &DIDCacheClient,
+) {
     // Forwarding processor — load-bearing (the cross-mediator delivery
     // path). Runs against any backend via the `forward_queue_*` trait
     // methods (Redis: Streams consumer groups; Fjall/Memory: in-process
@@ -801,51 +1021,12 @@ pub async fn serve_internal(
             }
         });
     }
+}
 
-    #[cfg(feature = "didcomm")]
-    // The advertised set is the mediator's public protocol contract and lives in
-    // one place, next to the tests that pin it. Notably it carries no
-    // coordinate-mediation entry: v2 routing is DID-addressed and needs no
-    // keylist (issue #755, `docs/mediation-and-routing.md`).
-    let discover_features = Arc::new(DiscoverFeatures {
-        protocols: crate::messages::protocols::discover_features::ADVERTISED_PROTOCOLS
-            .iter()
-            .map(|p| p.to_string())
-            .collect(),
-        ..Default::default()
-    });
-
-    let did_rate_limiter = did_rate_limiter(&config);
-    did_rate_limiter.spawn_gc(shutdown_token.clone());
-    if did_rate_limiter.is_enabled() {
-        info!(
-            "Per-DID rate limiting enabled: {} req/s per DID, burst: {}. Charged per \
-             authenticated HTTP request (including the /ws upgrade) and per message on an \
-             established WebSocket. The mediator and admin DIDs are exempt.",
-            config.limits.did_rate_limit_per_second, config.limits.did_rate_limit_burst,
-        );
-    }
-    if config.limits.ws_messages_per_second > 0 {
-        info!(
-            "WebSocket message rate: {} msg/s per authenticated socket, burst: {}; a socket \
-             over it is read more slowly, and closed (1008) after {} s over it (0 = never). \
-             The mediator and admin DIDs are exempt.",
-            config.limits.ws_messages_per_second,
-            config.limits.ws_message_burst,
-            config.limits.ws_message_throttle_close_secs,
-        );
-    } else {
-        warn!(
-            "WebSocket message rate limiting is OFF (limits.ws_messages_per_second = 0): \
-             messages on an authenticated WebSocket are not rate limited per socket."
-        );
-    }
-
-    let mediator_did = config.mediator_did.clone();
-    let admin_did = config.admin_did.clone();
-    let api_prefix = config.api_prefix.clone();
-
-    let self_authorities = compute_self_authorities(&config);
+/// The authorities this mediator answers on, which the forward handler
+/// treats as local; warns when a wildcard bind leaves the set unmatched.
+fn local_authorities(config: &Config) -> HashSet<(String, u16)> {
+    let self_authorities = compute_self_authorities(config);
     if !self_authorities.is_empty() {
         info!(
             "Routing 2.0 forward handler will treat {} authority/authorities as local: {:?}",
@@ -873,38 +1054,12 @@ pub async fn serve_internal(
         );
     }
 
-    let shared_state = SharedData {
-        live_limits,
-        config: Arc::new(config.clone()),
-        service_start_timestamp: chrono::Utc::now(),
-        did_resolver,
-        database: store,
-        mux: Default::default(),
-        streaming_task,
-        #[cfg(feature = "didcomm")]
-        discover_features,
-        active_websocket_count: Arc::new(AtomicUsize::new(0)),
-        ws_connections_per_did: Arc::new(dashmap::DashMap::new()),
-        relay_connections_per_ip: Arc::new(dashmap::DashMap::new()),
-        relay_client_ip: relay_client_ip_extractor(&config.trust_xff_cidrs)?,
-        readiness: Arc::new(crate::handlers::readiness::ReadinessCache::new(
-            crate::handlers::readiness::REFRESH_INTERVAL,
-        )),
-        did_rate_limiter,
-        shutdown_token: shutdown_token.clone(),
-        self_authorities: Arc::new(self_authorities),
-        trust_task_keys: Default::default(),
-        component_health: supervisor.registry(),
-        clock,
-        queue_snapshot,
-        monitor,
-        activity: Default::default(),
-        #[cfg(feature = "tsp")]
-        tsp_identity: Arc::new(tokio::sync::OnceCell::new()),
-        #[cfg(feature = "didcomm-v1")]
-        didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
-    };
+    self_authorities
+}
 
+/// DID multiplexing startup: refuse a setting that cannot be honoured, and
+/// spawn the cross-instance sync tasks.
+fn start_mux(shared_state: &SharedData, supervisor: &TaskSupervisor) -> Result<(), MediatorError> {
     // DID multiplexing startup checks. Mux is off unless an operator enables
     // it (design §5.8); when they do, refuse to start rather than run with a
     // setting that silently means less than its name (R5.2).
@@ -953,11 +1108,15 @@ pub async fn serve_internal(
             });
         }
     }
+    Ok(())
+}
 
+/// DIDComm v1 startup checks.
+#[cfg(feature = "didcomm-v1")]
+async fn check_didcomm_v1(shared_state: &SharedData) -> Result<(), MediatorError> {
     // DIDComm v1 startup checks. Both run before the listener binds, so a
     // misconfiguration is a refusal to start rather than traffic the mediator
     // accepts and then silently drops.
-    #[cfg(feature = "didcomm-v1")]
     if shared_state.config.didcomm_v1.enabled {
         // The routing-key index is what turns a forward's `to` verkey into an
         // account. A backend without it would accept v1 forwards and fail every
@@ -1005,13 +1164,19 @@ pub async fn serve_internal(
             );
         }
     }
+    Ok(())
+}
 
-    // What the server task waits for after the HTTP server has stopped (see
-    // `wait_for_shutdown`).
-    let open_sockets = shared_state.active_websocket_count.clone();
-    let task_health = shared_state.component_health.clone();
-
-    let app: Router = application_routes(&api_prefix, &shared_state);
+/// The application router with its layers, the probe routes and, when
+/// metrics are on, `/metrics`.
+fn build_router(
+    config: &Config,
+    api_prefix: &str,
+    shared_state: SharedData,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    shutdown_token: &CancellationToken,
+) -> Result<Router, MediatorError> {
+    let app: Router = application_routes(api_prefix, &shared_state);
 
     let rate_limiter = ip_rate_limiter(&config.limits);
     rate_limiter.spawn_gc(shutdown_token.clone());
@@ -1042,7 +1207,7 @@ pub async fn serve_internal(
         .layer(rate_limit_layer)
         .layer(RequestIdLayer::new())
         .merge(probe_routes(
-            &api_prefix,
+            api_prefix,
             shared_state,
             config.security.cors_allow_origin.clone(),
         ));
@@ -1078,7 +1243,7 @@ pub async fn serve_internal(
             );
         }
         app.route(
-            join_api_path(&api_prefix, "metrics").as_str(),
+            join_api_path(api_prefix, "metrics").as_str(),
             get(metrics_handler)
                 .with_state(handle)
                 .layer(axum::middleware::from_fn_with_state(access, metrics_access)),
@@ -1087,6 +1252,15 @@ pub async fn serve_internal(
         app
     };
 
+    Ok(app)
+}
+
+/// The listener to serve on — the caller's, or `listen_address` bound now —
+/// and the address it is bound to.
+fn bind_listener(
+    config: &Config,
+    listener: Option<std::net::TcpListener>,
+) -> Result<(std::net::TcpListener, SocketAddr), MediatorError> {
     // Bind synchronously with std so we can extract the actual port
     // before async work begins. `from_tcp` then takes the listener as
     // input — this is how the embedded path can hand the bound URL
@@ -1104,7 +1278,7 @@ pub async fn serve_internal(
     // hand the listener over. Re-binding an address they had already
     // bound and released leaves a window for another process to claim
     // it — taking the listener means the port is never released.
-    let std_listener = match opts.listener {
+    let std_listener = match listener {
         Some(listener) => listener,
         None => std::net::TcpListener::bind(configured_addr).map_err(|e| {
             error!("Failed to bind {}: {e}", configured_addr);
@@ -1130,6 +1304,21 @@ pub async fn serve_internal(
         )
     })?;
 
+    Ok((std_listener, bound_addr))
+}
+
+/// The server task serving `app` on `std_listener`, plain or TLS, and the
+/// URL schemes it answers on. The task drains on `shutdown_token` and then
+/// waits for the open sockets and supervised tasks (`wait_for_shutdown`).
+fn serve(
+    app: Router,
+    std_listener: std::net::TcpListener,
+    tls: TlsMode,
+    limits: &LimitsConfig,
+    shutdown_token: &CancellationToken,
+    open_sockets: Arc<AtomicUsize>,
+    task_health: crate::tasks::supervisor::HealthRegistry,
+) -> Result<ServerTask, MediatorError> {
     // Graceful shutdown: when the token cancels, signal axum_server to
     // drain. 30s drain matches the previous (TOML-only) behaviour.
     let server_handle = axum_server::Handle::new();
@@ -1143,7 +1332,7 @@ pub async fn serve_internal(
 
     let app_with_state = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let (server_task, scheme, ws_scheme) = match opts.tls {
+    let (server_task, scheme, ws_scheme) = match tls {
         TlsMode::Plain => {
             // `axum_server::from_tcp` returns `io::Result<Server>` —
             // wrap the std listener now (errors here mean the listener
@@ -1157,8 +1346,8 @@ pub async fn serve_internal(
                         format!("Failed to wrap TCP listener: {e}"),
                     )
                 })?
-                .map(|plain| connection_limit(plain, &config.limits));
-            http_server::configure(server.http_builder(), &config.limits);
+                .map(|plain| connection_limit(plain, limits));
+            http_server::configure(server.http_builder(), limits);
             let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
                 server
                     .handle(server_handle)
@@ -1190,8 +1379,8 @@ pub async fn serve_internal(
                         format!("Failed to wrap TCP listener with TLS: {e}"),
                     )
                 })?
-                .map(|tls| connection_limit(tls, &config.limits));
-            http_server::configure(server.http_builder(), &config.limits);
+                .map(|tls| connection_limit(tls, limits));
+            http_server::configure(server.http_builder(), limits);
             let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
                 server
                     .handle(server_handle)
@@ -1213,6 +1402,23 @@ pub async fn serve_internal(
         }
     };
 
+    Ok((server_task, scheme, ws_scheme))
+}
+
+/// The server task and its HTTP and WebSocket URL schemes.
+type ServerTask = (
+    JoinHandle<Result<(), MediatorError>>,
+    &'static str,
+    &'static str,
+);
+
+/// The published HTTP and WebSocket endpoints for `bound_addr`.
+fn endpoints(
+    scheme: &str,
+    ws_scheme: &str,
+    bound_addr: SocketAddr,
+    api_prefix: &str,
+) -> Result<(Url, Url), MediatorError> {
     // `api_prefix` is canonical (`""` or `"/foo"` with no trailing
     // slash). The published `http_endpoint` is documented as a base URL
     // that callers can concatenate suffixes onto (and that `Url::join`
@@ -1227,7 +1433,7 @@ pub async fn serve_internal(
                 format!("Failed to build http endpoint URL: {e}"),
             )
         })?;
-    let ws_path = join_api_path(&api_prefix, "ws");
+    let ws_path = join_api_path(api_prefix, "ws");
     let ws_endpoint = Url::parse(&format!("{ws_scheme}://{bound_addr}{ws_path}")).map_err(|e| {
         MediatorError::InternalError(
             error_codes::INTERNAL_ERROR,
@@ -1236,15 +1442,7 @@ pub async fn serve_internal(
         )
     })?;
 
-    Ok(MediatorHandle::__from_internals(
-        http_endpoint,
-        ws_endpoint,
-        bound_addr,
-        mediator_did,
-        admin_did,
-        shutdown_token,
-        server_task,
-    ))
+    Ok((http_endpoint, ws_endpoint))
 }
 
 /// The health and readiness routes.

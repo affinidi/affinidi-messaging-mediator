@@ -8,10 +8,7 @@ use serde_json::json;
 use tracing::{debug, info, span};
 use uuid::Uuid;
 
-use crate::{
-    common::session::Session,
-    messages::{ProcessMessageResponse, WrapperType},
-};
+use crate::{common::session::Session, messages::ProcessMessageResponse};
 
 /// The Trust Ping 2.0 response type.
 pub(crate) const PING_RESPONSE_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping-response";
@@ -44,23 +41,8 @@ pub(crate) fn process(
     )
     .entered();
 
-    if let Some(expires) = msg.expires_time
-        && expires <= now
-    {
-        return Err(MediatorError::problem_with_log(
-            error_codes::MESSAGE_EXPIRED,
-            &session.session_id,
-            Some(msg.id.to_string()),
-            ProblemReportSorter::Error,
-            ProblemReportScope::Protocol,
-            "message.expired",
-            "Message has expired: {1}",
-            vec![expires.to_string()],
-            StatusCode::BAD_REQUEST,
-            "Message has expired",
-        ));
-    }
-
+    // Expiry is checked once for every message to the mediator, before
+    // dispatch (`MessageHandler::process`).
     let to = super::addressed_to_mediator(msg, mediator_did, session, "Trust Ping")?;
     debug!("To: {}", to);
 
@@ -110,23 +92,17 @@ pub(crate) fn process(
 
         debug!("response_msg: {:?}", response_msg);
 
-        Ok(ProcessMessageResponse {
-            handed_over: None,
-            store_message: true,
-            force_live_delivery: false,
-            data: WrapperType::Message(Box::new(response_msg)),
-            forward_message: false,
-        })
+        Ok(ProcessMessageResponse::Reply(Box::new(response_msg)))
     } else {
         debug!("No response requested");
-        Ok(ProcessMessageResponse::default())
+        Ok(ProcessMessageResponse::Nothing)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{PING_RESPONSE_TYPE, process};
-    use crate::{common::session::Session, messages::WrapperType};
+    use crate::{common::session::Session, messages::ProcessMessageResponse};
     use affinidi_messaging_didcomm::message::Message;
 
     const MEDIATOR: &str = "did:example:mediator";
@@ -154,7 +130,7 @@ mod tests {
     #[test]
     fn a_ping_is_answered_with_a_ping_response() {
         let response = process(&ping(MEDIATOR), &session(), MEDIATOR, 1_000).unwrap();
-        let WrapperType::Message(reply) = response.data else {
+        let ProcessMessageResponse::Reply(reply) = response else {
             panic!("a ping with response_requested is answered");
         };
         assert_eq!(reply.typ, PING_RESPONSE_TYPE);
