@@ -514,34 +514,21 @@ pub async fn websocket_handler(
     let ws_size = state.config.limits.ws_size;
     let ws = ws.max_message_size(ws_size).max_frame_size(ws_size);
 
-    #[cfg(feature = "tsp")]
-    {
-        async move {
-            ws.on_upgrade(move |socket| {
-                handle_socket(
-                    socket,
-                    state,
-                    session,
-                    relay_source,
-                    mux_mode,
-                    tsp_mode,
-                    tsp_ack_mode,
-                )
-            })
-        }
+    // From here the socket's mode is one value, not a set of flags whose
+    // combinations the loop would have to keep consistent.
+    let mode = match relay_source {
+        Some(source) => ConnectionMode::Relay { source },
+        #[cfg(feature = "tsp")]
+        None if tsp_mode => ConnectionMode::Tsp {
+            ack: tsp_ack_mode,
+            mux: mux_mode,
+        },
+        None => ConnectionMode::DidComm { mux: mux_mode },
+    };
+
+    async move { ws.on_upgrade(move |socket| handle_socket(socket, state, session, mode)) }
         .instrument(_span)
         .await
-    }
-    #[cfg(not(feature = "tsp"))]
-    {
-        async move {
-            ws.on_upgrade(move |socket| {
-                handle_socket(socket, state, session, relay_source, mux_mode)
-            })
-        }
-        .instrument(_span)
-        .await
-    }
 }
 
 /// Test-only pause points for the connection loop.
