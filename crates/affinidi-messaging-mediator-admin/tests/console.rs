@@ -103,8 +103,64 @@ async fn a_standard_account_manages_its_own_queue_and_reads_its_own_mail() {
     assert_eq!(opened.body["content"], "hello from the console tests");
 }
 
+/// A private SDK instance, as `MediatorConsole::connect` makes one.
+async fn fresh_atm() -> affinidi_messaging_sdk::ATM {
+    use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
+    let tdk = TDKSharedState::new(TDKConfig::headless().expect("tdk config"))
+        .await
+        .expect("tdk");
+    let config = affinidi_messaging_sdk::config::ATMConfig::builder()
+        .build()
+        .expect("atm config");
+    affinidi_messaging_sdk::ATM::new(config, std::sync::Arc::new(tdk))
+        .await
+        .expect("atm")
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn an_admin_previews_then_purges_and_a_changed_queue_is_refused() {
+async fn the_connection_state_is_live_and_other_mail_is_handed_on() {
+    use affinidi_messaging_mediator_admin::ConnState;
+
+    let env = env().await;
+    let alice = env.add_user("alice").await.expect("alice");
+    let host = env.add_user("host").await.expect("host");
+
+    let (tx, mut unclaimed) = tokio::sync::mpsc::channel(8);
+    let console =
+        MediatorConsole::connect_with_unclaimed(fresh_atm().await, identity(&env, &host), tx)
+            .await
+            .expect("host connects");
+
+    let mut state = console
+        .connection_state()
+        .expect("the console runs a websocket");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        state.wait_for(|s| *s == ConnState::Connected),
+    )
+    .await
+    .expect("connected within ten seconds")
+    .expect("state signal");
+
+    // Mail for the console's DID that isn't a monitor batch reaches the
+    // embedding application rather than vanishing.
+    // (Other pushes, a pickup status say, may come first.)
+    send(&env, &alice, &host).await;
+    let message = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (message, _) = unclaimed.recv().await.expect("a message");
+            if message.body["content"].is_string() {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("handed on within ten seconds");
+    assert_eq!(message.body["content"], "hello from the console tests");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_previews_then_purges_only_what_the_preview_counted() {
     use specs::queue::purge::v0_1::Queue;
 
     let env = env().await;
@@ -138,26 +194,28 @@ async fn an_admin_previews_then_purges_and_a_changed_queue_is_refused() {
         older_than_seconds: None,
     };
 
-    // A queue that changes between preview and confirm is refused, untouched.
-    let stale = console
+    let plan = console
         .purge_preview(request.clone())
         .await
         .expect("preview");
-    assert_eq!(stale.matched, 2);
-    send(&env, &alice, &bob).await;
-    match console.purge(stale).await {
-        Err(ConsoleError::PlanStale {
-            previewed: 2,
-            now: 3,
-        }) => {}
-        other => panic!("expected a stale plan, got {other:?}"),
-    }
+    assert_eq!(plan.matched, 2);
 
-    // A fresh preview confirms and purges exactly what it counted.
-    let plan = console.purge_preview(request).await.expect("preview again");
-    assert_eq!(plan.matched, 3);
+    // A message that arrives between the preview and the confirmation is
+    // not what the user confirmed, so it stays. The purge is pinned to the
+    // preview's instant with a safety margin for the request's transit
+    // (PURGE_TRANSIT_MARGIN_SECS), so the two counted messages, stored
+    // within that margin before the preview, are spared as well: the pin
+    // only ever removes fewer than were counted. (Which counted messages
+    // older than the margin are removed is covered by purge.rs's tests.)
+    send(&env, &alice, &bob).await;
     let done = console.purge(plan).await.expect("purge");
-    assert_eq!(done.purged, 3);
+    assert_eq!(
+        done.purged, 0,
+        "nothing newer than preview minus the margin"
+    );
+
+    let left = console.purge_preview(request).await.expect("preview again");
+    assert_eq!(left.matched, 3, "the newer message is still queued");
 }
 
 #[tokio::test(flavor = "multi_thread")]

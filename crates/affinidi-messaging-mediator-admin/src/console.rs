@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use affinidi_messaging_core::ConnState;
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_sdk::protocols::trust_tasks::{MuxAdminRevokeOutcome, MuxConnectionsQuery};
 use affinidi_messaging_sdk::tasks::messaging::{account, message, mux, queue, stats};
@@ -12,12 +13,13 @@ use affinidi_messaging_sdk::{
 use affinidi_secrets_resolver::SecretsResolver;
 use affinidi_tdk_common::{TDKSharedState, config::TDKConfig};
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::error::{ConsoleError, Result};
 use crate::grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection};
 use crate::identity::Identity;
 use crate::live::{LiveStream, MembershipFilter, MonitorFeed, MonitorFilter};
-use crate::purge::{PurgePlan, PurgeRequest};
+use crate::purge::{PurgePlan, PurgeRequest, pinned_to_preview};
 
 /// Which account a call acts on: `None` is the console's own.
 pub type Target = Option<String>;
@@ -84,6 +86,8 @@ pub struct MediatorConsole {
     /// The mediator's release, from its `readyz` probe; `None` when it could
     /// not be read.
     mediator_version: Option<String>,
+    /// The connection's state, as the SDK publishes it.
+    conn: Option<watch::Receiver<ConnState>>,
 }
 
 /// The first mediator release that serves the operations tasks the console is
@@ -123,13 +127,64 @@ impl MediatorConsole {
         let atm = ATM::new(atm_config, Arc::new(tdk))
             .await
             .map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        Self::connect_with(atm, identity).await
+        Self::connect_exclusive(atm, identity).await
     }
 
-    /// Connect as `identity` through an existing SDK instance — for an
-    /// application that embeds the console alongside its own messaging.
+    /// Connect as `identity` through an SDK instance dedicated to the console.
     /// `identity`'s secrets are added to that instance's resolver.
+    ///
+    /// **The console takes every live message pushed to `identity`'s DID on
+    /// that instance.** The SDK has no receive filtered by message type, so
+    /// the console's reader pops each live message for the profile and keeps
+    /// only its own monitor batches; anything else is dropped from the SDK's
+    /// live cache (the mediator keeps its stored copy until it is picked up
+    /// and deleted). Use this only when nothing else on `atm` reads live
+    /// messages for the same DID. An application that shares the instance and
+    /// the DID uses [`connect_with_unclaimed`](Self::connect_with_unclaimed),
+    /// which hands those messages on instead.
+    pub async fn connect_exclusive(atm: ATM, identity: Identity) -> Result<Self> {
+        Self::connect_inner(atm, identity, None).await
+    }
+
+    /// Connect as `identity` through an existing SDK instance, taking every
+    /// live message for the DID on it.
+    ///
+    /// Deprecated because the name does not say that the console drops other
+    /// live messages for the DID. Choose explicitly:
+    /// [`connect_exclusive`](Self::connect_exclusive) for an instance
+    /// dedicated to the console (the same behaviour as this), or
+    /// [`connect_with_unclaimed`](Self::connect_with_unclaimed) for one shared
+    /// with the application's own live traffic.
+    #[deprecated(
+        since = "0.52.0",
+        note = "drops other live messages for the DID; use connect_exclusive for a dedicated SDK instance or connect_with_unclaimed for a shared one"
+    )]
     pub async fn connect_with(atm: ATM, identity: Identity) -> Result<Self> {
+        Self::connect_exclusive(atm, identity).await
+    }
+
+    /// Connect as `identity` through an existing SDK instance, for an application that shares
+    /// the SDK instance **and the DID** with its own live traffic: every
+    /// pushed message that is not one of the console's monitor batches goes
+    /// to `unclaimed`, with its unpack metadata, rather than being dropped.
+    ///
+    /// The console never deletes such a message at the mediator: the
+    /// application acknowledges (deletes) it as it would any other. When
+    /// `unclaimed` is full the message is not delivered to it (a warning is
+    /// logged); it stays stored at the mediator for a later pickup.
+    pub async fn connect_with_unclaimed(
+        atm: ATM,
+        identity: Identity,
+        unclaimed: tokio::sync::mpsc::Sender<crate::live::Unclaimed>,
+    ) -> Result<Self> {
+        Self::connect_inner(atm, identity, Some(unclaimed)).await
+    }
+
+    async fn connect_inner(
+        atm: ATM,
+        identity: Identity,
+        unclaimed: Option<tokio::sync::mpsc::Sender<crate::live::Unclaimed>>,
+    ) -> Result<Self> {
         if identity.secrets.is_empty() {
             return Err(ConsoleError::Identity(format!(
                 "{} has no secrets to connect with",
@@ -175,9 +230,11 @@ impl MediatorConsole {
             .map_err(ConsoleError::from_call)?;
         let (mode, capabilities) = classify(&account);
         let mediator_version = probe_version(&atm, &profile).await;
-        let live = LiveStream::start(atm.clone(), profile.clone());
+        let conn = profile.connection_state().await;
+        let live = LiveStream::start(atm.clone(), profile.clone(), unclaimed, conn.clone());
 
         Ok(Self {
+            conn,
             did_hash: crate::address_book::account_hash(&identity.did),
             did: identity.did,
             mediator_did,
@@ -189,6 +246,19 @@ impl MediatorConsole {
             live,
             mediator_version,
         })
+    }
+
+    /// The console's connection to the mediator, live: it changes to
+    /// [`ConnState::Disconnected`] on every drop and to
+    /// [`ConnState::Connected`] on every reconnect, so a caller can show
+    /// connectivity rather than infer it (R6.2). Wait on it with
+    /// [`watch::Receiver::changed`].
+    ///
+    /// `None` when the SDK runs no websocket for the session (REST only); its
+    /// state is then unknown, and a caller should say so rather than show it
+    /// as connected.
+    pub fn connection_state(&self) -> Option<watch::Receiver<ConnState>> {
+        self.conn.clone()
     }
 
     /// The mediator's release, when it could be read at connect time.
@@ -531,27 +601,40 @@ impl MediatorConsole {
     /// Count what a purge would remove, and return a plan to confirm.
     pub async fn purge_preview(&self, request: PurgeRequest) -> Result<PurgePlan> {
         self.require_target(&request.target, "another account's queue")?;
+        // Taken before the request leaves, so the instant is never later than
+        // the one the mediator counted at: pinning the purge to it can only
+        // leave out, never add, a message.
+        let previewed_at = chrono::Utc::now();
         let preview = self.run_purge(&request, true).await?;
         Ok(PurgePlan {
             matched: preview.matched,
             matched_bytes: preview.matched_bytes.unwrap_or(0),
-            previewed_at: chrono::Utc::now(),
+            previewed_at,
             request,
         })
     }
 
-    /// Carry out a previewed purge — refusing, with nothing removed, when the
-    /// queue no longer matches what was previewed, so a user never confirms
-    /// one count and loses another.
+    /// Carry out a previewed purge, pinned to the preview's instant.
+    ///
+    /// The purge is sent with an age that excludes every message that
+    /// arrived after the preview (and, with an age of its own, every message
+    /// that had not reached it by then): it removes only messages the
+    /// preview could have counted. It can remove **fewer** than
+    /// [`PurgePlan::matched`] — some may have been delivered or deleted
+    /// since, and the age carries a safety margin
+    /// ([`PURGE_TRANSIT_MARGIN_SECS`](crate::PURGE_TRANSIT_MARGIN_SECS), the
+    /// time the request may take to execute) and is rounded up to whole
+    /// seconds, so what arrived in that window before the preview is left
+    /// out — but never a message newer than the preview, provided the
+    /// mediator runs the purge within the margin. `purged` in the answer says
+    /// how many went.
+    ///
+    /// The SDK cannot send the purge task's `storedBefore` member yet, so the
+    /// pin is an age the console computes; the mediator still decides what
+    /// matches.
     pub async fn purge(&self, plan: PurgePlan) -> Result<queue::purge::v0_1::Response> {
-        let now = self.run_purge(&plan.request, true).await?;
-        if now.matched != plan.matched {
-            return Err(ConsoleError::PlanStale {
-                previewed: plan.matched,
-                now: now.matched,
-            });
-        }
-        self.run_purge(&plan.request, false).await
+        let request = pinned_to_preview(&plan, chrono::Utc::now());
+        self.run_purge(&request, false).await
     }
 
     async fn run_purge(

@@ -13,6 +13,9 @@ repository.workspace = true
 
 [dependencies]
 affinidi-messaging-sdk.workspace = true
+## `ConnState`, the connection signal the SDK publishes (not re-exported by
+## the SDK).
+affinidi-messaging-core.workspace = true
 ## The account a did:scid names: its `src` locator is not part of the
 ## identity (`scid` module, 0.4.4).
 affinidi-did-common.workspace = true
