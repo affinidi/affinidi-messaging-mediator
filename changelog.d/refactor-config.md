@@ -38,3 +38,26 @@
   but do not work together (it is `#[non_exhaustive]`).
 - Config file format, environment variables and default values are
   unchanged.
+
+### Changed — mediator-common depends on mediator-config, and takes its defaults from the table
+
+- The dependency between the two crates is inverted:
+  `affinidi-messaging-mediator-common` now depends on
+  `affinidi-messaging-mediator-config`, and the config crate no longer depends
+  on mediator-common (it takes `affinidi-messaging-mediator-types` directly for
+  the ACL types). The config crate is published first.
+- `ForwardingConfig::default()`, `ForwardingConfig`'s serde defaults (which the
+  standalone forwarding processor reads its typed TOML with) and
+  `DatabaseConfig::default()` now read the `defaults` table instead of
+  repeating its values. The values are unchanged; `DatabaseConfig::default()`
+  still names `./atm-functions.lua` as its `functions_file`.
+- The headless `SecurityConfig` (what `Config::headless` and `MediatorBuilder`
+  start from) takes its JWT lifetimes (900 s access, 86400 s refresh) and
+  security flags from the new `defaults::security` table. Values unchanged.
+- `redact` and `did_identity` move to `affinidi_messaging_mediator_config`
+  (its schema and validation use them). mediator-common re-exports both, so
+  `affinidi_messaging_mediator_common::redact::*` and
+  `affinidi_messaging_mediator_common::did_identity::*` keep working.
+- mediator-common's lean tier (`default-features = false`) now also pulls the
+  config crate's dependencies: `toml`, `serde_ignored`, `ipnet`, `humantime`
+  and `tracing`.

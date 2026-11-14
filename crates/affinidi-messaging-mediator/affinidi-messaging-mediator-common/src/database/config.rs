@@ -6,13 +6,14 @@
 //! deserialize this type directly from their own TOML. Either way a value is
 //! read strictly: one that does not read is an error, never a default.
 //!
-//! The defaults here must equal the config crate's `defaults::database` table
-//! (this crate cannot depend on it — the dependency runs the other way); the
-//! mediator's tests hold the two together.
+//! [`DatabaseConfig::default`] takes its values from the config crate's
+//! `defaults::database` table.
 
 use serde::{Deserialize, Serialize};
 
 use std::fmt;
+
+use affinidi_messaging_mediator_config::defaults::database as defaults;
 
 use crate::redact::redact_url;
 
@@ -51,15 +52,20 @@ impl fmt::Debug for DatabaseConfig {
     }
 }
 
+/// Every value from the `defaults::database` table, except `functions_file`:
+/// `./atm-functions.lua` (relative to the config file), a library file to
+/// load. The raw schema's default for that key is empty, which the mediator
+/// reads as its built-in library; here `None` means no library at all, which
+/// a Redis store without one refuses, so this default names a file.
 impl Default for DatabaseConfig {
     fn default() -> Self {
         DatabaseConfig {
             functions_file: Some("./atm-functions.lua".into()),
-            database_url: "redis://127.0.0.1/".into(),
-            database_timeout: 2,
-            cluster_mode: false,
-            circuit_breaker_threshold: 5,
-            circuit_breaker_recovery_secs: 10,
+            database_url: defaults::DATABASE_URL.into(),
+            database_timeout: defaults::DATABASE_TIMEOUT,
+            cluster_mode: defaults::CLUSTER_MODE,
+            circuit_breaker_threshold: defaults::CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_recovery_secs: defaults::CIRCUIT_BREAKER_RECOVERY_SECS,
         }
     }
 }

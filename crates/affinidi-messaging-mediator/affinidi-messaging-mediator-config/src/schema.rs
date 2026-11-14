@@ -1,7 +1,7 @@
 //! Top-level raw config schema (`[server]`, `[streaming]`, `[did_resolver]`,
 //! `[secrets]`, `[storage]`, and the `ConfigRaw` root).
 
-use affinidi_messaging_mediator_common::redact::redact_url;
+use crate::redact::redact_url;
 use serde::{Deserialize, Serialize};
 
 use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw, defaults};

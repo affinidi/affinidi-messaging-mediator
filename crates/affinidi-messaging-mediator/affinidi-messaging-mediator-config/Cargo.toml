@@ -29,15 +29,13 @@ thiserror.workspace = true
 tracing.workspace = true
 # `[secrets] cache_ttl` durations (`settings::secrets_cache_ttl`).
 humantime.workspace = true
-# Only for the lean ACL types used by validation (`types::acls`, always available
-# regardless of features). `default-features = false` keeps this crate off the
-# axum/redis/secrets stack. `DatabaseConfigRaw` is defined locally (see
-# `schema.rs`) rather than imported from mediator-common's `database` module —
-# that module is `server`-gated in the published mediator-common, so importing it
-# would force this lean crate to require an unpublished mediator-common just to
-# `cargo publish`. Keeping the raw DB schema here (it *is* config schema) keeps
-# this crate independent of mediator-common's server tier.
-affinidi-messaging-mediator-common = { version = "0.52.0", path = "../affinidi-messaging-mediator-common", default-features = false }
+# The lean ACL types used by validation (`types::acls`). Taken directly rather
+# than through mediator-common, which depends on this crate.
+affinidi-messaging-mediator-types.workspace = true
+# `did_identity`: the account a DID names (a did:scid DID URL's `src` locator is
+# not part of the identity) and its SHA-256 hash. Re-exported by mediator-common.
+affinidi-did-common.workspace = true
+sha256.workspace = true
 
 [dev-dependencies]
 # `check_tls` test writes temp cert/key files.

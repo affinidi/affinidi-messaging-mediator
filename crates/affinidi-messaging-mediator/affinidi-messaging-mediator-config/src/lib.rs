@@ -19,8 +19,15 @@
 //!   nothing beyond this crate (`log_level`, `[streaming]`, `[did_resolver]`,
 //!   `[secrets] cache_ttl`, `[storage]`).
 //!
-//! It is intentionally dependency-light: serde, plus the lean tier of
-//! `affinidi-messaging-mediator-common` for the ACL types validation uses. The
+//! It also holds two small pure helpers the schema needs and
+//! `affinidi-messaging-mediator-common` re-exports: [`redact`] (hiding a URL's
+//! credentials) and [`did_identity`] (the account a DID names).
+//!
+//! It is intentionally dependency-light: serde, toml and logging, plus
+//! `affinidi-messaging-mediator-types` for the ACL types validation uses.
+//! `affinidi-messaging-mediator-common` depends on this crate (its
+//! `DatabaseConfig` and `ForwardingConfig` defaults come from [`defaults`]),
+//! never the other way round. The
 //! **resolved** runtime `Config` (opened secret backends, JWT keys, the
 //! DID-resolver client, the VTA refresher) and all `ConfigRaw → Config`
 //! conversions stay in the mediator, which re-exports these types so
@@ -30,10 +37,12 @@
 //! which applies the same checks to recipe values.
 
 pub mod defaults;
+pub mod did_identity;
 pub mod env;
 pub mod error;
 mod limits;
 mod processors;
+pub mod redact;
 mod schema;
 mod security;
 pub mod settings;

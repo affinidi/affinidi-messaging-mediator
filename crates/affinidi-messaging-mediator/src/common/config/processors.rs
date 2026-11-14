@@ -20,13 +20,13 @@ pub struct ProcessorsConfig {
     pub session_expiry_cleanup: SessionExpiryCleanupConfig,
 }
 
-/// The config crate's defaults, read through the same conversions a file goes
+/// The config crate's defaults table: `ForwardingConfig::default()` reads it
+/// directly, the cleanup sections through the same conversions a file goes
 /// through.
 impl Default for ProcessorsConfig {
     fn default() -> Self {
         Self {
-            forwarding: forwarding_config_from_raw(ForwardingConfigRaw::default())
-                .expect("the built-in forwarding defaults are valid"),
+            forwarding: ForwardingConfig::default(),
             message_expiry_cleanup: MessageExpiryCleanupConfig::default(),
             session_expiry_cleanup: SessionExpiryCleanupConfig::default(),
         }
@@ -189,16 +189,15 @@ mod tests {
         assert!(config.blocked_forwarding.is_empty());
     }
 
-    /// mediator-common's `ForwardingConfig::default()` (and its serde
-    /// defaults, which the standalone forwarding processor reads its own
-    /// typed config with) cannot see the config crate's defaults table — the
-    /// dependency runs the other way. This holds the two to the same values,
-    /// so the table stays the one place a forwarding default is decided.
+    /// The raw section's defaults (the table written as the strings a file
+    /// holds) read through the strict conversion as `ForwardingConfig::default()`
+    /// (the table read directly): a file that states only defaults runs as a
+    /// mediator built in code does.
     #[test]
-    fn the_common_forwarding_default_is_the_config_table() {
-        let from_table = ProcessorsConfig::default().forwarding;
+    fn the_raw_forwarding_defaults_read_as_the_default() {
+        let read = forwarding_config_from_raw(ForwardingConfigRaw::default()).unwrap();
         assert_eq!(
-            serde_json::to_value(&from_table).unwrap(),
+            serde_json::to_value(&read).unwrap(),
             serde_json::to_value(ForwardingConfig::default()).unwrap()
         );
         assert!(MessageExpiryCleanupConfig::default().enabled);

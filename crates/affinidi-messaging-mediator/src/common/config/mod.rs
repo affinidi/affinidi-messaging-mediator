@@ -624,8 +624,8 @@ fn print_vta_recovery_playbook(context: &str) {
 impl TryFrom<ConfigRaw> for Config {
     type Error = MediatorError;
 
-    /// The two steps: [`ValidatedConfig::from_raw`] (the file alone, nothing
-    /// opened) then [`ValidatedConfig::resolve`] (secrets, VTA, DIDs).
+    /// The two steps: `ValidatedConfig::from_raw` (the file alone, nothing
+    /// opened) then `ValidatedConfig::resolve` (secrets, VTA, DIDs).
     async fn try_from(raw: ConfigRaw) -> Result<Self, Self::Error> {
         ValidatedConfig::from_raw(&raw)?.resolve(raw).await
     }
@@ -1845,22 +1845,6 @@ mod validate_raw_tests {
         );
         assert_eq!(config.limits.message_size, defaults::limits::MESSAGE_SIZE);
         assert_eq!(config.streaming_enabled, defaults::streaming::ENABLED);
-        assert_eq!(
-            config.database.circuit_breaker_threshold,
-            defaults::database::CIRCUIT_BREAKER_THRESHOLD
-        );
-        assert_eq!(
-            config.database.circuit_breaker_recovery_secs,
-            defaults::database::CIRCUIT_BREAKER_RECOVERY_SECS
-        );
-        assert_eq!(
-            config.database.database_timeout,
-            defaults::database::DATABASE_TIMEOUT
-        );
-        assert_eq!(
-            config.database.database_url,
-            defaults::database::DATABASE_URL
-        );
     }
 
     #[test]
