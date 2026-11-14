@@ -3,17 +3,26 @@ name: compose-smoke
 # (docker/mediator.Dockerfile), brings up docker-compose.test.yml (mediator +
 # Redis + static did:web), and runs a full DIDComm round-trip against it
 # (docker/smoke/smoke.sh, driving the test-mediator `docker_smoke` example).
+# Then brings up the local quickstart (docker/quickstart), which generates its
+# own identity, and checks it turns healthy and keeps that identity across a
+# restart (docker/smoke/quickstart.sh).
 #
-# NOT run per-PR — the mediator image is a full release build, too heavy for
-# every push. Runs on demand (workflow_dispatch) and nightly. PRs that touch
-# docker/ can opt into an image build + boot probe with the `ci:image` label
-# (publish-images.yaml).
+# The image is a full release build, too heavy for every push: this runs
+# nightly, on demand, and on PRs that change the image, the stacks or this
+# workflow (paths below). Other PRs that touch docker/ can opt into an image
+# build + boot probe with the `ci:image` label (publish-images.yaml).
 #
 # Runs on `vars.CI_RUNNER_LARGE` when that repo variable is set, else
 # `ubuntu-24.04`.
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "docker-compose.test.yml"
+      - ".dockerignore"
+      - ".github/workflows/compose-smoke.yaml"
   schedule:
     # 04:00 UTC nightly.
     - cron: "0 4 * * *"
@@ -22,8 +31,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: compose-smoke
-  cancel-in-progress: false
+  # One run per PR, superseded by a newer push; scheduled and manual runs on a
+  # branch queue rather than cancel each other.
+  group: compose-smoke-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   smoke:
@@ -34,11 +45,10 @@ jobs:
       RUSTFLAGS: "--cfg tracing_unstable"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Install native deps (libdbus for keyring, libssl)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev pkg-config
+      - uses: ./.github/actions/native-deps
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
@@ -52,3 +62,6 @@ jobs:
         # smoke.sh builds the image, brings the stack up, waits for health,
         # checks did:web, runs the SDK round-trip, then tears the stack down.
         run: bash docker/smoke/smoke.sh
+
+      - name: Smoke the quickstart stack
+        run: bash docker/smoke/quickstart.sh

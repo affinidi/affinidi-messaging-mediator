@@ -16,6 +16,7 @@ patches publish.
 import pathlib
 import re
 import subprocess
+import sys
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -197,3 +198,21 @@ def unreleased_split(changelog):
     nxt = re.search(r"^## ", changelog[m.end():], re.M)
     end = m.end() + nxt.start() if nxt else len(changelog)
     return changelog[: m.start()], changelog[m.end(): end], changelog[end:]
+
+
+def main(argv):
+    """`python3 scripts/release_lib.py publishable`: one publishable crate per line.
+
+    The single answer to "which crates does this workspace publish" for shell
+    callers (upstream-drift.yml), so they do not re-derive it from
+    `cargo metadata` with rules of their own.
+    """
+    if argv == ["publishable"]:
+        print("\n".join(sorted(publishable_crates(ROOT))))
+        return 0
+    print("usage: release_lib.py publishable", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

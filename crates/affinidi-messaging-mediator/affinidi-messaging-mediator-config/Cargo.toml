@@ -14,18 +14,18 @@ repository.workspace = true
 
 [dependencies]
 # Schema + config loading + validation. Still lean — no runtime/server stack.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 # TOML parsing for `read_config_file`.
-toml = "1"
+toml.workspace = true
 # Records every key the schema does not recognise (typo'd, removed, or filed
 # under the wrong `[table]`) so the mediator can warn instead of dropping it.
 serde_ignored = "0.1"
 # CIDR validation for trusted reverse-proxy client attribution.
-ipnet = { version = "2", features = ["serde"] }
+ipnet = { workspace = true, features = ["serde"] }
 # Lean error type for config loading (`ConfigError`).
-thiserror = "2"
+thiserror.workspace = true
 # Structured logging in the file-reading helpers, matching the mediator.
-tracing = "0.1"
+tracing.workspace = true
 # Only for the lean ACL types used by validation (`types::acls`, always available
 # regardless of features). `default-features = false` keeps this crate off the
 # axum/redis/secrets stack. `DatabaseConfigRaw` is defined locally (see
@@ -38,7 +38,7 @@ affinidi-messaging-mediator-common = { version = "0.52.0", path = "../affinidi-m
 
 [dev-dependencies]
 # `check_tls` test writes temp cert/key files.
-tempfile = "3"
+tempfile.workspace = true
 
 [lints]
 workspace = true

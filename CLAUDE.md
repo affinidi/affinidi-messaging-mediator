@@ -48,5 +48,13 @@ assembles the fragments (`scripts/changelog_fragments.py`).
 TDK crates come from crates.io as `major.minor` requirements: no git or path
 dependencies and no `[patch.crates-io]`. When a change needs a TDK fix, land
 and release it in affinidi-tdk-rs first, then bump the requirement here.
-`scripts/check-workspace-duplicates.sh` fails CI if a second copy of an
-`affinidi-*` crate enters the lockfile.
+`scripts/check-workspace-duplicates.sh` fails CI if a workspace member is also
+resolved from crates.io, or if an `affinidi-*`, `trust-tasks-*`, `vta-*` or
+`didwebvh-rs` crate resolves at two versions — unless it is listed, with a
+review-by date, in `scripts/version-duplicates-allow.txt`. `deny.toml`
+rejects git dependencies and unknown registries.
+
+Shared third-party dependency versions live in the root
+`[workspace.dependencies]`; members use `<dep>.workspace = true` plus their
+own `features`. Internal (workspace-member) requirements stay in each member
+manifest, where `scripts/release_lib.py` moves them in lockstep.

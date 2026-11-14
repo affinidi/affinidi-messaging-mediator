@@ -1521,11 +1521,15 @@ fn resolve_configured_paths(config: &mut ConfigRaw, config_file: &Path) {
         resolved.path.to_string_lossy().into_owned()
     };
 
-    config.database.functions_file = resolve(
-        "functions_file",
-        "DATABASE_FUNCTIONS_FILE",
-        &config.database.functions_file,
-    );
+    // An unset `functions_file` means the built-in library; resolving the
+    // empty string would turn it into the config directory itself.
+    if !config.database.functions_file.trim().is_empty() {
+        config.database.functions_file = resolve(
+            "functions_file",
+            "DATABASE_FUNCTIONS_FILE",
+            &config.database.functions_file,
+        );
+    }
     if let Some(cert) = config.security.ssl_certificate_file.as_deref() {
         config.security.ssl_certificate_file = Some(resolve(
             "ssl_certificate_file",
@@ -1644,16 +1648,34 @@ mod configured_path_tests {
         (dir, config_file)
     }
 
-    /// Keyring VTI-07: a config file outside the working directory finds the
-    /// Lua functions that ship beside it. Before, this resolved to
-    /// `./conf/atm-functions.lua` relative to wherever the process started.
+    /// The shipped config leaves `functions_file` unset, which means the
+    /// built-in stored-function library. Path resolution must leave the empty
+    /// value alone: resolving it against the config file turned it into the
+    /// config directory, which the mediator then failed to read as a file.
     #[test]
-    fn the_shipped_default_finds_its_functions_file_beside_itself() {
+    fn the_shipped_default_leaves_functions_file_unset() {
+        let (_dir, config_file) = deploy_shipped_conf();
+        let mut config = affinidi_messaging_mediator_config::env::read_config_file(
+            config_file.to_str().unwrap(),
+        )
+        .unwrap();
+
+        resolve_configured_paths(&mut config, &config_file);
+
+        assert_eq!(config.database.functions_file.trim(), "");
+    }
+
+    /// Keyring VTI-07: a config file outside the working directory finds a
+    /// configured Lua file that ships beside it, not one relative to wherever
+    /// the process started.
+    #[test]
+    fn a_configured_functions_file_resolves_beside_the_config() {
         let (dir, config_file) = deploy_shipped_conf();
         let mut config = affinidi_messaging_mediator_config::env::read_config_file(
             config_file.to_str().unwrap(),
         )
         .unwrap();
+        config.database.functions_file = "./atm-functions.lua".into();
 
         resolve_configured_paths(&mut config, &config_file);
 
@@ -1663,29 +1685,25 @@ mod configured_path_tests {
             "resolved beside the config, not against the working directory: {}",
             resolved.display()
         );
-        assert!(resolved.exists(), "{}", resolved.display());
+        assert!(resolved.is_file(), "{}", resolved.display());
     }
 
     /// And it does so by the intended rule, not the deprecated fallback — so a
-    /// default start is silent. A default that leaned on the fallback would
-    /// warn on every start, and a warning that always fires is one people
-    /// learn to ignore.
+    /// start with a config-relative `functions_file` is silent. A path that
+    /// leaned on the fallback would warn on every start, and a warning that
+    /// always fires is one people learn to ignore.
     #[test]
-    fn the_shipped_default_does_not_lean_on_the_legacy_fallback() {
+    fn a_config_relative_functions_file_does_not_lean_on_the_legacy_fallback() {
         use affinidi_messaging_mediator_common::config_path::{
             PathSource, resolve_config_relative,
         };
         let (_dir, config_file) = deploy_shipped_conf();
-        let config = affinidi_messaging_mediator_config::env::read_config_file(
-            config_file.to_str().unwrap(),
-        )
-        .unwrap();
 
-        let r = resolve_config_relative(&config_file, &config.database.functions_file);
+        let r = resolve_config_relative(&config_file, "./atm-functions.lua");
         assert_eq!(
             r.source,
             PathSource::ConfigDir,
-            "the shipped `functions_file` must be written relative to the config file"
+            "a `functions_file` written relative to the config file resolves there"
         );
     }
 

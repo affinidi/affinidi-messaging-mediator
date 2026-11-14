@@ -1,0 +1,25 @@
+name: Feature request
+description: Something the mediator or its tools should do that they do not.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+    validations:
+      required: true
+  - type: textarea
+    id: consumers
+    attributes:
+      label: Who else it affects
+      description: >-
+        Clients and services that deliver through the mediator (SDK, VTA, VTC,
+        trust registry, bridges). Changes to delivery, ack, auth or reconnect
+        behaviour affect all of them.
