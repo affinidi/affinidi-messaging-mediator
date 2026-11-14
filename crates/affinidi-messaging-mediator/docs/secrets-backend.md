@@ -7,9 +7,14 @@ trait. `mediator.toml` names it with a URL:
 
 ```toml
 [secrets]
-backend = "keyring://affinidi-mediator"   # env MEDIATOR_SECRETS_BACKEND
+backend = "aws_secrets://us-east-1/prod/mediator/"   # env MEDIATOR_SECRETS_BACKEND
 cache_ttl = "30d"                          # VTA cache TTL, humantime; default 30d, 0 = never expires
 ```
+
+There is no default backend. The shipped `conf/mediator.toml` leaves
+`backend` commented out with the choices listed, so every deployment picks
+one (`mediator-setup` sets it); the mediator refuses to start until it is set,
+and the error lists the choices.
 
 This document covers the backend URLs, how entries are stored, the entry
 schemas, provisioning without the wizard, `/readyz`, rotation, and HA.
@@ -20,14 +25,27 @@ schemas, provisioning without the wizard, `/readyz`, rotation, and HA.
 
 | Scheme | Stored as | Encryption | Notes |
 |--------|-----------|------------|-------|
-| `keyring://<service>` | One OS keychain entry, `mediator_secrets_bundle` | OS-managed | Single host only. Good for desktop dev. |
+| `keyring://<service>` | One OS keychain entry, `mediator_secrets_bundle` | OS-managed | Single host, desktop development only. **On Linux this is the kernel keyring (keyutils), which does not survive a reboot** — see [keyring on Linux](#keyring-on-linux). No Windows store. |
 | `file:///<absolute-path>` | One JSON file, base64 values | None | Dev only: plaintext on disk. |
 | `file:///<absolute-path>?encrypt=1` | One JSON file, AEAD-sealed | AES-256-GCM, Argon2id-derived key | Needs `MEDIATOR_FILE_BACKEND_PASSPHRASE` or `MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE` at start. |
 | `aws_secrets://<region>/<prefix>` | One secret, `<prefix>mediator_secrets_bundle` | AWS-managed | |
 | `gcp_secrets://<project>/<prefix>` | One secret, `<prefix>mediator_secrets_bundle`; each write adds a version | Google-managed | Auth: Application Default Credentials. |
-| `azure_keyvault://<vault-name-or-url>` | One secret, `mediator-secrets-bundle` (`_` becomes `-`) | Azure-managed | A bare name means `https://<name>.vault.azure.net`; a full `https://` URL is used as is (sovereign clouds). Auth: `DeveloperToolsCredential` (Azure CLI). |
+| `azure_keyvault://<vault-name-or-url>` | One secret, `mediator-secrets-bundle` (`_` becomes `-`) | Azure-managed | **Wizard / development only.** A bare name means `https://<name>.vault.azure.net`; a full `https://` URL is used as is (sovereign clouds). Auth: `DeveloperToolsCredential` (an Azure CLI / `azd` login) only — no managed or workload identity, so it cannot authenticate on AKS, a VM or a container. |
 | `vault://<endpoint>/<mount>[/<prefix>][?auth=…]` | One KV v2 secret, `<mount>/<prefix>/mediator_secrets_bundle` | Vault-managed | First path segment is the KV v2 mount; the rest is the prefix. See [Vault authentication](#vault-authentication). |
 | `k8s://[<namespace>/]<secret-name>` | One `Secret`; each entry is one `data` key | etcd (enable encryption at rest) | See [Kubernetes Secrets](#kubernetes-secrets). |
+
+### keyring on Linux
+
+On Linux the `keyring://` backend stores its entry in the kernel keyring
+(keyutils), not in a desktop Secret Service. Kernel keys live in memory and
+**are lost when the machine reboots**: the JWT signing key, the admin
+credential and the operating keys go with them, and the mediator then refuses
+to start ("JWT signing secret is missing", "No operating secrets found"),
+which reads like corruption. The mediator logs a warning at startup whenever
+it is configured with `keyring://` on Linux. Use it only for desktop
+development there; for a server choose a persistent backend (`aws_secrets://`,
+`gcp_secrets://`, `vault://`, `k8s://`, or `file:///…?encrypt=1`). On macOS
+the backend uses the login Keychain, which persists.
 
 **Per-key backends** in this document means keyring, AWS, GCP, Azure and
 Vault: stores that hold one value per secret. On these the mediator packs
@@ -444,8 +462,11 @@ present, it saves resolving the mediator's own DID.
 
 The last good `DidSecretsBundle` from the VTA, used at startup when the VTA
 is unreachable. It carries an HMAC-SHA256 keyed from the admin credential's
-private key (HKDF-SHA256, salt `"mediator-vta-cache-hmac-v1"`), so a tampered
-entry, or one from a different admin key, is treated as absent.
+private key (HKDF-SHA256, salt `"mediator-vta-cache-hmac-v1"`), so a corrupted
+or mismatched entry (one written under a different admin key) is treated as
+absent. The key is derived from a credential kept in the same backend, so
+this detects corruption and mismatch, not deliberate tampering: anyone who
+can write the backend can also read the admin credential and sign an entry.
 
 ```json
 {
@@ -626,10 +647,11 @@ starts with live credentials.
 
 | Backend | HA? | Why |
 |---------|-----|-----|
-| `keyring://` | No | Per-host keychain. |
+| `keyring://` | No | Per-host keychain; on Linux lost on reboot. |
 | `file://` | No | Local file. |
 | `file:///shared/path?encrypt=1` | Discouraged | Works on a shared mount, but there is no locking. |
-| `aws_secrets://`, `gcp_secrets://`, `azure_keyvault://`, `vault://`, `k8s://` | Yes | Shared managed store. Still one writer. |
+| `aws_secrets://`, `gcp_secrets://`, `vault://`, `k8s://` | Yes | Shared managed store. Still one writer. |
+| `azure_keyvault://` | No | Wizard / development only: authenticates only with an Azure CLI login, which a server deployment does not have. |
 
 The mediator does no leader election. For active/active traffic, partition
 DIDs across mediators, each with its own backend.

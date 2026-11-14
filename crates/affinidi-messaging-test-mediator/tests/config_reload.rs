@@ -27,19 +27,49 @@ async fn a_reload_picks_up_a_changed_limit_and_keeps_overrides() {
     let refused = tt.config_reload(&root.profile).await;
     assert!(refused.is_err(), "{refused:?}");
 
-    // The shipped template, with `listed_messages` lowered to 70.
+    // The shipped template, with `listed_messages` lowered to 70 and a secrets
+    // backend chosen (the template leaves it unset, and a reload checks the
+    // whole file as startup does).
     let template = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../affinidi-messaging-mediator/conf/mediator.toml"
     ))
     .expect("template");
     assert!(template.contains("listed_messages = \"100\""));
+    let backend_placeholder = "# backend = \"aws_secrets://us-east-1/prod/mediator/\"";
+    assert!(template.contains(backend_placeholder));
     let path = std::env::temp_dir().join(format!("reload-{}.toml", std::process::id()));
     std::fs::write(
         &path,
-        template.replace("listed_messages = \"100\"", "listed_messages = \"70\""),
+        template
+            .replace("listed_messages = \"100\"", "listed_messages = \"70\"")
+            .replace(
+                backend_placeholder,
+                "backend = \"file:///var/lib/mediator/secrets.json\"",
+            ),
     )
     .expect("write config");
+
+    // A file the mediator would refuse to start from is refused by a reload
+    // too, and changes nothing (#112).
+    let bad = std::env::temp_dir().join(format!("reload-bad-{}.toml", std::process::id()));
+    std::fs::write(
+        &bad,
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("listed_messages = \"70\"", "listed_messages = \"7O\""),
+    )
+    .expect("write bad config");
+    affinidi_messaging_mediator::common::config::overrides::record_config_path(
+        bad.to_str().unwrap(),
+    );
+    // The path is recorded once per process, so the bad file is the one
+    // reloaded below if this is the first record; otherwise skip the check.
+    if affinidi_messaging_mediator::common::config::overrides::config_path() == bad.to_str() {
+        let refused = tt.config_reload(&root.profile).await;
+        assert!(refused.is_err(), "{refused:?}");
+        std::fs::copy(&path, &bad).expect("fix the config");
+    }
     affinidi_messaging_mediator::common::config::overrides::record_config_path(
         path.to_str().unwrap(),
     );

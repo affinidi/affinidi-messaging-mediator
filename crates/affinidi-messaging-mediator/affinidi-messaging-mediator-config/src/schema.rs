@@ -32,11 +32,11 @@ pub struct DatabaseConfigRaw {
     #[serde(default)]
     pub cluster_mode: String,
     /// Consecutive failed database commands that open the circuit breaker.
-    /// Absent or unparseable: 5.
+    /// At least 1; absent: 5. An unreadable value is refused.
     #[serde(default)]
     pub circuit_breaker_threshold: String,
     /// Seconds an open circuit breaker waits before letting a probe command
-    /// through. Absent or unparseable: 10.
+    /// through. Absent: 10. An unreadable value is refused.
     #[serde(default)]
     pub circuit_breaker_recovery_secs: String,
 }
@@ -142,6 +142,13 @@ pub struct SecretsConfigRaw {
     /// Backend URL. Examples: `keyring://affinidi-mediator`,
     /// `file:///var/lib/mediator/secrets.json`,
     /// `aws_secrets://us-east-1/prod/mediator/`.
+    ///
+    /// Defaulted so a file that leaves it commented out (the shipped
+    /// template does, so the operator picks one) still parses; an empty value
+    /// is refused at startup by
+    /// [`check_secrets_backend`](crate::validate::check_secrets_backend),
+    /// which lists the choices.
+    #[serde(default)]
     pub backend: String,
     /// Maximum age for the cached VTA bundle (humantime format, e.g.
     /// `"30d"` or `"12h"`). `None` or `"0"` means no expiry. Defaults to
@@ -316,7 +323,7 @@ pub struct FjallConfig {
     ///   power loss too, at the cost of a disk sync per acknowledged write
     ///   (concurrent writes share syncs).
     ///
-    /// An unrecognised value is treated as `"sync"`.
+    /// Any other value is refused at startup.
     #[serde(default = "default_fjall_durability")]
     pub durability: String,
 }

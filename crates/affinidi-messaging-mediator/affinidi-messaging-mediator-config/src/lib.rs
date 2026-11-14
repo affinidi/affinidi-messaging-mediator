@@ -9,7 +9,9 @@
 //! - [`env`](mod@env): reading the file, unknown-key reporting and the environment
 //!   variable overrides named in the shipped template's `### Env:` labels;
 //! - [`validate`]: boot-time checks on raw values, with a crate-local
-//!   [`ConfigError`].
+//!   [`ConfigError`];
+//! - [`values`]: the strict readers every string-typed setting goes through
+//!   (an unreadable value is an error naming `section.key`, never a default).
 //!
 //! It is intentionally dependency-light: serde, plus the lean tier of
 //! `affinidi-messaging-mediator-common` for the ACL types validation uses. The
@@ -28,6 +30,7 @@ mod processors;
 mod schema;
 mod security;
 pub mod validate;
+pub mod values;
 
 pub use error::ConfigError;
 pub use limits::*;
@@ -57,6 +60,9 @@ mod golden {
         assert!(!raw.security.global_acl_default.is_empty());
         assert!(!raw.limits.message_size.is_empty());
         assert!(!raw.processors.forwarding.enabled.is_empty());
-        assert!(!raw.secrets.backend.is_empty());
+        // No secrets backend is chosen for the operator: the template lists
+        // the choices commented out, and startup refuses until one is set.
+        assert!(raw.secrets.backend.is_empty());
+        assert!(crate::validate::check_secrets_backend(&raw.secrets.backend).is_err());
     }
 }

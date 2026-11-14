@@ -2,8 +2,10 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 // `LimitsConfigRaw` (the raw TOML schema) lives in the config crate; the
 // conversion to the typed `LimitsConfig` (a mediator-local type) stays here.
 use affinidi_messaging_mediator_common::store::mux::MuxLimits;
-use affinidi_messaging_mediator_config::{LimitsConfigRaw, MuxConfigRaw};
+use affinidi_messaging_mediator_config::{LimitsConfigRaw, MuxConfigRaw, values};
 use serde::{Deserialize, Serialize};
+
+use super::{config_error, config_error_msg};
 
 /// Resource limits configuration for the mediator
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,8 +191,9 @@ mod defaults {
 /// pickup for many DIDs. See `design-docs/mediator-did-multiplexing-design.md`.
 ///
 /// **Off by default, and never turned on by an upgrade.** Everything about mux
-/// is opt-in (design §5.8): an absent table, an absent `enabled`, or an
-/// `enabled` that is not exactly `true` all mean off.
+/// is opt-in (design §5.8): an absent table or an absent or empty `enabled`
+/// means off, and only `true` turns it on. Any other `enabled` is refused
+/// rather than read as either.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MuxConfig {
     pub enabled: bool,
@@ -219,7 +222,7 @@ pub struct MuxConfig {
 
 impl Default for MuxConfig {
     fn default() -> Self {
-        Self::from(MuxConfigRaw::default())
+        Self::try_from(MuxConfigRaw::default()).expect("the built-in mux defaults are valid")
     }
 }
 
@@ -240,87 +243,64 @@ impl MuxConfig {
 /// bytes by `ws_send_buffer` anyway; this keeps one connection's depth sane.
 pub const MUX_MAX_CHANNEL_SLOTS_CEILING: usize = 65_536;
 
-/// Clamp `limits.mux.max_channel_slots` into `[8, 65536]`: below one member's
+/// `limits.mux.max_channel_slots` must be in `[8, 65536]`: below one member's
 /// share (8) a member could not use its own slots, and the channel must have a
 /// finite capacity.
-fn channel_slots(value: usize) -> usize {
+fn channel_slots(value: &str) -> Result<usize, MediatorError> {
+    let key = "limits.mux.max_channel_slots";
     let floor = crate::mux::fair_queue::MEMBER_SLOTS;
-    let clamped = value.clamp(floor, MUX_MAX_CHANNEL_SLOTS_CEILING);
-    if clamped != value {
-        eprintln!(
-            "WARN: limits.mux.max_channel_slots = {value} is outside [{floor}, {MUX_MAX_CHANNEL_SLOTS_CEILING}]; using {clamped}"
-        );
+    let slots: usize = values::number(key, value).map_err(config_error)?;
+    if !(floor..=MUX_MAX_CHANNEL_SLOTS_CEILING).contains(&slots) {
+        return Err(config_error(
+            affinidi_messaging_mediator_config::ConfigError::invalid(
+                key,
+                value.trim(),
+                format!("a whole number from {floor} to {MUX_MAX_CHANNEL_SLOTS_CEILING}"),
+            ),
+        ));
     }
-    clamped
+    Ok(slots)
 }
 
-impl From<MuxConfigRaw> for MuxConfig {
-    fn from(raw: MuxConfigRaw) -> Self {
-        // Config loads before tracing is up, hence eprintln (as below).
-        fn num<T: std::str::FromStr>(field: &str, value: &str, default: T, shown: &str) -> T {
-            value.trim().parse().unwrap_or_else(|_| {
-                eprintln!(
-                    "WARN: Could not parse limits.mux.{field} config value, using default: {shown}"
-                );
-                default
-            })
-        }
-        let enabled = match raw.enabled.trim() {
-            "true" => true,
-            "false" | "" => false,
-            other => {
-                eprintln!(
-                    "WARN: limits.mux.enabled = {other:?} is not \"true\" or \"false\"; DID multiplexing stays OFF"
-                );
-                false
-            }
+/// A whole-number setting `limits.<field>`, read strictly.
+fn limit<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, MediatorError> {
+    values::number(&format!("limits.{field}"), value).map_err(config_error)
+}
+
+impl std::convert::TryFrom<MuxConfigRaw> for MuxConfig {
+    type Error = MediatorError;
+
+    fn try_from(raw: MuxConfigRaw) -> Result<Self, Self::Error> {
+        let num = |field: &str, value: &str| -> Result<u64, MediatorError> {
+            limit(&format!("mux.{field}"), value)
         };
-        Self {
-            enabled,
-            max_dids_per_connection: num(
+        let count = |field: &str, value: &str| -> Result<usize, MediatorError> {
+            limit(&format!("mux.{field}"), value)
+        };
+        Ok(Self {
+            enabled: values::boolean_or("limits.mux.enabled", &raw.enabled, false)
+                .map_err(config_error)?,
+            max_dids_per_connection: count(
                 "max_dids_per_connection",
                 &raw.max_dids_per_connection,
-                1000,
-                "1000",
-            ),
-            max_grants_per_principal: num(
+            )?,
+            max_grants_per_principal: count(
                 "max_grants_per_principal",
                 &raw.max_grants_per_principal,
-                5000,
-                "5000",
-            ),
-            max_grants_per_did: num("max_grants_per_did", &raw.max_grants_per_did, 16, "16"),
-            max_grant_lifetime_secs: num(
-                "max_grant_lifetime_secs",
-                &raw.max_grant_lifetime_secs,
-                2_592_000,
-                "2592000",
-            ),
+            )?,
+            max_grants_per_did: count("max_grants_per_did", &raw.max_grants_per_did)?,
+            max_grant_lifetime_secs: num("max_grant_lifetime_secs", &raw.max_grant_lifetime_secs)?,
             max_attach_lifetime_secs: num(
                 "max_attach_lifetime_secs",
                 &raw.max_attach_lifetime_secs,
-                86_400,
-                "86400",
-            ),
+            )?,
             revalidate_interval_secs: num(
                 "revalidate_interval_secs",
                 &raw.revalidate_interval_secs,
-                900,
-                "900",
-            ),
-            max_channel_slots: channel_slots(num(
-                "max_channel_slots",
-                &raw.max_channel_slots,
-                512,
-                "512",
-            )),
-            dead_retention_secs: num(
-                "dead_retention_secs",
-                &raw.dead_retention_secs,
-                604_800,
-                "604800",
-            ),
-        }
+            )?,
+            max_channel_slots: channel_slots(&raw.max_channel_slots)?,
+            dead_retention_secs: num("dead_retention_secs", &raw.dead_retention_secs)?,
+        })
     }
 }
 
@@ -440,23 +420,17 @@ impl LimitsConfig {
     }
 }
 
-/// Parse a limit that has no "unlimited" setting: an unparseable value falls
-/// back to `default` with a warning (as every other limit does), and `0` is
+/// Parse a limit that has no "unlimited" setting: an unreadable value or `0` is
 /// refused, because these bound traffic that nothing else bounds.
-fn positive<T>(field: &str, value: &str, default: T) -> Result<T, MediatorError>
+fn positive<T>(field: &str, value: &str) -> Result<T, MediatorError>
 where
     T: std::str::FromStr + Default + PartialEq + std::fmt::Display + Copy,
 {
-    let parsed = value.trim().parse().unwrap_or_else(|_| {
-        eprintln!("WARN: Could not parse limits.{field} config value, using default: {default}");
-        default
-    });
+    let parsed: T = limit(field, value)?;
     if parsed == T::default() {
-        return Err(MediatorError::ConfigError(
-            crate::common::error_codes::CONFIG_ERROR,
-            "NA".into(),
-            format!("limits.{field} must be greater than 0"),
-        ));
+        return Err(config_error_msg(format!(
+            "limits.{field} must be greater than 0"
+        )));
     }
     Ok(parsed)
 }
@@ -475,19 +449,10 @@ fn ws_message_limits(raw: &LimitsConfigRaw) -> Result<(u32, u32, u64), MediatorE
         field: &str,
         value: &str,
     ) -> Result<Option<T>, MediatorError> {
-        let value = value.trim();
-        if value.is_empty() {
+        if value.trim().is_empty() {
             return Ok(None);
         }
-        value.parse().map(Some).map_err(|_| {
-            MediatorError::ConfigError(
-                crate::common::error_codes::CONFIG_ERROR,
-                "NA".into(),
-                format!(
-                    "limits.{field} must be a whole number of 0 or more (0 = off); got {value:?}"
-                ),
-            )
-        })
+        limit(field, value).map(Some)
     }
     let inherited = |value: &str, default: u32| -> u32 {
         match value.trim().parse::<u32>() {
@@ -561,247 +526,125 @@ pub(crate) fn websocket_liveness(
     ((ping_interval, pong_timeout, write_timeout), notes)
 }
 
-/// Refuse a queue limit below `-1`. `-1` means unlimited and `0` and more is a
-/// limit; any other negative value has no meaning, and the gates would
-/// otherwise have to guess one for it.
-fn check_queue_limits(limits: &LimitsConfig) -> Result<(), MediatorError> {
-    for (field, value) in [
-        (
-            "queued_send_messages_per_peer",
-            limits.queued_send_messages_per_peer,
-        ),
-        (
-            "queued_send_messages_soft",
-            limits.queued_send_messages_soft,
-        ),
-        (
-            "queued_send_messages_hard",
-            limits.queued_send_messages_hard,
-        ),
-        (
-            "queued_receive_messages_soft",
-            limits.queued_receive_messages_soft,
-        ),
-        (
-            "queued_receive_messages_hard",
-            limits.queued_receive_messages_hard,
-        ),
-    ] {
-        if value < -1 {
-            return Err(MediatorError::ConfigError(
-                crate::common::error_codes::CONFIG_ERROR,
-                "NA".into(),
-                format!("limits.{field} must be -1 (unlimited) or 0 and more; got {value}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl std::convert::TryFrom<LimitsConfigRaw> for LimitsConfig {
     type Error = MediatorError;
 
+    /// Every value is read strictly (an unreadable one is an error naming
+    /// `limits.<field>`, never a default), and the result must satisfy
+    /// [`LimitsConfig::check_invariants`].
     fn try_from(raw: LimitsConfigRaw) -> Result<Self, Self::Error> {
-        let limits = Self::parse(raw)?;
-        check_queue_limits(&limits)?;
-        Ok(limits)
-    }
-}
-
-impl LimitsConfig {
-    fn parse(raw: LimitsConfigRaw) -> Result<Self, MediatorError> {
-        let warn_default = |field: &str, default: &str| {
-            eprintln!(
-                "WARN: Could not parse limits.{field} config value, using default: {default}"
-            );
+        let queue = |field: &str, value: &str| -> Result<i32, MediatorError> {
+            values::queue_limit(&format!("limits.{field}"), value).map_err(config_error)
         };
 
         // The WebSocket message rate: see `ws_message_limits`.
         let (ws_messages_per_second, ws_message_burst, ws_message_throttle_close_secs) =
             ws_message_limits(&raw)?;
 
-        let secs = |field: &str, value: &str, default: u64| -> u64 {
-            value.parse().unwrap_or_else(|_| {
-                warn_default(field, &default.to_string());
-                default
-            })
-        };
-        let ((ws_ping_interval_secs, ws_pong_timeout_secs, ws_write_timeout_secs), notes) =
-            websocket_liveness(
-                secs(
-                    "ws_ping_interval_secs",
-                    &raw.ws_ping_interval_secs,
-                    DEFAULT_WS_PING_INTERVAL_SECS,
-                ),
-                secs(
-                    "ws_pong_timeout_secs",
-                    &raw.ws_pong_timeout_secs,
-                    DEFAULT_WS_PONG_TIMEOUT_SECS,
-                ),
-                secs(
-                    "ws_write_timeout_secs",
-                    &raw.ws_write_timeout_secs,
-                    DEFAULT_WS_WRITE_TIMEOUT_SECS,
-                ),
-            );
-        for note in notes {
-            eprintln!("WARN: {note}");
+        // WebSocket liveness: every interval at least 1 s, and the silence
+        // allowed at least two ping intervals (see `websocket_liveness`). A
+        // value outside that is refused here; a `LimitsConfig` built in code
+        // is raised to it instead.
+        let ws_ping_interval_secs: u64 = values::number_at_least(
+            "limits.ws_ping_interval_secs",
+            &raw.ws_ping_interval_secs,
+            1,
+        )
+        .map_err(config_error)?;
+        let ws_pong_timeout_secs: u64 = limit("ws_pong_timeout_secs", &raw.ws_pong_timeout_secs)?;
+        if ws_pong_timeout_secs < ws_ping_interval_secs.saturating_mul(2) {
+            return Err(config_error_msg(format!(
+                "limits.ws_pong_timeout_secs ({ws_pong_timeout_secs}) must be at least twice \
+                 limits.ws_ping_interval_secs ({ws_ping_interval_secs})"
+            )));
         }
+        let ws_write_timeout_secs: u64 = values::number_at_least(
+            "limits.ws_write_timeout_secs",
+            &raw.ws_write_timeout_secs,
+            1,
+        )
+        .map_err(config_error)?;
 
-        Ok(LimitsConfig {
-            attachments_max_count: raw.attachments_max_count.parse().unwrap_or_else(|_| {
-                warn_default("attachments_max_count", "20");
-                20
-            }),
-            crypto_operations_per_message: raw
-                .crypto_operations_per_message
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default("crypto_operations_per_message", "1000");
-                    1000
-                }),
-            deleted_messages: raw.deleted_messages.parse().unwrap_or_else(|_| {
-                warn_default("deleted_messages", "100");
-                100
-            }),
-            forward_task_queue: raw.forward_task_queue.parse().unwrap_or_else(|_| {
-                warn_default("forward_task_queue", "50000");
-                50_000
-            }),
-            http_size: raw.http_size.parse().unwrap_or_else(|_| {
-                warn_default("http_size", "10485760");
-                10_485_760
-            }),
-            listed_messages: raw.listed_messages.parse().unwrap_or_else(|_| {
-                warn_default("listed_messages", "100");
-                100
-            }),
-            local_max_acl: raw.local_max_acl.parse().unwrap_or_else(|_| {
-                warn_default("local_max_acl", "1000");
-                1_000
-            }),
-            pickup_round_robin: raw.pickup_round_robin.parse().unwrap_or_else(|_| {
-                warn_default("pickup_round_robin", "true");
-                true
-            }),
-            delivered_expiry_seconds: raw.delivered_expiry_seconds.parse().unwrap_or_else(|_| {
-                warn_default("delivered_expiry_seconds", "0");
-                0
-            }),
-            message_expiry_seconds: raw.message_expiry_seconds.parse().unwrap_or_else(|_| {
-                warn_default("message_expiry_seconds", "604800");
-                604_800
-            }),
-            message_size: raw.message_size.parse().unwrap_or_else(|_| {
-                warn_default("message_size", "1048576");
-                1_048_576
-            }),
-            queued_send_messages_per_peer: raw
-                .queued_send_messages_per_peer
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default("queued_send_messages_per_peer", "50");
-                    50
-                }),
-            queued_send_messages_soft: raw.queued_send_messages_soft.parse().unwrap_or_else(|_| {
-                warn_default("queued_send_messages_soft", "2000");
-                2_000
-            }),
-            queued_send_messages_hard: raw.queued_send_messages_hard.parse().unwrap_or_else(|_| {
-                warn_default("queued_send_messages_hard", "10000");
-                10_000
-            }),
-            queued_receive_messages_soft: raw.queued_receive_messages_soft.parse().unwrap_or_else(
-                |_| {
-                    warn_default("queued_receive_messages_soft", "200");
-                    200
-                },
-            ),
-            queued_receive_messages_hard: raw.queued_receive_messages_hard.parse().unwrap_or_else(
-                |_| {
-                    warn_default("queued_receive_messages_hard", "1000");
-                    1_000
-                },
-            ),
-            to_keys_per_recipient: raw.to_keys_per_recipient.parse().unwrap_or_else(|_| {
-                warn_default("to_keys_per_recipient", "100");
-                100
-            }),
-            to_recipients: raw.to_recipients.parse().unwrap_or_else(|_| {
-                warn_default("to_recipients", "100");
-                100
-            }),
-            ws_size: raw.ws_size.parse().unwrap_or_else(|_| {
-                warn_default("ws_size", "10485760");
-                10_485_760
-            }),
-            access_list_limit: raw.access_list_limit.parse().unwrap_or_else(|_| {
-                warn_default("access_list_limit", "1000");
-                1_000
-            }),
-            oob_invite_ttl: raw.oob_invite_ttl.parse().unwrap_or_else(|_| {
-                warn_default("oob_invite_ttl", "86400");
-                86_400
-            }),
-            rate_limit_per_ip: raw.rate_limit_per_ip.parse().unwrap_or_else(|_| {
-                warn_default("rate_limit_per_ip", "100");
-                100
-            }),
-            rate_limit_burst: raw.rate_limit_burst.parse().unwrap_or_else(|_| {
-                warn_default("rate_limit_burst", "50");
-                50
-            }),
-            max_websocket_connections: raw.max_websocket_connections.parse().unwrap_or_else(|_| {
-                warn_default("max_websocket_connections", "10000");
-                10000
-            }),
-            max_websocket_connections_per_did: raw
-                .max_websocket_connections_per_did
-                .parse()
-                .unwrap_or_else(|_| {
-                    warn_default("max_websocket_connections_per_did", "100");
-                    100
-                }),
-            did_rate_limit_per_second: raw.did_rate_limit_per_second.parse().unwrap_or_else(|_| {
-                warn_default("did_rate_limit_per_second", "0");
-                0
-            }),
-            did_rate_limit_burst: raw.did_rate_limit_burst.parse().unwrap_or_else(|_| {
-                warn_default("did_rate_limit_burst", "10");
-                10
-            }),
-            ws_send_buffer: raw.ws_send_buffer.parse().unwrap_or_else(|_| {
-                warn_default("ws_send_buffer", "33554432");
-                33_554_432
-            }),
-            pubsub_buffer: raw.pubsub_buffer.parse().unwrap_or_else(|_| {
-                warn_default("pubsub_buffer", "16777216");
-                16_777_216
-            }),
+        let limits = LimitsConfig {
+            attachments_max_count: limit("attachments_max_count", &raw.attachments_max_count)?,
+            crypto_operations_per_message: limit(
+                "crypto_operations_per_message",
+                &raw.crypto_operations_per_message,
+            )?,
+            deleted_messages: limit("deleted_messages", &raw.deleted_messages)?,
+            forward_task_queue: limit("forward_task_queue", &raw.forward_task_queue)?,
+            http_size: limit("http_size", &raw.http_size)?,
+            listed_messages: limit("listed_messages", &raw.listed_messages)?,
+            local_max_acl: limit("local_max_acl", &raw.local_max_acl)?,
+            pickup_round_robin: values::boolean(
+                "limits.pickup_round_robin",
+                &raw.pickup_round_robin,
+            )
+            .map_err(config_error)?,
+            delivered_expiry_seconds: limit(
+                "delivered_expiry_seconds",
+                &raw.delivered_expiry_seconds,
+            )?,
+            message_expiry_seconds: limit("message_expiry_seconds", &raw.message_expiry_seconds)?,
+            message_size: limit("message_size", &raw.message_size)?,
+            queued_send_messages_per_peer: queue(
+                "queued_send_messages_per_peer",
+                &raw.queued_send_messages_per_peer,
+            )?,
+            queued_send_messages_soft: queue(
+                "queued_send_messages_soft",
+                &raw.queued_send_messages_soft,
+            )?,
+            queued_send_messages_hard: queue(
+                "queued_send_messages_hard",
+                &raw.queued_send_messages_hard,
+            )?,
+            queued_receive_messages_soft: queue(
+                "queued_receive_messages_soft",
+                &raw.queued_receive_messages_soft,
+            )?,
+            queued_receive_messages_hard: queue(
+                "queued_receive_messages_hard",
+                &raw.queued_receive_messages_hard,
+            )?,
+            to_keys_per_recipient: limit("to_keys_per_recipient", &raw.to_keys_per_recipient)?,
+            to_recipients: limit("to_recipients", &raw.to_recipients)?,
+            ws_size: limit("ws_size", &raw.ws_size)?,
+            access_list_limit: limit("access_list_limit", &raw.access_list_limit)?,
+            oob_invite_ttl: limit("oob_invite_ttl", &raw.oob_invite_ttl)?,
+            rate_limit_per_ip: limit("rate_limit_per_ip", &raw.rate_limit_per_ip)?,
+            rate_limit_burst: limit("rate_limit_burst", &raw.rate_limit_burst)?,
+            max_websocket_connections: limit(
+                "max_websocket_connections",
+                &raw.max_websocket_connections,
+            )?,
+            max_websocket_connections_per_did: limit(
+                "max_websocket_connections_per_did",
+                &raw.max_websocket_connections_per_did,
+            )?,
+            did_rate_limit_per_second: limit(
+                "did_rate_limit_per_second",
+                &raw.did_rate_limit_per_second,
+            )?,
+            did_rate_limit_burst: limit("did_rate_limit_burst", &raw.did_rate_limit_burst)?,
+            ws_send_buffer: limit("ws_send_buffer", &raw.ws_send_buffer)?,
+            pubsub_buffer: limit("pubsub_buffer", &raw.pubsub_buffer)?,
             relay_connections_per_ip: positive(
                 "relay_connections_per_ip",
                 &raw.relay_connections_per_ip,
-                defaults::relay_connections_per_ip(),
             )?,
             relay_frames_per_second: positive(
                 "relay_frames_per_second",
                 &raw.relay_frames_per_second,
-                defaults::relay_frames_per_second(),
             )?,
-            relay_frame_burst: positive(
-                "relay_frame_burst",
-                &raw.relay_frame_burst,
-                defaults::relay_frame_burst(),
-            )?,
+            relay_frame_burst: positive("relay_frame_burst", &raw.relay_frame_burst)?,
             relay_bytes_per_second: positive(
                 "relay_bytes_per_second",
                 &raw.relay_bytes_per_second,
-                defaults::relay_bytes_per_second(),
             )?,
             metrics_requests_per_second: positive(
                 "metrics_requests_per_second",
                 &raw.metrics_requests_per_second,
-                defaults::metrics_requests_per_second(),
             )?,
             ws_messages_per_second,
             ws_message_burst,
@@ -809,8 +652,80 @@ impl LimitsConfig {
             ws_ping_interval_secs,
             ws_pong_timeout_secs,
             ws_write_timeout_secs,
-            mux: MuxConfig::from(raw.mux),
-        })
+            mux: MuxConfig::try_from(raw.mux)?,
+        };
+        limits.check_invariants().map_err(config_error_msg)?;
+        Ok(limits)
+    }
+}
+
+impl LimitsConfig {
+    /// The rules a configured set of limits must keep, which the shipped
+    /// template documents: the same soft ≤ hard coherence `config/patch` holds
+    /// a patch to, a message that fits the HTTP and WebSocket bodies that carry
+    /// it, and no `0` where `0` would make the mediator refuse everything
+    /// rather than mean "unlimited". The error names the setting.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        super::overrides::check_coherent(self)?;
+        for (field, value) in [
+            ("message_size", self.message_size),
+            ("http_size", self.http_size),
+            ("ws_size", self.ws_size),
+            ("listed_messages", self.listed_messages),
+            ("deleted_messages", self.deleted_messages),
+            ("to_recipients", self.to_recipients),
+            ("to_keys_per_recipient", self.to_keys_per_recipient),
+            (
+                "crypto_operations_per_message",
+                self.crypto_operations_per_message,
+            ),
+            ("forward_task_queue", self.forward_task_queue),
+            ("oob_invite_ttl", self.oob_invite_ttl),
+            ("ws_send_buffer", self.ws_send_buffer),
+            ("pubsub_buffer", self.pubsub_buffer),
+        ] {
+            if value == 0 {
+                return Err(format!("limits.{field} must be greater than 0"));
+            }
+        }
+        if self.message_expiry_seconds == 0 {
+            return Err("limits.message_expiry_seconds must be greater than 0".into());
+        }
+        // `-1` means unlimited and `0` and more is a limit; any other negative
+        // value has no meaning, and the gates would otherwise have to guess one
+        // for it (it used to cast to about four billion).
+        for (field, value) in [
+            (
+                "queued_send_messages_per_peer",
+                self.queued_send_messages_per_peer,
+            ),
+            ("queued_send_messages_soft", self.queued_send_messages_soft),
+            ("queued_send_messages_hard", self.queued_send_messages_hard),
+            (
+                "queued_receive_messages_soft",
+                self.queued_receive_messages_soft,
+            ),
+            (
+                "queued_receive_messages_hard",
+                self.queued_receive_messages_hard,
+            ),
+        ] {
+            if value < -1 {
+                return Err(format!(
+                    "limits.{field} must be -1 (unlimited) or 0 and more; got {value}"
+                ));
+            }
+        }
+        for (field, carrier) in [("http_size", self.http_size), ("ws_size", self.ws_size)] {
+            if carrier < self.message_size {
+                return Err(format!(
+                    "limits.{field} ({carrier}) must be at least limits.message_size ({}): a \
+                     message that size could never be sent",
+                    self.message_size
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -822,22 +737,30 @@ mod tests {
     fn mux_is_off_unless_explicitly_enabled() {
         assert!(!LimitsConfig::default().mux.enabled);
         let mut raw = MuxConfigRaw::default();
-        assert!(!MuxConfig::from(raw.clone()).enabled);
-        for v in ["", "yes", "1", "TRUE", "on"] {
+        assert!(!MuxConfig::try_from(raw.clone()).unwrap().enabled);
+        for v in ["", "  ", "false", "FALSE"] {
             raw.enabled = v.into();
             assert!(
-                !MuxConfig::from(raw.clone()).enabled,
+                !MuxConfig::try_from(raw.clone()).unwrap().enabled,
                 "{v:?} must not enable mux"
             );
         }
-        raw.enabled = "true".into();
-        assert!(MuxConfig::from(raw).enabled);
+        // Anything that is not true or false is refused, not read as either.
+        for v in ["yes", "1", "on", "ture"] {
+            raw.enabled = v.into();
+            let err = MuxConfig::try_from(raw.clone()).unwrap_err().to_string();
+            assert!(err.contains("limits.mux.enabled"), "{v:?}: {err}");
+        }
+        for v in ["true", " TRUE "] {
+            raw.enabled = v.into();
+            assert!(MuxConfig::try_from(raw.clone()).unwrap().enabled, "{v:?}");
+        }
     }
 
     #[test]
     fn an_absent_mux_table_parses_as_off() {
         let raw: MuxConfigRaw = toml::from_str("").unwrap();
-        let mux = MuxConfig::from(raw);
+        let mux = MuxConfig::try_from(raw).unwrap();
         assert_eq!(mux, MuxConfig::default());
         assert!(!mux.enabled);
         assert_eq!(mux.store_limits(), MuxLimits::default());
@@ -846,22 +769,42 @@ mod tests {
     #[test]
     fn mux_channel_slots_are_bounded() {
         let mut raw = MuxConfigRaw::default();
-        assert_eq!(MuxConfig::from(raw.clone()).max_channel_slots, 512);
+        assert_eq!(
+            MuxConfig::try_from(raw.clone()).unwrap().max_channel_slots,
+            512
+        );
         for (given, used) in [
-            ("0", 8),
-            ("3", 8),
             ("8", 8),
             ("1000", 1000),
-            ("10000000", MUX_MAX_CHANNEL_SLOTS_CEILING),
-            ("nonsense", 512),
+            ("65536", MUX_MAX_CHANNEL_SLOTS_CEILING),
         ] {
             raw.max_channel_slots = given.into();
             assert_eq!(
-                MuxConfig::from(raw.clone()).max_channel_slots,
+                MuxConfig::try_from(raw.clone()).unwrap().max_channel_slots,
                 used,
                 "{given}"
             );
         }
+        // Out of range or unreadable: refused, naming the key.
+        for given in ["0", "3", "65537", "10000000", "nonsense"] {
+            raw.max_channel_slots = given.into();
+            let err = MuxConfig::try_from(raw.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains("limits.mux.max_channel_slots"),
+                "{given}: {err}"
+            );
+        }
+    }
+
+    /// Every mux number is read strictly, naming its key.
+    #[test]
+    fn an_unreadable_mux_number_is_refused() {
+        let raw = MuxConfigRaw {
+            revalidate_interval_secs: "15m".into(),
+            ..MuxConfigRaw::default()
+        };
+        let err = MuxConfig::try_from(raw).unwrap_err().to_string();
+        assert!(err.contains("limits.mux.revalidate_interval_secs"), "{err}");
     }
 
     #[test]
@@ -1027,67 +970,123 @@ mod tests {
         assert_eq!(limits.did_rate_limit_burst, 20);
     }
 
+    /// The raw form of the defaults, for tests that change one value.
+    fn default_raw() -> LimitsConfigRaw {
+        toml::from_str(
+            r#"
+            attachments_max_count = "20"
+            crypto_operations_per_message = "1000"
+            deleted_messages = "100"
+            forward_task_queue = "50000"
+            http_size = "10485760"
+            listed_messages = "100"
+            local_max_acl = "1000"
+            message_expiry_seconds = "604800"
+            message_size = "1048576"
+            queued_send_messages_soft = "2000"
+            queued_send_messages_hard = "10000"
+            queued_receive_messages_soft = "200"
+            queued_receive_messages_hard = "1000"
+            to_keys_per_recipient = "100"
+            to_recipients = "100"
+            ws_size = "10485760"
+            access_list_limit = "1000"
+            oob_invite_ttl = "86400"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Set `field` of `raw` to `value`, through its TOML form.
+    fn with(raw: &LimitsConfigRaw, field: &str, value: &str) -> LimitsConfigRaw {
+        let mut table = toml::Table::try_from(raw).unwrap();
+        assert!(table.contains_key(field), "{field} is a [limits] key");
+        table.insert(field.into(), toml::Value::String(value.into()));
+        table.try_into().unwrap()
+    }
+
+    /// Issue #112: an unreadable value used to fall back to the built-in
+    /// default, which can be looser than what the operator wrote. Every one is
+    /// now refused, naming the key and the value.
     #[test]
-    fn test_limits_try_from_invalid_number_falls_back_to_default() {
-        // TryFrom uses unwrap_or, so invalid values fall back to defaults rather than erroring
-        let raw = LimitsConfigRaw {
-            attachments_max_count: "not_a_number".to_string(),
-            crypto_operations_per_message: "bad".to_string(),
-            deleted_messages: "100".to_string(),
-            forward_task_queue: "50000".to_string(),
-            http_size: "10485760".to_string(),
-            listed_messages: "100".to_string(),
-            local_max_acl: "1000".to_string(),
-            delivered_expiry_seconds: "0".to_string(),
-            pickup_round_robin: "true".to_string(),
-            message_expiry_seconds: "10080".to_string(),
-            message_size: "1048576".to_string(),
-            queued_send_messages_per_peer: "50".to_string(),
-            queued_send_messages_soft: "100".to_string(),
-            queued_send_messages_hard: "1000".to_string(),
-            queued_receive_messages_soft: "100".to_string(),
-            queued_receive_messages_hard: "1000".to_string(),
-            to_keys_per_recipient: "100".to_string(),
-            to_recipients: "100".to_string(),
-            ws_size: "10485760".to_string(),
-            access_list_limit: "1000".to_string(),
-            oob_invite_ttl: "86400".to_string(),
-            rate_limit_per_ip: "100".to_string(),
-            rate_limit_burst: "50".to_string(),
-            max_websocket_connections: "10000".to_string(),
-            max_websocket_connections_per_did: "100".to_string(),
-            did_rate_limit_per_second: "0".to_string(),
-            did_rate_limit_burst: "10".to_string(),
-            ws_send_buffer: "67108864".to_string(),
-            pubsub_buffer: "33554432".to_string(),
-            relay_connections_per_ip: "x".to_string(),
-            relay_frames_per_second: "50".to_string(),
-            relay_frame_burst: "100".to_string(),
-            relay_bytes_per_second: "4194304".to_string(),
-            metrics_requests_per_second: "5".to_string(),
-            ws_messages_per_second: String::new(),
-            ws_message_burst: String::new(),
-            ws_message_throttle_close_secs: "10".to_string(),
-            ws_ping_interval_secs: "soon".to_string(),
-            ws_pong_timeout_secs: "30".to_string(),
-            ws_write_timeout_secs: "-1".to_string(),
-            mux: MuxConfigRaw::default(),
-        };
-        let limits = LimitsConfig::try_from(raw).unwrap();
-        // Invalid values should fall back to unwrap_or defaults
-        assert_eq!(limits.attachments_max_count, 20);
-        assert_eq!(limits.crypto_operations_per_message, 1000);
-        assert_eq!(limits.relay_connections_per_ip, 10);
-        // Unset, the WebSocket message rate inherits the per-IP HTTP rate and
-        // burst ("100" / "50" here).
-        assert_eq!(limits.ws_messages_per_second, 100);
-        assert_eq!(limits.ws_message_burst, 50);
-        assert_eq!(limits.ws_message_throttle_close_secs, 10);
-        // An unparsable ping interval falls back to 30 s, which lifts the
-        // 30 s pong timeout to two intervals.
-        assert_eq!(limits.ws_ping_interval_secs, 30);
-        assert_eq!(limits.ws_pong_timeout_secs, 60);
-        assert_eq!(limits.ws_write_timeout_secs, 30);
+    fn an_unreadable_limit_is_refused_not_defaulted() {
+        let base = default_raw();
+        assert!(LimitsConfig::try_from(base.clone()).is_ok());
+        for (field, bad) in [
+            ("listed_messages", "5O"),
+            ("rate_limit_per_ip", "10/s"),
+            ("message_size", "1MB"),
+            ("attachments_max_count", "not_a_number"),
+            ("crypto_operations_per_message", ""),
+            ("relay_connections_per_ip", "x"),
+            ("pickup_round_robin", "yes"),
+            ("delivered_expiry_seconds", "1d"),
+            ("ws_ping_interval_secs", "soon"),
+            ("ws_write_timeout_secs", "-1"),
+            ("max_websocket_connections", "many"),
+        ] {
+            let err = LimitsConfig::try_from(with(&base, field, bad))
+                .expect_err(field)
+                .to_string();
+            assert!(err.contains(&format!("limits.{field}")), "{field}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{field}: {err}");
+        }
+    }
+
+    /// A queue limit takes -1 (no limit) and no other negative number.
+    #[test]
+    fn a_negative_queue_limit_other_than_minus_one_is_refused() {
+        let base = default_raw();
+        for field in [
+            "queued_send_messages_per_peer",
+            "queued_send_messages_soft",
+            "queued_send_messages_hard",
+            "queued_receive_messages_soft",
+            "queued_receive_messages_hard",
+        ] {
+            assert!(
+                LimitsConfig::try_from(with(&base, field, "-1")).is_ok(),
+                "{field}"
+            );
+            let err = LimitsConfig::try_from(with(&base, field, "-2"))
+                .expect_err(field)
+                .to_string();
+            assert!(err.contains(&format!("limits.{field}")), "{field}: {err}");
+        }
+    }
+
+    /// The template's documented invariants are enforced on the file baseline,
+    /// with the same soft <= hard rule `config/patch` holds a patch to.
+    #[test]
+    fn the_documented_invariants_are_enforced() {
+        let base = default_raw();
+        for (field, value, expect) in [
+            ("queued_send_messages_soft", "20000", "would exceed"),
+            ("queued_receive_messages_hard", "100", "would exceed"),
+            ("message_size", "0", "limits.message_size"),
+            ("http_size", "1000", "limits.http_size"),
+            ("ws_size", "1000", "limits.ws_size"),
+            ("listed_messages", "0", "limits.listed_messages"),
+            (
+                "message_expiry_seconds",
+                "0",
+                "limits.message_expiry_seconds",
+            ),
+            ("ws_pong_timeout_secs", "45", "at least twice"),
+            ("ws_ping_interval_secs", "0", "limits.ws_ping_interval_secs"),
+            ("ws_write_timeout_secs", "0", "limits.ws_write_timeout_secs"),
+        ] {
+            let err = LimitsConfig::try_from(with(&base, field, value))
+                .expect_err(field)
+                .to_string();
+            assert!(err.contains(expect), "{field}={value}: {err}");
+        }
+        // Unlimited on either side is exempt from soft <= hard.
+        let unlimited_hard = with(&base, "queued_send_messages_hard", "-1");
+        assert!(LimitsConfig::try_from(unlimited_hard).is_ok());
+        // Equal is coherent.
+        let equal = with(&base, "queued_receive_messages_hard", "200");
+        assert!(LimitsConfig::try_from(equal).is_ok());
     }
 
     /// Turning per-IP limiting off (common behind a load balancer) does not
@@ -1127,11 +1126,11 @@ mod tests {
         assert_eq!(limits.ws_message_burst, 50);
         assert_eq!(limits.ws_message_throttle_close_secs, 10);
 
-        // An unreadable per-IP value is not inherited either.
+        // An unreadable per-IP value is refused outright (it used to be
+        // skipped, leaving the WebSocket rate on its default).
         let mut unreadable = raw.clone();
         unreadable.rate_limit_per_ip = "lots".to_string();
-        let limits = LimitsConfig::try_from(unreadable).unwrap();
-        assert_eq!(limits.ws_messages_per_second, 100);
+        assert!(LimitsConfig::try_from(unreadable).is_err());
 
         // Only an explicit 0 turns the WebSocket rate off.
         let mut off = raw.clone();
@@ -1189,59 +1188,6 @@ mod tests {
             }
             let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
             assert!(err.contains(field), "{field}={bad}: {err}");
-        }
-    }
-
-    /// A queue limit below -1 means nothing, so it refuses to start rather
-    /// than the gates guessing (it used to cast to about four billion).
-    #[test]
-    fn a_queue_limit_below_minus_one_refuses_to_start() {
-        let base: LimitsConfigRaw = toml::from_str(
-            r#"
-            attachments_max_count = "20"
-            crypto_operations_per_message = "1000"
-            deleted_messages = "100"
-            forward_task_queue = "50000"
-            http_size = "10485760"
-            listed_messages = "100"
-            local_max_acl = "1000"
-            message_expiry_seconds = "604800"
-            message_size = "1048576"
-            queued_send_messages_per_peer = "50"
-            queued_send_messages_soft = "2000"
-            queued_send_messages_hard = "10000"
-            queued_receive_messages_soft = "200"
-            queued_receive_messages_hard = "1000"
-            to_keys_per_recipient = "100"
-            to_recipients = "100"
-            ws_size = "10485760"
-            access_list_limit = "1000"
-            oob_invite_ttl = "86400"
-            "#,
-        )
-        .unwrap();
-        assert!(LimitsConfig::try_from(base.clone()).is_ok());
-        let mut unlimited = base.clone();
-        unlimited.queued_send_messages_per_peer = "-1".to_string();
-        assert!(LimitsConfig::try_from(unlimited).is_ok(), "-1 is unlimited");
-        for field in [
-            "queued_send_messages_per_peer",
-            "queued_send_messages_soft",
-            "queued_send_messages_hard",
-            "queued_receive_messages_soft",
-            "queued_receive_messages_hard",
-        ] {
-            let mut raw = base.clone();
-            let bad = "-2".to_string();
-            match field {
-                "queued_send_messages_per_peer" => raw.queued_send_messages_per_peer = bad,
-                "queued_send_messages_soft" => raw.queued_send_messages_soft = bad,
-                "queued_send_messages_hard" => raw.queued_send_messages_hard = bad,
-                "queued_receive_messages_soft" => raw.queued_receive_messages_soft = bad,
-                _ => raw.queued_receive_messages_hard = bad,
-            }
-            let err = LimitsConfig::try_from(raw).expect_err(field).to_string();
-            assert!(err.contains(field), "{field}: {err}");
         }
     }
 

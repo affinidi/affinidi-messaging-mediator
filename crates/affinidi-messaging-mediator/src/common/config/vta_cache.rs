@@ -1,7 +1,7 @@
 //! VTA secrets cache — thin adapter over [`MediatorSecrets`].
 //!
 //! The cache is a well-known entry in the unified secret backend
-//! (`mediator/vta/last_known_bundle`), HMAC-signed with a key derived from
+//! (`mediator_vta_last_known_bundle`), HMAC-signed with a key derived from
 //! the admin credential, with a configurable TTL. All persistence logic
 //! lives in `mediator-common`; this file just bridges the vta-sdk
 //! [`SecretCache`] trait to `MediatorSecrets::{load,store}_vta_cached_bundle`.

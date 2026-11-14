@@ -5,11 +5,7 @@
 //! over the file). Runtime resolution (secrets, DID resolver, VTA) happens
 //! later, in the mediator binary.
 
-use std::{
-    fs::File,
-    io::{self, BufRead},
-    path::Path,
-};
+use std::path::Path;
 
 use tracing::{error, info, warn};
 
@@ -30,6 +26,25 @@ macro_rules! env_override_opt {
             $field = Some(val);
         }
     };
+}
+
+/// Override a field from the first of several environment variables that is
+/// set: the preferred name first, then the older name it replaces. Used for
+/// the `MEDIATOR_`-prefixed names of variables whose bare names
+/// (`DATABASE_URL`, `LOG_LEVEL`, …) are common enough to collide with
+/// unrelated software in the same container, and for names renamed to match
+/// their setting. The preferred name wins when both are set.
+macro_rules! env_override_first {
+    ($field:expr, $($env_var:expr),+ $(,)?) => {
+        if let Some(val) = first_env(&[$($env_var),+]) {
+            $field = val;
+        }
+    };
+}
+
+/// The value of the first of `names` that is set.
+fn first_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| std::env::var(name).ok())
 }
 
 /// Override a `Vec<String>` field from a comma-separated environment variable.
@@ -58,17 +73,25 @@ fn split_list(value: &str) -> Vec<String> {
 /// Apply environment variable overrides to the raw config. Env vars take
 /// priority over values in the TOML file.
 pub fn apply_env_overrides(config: &mut ConfigRaw) {
-    env_override!(config.log_level, "LOG_LEVEL");
+    env_override_first!(config.log_level, "MEDIATOR_LOG_LEVEL", "LOG_LEVEL");
     env_override!(config.log_json, "LOG_JSON");
     env_override!(config.mediator_did, "MEDIATOR_DID");
 
-    env_override!(config.server.listen_address, "LISTEN_ADDRESS");
+    env_override_first!(
+        config.server.listen_address,
+        "MEDIATOR_LISTEN_ADDRESS",
+        "LISTEN_ADDRESS"
+    );
     env_override!(config.server.api_prefix, "API_PREFIX");
     env_override!(config.server.admin_did, "ADMIN_DID");
     env_override_opt!(config.server.did_web_self_hosted, "DID_WEB_SELF_HOSTED");
     env_override_list!(config.server.local_endpoints, "LOCAL_ENDPOINTS");
     env_override!(config.database.functions_file, "DATABASE_FUNCTIONS_FILE");
-    env_override!(config.database.database_url, "DATABASE_URL");
+    env_override_first!(
+        config.database.database_url,
+        "MEDIATOR_DATABASE_URL",
+        "DATABASE_URL"
+    );
     // DATABASE_POOL_SIZE removed — the mediator uses a multiplexed
     // connection, there is no pool to size. Pre-0.14 deployments that
     // set it can drop the env var with no behaviour change.
@@ -84,7 +107,11 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
     );
 
     env_override!(config.security.mediator_acl_mode, "MEDIATOR_ACL_MODE");
-    env_override!(config.security.global_acl_default, "GLOBAL_DEFAULT_ACL");
+    env_override_first!(
+        config.security.global_acl_default,
+        "GLOBAL_ACL_DEFAULT",
+        "GLOBAL_DEFAULT_ACL"
+    );
     env_override!(
         config.security.local_direct_delivery_allowed,
         "LOCAL_DIRECT_DELIVERY_ALLOWED"
@@ -93,7 +120,7 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.security.local_direct_delivery_allow_anon,
         "LOCAL_DIRECT_DELIVERY_ALLOW_ANON"
     );
-    env_override!(config.security.use_ssl, "USE_SSL");
+    env_override_first!(config.security.use_ssl, "MEDIATOR_USE_SSL", "USE_SSL");
     env_override_opt!(config.security.ssl_certificate_file, "SSL_CERTIFICATE_FILE");
     env_override_opt!(config.security.ssl_key_file, "SSL_KEY_FILE");
     env_override!(config.security.jwt_access_expiry, "JWT_ACCESS_EXPIRY");
@@ -185,11 +212,23 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.limits.queued_receive_messages_hard,
         "LIMIT_QUEUED_RECEIVE_MESSAGES_HARD"
     );
-    env_override!(config.limits.to_keys_per_recipient, "LIMIT_TO_KEYS_PER_DID");
+    env_override_first!(
+        config.limits.to_keys_per_recipient,
+        "LIMIT_TO_KEYS_PER_RECIPIENT",
+        "LIMIT_TO_KEYS_PER_DID"
+    );
     env_override!(config.limits.to_recipients, "LIMIT_TO_RECIPIENTS");
     env_override!(config.limits.ws_size, "LIMIT_WS_SIZE");
-    env_override!(config.limits.access_list_limit, "ACCESS_LIST_LIMIT");
-    env_override!(config.limits.oob_invite_ttl, "OOB_INVITE_TTL");
+    env_override_first!(
+        config.limits.access_list_limit,
+        "LIMIT_ACCESS_LIST_LIMIT",
+        "ACCESS_LIST_LIMIT"
+    );
+    env_override_first!(
+        config.limits.oob_invite_ttl,
+        "LIMIT_OOB_INVITE_TTL",
+        "OOB_INVITE_TTL"
+    );
     env_override!(config.limits.rate_limit_per_ip, "LIMIT_RATE_LIMIT_PER_IP");
     env_override!(config.limits.rate_limit_burst, "LIMIT_RATE_LIMIT_BURST");
     env_override!(
@@ -265,11 +304,37 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.limits.mux.max_grant_lifetime_secs,
         "LIMIT_MUX_MAX_GRANT_LIFETIME_SECS"
     );
+    env_override!(
+        config.limits.mux.max_attach_lifetime_secs,
+        "LIMIT_MUX_MAX_ATTACH_LIFETIME_SECS"
+    );
+    env_override!(
+        config.limits.mux.revalidate_interval_secs,
+        "LIMIT_MUX_REVALIDATE_INTERVAL_SECS"
+    );
+    env_override!(
+        config.limits.mux.max_channel_slots,
+        "LIMIT_MUX_MAX_CHANNEL_SLOTS"
+    );
+    env_override!(
+        config.limits.mux.dead_retention_secs,
+        "LIMIT_MUX_DEAD_RETENTION_SECS"
+    );
 
-    // `[storage]` is optional, and `[storage.fjall]` is optional within it, so
-    // these only override a section that already exists. An env var alone does
-    // not conjure a storage backend into being — selecting the backend is a
-    // deliberate choice that belongs in the file.
+    // `[storage]` is optional. `STORAGE_BACKEND` selects the backend as the
+    // file's `backend` key would, so it creates the section when the file has
+    // none (the published image's config has none). The other `STORAGE_*`
+    // variables only tune a section that exists; set without one they are
+    // ignored, which `ignored_env_notes` reports.
+    if config.storage.is_none()
+        && let Ok(backend) = std::env::var("STORAGE_BACKEND")
+    {
+        config.storage = Some(crate::StorageConfig {
+            backend,
+            data_dir: None,
+            fjall: None,
+        });
+    }
     if let Some(storage) = config.storage.as_mut() {
         env_override!(storage.backend, "STORAGE_BACKEND");
         env_override_opt!(storage.data_dir, "STORAGE_DATA_DIR");
@@ -360,6 +425,10 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         "PROCESSOR_FORWARDING_MAX_HOPS"
     );
     env_override!(
+        config.processors.forwarding.accept_invalid_certs,
+        "PROCESSOR_FORWARDING_ACCEPT_INVALID_CERTS"
+    );
+    env_override!(
         config.processors.forwarding.relay_mode,
         "PROCESSOR_FORWARDING_RELAY_MODE"
     );
@@ -380,6 +449,59 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
 
     env_override!(config.secrets.backend, "MEDIATOR_SECRETS_BACKEND");
     env_override_opt!(config.secrets.cache_ttl, "MEDIATOR_SECRETS_CACHE_TTL");
+}
+
+/// Environment variables that are set but had no effect, each with why. The
+/// overlay runs before the mediator's logging exists, so it cannot warn
+/// itself; the caller logs these once it can (see [`warn_ignored_env`]).
+pub fn ignored_env_notes(config: &ConfigRaw) -> Vec<String> {
+    let mut notes = Vec::new();
+    if config.storage.is_none() {
+        for var in [
+            "STORAGE_DATA_DIR",
+            "STORAGE_FJALL_BLOCK_CACHE",
+            "STORAGE_FJALL_WRITE_BUFFER",
+            "STORAGE_FJALL_MAX_JOURNAL",
+            "STORAGE_FJALL_DURABILITY",
+        ] {
+            if std::env::var_os(var).is_some() {
+                notes.push(format!(
+                    "{var} is set but ignored: there is no [storage] section and \
+                     STORAGE_BACKEND is not set, so the mediator uses Redis ([database]). \
+                     Set STORAGE_BACKEND=fjall (or add [storage]) to use it."
+                ));
+            }
+        }
+    }
+    for (preferred, older) in ENV_ALIASES {
+        if std::env::var_os(preferred).is_some() && std::env::var_os(older).is_some() {
+            notes.push(format!(
+                "both {preferred} and {older} are set; {preferred} is used and {older} \
+                 is ignored"
+            ));
+        }
+    }
+    notes
+}
+
+/// `(preferred, older)` environment variable names for one setting. The
+/// preferred name wins when both are set.
+const ENV_ALIASES: &[(&str, &str)] = &[
+    ("MEDIATOR_LOG_LEVEL", "LOG_LEVEL"),
+    ("MEDIATOR_LISTEN_ADDRESS", "LISTEN_ADDRESS"),
+    ("MEDIATOR_DATABASE_URL", "DATABASE_URL"),
+    ("MEDIATOR_USE_SSL", "USE_SSL"),
+    ("GLOBAL_ACL_DEFAULT", "GLOBAL_DEFAULT_ACL"),
+    ("LIMIT_TO_KEYS_PER_RECIPIENT", "LIMIT_TO_KEYS_PER_DID"),
+    ("LIMIT_ACCESS_LIST_LIMIT", "ACCESS_LIST_LIMIT"),
+    ("LIMIT_OOB_INVITE_TTL", "OOB_INVITE_TTL"),
+];
+
+/// Log each of [`ignored_env_notes`] as a warning.
+pub fn warn_ignored_env(config: &ConfigRaw) {
+    for note in ignored_env_notes(config) {
+        warn!("{note}");
+    }
 }
 
 /// Parse a comma-separated list of CIDR ranges from environment variable
@@ -571,38 +693,41 @@ pub fn warn_unknown_keys(file_name: &str, unknown_keys: &[String]) {
 
 /// Reads a file and returns a vector of strings, one for each line in the file.
 /// Lines starting with `#` (comments) are blanked rather than dropped, so a
-/// parse error's line number still points at the line in the file.
+/// parse error's line number still points at the line in the file. A file
+/// that is not UTF-8 is an error: it used to be cut off silently at the first
+/// line that was not.
 fn read_file_lines<P>(file_name: P) -> Result<Vec<String>, ConfigError>
 where
     P: AsRef<Path>,
 {
     let path = file_name.as_ref();
-    let file = File::open(path).map_err(|err| {
-        error!("Could not open file({}). {}", path.display(), err);
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        error!("Could not read file({}). {}", path.display(), err);
         ConfigError::FileRead {
             path: path.display().to_string(),
             source: err,
         }
     })?;
 
-    let mut lines = Vec::new();
-    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
-        if line.starts_with('#') {
-            lines.push(String::new());
-        } else {
-            lines.push(line);
-        }
-    }
-
-    Ok(lines)
+    Ok(contents
+        .lines()
+        .map(|line| {
+            if line.starts_with('#') {
+                String::new()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         apply_metrics_allow_cidrs_override, apply_metrics_bearer_token_override,
-        apply_trust_xff_cidrs_override, parse_config, split_list, unknown_key_message,
+        apply_trust_xff_cidrs_override, first_env, parse_config, split_list, unknown_key_message,
     };
+    use std::collections::BTreeSet;
 
     const SHIPPED: &str = include_str!("../../conf/mediator.toml");
 
@@ -614,23 +739,170 @@ mod tests {
         assert!(unknown.is_empty(), "unexpected unknown keys: {unknown:?}");
     }
 
-    /// The template's header promises every setting can be overridden by the
-    /// environment variable named in its `### Env:` label. A label with no
-    /// override behind it is silently ignored at runtime
-    /// (`LIMIT_QUEUED_SEND_MESSAGES_PER_PEER` was, until 0.49).
+    /// Every environment variable name `env.rs` reads: each `"UPPER_CASE"`
+    /// string literal outside the tests.
+    fn env_vars_read() -> BTreeSet<String> {
+        let source = include_str!("env.rs");
+        let code = source.split("#[cfg(test)]").next().expect("source");
+        let bytes = code.as_bytes();
+        let mut names = BTreeSet::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_uppercase()
+                        || bytes[end].is_ascii_digit()
+                        || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                if end < bytes.len()
+                    && bytes[end] == b'"'
+                    && end - start >= 3
+                    && bytes[start].is_ascii_uppercase()
+                {
+                    names.insert(code[start..end].to_string());
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        names
+    }
+
+    /// Every variable named on a `### Env:` line of `template`. A line may
+    /// name more than one (an alias, or related settings); prose after an em
+    /// dash is not a name.
+    fn labelled_env_vars(template: &str) -> BTreeSet<String> {
+        template
+            .lines()
+            .filter_map(|line| line.strip_prefix("### Env: "))
+            .flat_map(|rest| {
+                let names = rest.split('\u{2014}').next().unwrap_or_default();
+                names
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|token| {
+                        token.len() >= 3
+                            && token.starts_with(|c: char| c.is_ascii_uppercase())
+                            && token
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The template's header promises that the variable named in a setting's
+    /// `### Env:` label overrides it. A label with no override behind it is
+    /// silently ignored at runtime (`LIMIT_QUEUED_SEND_MESSAGES_PER_PEER` was,
+    /// until 0.49).
     #[test]
     fn every_env_label_in_the_shipped_config_is_read() {
-        let source = include_str!("env.rs");
-        let missing: Vec<&str> = SHIPPED
-            .lines()
-            .filter_map(|l| l.strip_prefix("### Env: "))
-            .filter_map(|rest| rest.split_whitespace().next())
-            .filter(|var| !source.contains(&format!("\"{var}\"")))
+        let read = env_vars_read();
+        let missing: Vec<String> = labelled_env_vars(SHIPPED)
+            .into_iter()
+            .filter(|var| !read.contains(var))
             .collect();
         assert!(
             missing.is_empty(),
             "template names env vars env.rs never reads: {missing:?}"
         );
+    }
+
+    /// And the other way round: every variable the overlay reads is named in
+    /// the template, so an operator reading it learns every override.
+    #[test]
+    fn every_env_var_read_is_labelled_in_the_shipped_config() {
+        let labelled = labelled_env_vars(SHIPPED);
+        let unlabelled: Vec<String> = env_vars_read()
+            .into_iter()
+            .filter(|var| !labelled.contains(var))
+            .collect();
+        assert!(
+            unlabelled.is_empty(),
+            "env.rs reads env vars the template does not label: {unlabelled:?}"
+        );
+    }
+
+    /// The test deployment's config (`docker/test/conf`) carries the same
+    /// labels; none of them may name a variable that does nothing.
+    #[test]
+    fn every_env_label_in_the_test_container_config_is_read() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docker/test/conf/mediator.toml");
+        let Ok(template) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        };
+        let read = env_vars_read();
+        let missing: Vec<String> = labelled_env_vars(&template)
+            .into_iter()
+            .filter(|var| !read.contains(var))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docker/test/conf names env vars env.rs never reads: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_env_var_scanner_finds_what_it_should() {
+        let read = env_vars_read();
+        for var in [
+            "LOG_LEVEL",
+            "MEDIATOR_LOG_LEVEL",
+            "MEDIATOR_SECRETS_BACKEND",
+            "TRUST_XFF_CIDRS",
+            "LIMIT_MUX_DEAD_RETENTION_SECS",
+        ] {
+            assert!(read.contains(var), "{var}");
+        }
+        let labels = labelled_env_vars(
+            "### Env: A_ONE (or the older B_TWO)\n### Env: C_THREE \u{2014} NOT_A_NAME\n",
+        );
+        assert_eq!(
+            labels.into_iter().collect::<Vec<_>>(),
+            vec!["A_ONE", "B_TWO", "C_THREE"]
+        );
+    }
+
+    /// A `MEDIATOR_`-prefixed name, or the renamed name, wins over the older
+    /// one; either alone works.
+    #[test]
+    fn the_preferred_name_wins_over_the_older_one() {
+        // Names no other test (or the environment) sets.
+        let preferred = "MEDIATOR_CONFIG_TEST_PREFERRED_X";
+        let older = "MEDIATOR_CONFIG_TEST_OLDER_X";
+        // SAFETY: these names are unique to this test.
+        unsafe {
+            std::env::remove_var(preferred);
+            std::env::set_var(older, "old");
+        }
+        assert_eq!(first_env(&[preferred, older]).as_deref(), Some("old"));
+        unsafe { std::env::set_var(preferred, "new") };
+        assert_eq!(first_env(&[preferred, older]).as_deref(), Some("new"));
+        unsafe {
+            std::env::remove_var(preferred);
+            std::env::remove_var(older);
+        }
+        assert_eq!(first_env(&[preferred, older]), None);
+    }
+
+    /// A file that is not UTF-8 is refused, not cut off at the first bad line.
+    #[test]
+    fn a_config_file_that_is_not_utf8_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mediator.toml");
+        let mut bytes = SHIPPED.as_bytes().to_vec();
+        let at = SHIPPED.find("\n[security]").expect("security table");
+        bytes.splice(at..at, *b"\n# \xff\xfe\n");
+        std::fs::write(&path, bytes).expect("write");
+        assert!(super::read_file_lines(&path).is_err());
     }
 
     /// Keyring VTI-06: a key appended below the last table header is filed

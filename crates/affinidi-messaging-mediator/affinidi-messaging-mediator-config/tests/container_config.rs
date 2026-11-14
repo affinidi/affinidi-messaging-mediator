@@ -22,6 +22,12 @@ fn container_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docker/conf/mediator.toml")
 }
 
+/// `docker/test/conf/mediator.toml` — the test deployment's config
+/// (`docker-compose.test.yml`), relative to this crate's manifest.
+fn test_container_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docker/test/conf/mediator.toml")
+}
+
 /// The annotated template, `conf/mediator.toml`, relative to this crate's manifest.
 fn template_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conf/mediator.toml")
@@ -79,17 +85,16 @@ fn container_mediator_toml_parses() {
     );
 }
 
-/// The image's `[limits]` must match the annotated template. The image config
-/// overwrites the template in the published container, so a limit that differs
-/// here is the one every container deployment actually runs, while the
-/// template, the Rust defaults and the docs all say otherwise. The send-queue
-/// limits shipped at 200 / 1000 against a documented 2000 / 10000 this way.
+/// A container config's `[limits]` must match the annotated template. The
+/// image config overwrites the template in the published container, so a
+/// limit that differs here is the one every container deployment actually
+/// runs, while the template, the Rust defaults and the docs all say otherwise.
+/// The send-queue limits shipped at 200 / 1000 against a documented 2000 /
+/// 10000 this way — in the image, and again in the test deployment's config.
 ///
-/// If the image needs a limit that differs on purpose, change the template too,
+/// If a config needs a limit that differs on purpose, change the template too,
 /// or carve the key out here with a comment saying why.
-#[test]
-fn container_limits_match_template() {
-    let container = container_config_path();
+fn assert_limits_match_template(container: PathBuf, name: &str) {
     let template = template_config_path();
     if !container.exists() || !template.exists() {
         eprintln!("skipping: container or template config not present (not a workspace checkout)");
@@ -114,7 +119,7 @@ fn container_limits_match_template() {
         .filter(|key| image.get(*key) != documented.get(*key))
         .map(|key| {
             format!(
-                "{key}: image {:?}, template {:?}",
+                "{key}: {name} {:?}, template {:?}",
                 image.get(key),
                 documented.get(key)
             )
@@ -123,7 +128,42 @@ fn container_limits_match_template() {
 
     assert!(
         drift.is_empty(),
-        "docker/conf/mediator.toml [limits] drifted from conf/mediator.toml:\n  {}",
+        "{name} [limits] drifted from conf/mediator.toml:\n  {}",
         drift.join("\n  ")
     );
+}
+
+#[test]
+fn container_limits_match_template() {
+    assert_limits_match_template(container_config_path(), "docker/conf/mediator.toml");
+}
+
+#[test]
+fn test_container_limits_match_template() {
+    assert_limits_match_template(
+        test_container_config_path(),
+        "docker/test/conf/mediator.toml",
+    );
+}
+
+/// The test deployment's config parses, and has no key the mediator does not
+/// read.
+#[test]
+fn test_container_mediator_toml_parses() {
+    let path = test_container_config_path();
+    if !path.exists() {
+        eprintln!(
+            "skipping: {} not present (not a workspace checkout)",
+            path.display()
+        );
+        return;
+    }
+    let toml = std::fs::read_to_string(&path).expect("read docker/test/conf/mediator.toml");
+    let (raw, unknown): (ConfigRaw, _) =
+        parse_config(&toml).expect("docker/test/conf/mediator.toml parses as ConfigRaw");
+    assert!(
+        unknown.is_empty(),
+        "unknown keys in test config: {unknown:?}"
+    );
+    assert!(raw.secrets.backend.starts_with("file://"));
 }
