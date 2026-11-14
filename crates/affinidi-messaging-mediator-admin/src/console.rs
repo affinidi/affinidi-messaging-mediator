@@ -22,7 +22,7 @@ use crate::error::{ConsoleError, Result, bounded};
 use crate::grants::{BulkRevokeOutcome, GrantKey, GrantRevokeResult, GrantSelection};
 use crate::identity::Identity;
 use crate::live::{LiveStream, MembershipFilter, MonitorFeed, MonitorFilter};
-use crate::purge::{PurgePlan, PurgeRequest, pinned_to_preview};
+use crate::purge::{PurgePlan, PurgeRequest, pinned_to_preview, transit_margin_secs};
 
 /// Which account a call acts on: `None` is the console's own.
 pub type Target = Option<String>;
@@ -917,8 +917,9 @@ impl MediatorConsole {
     /// preview could have counted. It can remove **fewer** than
     /// [`PurgePlan::matched`] — some may have been delivered or deleted
     /// since, and the age carries a safety margin
-    /// ([`PURGE_TRANSIT_MARGIN_SECS`](crate::PURGE_TRANSIT_MARGIN_SECS), the
-    /// time the request may take to execute) and is rounded up to whole
+    /// (the time the request may take to execute: the console's request
+    /// timeout, and at least
+    /// [`PURGE_TRANSIT_MARGIN_SECS`](crate::PURGE_TRANSIT_MARGIN_SECS)) and is rounded up to whole
     /// seconds, so what arrived in that window before the preview is left
     /// out — but never a message newer than the preview, provided the
     /// mediator runs the purge within the margin. `purged` in the answer says
@@ -928,7 +929,11 @@ impl MediatorConsole {
     /// pin is an age the console computes; the mediator still decides what
     /// matches.
     pub async fn purge(&self, plan: PurgePlan) -> Result<queue::purge::v0_1::Response> {
-        let request = pinned_to_preview(&plan, chrono::Utc::now());
+        let request = pinned_to_preview(
+            &plan,
+            chrono::Utc::now(),
+            transit_margin_secs(self.request_timeout),
+        );
         self.run_purge(&request, false).await
     }
 

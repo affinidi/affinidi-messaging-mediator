@@ -178,7 +178,7 @@ pub enum Command {
     ///
     /// The removal never takes a message newer than the count, and keeps a
     /// safety margin for the request's transit: messages queued within
-    /// `PURGE_TRANSIT_MARGIN_SECS` (30 s) before the count are spared too, so
+    /// the transit margin (`--timeout`, at least 30 s) before the count are spared too, so
     /// it can remove fewer than were counted.
     Purge {
         #[command(flatten)]
@@ -196,7 +196,7 @@ pub enum Command {
         #[arg(long, conflicts_with = "yes", required_unless_present = "yes")]
         dry_run: bool,
         /// Remove what the count matched, except what was queued within the
-        /// transit margin (30 s) before it.
+        /// transit margin (`--timeout`, at least 30 s) before it.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]

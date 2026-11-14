@@ -178,7 +178,7 @@ let done = console.purge(plan).await?;
 that arrived after the preview, or one that was not yet old enough then. It
 can remove **fewer** than `plan.matched`, when messages were delivered or
 deleted in between, and because the pin keeps a safety margin for the
-request's transit (`PURGE_TRANSIT_MARGIN_SECS`, 30 s) and is in whole
+request's transit (the request timeout, at least `PURGE_TRANSIT_MARGIN_SECS`, 30 s) and is in whole
 seconds, it also leaves out what arrived in that window before the preview.
 Report `purged`, not `matched`, as what was removed.
 

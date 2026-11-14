@@ -78,7 +78,8 @@
   a code a script can act on: `0` done, `1` failed, `2` invalid arguments,
   `3` refused, `4` unreachable or timed out. `purge` needs `--dry-run` (count
   only) or `--yes` (count, then remove what was counted, sparing what was
-  queued within the 30 s transit margin before the count).
+  queued within the transit margin before the count: the request timeout,
+  at least 30 s).
 - `--timeout` and `--connect-timeout` bound the console's waits, in the
   console and in commands alike.
 

@@ -202,8 +202,8 @@ A purge is always counted first. The console shows whose queue, which queue,
 and how many messages (and bytes) would go, and waits for `y`. The purge is
 then pinned to the moment of that count: a message that arrives after it is
 never removed. Fewer may go than were counted, when some are delivered in the
-meantime, and the console says how many did. (The pin keeps a 30 s safety
-margin for the request's transit and is in whole seconds, so it also leaves
+meantime, and the console says how many did. (The pin keeps a safety
+margin for the request's transit, the request timeout and at least 30 s, and is in whole seconds, so it also leaves
 out what arrived in that window before the count.) Purged messages are gone;
 they aren't returned to their senders. `mediator-console purge --yes` works
 the same way.
