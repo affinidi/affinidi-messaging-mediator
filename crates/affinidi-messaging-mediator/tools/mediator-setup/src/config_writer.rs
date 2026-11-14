@@ -621,6 +621,9 @@ mod tests {
 
     #[test]
     fn build_backend_url_file_relative_resolves_to_absolute_three_slash() {
+        // The expected path and build_backend_url both read the CWD, which
+        // other tests change; hold the lock so they read the same one.
+        let _cwd = crate::cwd_lock();
         // A relative path must be resolved against the CWD into a
         // three-slash `file:///<abs>` URL — a bare `file://conf/secrets.json`
         // is RFC-malformed (authority=`conf`) and opens `/secrets.json` (#350).
