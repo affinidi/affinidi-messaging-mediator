@@ -46,7 +46,9 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState, StreamingClientState,
 };
-use affinidi_messaging_mediator_common::store::{RefreshRotation, TrustTaskClaim, mux, prelude::*};
+use affinidi_messaging_mediator_common::store::{
+    AccessListUpdate, AccountUpdate, RefreshRotation, TrustTaskClaim, mux, prelude::*,
+};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountStatsDelta, ActivityKind, StatsDirection, StatsWire,
 };
@@ -4515,6 +4517,245 @@ async fn check_stale_expiry_entry_keeps_a_later_copy(store: Arc<dyn MediatorStor
     assert_nothing_queued(&store, from, &[to, from]).await;
 }
 
+/// `account_update` applies every member as one step, refuses (writing
+/// nothing) for a DID with no account, and keeps admin-set membership in
+/// step with the role.
+async fn check_account_update(store: Arc<dyn MediatorStore>) {
+    let did = "did_hash_account_update_target";
+    let sender = "did_hash_account_update_sender";
+
+    let promote = AccountUpdate {
+        acls: Some(acls_with_mode(AccessListModeType::ExplicitAllow)),
+        send_queue_limit: Some(10),
+        receive_queue_limit: Some(-1),
+        role: Some(AccountType::Admin),
+    };
+
+    // No account: nothing is written, and none is created.
+    assert!(
+        !store
+            .account_update(did, &promote)
+            .await
+            .expect("account_update of a missing account"),
+        "an update of a missing account reports it"
+    );
+    assert!(!store.account_exists(did).await.expect("account_exists"));
+    assert!(!store.check_admin_account(did).await.expect("check_admin"));
+
+    // A record holding only queue counters is not an account either.
+    store
+        .account_add(did, &allow_all(), None)
+        .await
+        .expect("account_add");
+    store
+        .store_message(
+            "session-id",
+            "{\"protected\":\"account-update\"}",
+            did,
+            Some(sender),
+            NEVER,
+            1000,
+        )
+        .await
+        .expect("store_message");
+    assert!(
+        !store
+            .account_update(sender, &promote)
+            .await
+            .expect("account_update of a counters-only record"),
+        "a counters-only record is not updated"
+    );
+    assert!(!store.account_exists(sender).await.expect("account_exists"));
+    assert!(
+        !store
+            .check_admin_account(sender)
+            .await
+            .expect("check_admin")
+    );
+
+    // An empty update changes nothing and answers that the account exists.
+    assert!(
+        store
+            .account_update(did, &AccountUpdate::default())
+            .await
+            .expect("empty account_update")
+    );
+
+    // Every member lands together.
+    assert!(store.account_update(did, &promote).await.expect("promote"));
+    let account = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account present");
+    assert_eq!(
+        account.acls,
+        acls_with_mode(AccessListModeType::ExplicitAllow).to_u64()
+    );
+    assert_eq!(account.queue_send_limit, Some(10));
+    assert_eq!(account.queue_receive_limit, Some(-1));
+    assert_eq!(account._type, AccountType::Admin);
+    assert!(
+        store.check_admin_account(did).await.expect("check_admin"),
+        "a promoted account is listed as an admin"
+    );
+
+    // Members left out stay; `-2` resets a limit; a demotion unlists.
+    assert!(
+        store
+            .account_update(
+                did,
+                &AccountUpdate {
+                    send_queue_limit: Some(-2),
+                    role: Some(AccountType::Standard),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("demote")
+    );
+    let account = store
+        .account_get(did)
+        .await
+        .expect("account_get")
+        .expect("account present");
+    assert_eq!(
+        account.acls,
+        acls_with_mode(AccessListModeType::ExplicitAllow).to_u64(),
+        "an update without ACLs keeps them"
+    );
+    assert_eq!(account.queue_send_limit, None, "-2 resets the limit");
+    assert_eq!(
+        account.queue_receive_limit,
+        Some(-1),
+        "untouched limit stays"
+    );
+    assert_eq!(account._type, AccountType::Standard);
+    assert!(
+        !store.check_admin_account(did).await.expect("check_admin"),
+        "a demoted account is not an admin"
+    );
+
+    // Switching between admin roles keeps the listing.
+    for role in [AccountType::Admin, AccountType::RootAdmin] {
+        assert!(
+            store
+                .account_update(
+                    did,
+                    &AccountUpdate {
+                        role: Some(role),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("set admin role")
+        );
+        assert!(store.check_admin_account(did).await.expect("check_admin"));
+    }
+}
+
+/// `access_list_update` applies `clear`, `add` and `remove` as one step in
+/// that order, admitting `add` against the list `clear` left.
+async fn check_access_list_update(store: Arc<dyn MediatorStore>) {
+    let owner = "did_hash_alu_owner";
+    let h = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .map(|n| format!("did_hash_alu_member_{n}"))
+            .collect()
+    };
+    store
+        .account_add(owner, &allow_all(), None)
+        .await
+        .expect("account_add owner");
+    store
+        .access_list_add(10, owner, &h(&["a", "b"]))
+        .await
+        .expect("access_list_add");
+
+    // clear + add replaces the list.
+    let outcome = store
+        .access_list_update(
+            3,
+            owner,
+            &AccessListUpdate {
+                clear: true,
+                add: h(&["c", "d"]),
+                remove: Vec::new(),
+            },
+        )
+        .await
+        .expect("replace");
+    assert_eq!(outcome.added, h(&["c", "d"]));
+    assert!(!outcome.truncated);
+    assert!(outcome.removed.is_empty());
+    assert_eq!(outcome.count, 2);
+    assert_eq!(
+        store
+            .access_list_get(owner, &h(&["a", "b", "c", "d"]))
+            .await
+            .expect("access_list_get")
+            .did_hashes,
+        h(&["c", "d"]),
+        "the cleared entries are gone and the added ones listed"
+    );
+
+    // add is admitted against the limit, then remove runs, each entry once.
+    let mut remove = h(&["c", "c"]);
+    remove.extend(h(&["never_listed"]));
+    let outcome = store
+        .access_list_update(
+            3,
+            owner,
+            &AccessListUpdate {
+                clear: false,
+                add: h(&["e", "f"]),
+                remove,
+            },
+        )
+        .await
+        .expect("add and remove");
+    assert_eq!(outcome.added, h(&["e"]), "only what fits under the limit");
+    assert!(outcome.truncated);
+    assert_eq!(outcome.removed, h(&["c"]), "listed entries, each once");
+    assert_eq!(outcome.count, 2);
+    assert_eq!(access_list_len(&store, owner).await, 2);
+
+    // clear with an add past the limit: admitted against the empty list.
+    let outcome = store
+        .access_list_update(
+            3,
+            owner,
+            &AccessListUpdate {
+                clear: true,
+                add: h(&["p", "q", "r", "s"]),
+                remove: h(&["d"]),
+            },
+        )
+        .await
+        .expect("replace past the limit");
+    assert_eq!(outcome.added, h(&["p", "q", "r"]));
+    assert!(outcome.truncated);
+    assert!(outcome.removed.is_empty(), "d went with the clear");
+    assert_eq!(outcome.count, 3);
+    assert_eq!(access_list_len(&store, owner).await, 3);
+
+    // clear alone empties it.
+    let outcome = store
+        .access_list_update(
+            3,
+            owner,
+            &AccessListUpdate {
+                clear: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clear");
+    assert_eq!(outcome.count, 0);
+    assert_eq!(access_list_len(&store, owner).await, 0);
+}
+
 /// Checks that share Redis DB 0, run one after another so neither flushes the
 /// other's keys mid-run.
 #[cfg(feature = "redis-backend")]
@@ -4522,6 +4763,8 @@ async fn check_db0_in_sequence(store: Arc<dyn MediatorStore>) {
     // Store-only checks first, so a failure in the message path (Lua) can't
     // hide them.
     check_admin_roles(store.clone()).await;
+    check_account_update(store.clone()).await;
+    check_access_list_update(store.clone()).await;
     check_account_add_keeps_existing_account(store.clone()).await;
     check_counters_only_record_is_not_an_account(store.clone()).await;
     check_login_session(store.clone()).await;
@@ -4600,6 +4843,14 @@ macro_rules! conformance_for {
             #[tokio::test]
             async fn access_list_lifecycle() {
                 check_access_list_lifecycle(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn account_update() {
+                check_account_update(ready($ctor).await).await;
+            }
+            #[tokio::test]
+            async fn access_list_update() {
+                check_access_list_update(ready($ctor).await).await;
             }
             #[tokio::test]
             async fn forward_queue_delete() {

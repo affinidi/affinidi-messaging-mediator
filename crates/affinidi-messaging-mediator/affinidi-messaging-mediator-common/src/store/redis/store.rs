@@ -48,9 +48,10 @@ use crate::{
     database::{DatabaseHandler, RedisConnection},
     errors::MediatorError,
     store::{
-        DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
-        InboxStatusReply, MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session,
-        SessionSweepReport, StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
+        AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, DeletionAuthority, ExpiryReport,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MetadataStats,
+        PubSubRecord, RefreshRotation, Session, SessionSweepReport, StatCounter, StoreHealth,
+        StreamingClientState, TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -1534,6 +1535,14 @@ impl SessionStore for RedisStore {
 
 #[async_trait]
 impl AccountStore for RedisStore {
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        self.account_update(did_hash, update).await
+    }
+
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         self.account_exists(did_hash).await
     }
@@ -1802,6 +1811,16 @@ impl AccountStore for RedisStore {
 
 #[async_trait]
 impl AclStore for RedisStore {
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        self.access_list_update(access_list_limit, did_hash, update)
+            .await
+    }
+
     async fn set_did_acl(
         &self,
         did_hash: &str,

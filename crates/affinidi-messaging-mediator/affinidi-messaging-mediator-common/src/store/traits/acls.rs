@@ -1,7 +1,7 @@
 //! The [`AclStore`] capability of a storage backend.
 
 use crate::errors::MediatorError;
-use crate::store::DeliveryDecision;
+use crate::store::{AccessListUpdate, AccessListUpdateOutcome, DeliveryDecision};
 use crate::types::acls::{AccessListModeType, MediatorACLSet};
 use crate::types::acls_handler::{
     MediatorACLGetResponse, MediatorAccessListAddResponse, MediatorAccessListGetResponse,
@@ -92,6 +92,24 @@ pub trait AclStore: Send + Sync + std::fmt::Debug {
 
     /// Drop the entire access list for a DID.
     async fn access_list_clear(&self, did_hash: &str) -> Result<(), MediatorError>;
+
+    /// Apply `update` to `did_hash`'s access list as **one atomic step**, in
+    /// the order `clear`, `add`, `remove`: no reader sees the list cleared and
+    /// not yet refilled, and a failure leaves it as it was.
+    /// `messaging/access-list/update` uses it, so `clear` with `add` replaces
+    /// the list wholesale.
+    ///
+    /// `add` is admitted as [`access_list_add`](Self::access_list_add) admits
+    /// it, against the list as `clear` left it: when the list would pass
+    /// `access_list_limit`, the first hashes that fit are added and the
+    /// outcome is `truncated`. `removed` names the hashes that were listed
+    /// after the additions, each once; `count` is the size afterwards.
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError>;
 
     /// Filter `hashes` to those present in the given DID's access list.
     async fn access_list_get(

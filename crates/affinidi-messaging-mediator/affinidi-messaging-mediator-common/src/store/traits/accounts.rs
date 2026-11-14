@@ -1,7 +1,7 @@
 //! The [`AccountStore`] capability of a storage backend.
 
 use crate::errors::MediatorError;
-use crate::store::Session;
+use crate::store::{AccountUpdate, Session};
 use crate::types::accounts::{
     Account, AccountActivity, AccountStats, AccountStatsDelta, AccountType, ActivityKind,
     MediatorAccountList,
@@ -76,6 +76,28 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
         send_queue_limit: Option<i32>,
         receive_queue_limit: Option<i32>,
     ) -> Result<(), MediatorError>;
+
+    /// Apply `update` to the existing account `did_hash` as **one atomic
+    /// step**: its ACLs, queue limits and role (with admin-set membership)
+    /// all change, or none does, and no reader sees some members applied and
+    /// not others. `messaging/account/update` uses it so a refused or failed
+    /// write never leaves a partial update behind.
+    ///
+    /// Returns `false`, writing nothing, when `did_hash` has no account (a
+    /// record holding only queue counters is not one). An empty update
+    /// writes nothing and answers whether the account exists.
+    ///
+    /// Redis runs it as one script on the account's slot. With cluster mode
+    /// on, the global `ADMINS` set lives in another slot and is written in
+    /// its own step, ordered so a failure between the two never grants more
+    /// than either end state: added before a promotion, removed after a
+    /// demotion. `ROLE_TYPE`, which alone grants admin rights, is always in
+    /// the atomic step.
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError>;
 
     /// Ensure an admin account exists with the given role and ACLs.
     /// Creates the account if missing, updates the role + admin-set

@@ -29,7 +29,8 @@ use affinidi_messaging_mediator_common::store::mux::{
     MuxChangeRecord, MuxDidRecord, MuxIndexDelta,
 };
 use affinidi_messaging_mediator_common::store::{
-    StreamingClaim, StreamingKind, StreamingWrite, single_process,
+    AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, StreamingClaim, StreamingKind,
+    StreamingWrite, single_process,
 };
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
@@ -1391,6 +1392,36 @@ impl SessionStore for MemoryStore {
 
 #[async_trait]
 impl AccountStore for MemoryStore {
+    /// Under the one lock, so every member lands together.
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(record) = state
+            .accounts
+            .get_mut(did_hash)
+            .filter(|record| record.is_account)
+        else {
+            return Ok(false);
+        };
+        if let Some(acls) = &update.acls {
+            record.acls = acls.clone();
+        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, update.send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, update.receive_queue_limit);
+        if let Some(role) = update.role {
+            record.role = role;
+            if role.is_admin() {
+                state.admins.insert(did_hash.to_string());
+            } else {
+                state.admins.remove(did_hash);
+            }
+        }
+        Ok(true)
+    }
+
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         Ok(self.state.lock().await.account(did_hash).is_some())
     }
@@ -1667,6 +1698,30 @@ impl AccountStore for MemoryStore {
 
 #[async_trait]
 impl AclStore for MemoryStore {
+    /// Planned by `ops::plan_access_list_update` and applied under the one
+    /// lock.
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        let mut state = self.state.lock().await;
+        let current = state.access_lists.remove(did_hash).unwrap_or_default();
+        let plan = ops::plan_access_list_update(&current, update, access_list_limit);
+        let dropped: HashSet<&String> = plan.delete.iter().collect();
+        let mut list: Vec<String> = current
+            .iter()
+            .filter(|h| !dropped.contains(h))
+            .cloned()
+            .collect();
+        list.extend(plan.insert.iter().cloned());
+        if !list.is_empty() {
+            state.access_lists.insert(did_hash.to_string(), list);
+        }
+        Ok(plan.outcome)
+    }
+
     async fn set_did_acl(
         &self,
         did_hash: &str,

@@ -73,7 +73,8 @@ use affinidi_messaging_mediator_common::store::mux::{
     MuxChangeRecord, MuxDidRecord, MuxIndexDelta,
 };
 use affinidi_messaging_mediator_common::store::{
-    StreamingClaim, StreamingKind, StreamingWrite, is_session_over, single_process,
+    AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, StreamingClaim, StreamingKind,
+    StreamingWrite, is_session_over, single_process,
 };
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
@@ -1354,6 +1355,21 @@ impl FjallStore {
         Ok(count)
     }
 
+    /// Every member of `did_hash`'s access list.
+    fn access_list_members(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        let prefix_len = did_hash.len();
+        let mut members = Vec::new();
+        for guard in self.access_lists.prefix(did_hash.as_bytes()) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("access_list_members:prefix", e))?;
+            if key.len() > prefix_len {
+                members.push(String::from_utf8_lossy(&key[prefix_len..]).into_owned());
+            }
+        }
+        Ok(members)
+    }
+
     fn access_list_contains(&self, did_hash: &str, member: &str) -> Result<bool, MediatorError> {
         let mut k = did_hash.as_bytes().to_vec();
         k.extend_from_slice(member.as_bytes());
@@ -2575,6 +2591,37 @@ impl SessionStore for FjallStore {
 
 #[async_trait]
 impl AccountStore for FjallStore {
+    /// One batch under the write lock, so every member lands together.
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let Some(mut record) = self.account_record(did_hash)? else {
+            return Ok(false);
+        };
+        if let Some(acls) = &update.acls {
+            record.acls = acls.to_u64();
+        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, update.send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, update.receive_queue_limit);
+        let mut batch = self.db.batch();
+        if let Some(role) = update.role {
+            record.role = role;
+            if role.is_admin() {
+                batch.insert(&self.admins, did_hash.as_bytes(), Vec::<u8>::new());
+            } else {
+                batch.remove(&self.admins, did_hash.as_bytes());
+            }
+        }
+        batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("account_update:commit", e))?;
+        Ok(true)
+    }
+
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         Ok(self.account_record(did_hash)?.is_some())
     }
@@ -2988,6 +3035,35 @@ impl AccountStore for FjallStore {
 
 #[async_trait]
 impl AclStore for FjallStore {
+    /// Planned by `ops::plan_access_list_update` and applied as one batch
+    /// under the write lock.
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let current = self.access_list_members(did_hash)?;
+        let plan = ops::plan_access_list_update(&current, update, access_list_limit);
+        let key = |member: &str| {
+            let mut k = did_hash.as_bytes().to_vec();
+            k.extend_from_slice(member.as_bytes());
+            k
+        };
+        let mut batch = self.db.batch();
+        for member in &plan.delete {
+            batch.remove(&self.access_lists, key(member));
+        }
+        for member in &plan.insert {
+            batch.insert(&self.access_lists, key(member), Vec::<u8>::new());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("access_list_update:commit", e))?;
+        Ok(plan.outcome)
+    }
+
     async fn set_did_acl(
         &self,
         did_hash: &str,
