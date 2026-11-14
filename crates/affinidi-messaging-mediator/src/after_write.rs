@@ -23,6 +23,7 @@
 //! Outside both (no REST scope, nothing pushed) a completion is dropped: the
 //! reply reached no transport, so nothing it describes happened.
 
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use std::{
     future::Future,
     pin::Pin,

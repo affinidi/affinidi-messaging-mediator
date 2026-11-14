@@ -33,11 +33,11 @@ use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     store::{
         DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
-        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MediatorStore, MessageMetaData,
-        MessageScope, MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS,
-        PubSubRecord, RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState,
-        SessionSweepReport, StatCounter, StoreHealth, StoredMessageRef, StreamingClientState,
-        TrustTaskClaim, acknowledged_until, ops,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageScope,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, POISON_ATTEMPTS, PubSubRecord,
+        RefreshRotation, RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport,
+        StatCounter, StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim,
+        acknowledged_until, ops, prelude::*,
     },
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
 };
@@ -597,9 +597,7 @@ fn counter_key(c: StatCounter) -> &'static str {
 // ─── MediatorStore impl ─────────────────────────────────────────────────────
 
 #[async_trait]
-impl MediatorStore for MemoryStore {
-    // ─── Bootstrap & health ─────────────────────────────────────────────────
-
+impl StoreLifecycle for MemoryStore {
     async fn initialize(&self) -> Result<(), MediatorError> {
         Ok(())
     }
@@ -612,9 +610,10 @@ impl MediatorStore for MemoryStore {
         self.broadcast_channels.lock().await.clear();
         Ok(())
     }
+}
 
-    // ─── Messages ───────────────────────────────────────────────────────────
-
+#[async_trait]
+impl MessageStore for MemoryStore {
     async fn store_message(
         &self,
         _session_id: &str,
@@ -947,8 +946,6 @@ impl MediatorStore for MemoryStore {
         })
     }
 
-    // ─── Inbox & outbox ─────────────────────────────────────────────────────
-
     async fn list_messages(
         &self,
         did_hash: &str,
@@ -1148,8 +1145,95 @@ impl MediatorStore for MemoryStore {
         Ok(reply)
     }
 
-    // ─── Sessions ───────────────────────────────────────────────────────────
+    async fn sweep_expired_messages(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+    ) -> Result<ExpiryReport, MediatorError> {
+        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
+            .await
+    }
 
+    async fn sweep_expired_messages_observed(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+        on_expired: Option<OnExpired<'_>>,
+    ) -> Result<ExpiryReport, MediatorError> {
+        // Snapshot due timeslot keys + their records under the lock, then
+        // remove each record that is still due, under the lock.
+        let due: Vec<(u64, Vec<RecordKey>)> = {
+            let state = self.state.lock().await;
+            state
+                .expiry
+                .range(..=now_secs)
+                .map(|(ts, keys)| (*ts, keys.iter().cloned().collect()))
+                .collect()
+        };
+
+        let by = DeletionAuthority::Admin {
+            admin_did_hash: admin_did_hash.to_string(),
+        };
+        let mut report = ExpiryReport {
+            timeslots_swept: due.len() as u32,
+            ..Default::default()
+        };
+        for (ts, keys) in due {
+            for key in keys {
+                // Only an entry at or after the record's current expiry
+                // removes it. One left by a deadline the record no longer has
+                // (an earlier copy of the same bytes for the same recipient,
+                // or the original deadline of a delivered message) is dropped
+                // and the record kept.
+                let removed = {
+                    let mut state = self.state.lock().await;
+                    let meta = state
+                        .messages
+                        .get(&key)
+                        .filter(|record| ops::expiry_entry_is_due(record.expires_at, ts))
+                        .map(|record| MessageMetaData {
+                            bytes: record.bytes,
+                            to_did_hash: record.to_did_hash.clone(),
+                            from_did_hash: record.from_did_hash.clone(),
+                            timestamp: record.timestamp_ms,
+                        });
+                    if meta.is_some() {
+                        state.remove_record(&key, &by);
+                    }
+                    if let Some(set) = state.expiry.get_mut(&ts) {
+                        set.remove(&key);
+                        if set.is_empty() {
+                            state.expiry.remove(&ts);
+                        }
+                    }
+                    meta
+                };
+                match removed {
+                    Some(meta) => {
+                        report.expired += 1;
+                        if let Some(observe) = on_expired {
+                            observe(&key.0, &meta);
+                        }
+                    }
+                    None => report.already_deleted += 1,
+                }
+            }
+        }
+        self.state.lock().await.receipts.retain(|_, per_recipient| {
+            per_recipient.retain(|_, (_, expires)| *expires > now_secs);
+            !per_recipient.is_empty()
+        });
+        self.state
+            .lock()
+            .await
+            .acknowledged
+            .retain(|_, until| *until > now_secs);
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl SessionStore for MemoryStore {
     async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
         state.sessions.insert(
@@ -1275,8 +1359,27 @@ impl MediatorStore for MemoryStore {
         Ok(RefreshRotation::Rotated)
     }
 
-    // ─── Accounts ───────────────────────────────────────────────────────────
+    async fn sweep_expired_sessions(
+        &self,
+        _now_secs: u64,
+    ) -> Result<SessionSweepReport, MediatorError> {
+        // Session TTLs are tracked as `Instant`s here, so the wall-clock
+        // `now_secs` argument is ignored in favour of `Instant::now()`,
+        // exactly matching the lazy-expiry check in `get_session_record`.
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let before = state.sessions.len();
+        state.sessions.retain(|_, record| record.expires_at > now);
+        let expired = (before - state.sessions.len()) as u32;
+        Ok(SessionSweepReport {
+            scanned: before as u32,
+            expired,
+        })
+    }
+}
 
+#[async_trait]
+impl AccountStore for MemoryStore {
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         Ok(self.state.lock().await.account(did_hash).is_some())
     }
@@ -1395,165 +1498,6 @@ impl MediatorStore for MemoryStore {
         Ok(true)
     }
 
-    // ─── DIDComm v1 routing keys ─────────────────────────────────────────────
-
-    // ─── DID multiplexing ────────────────────────────────────────────────────
-
-    fn supports_mux(&self) -> bool {
-        true
-    }
-
-    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
-        Ok(self.state.lock().await.mux_records.get(did_hash).cloned())
-    }
-
-    async fn mux_record_cas(
-        &self,
-        did_hash: &str,
-        expected_version: Option<u64>,
-        new: Option<&MuxDidRecord>,
-        index: &MuxIndexDelta,
-    ) -> Result<bool, MediatorError> {
-        let mut state = self.state.lock().await;
-        if state.mux_records.get(did_hash).map(|r| r.version) != expected_version {
-            return Ok(false);
-        }
-        match new {
-            Some(rec) => {
-                state.mux_records.insert(did_hash.to_string(), rec.clone());
-            }
-            None => {
-                state.mux_records.remove(did_hash);
-            }
-        }
-        for p in &index.add {
-            state
-                .mux_principals
-                .entry(p.clone())
-                .or_default()
-                .insert(did_hash.to_string());
-        }
-        for p in &index.remove {
-            if let Some(set) = state.mux_principals.get_mut(p) {
-                set.remove(did_hash);
-                if set.is_empty() {
-                    state.mux_principals.remove(p);
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    async fn mux_principal_dids(
-        &self,
-        principal_hash: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<String>, MediatorError> {
-        let state = self.state.lock().await;
-        let Some(set) = state.mux_principals.get(principal_hash) else {
-            return Ok(Vec::new());
-        };
-        Ok(match after {
-            Some(a) => set
-                .range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
-                .take(limit)
-                .cloned()
-                .collect(),
-            None => set.iter().take(limit).cloned().collect(),
-        })
-    }
-
-    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .mux_principals
-            .get(principal_hash)
-            .map_or(0, BTreeSet::len))
-    }
-
-    fn supports_v1_routing_keys(&self) -> bool {
-        true
-    }
-
-    async fn v1_routing_key_bind(&self, verkey: &str, did: &str) -> Result<(), MediatorError> {
-        let mut state = self.state.lock().await;
-        match state.v1_routing_keys.get(verkey) {
-            // Idempotent re-bind by the same owner.
-            Some((owner, _)) if owner == did => Ok(()),
-            // Claiming another account's routing key would capture its inbound
-            // v1 traffic; see the trait's security note.
-            Some(_) => Err(MediatorError::ConfigError(
-                error_codes::CONFIG_ERROR,
-                "NA".into(),
-                "routing verkey is already bound to a different account".into(),
-            )),
-            None => {
-                state.v1_routing_keys.insert(
-                    verkey.to_string(),
-                    (
-                        did.to_string(),
-                        affinidi_messaging_mediator_common::did_identity::did_hash(did),
-                    ),
-                );
-                Ok(())
-            }
-        }
-    }
-
-    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .v1_routing_keys
-            .get(verkey)
-            .map(|(did, _)| did.clone()))
-    }
-
-    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .v1_routing_keys
-            .remove(verkey)
-            .is_some())
-    }
-
-    async fn v1_routing_key_unbind_if_owner(
-        &self,
-        verkey: &str,
-        did: &str,
-    ) -> Result<bool, MediatorError> {
-        let mut state = self.state.lock().await;
-        if state
-            .v1_routing_keys
-            .get(verkey)
-            .is_some_and(|(owner, _)| owner == did)
-        {
-            state.v1_routing_keys.remove(verkey);
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
-        let state = self.state.lock().await;
-        let mut keys: Vec<String> = state
-            .v1_routing_keys
-            .iter()
-            .filter(|(_, (_, owner_hash))| owner_hash == did_hash)
-            .map(|(verkey, _)| verkey.clone())
-            .collect();
-        // HashMap order is not stable; sort so callers (and tests) see a
-        // deterministic list.
-        keys.sort();
-        Ok(keys)
-    }
-
     async fn account_list(
         &self,
         cursor: u32,
@@ -1629,8 +1573,97 @@ impl MediatorStore for MemoryStore {
         Ok(())
     }
 
-    // ─── ACLs ───────────────────────────────────────────────────────────────
+    async fn setup_admin_account(
+        &self,
+        admin_did_hash: &str,
+        admin_type: AccountType,
+        acls: &MediatorACLSet,
+    ) -> Result<(), MediatorError> {
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
+        let mut state = self.state.lock().await;
+        if let Some(record) = state.accounts.get_mut(admin_did_hash) {
+            record.role = admin_type;
+        }
+        state.admins.insert(admin_did_hash.to_string());
+        Ok(())
+    }
 
+    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        let state = self.state.lock().await;
+        if !state.admins.contains(did_hash) {
+            return Ok(false);
+        }
+        let role = state.accounts.get(did_hash).map(|r| r.role);
+        Ok(matches!(
+            role,
+            Some(AccountType::Admin) | Some(AccountType::RootAdmin)
+        ))
+    }
+
+    async fn account_activity_record(
+        &self,
+        did_hash: &str,
+        kind: ActivityKind,
+        at: u64,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.account(did_hash).is_none() {
+            return Ok(());
+        }
+        let activity = state.activity.entry(did_hash.to_string()).or_default();
+        match kind {
+            ActivityKind::Received => activity.last_received = Some(at),
+            ActivityKind::Authenticated => activity.last_authenticated = Some(at),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn account_activity(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountActivity>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(did_hashes
+            .iter()
+            .map(|h| state.activity.get(h).copied().unwrap_or_default())
+            .collect())
+    }
+
+    async fn account_stats_bump(
+        &self,
+        did_hash: &str,
+        delta: AccountStatsDelta,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.account(did_hash).is_none() {
+            return Ok(());
+        }
+        state
+            .stats
+            .entry(did_hash.to_string())
+            .or_default()
+            .apply(delta);
+        Ok(())
+    }
+
+    async fn account_stats(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountStats>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(did_hashes
+            .iter()
+            .map(|h| state.stats.get(h).copied().unwrap_or_default())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl AclStore for MemoryStore {
     async fn set_did_acl(
         &self,
         did_hash: &str,
@@ -1801,176 +1834,10 @@ impl MediatorStore for MemoryStore {
         };
         Ok(MediatorAccessListGetResponse { did_hashes })
     }
+}
 
-    // ─── Admin accounts ─────────────────────────────────────────────────────
-
-    async fn setup_admin_account(
-        &self,
-        admin_did_hash: &str,
-        admin_type: AccountType,
-        acls: &MediatorACLSet,
-    ) -> Result<(), MediatorError> {
-        // Unconditional: a no-op for an existing account, and it completes a
-        // record that holds only queue counters, so the role below is never
-        // set on a record without ACLs.
-        self.account_create(admin_did_hash, acls, None).await?;
-        let mut state = self.state.lock().await;
-        if let Some(record) = state.accounts.get_mut(admin_did_hash) {
-            record.role = admin_type;
-        }
-        state.admins.insert(admin_did_hash.to_string());
-        Ok(())
-    }
-
-    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
-        let state = self.state.lock().await;
-        if !state.admins.contains(did_hash) {
-            return Ok(false);
-        }
-        let role = state.accounts.get(did_hash).map(|r| r.role);
-        Ok(matches!(
-            role,
-            Some(AccountType::Admin) | Some(AccountType::RootAdmin)
-        ))
-    }
-
-    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
-        let mut state = self.state.lock().await;
-        // Newest-first: push to the front, drop the oldest (back) past the cap.
-        state.audit_log.push_front(entry.clone());
-        while state.audit_log.len() > AUDIT_LOG_MAX_ENTRIES {
-            state.audit_log.pop_back();
-        }
-        Ok(())
-    }
-
-    async fn audit_log_list(
-        &self,
-        cursor: u32,
-        limit: u32,
-    ) -> Result<MediatorAuditLogList, MediatorError> {
-        let limit = limit.min(100) as usize;
-        let state = self.state.lock().await;
-        // Already newest-first; page by offset.
-        let entries: Vec<AuditLogEntry> = state
-            .audit_log
-            .iter()
-            .skip(cursor as usize)
-            .take(limit)
-            .cloned()
-            .collect();
-        let next_cursor = if cursor as usize + entries.len() >= state.audit_log.len() {
-            0
-        } else {
-            cursor + entries.len() as u32
-        };
-        Ok(MediatorAuditLogList {
-            entries,
-            cursor: next_cursor,
-        })
-    }
-
-    // ─── OOB Discovery invitations ──────────────────────────────────────────
-
-    async fn trust_task_claim(
-        &self,
-        key: &str,
-        digest: &str,
-        retain_until: u64,
-        now: u64,
-    ) -> Result<TrustTaskClaim, MediatorError> {
-        let mut state = self.state.lock().await;
-        match state.trust_task_claims.get(key) {
-            Some((recorded, until)) if *until > now => Ok(if recorded == digest {
-                TrustTaskClaim::Duplicate
-            } else {
-                TrustTaskClaim::Conflict
-            }),
-            // Absent, or lapsed: this is a first sight.
-            _ => {
-                state
-                    .trust_task_claims
-                    .insert(key.to_string(), (digest.to_string(), retain_until));
-                Ok(TrustTaskClaim::Fresh)
-            }
-        }
-    }
-
-    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError> {
-        let mut state = self.state.lock().await;
-        let before = state.trust_task_claims.len();
-        state.trust_task_claims.retain(|_, (_, until)| *until > now);
-        Ok(before - state.trust_task_claims.len())
-    }
-
-    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
-        let mut state = self.state.lock().await;
-        state
-            .scid_sources
-            .insert(did_hash.to_string(), record.to_string());
-        Ok(())
-    }
-
-    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .scid_sources
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn oob_discovery_store(
-        &self,
-        did_hash: &str,
-        invite_b64: &str,
-        expires_at: u64,
-    ) -> Result<String, MediatorError> {
-        let invite_hash = digest(invite_b64);
-        let mut state = self.state.lock().await;
-        state.oob_invites.insert(
-            invite_hash.clone(),
-            OobInvite {
-                invite_b64: invite_b64.to_string(),
-                did_hash: did_hash.to_string(),
-                expires_at,
-            },
-        );
-        state.incr_counter("OOB_INVITES_CREATED", 1);
-        Ok(invite_hash)
-    }
-
-    async fn oob_discovery_get(
-        &self,
-        oob_id: &str,
-    ) -> Result<Option<(String, String)>, MediatorError> {
-        let now = unix_timestamp_secs();
-        let mut state = self.state.lock().await;
-        let invite = match state.oob_invites.get(oob_id) {
-            Some(i) if i.expires_at == 0 || i.expires_at > now => {
-                Some((i.invite_b64.clone(), i.did_hash.clone()))
-            }
-            Some(_) => {
-                // Expired — remove and return None.
-                state.oob_invites.remove(oob_id);
-                None
-            }
-            None => None,
-        };
-        if invite.is_some() {
-            state.incr_counter("OOB_INVITES_CLAIMED", 1);
-        }
-        Ok(invite)
-    }
-
-    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
-        Ok(self.state.lock().await.oob_invites.remove(oob_id).is_some())
-    }
-
-    // ─── Stats / counters ───────────────────────────────────────────────────
-
+#[async_trait]
+impl StatsStore for MemoryStore {
     async fn get_global_stats(&self) -> Result<MetadataStats, MediatorError> {
         let state = self.state.lock().await;
         let read = |key: &str| state.counters.get(key).copied().unwrap_or(0);
@@ -1997,9 +1864,10 @@ impl MediatorStore for MemoryStore {
             .incr_counter(counter_key(counter), by);
         Ok(())
     }
+}
 
-    // ─── Forwarding queue ───────────────────────────────────────────────────
-
+#[async_trait]
+impl ForwardQueueStore for MemoryStore {
     async fn forward_queue_enqueue(
         &self,
         entry: &ForwardQueueEntry,
@@ -2225,9 +2093,10 @@ impl MediatorStore for MemoryStore {
         }
         Ok(lost)
     }
+}
 
-    // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
-
+#[async_trait]
+impl StreamingStore for MemoryStore {
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
         let mut state = self.state.lock().await;
         state
@@ -2335,65 +2204,305 @@ impl MediatorStore for MemoryStore {
         channels.insert(mediator_uuid.to_string(), sender);
         Ok(receiver)
     }
+}
 
-    // ─── Message expiry processor ───────────────────────────────────────────
+#[async_trait]
+impl MuxStore for MemoryStore {
+    fn supports_mux(&self) -> bool {
+        true
+    }
 
-    async fn account_activity_record(
+    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
+        Ok(self.state.lock().await.mux_records.get(did_hash).cloned())
+    }
+
+    async fn mux_record_cas(
         &self,
         did_hash: &str,
-        kind: ActivityKind,
-        at: u64,
-    ) -> Result<(), MediatorError> {
+        expected_version: Option<u64>,
+        new: Option<&MuxDidRecord>,
+        index: &MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
         let mut state = self.state.lock().await;
-        if state.account(did_hash).is_none() {
-            return Ok(());
+        if state.mux_records.get(did_hash).map(|r| r.version) != expected_version {
+            return Ok(false);
         }
-        let activity = state.activity.entry(did_hash.to_string()).or_default();
-        match kind {
-            ActivityKind::Received => activity.last_received = Some(at),
-            ActivityKind::Authenticated => activity.last_authenticated = Some(at),
-            _ => {}
+        match new {
+            Some(rec) => {
+                state.mux_records.insert(did_hash.to_string(), rec.clone());
+            }
+            None => {
+                state.mux_records.remove(did_hash);
+            }
+        }
+        for p in &index.add {
+            state
+                .mux_principals
+                .entry(p.clone())
+                .or_default()
+                .insert(did_hash.to_string());
+        }
+        for p in &index.remove {
+            if let Some(set) = state.mux_principals.get_mut(p) {
+                set.remove(did_hash);
+                if set.is_empty() {
+                    state.mux_principals.remove(p);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let state = self.state.lock().await;
+        let Some(set) = state.mux_principals.get(principal_hash) else {
+            return Ok(Vec::new());
+        };
+        Ok(match after {
+            Some(a) => set
+                .range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
+                .take(limit)
+                .cloned()
+                .collect(),
+            None => set.iter().take(limit).cloned().collect(),
+        })
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .mux_principals
+            .get(principal_hash)
+            .map_or(0, BTreeSet::len))
+    }
+}
+
+#[async_trait]
+impl V1RoutingKeyStore for MemoryStore {
+    fn supports_v1_routing_keys(&self) -> bool {
+        true
+    }
+
+    async fn v1_routing_key_bind(&self, verkey: &str, did: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        match state.v1_routing_keys.get(verkey) {
+            // Idempotent re-bind by the same owner.
+            Some((owner, _)) if owner == did => Ok(()),
+            // Claiming another account's routing key would capture its inbound
+            // v1 traffic; see the trait's security note.
+            Some(_) => Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "routing verkey is already bound to a different account".into(),
+            )),
+            None => {
+                state.v1_routing_keys.insert(
+                    verkey.to_string(),
+                    (
+                        did.to_string(),
+                        affinidi_messaging_mediator_common::did_identity::did_hash(did),
+                    ),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .v1_routing_keys
+            .get(verkey)
+            .map(|(did, _)| did.clone()))
+    }
+
+    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .v1_routing_keys
+            .remove(verkey)
+            .is_some())
+    }
+
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        if state
+            .v1_routing_keys
+            .get(verkey)
+            .is_some_and(|(owner, _)| owner == did)
+        {
+            state.v1_routing_keys.remove(verkey);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        let state = self.state.lock().await;
+        let mut keys: Vec<String> = state
+            .v1_routing_keys
+            .iter()
+            .filter(|(_, (_, owner_hash))| owner_hash == did_hash)
+            .map(|(verkey, _)| verkey.clone())
+            .collect();
+        // HashMap order is not stable; sort so callers (and tests) see a
+        // deterministic list.
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+#[async_trait]
+impl AuditStore for MemoryStore {
+    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        // Newest-first: push to the front, drop the oldest (back) past the cap.
+        state.audit_log.push_front(entry.clone());
+        while state.audit_log.len() > AUDIT_LOG_MAX_ENTRIES {
+            state.audit_log.pop_back();
         }
         Ok(())
     }
 
-    async fn account_activity(
+    async fn audit_log_list(
         &self,
-        did_hashes: &[String],
-    ) -> Result<Vec<AccountActivity>, MediatorError> {
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAuditLogList, MediatorError> {
+        let limit = limit.min(100) as usize;
         let state = self.state.lock().await;
-        Ok(did_hashes
+        // Already newest-first; page by offset.
+        let entries: Vec<AuditLogEntry> = state
+            .audit_log
             .iter()
-            .map(|h| state.activity.get(h).copied().unwrap_or_default())
-            .collect())
+            .skip(cursor as usize)
+            .take(limit)
+            .cloned()
+            .collect();
+        let next_cursor = if cursor as usize + entries.len() >= state.audit_log.len() {
+            0
+        } else {
+            cursor + entries.len() as u32
+        };
+        Ok(MediatorAuditLogList {
+            entries,
+            cursor: next_cursor,
+        })
+    }
+}
+
+#[async_trait]
+impl AuxiliaryStore for MemoryStore {
+    async fn trust_task_claim(
+        &self,
+        key: &str,
+        digest: &str,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<TrustTaskClaim, MediatorError> {
+        let mut state = self.state.lock().await;
+        match state.trust_task_claims.get(key) {
+            Some((recorded, until)) if *until > now => Ok(if recorded == digest {
+                TrustTaskClaim::Duplicate
+            } else {
+                TrustTaskClaim::Conflict
+            }),
+            // Absent, or lapsed: this is a first sight.
+            _ => {
+                state
+                    .trust_task_claims
+                    .insert(key.to_string(), (digest.to_string(), retain_until));
+                Ok(TrustTaskClaim::Fresh)
+            }
+        }
     }
 
-    async fn account_stats_bump(
-        &self,
-        did_hash: &str,
-        delta: AccountStatsDelta,
-    ) -> Result<(), MediatorError> {
+    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError> {
         let mut state = self.state.lock().await;
-        if state.account(did_hash).is_none() {
-            return Ok(());
-        }
+        let before = state.trust_task_claims.len();
+        state.trust_task_claims.retain(|_, (_, until)| *until > now);
+        Ok(before - state.trust_task_claims.len())
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
         state
-            .stats
-            .entry(did_hash.to_string())
-            .or_default()
-            .apply(delta);
+            .scid_sources
+            .insert(did_hash.to_string(), record.to_string());
         Ok(())
     }
 
-    async fn account_stats(
-        &self,
-        did_hashes: &[String],
-    ) -> Result<Vec<AccountStats>, MediatorError> {
-        let state = self.state.lock().await;
-        Ok(did_hashes
-            .iter()
-            .map(|h| state.stats.get(h).copied().unwrap_or_default())
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .scid_sources
+            .values()
+            .cloned()
             .collect())
+    }
+
+    async fn oob_discovery_store(
+        &self,
+        did_hash: &str,
+        invite_b64: &str,
+        expires_at: u64,
+    ) -> Result<String, MediatorError> {
+        let invite_hash = digest(invite_b64);
+        let mut state = self.state.lock().await;
+        state.oob_invites.insert(
+            invite_hash.clone(),
+            OobInvite {
+                invite_b64: invite_b64.to_string(),
+                did_hash: did_hash.to_string(),
+                expires_at,
+            },
+        );
+        state.incr_counter("OOB_INVITES_CREATED", 1);
+        Ok(invite_hash)
+    }
+
+    async fn oob_discovery_get(
+        &self,
+        oob_id: &str,
+    ) -> Result<Option<(String, String)>, MediatorError> {
+        let now = unix_timestamp_secs();
+        let mut state = self.state.lock().await;
+        let invite = match state.oob_invites.get(oob_id) {
+            Some(i) if i.expires_at == 0 || i.expires_at > now => {
+                Some((i.invite_b64.clone(), i.did_hash.clone()))
+            }
+            Some(_) => {
+                // Expired — remove and return None.
+                state.oob_invites.remove(oob_id);
+                None
+            }
+            None => None,
+        };
+        if invite.is_some() {
+            state.incr_counter("OOB_INVITES_CLAIMED", 1);
+        }
+        Ok(invite)
+    }
+
+    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
+        Ok(self.state.lock().await.oob_invites.remove(oob_id).is_some())
     }
 
     async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError> {
@@ -2403,110 +2512,6 @@ impl MediatorStore for MemoryStore {
     async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError> {
         self.state.lock().await.config_overrides = Some(overrides.to_string());
         Ok(())
-    }
-
-    async fn sweep_expired_messages(
-        &self,
-        now_secs: u64,
-        admin_did_hash: &str,
-    ) -> Result<ExpiryReport, MediatorError> {
-        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
-            .await
-    }
-
-    async fn sweep_expired_messages_observed(
-        &self,
-        now_secs: u64,
-        admin_did_hash: &str,
-        on_expired: Option<OnExpired<'_>>,
-    ) -> Result<ExpiryReport, MediatorError> {
-        // Snapshot due timeslot keys + their records under the lock, then
-        // remove each record that is still due, under the lock.
-        let due: Vec<(u64, Vec<RecordKey>)> = {
-            let state = self.state.lock().await;
-            state
-                .expiry
-                .range(..=now_secs)
-                .map(|(ts, keys)| (*ts, keys.iter().cloned().collect()))
-                .collect()
-        };
-
-        let by = DeletionAuthority::Admin {
-            admin_did_hash: admin_did_hash.to_string(),
-        };
-        let mut report = ExpiryReport {
-            timeslots_swept: due.len() as u32,
-            ..Default::default()
-        };
-        for (ts, keys) in due {
-            for key in keys {
-                // Only an entry at or after the record's current expiry
-                // removes it. One left by a deadline the record no longer has
-                // (an earlier copy of the same bytes for the same recipient,
-                // or the original deadline of a delivered message) is dropped
-                // and the record kept.
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    let meta = state
-                        .messages
-                        .get(&key)
-                        .filter(|record| ops::expiry_entry_is_due(record.expires_at, ts))
-                        .map(|record| MessageMetaData {
-                            bytes: record.bytes,
-                            to_did_hash: record.to_did_hash.clone(),
-                            from_did_hash: record.from_did_hash.clone(),
-                            timestamp: record.timestamp_ms,
-                        });
-                    if meta.is_some() {
-                        state.remove_record(&key, &by);
-                    }
-                    if let Some(set) = state.expiry.get_mut(&ts) {
-                        set.remove(&key);
-                        if set.is_empty() {
-                            state.expiry.remove(&ts);
-                        }
-                    }
-                    meta
-                };
-                match removed {
-                    Some(meta) => {
-                        report.expired += 1;
-                        if let Some(observe) = on_expired {
-                            observe(&key.0, &meta);
-                        }
-                    }
-                    None => report.already_deleted += 1,
-                }
-            }
-        }
-        self.state.lock().await.receipts.retain(|_, per_recipient| {
-            per_recipient.retain(|_, (_, expires)| *expires > now_secs);
-            !per_recipient.is_empty()
-        });
-        self.state
-            .lock()
-            .await
-            .acknowledged
-            .retain(|_, until| *until > now_secs);
-        Ok(report)
-    }
-
-    async fn sweep_expired_sessions(
-        &self,
-        _now_secs: u64,
-    ) -> Result<SessionSweepReport, MediatorError> {
-        // Session TTLs are tracked as `Instant`s here, so the wall-clock
-        // `now_secs` argument is ignored in favour of `Instant::now()`,
-        // exactly matching the lazy-expiry check in `get_session_record`.
-        let now = Instant::now();
-        let mut state = self.state.lock().await;
-        let before = state.sessions.len();
-        state.sessions.retain(|_, record| record.expires_at > now);
-        let expired = (before - state.sessions.len()) as u32;
-        Ok(SessionSweepReport {
-            scanned: before as u32,
-            expired,
-        })
     }
 }
 

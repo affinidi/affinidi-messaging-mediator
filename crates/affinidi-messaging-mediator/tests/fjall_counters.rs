@@ -14,7 +14,7 @@
 
 use affinidi_messaging_mediator::store::FjallStore;
 use affinidi_messaging_mediator_common::{
-    store::{MediatorStore, types::ForwardQueueEntry},
+    store::{prelude::*, types::ForwardQueueEntry},
     types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditAction, AuditLogEntry},
 };
 use std::sync::Arc;

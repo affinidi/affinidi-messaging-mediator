@@ -31,6 +31,7 @@ use affinidi_messaging_didcomm_v1::message::MessageV1;
 use affinidi_messaging_didcomm_v1::protocols::coordinate_mediation as cm;
 use affinidi_messaging_didcomm_v1::protocols::message_pickup as mp;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use affinidi_messaging_mediator_common::store::types::{DeletionAuthority, MessageScope};
 use affinidi_messaging_mediator_common::types::messages::{FetchDeletePolicy, FetchOptions};
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};

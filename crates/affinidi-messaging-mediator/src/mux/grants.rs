@@ -10,8 +10,8 @@
 use affinidi_messaging_mediator_common::{
     did_identity::did_hash,
     store::{
-        MediatorStore,
         mux::{self, MuxCapability, MuxGrant, MuxLimits, MuxScope, MuxStoreError},
+        prelude::*,
     },
     types::acls::MediatorACLSet,
 };

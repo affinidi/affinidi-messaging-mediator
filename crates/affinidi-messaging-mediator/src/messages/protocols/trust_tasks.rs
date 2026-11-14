@@ -35,6 +35,7 @@ use crate::task_specs::{audit, config};
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::redact::redact_url;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use affinidi_messaging_mediator_common::types::accounts::{Account, AccountType};
 use affinidi_messaging_mediator_common::types::acls::{
     ACLError, AccessListModeType, MediatorACLSet,

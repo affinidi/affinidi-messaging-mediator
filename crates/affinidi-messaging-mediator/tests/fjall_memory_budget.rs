@@ -25,7 +25,7 @@
 #![cfg(all(feature = "fjall-backend", feature = "didcomm"))]
 
 use affinidi_messaging_mediator::store::FjallStore;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use std::sync::Arc;
 
 /// Resident set size of this process, in bytes.

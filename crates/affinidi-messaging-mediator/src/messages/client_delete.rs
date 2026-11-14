@@ -36,7 +36,7 @@
 use affinidi_messaging_mediator_common::store::MessageRef;
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
-    store::{DeletionAuthority, MediatorStore, MessageScope, RemovedCopy, ops},
+    store::{DeletionAuthority, MessageScope, RemovedCopy, ops, prelude::*},
 };
 
 /// What a client's delete removed, and as which owner.

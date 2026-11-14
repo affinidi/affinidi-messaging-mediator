@@ -10,6 +10,7 @@
 use crate::common;
 
 use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use affinidi_messaging_mediator_common::store::types::Session;
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_test_mediator::{

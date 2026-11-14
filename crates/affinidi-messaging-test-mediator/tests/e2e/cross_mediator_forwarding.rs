@@ -27,6 +27,7 @@ use crate::common::now as unix_secs;
 use std::time::Duration;
 
 use affinidi_messaging_didcomm::Message;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use affinidi_messaging_test_mediator::{
     MediatorACLSet, RelayMode, TestEnvironment, TestMediator, TestUser, acl,
 };

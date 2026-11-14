@@ -61,7 +61,7 @@ use std::sync::Arc;
 
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
-    store::{MediatorStore, MessageRef},
+    store::{MessageRef, prelude::*},
     types::{
         accounts::{AccountType, MediatorAccountList},
         clock::Clock,

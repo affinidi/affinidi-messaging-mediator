@@ -30,7 +30,7 @@
 
 use crate::error_codes;
 use crate::errors::MediatorError;
-use crate::store::{MediatorStore, types::ForwardQueueEntry};
+use crate::store::{prelude::*, types::ForwardQueueEntry};
 use crate::tasks::forwarding::config::ForwardingConfig;
 use crate::tasks::forwarding::observer::{ForwardOutcome, ForwardTransport, ForwardingObserver};
 use crate::tasks::forwarding::packer::SystemMessagePacker;

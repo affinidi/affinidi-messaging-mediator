@@ -46,9 +46,7 @@ use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::store::types::{
     ForwardQueueEntry, MessageMetaData, Session, SessionState, StreamingClientState,
 };
-use affinidi_messaging_mediator_common::store::{
-    MediatorStore, RefreshRotation, TrustTaskClaim, mux,
-};
+use affinidi_messaging_mediator_common::store::{RefreshRotation, TrustTaskClaim, mux, prelude::*};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountStatsDelta, ActivityKind, StatsDirection, StatsWire,
 };
@@ -4874,10 +4872,15 @@ async fn check_redis_malformed_forward_entries_are_dropped(
 
     // Read: dropped at once.
     let read_bad = xadd(&mut conn).await;
-    let read =
-        MediatorStore::forward_queue_read(store, &group, "reader", 10, Duration::from_millis(50))
-            .await
-            .expect("forward_queue_read");
+    let read = ForwardQueueStore::forward_queue_read(
+        store,
+        &group,
+        "reader",
+        10,
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("forward_queue_read");
     assert!(read.is_empty());
     assert!(!exists(&mut conn, read_bad).await, "dropped by the read");
 
@@ -4896,10 +4899,16 @@ async fn check_redis_malformed_forward_entries_are_dropped(
         .query_async::<::redis::Value>(&mut conn)
         .await
         .expect("XREADGROUP");
-    let page =
-        MediatorStore::forward_queue_autoclaim(store, &group, "sweeper", Duration::ZERO, 10, "0-0")
-            .await
-            .expect("forward_queue_autoclaim");
+    let page = ForwardQueueStore::forward_queue_autoclaim(
+        store,
+        &group,
+        "sweeper",
+        Duration::ZERO,
+        10,
+        "0-0",
+    )
+    .await
+    .expect("forward_queue_autoclaim");
     assert!(page.entries.is_empty());
     assert!(!exists(&mut conn, swept_bad).await, "dropped by the sweep");
 

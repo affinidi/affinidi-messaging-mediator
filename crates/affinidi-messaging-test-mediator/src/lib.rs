@@ -140,8 +140,10 @@ use affinidi_messaging_mediator::{
     store::MemoryStore,
 };
 use affinidi_messaging_mediator_common::{
-    MediatorSecrets, errors::MediatorError, secrets::backends::MemoryStore as SecretsMemoryStore,
-    store::MediatorStore,
+    MediatorSecrets,
+    errors::MediatorError,
+    secrets::backends::MemoryStore as SecretsMemoryStore,
+    store::{MediatorStore, MediatorStoreExt},
 };
 // Re-exported so tests can pick the Trust Task acceptance mode.
 pub use affinidi_messaging_mediator::common::config::{CorsOriginPolicy, TrustTaskVerification};

@@ -25,7 +25,7 @@
 use crate::error_codes;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 #[cfg(feature = "didcomm")]
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 use subtle::ConstantTimeEq;
 use tracing::debug;

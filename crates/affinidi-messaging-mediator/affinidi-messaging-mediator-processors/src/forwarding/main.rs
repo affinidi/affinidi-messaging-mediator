@@ -30,7 +30,7 @@
 use affinidi_messaging_mediator_common::{
     database::DatabaseHandler,
     errors::ProcessorError,
-    store::{MediatorStore, redis::RedisStore},
+    store::{prelude::*, redis::RedisStore},
     tasks::forwarding::ForwardingProcessor,
 };
 use clap::Parser;

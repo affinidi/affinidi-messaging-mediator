@@ -87,7 +87,7 @@ pub fn encode_oob_invite(invite: &Message) -> Result<String, MediatorError> {
 // such as the coverage job (#351).
 #[cfg(all(test, any(feature = "fjall-backend", feature = "memory-backend")))]
 pub(crate) mod auth_flow_harness {
-    use affinidi_messaging_mediator_common::store::{MediatorStore, Session, SessionState};
+    use affinidi_messaging_mediator_common::store::{Session, SessionState, prelude::*};
 
     /// Drive `create_session` → `update_session_authenticated` →
     /// `get_session(new, did)` → refresh-hash rotation → `delete_session`,
@@ -187,7 +187,7 @@ pub(crate) mod auth_flow_harness {
 /// account.
 #[cfg(all(test, any(feature = "fjall-backend", feature = "memory-backend")))]
 pub(crate) mod activity_harness {
-    use affinidi_messaging_mediator_common::store::{MediatorStore, Session};
+    use affinidi_messaging_mediator_common::store::{Session, prelude::*};
     use affinidi_messaging_mediator_common::types::accounts::{
         AccountActivity, AccountStats, AccountStatsDelta, ActivityKind, StatsDirection, StatsWire,
     };

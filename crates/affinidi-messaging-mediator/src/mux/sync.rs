@@ -31,8 +31,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use affinidi_messaging_mediator_common::store::{
-    MediatorStore,
     mux::{self, MemberHint, MuxChange, MuxChangeRecord, MuxGrantState, MuxLimits},
+    prelude::*,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::{debug, info, warn};

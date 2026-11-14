@@ -25,7 +25,7 @@ use crate::common;
 use std::{sync::Arc, time::Duration};
 
 use affinidi_messaging_mediator::store::MemoryStore;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use affinidi_messaging_sdk::messages::fetch::FetchOptions;
 use affinidi_messaging_test_mediator::{
     AccessListModeType, TestEnvironment, TestMediator, TestMediatorHandle, acl,

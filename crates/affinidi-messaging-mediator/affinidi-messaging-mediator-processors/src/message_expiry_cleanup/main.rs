@@ -26,7 +26,7 @@
 use affinidi_messaging_mediator_common::{
     database::DatabaseHandler,
     errors::ProcessorError,
-    store::{MediatorStore, redis::RedisStore},
+    store::{prelude::*, redis::RedisStore},
     time::unix_timestamp_secs,
 };
 use clap::Parser;

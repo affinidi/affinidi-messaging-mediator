@@ -300,7 +300,7 @@ pub async fn serve_internal(
     // tasks (statistics, expiry sweep, forwarding processor, websocket
     // streaming) all consume `Arc<dyn MediatorStore>`, so they run
     // unchanged regardless of which backend is in use.
-    use affinidi_messaging_mediator_common::store::MediatorStore;
+    use affinidi_messaging_mediator_common::store::prelude::*;
     // Outcome of the stored-function integrity check, published to `/readyz`
     // once the supervisor that owns the health registry exists. `None` on any
     // build or backend where there are no stored functions to check.

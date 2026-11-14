@@ -43,8 +43,9 @@ use crate::tasks::supervisor::TaskSupervisor;
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
     store::{
-        MediatorStore, StreamingClaim, StreamingKind, StreamingWrite,
+        StreamingClaim, StreamingKind, StreamingWrite,
         mux::{MuxChangeRecord, StreamingHandoff},
+        prelude::*,
         types::PubSubRecord,
     },
     types::messages::FetchOptions,

@@ -605,7 +605,7 @@ mod tests {
     use crate::store::MemoryStore;
     use crate::task_specs::messaging::mux as spec;
     use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-    use affinidi_messaging_mediator_common::store::{MediatorStore, mux::MuxLimits};
+    use affinidi_messaging_mediator_common::store::{mux::MuxLimits, prelude::*};
     use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
     use affinidi_secrets_resolver::secrets::Secret;
     use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};

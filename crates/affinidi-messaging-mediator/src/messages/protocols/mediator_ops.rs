@@ -14,6 +14,7 @@
 #![allow(deprecated)]
 
 use crate::error_codes;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 

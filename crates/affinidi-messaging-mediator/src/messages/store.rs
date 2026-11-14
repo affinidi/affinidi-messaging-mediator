@@ -6,7 +6,7 @@ use crate::messages::MessageHandler;
 #[cfg(feature = "didcomm")]
 use crate::messages::PackOptions;
 use affinidi_messaging_mediator_common::errors::MediatorError;
-use affinidi_messaging_mediator_common::store::{MediatorStore, StoredMessageRef};
+use affinidi_messaging_mediator_common::store::{StoredMessageRef, prelude::*};
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::messages::compat::PackEncryptedMetadata;
 use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
