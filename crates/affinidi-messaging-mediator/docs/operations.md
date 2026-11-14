@@ -212,6 +212,13 @@ fixed buckets, so it aggregates across instances.
 
 See [multiplexing.md](multiplexing.md) for the protocol itself.
 
+### Wake
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `wake_requests_total` | counter | `outcome` | `messaging/wake/request` outcomes: `rung`; `armed` (its messages were not stored yet), then `arm_expired` or a later outcome; `no_account`, `no_handle`, `gateway_refused`; `not_queued`, `delivered`, `stale`, `foreign_sender`, `blocked`, `online`, `already_rung`; `rate_limited`, `coalesced`, `addressee_limited`, `requester_rate_limited`; `disabled`, `arm_full`, `ring_failed`, `error`. Aggregate only: the requester is answered `{}` whatever happened, so this is the only place the outcome shows. |
+| `wake_rings_total` | counter | `outcome` | `push/wake` rings sent to push gateways and their answers: `sent`, `send_failed`, then `answered`, `token_unregistered` (the handle was dropped) or `not_allowed` (this mediator is not on the handle's allowlist; not rung again until the account sets a handle). |
+
 ### Storage, sessions and secrets
 
 | Metric | Type | Labels | Meaning |
@@ -293,6 +300,7 @@ values; the template's `Env:` lines list the rest.
 | `METRICS_ALLOW_CIDRS`, `METRICS_BEARER_TOKEN` | `/metrics` access. |
 | `STREAMING_ENABLED` | Live delivery over WebSocket. |
 | `LIMIT_MUX_ENABLED` | DID multiplexing. |
+| `PROCESSOR_WAKE_ENABLED` | Ringing an account's device on a sender's `messaging/wake/request` (`[processors.wake]`; on by default). `PROCESSOR_WAKE_PAIR_PER_MINUTE`, `PROCESSOR_WAKE_PAIR_PER_DAY`, `PROCESSOR_WAKE_ADDRESSEE_COALESCE_SECONDS` and `PROCESSOR_WAKE_ADDRESSEE_PER_HOUR` set its rate limits. |
 | `MEDIATOR_ALLOW_TEST_IDENTITY` | Lets a release build start with the sample identities committed to this repository. Test deployments only. |
 
 Limits can also be changed at runtime, without a restart, by a root admin
