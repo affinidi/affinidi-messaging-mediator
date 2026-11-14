@@ -39,7 +39,7 @@ pub use live::{
     MembershipEvent, MembershipFilter, MonitorEvent, MonitorFeed, MonitorFilter, MonitorUpdate,
     Unclaimed,
 };
-pub use purge::{PurgePlan, PurgeRequest};
+pub use purge::{PURGE_TRANSIT_MARGIN_SECS, PurgePlan, PurgeRequest};
 
 /// What a `messaging/mux/connections` page lists: see
 /// [`MediatorConsole::mux_connections`].

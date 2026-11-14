@@ -127,26 +127,43 @@ impl MediatorConsole {
         let atm = ATM::new(atm_config, Arc::new(tdk))
             .await
             .map_err(|e| ConsoleError::Connect(e.to_string()))?;
-        Self::connect_with(atm, identity).await
+        Self::connect_exclusive(atm, identity).await
     }
 
-    /// Connect as `identity` through an existing SDK instance.
+    /// Connect as `identity` through an SDK instance dedicated to the console.
     /// `identity`'s secrets are added to that instance's resolver.
     ///
     /// **The console takes every live message pushed to `identity`'s DID on
     /// that instance.** The SDK has no receive filtered by message type, so
     /// the console's reader pops each live message for the profile and keeps
-    /// only its own monitor batches; anything else is gone from the SDK's live
-    /// cache (the mediator keeps its stored copy until it is picked up and
-    /// deleted). Use this only when nothing else on `atm` reads live messages
-    /// for the same DID — or use
-    /// [`connect_with_unclaimed`](Self::connect_with_unclaimed), which hands
-    /// those messages on instead.
-    pub async fn connect_with(atm: ATM, identity: Identity) -> Result<Self> {
+    /// only its own monitor batches; anything else is dropped from the SDK's
+    /// live cache (the mediator keeps its stored copy until it is picked up
+    /// and deleted). Use this only when nothing else on `atm` reads live
+    /// messages for the same DID. An application that shares the instance and
+    /// the DID uses [`connect_with_unclaimed`](Self::connect_with_unclaimed),
+    /// which hands those messages on instead.
+    pub async fn connect_exclusive(atm: ATM, identity: Identity) -> Result<Self> {
         Self::connect_inner(atm, identity, None).await
     }
 
-    /// [`connect_with`](Self::connect_with), for an application that shares
+    /// Connect as `identity` through an existing SDK instance, taking every
+    /// live message for the DID on it.
+    ///
+    /// Deprecated because the name does not say that the console drops other
+    /// live messages for the DID. Choose explicitly:
+    /// [`connect_exclusive`](Self::connect_exclusive) for an instance
+    /// dedicated to the console (the same behaviour as this), or
+    /// [`connect_with_unclaimed`](Self::connect_with_unclaimed) for one shared
+    /// with the application's own live traffic.
+    #[deprecated(
+        since = "0.52.0",
+        note = "drops other live messages for the DID; use connect_exclusive for a dedicated SDK instance or connect_with_unclaimed for a shared one"
+    )]
+    pub async fn connect_with(atm: ATM, identity: Identity) -> Result<Self> {
+        Self::connect_exclusive(atm, identity).await
+    }
+
+    /// Connect as `identity` through an existing SDK instance, for an application that shares
     /// the SDK instance **and the DID** with its own live traffic: every
     /// pushed message that is not one of the console's monitor batches goes
     /// to `unclaimed`, with its unpack metadata, rather than being dropped.
@@ -604,12 +621,17 @@ impl MediatorConsole {
     /// that had not reached it by then): it removes only messages the
     /// preview could have counted. It can remove **fewer** than
     /// [`PurgePlan::matched`] — some may have been delivered or deleted
-    /// since, and the age is rounded up to whole seconds, which can leave out
-    /// what arrived in the second before the preview — but never a message
-    /// newer than the preview. `purged` in the answer says how many went.
+    /// since, and the age carries a safety margin
+    /// ([`PURGE_TRANSIT_MARGIN_SECS`](crate::PURGE_TRANSIT_MARGIN_SECS), the
+    /// time the request may take to execute) and is rounded up to whole
+    /// seconds, so what arrived in that window before the preview is left
+    /// out — but never a message newer than the preview, provided the
+    /// mediator runs the purge within the margin. `purged` in the answer says
+    /// how many went.
     ///
-    /// The mediator's purge has no "as of" member yet, so the pin is an age
-    /// the console computes; the mediator still decides what matches.
+    /// The SDK cannot send the purge task's `storedBefore` member yet, so the
+    /// pin is an age the console computes; the mediator still decides what
+    /// matches.
     pub async fn purge(&self, plan: PurgePlan) -> Result<queue::purge::v0_1::Response> {
         let request = pinned_to_preview(&plan, chrono::Utc::now());
         self.run_purge(&request, false).await

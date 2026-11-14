@@ -11,22 +11,27 @@
   `match` on it needs a wildcard arm.
 - `MediatorConsole::purge` no longer recounts and refuses with `PlanStale`. It
   sends the purge pinned to the preview's instant (`olderThanSeconds` = any
-  requested age plus the time since the preview, rounded up to whole seconds),
-  so it never removes a message that arrived after the preview. It can remove
-  **fewer** than `PurgePlan::matched`, when messages were delivered in
-  between; report `purged`, not `matched`. The old recount let a message that
+  requested age plus the time since the preview, rounded up to whole seconds,
+  plus `PURGE_TRANSIT_MARGIN_SECS` (30) for the request's transit and
+  queueing before the mediator runs it), so it never removes a message that
+  arrived after the preview. It can remove **fewer** than
+  `PurgePlan::matched`: messages delivered in between, and messages stored in
+  the margin before the preview, are left; report `purged`, not `matched`. The old recount let a message that
   arrived after the check be removed, and let a different set with the same
   count through. `ConsoleError::PlanStale` stays, but `purge` no longer
   returns it. A mediator-side "as of" member for `queue/purge` is a separate
   follow-up.
 
-### Added — `MediatorConsole::connect_with_unclaimed`
+### Added — `MediatorConsole::connect_with_unclaimed` and `connect_exclusive`; `connect_with` deprecated
 
 - The SDK has no receive filtered by message type, so the console's live
   reader takes every message pushed to its DID on its SDK instance, keeping
-  only monitor batches. `connect_with` is unchanged but now documents that
-  hazard. An application sharing its SDK instance and DID with the console
-  uses `connect_with_unclaimed(atm, identity, tx)` instead. Every other
+  only monitor batches. `connect_with` hid that in its name, so it is
+  deprecated; it still behaves as before. Choose explicitly instead:
+  `connect_exclusive(atm, identity)` for an SDK instance dedicated to the
+  console (what `connect_with` did), or
+  `connect_with_unclaimed(atm, identity, tx)` for an application sharing its
+  SDK instance and DID with the console. Every other
   message then goes to `tx`, with its unpack metadata. The console never
   deletes such a message at the mediator. If `tx` is full, the message is left
   stored for a later pickup.

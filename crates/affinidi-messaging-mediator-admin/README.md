@@ -46,11 +46,13 @@ match console.mode() {
 }
 ```
 
-To share an existing SDK instance with your application, use
-`MediatorConsole::connect_with(atm, identity)` — but read
+To connect through an existing SDK instance, read
 [How the console reads its connection](#how-the-console-reads-its-connection)
-first: if your application also reads live messages for the same DID on that
-instance, use `connect_with_unclaimed` instead, or the console takes them.
+first, then choose: `MediatorConsole::connect_with_unclaimed(atm, identity, tx)`
+when your application also reads live messages for the same DID on that
+instance, or `MediatorConsole::connect_exclusive(atm, identity)` when the
+instance is dedicated to the console. (`connect_with` is deprecated: it is
+`connect_exclusive` under a name that hides that it takes those messages.)
 
 `console.connection_state()` is the connection's state as the SDK publishes
 it: `ConnState::Disconnected` on every drop, `Connected` on every reconnect.
@@ -220,8 +222,8 @@ mediator keeps its stored copy, but on that SDK instance the message is gone
 until a later pickup or reconnect redelivers it:
 
 - With `connect` (a private SDK instance) this doesn't matter.
-- With `connect_with`, nothing else on that instance may read live messages
-  for the same DID.
+- With `connect_exclusive` (and the deprecated `connect_with`), nothing else
+  on that instance may read live messages for the same DID.
 - With `connect_with_unclaimed(atm, identity, tx)`, every message that is not
   a monitor batch goes to `tx`, with its unpack metadata, for your
   application to handle and delete as usual. If `tx` is full, the message is

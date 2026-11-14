@@ -6,12 +6,24 @@
 //! count; [`MediatorConsole::purge`](crate::MediatorConsole::purge) carries it
 //! out, pinned to the preview's instant: it never removes a message that
 //! arrived after the preview. It may remove fewer than were counted (some may
-//! have been delivered meanwhile), and its answer says how many went.
+//! have been delivered meanwhile, and the pin keeps a safety margin), and its
+//! answer says how many went.
 
 use affinidi_messaging_sdk::tasks::messaging::queue::purge::v0_1::Queue;
 use chrono::{DateTime, Utc};
 
 use crate::console::Target;
+
+/// Seconds added to a confirming purge's age on top of the time since the
+/// preview, to cover the request's transit and queueing before the mediator
+/// runs it. The age is measured on the mediator's clock when it executes, so
+/// without a margin a purge that executes more than about a second after it
+/// was sent could match a message stored just after the preview. It is the
+/// console's request timeout: a purge still being waited for executes within
+/// it. The cost is that messages stored in this window before the preview are
+/// spared too. The exact fix is the purge task's `storedBefore` member, which
+/// the console will send once the SDK supports it.
+pub const PURGE_TRANSIT_MARGIN_SECS: u64 = 30;
 
 /// What to purge.
 #[derive(Clone, Debug)]
@@ -44,11 +56,16 @@ pub struct PurgePlan {
 /// A message matched the preview when it had been queued `older_than` (zero
 /// without one) by `previewed_at`. At `now` that same set is the messages
 /// queued `older_than + (now - previewed_at)`. The elapsed time is rounded up
-/// to whole seconds (the member's unit) and is at least one, so the cutoff
-/// never moves past the preview: the rounding can only leave a message out.
+/// to whole seconds (the member's unit) and is at least one, and
+/// [`PURGE_TRANSIT_MARGIN_SECS`] is added for the time the request takes to
+/// execute, so the cutoff never moves past the preview: the rounding and the
+/// margin can only leave a message out.
 pub(crate) fn pinned_to_preview(plan: &PurgePlan, now: DateTime<Utc>) -> PurgeRequest {
     let elapsed_ms = (now - plan.previewed_at).num_milliseconds().max(0) as u64;
-    let elapsed = elapsed_ms.div_ceil(1_000).max(1);
+    let elapsed = elapsed_ms
+        .div_ceil(1_000)
+        .max(1)
+        .saturating_add(PURGE_TRANSIT_MARGIN_SECS);
     PurgeRequest {
         older_than_seconds: Some(
             plan.request
@@ -82,17 +99,35 @@ mod tests {
     fn the_purge_reaches_back_no_later_than_the_preview() {
         let at = Utc::now();
         let ms = chrono::Duration::milliseconds;
-        // 2.3 s after the preview: 3 s back, rounded up.
+        let margin = PURGE_TRANSIT_MARGIN_SECS;
+        // 2.3 s after the preview: 3 s back, rounded up, plus the margin.
         let r = pinned_to_preview(&plan(None, at), at + ms(2_300));
-        assert_eq!(r.older_than_seconds, Some(3));
+        assert_eq!(r.older_than_seconds, Some(3 + margin));
         assert_eq!(r.peer.as_deref(), Some("peer"));
         assert_eq!(r.target.as_deref(), Some("abc"));
         // Whole seconds stay whole.
         let r = pinned_to_preview(&plan(None, at), at + ms(4_000));
-        assert_eq!(r.older_than_seconds, Some(4));
+        assert_eq!(r.older_than_seconds, Some(4 + margin));
         // At once, or with the clock stepped back: still a second.
         let r = pinned_to_preview(&plan(None, at), at - ms(500));
-        assert_eq!(r.older_than_seconds, Some(1));
+        assert_eq!(r.older_than_seconds, Some(1 + margin));
+    }
+
+    /// A message stored just after the preview is not selected even when the
+    /// purge executes well after it was sent, as long as it executes within
+    /// the margin.
+    #[test]
+    fn a_message_stored_after_the_preview_survives_a_slow_purge() {
+        let at = Utc::now();
+        let sent = at + chrono::Duration::milliseconds(2_000);
+        let r = pinned_to_preview(&plan(None, at), sent);
+        let age_cutoff = r.older_than_seconds.unwrap() as i64;
+        // Stored 1 ms after the preview; the mediator runs the purge 29 s
+        // after the console sent it.
+        let stored = at + chrono::Duration::milliseconds(1);
+        let executes = sent + chrono::Duration::seconds(29);
+        let age = (executes - stored).num_seconds();
+        assert!(age < age_cutoff, "age {age} must stay under {age_cutoff}");
     }
 
     #[test]
@@ -104,6 +139,9 @@ mod tests {
             &plan(Some(3_600), at),
             at + chrono::Duration::milliseconds(10_001),
         );
-        assert_eq!(r.older_than_seconds, Some(3_611));
+        assert_eq!(
+            r.older_than_seconds,
+            Some(3_611 + PURGE_TRANSIT_MARGIN_SECS)
+        );
     }
 }

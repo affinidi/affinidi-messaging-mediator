@@ -194,9 +194,6 @@ async fn an_admin_previews_then_purges_only_what_the_preview_counted() {
         older_than_seconds: None,
     };
 
-    // The purge is pinned to the preview's instant, rounded to whole seconds
-    // away from it: let the counted messages age past that first.
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let plan = console
         .purge_preview(request.clone())
         .await
@@ -204,13 +201,21 @@ async fn an_admin_previews_then_purges_only_what_the_preview_counted() {
     assert_eq!(plan.matched, 2);
 
     // A message that arrives between the preview and the confirmation is
-    // not what the user confirmed, so it stays.
+    // not what the user confirmed, so it stays. The purge is pinned to the
+    // preview's instant with a safety margin for the request's transit
+    // (PURGE_TRANSIT_MARGIN_SECS), so the two counted messages, stored
+    // within that margin before the preview, are spared as well: the pin
+    // only ever removes fewer than were counted. (Which counted messages
+    // older than the margin are removed is covered by purge.rs's tests.)
     send(&env, &alice, &bob).await;
     let done = console.purge(plan).await.expect("purge");
-    assert_eq!(done.purged, 2);
+    assert_eq!(
+        done.purged, 0,
+        "nothing newer than preview minus the margin"
+    );
 
     let left = console.purge_preview(request).await.expect("preview again");
-    assert_eq!(left.matched, 1, "the newer message is still queued");
+    assert_eq!(left.matched, 3, "the newer message is still queued");
 }
 
 #[tokio::test(flavor = "multi_thread")]
