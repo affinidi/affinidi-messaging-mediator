@@ -31,17 +31,11 @@ pub trait StoreLifecycle: Send + Sync + std::fmt::Debug {
     /// connections the others cannot see. `false` for an in-process store
     /// (memory, Fjall); the Redis store says `true`. An answer that lists
     /// live state from one process says which it covers on this basis.
-    fn spans_processes(&self) -> bool {
-        false
-    }
+    fn spans_processes(&self) -> bool;
 
-    /// Legacy: synchronous health summary. Default impl calls the async
-    /// [`health`](Self::health) and stringifies, but the cost of an
-    /// async call from a sync context is real — backends with cheap
-    /// in-memory state should override and return directly. Returns
-    /// `"closed"` / `"half_open"` / `"open"` to match the names the
-    /// admin status handler already shows in operator dashboards.
-    fn circuit_breaker_state(&self) -> &'static str {
-        "closed"
-    }
+    /// The backend's circuit-breaker state, read synchronously for the
+    /// admin status and `/readyz` answers: `"closed"` / `"half_open"` /
+    /// `"open"`, the names operator dashboards already show. A backend with
+    /// no breaker answers `"closed"`.
+    fn circuit_breaker_state(&self) -> &'static str;
 }

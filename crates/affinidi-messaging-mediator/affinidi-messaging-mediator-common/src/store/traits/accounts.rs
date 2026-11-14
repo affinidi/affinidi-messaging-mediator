@@ -104,10 +104,9 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     /// was being removed, which the existence check cannot rule out on a
     /// store without a transaction across both.
     ///
-    /// Activity is observability, not state anything depends on, so the
-    /// default keeps nothing and succeeds; [`account_activity`] then reports
-    /// nothing recorded. Every built-in backend overrides both. Removing the
-    /// account removes its activity.
+    /// Activity is observability, not state anything depends on: a failure
+    /// here is logged by the caller, never surfaced. Removing the account
+    /// removes its activity.
     ///
     /// [`account_activity`]: Self::account_activity
     async fn account_activity_record(
@@ -115,10 +114,7 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
         did_hash: &str,
         kind: ActivityKind,
         at: u64,
-    ) -> Result<(), MediatorError> {
-        let _ = (did_hash, kind, at);
-        Ok(())
-    }
+    ) -> Result<(), MediatorError>;
 
     /// The recorded activity of each account in `did_hashes`, in the same
     /// order. An account with nothing recorded, or none at all, gets
@@ -126,9 +122,7 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     async fn account_activity(
         &self,
         did_hashes: &[String],
-    ) -> Result<Vec<AccountActivity>, MediatorError> {
-        Ok(vec![AccountActivity::default(); did_hashes.len()])
-    }
+    ) -> Result<Vec<AccountActivity>, MediatorError>;
 
     /// Count one message against the account `did_hash`.
     ///
@@ -139,18 +133,12 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     ///
     /// This is on the message path, so a backend should make it **one write**.
     ///
-    /// The default keeps nothing and succeeds; [`account_stats`] then reports
-    /// zeroes. Every built-in backend overrides both.
-    ///
     /// [`account_stats`]: Self::account_stats
     async fn account_stats_bump(
         &self,
         did_hash: &str,
         delta: AccountStatsDelta,
-    ) -> Result<(), MediatorError> {
-        let _ = (did_hash, delta);
-        Ok(())
-    }
+    ) -> Result<(), MediatorError>;
 
     /// The counters of each account in `did_hashes`, in the same order. An
     /// account with nothing counted, or none at all, gets
@@ -158,7 +146,5 @@ pub trait AccountStore: Send + Sync + std::fmt::Debug {
     async fn account_stats(
         &self,
         did_hashes: &[String],
-    ) -> Result<Vec<AccountStats>, MediatorError> {
-        Ok(vec![AccountStats::default(); did_hashes.len()])
-    }
+    ) -> Result<Vec<AccountStats>, MediatorError>;
 }

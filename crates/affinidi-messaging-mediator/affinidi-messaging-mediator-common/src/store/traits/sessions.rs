@@ -15,11 +15,9 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// `session_id`), and refresh-token rotation (write back the same
     /// session with a new `refresh_token_hash`).
     ///
-    /// The post-auth rename is fail-closed: the default
-    /// [`update_session_authenticated`](Self::update_session_authenticated)
-    /// does `delete_session(old)` *then* `put_session(new)`, so an
-    /// interruption can only lose the new session, never leave both. Redis
-    /// and Fjall override it with a single atomic operation.
+    /// The post-auth rename is not built from this: it is
+    /// [`update_session_authenticated`](Self::update_session_authenticated),
+    /// one atomic step in every backend.
     async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError>;
 
     /// Retrieve a session by ID and join with the corresponding `DID:`
@@ -37,15 +35,14 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// [`session_not_found`]. Every other error is a storage failure.
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError>;
 
-    /// Delete a session record. Used for logout and as the *first* step
-    /// of the fail-closed post-auth rename (delete old, then write new).
+    /// Delete a session record (logout, account removal).
     async fn delete_session(&self, session_id: &str) -> Result<(), MediatorError>;
 
     /// Run one pass of the session expiry sweep, removing session
     /// records whose TTL has elapsed (`expires_at <= now_secs`).
     ///
     /// Backends with native TTL (Redis `EXPIRE`) reclaim expired
-    /// sessions themselves, so the default is a no-op. Backends without
+    /// sessions themselves and answer an empty report. Backends without
     /// (Fjall, memory) expire sessions lazily on [`get_session`](Self::get_session), which
     /// means a session that is created but never read again — e.g. a
     /// one-off DID that runs `/authenticate/challenge` and disappears —
@@ -64,10 +61,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     async fn sweep_expired_sessions(
         &self,
         now_secs: u64,
-    ) -> Result<SessionSweepReport, MediatorError> {
-        let _ = now_secs;
-        Ok(SessionSweepReport::default())
-    }
+    ) -> Result<SessionSweepReport, MediatorError>;
 
     /// Promote a `ChallengeSent` session to `Authenticated` under
     /// `new_session_id`, recording the refresh-token hash, and count it in
@@ -96,16 +90,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         &self,
         session_id: &str,
         refresh_token_hash: &str,
-    ) -> Result<(), MediatorError> {
-        // We don't know the DID at this layer; pass empty so the
-        // join-with-account in `get_session` is best-effort. Backends
-        // that need the DID for the refresh path should override. A session
-        // that has ended is not recreated: the update fails.
-        let mut session = self.get_session(session_id, "").await?;
-        session.refresh_token_hash = Some(refresh_token_hash.to_string());
-        self.put_session(&session, std::time::Duration::from_secs(86_400))
-            .await
-    }
+    ) -> Result<(), MediatorError>;
 
     /// Exchange a refresh token: if the session's stored refresh-token hash
     /// equals `presented_hash`, replace it with `new_hash`; otherwise write
@@ -113,35 +98,19 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// requests presenting the same token can never both see
     /// [`RefreshRotation::Rotated`].
     ///
-    /// The default is NOT atomic (read, compare, write) and exists only so
-    /// out-of-tree backends keep compiling; every in-tree backend overrides
-    /// it. A missing session or a missing stored hash is
+    /// A missing session or a missing stored hash is
     /// [`RefreshRotation::Missing`], never a match.
     async fn rotate_refresh_token_hash(
         &self,
         session_id: &str,
         presented_hash: &str,
         new_hash: &str,
-    ) -> Result<RefreshRotation, MediatorError> {
-        match self.get_refresh_token_hash(session_id).await? {
-            None => Ok(RefreshRotation::Missing),
-            Some(stored) if stored != presented_hash => Ok(RefreshRotation::Mismatch),
-            Some(_) => {
-                self.update_refresh_token_hash(session_id, new_hash).await?;
-                Ok(RefreshRotation::Rotated)
-            }
-        }
-    }
+    ) -> Result<RefreshRotation, MediatorError>;
 
-    /// Legacy: read just the refresh-token hash for a session. Default
-    /// impl loads the whole session and returns the field.
+    /// The refresh-token hash recorded on a session; `None` when the session
+    /// is gone or holds none.
     async fn get_refresh_token_hash(
         &self,
         session_id: &str,
-    ) -> Result<Option<String>, MediatorError> {
-        match self.get_session(session_id, "").await {
-            Ok(s) => Ok(s.refresh_token_hash),
-            Err(_) => Ok(None),
-        }
-    }
+    ) -> Result<Option<String>, MediatorError>;
 }

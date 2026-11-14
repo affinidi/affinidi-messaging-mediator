@@ -57,16 +57,13 @@ pub trait ForwardQueueStore: Send + Sync + std::fmt::Debug {
     /// a consumer that is finished with the entries. A backend that can
     /// commit both as one write should: a crash between a separate ack and
     /// delete leaves an entry that no consumer holds and the group has read
-    /// past, so it is never read, claimed or deleted again. The default runs
-    /// the two in turn.
+    /// past, so it is never read, claimed or deleted again. Every backend
+    /// commits both as one write.
     async fn forward_queue_ack_and_delete(
         &self,
         group_name: &str,
         stream_ids: &[&str],
-    ) -> Result<(), MediatorError> {
-        self.forward_queue_ack(group_name, stream_ids).await?;
-        self.forward_queue_delete(stream_ids).await
-    }
+    ) -> Result<(), MediatorError>;
 
     /// Remove consumers of `group_name` that hold no entries and have been
     /// idle for at least `min_idle`, other than `keep_consumer` (the
@@ -75,16 +72,14 @@ pub trait ForwardQueueStore: Send + Sync + std::fmt::Debug {
     /// restart for ever. A consumer still holding entries is never removed:
     /// its entries are handed on by
     /// [`forward_queue_autoclaim`](Self::forward_queue_autoclaim). Returns
-    /// how many were removed. The default, for a backend that keeps no
-    /// consumer records, removes nothing.
+    /// how many were removed. A backend that keeps no consumer records
+    /// answers `0`.
     async fn forward_queue_prune_consumers(
         &self,
-        _group_name: &str,
-        _keep_consumer: &str,
-        _min_idle: Duration,
-    ) -> Result<usize, MediatorError> {
-        Ok(0)
-    }
+        group_name: &str,
+        keep_consumer: &str,
+        min_idle: Duration,
+    ) -> Result<usize, MediatorError>;
 
     /// Reclaim entries idle for longer than `min_idle` (typical: a
     /// crashed/timed-out consumer). The reclaiming consumer becomes the

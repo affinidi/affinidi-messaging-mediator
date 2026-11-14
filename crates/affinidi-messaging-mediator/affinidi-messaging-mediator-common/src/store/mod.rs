@@ -357,6 +357,10 @@ pub mod ops;
 /// DID multiplexing grant rules, shared by every backend. See [`mux`].
 pub mod mux;
 
+/// Single-process answers for the cross-process parts of the streaming
+/// contract, shared by the in-process backends.
+pub mod single_process;
+
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 

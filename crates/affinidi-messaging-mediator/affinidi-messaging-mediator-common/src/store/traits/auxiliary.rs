@@ -1,6 +1,5 @@
 //! The [`AuxiliaryStore`] capability of a storage backend.
 
-use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::TrustTaskClaim;
 use async_trait::async_trait;
@@ -50,32 +49,21 @@ pub trait AuxiliaryStore: Send + Sync + std::fmt::Debug {
     /// sharing the store — that is what makes a replay to a *second* instance
     /// fail too.
     ///
-    /// **The default refuses.** A store that does not implement this cannot
-    /// say whether a document was already executed, and executing anyway is
-    /// the double execution the rule forbids; the caller fails closed on the
-    /// error. Every built-in backend overrides it.
+    /// A store that cannot answer must return an error: executing anyway is
+    /// the double execution the rule forbids, and the caller fails closed on
+    /// the error.
     async fn trust_task_claim(
         &self,
         key: &str,
         digest: &str,
         retain_until: u64,
         now: u64,
-    ) -> Result<TrustTaskClaim, MediatorError> {
-        let _ = (key, digest, retain_until, now);
-        Err(MediatorError::InternalError(
-            error_codes::DB_OPERATION_ERROR,
-            "NA".into(),
-            "this store keeps no Trust Task duplicate-execution record".into(),
-        ))
-    }
+    ) -> Result<TrustTaskClaim, MediatorError>;
 
     /// Drop Trust Task claims whose `retain_until` is at or before `now`.
-    /// Returns how many were removed. Backends with native key expiry (Redis)
-    /// keep the default no-op.
-    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError> {
-        let _ = now;
-        Ok(0)
-    }
+    /// Returns how many were removed. A backend with native key expiry (Redis)
+    /// answers `0`.
+    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError>;
 
     /// Record where the did:scid account `did_hash` has been found, and the
     /// latest version of its log verified — `record` is the resolver's
@@ -86,33 +74,19 @@ pub trait AuxiliaryStore: Send + Sync + std::fmt::Debug {
     /// it keeps a restart from accepting an older copy of the log (a moved log's
     /// former host can serve its pre-move state under the same did:scid).
     ///
-    /// **The default refuses**, as the floor is then not durable; the caller
-    /// logs it. Every built-in backend overrides it.
-    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
-        let _ = (did_hash, record);
-        Err(MediatorError::InternalError(
-            error_codes::DB_OPERATION_ERROR,
-            "NA".into(),
-            "this store keeps no did:scid source records".into(),
-        ))
-    }
+    /// A store that cannot keep it must return an error, as the floor is then
+    /// not durable; the caller logs it.
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError>;
 
     /// Every did:scid source record [`Self::scid_source_put`] stored, for
-    /// seeding the resolver at boot. The default holds none.
-    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
-        Ok(Vec::new())
-    }
+    /// seeding the resolver at boot.
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError>;
 
     /// The mediator's stored configuration overrides, as a JSON object of
     /// `key → value` (keys like `limits.queued_send_messages_hard`), or `None`
     /// when none have been stored. Written by `config/patch` and layered over
     /// the file/env configuration at startup.
-    ///
-    /// The default has none, which is the truth for a store that cannot keep
-    /// them.
-    async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError> {
-        Ok(None)
-    }
+    async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError>;
 
     /// Replace the stored configuration overrides with `overrides`, a JSON
     /// object. An empty object clears them.
@@ -121,14 +95,7 @@ pub trait AuxiliaryStore: Send + Sync + std::fmt::Debug {
     /// modify and write under one lock; the mediator does all of that under
     /// its patch lock (`LiveLimits::lock_for_patch`).
     ///
-    /// **The default refuses**: a patch must not report a value as stored when
-    /// the store kept nothing. Every built-in backend overrides it.
-    async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError> {
-        let _ = overrides;
-        Err(MediatorError::InternalError(
-            error_codes::DB_OPERATION_ERROR,
-            "NA".into(),
-            "this store cannot keep configuration overrides".into(),
-        ))
-    }
+    /// A store that cannot keep them must return an error: a patch must not
+    /// report a value as stored when the store kept nothing.
+    async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError>;
 }

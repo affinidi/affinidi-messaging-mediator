@@ -69,7 +69,12 @@
 //! thereafter, which is sound because this backend is single-process.
 
 use crate::error_codes;
-use affinidi_messaging_mediator_common::store::mux::{MuxDidRecord, MuxIndexDelta};
+use affinidi_messaging_mediator_common::store::mux::{
+    MuxChangeRecord, MuxDidRecord, MuxIndexDelta,
+};
+use affinidi_messaging_mediator_common::store::{
+    StreamingClaim, StreamingKind, StreamingWrite, is_session_over, single_process,
+};
 use affinidi_messaging_mediator_common::types::accounts::{
     AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
 };
@@ -1439,6 +1444,10 @@ impl std::fmt::Debug for FjallStore {
 
 #[async_trait]
 impl StoreLifecycle for FjallStore {
+    fn spans_processes(&self) -> bool {
+        false
+    }
+
     async fn initialize(&self) -> Result<(), MediatorError> {
         // Partitions are opened eagerly in `open`. The remaining bootstrap
         // step is the schema-version check: stamp the current version on a
@@ -2279,6 +2288,17 @@ impl MessageStore for FjallStore {
 
 #[async_trait]
 impl SessionStore for FjallStore {
+    async fn get_refresh_token_hash(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, MediatorError> {
+        match self.get_session(session_id, "").await {
+            Ok(session) => Ok(session.refresh_token_hash),
+            Err(e) if is_session_over(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
         // Take the cross-partition write lock like every other write op
         // in this backend. Session writes are single-key today, but
@@ -3260,6 +3280,17 @@ impl StatsStore for FjallStore {
 
 #[async_trait]
 impl ForwardQueueStore for FjallStore {
+    /// No consumer records are kept beyond the pending entries, so there is
+    /// nothing to prune.
+    async fn forward_queue_prune_consumers(
+        &self,
+        _group_name: &str,
+        _keep_consumer: &str,
+        _min_idle: Duration,
+    ) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
     async fn forward_queue_enqueue(
         &self,
         entry: &ForwardQueueEntry,
@@ -3711,6 +3742,71 @@ impl ForwardQueueStore for FjallStore {
 
 #[async_trait]
 impl StreamingStore for FjallStore {
+    // One process: no other instance to coordinate with. These are the
+    // explicit single-process answers (`store::single_process`).
+
+    async fn streaming_claim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        live: bool,
+        _kind: StreamingKind,
+        _write: StreamingWrite,
+    ) -> Result<StreamingClaim, MediatorError> {
+        single_process::streaming_claim(self, did_hash, mediator_uuid, live).await
+    }
+
+    async fn streaming_release(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        single_process::streaming_release(self, did_hash, mediator_uuid).await
+    }
+
+    async fn streaming_heartbeat(
+        &self,
+        _mediator_uuid: &str,
+        _lifetime: Duration,
+        _prune_after: Duration,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_dead_instances(
+        &self,
+        mediator_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; mediator_uuids.len()])
+    }
+
+    async fn streaming_evict(
+        &self,
+        _did_hash: &str,
+        _dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; did_hashes.len()])
+    }
+
+    async fn monitor_fanout_publish(
+        &self,
+        _scope: &str,
+        _payload: &str,
+    ) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    async fn monitor_fanout_subscribe(
+        &self,
+        _scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        Ok(None)
+    }
+
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
         // Drop every registration that points at this mediator UUID. The
         // table is in memory, so on a fresh process it is already empty; the
@@ -3844,6 +3940,18 @@ impl StreamingStore for FjallStore {
 
 #[async_trait]
 impl MuxStore for FjallStore {
+    /// One process: no other instance to tell.
+    async fn mux_changes_publish(&self, _record: &MuxChangeRecord) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    /// One process: nothing to hear.
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<MuxChangeRecord>>, MediatorError> {
+        Ok(None)
+    }
+
     fn supports_mux(&self) -> bool {
         true
     }

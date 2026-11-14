@@ -1,6 +1,5 @@
 //! The [`StreamingStore`] capability of a storage backend.
 
-use crate::error_codes;
 use crate::errors::MediatorError;
 use crate::store::{
     PubSubRecord, StoredMessageRef, StreamingClaim, StreamingClientState, StreamingKind,
@@ -18,28 +17,21 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// deployments sharing one server never hear each other. Best-effort and
     /// at most once.
     ///
-    /// The default does nothing: a single-process backend has no other
-    /// instance whose monitor subscribers could hear it.
-    async fn monitor_fanout_publish(
-        &self,
-        _scope: &str,
-        _payload: &str,
-    ) -> Result<(), MediatorError> {
-        Ok(())
-    }
+    /// A single-process backend does nothing: it has no other instance whose
+    /// monitor subscribers could hear it.
+    async fn monitor_fanout_publish(&self, scope: &str, payload: &str)
+    -> Result<(), MediatorError>;
 
     /// Subscribe to [`monitor_fanout_publish`](Self::monitor_fanout_publish)
     /// records for `scope` from every instance, this one's included.
-    /// `Ok(None)` when the backend is single-process (the default).
+    /// `Ok(None)` when the backend is single-process.
     ///
     /// `Lagged` means records were missed; `Closed` means the subscription
     /// was lost and must be opened again.
     async fn monitor_fanout_subscribe(
         &self,
-        _scope: &str,
-    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
-        Ok(None)
-    }
+        scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError>;
 
     /// Reset the streaming session set for this mediator instance.
     /// Called once at startup to clean up state from previous runs.
@@ -67,42 +59,28 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// otherwise the newest registration wins; `write` says whether this is a
     /// new registration or a change to one (see [`StreamingWrite`]).
     ///
-    /// The default is for a single-instance store, where the streaming task
-    /// already orders its own entries: it sets the state and holds the DID.
+    /// A single-process store, where the streaming task already orders its
+    /// own entries, sets the state and holds the DID
+    /// ([`single_process::streaming_claim`](crate::store::single_process::streaming_claim)).
     async fn streaming_claim(
         &self,
         did_hash: &str,
         mediator_uuid: &str,
         live: bool,
-        _kind: StreamingKind,
-        _write: StreamingWrite,
-    ) -> Result<StreamingClaim, MediatorError> {
-        let state = if live {
-            StreamingClientState::Live
-        } else {
-            StreamingClientState::Registered
-        };
-        self.streaming_set_state(did_hash, mediator_uuid, state)
-            .await?;
-        Ok(StreamingClaim {
-            held_here: true,
-            displaced_mux: None,
-        })
-    }
+        kind: StreamingKind,
+        write: StreamingWrite,
+    ) -> Result<StreamingClaim, MediatorError>;
 
     /// Deregister `did_hash` from this instance, removing its entry only
     /// while this instance owns it. Returns whether a mux entry on another
     /// instance waits for the DID, so the caller tells it to take the DID
-    /// back. The default (single instance): deregister, nobody waits.
+    /// back. A single-process store deregisters, and nobody waits
+    /// ([`single_process::streaming_release`](crate::store::single_process::streaming_release)).
     async fn streaming_release(
         &self,
         did_hash: &str,
         mediator_uuid: &str,
-    ) -> Result<bool, MediatorError> {
-        self.streaming_set_state(did_hash, mediator_uuid, StreamingClientState::Deregistered)
-            .await?;
-        Ok(false)
-    }
+    ) -> Result<bool, MediatorError>;
 
     /// Whether `did_hash` has a streaming subscriber on any mediator
     /// instance, returning the mediator UUID hosting the subscriber.
@@ -122,8 +100,9 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// read is an error, never "nobody", so a caller can act on a missing
     /// entry.
     ///
-    /// The default asks one DID at a time; a store shared between processes
-    /// reads them in batches.
+    /// The default asks one DID at a time, which is correct for every
+    /// backend; a store shared between processes overrides it to read them in
+    /// batches.
     async fn streaming_owners(
         &self,
         did_hashes: &[String],
@@ -141,53 +120,42 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// the heartbeat had lapsed, so other instances may have taken over this
     /// instance's entries meanwhile.
     ///
-    /// The default does nothing: a store used by one process has no other
-    /// instance to tell.
+    /// A store used by one process has no other instance to tell: it does
+    /// nothing and answers `false`.
     async fn streaming_heartbeat(
         &self,
-        _mediator_uuid: &str,
-        _lifetime: std::time::Duration,
-        _prune_after: std::time::Duration,
-    ) -> Result<bool, MediatorError> {
-        Ok(false)
-    }
+        mediator_uuid: &str,
+        lifetime: std::time::Duration,
+        prune_after: std::time::Duration,
+    ) -> Result<bool, MediatorError>;
 
     /// Whether each of `mediator_uuids` is a dead instance, in the order
     /// asked: one that kept a heartbeat ([`streaming_heartbeat`](Self::streaming_heartbeat))
     /// and let it expire. An instance that never kept one (an older release)
     /// is never dead. A failed read is an error.
     ///
-    /// The default (one process): nobody is dead.
+    /// In a single-process store nobody is dead.
     async fn streaming_dead_instances(
         &self,
         mediator_uuids: &[String],
-    ) -> Result<Vec<bool>, MediatorError> {
-        Ok(vec![false; mediator_uuids.len()])
-    }
+    ) -> Result<Vec<bool>, MediatorError>;
 
     /// Remove `did_hash`'s streaming entry if `dead_uuid` still owns it and
     /// is still dead, both checked in the same step as the removal. Returns
     /// whether it was removed; the caller then claims the DID as for a
     /// missing entry.
     ///
-    /// The default (one process): nothing to remove.
-    async fn streaming_evict(
-        &self,
-        _did_hash: &str,
-        _dead_uuid: &str,
-    ) -> Result<bool, MediatorError> {
-        Ok(false)
-    }
+    /// A single-process store has nothing to remove.
+    async fn streaming_evict(&self, did_hash: &str, dead_uuid: &str)
+    -> Result<bool, MediatorError>;
 
     /// Whether each of `did_hashes` is held by a mux entry rather than the
     /// DID's own socket, in the order asked; `false` for a DID with no
     /// entry. A failed read is an error.
     ///
-    /// The default (one process): the streaming task orders its own entries,
-    /// so nothing needs it.
-    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
-        Ok(vec![false; did_hashes.len()])
-    }
+    /// A single-process store answers `false` for every DID: its streaming
+    /// task orders its own entries, so nothing needs it.
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError>;
 
     /// Publish a delivery notification to the streaming channel for
     /// `mediator_uuid`. Subscribers (the WebSocket task on that mediator
@@ -207,11 +175,6 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// message that is in the recipient's inbox, tagged with `stored` so the
     /// streaming task can report its delivery once the notification is
     /// actually queued to the socket (R1.1).
-    ///
-    /// The default publishes an untagged notification: delivery is
-    /// unaffected, but no `delivered` monitor event is reported for it —
-    /// under-reporting rather than claiming a delivery nobody saw. Every
-    /// built-in backend implements it.
     async fn streaming_publish_stored(
         &self,
         did_hash: &str,
@@ -219,11 +182,7 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
         message: &str,
         force_delivery: bool,
         stored: StoredMessageRef,
-    ) -> Result<(), MediatorError> {
-        let _ = stored;
-        self.streaming_publish_message(did_hash, mediator_uuid, message, force_delivery)
-            .await
-    }
+    ) -> Result<(), MediatorError>;
 
     /// Publish a frame to be delivered to the client **as it is**, rather
     /// than as a notification to go and fetch what is stored.
@@ -233,23 +192,15 @@ pub trait StreamingStore: Send + Sync + std::fmt::Debug {
     /// — drain the inbox — would deliver nothing at all. Ordinary deliveries
     /// keep using [`streaming_publish_message`](Self::streaming_publish_message).
     ///
-    /// **The default refuses**, so a store that cannot carry the distinction
-    /// makes the caller count the batch as dropped rather than report a frame
-    /// delivered that the socket then discards. Every built-in backend
-    /// implements it.
+    /// A store that cannot carry the distinction must refuse, so the caller
+    /// counts the batch as dropped rather than report a frame delivered that
+    /// the socket then discards.
     async fn streaming_publish_verbatim(
         &self,
         did_hash: &str,
         mediator_uuid: &str,
         message: &str,
-    ) -> Result<(), MediatorError> {
-        let _ = (did_hash, mediator_uuid, message);
-        Err(MediatorError::InternalError(
-            error_codes::DB_OPERATION_ERROR,
-            "NA".into(),
-            "this store cannot publish a verbatim frame".into(),
-        ))
-    }
+    ) -> Result<(), MediatorError>;
 
     /// Subscribe to live-streaming delivery notifications for one
     /// mediator UUID. Returns a [`broadcast::Receiver`]; lagged

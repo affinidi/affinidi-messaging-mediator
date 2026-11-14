@@ -74,25 +74,17 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// the mediator (withdrawal, expiry, admin, account removal) record
     /// nothing. A client delete uses it to tell a repeated acknowledgement
     /// from a withdrawal (`messages::client_delete` in the mediator).
-    ///
-    /// The default answers `false`, as for a backend that records nothing.
-    async fn acknowledged(&self, _to_did_hash: &str, _msg_id: &str) -> Result<bool, MediatorError> {
-        Ok(false)
-    }
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError>;
 
     /// The receipts `from_did_hash` holds for the copies of `msg_id` removed
     /// within [`OUTBOX_RECEIPT_TTL`], one per recipient:
     /// `(recipient, receipt)`. Receipts are per recipient, so one copy's
     /// removal never stands for another's.
-    ///
-    /// The default answers none, as for a backend that keeps no receipts.
     async fn outbox_receipts(
         &self,
-        _from_did_hash: &str,
-        _msg_id: &str,
-    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
-        Ok(Vec::new())
-    }
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError>;
 
     /// Where each of `msg_ids` stands for `sender_did_hash`, in the order asked
     /// (`messaging/message/status/0.1`). An id the sender stored for several
@@ -104,16 +96,11 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// message's recorded sender: anything else is `Unknown`, identically, so
     /// the answer cannot be used to learn whether another account's message
     /// exists. See [`ops::sent_message_state`].
-    ///
-    /// The default answers `Unknown` for everything — true of a backend that
-    /// keeps no receipts, and a sender treats it as no evidence.
     async fn sent_message_states(
         &self,
-        _sender_did_hash: &str,
+        sender_did_hash: &str,
         msg_ids: &[String],
-    ) -> Result<Vec<SentMessageState>, MediatorError> {
-        Ok(vec![SentMessageState::Unknown; msg_ids.len()])
-    }
+    ) -> Result<Vec<SentMessageState>, MediatorError>;
 
     /// Retrieve one message by ID with the body and metadata, resolved as
     /// [`MessageScope::Party`] of `did_hash`: its own inbox copy when it has
@@ -133,8 +120,9 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     ///
     /// The single-message [`get_message`](Self::get_message) is a round trip
     /// each; a fair pickup needs a whole batch, so backends that can read them
-    /// together should. The default loops, which is no worse than the caller
-    /// doing it.
+    /// together should. The default loops: correct for every backend, and no
+    /// worse than the caller doing it, so overriding it is an optimisation
+    /// only.
     ///
     /// A message that has gone since it was listed comes back as `None` rather
     /// than an error — a concurrent delete is normal, not a failure.
@@ -214,13 +202,11 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// recipient decide when a sender's messages die.
     async fn mark_delivered(
         &self,
-        _recipient_did_hash: &str,
-        _msg_ids: &[String],
-        _now_ms: u64,
-        _delivered_ttl_secs: u64,
-    ) -> Result<DeliveryMarkReport, MediatorError> {
-        Ok(DeliveryMarkReport::default())
-    }
+        recipient_did_hash: &str,
+        msg_ids: &[String],
+        now_ms: u64,
+        delivered_ttl_secs: u64,
+    ) -> Result<DeliveryMarkReport, MediatorError>;
 
     /// What the mediator knows about `msg_id` having been handed to
     /// `recipient_did_hash`.
@@ -230,11 +216,9 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// honest answer — not an error, and not the same as "not found".
     async fn delivery_state(
         &self,
-        _recipient_did_hash: &str,
-        _msg_id: &str,
-    ) -> Result<Option<DeliveryState>, MediatorError> {
-        Ok(None)
-    }
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError>;
 
     /// Delivery state for several messages at once, in the order asked.
     ///
@@ -330,17 +314,9 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// The count covers messages actually queued, so it falls as the recipient
     /// collects and the entries are deleted.
     ///
-    /// The default returns `Ok(0)`, which leaves any gate built on it inert.
-    /// A backend without per-pair tracking therefore behaves exactly as it did
-    /// before this method existed, and is still covered by the recipient-total
-    /// and sender-total gates. Overriding it is what turns the gate on.
-    async fn peer_queue_count(
-        &self,
-        _from_hash: &str,
-        _to_hash: &str,
-    ) -> Result<u32, MediatorError> {
-        Ok(0)
-    }
+    /// Required: a backend answering `0` would leave the per-relationship gate
+    /// silently inert.
+    async fn peer_queue_count(&self, from_hash: &str, to_hash: &str) -> Result<u32, MediatorError>;
 
     /// Run one pass of the message expiry sweep. Inspects all expiry
     /// indices whose timestamp is `<= now_secs`, deletes the messages
@@ -360,17 +336,10 @@ pub trait MessageStore: Send + Sync + std::fmt::Debug {
     /// `on_expired` (when given) the id and metadata of each message it
     /// removes. The metadata is read before the delete, and only when an
     /// observer is given, so an unobserved sweep costs no more than before.
-    ///
-    /// The built-in stores implement this. The default sweeps without
-    /// reporting individual messages, so a store written before this method
-    /// existed still compiles and still expires messages.
     async fn sweep_expired_messages_observed(
         &self,
         now_secs: u64,
         admin_did_hash: &str,
         on_expired: Option<OnExpired<'_>>,
-    ) -> Result<ExpiryReport, MediatorError> {
-        let _ = on_expired;
-        self.sweep_expired_messages(now_secs, admin_did_hash).await
-    }
+    ) -> Result<ExpiryReport, MediatorError>;
 }

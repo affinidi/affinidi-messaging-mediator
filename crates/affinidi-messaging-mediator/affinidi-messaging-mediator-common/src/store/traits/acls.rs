@@ -48,25 +48,13 @@ pub trait AclStore: Send + Sync + std::fmt::Debug {
     /// `access_list_allowed` costs three reads of that record; this method
     /// exists so a backend can serve all three from one.
     ///
-    /// The default implementation is the unoptimised two-call version, so
-    /// third-party backends keep working unchanged. Backends that can batch
-    /// should override it — `RedisStore` already pipelines the membership
-    /// probe and the ACL read into a single round trip, and the in-process
-    /// backends read one record.
+    /// `RedisStore` pipelines the membership probe and the ACL read into a
+    /// single round trip, and the in-process backends read one record.
     async fn delivery_decision(
         &self,
         to_hash: &str,
         from_hash: Option<&str>,
-    ) -> Result<Option<DeliveryDecision>, MediatorError> {
-        let Some(acls) = self.get_did_acl(to_hash).await? else {
-            return Ok(None);
-        };
-        let access_list_allows = self.access_list_allowed(to_hash, from_hash).await;
-        Ok(Some(DeliveryDecision {
-            acls,
-            access_list_allows,
-        }))
-    }
+    ) -> Result<Option<DeliveryDecision>, MediatorError>;
 
     /// Page through a DID's access list using a server-side cursor. Pass `0` to
     /// start; feed the returned `cursor` back in for the next page.

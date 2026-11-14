@@ -54,7 +54,8 @@ use crate::{
     store::{
         DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
         InboxStatusReply, MessageMetaData, MetadataStats, PubSubRecord, RefreshRotation, Session,
-        SessionState, StatCounter, StoreHealth, StreamingClientState, TrustTaskClaim,
+        SessionState, SessionSweepReport, StatCounter, StoreHealth, StreamingClientState,
+        TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -625,6 +626,12 @@ fn stat_counter_redis_field(counter: StatCounter) -> &'static str {
 impl StoreLifecycle for RedisStore {
     fn spans_processes(&self) -> bool {
         true
+    }
+
+    fn circuit_breaker_state(&self) -> &'static str {
+        // Read-only: the breaker moves on the next request it guards (the
+        // readiness probe's storage check is one), not on this read.
+        self.circuit_breaker.state_str()
     }
 
     async fn initialize(&self) -> Result<(), MediatorError> {
@@ -1480,6 +1487,15 @@ impl MessageStore for RedisStore {
 
 #[async_trait]
 impl SessionStore for RedisStore {
+    /// Sessions carry a Redis `EXPIRE`, so Redis reclaims them itself and
+    /// there is nothing to sweep.
+    async fn sweep_expired_sessions(
+        &self,
+        _now_secs: u64,
+    ) -> Result<SessionSweepReport, MediatorError> {
+        Ok(SessionSweepReport::default())
+    }
+
     async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
         let mut conn = self.get_connection().await?;
         let sid = format!("SESSION:{}", session.session_id);
@@ -2681,6 +2697,12 @@ impl AuditStore for RedisStore {
 
 #[async_trait]
 impl AuxiliaryStore for RedisStore {
+    /// Claims carry a Redis expiry at their `retain_until`, so Redis drops
+    /// them itself and there is nothing to sweep.
+    async fn sweep_expired_trust_task_claims(&self, _now: u64) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
     async fn trust_task_claim(
         &self,
         key: &str,
