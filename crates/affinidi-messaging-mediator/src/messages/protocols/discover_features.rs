@@ -1,9 +1,5 @@
 use crate::error_codes;
-use crate::{
-    SharedData,
-    common::session::Session,
-    messages::{ProcessMessageResponse, WrapperType},
-};
+use crate::{SharedData, common::session::Session, messages::ProcessMessageResponse};
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
@@ -76,13 +72,7 @@ pub(crate) fn process(
 
     debug!("response_msg: {:?}", response_msg);
 
-    Ok(ProcessMessageResponse {
-        handed_over: None,
-        store_message: true,
-        force_live_delivery: false,
-        data: WrapperType::Message(Box::new(response_msg)),
-        forward_message: false,
-    })
+    Ok(ProcessMessageResponse::Reply(Box::new(response_msg)))
 }
 
 /// Every DIDComm **v2** protocol this mediator serves, as advertised over

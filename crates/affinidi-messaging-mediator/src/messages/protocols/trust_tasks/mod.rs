@@ -79,11 +79,11 @@ use crate::SharedData;
 use crate::common::authz::check_permissions;
 use crate::common::roles;
 use crate::common::session::Session;
+#[cfg(feature = "didcomm")]
+use crate::messages::ProcessMessageResponse;
 use crate::messages::protocols::mediator::record_audit;
 use crate::messages::protocols::trust_task_versions::NewerVersion;
 use crate::messages::protocols::{mediator_ops, trust_task_sign, trust_task_verify};
-#[cfg(feature = "didcomm")]
-use crate::messages::{ProcessMessageResponse, WrapperType};
 
 /// DIDComm `type` URI of a Trust Tasks binding envelope.
 pub const ENVELOPE_TYPE: &str = "https://trusttasks.org/binding/didcomm/0.1/envelope";
@@ -182,7 +182,7 @@ pub(crate) async fn process(
     let response_value = match consumed {
         Ok(Some(v)) => v,
         // identity_mismatch with no transport sender → emit nothing.
-        Ok(None) => return Ok(ProcessMessageResponse::default()),
+        Ok(None) => return Ok(ProcessMessageResponse::Nothing),
         Err(e) => match refusing.document(&e, session, &sender_did, state).await {
             Some(doc) => doc,
             None => return Err(e),
@@ -208,12 +208,14 @@ pub(crate) async fn process(
     .expires_time(now_secs + 300)
     .finalize();
 
-    Ok(ProcessMessageResponse {
-        handed_over: None,
-        store_message: !push_only,
-        force_live_delivery: push_only,
-        data: WrapperType::Message(Box::new(response_msg)),
-        forward_message: false,
+    Ok(if push_only {
+        ProcessMessageResponse::EphemeralReply {
+            message: Box::new(response_msg),
+            force_live_delivery: true,
+            handed_over: None,
+        }
+    } else {
+        ProcessMessageResponse::Reply(Box::new(response_msg))
     })
 }
 

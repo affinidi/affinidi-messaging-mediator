@@ -13,7 +13,7 @@ use crate::{
     SharedData,
     common::session::Session,
     messages::{
-        ProcessMessageResponse, WrapperType,
+        ProcessMessageResponse,
         error_response::generate_error_response,
         store::{store_forwarded_message, store_message},
     },
@@ -1151,13 +1151,7 @@ pub(crate) async fn process(
         )
         .await?;
 
-        Ok(ProcessMessageResponse {
-            handed_over: None,
-            store_message: false,
-            force_live_delivery: false,
-            forward_message: true,
-            data: WrapperType::None,
-        })
+        Ok(ProcessMessageResponse::Forwarded)
     }
     .instrument(_span)
     .await
