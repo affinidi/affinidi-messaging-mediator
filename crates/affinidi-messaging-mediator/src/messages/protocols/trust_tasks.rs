@@ -9,8 +9,9 @@
 //! through the mediator's existing outbound path — exactly like the trust-ping
 //! pong — so no separate binding/agent plumbing is needed here.
 //!
-//! This consumes the **rationalized** `messaging/*` surface (19 → 9 active
-//! tasks, affinidi/affinidi-tdk-rs#667): `account/update` replaces the retired
+//! This consumes the **rationalized** `messaging/*` surface
+//! (affinidi/affinidi-tdk-rs#667; the served list is `served_tasks!`):
+//! `account/update` replaces the retired
 //! `change-type` / `change-queue-limits` / `acl/set` / `admin/add` /
 //! `admin/strip`; `access-list/update` replaces `access-list/{add,remove,clear}`;
 //! the role-filtered `account/list` replaces `admin/list`; the `entries`

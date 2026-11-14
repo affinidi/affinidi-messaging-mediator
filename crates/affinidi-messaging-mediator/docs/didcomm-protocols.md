@@ -312,6 +312,7 @@ The SDK sends every one of them through `atm.trust_tasks()`.
 | Queues       | `messaging/queue/{status,list,purge}`, `messaging/message/{list,get,status,delete}`                                |
 | Operations   | `messaging/ping`, `messaging/stats/show`, `messaging/monitor/{subscribe,unsubscribe}`                              |
 | Mediator     | `audit/list`, `config/{show,patch,reload}`                                                                          |
+| DID mux      | `messaging/mux/{grant,list,update,revoke,revoke-all,attach,detach,ack,connections}`, `messaging/mux/{admin-list,admin-revoke,admin-revoke-all}` |
 
 The former `https://didcomm.org/mediator/1.0/*` admin, account and ACL
 protocols are not served; a message of those types is refused as unknown.

@@ -199,7 +199,6 @@ pub(crate) fn rewrap_inner_attachment(mediator_did: &str, msg: &Message) -> Opti
     String::from_utf8(bytes).ok()
 }
 
-/// Process a forward message, run checks and then if accepted place into FORWARD_TASKS stream
 /// Parse the `next` hop DID from a routing-2.0 forward body.
 fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorError> {
     match ForwardRequest::deserialize(&msg.body) {
@@ -919,6 +918,8 @@ async fn resolve_forward_sender(
     }
 }
 
+/// Process a forward message: run the checks and, if it is accepted, deliver
+/// it to a local recipient or place it on the forwarding queue for a remote one.
 pub(crate) async fn process(
     msg: &Message,
     metadata: &UnpackMetadata,
@@ -1130,9 +1131,7 @@ pub(crate) async fn process(
             }
         };
 
-        // Forward is good, lets process the attachments and add to the queues
-        // First step is to determine if the next hop is local to the mediator or remote?
-        //if next_did_doc.service
+        // The forward is accepted: decode its attachment for the queue.
 
         let data = decode_first_attachment(msg, session, attachments)?;
 

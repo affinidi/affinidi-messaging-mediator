@@ -7,10 +7,11 @@
 //! messages for its controller. Dispatch, acceptance checks and response
 //! signing are shared with the account/ACL tasks in [`super::trust_tasks`].
 
-// The mediator serves the 0.1 versions of the `messaging/*` and `audit/list`
-// tasks. `trust-tasks-rs` 0.35 marks them superseded by 0.2
-// (dtgwg-trust-tasks-tf#921); serving 0.2 beside 0.1 is follow-up work, due
-// before 0.1 is withdrawn.
+// The handlers here are written against the 0.1 types of the `messaging/*`
+// and `audit/list` tasks, which `trust-tasks-rs` marks superseded by 0.2
+// (dtgwg-trust-tasks-tf#921). The tasks that have a 0.2 version serve it
+// beside 0.1 through these same handlers (`trust_task_versions` lists them and
+// maps the documents); the 0.1 types stay until 0.1 is withdrawn.
 #![allow(deprecated)]
 
 use crate::error_codes;

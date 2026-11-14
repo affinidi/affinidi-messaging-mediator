@@ -103,17 +103,19 @@ pub(crate) async fn handle_inbound(
 
 /// Handle an inbound TSP message, sniffed at ingress by its CESR magic byte.
 ///
-/// Parses the cleartext envelope (no keys) and, for a **Direct** message
-/// addressed to a **locally-served** recipient, stores it for pickup — reusing
-/// the protocol-neutral store path that DIDComm direct delivery uses. The TSP
-/// message is base64url-encoded for storage (which is its CESR qb64 text form),
-/// so it rides the existing UTF-8 string store/pickup pipeline; a pickup client
-/// recognises it by the qb64 (`-E…`) prefix and decodes it back to qb2.
+/// Routes on the cleartext envelope's *receiver*:
 ///
-/// Routed/Nested/Control message types, remote recipients (routing/relay), and
-/// the TSP↔DIDComm bridge land in later PRs. The mediator does not decrypt or
-/// verify the message — exactly as for an opaque DIDComm envelope it forwards —
-/// the recipient authenticates the sender end-to-end on unpack.
+/// * **Not this mediator** — opaque pass-through. The message is neither
+///   decrypted nor verified (the recipient authenticates the sender end to end
+///   on unpack); it passes the direct-delivery gate and is stored for the local
+///   recipient as base64url(qb2), its CESR qb64 text form, which rides the
+///   UTF-8 store/pickup pipeline and is recognised on pickup by its `-E…`
+///   prefix.
+/// * **This mediator** — the layer is unpacked, which verifies its sender, and
+///   acted on by kind: a Routed or Nested message is relayed (to a local
+///   recipient, or enqueued for a remote TSP endpoint; the inner may be a
+///   bridged DIDComm message), a management Trust Task is answered, and
+///   anything else is mail for the mediator's own account.
 #[cfg(feature = "tsp")]
 pub(crate) async fn handle_inbound_tsp(
     state: &SharedData,
@@ -633,11 +635,9 @@ async fn dispatch_tsp_trust_task(
         )
     })?;
 
-    // Rev 3 seals under HPKE-**Base**, so the sender's own X25519 secret no
-    // longer enters the KEM and `pack` no longer takes it. Sender authenticity
-    // is the ESSR sender field plus the outer Ed25519 signature instead. This
-    // call site arrived from main while this branch was in flight, which is why
-    // it still had the Rev 2 arity.
+    // Rev 3 seals under HPKE-**Base**, so the sender's own X25519 secret does
+    // not enter the KEM and `pack` does not take it. Sender authenticity is the
+    // ESSR sender field plus the outer Ed25519 signature instead.
     let packed = affinidi_tsp::message::direct::pack(
         &payload,
         affinidi_tsp::MessageType::Direct,
@@ -819,8 +819,8 @@ fn plan_route_step(
 /// handles it natively on pickup; the mediator never reads it. `from_vid` is the
 /// authenticated sender the mediator routes on (the routing-layer sender for a
 /// relayed message, or the envelope sender for Direct), against which the
-/// recipient's access-list is applied. Remote recipients (forwarding on to
-/// another mediator) are not yet handled.
+/// recipient's access-list is applied. A remote recipient never reaches here:
+/// [`forward_to_next`] sends it to [`forward_tsp_remote`] instead.
 #[cfg(feature = "tsp")]
 async fn deliver_opaque(
     state: &SharedData,
