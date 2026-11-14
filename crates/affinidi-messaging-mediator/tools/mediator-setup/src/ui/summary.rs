@@ -7,8 +7,9 @@ use crate::{
     app::WizardConfig,
     config_writer::build_backend_url,
     consts::{
-        CORS_MODE_ANY, CORS_MODE_LIST, CORS_MODE_NONE, JWT_MODE_GENERATE, NETWORK_MODE_CLOSED,
-        NETWORK_MODE_OPEN, SSL_EXISTING, SSL_SELF_SIGNED, STORAGE_BACKEND_FJALL,
+        ADMIN_GENERATE, ADMIN_PASTE, ADMIN_SKIP, ADMIN_VTA, CORS_MODE_ANY, CORS_MODE_LIST,
+        CORS_MODE_NONE, JWT_MODE_GENERATE, NETWORK_MODE_CLOSED, NETWORK_MODE_OPEN, SSL_EXISTING,
+        SSL_SELF_SIGNED, STORAGE_BACKEND_FJALL,
     },
     ui::theme,
     vta::{VtaReply, VtaSession},
@@ -232,7 +233,7 @@ pub fn render_summary(
     add_field(
         &mut lines,
         "  Admin DID",
-        &config.admin_did_mode,
+        &admin_display(config, vta_session),
         label_style,
         value_style,
     );
@@ -358,6 +359,24 @@ fn network_mode_display(mode: &str) -> String {
     match mode {
         NETWORK_MODE_OPEN => "Open (ALLOW_ALL by default)".into(),
         NETWORK_MODE_CLOSED => "Closed (DENY_ALL by default)".into(),
+        other => other.to_string(),
+    }
+}
+
+/// What the admin choice will actually produce (#173): the generated key is
+/// separate from a VTA credential; reusing the VTA credential is said so.
+fn admin_display(config: &WizardConfig, vta_session: Option<&VtaSession>) -> String {
+    match config.admin_did_mode.as_str() {
+        ADMIN_GENERATE if config.use_vta => {
+            "Generate did:key (separate from the VTA credential)".into()
+        }
+        ADMIN_GENERATE => "Generate did:key".into(),
+        ADMIN_VTA => match vta_session {
+            Some(s) => format!("VTA-issued credential {}", s.admin_did()),
+            None => "VTA-issued credential".into(),
+        },
+        ADMIN_PASTE => format!("Existing DID {}", config.admin_did),
+        ADMIN_SKIP | "" => "Skip (none)".into(),
         other => other.to_string(),
     }
 }

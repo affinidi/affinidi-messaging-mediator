@@ -17,7 +17,7 @@ command differ.
 
 | Mode | VTA reachable over network? | VTA has existing state for this mediator? | VTA-side command | Interactive? |
 |---|---|---|---|---|
-| [Online](#1-online) | Yes | No (greenfield) | `pnm bootstrap provision-integration` via admin PNM session | TUI only |
+| [Online](#1-online) | Yes | No (greenfield) | `pnm bootstrap provision-integration` via admin PNM session | TUI only (an admin credential alone: [`--setup-key-out` / `--setup-key-file`](#online-admin-credential-headless)) |
 | [Sealed-mint](#2-sealed-mint) | Optional (file transfer works air-gapped too) | No (greenfield) | `vta bootstrap provision-integration --request req.json` on VTA host | TUI *or* `--from` |
 | [Sealed-export](#3-sealed-export) | Optional | **Yes** (ran mode 1 or 2 previously) | `vta contexts reprovision --id <ctx> --recipient req.json` on VTA host | TUI *or* `--from` |
 
@@ -57,9 +57,12 @@ On the mediator host, launch the wizard:
 mediator-setup
 ```
 
-Walk through the initial screens (deployment type, protocol, key
-storage) and pick `Full setup — VTA mints my mediator DID` on the VTA
-intent screen, then `Online` on the transport screen.
+The screens run in this order: deployment type, key storage, VTA,
+protocol, DID, security, database, admin, output location, summary. The
+wizard checks the secret backend as soon as the key-storage step is done,
+so an unreachable or already-provisioned backend is reported before any
+VTA work. On the VTA screen pick `Full setup — VTA mints my mediator DID`,
+then `Online` on the transport screen.
 
 The wizard will:
 
@@ -69,13 +72,19 @@ The wizard will:
 3. Wait for you to run that command on your admin workstation. After
    running it, come back to the wizard and press Enter.
 4. Open an authenticated DIDComm session, run the provisioning round
-   trip, and receive the mediator DID + keys + authorization VC.
+   trip, and receive the mediator DID + keys + authorization VC. The
+   VTA admin credential and the VTA key cache are stored in the secret
+   backend straight away, so quitting or a later failure does not lose a
+   DID the VTA has already minted. Quitting after this point asks for
+   confirmation.
 5. Drop you onto the remaining config steps (database, admin DID,
    output location).
 
 The wizard finishes by writing `mediator.toml`, pushing the
 provisioned keys into your chosen secret backend, and offering to run
-`cargo install` for you.
+`cargo install` for you. If anything fails after the wizard's screens,
+your answers are saved as `mediator-build.resume.toml` next to the config
+and the error says how to continue.
 
 ### What the mediator ends up with
 
@@ -83,6 +92,8 @@ provisioned keys into your chosen secret backend, and offering to run
   key-agreement keys in the secret backend
 - Authorization VC archived next to `mediator.toml`
 - Admin credential for authenticating to the VTA at boot
+- The mediator's own admin-API DID, as chosen on the admin screen (see
+  [admin identity](#admin-identity))
 - JWT secret for the mediator's own admin API
 - Cached `DidSecretsBundle` for VTA-unreachable boot fallback
 
@@ -169,13 +180,17 @@ The wizard:
    bundle id, and unseals.
 2. Auto-detects the `TemplateBootstrap` payload variant and projects
    it onto an internal session.
-3. Runs the same config-writing pipeline as the TUI: writes
-   `mediator.toml`, pushes operating keys / admin credential / JWT
-   secret / cached bundle into the secret backend.
-4. Deletes the ephemeral seed from the backend and cleans up the
-   request file.
+3. Runs the same config-writing pipeline as the TUI: pushes operating
+   keys / admin credential / JWT secret / cached bundle into the secret
+   backend, then writes `mediator.toml`.
+4. Only once everything is written, deletes the ephemeral seed from the
+   backend and cleans up the request file. If any step before that
+   fails, re-run the same phase-2 command: the seed is still there, so
+   the same bundle opens again (add `--force-reprovision` if the backend
+   already received this run's entries).
 
-Exit code 0 means the mediator is ready to start.
+Exit code 0 means the mediator is ready to start; see
+[exit codes](#exit-codes) for the others.
 
 ### What the mediator ends up with
 
@@ -185,7 +200,7 @@ Same as online mode:
 - Authorization VC next to `mediator.toml`
 - Admin credential (VTA-minted rollover DID) for mediator→VTA auth
 - Mediator's own admin-API DID (generated fresh by default — see
-  [trust model](#trust-model))
+  [admin identity](#admin-identity))
 - JWT secret, cached VTA bundle
 
 ### Common gotchas
@@ -193,11 +208,11 @@ Same as online mode:
 | Symptom | Cause | Remedy |
 |---|---|---|
 | "A bootstrap is already in progress" on phase 1 | Previous phase-1 run didn't finalise; seed is still in the secret backend's sweep index | Either run phase 2 with `--bundle` to finalise, wait for the 24h auto-sweep (`MEDIATOR_BOOTSTRAP_SEED_TTL` overrides), or re-run phase 1 with `--force-reprovision`, which discards the in-flight request's seed (a bundle already made for it can no longer be opened) |
-| "could not locate the ephemeral seed" on phase 2 | Phase 2 is pointing at a different secret backend than phase 1, or the seed was swept / manually deleted | Re-run phase 2 with the same recipe (same `[secrets].backend`) as phase 1; confirm the bundle id in the error matches what phase 1 printed |
+| "could not locate the ephemeral seed" on phase 2 | Phase 2 is pointing at a different secret backend than phase 1, or the seed was swept / manually deleted | Re-run phase 2 with the same recipe (same `[secrets].storage`) as phase 1; confirm the bundle id in the error matches what phase 1 printed |
 | "the bundle digest is required" on phase 2 | `--digest` was not given | Pass the digest the VTA host printed. `--allow-bundle-without-digest` skips it for a throwaway dev setup only |
 | "provided digest did not match the bundle" | The digest you typed differs from what the VTA printed | Re-copy the digest from the VTA host; if it still fails, the bundle was tampered with — re-request |
 | Phase 1 fails with "requires identity.public_url" | Recipe doesn't set the mediator URL | Add `public_url = "https://..."` under `[identity]` in the recipe — the VTA's `didcomm-mediator` template needs it to render the mediator DID |
-| Bundle opens but `did.jsonl` doesn't get written | Config dir is not writable, or `--config` points at a path with no parent directory | Check permissions on the directory holding `mediator.toml` |
+| Phase 2 fails writing `did.jsonl` | Config dir is not writable | Fix the permissions on the directory holding `mediator.toml` and re-run phase 2 — the seed is kept until the setup is written, and `mediator.toml` is written only after `did.jsonl` |
 
 ## 3. Sealed-export
 
@@ -268,7 +283,7 @@ auto-detects and routes to the right projector.
 - The **existing** mediator DID and its operational keys (NOT fresh)
 - The **existing** DID document and `did.jsonl` entry
 - A freshly-auto-minted admin credential for mediator→VTA auth
-- A separate, fresh admin-API DID (see [trust model](#trust-model))
+- A separate, fresh admin-API DID (see [admin identity](#admin-identity))
 - JWT secret, cached VTA bundle
 
 ### Common gotchas
@@ -281,8 +296,9 @@ auto-detects and routes to the right projector.
 
 ## Recipe fields by mode
 
-A minimal recipe for each sealed mode. See `examples/mediator-build.toml`
-in the repo for the full schema.
+A minimal recipe for each sealed mode. `tools/mediator-setup/examples/mediator-build.toml`
+lists every recipe key with its values and default; every recipe shown
+here and there is loaded by the wizard's test suite, so they stay valid.
 
 ### Sealed-mint
 
@@ -313,6 +329,7 @@ storage = "keyring://affinidi-mediator"         # or file://, aws_secrets://, va
 ssl = "none"                                    # operator-managed reverse proxy expected
 admin = "generate"                              # fresh did:key for mediator's own admin API
 jwt_mode = "generate"
+network_mode = "closed"                         # the default for server / container
 
 [database]
 url = "redis://127.0.0.1/"
@@ -342,11 +359,149 @@ explicit values in new recipes.
 | Deployment type (local / server / container) | Recipe `deployment.type` or TUI | All |
 | Mediator public URL | Recipe `identity.public_url` or TUI | Online, sealed-mint |
 | VTA context id | Recipe `[vta].context` or TUI, default `"mediator"` | All VTA modes |
-| VTA DID | TUI (online only) | Online |
+| VTA DID | TUI, or `--vta-did` for `--setup-key-*` | Online |
 | Secret-backend URL | Recipe `secrets.storage` or TUI | All |
 | Database URL | Recipe `database.url` or `$DATABASE_URL` env | All |
-| Admin DID mode | Recipe `security.admin` or TUI | All |
+| Admin DID mode | Recipe `security.admin` (+ `admin_did`) or TUI | All |
+| Network posture | Recipe `security.network_mode` or TUI | All |
 | `bundle.armor` + digest | Phase 2 CLI flags or TUI paste | Sealed-mint, sealed-export |
+
+## Headless runs
+
+A headless run never prompts and never reads stdin. Its input is one
+recipe, built in three layers, later layers winning:
+
+1. the recipe file given with `--from` (or an empty recipe);
+2. the shorthand flags — `--deployment`, `--did-method`, `--public-url`,
+   `--secret-storage`, `--ssl`, `--database-url`, `--admin`,
+   `--admin-did`, `--listen-address`, `--key-suite`, `--vta-context`,
+   `--allow-plaintext-file`, `--config` — each a name for one recipe key
+   (`--help` lists which);
+3. `--set section.key=value`, repeatable, for any recipe key. The value
+   is read as TOML (`true`, `["10.0.0.0/8"]`) or else as a string.
+
+Every value a flag or `--set` changes is printed as an `override:` or
+`set:` line, and every flag the run does not use as an `ignored:` line.
+A mistyped `--set` key is an error. `--non-interactive` runs the same
+pipeline from the flags alone and needs `--did-method peer` or `webvh`:
+a VTA-minted DID needs a VTA session, which only a sealed recipe (or
+the TUI) provides.
+
+```bash
+# A local did:peer mediator with a Fjall store and a closed network:
+mediator-setup --non-interactive --did-method peer \
+  --set storage.backend=fjall --set security.network_mode=closed
+
+# A recipe with one value changed for this environment:
+mediator-setup --from recipe.toml --set secrets.storage=aws_secrets://eu-west-1/mediator/
+```
+
+Two guard rails apply to headless runs as they do in the TUI:
+
+- An unencrypted `file://` secret store outside a `local` deployment is
+  refused unless accepted with `allow_plaintext_file = true` under
+  `[secrets]` (or `--allow-plaintext-file`). Prefer
+  `file://…?encrypt=1` or a secret manager.
+- `gcp_secrets://`, `azure_keyvault://` and `vault://` have no usable
+  default project / vault / endpoint, so a bare scheme is refused; give
+  the full URL.
+
+The network posture defaults to `open` for a `local` deployment and to
+`closed` (explicit ACL grants, the shipped template's posture) for
+`server` and `container`. The summary printed before anything is written
+states it.
+
+### Online admin credential, headless
+
+When the mediator brings its own DID (did:peer or did:webvh) and only
+needs a VTA admin credential, the online flow runs headless in two
+phases:
+
+```bash
+# Phase 1: mint a setup did:key (written 0600 to the file) and print the
+# `pnm contexts create … --admin-did <did:key>` command for the VTA admin.
+mediator-setup --setup-key-out setup.key --vta-did did:webvh:vta.example.com \
+  --mediator-url https://mediator.example.com --did-method peer
+
+# Phase 2, once the VTA admin has run that command: authenticate, then
+# provision the mediator exactly as a recipe run would.
+mediator-setup --setup-key-file setup.key --vta-did did:webvh:vta.example.com \
+  --mediator-url https://mediator.example.com --did-method peer \
+  --secret-storage aws --set security.network_mode=closed
+```
+
+In this admin-only flow the setup did:key *is* the mediator's long-term
+VTA credential: phase 2 stores it in the secret backend as
+`mediator_admin_credential` and deletes the key file once everything is
+written. `--wait-for-acl <secs>` retries authentication while the ACL
+entry propagates. Phase 2 also accepts `--from <recipe>` and `--set`.
+
+## Admin identity
+
+The mediator has two identities that can look alike:
+
+- the **VTA credential** (`mediator_admin_credential` in the secret
+  backend), which the mediator uses to authenticate *to* the VTA; and
+- the **admin-API DID** (`[server].admin_did`), which clients use to
+  administer *the mediator*.
+
+The admin choice decides the second one, in every flow:
+
+| Choice | Recipe `security.admin` | Admin-API DID |
+|---|---|---|
+| Generate (default) | `generate` | A fresh did:key. In a VTA flow it is separate from the VTA credential; its key goes to `admin-monitor.json` (and, without a VTA, to `mediator_admin_credential`) |
+| VTA-issued | `vta` | The VTA credential's DID — one key for both roles |
+| Existing DID | `import` + `admin_did = "did:…"` | The DID you give; the wizard holds no key for it |
+| Skip | `skip` | None |
+
+The summary before anything is written shows which applies. The admin
+private key is never printed; `--show-admin-key` prints it when stdout
+is a terminal.
+
+## Re-running, backups and uninstall
+
+- Before writing anything, the wizard checks the secret backend it is
+  about to write: if it already holds mediator keys (JWT secret, admin
+  credential, operating keys, VTA cache, did:webvh update keys) it
+  refuses (exit 4) unless `--force-reprovision` is given — whichever
+  `--config` path is used. A backend that cannot be read is treated the
+  same way.
+- A `mediator.toml` being replaced is first copied to
+  `mediator.toml.bak.<UTC timestamp>`.
+- Every file is written to a temporary name and renamed into place;
+  key-bearing files are owner-only (`0600`), and directories the wizard
+  creates are `0700`.
+- Each setup records the files it wrote in
+  `.mediator-setup-manifest.json` next to the config.
+  `mediator-setup --uninstall --config <mediator.toml>` deletes the
+  backend entries and every file listed there (plus the config backups
+  and the configured secrets file).
+
+## Containers
+
+For a `container` deployment the wizard writes `Dockerfile`,
+`Dockerfile.dockerignore` and `docker-compose.yml` next to
+`mediator.toml` (never over a different existing file: the new version is
+written as `<name>.new`). The image holds only the binary; the compose
+file mounts the config directory at `/etc/mediator/conf`, and the paths
+written into `mediator.toml` (a `file://` secrets file, `did.jsonl`) are
+the in-container ones. Nothing secret is copied into an image layer.
+`keyring://` does not exist inside a container; pick a secret manager or
+`k8s://`.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Any other failure: invalid flags or recipe, backend unreachable, a write failed |
+| 2 | `--setup-key-file`: no VTA transport worked (clap also uses 2 for a usage error) |
+| 3 | `--setup-key-file`: the VTA accepted the handshake, then rejected the request |
+| 4 | Refused: the target secret backend already holds a provisioned mediator |
+| 5 | A VTA-managed DID was asked for, but no VTA session is available |
+| 6 | An import was asked for without its data (`admin = "import"` without `admin_did`; `did_method = "import"` is not supported) |
+| 7 | Setup completed, but publishing to `did_target` / `did_log_target` failed — the message gives the manual retry |
+| 8 | The interactive wizard needs a terminal |
 
 ## Trust model
 
@@ -392,14 +547,13 @@ once the mediator has its operational keys and admin credential in
 the secret backend, the VC is a historical receipt, not a runtime
 check.
 
-**Mediator admin DID separation.** For sealed-export specifically,
-the wizard defaults the mediator's *own* admin-API DID to a fresh
-`did:key` rather than reusing the VTA-auto-minted admin credential
-that ships in the bundle. The reasoning: the bundle's admin
-credential is intended for mediator→VTA authentication; reusing it
-as the mediator's own admin-API identity overloads one key across
-two distinct trust scopes (VTA admin vs. clients calling INTO the
-mediator). See `[security].admin` in the recipe to override.
+**Mediator admin DID separation.** The VTA credential in the bundle is
+for mediator→VTA authentication. Reusing it as the mediator's own
+admin-API identity overloads one key across two trust scopes (VTA admin
+vs. clients calling INTO the mediator), so recipes default to a separate,
+fresh `did:key` (`admin = "generate"`), and the TUI does for
+sealed-export. `admin = "vta"` reuses the VTA credential deliberately.
+See [admin identity](#admin-identity).
 
 ## How the mediator reaches the VTA after setup
 

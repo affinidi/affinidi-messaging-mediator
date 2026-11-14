@@ -54,7 +54,7 @@ pub async fn publish_did_artefacts(did: &str, did_target: Option<&str>) -> anyho
         return Ok(());
     };
 
-    println!("\n\x1b[1mPublishing public identity\x1b[0m");
+    out!("\n\x1b[1mPublishing public identity\x1b[0m");
     publish_value(target, did, "DID")
         .await
         .with_context(|| format!("publishing DID to '{target}'"))
@@ -80,7 +80,7 @@ pub async fn publish_did_log_artefacts(
         return Ok(());
     };
 
-    println!("\n\x1b[1mPublishing DID log\x1b[0m");
+    out!("\n\x1b[1mPublishing DID log\x1b[0m");
     // Strict JSON-Lines requires each record to end with `\n`; normalise to
     // exactly one so the served `/.well-known/did.jsonl` is well-formed and
     // future log entries append cleanly.
@@ -175,9 +175,7 @@ async fn publish_value(target: &str, value: &str, label: &str) -> anyhow::Result
             }
             std::fs::write(path, value)
                 .with_context(|| format!("writing {label} to file '{target}'"))?;
-            println!(
-                "  \x1b[32m\u{2714}\x1b[0m Published {label} \u{2192} \x1b[36m{target}\x1b[0m"
-            );
+            out!("  \x1b[32m\u{2714}\x1b[0m Published {label} \u{2192} \x1b[36m{target}\x1b[0m");
             Ok(())
         }
         (PARAMETER_STORE_SCHEME, _) => {
@@ -230,7 +228,7 @@ async fn put_ssm_parameter(
             )
         })?;
 
-    println!(
+    out!(
         "  \x1b[32m\u{2714}\x1b[0m Published {label} \u{2192} \x1b[36m{}\x1b[0m",
         render_target(target)
     );
@@ -296,7 +294,7 @@ async fn put_s3_object(target: &S3Target, value: &str, label: &str) -> anyhow::R
             )
         })?;
 
-    println!(
+    out!(
         "  \x1b[32m\u{2714}\x1b[0m Published {label} \u{2192} \x1b[36m{}\x1b[0m",
         render_s3_target(target)
     );

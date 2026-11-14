@@ -20,8 +20,18 @@ use crate::app::{InputMode, WizardApp};
 /// Draw a gradient border around a rect, with colors fading from purple to blue.
 /// Returns the inner area (1 cell inset on each side).
 fn render_gradient_border(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    // A border needs two columns and two rows; below that there is nothing
+    // to draw and the edge arithmetic would underflow.
+    if area.width < 2 || area.height < 2 {
+        return Rect {
+            width: 0,
+            height: 0,
+            ..area
+        };
+    }
     let buf = frame.buffer_mut();
     let h = area.height;
+    let right = area.x + area.width - 1;
 
     // Rounded border characters
     const TL: &str = "╭";
@@ -39,10 +49,8 @@ fn render_gradient_border(frame: &mut Frame, area: Rect, title: &str) -> Rect {
         if row == 0 {
             // Top border: ╭───── title ─────╮
             buf[(area.x, y)].set_symbol(TL).set_style(style);
-            buf[(area.x + area.width - 1, y)]
-                .set_symbol(TR)
-                .set_style(style);
-            for x in (area.x + 1)..(area.x + area.width - 1) {
+            buf[(right, y)].set_symbol(TR).set_style(style);
+            for x in (area.x + 1)..right {
                 buf[(x, y)].set_symbol(HZ).set_style(style);
             }
             // Title overlay
@@ -50,25 +58,21 @@ fn render_gradient_border(frame: &mut Frame, area: Rect, title: &str) -> Rect {
             let padded = format!(" {title} ");
             for (i, ch) in padded.chars().enumerate() {
                 let x = title_start + i as u16;
-                if x < area.x + area.width - 2 {
+                if x < right.saturating_sub(1) {
                     buf[(x, y)].set_char(ch).set_style(theme::title_style());
                 }
             }
-        } else if row == h - 1 {
+        } else if row + 1 == h {
             // Bottom border
             buf[(area.x, y)].set_symbol(BL).set_style(style);
-            buf[(area.x + area.width - 1, y)]
-                .set_symbol(BR)
-                .set_style(style);
-            for x in (area.x + 1)..(area.x + area.width - 1) {
+            buf[(right, y)].set_symbol(BR).set_style(style);
+            for x in (area.x + 1)..right {
                 buf[(x, y)].set_symbol(HZ).set_style(style);
             }
         } else {
             // Side borders
             buf[(area.x, y)].set_symbol(VT).set_style(style);
-            buf[(area.x + area.width - 1, y)]
-                .set_symbol(VT)
-                .set_style(style);
+            buf[(right, y)].set_symbol(VT).set_style(style);
         }
     }
 
@@ -81,8 +85,141 @@ fn render_gradient_border(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     }
 }
 
+/// Smallest terminal the layout fits in. Below it the wizard shows a
+/// "terminal too small" screen instead of a clipped (or panicking) layout.
+pub const MIN_WIDTH: u16 = 60;
+pub const MIN_HEIGHT: u16 = 16;
+
 /// Render the full wizard layout.
 pub fn render(frame: &mut Frame, app: &WizardApp) {
+    let size = frame.area();
+    if size.width < MIN_WIDTH || size.height < MIN_HEIGHT {
+        render_too_small(frame, size);
+    } else {
+        render_wizard(frame, app);
+    }
+    // `NO_COLOR`: keep the layout and the bold / underline cues, drop
+    // every colour in one place rather than in each widget.
+    if !crate::style::tui_color_enabled() {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            cell.set_fg(Color::Reset);
+            cell.set_bg(Color::Reset);
+        }
+    }
+}
+
+fn render_too_small(frame: &mut Frame, area: Rect) {
+    let text = format!(
+        "Terminal too small ({}x{}).\nResize to at least {MIN_WIDTH}x{MIN_HEIGHT}, \
+         or press Ctrl+C to quit.",
+        area.width, area.height
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// The key hints for what is on screen, built from the keys the handler in
+/// `main::handle_key_event` actually binds in this state.
+pub fn help_text(app: &WizardApp) -> String {
+    use crate::app::{FocusPanel, KeyStoragePhase};
+    use crate::sealed_handoff::SealedPhase;
+    use crate::vta::ConnectPhase;
+
+    const QUIT: &str = "Ctrl+C/F10 Quit";
+    let mut keys: Vec<&str> = Vec::new();
+
+    if app.quit_confirm_pending() {
+        return "y Quit  n/Esc Stay".into();
+    }
+    if app.in_discovery_overlay() {
+        keys.extend([
+            "\u{2191}\u{2193}/PgUp/PgDn Scroll",
+            "Enter Pick",
+            "Esc Cancel",
+            QUIT,
+        ]);
+        return keys.join("  ");
+    }
+
+    let sealed_phase = app
+        .sealed_handoff
+        .as_ref()
+        .filter(|_| app.in_sealed_handoff_subflow())
+        .map(|s| s.phase);
+    let vta_phase = app.vta_connect.as_ref().map(|s| s.phase.clone());
+
+    match app.mode {
+        InputMode::TextInput => {
+            if matches!(
+                app.key_storage_phase,
+                Some(KeyStoragePhase::AwsNamespace)
+                    | Some(KeyStoragePhase::GcpNamespace)
+                    | Some(KeyStoragePhase::AzureVault)
+                    | Some(KeyStoragePhase::VaultMount)
+            ) {
+                keys.push("F5 List existing");
+            }
+            keys.extend(["Enter Confirm", "\u{2190}\u{2192} Move", "Esc Back"]);
+        }
+        InputMode::Confirming => {
+            keys.push("Enter Confirm");
+            if app.current_step == crate::app::WizardStep::Summary {
+                keys.extend(["c Copy config path", "b Copy backend URL"]);
+            }
+            keys.push("Esc Back");
+        }
+        InputMode::Selecting => match app.focus {
+            FocusPanel::Progress => {
+                keys.extend([
+                    "\u{2191}\u{2193}/j/k Navigate",
+                    "Enter Jump",
+                    "\u{2192}/Esc Options",
+                ]);
+            }
+            FocusPanel::Content => {
+                if sealed_phase == Some(SealedPhase::RequestGenerated) {
+                    keys.extend([
+                        "\u{2191}\u{2193}/PgUp/PgDn Scroll",
+                        "c Copy request",
+                        "v Copy vta cmd",
+                        "p Copy pnm cmd",
+                        "f Copy fallback",
+                        "Enter Continue",
+                    ]);
+                } else {
+                    keys.push("\u{2191}\u{2193}/j/k Navigate");
+                    if app.current_step.is_multi_select() {
+                        keys.extend(["Space Toggle", "Enter Continue"]);
+                    } else {
+                        keys.push("Enter Select");
+                    }
+                    if sealed_phase == Some(SealedPhase::Complete)
+                        || vta_phase == Some(ConnectPhase::Connected)
+                    {
+                        keys.push("m/a/v Copy DIDs");
+                    }
+                    if vta_phase == Some(ConnectPhase::AwaitingAcl) {
+                        keys.push("c Copy command");
+                    }
+                    keys.push("\u{2190} Steps");
+                }
+                keys.push(if app.provision_in_flight() {
+                    "Esc Cancel"
+                } else {
+                    "Esc Back"
+                });
+            }
+        },
+    }
+    keys.push(QUIT);
+    keys.join("  ")
+}
+
+fn render_wizard(frame: &mut Frame, app: &WizardApp) {
     let size = frame.area();
 
     // Outer gradient border
@@ -100,51 +237,47 @@ pub fn render(frame: &mut Frame, app: &WizardApp) {
         x: inner.x,
         y: inner.y + main_area.height,
         width: inner.width,
-        height: help_height,
+        height: help_height.min(inner.height),
     };
 
-    // Render help bar — surfacing the F5 hotkey on discoverable
-    // cloud-backend phases so operators don't have to read the
-    // prompt's hint text to find it. Discovery overlay states get
-    // their own bar so the keys actually available there
-    // (\u{2191}/\u{2193} scroll, Enter pick, Esc cancel) are visible
-    // without scanning the (now hidden) usual key map.
-    let discovery_help = "\u{2191}\u{2193}/PgUp/PgDn Scroll  Enter Pick  Esc Cancel  F10 Quit";
-    let help_text = if app.in_discovery_overlay() {
-        discovery_help
-    } else if matches!(
-        app.key_storage_phase,
-        Some(crate::app::KeyStoragePhase::AwsNamespace)
-            | Some(crate::app::KeyStoragePhase::GcpNamespace)
-            | Some(crate::app::KeyStoragePhase::AzureVault)
-            | Some(crate::app::KeyStoragePhase::VaultMount)
-    ) {
-        "F5 List existing  Enter Confirm  Esc Cancel  F10 Quit"
-    } else {
-        match app.mode {
-            InputMode::TextInput => {
-                "\u{2191}\u{2193} Navigate  Enter Confirm  Esc Cancel  F10 Quit"
-            }
-            InputMode::Confirming => "Enter Confirm  Esc Back  F10 Quit",
-            _ => match app.focus {
-                crate::app::FocusPanel::Content => {
-                    if app.current_step.is_multi_select() {
-                        "\u{2191}\u{2193} Navigate  Space Toggle  Enter Continue  \u{2190} Steps  Esc Back  F10 Quit"
-                    } else {
-                        "\u{2191}\u{2193} Navigate  Enter Select  \u{2190} Steps  Esc Back  F10 Quit"
-                    }
-                }
-                crate::app::FocusPanel::Progress => {
-                    "\u{2191}\u{2193} Navigate  Enter Jump  \u{2192} Options  Esc Back  F10 Quit"
-                }
-            },
-        }
-    };
-    let help = Paragraph::new(Line::from(Span::styled(
-        format!("  {help_text}"),
-        theme::muted_style(),
-    )));
+    // First line: why the last input was refused, or what a background
+    // task reported. Second line: the keys.
+    let status = app
+        .input_error
+        .as_ref()
+        .map(|e| Span::styled(format!("  \u{26A0} {e}"), theme::warning_style()))
+        .or_else(|| {
+            app.session_persist_status
+                .as_ref()
+                .filter(|_| app.current_step == crate::app::WizardStep::Vta)
+                .map(|s| Span::styled(format!("  {s}"), theme::muted_style()))
+        })
+        .unwrap_or_default();
+    let help = Paragraph::new(vec![
+        Line::from(status),
+        Line::from(Span::styled(
+            format!("  {}", help_text(app)),
+            theme::muted_style(),
+        )),
+    ]);
     frame.render_widget(help, help_area);
+
+    // A pending quit confirmation sits over everything.
+    if app.quit_confirm_pending() {
+        let text = "A VTA session exists: the VTA has already minted keys / used the setup \
+                    ACL for this run. Its admin credential is stored in the secret backend, \
+                    but quitting now leaves the mediator unconfigured.\n\nQuit anyway? [y/N]";
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: true }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Quit? ")
+                    .padding(Padding::uniform(1)),
+            ),
+            main_area,
+        );
+        return;
+    }
 
     // Summary step gets full width
     if app.current_step == crate::app::WizardStep::Summary {
@@ -643,11 +776,10 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                 // with `unreachable!()` to keep the patterns
                 // exhaustive without duplicating the prompt struct.
                 let (title, desc, placeholder, hint) = match phase {
-                    KeyStoragePhase::FileEncryptChoice => {
-                        unreachable!("FileEncryptChoice runs in selection mode, not TextInput")
-                    }
-                    KeyStoragePhase::VaultAuthMethod => {
-                        unreachable!("VaultAuthMethod runs in selection mode, not TextInput")
+                    // Selection-mode phases: nothing to prompt for if the
+                    // mode is momentarily out of step.
+                    KeyStoragePhase::FileEncryptChoice | KeyStoragePhase::VaultAuthMethod => {
+                        return;
                     }
                     KeyStoragePhase::FileGate => (
                         "file:// is dev-only — type \"I understand\" to confirm",
@@ -880,15 +1012,10 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                          `<url>/.well-known/did.jsonl`, so only scheme+host \
                          (plus optional port) matter.",
                     ),
-                    DidPhase::SelectWebvhHost => {
-                        unreachable!("SelectWebvhHost runs in Selecting mode, not TextInput")
-                    }
-                    DidPhase::SaveDidWebChoice => {
-                        unreachable!("SaveDidWebChoice runs in Selecting mode, not TextInput")
-                    }
-                    DidPhase::IdentityFormChoice => {
-                        unreachable!("IdentityFormChoice runs in Selecting mode, not TextInput")
-                    }
+                    // Selection-mode phases: nothing to prompt for.
+                    DidPhase::SelectWebvhHost
+                    | DidPhase::SaveDidWebChoice
+                    | DidPhase::IdentityFormChoice => return,
                 };
                 prompt::render_prompt(
                     frame,
@@ -987,11 +1114,29 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                 }
                 return;
             }
+            // Name the field being typed where a step has more than one.
+            let (title, description) = match (app.current_step, app.ssl_field) {
+                (crate::app::WizardStep::Admin, _) => (
+                    "Existing admin DID".to_string(),
+                    "The DID that will administer the mediator (did:<method>:<id>). The \
+                     wizard holds no key for it."
+                        .to_string(),
+                ),
+                (crate::app::WizardStep::Security, Some(crate::app::SslField::Key)) => (
+                    "SSL private key file".to_string(),
+                    "Path to the PEM private key that matches the certificate.".to_string(),
+                ),
+                (crate::app::WizardStep::Security, _) => (
+                    "SSL certificate file".to_string(),
+                    "Path to the PEM certificate (chain).".to_string(),
+                ),
+                _ => (step_data.title.clone(), step_data.description.clone()),
+            };
             text_input::render_text_input(
                 frame,
                 chunks[0],
-                &step_data.title,
-                &step_data.description,
+                &title,
+                &description,
                 &app.text_input,
                 true,
             );
@@ -1237,10 +1382,9 @@ fn render_sealed_complete(
 ) {
     use ratatui::widgets::Padding;
 
-    let session = state
-        .session
-        .as_ref()
-        .expect("Complete phase always carries a session");
+    let Some(session) = state.session.as_ref() else {
+        return;
+    };
 
     let label = theme::title_style();
     let value = Style::default().fg(theme::TEXT);
