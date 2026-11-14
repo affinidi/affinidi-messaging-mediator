@@ -24,8 +24,11 @@ serde_ignored = "0.1"
 ipnet = { workspace = true, features = ["serde"] }
 # Lean error type for config loading (`ConfigError`).
 thiserror.workspace = true
-# Structured logging in the file-reading helpers, matching the mediator.
+# Structured logging in the file-reading helpers, matching the mediator; its
+# `LevelFilter` is what `settings::log_level` reads `log_level` into.
 tracing.workspace = true
+# `[secrets] cache_ttl` durations (`settings::secrets_cache_ttl`).
+humantime.workspace = true
 # Only for the lean ACL types used by validation (`types::acls`, always available
 # regardless of features). `default-features = false` keeps this crate off the
 # axum/redis/secrets stack. `DatabaseConfigRaw` is defined locally (see

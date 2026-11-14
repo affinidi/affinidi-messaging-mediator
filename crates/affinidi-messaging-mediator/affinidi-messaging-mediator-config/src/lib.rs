@@ -11,7 +11,13 @@
 //! - [`validate`]: boot-time checks on raw values, with a crate-local
 //!   [`ConfigError`];
 //! - [`values`]: the strict readers every string-typed setting goes through
-//!   (an unreadable value is an error naming `section.key`, never a default).
+//!   (an unreadable value is an error naming `section.key`, never a default);
+//! - [`defaults`]: the one table of built-in defaults. The raw schema's serde
+//!   defaults and `Default` impls, and the mediator's typed defaults, all
+//!   derive from it;
+//! - [`settings`]: the typed reads of the sections whose runtime form needs
+//!   nothing beyond this crate (`log_level`, `[streaming]`, `[did_resolver]`,
+//!   `[secrets] cache_ttl`, `[storage]`).
 //!
 //! It is intentionally dependency-light: serde, plus the lean tier of
 //! `affinidi-messaging-mediator-common` for the ACL types validation uses. The
@@ -23,12 +29,14 @@
 //! One schema, two consumers: the mediator, and the `mediator-setup` wizard,
 //! which applies the same checks to recipe values.
 
+pub mod defaults;
 pub mod env;
 pub mod error;
 mod limits;
 mod processors;
 mod schema;
 mod security;
+pub mod settings;
 pub mod validate;
 pub mod values;
 

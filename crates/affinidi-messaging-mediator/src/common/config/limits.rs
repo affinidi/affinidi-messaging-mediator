@@ -134,7 +134,7 @@ pub struct LimitsConfig {
     pub metrics_requests_per_second: u32,
     /// Seconds between the pings the mediator sends on each WebSocket.
     /// At least 1.
-    #[serde(default = "default_ws_ping_interval_secs")]
+    #[serde(default = "defaults::ws_ping_interval_secs")]
     pub ws_ping_interval_secs: u64,
     /// How long a WebSocket peer may stay silent. Once a ping goes
     /// unanswered, the peer has `ws_pong_timeout_secs - ws_ping_interval_secs`
@@ -144,12 +144,12 @@ pub struct LimitsConfig {
     /// [`ws_ping_interval_secs`](Self::ws_ping_interval_secs), so a peer that
     /// answers every ping is never closed. Must also cover the slowest single
     /// inbound frame upload, since a frame only counts once complete.
-    #[serde(default = "default_ws_pong_timeout_secs")]
+    #[serde(default = "defaults::ws_pong_timeout_secs")]
     pub ws_pong_timeout_secs: u64,
     /// Seconds one write to a WebSocket may take. A peer that stops reading
     /// leaves a write waiting once its TCP window closes; past this the
     /// mediator closes the connection with 1001. At least 1.
-    #[serde(default = "default_ws_write_timeout_secs")]
+    #[serde(default = "defaults::ws_write_timeout_secs")]
     pub ws_write_timeout_secs: u64,
     /// Seconds an HTTP/1 client has to send a request's headers, counted from
     /// when the connection is ready for its next request: it bounds a slow
@@ -172,43 +172,38 @@ pub struct LimitsConfig {
     pub mux: MuxConfig,
 }
 
-/// Defaults for the endpoint and relay limits, shared by [`LimitsConfig`]'s
-/// `Default`, its serde defaults and the raw-config parse.
+/// Serde defaults for [`LimitsConfig`]'s later-added fields. Each is a value
+/// from the config crate's one defaults table
+/// ([`defaults::limits`](affinidi_messaging_mediator_config::defaults::limits));
+/// serde needs a function path, so these only adapt it.
 mod defaults {
-    pub(super) fn relay_connections_per_ip() -> usize {
-        10
+    use affinidi_messaging_mediator_config::defaults::limits as d;
+
+    macro_rules! table {
+        ($($name:ident: $ty:ty = $value:ident),* $(,)?) => {
+            $(
+                pub(super) fn $name() -> $ty {
+                    d::$value
+                }
+            )*
+        };
     }
-    pub(super) fn relay_frames_per_second() -> u32 {
-        50
-    }
-    pub(super) fn relay_frame_burst() -> u32 {
-        100
-    }
-    pub(super) fn relay_bytes_per_second() -> u32 {
-        4_194_304
-    }
-    pub(super) fn metrics_requests_per_second() -> u32 {
-        5
-    }
-    /// The per-IP request rate's default (`rate_limit_per_ip`).
-    pub(super) fn ws_messages_per_second() -> u32 {
-        100
-    }
-    /// The per-IP burst's default (`rate_limit_burst`).
-    pub(super) fn ws_message_burst() -> u32 {
-        50
-    }
-    pub(super) fn ws_message_throttle_close_secs() -> u64 {
-        10
-    }
-    pub(super) fn http_header_read_timeout_secs() -> u64 {
-        30
-    }
-    pub(super) fn http_request_timeout_secs() -> u64 {
-        60
-    }
-    pub(super) fn max_http_connections() -> usize {
-        20_000
+
+    table! {
+        relay_connections_per_ip: usize = RELAY_CONNECTIONS_PER_IP,
+        relay_frames_per_second: u32 = RELAY_FRAMES_PER_SECOND,
+        relay_frame_burst: u32 = RELAY_FRAME_BURST,
+        relay_bytes_per_second: u32 = RELAY_BYTES_PER_SECOND,
+        metrics_requests_per_second: u32 = METRICS_REQUESTS_PER_SECOND,
+        ws_messages_per_second: u32 = WS_MESSAGES_PER_SECOND,
+        ws_message_burst: u32 = WS_MESSAGE_BURST,
+        ws_message_throttle_close_secs: u64 = WS_MESSAGE_THROTTLE_CLOSE_SECS,
+        ws_ping_interval_secs: u64 = WS_PING_INTERVAL_SECS,
+        ws_pong_timeout_secs: u64 = WS_PONG_TIMEOUT_SECS,
+        ws_write_timeout_secs: u64 = WS_WRITE_TIMEOUT_SECS,
+        http_header_read_timeout_secs: u64 = HTTP_HEADER_READ_TIMEOUT_SECS,
+        http_request_timeout_secs: u64 = HTTP_REQUEST_TIMEOUT_SECS,
+        max_http_connections: usize = MAX_HTTP_CONNECTIONS,
     }
 }
 
@@ -376,54 +371,13 @@ impl LimitsConfig {
     }
 }
 
+/// The config crate's defaults table
+/// ([`defaults::limits`](affinidi_messaging_mediator_config::defaults::limits)),
+/// read through the same strict conversion and invariant checks a file goes
+/// through — so a default can never be a value the file would refuse.
 impl Default for LimitsConfig {
     fn default() -> Self {
-        LimitsConfig {
-            attachments_max_count: 20,
-            crypto_operations_per_message: 1000,
-            deleted_messages: 100,
-            forward_task_queue: 50_000,
-            http_size: 10_485_760,
-            listed_messages: 100,
-            local_max_acl: 1_000,
-            message_expiry_seconds: 604_800,
-            delivered_expiry_seconds: 0,
-            pickup_round_robin: true,
-            message_size: 1_048_576,
-            queued_send_messages_per_peer: 50,
-            queued_send_messages_soft: 2_000,
-            queued_send_messages_hard: 10_000,
-            queued_receive_messages_soft: 200,
-            queued_receive_messages_hard: 1_000,
-            to_keys_per_recipient: 100,
-            to_recipients: 100,
-            ws_size: 10_485_760,
-            access_list_limit: 1_000,
-            oob_invite_ttl: 86_400,
-            rate_limit_per_ip: 100,
-            rate_limit_burst: 50,
-            max_websocket_connections: 10000,
-            max_websocket_connections_per_did: 100,
-            did_rate_limit_per_second: 0,
-            did_rate_limit_burst: 10,
-            ws_send_buffer: 33_554_432,
-            pubsub_buffer: 16_777_216,
-            relay_connections_per_ip: defaults::relay_connections_per_ip(),
-            relay_frames_per_second: defaults::relay_frames_per_second(),
-            relay_frame_burst: defaults::relay_frame_burst(),
-            relay_bytes_per_second: defaults::relay_bytes_per_second(),
-            metrics_requests_per_second: defaults::metrics_requests_per_second(),
-            ws_messages_per_second: defaults::ws_messages_per_second(),
-            ws_message_burst: defaults::ws_message_burst(),
-            ws_message_throttle_close_secs: defaults::ws_message_throttle_close_secs(),
-            ws_ping_interval_secs: DEFAULT_WS_PING_INTERVAL_SECS,
-            ws_pong_timeout_secs: DEFAULT_WS_PONG_TIMEOUT_SECS,
-            ws_write_timeout_secs: DEFAULT_WS_WRITE_TIMEOUT_SECS,
-            http_header_read_timeout_secs: defaults::http_header_read_timeout_secs(),
-            http_request_timeout_secs: defaults::http_request_timeout_secs(),
-            max_http_connections: defaults::max_http_connections(),
-            mux: MuxConfig::default(),
-        }
+        Self::try_from(LimitsConfigRaw::default()).expect("the built-in limits are valid")
     }
 }
 
@@ -502,20 +456,6 @@ fn ws_message_limits(raw: &LimitsConfigRaw) -> Result<(u32, u32, u64), MediatorE
     )?
     .unwrap_or_else(defaults::ws_message_throttle_close_secs);
     Ok((rate, burst, close_secs))
-}
-
-const DEFAULT_WS_PING_INTERVAL_SECS: u64 = 30;
-const DEFAULT_WS_PONG_TIMEOUT_SECS: u64 = 90;
-const DEFAULT_WS_WRITE_TIMEOUT_SECS: u64 = 30;
-
-fn default_ws_ping_interval_secs() -> u64 {
-    DEFAULT_WS_PING_INTERVAL_SECS
-}
-fn default_ws_pong_timeout_secs() -> u64 {
-    DEFAULT_WS_PONG_TIMEOUT_SECS
-}
-fn default_ws_write_timeout_secs() -> u64 {
-    DEFAULT_WS_WRITE_TIMEOUT_SECS
 }
 
 /// The WebSocket liveness settings, held to values that work together:

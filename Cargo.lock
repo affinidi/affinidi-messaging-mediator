@@ -588,6 +588,7 @@ name = "affinidi-messaging-mediator-config"
 version = "0.52.0"
 dependencies = [
  "affinidi-messaging-mediator-common",
+ "humantime",
  "ipnet",
  "serde",
  "serde_ignored",

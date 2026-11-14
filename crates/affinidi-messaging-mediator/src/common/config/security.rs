@@ -543,8 +543,11 @@ pub(crate) trait SecurityConfigRawExt {
     /// Read every file-only `[security]` value strictly, and check the ones
     /// that must agree.
     fn values(&self) -> Result<SecurityValues, MediatorError>;
+    /// Build the runtime config from `values` (this section's
+    /// [`values`](Self::values)), loading the secrets it needs.
     async fn convert(
         &self,
+        values: SecurityValues,
         secrets_resolver: Arc<ThreadedSecretsResolver>,
         secrets: &MediatorSecrets,
         vta_bundle: Option<&[OperatingSecret]>,
@@ -803,13 +806,16 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
     ///
     /// The JWT secret is always loaded from the backend's `JWT_SECRET`
     /// well-known entry — no inline `string://` path.
+    ///
+    /// `values` is what [`values`](Self::values) read from `self`; the file is
+    /// not read a second time.
     async fn convert(
         &self,
+        values: SecurityValues,
         secrets_resolver: Arc<ThreadedSecretsResolver>,
         secrets: &MediatorSecrets,
         vta_bundle: Option<&[OperatingSecret]>,
     ) -> Result<SecurityConfig, MediatorError> {
-        let values = self.values()?;
         let mut config = SecurityConfig {
             mediator_acl_mode: values.mediator_acl_mode,
             global_acl_default: values.global_acl_default,
