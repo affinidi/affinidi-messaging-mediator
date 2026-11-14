@@ -19,7 +19,7 @@ use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, Probl
 #[cfg(feature = "didcomm")]
 use http::StatusCode;
 #[cfg(feature = "didcomm")]
-use tracing::{Instrument, error, span, trace};
+use tracing::{Instrument, span, trace};
 
 /// Store `data` for `to_did_hash`, then publish the live notification.
 ///
@@ -171,21 +171,17 @@ pub(crate) async fn store_message(
                 }
                 Ok(InboundMessageResponse::Ephemeral(packed))
             }
-            // Kept as the refusal it has always been: a DIDComm ping that
-            // asked for no response is answered with this error today.
+            // The message was handled and asked for no answer (a ping with
+            // `response_requested: false`, a Trust Task answered with
+            // silence). That is a success with nothing in it: over REST the
+            // usual `200` envelope with `data: "Empty"` — the same status
+            // every other accepted `/inbound` message gets, and the SDK's
+            // variant for "no response expected" — and over a WebSocket no
+            // frame at all. It was once a `500 me.storage.message.error`,
+            // which told the sender a handled message had failed.
             ProcessMessageResponse::Nothing => {
-                error!("No message to return");
-                Err(MediatorError::problem(
-                    error_codes::MESSAGE_STORE_ERROR,
-                    &session.session_id,
-                    None,
-                    ProblemReportSorter::Error,
-                    ProblemReportScope::Protocol,
-                    "me.storage.message.error",
-                    "Expected a message to store, instead got None",
-                    vec![],
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ))
+                debug!("Handled; nothing to answer");
+                Ok(InboundMessageResponse::Empty)
             }
         }
     }

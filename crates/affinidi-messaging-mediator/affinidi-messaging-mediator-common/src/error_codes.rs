@@ -370,7 +370,8 @@ pub const MESSAGE_RECIPIENTS_MISSING: u16 = 75;
 /// `e.p.message.recipients.too_many`.
 pub const MESSAGE_RECIPIENTS_TOO_MANY: u16 = 76;
 
-/// Internal error while storing the message. Problem code
+/// No longer returned; a handled message with nothing to answer is a success
+/// (`InboundMessageResponse::Empty`). Problem code
 /// `e.p.me.storage.message.error`.
 pub const MESSAGE_STORE_ERROR: u16 = 77;
 

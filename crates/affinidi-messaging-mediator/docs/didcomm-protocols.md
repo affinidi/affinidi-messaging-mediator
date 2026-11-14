@@ -38,7 +38,7 @@ Simple protocol to verify connectivity and that the mediator is responsive.
 
 | Field                | Type   | Required | Description                                                                                                |
 | -------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `response_requested` | `bool` | No       | If `true` (default), the mediator sends a ping response back. If `false`, the mediator processes silently. A ping asking for a response must carry a `from` header, else `message.anonymous`. |
+| `response_requested` | `bool` | No       | If `true` (default), the mediator sends a ping response back. If `false`, the mediator processes silently: over REST `/inbound` answers `200` with `data: "Empty"`, over a WebSocket nothing is sent. A ping asking for a response must carry a `from` header, else `message.anonymous`. |
 
 The ping must be addressed (`to`) to the mediator's DID, else `message.to`.
 

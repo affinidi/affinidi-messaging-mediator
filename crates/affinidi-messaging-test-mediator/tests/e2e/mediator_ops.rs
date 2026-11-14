@@ -630,6 +630,159 @@ async fn a_dry_run_counts_and_the_real_purge_removes_only_the_filtered_peer() {
     );
 }
 
+/// A `messaging/queue/purge` request from `from`, signed by hand: the SDK's
+/// `queue_purge` has no `storedBefore` yet. Sent over DIDComm; returns the
+/// response payload.
+async fn purge_signed(
+    env: &TestEnvironment,
+    from: &TestUser,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    use affinidi_messaging_sdk::protocols::trust_tasks::ENVELOPE_TYPE;
+    use affinidi_messaging_sdk::transports::SendMessageResponse;
+    use affinidi_secrets_resolver::secrets::KeyType;
+    use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};
+
+    let mediator_did = env.mediator.did().to_string();
+    let now = chrono::Utc::now();
+    let doc = json!({
+        "id": format!("urn:uuid:{}", Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/messaging/queue/purge/0.1",
+        "issuer": from.did,
+        "recipient": mediator_did,
+        "issuedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": payload,
+    });
+    let key = from
+        .secrets
+        .iter()
+        .find(|s| s.get_key_type() == KeyType::Ed25519)
+        .expect("an Ed25519 signing key");
+    let doc = sign_trust_task(&doc, key, SignOptions::new())
+        .await
+        .expect("sign the task");
+    let secs = now.timestamp() as u64;
+    let msg = Message::build(
+        format!("urn:uuid:{}", Uuid::new_v4()),
+        ENVELOPE_TYPE.to_string(),
+        doc,
+    )
+    .to(mediator_did.clone())
+    .from(from.did.clone())
+    .created_time(secs)
+    .expires_time(secs + 60)
+    .finalize();
+    let msg_id = msg.id.clone();
+    let (packed, _) = env
+        .atm
+        .pack_encrypted(&msg, &mediator_did, Some(&from.did), None)
+        .await
+        .expect("authcrypt");
+    match env
+        .atm
+        .send_message(&from.profile, &packed, &msg_id, true, true)
+        .await
+        .expect("purge answered")
+    {
+        SendMessageResponse::Message(reply) => {
+            assert!(
+                reply.body["type"]
+                    .as_str()
+                    .is_some_and(|t| t.ends_with("queue/purge/0.1#response")),
+                "{:#}",
+                reply.body
+            );
+            reply.body["payload"].clone()
+        }
+        other => panic!("expected a reply message, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_purge_bounded_by_stored_before_spares_what_arrived_after_it() {
+    let env = direct_env().await;
+    let alice = env.add_user("alice").await.expect("alice");
+    let carol = env.add_user("carol").await.expect("carol");
+    let bob = env.add_user("bob").await.expect("bob");
+    env.atm
+        .profile_add(&bob.profile, true)
+        .await
+        .expect("bob live");
+    for _ in 0..2 {
+        send_direct(&env, &alice, &bob).await;
+    }
+    send_direct(&env, &carol, &bob).await;
+
+    // The instant to confirm against: the latest arrival so far, as the
+    // store stamped it, in the millisecond resolution the store keeps.
+    let listed = env
+        .mediator
+        .store()
+        .list_messages(
+            &bob.did_hash(),
+            affinidi_messaging_sdk::messages::Folder::Inbox,
+            None,
+            100,
+        )
+        .await
+        .expect("list");
+    let bound_ms = listed.iter().map(|e| e.timestamp).max().expect("listed") as i64;
+    let stored_before = chrono::DateTime::from_timestamp_millis(bound_ms)
+        .expect("instant")
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // Arrives after the instant, from the same peer.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send_direct(&env, &alice, &bob).await;
+    assert_eq!(receive_ids(&env, &bob).await.len(), 4);
+
+    let preview = purge_signed(
+        &env,
+        &bob,
+        json!({
+            "queue": "receive",
+            "peer": alice.did_hash(),
+            "storedBefore": stored_before,
+            "dryRun": true,
+        }),
+    )
+    .await;
+    assert_eq!(preview["matched"], 2, "{preview:#}");
+    assert_eq!(preview["purged"], 0, "{preview:#}");
+    assert!(
+        preview.get("selectedAt").is_none(),
+        "not sent until an SDK accepts it: {preview:#}"
+    );
+
+    let purged = purge_signed(
+        &env,
+        &bob,
+        json!({
+            "queue": "receive",
+            "peer": alice.did_hash(),
+            "storedBefore": stored_before,
+        }),
+    )
+    .await;
+    assert_eq!(purged["purged"], 2, "{purged:#}");
+    assert_eq!(
+        receive_ids(&env, &bob).await.len(),
+        2,
+        "carol's message and alice's later one survive"
+    );
+
+    let audit = env
+        .mediator
+        .store()
+        .audit_log_list(0, 50)
+        .await
+        .expect("audit");
+    assert!(
+        format!("{audit:?}").contains(&format!("stored before: {stored_before}")),
+        "the purge's storedBefore is audited: {audit:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_admin_watches_a_message_arrive_live() {
     use affinidi_messaging_sdk::tasks::messaging::monitor::subscribe::v0_1::MonitorFilter;

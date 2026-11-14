@@ -112,7 +112,7 @@ returned; they are kept so a number is never reused.
 | 74 | 503 | `e.p.did.resolve` | Maybe | A DID couldn't be resolved. On a forward (503, retryable): the mediator its next hop names. 400 when the recipient of a reply can't be resolved |
 | 75 | 500 | `e.p.message.recipients.missing` | No | There are no recipients for this message |
 | 76 | 500 | `e.p.message.recipients.too_many` | No | There are too many recipients for this message |
-| 77 | 500 | `e.p.me.storage.message.error` | No | Internal error while storing the message |
+| 77 | — | `e.p.me.storage.message.error` | — | No longer returned; a handled message with nothing to answer (a ping with `response_requested: false`) is a `200` with `data: "Empty"` |
 | 78 | — | `e.p.me.res.storage.pubsub.subscribe` | — | No longer returned; a failed subscribe is 14 |
 | 79 | 400 | `w.m.message.header.ephemeral.invalid` | No | The `ephemeral` header isn't a JSON boolean. Treated as false; the message is still sent |
 | 80 | — | `w.m.protocol.acls.change.denied` | — | No longer returned; the Trust Task is refused with `messaging/account/update:selfChangeDenied` |

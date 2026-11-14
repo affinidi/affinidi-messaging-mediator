@@ -925,9 +925,11 @@ impl MediatorConsole {
     /// mediator runs the purge within the margin. `purged` in the answer says
     /// how many went.
     ///
-    /// The SDK cannot send the purge task's `storedBefore` member yet, so the
-    /// pin is an age the console computes; the mediator still decides what
-    /// matches.
+    /// The pin is an age the console computes; the mediator still decides
+    /// what matches. The mediator also honours `storedBefore`, the exact
+    /// form of this pin, but no published `affinidi-messaging-sdk` can send
+    /// it yet (its `queue_purge` has no such parameter), so the console
+    /// switches to it once one can (#122).
     pub async fn purge(&self, plan: PurgePlan) -> Result<queue::purge::v0_1::Response> {
         let request = pinned_to_preview(
             &plan,
