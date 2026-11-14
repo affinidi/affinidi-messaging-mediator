@@ -208,6 +208,24 @@ pub mod streaming {
     pub const ENABLED: bool = true;
 }
 
+/// `[security]`. The file must state each of these keys (except
+/// `enable_inter_mediator_relay`, absent = off); the values here are what a
+/// `Config` built in code (`SecurityConfig::headless`, the `MediatorBuilder`)
+/// starts from. Every gate is closed (R5.1).
+pub mod security {
+    /// 15 minutes.
+    pub const JWT_ACCESS_EXPIRY: u64 = 900;
+    /// 1 day.
+    pub const JWT_REFRESH_EXPIRY: u64 = 86_400;
+    pub const USE_SSL: bool = true;
+    pub const LOCAL_DIRECT_DELIVERY_ALLOWED: bool = false;
+    pub const LOCAL_DIRECT_DELIVERY_ALLOW_ANON: bool = false;
+    pub const BLOCK_ANONYMOUS_OUTER_ENVELOPE: bool = true;
+    pub const FORCE_SESSION_DID_MATCH: bool = true;
+    pub const BLOCK_REMOTE_ADMIN_MSGS: bool = true;
+    pub const ENABLE_INTER_MEDIATOR_RELAY: bool = false;
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{ForwardingConfigRaw, LimitsConfigRaw, MuxConfigRaw};
