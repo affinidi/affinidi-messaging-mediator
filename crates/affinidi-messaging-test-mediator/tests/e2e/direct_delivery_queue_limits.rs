@@ -27,15 +27,10 @@ use uuid::Uuid;
 /// handful of real sends; the production default is 50.
 const PER_PEER: i32 = 4;
 
-/// How many messages actually fit under a cap of [`PER_PEER`].
-///
-/// `queue_at_capacity` refuses when `queued + incoming >= limit`, so a limit of
-/// L admits L-1 — the incoming message is counted against the cap it is being
-/// checked against. That is the mediator's existing convention (the forward
-/// path has always worked this way) and is deliberately not changed here;
-/// naming it is how these tests avoid encoding an off-by-one as an
-/// expectation.
-const FITS: i32 = PER_PEER - 1;
+/// How many messages fit under a cap of [`PER_PEER`]: all of them. A limit
+/// of L admits L (`queue_at_capacity` refuses only when `queued + incoming`
+/// would go past it); it used to admit L-1.
+const FITS: i32 = PER_PEER;
 
 /// Collect `user`'s mailbox, **deleting** as it reads.
 ///

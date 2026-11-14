@@ -3,12 +3,17 @@ use affinidi_messaging_sdk::messages::{
     GetMessagesRequest, GetMessagesResponse,
     problem_report::{ProblemReportScope, ProblemReportSorter},
 };
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::State,
+    response::{IntoResponse, Response},
+};
 use http::StatusCode;
-use tracing::{Instrument, Level, debug, span};
+use tracing::{Instrument, Level, debug, span, warn};
 
 use crate::{
     SharedData,
+    after_write::{AfterWrite, HandedOver, HandedOverMessage, respond_then},
     common::authz::{self, Capability},
     common::session::Session,
     messages::client_delete::delete_for_client,
@@ -17,11 +22,17 @@ use crate::{
 /// Delivers messages to the client for given message_ids
 /// outbound refers to outbound from the mediator perspective
 /// ACL_MODE: Rquires LOCAL access
+///
+/// Each message is reported `delivered` — and, with `delete`, deleted — only
+/// once the response body carrying it has been written (R1.1). A response
+/// that is never fully written deletes and reports nothing, so the client can
+/// fetch again. A delete that then fails is logged; it cannot be reported in a
+/// response that has already gone, so `delete_errors` is always empty.
 pub async fn message_outbound_handler(
     session: Session,
     State(state): State<SharedData>,
     Json(body): Json<GetMessagesRequest>,
-) -> Result<(StatusCode, Json<SuccessResponse<GetMessagesResponse>>), AppError> {
+) -> Result<Response, AppError> {
     let _span = span!(
         Level::DEBUG,
         "message_outbound_handler",
@@ -73,6 +84,8 @@ pub async fn message_outbound_handler(
         }
 
         let mut messages = GetMessagesResponse::default();
+        let mut handed_over = HandedOver::new(&session.did_hash);
+        let mut to_delete: Vec<String> = Vec::new();
 
         for msg_id in &body.message_ids {
             debug!("getting message with id: {}", msg_id);
@@ -81,42 +94,11 @@ pub async fn message_outbound_handler(
                     debug!("Got message: {:?}", msg);
                     // Tag the message's wire protocol so the client can route it.
                     msg.detect_protocol_in_place();
-                    state
-                        .monitor
-                        .delivered_element(&msg, crate::monitor::Channel::Rest);
-                    // Kept for the delete event below: `msg` moves into the
-                    // response, and the body is what names the wire protocol.
-                    let msg_body = msg.msg.clone();
-                    messages.success.push(msg);
-
+                    handed_over.messages.push(HandedOverMessage::of(&msg));
                     if body.delete {
-                        debug!("Deleting message: {}", msg_id);
-                        // As `DELETE /delete`: the caller's own copy, else
-                        // what it sent unless this repeats an acknowledgement.
-                        let owners = [session.did_hash.clone()];
-                        match delete_for_client(&*state.database, &owners, msg_id, true).await {
-                            Ok(removed) => {
-                                // One event per copy removed.
-                                for copy in &removed.copies {
-                                    state.monitor.deleted(
-                                        msg_id,
-                                        &session.did_hash,
-                                        copy.from_did_hash.as_deref(),
-                                        Some(copy.to_did_hash.as_str()),
-                                        crate::monitor::Channel::Rest,
-                                        msg_body.as_deref(),
-                                    );
-                                }
-                                debug!("Deleted message: {}", msg_id);
-                            }
-                            Err(err) => {
-                                debug!("Error deleting message: {:?}", err);
-                                messages
-                                    .delete_errors
-                                    .push((msg_id.clone(), err.to_string()));
-                            }
-                        }
+                        to_delete.push(msg_id.clone());
                     }
+                    messages.success.push(msg);
                 }
                 Ok(None) => {
                     debug!("Message not found: {}", msg_id);
@@ -131,7 +113,48 @@ pub async fn message_outbound_handler(
             }
         }
 
-        Ok((
+        // After the body is written: report each message delivered, then
+        // delete what the client asked to have deleted.
+        let after = AfterWrite::default();
+        let deleted_on_write = {
+            let state = state.clone();
+            let owner = session.did_hash.clone();
+            Box::pin(async move {
+                for msg_id in to_delete {
+                    // As `DELETE /delete`: the caller's own copy, else what it
+                    // sent unless this repeats an acknowledgement.
+                    match delete_for_client(
+                        &*state.database,
+                        std::slice::from_ref(&owner),
+                        &msg_id,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(removed) => {
+                            for copy in &removed.copies {
+                                state.monitor.deleted(
+                                    &msg_id,
+                                    &owner,
+                                    copy.from_did_hash.as_deref(),
+                                    Some(copy.to_did_hash.as_str()),
+                                    crate::monitor::Channel::Rest,
+                                    None,
+                                );
+                            }
+                        }
+                        Err(err) => warn!(
+                            msg_id = %msg_id,
+                            "delete after a written /outbound response failed: {err}"
+                        ),
+                    }
+                }
+            })
+        };
+        after.push_completion(handed_over.completion(&state, crate::monitor::Channel::Rest));
+        after.push_completion(deleted_on_write);
+
+        let response = (
             StatusCode::OK,
             Json(SuccessResponse {
                 session_id: session.session_id,
@@ -141,7 +164,9 @@ pub async fn message_outbound_handler(
                 message: "Success".to_string(),
                 data: Some(messages),
             }),
-        ))
+        )
+            .into_response();
+        Ok(respond_then(response, after))
     }
     .instrument(_span)
     .await

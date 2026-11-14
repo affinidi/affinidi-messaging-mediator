@@ -1213,6 +1213,14 @@ pub async fn sender_session(
     })
 }
 
+/// The DID of the member `did_hash` on `session_id`'s mux connection, if it
+/// carries that member now.
+pub async fn member_did(state: &SharedData, session_id: &str, did_hash: &str) -> Option<String> {
+    let conn = state.mux.get(session_id)?;
+    let s = conn.session.lock().await;
+    s.get(did_hash).map(|m| m.did.clone())
+}
+
 /// The members of `session_id`'s mux connection that hold `cap` now, by
 /// scope and expiry only. Reads nothing: a caller acting for one of them
 /// checks that member's standing with [`allows`] once a request resolves to

@@ -46,6 +46,7 @@ pub(crate) fn generate_error_response(
         .insert("ack".into(), json!([thid.to_owned()]));
 
     Ok(ProcessMessageResponse {
+        handed_over: None,
         store_message,
         force_live_delivery: false,
         data: super::WrapperType::Message(Box::new(error_msg)),

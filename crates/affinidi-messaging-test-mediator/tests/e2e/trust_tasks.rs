@@ -43,9 +43,22 @@ async fn ping_trust_task_round_trips_through_the_mediator() {
         "advertises DIDComm: {:?}",
         response.protocols
     );
+    // TSP is advertised only by a mediator built with it (#196). With this
+    // crate's `tsp` feature the mediator certainly has it; without, it may
+    // still be unified in from elsewhere in the workspace.
+    if cfg!(feature = "tsp") {
+        assert!(
+            response.protocols.iter().any(|p| p == "tsp"),
+            "advertises TSP: {:?}",
+            response.protocols
+        );
+    }
     assert!(
-        response.protocols.iter().any(|p| p == "tsp"),
-        "advertises TSP: {:?}",
+        response
+            .protocols
+            .iter()
+            .all(|p| p == "didcomm" || p == "tsp"),
+        "advertises only protocols it serves: {:?}",
         response.protocols
     );
 }

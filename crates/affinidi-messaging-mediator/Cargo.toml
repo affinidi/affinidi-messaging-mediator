@@ -219,6 +219,9 @@ axum-extra = { version = "0.12", features = ["typed-header"] }
 ## TLS termination for direct HTTPS (alternative: use a reverse proxy)
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 http = "1"
+## Response-body wrapper that defers delivery bookkeeping until the body is
+## written (`after_write`). Already in the tree through axum/hyper.
+http-body = "1"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
 

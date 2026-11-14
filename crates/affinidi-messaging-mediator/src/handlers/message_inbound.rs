@@ -229,12 +229,14 @@ pub async fn message_inbound_handler(
                     Protocol::DidCommV1,
                     raw.as_bytes(),
                 );
-                let outcome = crate::monitor::with_channel(
+                // A pickup reply's deliveries are recorded once its body is
+                // written (`after_write`), not when the handler returns.
+                let (outcome, after) = crate::after_write::collect(crate::monitor::with_channel(
                     Channel::Rest,
                     crate::messages::inbound_v1::handle_inbound_didcomm_v1(&state, &session, raw),
-                )
-                .await
-                .inspect_err(|e| {
+                ))
+                .await;
+                let outcome = outcome.inspect_err(|e| {
                     state.monitor.refused(
                         &session.did_hash,
                         Channel::Rest,
@@ -244,7 +246,7 @@ pub async fn message_inbound_handler(
                     )
                 })?;
 
-                return Ok(match outcome {
+                let response = match outcome {
                     // A routed forward answers like any other stored message.
                     crate::messages::inbound_v1::V1Outcome::Stored(response) => (
                         StatusCode::OK,
@@ -268,7 +270,8 @@ pub async fn message_inbound_handler(
                         packed,
                     )
                         .into_response(),
-                });
+                };
+                return Ok(crate::after_write::respond_then(response, after));
             }
         }
 
@@ -320,31 +323,38 @@ pub async fn message_inbound_handler(
             Protocol::DidComm,
             s.as_bytes(),
         );
-        let response =
-            crate::monitor::with_channel(Channel::Rest, handle_inbound(&state, &session, &s))
-                .await
-                .inspect_err(|e| {
-                    state.monitor.refused(
-                        &session.did_hash,
-                        Channel::Rest,
-                        Protocol::DidComm,
-                        s.as_bytes(),
-                        e,
-                    )
-                })?;
+        // A pickup reply's deliveries are recorded once its body is written
+        // (`after_write`), not when the handler returns.
+        let (response, after) = crate::after_write::collect(crate::monitor::with_channel(
+            Channel::Rest,
+            handle_inbound(&state, &session, &s),
+        ))
+        .await;
+        let response = response.inspect_err(|e| {
+            state.monitor.refused(
+                &session.did_hash,
+                Channel::Rest,
+                Protocol::DidComm,
+                s.as_bytes(),
+                e,
+            )
+        })?;
 
-        Ok((
-            StatusCode::OK,
-            Json(SuccessResponse {
-                session_id: session.session_id,
-                http_code: StatusCode::OK.as_u16(),
-                error_code: 0,
-                error_code_str: "NA".to_string(),
-                message: "Success".to_string(),
-                data: Some(response),
-            }),
-        )
-            .into_response())
+        Ok(crate::after_write::respond_then(
+            (
+                StatusCode::OK,
+                Json(SuccessResponse {
+                    session_id: session.session_id,
+                    http_code: StatusCode::OK.as_u16(),
+                    error_code: 0,
+                    error_code_str: "NA".to_string(),
+                    message: "Success".to_string(),
+                    data: Some(response),
+                }),
+            )
+                .into_response(),
+            after,
+        ))
     }
     .instrument(_span)
     .await

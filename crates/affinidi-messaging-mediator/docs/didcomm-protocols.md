@@ -40,12 +40,18 @@ Simple protocol to verify connectivity and that the mediator is responsive.
 | -------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
 | `response_requested` | `bool` | No       | If `true` (default), the mediator sends a ping response back. If `false`, the mediator processes silently. A ping asking for a response must carry a `from` header, else `message.anonymous`. |
 
+The ping must be addressed (`to`) to the mediator's DID, else `message.to`.
+
 ### Ping Response
 
-| Field         | Value                                     |
-| ------------- | ----------------------------------------- |
-| **Type URI**  | `https://didcomm.org/trust-ping/2.0/ping` |
-| **Direction** | Mediator -> Client                        |
+| Field         | Value                                              |
+| ------------- | -------------------------------------------------- |
+| **Type URI**  | `https://didcomm.org/trust-ping/2.0/ping-response` |
+| **Direction** | Mediator -> Client                                 |
+
+Mediators before this release answered with the request type
+(`…/trust-ping/2.0/ping`); a client that matches the answer by type should
+accept both while it may talk to an older mediator.
 
 Only sent when `response_requested` is `true`.
 
@@ -89,13 +95,20 @@ Routes an encrypted DIDComm message to a recipient through the mediator.
 
 | Header        | Type   | Description |
 | ------------- | ------ | ----------- |
-| `ephemeral`   | `bool` | If `true`, the message is never stored or relayed. It is pushed only to a recipient that is live-connected right now, and dropped otherwise. |
-| `delay_milli` | `i64`  | Delay in milliseconds before the forwarding processor relays the message to a **remote** next hop. Values ≤ 0 mean no delay; local delivery is immediate. A magnitude above `processors.forwarding.future_time_limit` seconds is refused (`protocol.forwarding.delay_milli`). |
+| `ephemeral`   | `bool` | If `true`, the message is never stored or relayed. It is pushed only to a recipient that is live-connected right now; a recipient that is not is answered `delivery.not_live` (99), and the message is not queued. |
+| `delay_milli` | `i64`  | Delay in milliseconds before the forwarding processor relays the message to a **remote** next hop; local delivery is immediate. A whole number from `0` to `processors.forwarding.future_time_limit` × 1000. Anything else — negative, fractional, not a number, past the limit — is refused (`protocol.forwarding.delay_milli`). |
+
+`hop_count` on a forward is not read: a sender could set it low to defeat loop
+detection. Only the count an authenticated peer mediator carries on a
+re-wrap layer is used (see [`multi-mediator.md`](./multi-mediator.md)).
 
 **Attachments:**
 
-The packed message to forward is the first attachment, as `base64` or inline
-`json`. JWS-signed JSON and linked attachments are refused.
+A forward carries exactly one attachment: the packed message for `next`, as
+`base64` or inline `json`. A forward with more than one is refused
+(`protocol.forwarding.attachments.too_many`), as is one with none
+(`protocol.forwarding.attachments.missing`). JWS-signed JSON and linked
+attachments are refused.
 
 ### Response
 
@@ -116,8 +129,17 @@ Every Message Pickup 3.0 request must:
 - carry a `from` header (anonymous requests get `message.anonymous`);
 - include the extra header `"return_route": "all"` (else `protocol.pickup.return_route`).
 
-A request acts only on the authenticated session's own inbox. A
-`recipient_did` that differs from the session DID is refused.
+A request acts on the authenticated session's own inbox. On a mux connection
+(`affinidi-mux`) it may also act for a member that granted the principal
+`pickup` (status, delivery) or `delete` (messages-received); any other
+`recipient_did` that differs from the session DID is refused. A status reply's
+`recipient_did` names the account it reports on.
+
+Whatever a reply hands over is recorded — stamped delivered, reported as a
+`delivered` monitor event — only once the reply has been packed and handed to
+the transport: the REST response body written, or the live stream's push
+accepted. A reply that never gets that far records nothing, and its messages
+stay queued.
 
 Message IDs in this protocol are the mediator's stored message IDs (SHA-256
 hashes), as returned in the delivery attachment IDs — not the `id` header of
@@ -142,7 +164,7 @@ Request the current mailbox status for a DID.
 
 | Field           | Type     | Required | Description                                                            |
 | --------------- | -------- | -------- | ---------------------------------------------------------------------- |
-| `recipient_did` | `string` | No       | Must equal the session DID if present. Defaults to the session DID. |
+| `recipient_did` | `string` | No       | The session DID, or a mux member with `pickup`. Defaults to the session DID. |
 
 ### 3.2 Status Response
 
@@ -196,7 +218,7 @@ Toggle real-time message delivery via WebSocket.
 | --------------- | ------ | -------- | --------------------------------------------------- |
 | `live_delivery` | `bool` | Yes      | `true` to enable live delivery, `false` to disable. |
 
-**Response:** Returns a **Status Response** message (type `status`) with the updated `live_delivery` value.
+**Response:** Returns a **Status Response** message (type `status`) with the updated `live_delivery` value. On a mediator without streaming, turning live delivery on is refused (`protocol.pickup.live_streaming`, 501) rather than answered with a status claiming it is on.
 
 ### 3.4 Delivery Request
 
@@ -218,7 +240,7 @@ Request retrieval of queued messages.
 
 | Field           | Type     | Required | Description                                                          |
 | --------------- | -------- | -------- | -------------------------------------------------------------------- |
-| `recipient_did` | `string` | Yes      | Must equal the session DID.                                          |
+| `recipient_did` | `string` | Yes      | The session DID, or a mux member with `pickup`.                      |
 | `limit`         | `usize`  | Yes      | Number of messages to retrieve. Must be between 1 and 100 inclusive. |
 
 ### 3.5 Delivery Response
@@ -230,7 +252,8 @@ Request retrieval of queued messages.
 
 If messages exist, each one is an attachment: the stored packed message,
 base64url-encoded without padding, with the attachment `id` set to its message
-ID.
+ID. One delivery carries at most four `limits.message_size` of stored bodies
+(always at least one message); the rest stay queued for the next request.
 
 If no messages are available, a **Status Response** is returned instead.
 
@@ -261,9 +284,9 @@ Acknowledge receipt and delete messages from the mediator.
 
 | Field             | Type       | Required | Description                                             |
 | ----------------- | ---------- | -------- | ------------------------------------------------------- |
-| `message_id_list` | `string[]` | Yes      | Message IDs to delete. IDs not found in the caller's inbox are skipped. |
+| `message_id_list` | `string[]` | Yes      | Message IDs to delete, at most 100 (else `protocol.pickup.messages_received.limit`). IDs not found in the caller's inbox (or a mux member's with `delete`) are skipped. |
 
-**Response:** Returns a **Status Response** message reflecting the updated queue state.
+**Response:** Returns a **Status Response** message reflecting the updated queue state: the mux member's, when every acknowledged message was that member's, else the session's own.
 
 ---
 
@@ -366,7 +389,8 @@ documented once, in [`acls.md` §5](./acls.md#5-the-permission-bits) and
 
 | Protocol              | Message Type URI                                             | Direction          |
 | --------------------- | ------------------------------------------------------------ | ------------------ |
-| Trust Ping 2.0        | `https://didcomm.org/trust-ping/2.0/ping`                    | Request & Response |
+| Trust Ping 2.0        | `https://didcomm.org/trust-ping/2.0/ping`                    | Request            |
+| Trust Ping 2.0        | `https://didcomm.org/trust-ping/2.0/ping-response`           | Response           |
 | Routing 2.0           | `https://didcomm.org/routing/2.0/forward`                    | Request only       |
 | Message Pickup 3.0    | `https://didcomm.org/messagepickup/3.0/status-request`       | Request            |
 | Message Pickup 3.0    | `https://didcomm.org/messagepickup/3.0/status`               | Response           |

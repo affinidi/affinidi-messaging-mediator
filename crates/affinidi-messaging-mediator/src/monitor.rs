@@ -449,23 +449,8 @@ impl TrafficMonitor {
         });
     }
 
-    /// A stored message handed out on pickup, from its store record.
-    pub(crate) fn delivered_element(
-        &self,
-        element: &affinidi_messaging_mediator_common::types::messages::MessageListElement,
-        channel: Channel,
-    ) {
-        self.delivered(
-            &element.msg_id,
-            element.from_address.as_deref(),
-            element.to_address.as_deref(),
-            element.size,
-            channel,
-            element.msg.as_deref(),
-        );
-    }
-
     /// A stored message was handed to its recipient on pickup.
+    #[cfg_attr(not(feature = "tsp"), allow(dead_code))]
     pub(crate) fn delivered(
         &self,
         msg_id: &str,
