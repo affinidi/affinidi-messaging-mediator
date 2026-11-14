@@ -1,6 +1,8 @@
 //! What a client is told about a delivery matches what happened.
 //!
 //! - A trust-ping is answered with a `ping-response` (#196).
+//! - A trust-ping that asks for no response is a success with nothing in it
+//!   (`200`, `data: "Empty"`), not a `500 me.storage.message.error`.
 //! - A forward carrying more than one attachment is refused, not answered
 //!   `Forwarded` with the extra attachments dropped (#192).
 //! - A `messages-received` names at most 100 ids (#187).
@@ -168,6 +170,33 @@ async fn a_trust_ping_is_answered_with_a_ping_response() {
         .expect("the ping is answered");
     assert_eq!(pong.typ, "https://didcomm.org/trust-ping/2.0/ping-response");
     assert_eq!(pong.from.as_deref(), Some(env.mediator.did()));
+}
+
+#[tokio::test]
+async fn a_trust_ping_asking_for_no_response_is_an_empty_success() {
+    init_tracing();
+    let env = env().await;
+    let alice = env.add_user("silent-ping-alice").await.unwrap();
+
+    let ping = to_mediator(
+        &env,
+        &alice,
+        "https://didcomm.org/trust-ping/2.0/ping",
+        json!({ "response_requested": false }),
+    );
+    let (status, body) = post(&env, &alice, &ping).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"], json!("Empty"), "{body}");
+    assert_eq!(body["errorCode"], json!(0), "{body}");
+
+    // Handled, and nothing was answered.
+    assert!(
+        !replies(&env, &alice)
+            .await
+            .iter()
+            .any(|m| m.thid.as_deref() == Some(ping.id.as_str())),
+        "a ping asking for no response is not answered"
+    );
 }
 
 #[tokio::test]
