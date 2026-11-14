@@ -10,9 +10,18 @@ use std::collections::HashMap;
 
 use crate::common::config::WakeConfig;
 
-/// Entries kept before the windows that have closed are swept out. Bounds the
-/// memory a stream of distinct requesters can take.
+/// Entries kept before the windows that have closed are swept out.
 const SWEEP_AT: usize = 10_000;
+
+/// Pair entries kept at most. A pair entry is only made by a ring that passed
+/// every earlier rule (queued, undelivered mail the requester stored for an
+/// account with a wake handle) and spent that addressee's hourly budget, so
+/// live entries are already bounded by the wake-capable accounts times their
+/// budgets; this is a hard ceiling on top. Past it, the entry whose day
+/// window started first is dropped. That only resets one requester's budget
+/// for one addressee: the addressee's own coalescing and hourly budget still
+/// hold.
+const MAX_PAIRS: usize = 100_000;
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 3_600;
@@ -82,6 +91,9 @@ struct Addressee {
 pub(crate) struct Limiter {
     pairs: HashMap<(String, String), Pair>,
     addressees: HashMap<String, Addressee>,
+    /// No sweep before this instant, so a map full of live entries is not
+    /// rescanned on every request.
+    next_sweep: u64,
 }
 
 impl Limiter {
@@ -113,6 +125,9 @@ impl Limiter {
             return Err(Limited::Addressee);
         }
 
+        if !self.pairs.contains_key(&key) && self.pairs.len() >= MAX_PAIRS {
+            self.evict_oldest_pair();
+        }
         let pair = self.pairs.entry(key).or_default();
         pair.minute.take(now, MINUTE);
         pair.day.take(now, DAY);
@@ -122,19 +137,83 @@ impl Limiter {
         Ok(())
     }
 
-    /// Drop entries whose every window has closed, once there are many.
+    /// Drop entries whose every window has closed, once there are many, at
+    /// most once a minute.
     fn sweep(&mut self, now: u64) {
-        if self.pairs.len() + self.addressees.len() < SWEEP_AT {
+        if self.pairs.len() + self.addressees.len() < SWEEP_AT || now < self.next_sweep {
             return;
         }
+        self.next_sweep = now.saturating_add(MINUTE);
         self.pairs.retain(|_, p| !p.day.closed(now, DAY));
         self.addressees.retain(|_, a| !a.hour.closed(now, HOUR));
+    }
+
+    /// Drop the pair whose day window started first.
+    fn evict_oldest_pair(&mut self) {
+        if let Some(oldest) = self
+            .pairs
+            .iter()
+            .min_by_key(|(_, p)| p.day.start)
+            .map(|(k, _)| k.clone())
+        {
+            self.pairs.remove(&oldest);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past the ceiling, a new pair replaces the oldest; the map never grows
+    /// beyond it.
+    #[test]
+    fn the_pair_map_is_bounded() {
+        let mut l = Limiter::default();
+        let c = WakeConfig {
+            addressee_coalesce_seconds: 0,
+            addressee_per_hour: u32::MAX,
+            ..config()
+        };
+        // Unix-like instants, all within one day, so no sweep removes them;
+        // "oldest" rang first.
+        const T: u64 = 1_800_000_000;
+        assert_eq!(l.try_ring(&c, "oldest", "d", T), Ok(()));
+        for i in 1..MAX_PAIRS {
+            let now = T + 1 + (i as u64) / 4;
+            assert_eq!(l.try_ring(&c, &format!("r{i}"), "d", now), Ok(()));
+        }
+        assert_eq!(l.pairs.len(), MAX_PAIRS);
+        assert_eq!(l.try_ring(&c, "newcomer", "d", T + 40_000), Ok(()));
+        assert_eq!(l.pairs.len(), MAX_PAIRS);
+        assert!(
+            !l.pairs
+                .contains_key(&("oldest".to_string(), "d".to_string()))
+        );
+        assert!(
+            l.pairs
+                .contains_key(&("newcomer".to_string(), "d".to_string()))
+        );
+    }
+
+    /// A map of live entries above the sweep threshold is scanned at most once
+    /// a minute, not on every request.
+    #[test]
+    fn a_full_map_is_swept_at_most_once_a_minute() {
+        let mut l = Limiter::default();
+        for i in 0..SWEEP_AT {
+            l.pairs
+                .insert((format!("r{i}"), "d".into()), Pair::default());
+        }
+        l.sweep(10);
+        assert_eq!(l.next_sweep, 10 + MINUTE);
+        l.sweep(20);
+        assert_eq!(
+            l.next_sweep,
+            10 + MINUTE,
+            "no second sweep within the minute"
+        );
+    }
 
     fn config() -> WakeConfig {
         WakeConfig::default()
