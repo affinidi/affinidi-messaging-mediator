@@ -42,6 +42,18 @@ secrets-k8s = ["affinidi-messaging-mediator-common/secrets-k8s"]
 # separate from `secrets-aws` (AWS secret *storage*) so a build that only
 # stores secrets in AWS doesn't have to pull the SSM client, and vice versa.
 publish-aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
+## The wizard's VTA flows: online VTA provisioning, the sealed-handoff
+## bootstrap, `--setup-key-*`, VTA-minted did:webvh and the VTA secret
+## backend. Not in `default`.
+##
+## UNAVAILABLE IN THIS RELEASE. `vta-sdk` is out of the dependency graph
+## (see the commented-out dependency below): every published vta-sdk
+## (<= 0.88.x) pulls trust-tasks-proof 0.36/0.37, which no longer compiles
+## against affinidi-data-integrity 0.8.7. Enabling the feature stops the
+## build with a `compile_error!`; without it the wizard shows the VTA
+## options as unavailable. Step 3 of the release order (vta-sdk released on
+## SDK 0.47 / TDK 0.45) restores `dep:vta-sdk` here and `vta` in `default`.
+vta = []  # step 3: vta = ["dep:vta-sdk"]
 
 [dependencies]
 ## The mediator's config schema and its boot-time checks: recipe values are
@@ -109,7 +121,8 @@ affinidi-did-common.workspace = true
 ##                   `sealed-transfer`), so this single feature covers the
 ##                   wizard's online VTA flow plus the sealed-handoff bundle
 ##                   handling in `sealed_handoff.rs`.
-vta-sdk = { workspace = true, features = ["provision-client"] }
+## Step 3: restore as `optional = true` behind the `vta` feature.
+# vta-sdk = { workspace = true, features = ["provision-client"] }
 
 # ── DID Resolution ───────────────────────────────────────────────────────
 ## Used to resolve the VTA's DID document and extract VTARest /
@@ -183,7 +196,8 @@ aws-sdk-s3 = { workspace = true, optional = true }
 ## Additive — `cargo test` unions [dependencies] + [dev-dependencies]
 ## features, so this lands the `test-support` flag without affecting
 ## release builds.
-vta-sdk = { workspace = true, features = ["test-support"] }
+## Step 3: restore (the `vta` feature's tests need it).
+# vta-sdk = { workspace = true, features = ["test-support"] }
 ## Used by setup_key persistence tests to create scoped temporary paths.
 tempfile.workspace = true
 ## Required by `bootstrap_headless` tests that mutate CWD via

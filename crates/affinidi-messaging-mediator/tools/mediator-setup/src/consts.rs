@@ -130,6 +130,7 @@ pub const DEFAULT_VTA_CONTEXT: &str = "mediator";
 /// Default expiry for the setup-did ACL entry granted via
 /// `pnm contexts create --admin-expires`. Gives the operator an hour to
 /// finish mediator setup; override to `24h`, `7d`, etc. for slower rollouts.
+#[cfg(feature = "vta")]
 pub const DEFAULT_VTA_SETUP_EXPIRY: &str = "1h";
 
 /// Name of the built-in VTA DID template the wizard asks the VTA to
@@ -138,6 +139,7 @@ pub const DEFAULT_VTA_SETUP_EXPIRY: &str = "1h";
 /// `pnm did-templates upload --name didcomm-mediator …` and the VTA's
 /// resolution order (context → global → builtin) will pick up the
 /// override on the next wizard run.
+#[cfg(feature = "vta")]
 pub const DEFAULT_MEDIATOR_TEMPLATE: &str = "didcomm-mediator";
 
 /// Name of the built-in VTA DID template used for the long-term admin
@@ -145,6 +147,7 @@ pub const DEFAULT_MEDIATOR_TEMPLATE: &str = "didcomm-mediator";
 /// `ask`). Same shadowing rules as
 /// [`DEFAULT_MEDIATOR_TEMPLATE`] — a `vta-admin` template registered
 /// at the context scope overrides the builtin.
+#[cfg(feature = "vta")]
 pub const DEFAULT_VTA_ADMIN_TEMPLATE: &str = "vta-admin";
 
 /// Per-backend sensible defaults for the KeyStorage step.

@@ -1,3 +1,8 @@
+// Without the `vta` feature the docs of the VTA modules still name the
+// vta-sdk types and the gated items they describe. Step 3 of the release order
+// (vta-sdk back in the graph) removes this.
+#![cfg_attr(not(feature = "vta"), allow(rustdoc::broken_intra_doc_links))]
+
 /// Serialises every test that reads or writes the process-wide current
 /// directory.
 ///
@@ -23,11 +28,23 @@ pub(crate) fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// `vta-sdk` is out of the dependency graph for this release (no published
+// vta-sdk builds against affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45 yet),
+// so the wizard's VTA flows cannot be built. Step 3 of the release order —
+// vta-sdk back on the new line — restores `dep:vta-sdk` and removes this.
+#[cfg(feature = "vta")]
+compile_error!(
+    "the `vta` feature is unavailable in this release: vta-sdk is not in the \
+     dependency graph until it is released on affinidi-messaging-sdk 0.47 / \
+     affinidi-tdk 0.45 (see changelog.d/sdk-0-47-without-vta.md)"
+);
+
 #[macro_use]
 mod style;
 
 mod admin_monitor_profile;
 mod app;
+#[cfg(feature = "vta")]
 mod bootstrap_headless;
 mod cli;
 mod clipboard;
@@ -45,6 +62,7 @@ mod provision;
 mod publish;
 mod recipe;
 mod reprovision;
+#[cfg(feature = "vta")]
 mod sealed_handoff;
 mod secret_backend;
 mod secure_fs;
@@ -91,6 +109,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // Two-phase online admin-only VTA setup.
+    #[cfg(not(feature = "vta"))]
+    if args.setup_key_out.is_some() {
+        return Err(exit::error(exit::NO_VTA_SESSION, vta::VTA_UNAVAILABLE));
+    }
+    #[cfg(feature = "vta")]
     if let Some(path) = args.setup_key_out.as_ref() {
         return vta::cli::run_phase1_init(
             path,

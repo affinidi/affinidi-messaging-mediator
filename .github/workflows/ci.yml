@@ -88,6 +88,13 @@ jobs:
     # test-hooks and test-clock was never linted. One --all-features pass
     # covers all of it; tsp-only below covers the build without didcomm, and
     # the check matrices cover each backend on its own.
+    #
+    # Every feature EXCEPT `vta` (mediator and mediator-setup): vta-sdk is out
+    # of the dependency graph until VTI releases it on affinidi-messaging-sdk
+    # 0.47 / affinidi-tdk 0.45, and `vta` stops the build with a
+    # compile_error! until then. The list is computed from the manifests so it
+    # stays "all features" as features are added. Step 3 of the release order
+    # (vta-sdk restored) goes back to plain --all-features.
     name: cargo clippy (all features)
     runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 45
@@ -104,7 +111,19 @@ jobs:
           key: all-features
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/native-deps
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: cargo clippy --workspace --all-targets (every feature but vta)
+        run: |
+          features="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c '
+          import json, sys
+          meta = json.load(sys.stdin)
+          print(",".join(
+              p["name"] + "/" + f
+              for p in meta["packages"]
+              for f in sorted(p["features"])
+              if f not in ("default", "vta")
+          ))')"
+          echo "features: $features"
+          cargo clippy --workspace --all-targets --locked --features "$features" -- -D warnings
 
   test:
     # The workspace suite with default features, which includes the

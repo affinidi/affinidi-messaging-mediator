@@ -7,6 +7,11 @@
 #
 #   mediator-setup --from mediator-build.toml
 #
+# NOTE: this recipe needs a wizard built with VTA integration. This release
+# builds the wizard without it (vta-sdk is out of the dependency graph until it
+# is released on affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45), so it is
+# refused here; set `use_vta = false` and pick did:peer or did:webvh instead.
+#
 # This example is a sealed-mint setup: the VTA mints the mediator's DID and
 # keys and hands them over in a sealed bundle, with no live network path
 # between this host and the VTA. It runs in two phases:

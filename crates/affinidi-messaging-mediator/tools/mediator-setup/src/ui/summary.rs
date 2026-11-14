@@ -3,7 +3,9 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{AdminMode, Deployment, DidMethod, SslMode, VtaMode};
+use crate::app::{AdminMode, Deployment, DidMethod, SslMode};
+#[cfg(feature = "vta")]
+use crate::{app::VtaMode, vta::VtaReply};
 use crate::{
     app::WizardConfig,
     config_writer::build_backend_url,
@@ -12,7 +14,7 @@ use crate::{
         NETWORK_MODE_OPEN, STORAGE_BACKEND_FJALL,
     },
     ui::{labels::label_of, theme},
-    vta::{VtaReply, VtaSession},
+    vta::VtaSession,
 };
 
 /// Renders the summary view showing all configuration choices.
@@ -74,6 +76,13 @@ pub fn render_summary(
     // intent (FullSetup vs AdminOnly). Intent comes from the session's
     // reply variant — `Full` means the VTA minted the integration DID,
     // `AdminOnly` means the VTA only issued an admin credential.
+    // Without the `vta` feature the wizard offers no VTA option.
+    #[cfg(not(feature = "vta"))]
+    let vta_display = {
+        let _ = vta_session;
+        "Disabled (VTA integration is unavailable in this release)".to_string()
+    };
+    #[cfg(feature = "vta")]
     let vta_display = if config.use_vta {
         let intent_label = match vta_session.map(|s| &s.reply) {
             Some(VtaReply::Full(_)) => "full setup",
@@ -96,6 +105,7 @@ pub fn render_summary(
     // so we render whatever the VTA actually resolved rather than
     // echoing the operator's pick — useful if the VTA renamed or
     // re-routed under the covers.
+    #[cfg(feature = "vta")]
     if let Some(VtaReply::Full(provision)) = vta_session.map(|s| &s.reply) {
         let webvh_display = match provision.summary.webvh_server_id.as_deref() {
             Some(id) => format!("{id} (VTA-pinned)"),

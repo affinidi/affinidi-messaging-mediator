@@ -114,8 +114,9 @@ git rebase --signoff origin/main
    call them out in a `changelog.d/` fragment (R3.6 in
    [docs/delivery-rules.md](docs/delivery-rules.md)).
 9. **Clippy is clean under every feature combination CI builds**, with
-   `-D warnings`: the default set, `--all-features`, TSP-only, and each
-   storage and secrets backend.
+   `-D warnings`: the default set, every feature (all but `vta` while
+   vta-sdk is out of the dependency graph), TSP-only, and each storage and
+   secrets backend.
 
 ## Code of Conduct
 

@@ -55,6 +55,7 @@ pub(crate) fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: Ke
     // RequestGenerated phase uses Selecting mode today, but keeping the
     // hotkey mode-agnostic is cheap and future-proofs against UI
     // shuffling.
+    #[cfg(feature = "vta")]
     if !modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             code,
@@ -116,6 +117,7 @@ pub(crate) fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: Ke
     // the mediator / admin / VTA DIDs to the clipboard. Phase-scoped
     // to Complete so the same letters don't conflict with `[v]` /
     // `[p]` on the RequestGenerated screen above.
+    #[cfg(feature = "vta")]
     if !modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             code,
@@ -149,6 +151,7 @@ pub(crate) fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: Ke
     // rendered `pnm acl create` command to the system clipboard. Same
     // early-return placement as the sealed-handoff hotkey so it fires
     // regardless of InputMode.
+    #[cfg(feature = "vta")]
     if !modifiers.contains(KeyModifiers::CONTROL)
         && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
         && let Some(state) = app.vta_connect.as_mut()
@@ -185,6 +188,7 @@ pub(crate) fn handle_key_event(app: &mut WizardApp, code: KeyCode, modifiers: Ke
     // the VTA / mediator / admin DIDs to the clipboard. Phase-scoped
     // to Connected so the same letter keys can be used for unrelated
     // actions on other phases without ambiguity.
+    #[cfg(feature = "vta")]
     if !modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             code,

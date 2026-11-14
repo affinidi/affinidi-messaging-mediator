@@ -179,7 +179,7 @@ and the numbers in this document are meaningful.
 
 To use the system allocator (for profiling, or on a target jemalloc does not
 support), build without the `jemalloc` feature while keeping the others, e.g.
-`--no-default-features --features didcomm,tsp,redis-backend,vta`. Plain
+`--no-default-features --features didcomm,tsp,redis-backend`. Plain
 `--no-default-features` also drops the protocol and storage features. Expect
 resident memory to read high and flat if you do.
 
