@@ -361,7 +361,7 @@ pub async fn authentication_refresh(
 
         // Does the Global ACL still allow them to connect?
         if authz::require_capability(&session_check.acls, Capability::NotBlocked).is_err() {
-            info!("DID({}) is blocked from connecting", affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did));
+            info!(did_hash = %affinidi_messaging_mediator_common::did_identity::did_hash(&session_check.did), "DID is blocked from connecting");
             return Err(MediatorError::problem(
                 25,
                 "",
@@ -386,8 +386,7 @@ pub async fn authentication_refresh(
         )?;
 
         // Generate a new refresh token (rotation — old one is now invalid)
-        let refresh_expiry = state.config.security.jwt_refresh_expiry
-            - state.config.security.jwt_access_expiry;
+        let refresh_expiry = state.config.security.refresh_token_lifetime();
         let (new_refresh_token, new_refresh_expires_at, new_refresh_hash) = _create_refresh_token(
             &session_check.did,
             &session_check.session_id,

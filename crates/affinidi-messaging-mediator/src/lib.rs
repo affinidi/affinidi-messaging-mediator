@@ -71,7 +71,7 @@ pub fn install_jwt_crypto_provider() {
 #[derive(Clone)]
 pub struct SharedData {
     /// Mediator configuration loaded at startup.
-    pub config: Config,
+    pub config: Arc<Config>,
     /// The limits in effect now: `config.limits` with any live `config/patch`
     /// changes. Read the live keys through [`SharedData::limits`]; see
     /// [`common::config::overrides`].

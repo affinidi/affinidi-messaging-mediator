@@ -10,6 +10,22 @@ cluster_mode = "false"
 
 [processors.forwarding]
 enabled = true
+# These seven mirror the mediator's [processors.forwarding] settings (see its
+# conf/mediator.toml); keep them the same on both.
+# Seconds into the future a forward's delay may reach
+future_time_limit = 86400
+# Forward to remote mediators (false = local delivery only)
+external_forwarding = true
+# DIDs never forwarded to (blocked_forwarding_dids in the mediator)
+blocked_forwarding = []
+# Accept invalid TLS certificates from next hops. Never true in production.
+accept_invalid_certs = false
+# Hops a forward may make before it is dropped (loop protection)
+max_hops = 10
+# "blind" or "rewrap"; both mediators of a relaying pair must agree
+relay_mode = "blind"
+# Peer mediator DIDs whose relays are accepted (empty = any)
+relay_trusted_mediators = []
 # Sliding window in seconds for tracking message rate per endpoint
 rate_window_seconds = 300
 # If rate >= this threshold (msgs per 10 seconds), prefer WebSocket
@@ -33,5 +49,8 @@ delivery_timeout_seconds = 90
 reclaim_idle_seconds = 180
 # Redis consumer group name (all processors in same group coordinate)
 consumer_group = "forwarding"
-# Send problem reports to senders on forwarding failure
-report_errors = true
+# Send problem reports to senders on forwarding failure. Must be false here:
+# a report is packed with the mediator's own keys, which this standalone
+# processor does not hold, so it refuses to start with true. To report
+# failures to senders, forward in-process in the mediator instead.
+report_errors = false

@@ -223,7 +223,9 @@ http = "1"
 ## written (`after_write`). Already in the tree through axum/hyper.
 http-body = "1"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit", "timeout"] }
+## `TokioTimer`: hyper enforces its header-read timeout only with a timer.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
 # ── Database (Redis) ─────────────────────────────────────────────────────
 ## Redis 7.1+ required. Uses multiplexed connection (not pool).
@@ -371,6 +373,9 @@ tokio = { workspace = true, features = ["test-util"] }
 ## ES256K test signing for the `verify_inner_jws` secp256k1 path (the runtime
 ## is verify-only, via affinidi-crypto / affinidi-messaging-didcomm).
 k256 = { version = "0.14", features = ["ecdsa"] }
+## `DebuggingRecorder`, so the request-metrics tests can read what a request
+## recorded. Already in the tree through metrics-exporter-prometheus.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 [lints]
 workspace = true

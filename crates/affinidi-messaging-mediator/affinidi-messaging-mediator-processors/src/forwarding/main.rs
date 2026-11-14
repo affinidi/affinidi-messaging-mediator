@@ -4,7 +4,14 @@
 //! remote mediators. Designed for horizontal scaling: deploy multiple
 //! instances on different hosts, all pointed at the same Redis. They
 //! coordinate through the consumer group (`XREADGROUP` / `XACK` /
-//! `XAUTOCLAIM`) so each message is processed exactly once.
+//! `XAUTOCLAIM`), so each message is delivered **at least once**: an entry
+//! whose processor stopped or stalled before acknowledging it is taken over
+//! and sent again by another.
+//!
+//! This process cannot pack the problem reports `report_errors` promises
+//! (they need the mediator's keys), so it refuses to start with
+//! `report_errors = true`. It stops on SIGINT or SIGTERM; anything it had
+//! claimed but not finished is taken over by another processor.
 //!
 //! Only meaningful for Redis-backed mediator deployments. If the mediator
 //! is using `memory-backend` or `fjall-backend`, run the in-process
@@ -29,7 +36,6 @@ use affinidi_messaging_mediator_common::{
 use clap::Parser;
 use config::Config;
 use std::sync::Arc;
-use tokio::join;
 use tracing::{error, info};
 use tracing_subscriber::filter;
 
@@ -54,6 +60,13 @@ async fn main() -> Result<(), ProcessorError> {
     tracing::subscriber::set_global_default(subscriber).expect("Logging failed, exiting...");
 
     let config = _read_config(&args.config_file)?;
+    affinidi_messaging_mediator_processors::check_standalone_forwarding(
+        &config.processors.forwarding,
+    )
+    .map_err(|err| {
+        error!("{err}");
+        ProcessorError::ForwardingError(err)
+    })?;
     info!("Configuration loaded successfully");
 
     info!("Connecting to database...");
@@ -82,20 +95,29 @@ async fn main() -> Result<(), ProcessorError> {
             ))
         })?;
 
-    let handle = tokio::spawn(async move {
-        if let Err(err) = processor.start().await {
-            error!("Forwarding processor exited with error: {err}");
+    tokio::select! {
+        result = processor.start() => {
+            if let Err(err) = result {
+                error!("Forwarding processor exited with error: {err}");
+                return Err(ProcessorError::ForwardingError(format!(
+                    "Forwarding processor exited with error: {err}"
+                )));
+            }
         }
-    });
-
-    let _ = join!(handle);
+        _ = affinidi_messaging_mediator_processors::shutdown_signal() => {
+            info!("Shutdown signal received; stopping the forwarding processor");
+        }
+    }
 
     Ok(())
 }
 
 fn _read_config(file: &str) -> Result<Config, ProcessorError> {
-    let config = std::fs::read_to_string(file).expect("Couldn't read config file");
-    let mut config: Config = toml::from_str(&config).expect("Couldn't parse config file");
+    let mut config: Config =
+        affinidi_messaging_mediator_processors::load_toml(file).map_err(|err| {
+            error!("{err}");
+            ProcessorError::ForwardingError(err)
+        })?;
 
     // `functions_file` is written in the config file, so it resolves against
     // that file's directory, with the legacy working-directory fallback —

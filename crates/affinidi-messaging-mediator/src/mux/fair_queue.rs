@@ -13,8 +13,9 @@
 //!   `min(8 × DIDs, max_channel_slots)` frames, and a member whose own share
 //!   is full has *its* push dropped and *its* resync raised; the others keep
 //!   their room. The decision is made where `try_queue` makes it today, so
-//!   "queued" (which is when the `delivered` monitor event is emitted) keeps
-//!   meaning exactly what it means on a direct socket.
+//!   "queued" keeps meaning exactly what it means on a direct socket. (The
+//!   `delivered` monitor event is not emitted on queueing: the socket loop
+//!   emits it once the frame is written, R1.1.)
 //! - [`FairOrder`], on the **writer** side. The socket loop moves what is in
 //!   the channel into one lane per DID and writes round-robin across the lanes
 //!   with something pending, so a member's frame waits behind at most one

@@ -12,7 +12,7 @@ pub async fn well_known_did_fetch_handler(
 ) -> Result<(StatusCode, Json<SuccessResponse<String>>), AppError> {
     let _span = span!(Level::DEBUG, "well_known_did_fetch_handler");
     async move {
-        let did = state.config.clone().mediator_did;
+        let did = state.config.mediator_did.clone();
 
         Ok((
             StatusCode::OK,

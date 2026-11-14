@@ -34,7 +34,7 @@ pub async fn message_delete_handler(
         Level::DEBUG,
         "message_delete_handler",
         session = session.session_id,
-        did = session.did,
+        did_hash = session.did_hash,
     );
     async move {
         // ACL Check
@@ -62,8 +62,11 @@ pub async fn message_delete_handler(
                 ProblemReportSorter::Error,
                 ProblemReportScope::Protocol,
                 "api.message_delete.limit",
-                "Invalid limit ({1}). Maximum of 100 messages can be deleted per transaction",
-                vec![body.message_ids.len().to_string()],
+                "Invalid limit ({1}). Maximum of {2} messages can be deleted per transaction",
+                vec![
+                    body.message_ids.len().to_string(),
+                    state.limits().deleted_messages.to_string(),
+                ],
                 StatusCode::BAD_REQUEST,
                 "Invalid limit",
             )

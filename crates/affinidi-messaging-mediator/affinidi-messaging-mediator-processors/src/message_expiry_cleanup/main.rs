@@ -18,6 +18,8 @@
 //! and Fjall backends would refuse to compile here because the binary
 //! pulls in `redis-backend` directly.
 //!
+//! It stops on SIGINT or SIGTERM, between sweeps.
+//!
 //! [`RedisStore`]: affinidi_messaging_mediator_common::store::redis::RedisStore
 //! [`sweep_expired_messages`]: affinidi_messaging_mediator_common::store::MediatorStore::sweep_expired_messages
 
@@ -88,8 +90,16 @@ async fn main() -> Result<(), ProcessorError> {
     // skip missed ticks if the previous sweep ran long.
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let shutdown = affinidi_messaging_mediator_processors::shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping the message expiry cleanup");
+                return Ok(());
+            }
+        }
 
         let now_secs = unix_timestamp_secs();
         match store
@@ -115,8 +125,11 @@ async fn main() -> Result<(), ProcessorError> {
 }
 
 fn _read_config(file: &str) -> Result<Config, ProcessorError> {
-    let config = std::fs::read_to_string(file).expect("Couldn't read config file");
-    let mut config: Config = toml::from_str(&config).expect("Couldn't parse config file");
+    let mut config: Config =
+        affinidi_messaging_mediator_processors::load_toml(file).map_err(|err| {
+            error!("{err}");
+            ProcessorError::MessageExpiryCleanupError(err)
+        })?;
 
     // `functions_file` is written in the config file, so it resolves against
     // that file's directory, with the legacy working-directory fallback —

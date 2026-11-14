@@ -462,12 +462,14 @@ dependencies = [
  "http",
  "http-body",
  "humantime",
+ "hyper-util",
  "itertools 0.15.0",
  "jsonwebtoken",
  "k256",
  "lazy_static",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "num-format",
  "rand 0.10.3",
  "redis",
@@ -5283,7 +5285,9 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.16.1",
+ "indexmap 2.14.2",
  "metrics",
+ "ordered-float 5.5.1",
  "quanta",
  "rand 0.9.5",
  "rand_xoshiro",
@@ -5786,6 +5790,15 @@ name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
+version = "5.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
 dependencies = [
  "num-traits",
 ]
@@ -8270,6 +8283,7 @@ dependencies = [
  "mime",
  "percent-encoding",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
