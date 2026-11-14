@@ -14,6 +14,8 @@ fn validate_fjall_rejects_empty() {
 
 #[test]
 fn validate_fjall_accepts_existing_directory() {
+    // Reads the CWD, which other tests change; see `crate::cwd_lock`.
+    let _cwd = crate::cwd_lock();
     // The repo root is guaranteed to exist on every CI runner.
     let cwd = std::env::current_dir().unwrap();
     validate_fjall_data_dir(cwd.to_str().unwrap()).expect("CWD is a directory");
@@ -21,6 +23,8 @@ fn validate_fjall_accepts_existing_directory() {
 
 #[test]
 fn validate_fjall_rejects_existing_non_directory() {
+    // Reads the CWD, which other tests change; see `crate::cwd_lock`.
+    let _cwd = crate::cwd_lock();
     // Cargo.toml is always a regular file relative to the package root.
     let err = validate_fjall_data_dir("Cargo.toml")
         .expect_err("validation must reject paths that exist but aren't directories");
@@ -414,6 +418,8 @@ fn database_step_esc_from_text_input_returns_to_picker() {
 
 #[test]
 fn database_step_text_input_writes_correct_field_per_backend() {
+    // Reads the CWD, which other tests change; see `crate::cwd_lock`.
+    let _cwd = crate::cwd_lock();
     // Redis path — operator types a URL.
     let mut app = WizardApp::new("test.toml".into());
     advance_to_database_step(&mut app);
