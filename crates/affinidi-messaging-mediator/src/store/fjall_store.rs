@@ -41,8 +41,6 @@
 //!   [`ForwardQueueEntry`]
 //! - `forward_pending`    — `{group}:{stream_id}` → claim metadata
 //! - `globals`            — counter name → `i64` little-endian
-//! - `streaming_clients`  — `{uuid}:{did_hash}` →
-//!   [`StreamingClientState`] tag byte
 //! - `audit_log`          — `{stream_id}` → JSON-serialised
 //!   [`AuditLogEntry`]; ascending by insertion (oldest-first), bounded ring
 //!
@@ -50,7 +48,16 @@
 //!
 //! Live-streaming pub/sub uses a per-mediator-UUID
 //! [`broadcast::channel`] with no Fjall-side persistence — subscribers
-//! disconnect on mediator restart. Forward-queue blocking reads use a
+//! disconnect on mediator restart. The streaming registrations
+//! (`streaming_set_state`) are likewise held in memory: they describe this
+//! process's sockets, which do not outlive it, so writing them to disk on
+//! every register and deregister bought no durability and left tombstones.
+//! An older data directory's `streaming_clients` keyspace is dropped at open.
+//!
+//! The DIDComm v1 routing-key reverse index (owner DID hash → verkeys) is
+//! also in memory, seeded by one scan of `v1_routing_keys` at open and
+//! maintained under `write_lock`, so `v1_routing_keys_for` and
+//! `account_remove` no longer scan and hash every routing key. Forward-queue blocking reads use a
 //! [`Notify`] that fires on each `forward_queue_enqueue`.
 //!
 //! The `audit_log` and `forward_queue` keyspaces keep a live entry count
@@ -355,7 +362,6 @@ pub struct FjallStore {
     forward_queue: Keyspace,
     forward_pending: Keyspace,
     globals: Keyspace,
-    streaming_clients: Keyspace,
     audit_log: Keyspace,
     /// Per-relationship queue depth. Keyed `<from_hash> 0xFF <to_hash>`; the
     /// row is removed when it reaches zero, so the partition holds only pairs
@@ -371,6 +377,12 @@ pub struct FjallStore {
     /// effectively atomic. Reads happen inside the lock too, so each
     /// method sees a consistent snapshot.
     write_lock: Arc<Mutex<()>>,
+    /// Streaming registrations, by DID hash. Process-local state: see the
+    /// module-level note. A std lock, never held across an await.
+    streaming_clients: std::sync::RwLock<HashMap<String, StoredStreamingClient>>,
+    /// Owner DID hash → the v1 routing verkeys bound to it. The reverse of
+    /// `v1_routing_keys`, seeded at open and maintained under `write_lock`.
+    v1_routing_owners: std::sync::Mutex<HashMap<String, std::collections::BTreeSet<String>>>,
     /// Most-recently-allocated stream millisecond timestamp. Used by
     /// `alloc_stream_id` to bump the sequence within a single ms.
     last_stream_ms: AtomicU64,
@@ -595,6 +607,13 @@ impl StoredAccount {
 struct StoredSession {
     session: Session,
     /// Unix-seconds wall-clock expiry.
+    expires_at_unix: u64,
+}
+
+/// The one field of a [`StoredSession`] the expiry sweep needs. Decoding
+/// into this skips building the session itself.
+#[derive(Deserialize)]
+struct SessionExpiry {
     expires_at_unix: u64,
 }
 
@@ -1098,6 +1117,33 @@ impl FjallStore {
             .len()
             .map_err(|e| Self::db_err("open:forward_queue_len", e))?;
 
+        // Streaming registrations are in memory now. An older data directory
+        // still holds the keyspace they were written to; drop it so its stale
+        // rows cannot be mistaken for state.
+        if db.keyspace_exists(PARTITION_STREAMING_CLIENTS) {
+            let legacy = open_partition(PARTITION_STREAMING_CLIENTS)?;
+            db.delete_keyspace(legacy)
+                .map_err(|e| Self::db_err("open:drop_streaming_clients", e))?;
+        }
+
+        // Seed the routing-key reverse index with one scan.
+        let v1_routing_keys = open_partition(PARTITION_V1_ROUTING_KEYS)?;
+        let mut v1_routing_owners: HashMap<String, std::collections::BTreeSet<String>> =
+            HashMap::new();
+        for guard in v1_routing_keys.iter() {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("open:v1_routing_keys", e))?;
+            if let Ok(owner) = std::str::from_utf8(value.as_ref()) {
+                v1_routing_owners
+                    .entry(affinidi_messaging_mediator_common::did_identity::did_hash(
+                        owner,
+                    ))
+                    .or_default()
+                    .insert(String::from_utf8_lossy(key.as_ref()).into_owned());
+            }
+        }
+
         Ok(Self {
             messages: open_partition(PARTITION_MESSAGES)?,
             inbox: open_partition(PARTITION_INBOX)?,
@@ -1107,7 +1153,7 @@ impl FjallStore {
             accounts: open_partition(PARTITION_ACCOUNTS)?,
             access_lists: open_partition(PARTITION_ACCESS_LISTS)?,
             admins: open_partition(PARTITION_ADMINS)?,
-            v1_routing_keys: open_partition(PARTITION_V1_ROUTING_KEYS)?,
+            v1_routing_keys,
             mux_records: open_partition(PARTITION_MUX_RECORDS)?,
             mux_principals: open_partition(PARTITION_MUX_PRINCIPALS)?,
             oob_invites: open_partition(PARTITION_OOB_INVITES)?,
@@ -1116,7 +1162,6 @@ impl FjallStore {
             forward_queue,
             forward_pending: open_partition(PARTITION_FORWARD_PENDING)?,
             globals: open_partition(PARTITION_GLOBALS)?,
-            streaming_clients: open_partition(PARTITION_STREAMING_CLIENTS)?,
             peer_queue: open_partition(PARTITION_PEER_QUEUE)?,
             outbox_receipts: open_partition(PARTITION_OUTBOX_RECEIPTS)?,
             outbox_receipt_expiry: open_partition(PARTITION_OUTBOX_RECEIPT_EXPIRY)?,
@@ -1125,6 +1170,8 @@ impl FjallStore {
             durability: tuning.durability,
             path,
             write_lock: Arc::new(Mutex::new(())),
+            streaming_clients: std::sync::RwLock::new(HashMap::new()),
+            v1_routing_owners: std::sync::Mutex::new(v1_routing_owners),
             last_stream_ms: AtomicU64::new(0),
             next_stream_seq: AtomicU64::new(0),
             broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
@@ -1206,13 +1253,50 @@ impl FjallStore {
     /// Called after `write_lock` is released: the sync covers every write
     /// committed before it, so concurrent writers waiting here share syncs
     /// instead of queueing one each behind the lock.
-    fn sync_if_durable(&self, method: &str) -> Result<(), MediatorError> {
+    ///
+    /// The fsync runs on the blocking pool, not on the calling runtime
+    /// worker: a slow disk must stall the writer that asked for durability,
+    /// not every task scheduled on the same worker thread.
+    async fn sync_if_durable(&self, method: &str) -> Result<(), MediatorError> {
         if self.durability == FjallDurability::Sync {
-            self.db
-                .persist(PersistMode::SyncAll)
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll))
+                .await
+                .map_err(|e| {
+                    MediatorError::InternalError(
+                        error_codes::INTERNAL_ERROR,
+                        "fjall".into(),
+                        format!("FjallStore::{method} failed: persist task: {e}"),
+                    )
+                })?
                 .map_err(|e| Self::db_err(method, e))?;
         }
         Ok(())
+    }
+
+    /// Record `verkey` as bound to the DID whose hash is `owner_hash`, in the
+    /// in-memory reverse index. Caller holds `write_lock`.
+    fn routing_owner_add(&self, owner_hash: String, verkey: &str) {
+        self.v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(owner_hash)
+            .or_default()
+            .insert(verkey.to_string());
+    }
+
+    /// Forget `verkey` from `owner_hash`'s entry. Caller holds `write_lock`.
+    fn routing_owner_remove(&self, owner_hash: &str, verkey: &str) {
+        let mut owners = self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(keys) = owners.get_mut(owner_hash) {
+            keys.remove(verkey);
+            if keys.is_empty() {
+                owners.remove(owner_hash);
+            }
+        }
     }
 
     /// Remove the session if it is still expired, under the write lock —
@@ -1564,7 +1648,7 @@ impl MediatorStore for FjallStore {
 
         // Before the store reports success: the caller acknowledges the
         // message to its sender on it.
-        self.sync_if_durable("store_message:persist")?;
+        self.sync_if_durable("store_message:persist").await?;
         Ok(msg_id)
     }
 
@@ -2038,33 +2122,39 @@ impl MediatorStore for FjallStore {
             reply.total_bytes = acc.receive_queue_bytes;
         }
 
-        // First and last stream IDs come from a forward + reverse
-        // range scan limited to one entry each.
+        // First and last stream IDs come from the two ends of the DID's
+        // range: one entry read from each, not a walk of the whole inbox.
         let did_bytes = did_hash.as_bytes();
         let did_len = did_bytes.len();
         let start = stream_key(did_hash, 0, 0);
         let end = stream_key(did_hash, u64::MAX, u64::MAX);
-
-        let mut count: u64 = 0;
-        let mut first: Option<(u64, u64)> = None;
-        let mut last: Option<(u64, u64)> = None;
-        for guard in self.inbox.range(start.clone()..=end.clone()) {
-            let (key, _v) = guard
-                .into_inner()
+        let stream_id_of = |guard: fjall::Guard| -> Result<Option<(u64, u64)>, MediatorError> {
+            let key = guard
+                .key()
                 .map_err(|e| Self::db_err("inbox_status:range", e))?;
             if key.len() < did_len + 16 || &key[..did_len] != did_bytes {
-                continue;
+                return Ok(None);
             }
-            let Some(sid) = decode_stream_id(&key[did_len..did_len + 16]) else {
-                continue;
-            };
-            count += 1;
-            if first.is_none() {
+            Ok(decode_stream_id(&key[did_len..did_len + 16]))
+        };
+        let mut first: Option<(u64, u64)> = None;
+        for guard in self.inbox.range(start.clone()..=end.clone()) {
+            if let Some(sid) = stream_id_of(guard)? {
                 first = Some(sid);
+                break;
             }
-            last = Some(sid);
         }
-        reply.queue_count = count;
+        let mut last: Option<(u64, u64)> = None;
+        if first.is_some() {
+            for guard in self.inbox.range(start..=end).rev() {
+                if let Some(sid) = stream_id_of(guard)? {
+                    last = Some(sid);
+                    break;
+                }
+            }
+        }
+        // The account record counts the inbox; it is the queue count.
+        reply.queue_count = reply.message_count;
         if let Some((ms, seq)) = first {
             reply.oldest_received = format_stream_id(ms, seq);
         }
@@ -2076,9 +2166,9 @@ impl MediatorStore for FjallStore {
         // connected but has not turned live mode on is not live.
         reply.live_delivery = self
             .streaming_clients
-            .get(did_hash.as_bytes())
-            .map_err(|e| Self::db_err("inbox_status:streaming.get", e))?
-            .and_then(|raw| Self::decode::<StoredStreamingClient>(&raw).ok())
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
             .is_some_and(|c| c.state == StreamingClientState::Live);
 
         Ok(reply)
@@ -2454,22 +2544,25 @@ impl MediatorStore for FjallStore {
         }
         // Drop the account's v1 routing keys, or its verkeys keep resolving
         // and inbound v1 traffic keeps being accepted for a mailbox that no
-        // longer exists. The index is keyed by verkey, so this is a scan —
-        // acceptable on a cold keyspace touched only by account removal and
-        // keylist updates.
-        for guard in self.v1_routing_keys.iter() {
-            let (key, value) = guard
-                .into_inner()
-                .map_err(|e| Self::db_err("account_remove:v1keys.iter", e))?;
-            if std::str::from_utf8(value.as_ref()).is_ok_and(|owner| {
-                affinidi_messaging_mediator_common::did_identity::did_hash(owner) == did_hash
-            }) {
-                batch.remove(&self.v1_routing_keys, key.as_ref());
-            }
+        // longer exists. Found through the reverse index, not a scan.
+        let verkeys = self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
+            .cloned()
+            .unwrap_or_default();
+        for verkey in &verkeys {
+            batch.remove(&self.v1_routing_keys, verkey.as_bytes());
         }
         batch
             .commit()
             .map_err(|e| Self::db_err("account_remove:commit", e))?;
+        // Only once the removal is committed.
+        self.v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(did_hash);
         drop(_guard);
 
         // A message stored while the inbox was being purged — the steps above
@@ -2616,6 +2709,10 @@ impl MediatorStore for FjallStore {
         self.v1_routing_keys
             .insert(verkey.as_bytes(), did.as_bytes())
             .map_err(|e| Self::db_err("v1_routing_key_bind:insert", e))?;
+        self.routing_owner_add(
+            affinidi_messaging_mediator_common::did_identity::did_hash(did),
+            verkey,
+        );
         Ok(())
     }
 
@@ -2632,15 +2729,21 @@ impl MediatorStore for FjallStore {
 
     async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
         let _guard = self.write_lock.lock().await;
-        let existed = self
+        let owner = self
             .v1_routing_keys
             .get(verkey.as_bytes())
-            .map_err(|e| Self::db_err("v1_routing_key_unbind:get", e))?
-            .is_some();
-        if existed {
+            .map_err(|e| Self::db_err("v1_routing_key_unbind:get", e))?;
+        let existed = owner.is_some();
+        if let Some(owner) = owner {
             self.v1_routing_keys
                 .remove(verkey.as_bytes())
                 .map_err(|e| Self::db_err("v1_routing_key_unbind:remove", e))?;
+            if let Ok(owner) = std::str::from_utf8(owner.as_ref()) {
+                self.routing_owner_remove(
+                    &affinidi_messaging_mediator_common::did_identity::did_hash(owner),
+                    verkey,
+                );
+            }
         }
         Ok(existed)
     }
@@ -2662,27 +2765,23 @@ impl MediatorStore for FjallStore {
             self.v1_routing_keys
                 .remove(verkey.as_bytes())
                 .map_err(|e| Self::db_err("v1_routing_key_unbind_if_owner:remove", e))?;
+            self.routing_owner_remove(
+                &affinidi_messaging_mediator_common::did_identity::did_hash(did),
+                verkey,
+            );
         }
         Ok(owned)
     }
 
     async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
-        // The index is keyed by verkey and stores the DID, so matching by hash
-        // means hashing each stored DID. Acceptable on a cold keyspace touched
-        // only by keylist updates and account removal.
-        let mut keys = Vec::new();
-        for guard in self.v1_routing_keys.iter() {
-            let (key, value) = guard
-                .into_inner()
-                .map_err(|e| Self::db_err("v1_routing_keys_for:iter", e))?;
-            if std::str::from_utf8(value.as_ref()).is_ok_and(|owner| {
-                affinidi_messaging_mediator_common::did_identity::did_hash(owner) == did_hash
-            }) {
-                keys.push(String::from_utf8_lossy(key.as_ref()).into_owned());
-            }
-        }
-        keys.sort();
-        Ok(keys)
+        // The in-memory reverse index, already sorted: no scan, no hashing.
+        Ok(self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn account_list(
@@ -2696,14 +2795,19 @@ impl MediatorStore for FjallStore {
         let mut returned: u32 = 0;
         let mut more_after = false;
 
-        for guard in self.accounts.iter() {
+        // Skipped rows before the cursor are counted without reading
+        // their values.
+        let mut rows = self.accounts.iter();
+        for guard in rows.by_ref().take(cursor as usize) {
+            guard
+                .key()
+                .map_err(|e| Self::db_err("account_list:skip", e))?;
+            total_seen += 1;
+        }
+        for guard in rows {
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| Self::db_err("account_list:iter", e))?;
-            if total_seen < cursor {
-                total_seen += 1;
-                continue;
-            }
             if returned as usize >= limit {
                 more_after = true;
                 break;
@@ -2722,7 +2826,10 @@ impl MediatorStore for FjallStore {
             returned += 1;
         }
 
-        let next_cursor = if more_after { cursor + returned } else { 0 };
+        // The next page starts after every row this one consumed, counter-only
+        // records included; `cursor + returned` would re-serve accounts that
+        // followed a skipped row.
+        let next_cursor = if more_after { total_seen } else { 0 };
         Ok(MediatorAccountList {
             accounts,
             cursor: next_cursor,
@@ -3393,7 +3500,8 @@ impl MediatorStore for FjallStore {
         self.forward_queue_len
             .store(current + 1 - removed, Ordering::Release);
         drop(_guard);
-        self.sync_if_durable("forward_queue_enqueue:persist")?;
+        self.sync_if_durable("forward_queue_enqueue:persist")
+            .await?;
         self.forward_notify.notify_waiters();
         Ok(stream_id)
     }
@@ -3744,7 +3852,7 @@ impl MediatorStore for FjallStore {
         // Only after the batch is durable. Still under `write_lock`.
         self.forward_queue_len.store(len, Ordering::Release);
         drop(guard);
-        self.sync_if_durable("forward_queue_finish:persist")?;
+        self.sync_if_durable("forward_queue_finish:persist").await?;
         if requeue.is_some() {
             self.forward_notify.notify_waiters();
         }
@@ -3795,30 +3903,13 @@ impl MediatorStore for FjallStore {
     // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
 
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
-        // Drop every streaming-client entry that points at this
-        // mediator UUID. On startup the mediator calls this to clear
-        // stale registrations from a previous run.
-        let _guard = self.write_lock.lock().await;
-        let mut to_remove = Vec::new();
-        for guard in self.streaming_clients.iter() {
-            let (key, value) = guard
-                .into_inner()
-                .map_err(|e| Self::db_err("streaming_clean_start:iter", e))?;
-            let stored: StoredStreamingClient = match Self::decode(&value) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if stored.mediator_uuid == mediator_uuid {
-                to_remove.push(key);
-            }
-        }
-        let mut batch = self.db.batch();
-        for k in to_remove {
-            batch.remove(&self.streaming_clients, k.as_ref());
-        }
-        batch
-            .commit()
-            .map_err(|e| Self::db_err("streaming_clean_start:commit", e))?;
+        // Drop every registration that points at this mediator UUID. The
+        // table is in memory, so on a fresh process it is already empty; the
+        // call is kept for the trait's restart contract.
+        self.streaming_clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, c| c.mediator_uuid != mediator_uuid);
         Ok(())
     }
 
@@ -3828,37 +3919,31 @@ impl MediatorStore for FjallStore {
         mediator_uuid: &str,
         state: StreamingClientState,
     ) -> Result<(), MediatorError> {
-        // Under the lock, so it cannot interleave with `streaming_clean_start`'s
-        // scan-then-remove and lose a registration made meanwhile.
-        let _guard = self.write_lock.lock().await;
+        // In memory and under one std lock: no `write_lock`, no disk write,
+        // and no interleaving with `streaming_clean_start`.
+        let mut clients = self
+            .streaming_clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         match state {
             // Only the owner's leaving removes the entry: another instance
             // may hold the DID now.
             StreamingClientState::Deregistered => {
-                let owned = match self
-                    .streaming_clients
-                    .get(did_hash.as_bytes())
-                    .map_err(|e| Self::db_err("streaming_set_state:get", e))?
+                if clients
+                    .get(did_hash)
+                    .is_some_and(|c| c.mediator_uuid == mediator_uuid)
                 {
-                    Some(raw) => Self::decode::<StoredStreamingClient>(&raw)
-                        .map(|c| c.mediator_uuid == mediator_uuid)
-                        .unwrap_or(true),
-                    None => false,
-                };
-                if owned {
-                    self.streaming_clients
-                        .remove(did_hash.as_bytes())
-                        .map_err(|e| Self::db_err("streaming_set_state:remove", e))?;
+                    clients.remove(did_hash);
                 }
             }
             other => {
-                let stored = StoredStreamingClient {
-                    mediator_uuid: mediator_uuid.to_string(),
-                    state: other,
-                };
-                self.streaming_clients
-                    .insert(did_hash.as_bytes(), Self::encode(&stored)?)
-                    .map_err(|e| Self::db_err("streaming_set_state:insert", e))?;
+                clients.insert(
+                    did_hash.to_string(),
+                    StoredStreamingClient {
+                        mediator_uuid: mediator_uuid.to_string(),
+                        state: other,
+                    },
+                );
             }
         }
         Ok(())
@@ -3869,11 +3954,16 @@ impl MediatorStore for FjallStore {
         did_hash: &str,
         force_delivery: bool,
     ) -> Option<String> {
-        let raw = self.streaming_clients.get(did_hash.as_bytes()).ok()??;
-        let stored: StoredStreamingClient = Self::decode(&raw).ok()?;
+        let clients = self
+            .streaming_clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let stored = clients.get(did_hash)?;
         match stored.state {
-            StreamingClientState::Live => Some(stored.mediator_uuid),
-            StreamingClientState::Registered if force_delivery => Some(stored.mediator_uuid),
+            StreamingClientState::Live => Some(stored.mediator_uuid.clone()),
+            StreamingClientState::Registered if force_delivery => {
+                Some(stored.mediator_uuid.clone())
+            }
             _ => None,
         }
     }
@@ -4164,7 +4254,9 @@ impl MediatorStore for FjallStore {
                 .into_inner()
                 .map_err(|e| Self::db_err("sweep_expired_sessions:iter", e))?;
             report.scanned += 1;
-            let stored: StoredSession = Self::decode(&value)?;
+            // Only the expiry is needed to decide; the session body is
+            // skipped rather than built.
+            let stored: SessionExpiry = Self::decode(&value)?;
             if stored.expires_at_unix > 0 && stored.expires_at_unix <= now_secs {
                 to_remove.push(key.as_ref().to_vec());
             }
@@ -4677,6 +4769,64 @@ mod tests {
             .expect("get")
             .expect("message must persist across open");
         assert_eq!(got.msg.as_deref(), Some("persistent"));
+    }
+
+    /// The routing-key reverse index is in memory (#175); it must be rebuilt
+    /// from disk on open, or `v1_routing_keys_for` reads empty after a
+    /// restart and account removal leaves the keys resolving.
+    #[tokio::test]
+    async fn routing_key_reverse_index_is_rebuilt_on_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let alice = "did:example:alice";
+        let alice_hash = affinidi_messaging_mediator_common::did_identity::did_hash(alice);
+        {
+            let store = FjallStore::open(dir.path()).expect("open");
+            store.v1_routing_key_bind("vk2", alice).await.expect("bind");
+            store.v1_routing_key_bind("vk1", alice).await.expect("bind");
+            store
+                .v1_routing_key_bind("vk3", "did:example:bob")
+                .await
+                .expect("bind");
+            store.shutdown().await.expect("shutdown");
+        }
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.v1_routing_keys_for(&alice_hash).await.expect("for"),
+            vec!["vk1".to_string(), "vk2".to_string()]
+        );
+        assert!(store.v1_routing_key_unbind("vk1").await.expect("unbind"));
+        assert_eq!(
+            store.v1_routing_keys_for(&alice_hash).await.expect("for"),
+            vec!["vk2".to_string()]
+        );
+    }
+
+    /// Streaming registrations are process-local (#175): an older data
+    /// directory's on-disk keyspace is dropped at open, and the state is
+    /// held in memory.
+    #[tokio::test]
+    async fn legacy_streaming_keyspace_is_dropped_on_open() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let db = Database::builder(dir.path()).open().expect("db");
+            let ks = db
+                .keyspace(PARTITION_STREAMING_CLIENTS, KeyspaceCreateOptions::default)
+                .expect("keyspace");
+            ks.insert(b"stale", b"{}").expect("insert");
+            db.persist(PersistMode::SyncAll).expect("persist");
+        }
+        let store = FjallStore::open(dir.path()).expect("open");
+        assert!(!store.db.keyspace_exists(PARTITION_STREAMING_CLIENTS));
+        let alice = hash("alice");
+        store
+            .streaming_set_state(&alice, "uuid-1", StreamingClientState::Live)
+            .await
+            .expect("set");
+        assert!(!store.db.keyspace_exists(PARTITION_STREAMING_CLIENTS));
+        assert_eq!(
+            store.streaming_is_client_live(&alice, false).await,
+            Some("uuid-1".to_string())
+        );
     }
 
     /// The KR-29 / VTI-29 regression: a sender fanning out to many recipients

@@ -313,13 +313,17 @@ pub mod names {
     /// climbing steadily toward `message_expiry_seconds` means nothing is
     /// collecting and the only thing that will clear the queue is expiry.
     ///
-    /// Two limits on what it sees, both by construction rather than by
-    /// accident. It covers only the accounts probed this cycle — the deepest
-    /// queues, capped at `MAX_AGE_PROBES` — so a shallow queue that is very
-    /// old can be missed while deeper ones exist. And the outbox series is
-    /// blind to anonymous senders: an outbox entry is only allocated when the
-    /// sender is known, so anonymous traffic appears in the inbox series
-    /// alone. Read the pair, not either half.
+    /// It covers the queues probed this cycle: the deepest ones
+    /// (`MAX_AGE_PROBES`) plus a window over every other non-empty queue that
+    /// rotates from cycle to cycle (`MAX_ROTATING_PROBES`), so a shallow queue
+    /// that has stopped moving is reached within a bounded number of cycles.
+    /// Alert on `max_over_time(...)` over a window long enough to span the
+    /// rotation. `0` means the folder is empty; `NaN` means messages are queued
+    /// but no probe succeeded, so the age is unknown, not healthy.
+    ///
+    /// The outbox series is blind to anonymous senders: an outbox entry is
+    /// only allocated when the sender is known, so anonymous traffic appears
+    /// in the inbox series alone. Read the pair, not either half.
     pub const QUEUE_OLDEST_AGE_SECONDS: &str = "queue_oldest_age_seconds";
     /// gauge: Highest ratio of used-to-permitted queue depth seen on any
     /// surveyed account (label: folder = inbox|outbox), where 1.0 means an

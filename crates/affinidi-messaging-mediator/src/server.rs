@@ -893,6 +893,7 @@ pub async fn serve_internal(
         did_rate_limiter,
         shutdown_token: shutdown_token.clone(),
         self_authorities: Arc::new(self_authorities),
+        trust_task_keys: Default::default(),
         component_health: supervisor.registry(),
         clock,
         queue_snapshot,

@@ -143,11 +143,12 @@ pub(crate) async fn accept(
     session: &Session,
 ) -> Result<(), MediatorError> {
     let mode = state.config.security.trust_task_verification;
-    let verifier = proof_verifier(state.did_resolver.clone());
+    // Built once per mediator, not per request (#198).
+    let verifier = state.trust_task_keys.verifier(state);
     // The duplicate-execution claim runs last, and only once every other
     // check has passed: claiming first would burn the id of a document that
     // was then refused, so its corrected resend could never run.
-    let outcome = match check(doc, raw, policy, sender_did, now, &verifier).await {
+    let outcome = match check(doc, raw, policy, sender_did, now, verifier).await {
         Ok(()) => claim(doc, policy, sender_did, now, state).await,
         Err(rejection) => Err(rejection),
     };

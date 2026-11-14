@@ -4,11 +4,17 @@
 //! Provides `MetaEnvelope`, `unpack`, and `pack_encrypted` functionality
 //! that the mediator previously obtained from the legacy DIDComm crate.
 //!
-//! ## Performance optimizations
+//! ## Cost
 //!
-//! - JSON is parsed **once** in `MetaEnvelope::new()` and the parsed value is
-//!   shared with `unpack()` via `MetaEnvelope::unpack()`, eliminating redundant parsing.
-//! - The protected header is decoded once during envelope creation and reused.
+//! - `MetaEnvelope::new()` reads the envelope's routing headers with a typed
+//!   probe that skips the bulky members (`ciphertext`, `payload`,
+//!   `signatures`) without allocating them, and keeps only what `unpack()`
+//!   needs (the envelope kind and the recipient key ids), not a parsed copy
+//!   of the whole message.
+//! - The decryption itself parses the JWE again: `decrypt_bound` in
+//!   `affinidi-messaging-didcomm` takes the JWE as a string. Handing it the
+//!   already-parsed envelope needs an API there (a follow-up in
+//!   affinidi-tdk-rs); until then a JWE is parsed twice, not once.
 //! - Sender public key resolution is done lazily during decryption, not eagerly.
 
 use affinidi_crypto::jose::key_agreement::{Curve, PrivateKeyAgreement, PublicKeyAgreement};
@@ -35,10 +41,7 @@ use affinidi_secrets_resolver::SecretsResolver;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use tracing::warn;
 
-/// Pre-parsed envelope metadata extracted without decryption.
-///
-/// Holds the parsed JSON value so it can be passed directly to `unpack()`
-/// without re-parsing. This eliminates the double-parse overhead.
+/// Envelope metadata extracted without decryption.
 pub struct MetaEnvelope {
     /// The raw message string
     pub raw: String,
@@ -50,10 +53,37 @@ pub struct MetaEnvelope {
     pub from_did: Option<String>,
     /// Metadata about the envelope
     pub metadata: EnvelopeMetadata,
-    /// Pre-parsed JSON value (shared with unpack to avoid re-parsing)
-    parsed: serde_json::Value,
+    /// Which of the three DIDComm envelope forms this is.
+    kind: EnvelopeKind,
+    /// A JWE's recipient key ids, in envelope order (empty otherwise).
+    recipient_kids: Vec<String>,
     /// The sender's specific key id (full `skid`) for ECDH-1PU key resolution
     sender_kid: Option<String>,
+}
+
+/// The three DIDComm envelope forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeKind {
+    Jwe,
+    Jws,
+    Plaintext,
+}
+
+/// The members of an envelope `MetaEnvelope::new` reads. Only presence is
+/// needed of the bulky ones, so they are skipped (`IgnoredAny`) rather than
+/// copied into a JSON tree: a 1 MiB ciphertext is not allocated a second
+/// time just to learn that it is there.
+#[derive(serde::Deserialize)]
+struct EnvelopeProbe {
+    ciphertext: Option<serde::de::IgnoredAny>,
+    recipients: Option<serde_json::Value>,
+    protected: Option<serde_json::Value>,
+    payload: Option<serde::de::IgnoredAny>,
+    signatures: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "type")]
+    typ: Option<serde::de::IgnoredAny>,
+    to: Option<serde_json::Value>,
+    from: Option<serde_json::Value>,
 }
 
 /// Metadata about the envelope format
@@ -66,39 +96,45 @@ pub struct EnvelopeMetadata {
 impl MetaEnvelope {
     /// Parse a raw message string to extract envelope metadata.
     ///
-    /// The JSON is parsed once here. Use `self.unpack()` to decrypt using
-    /// the pre-parsed value, avoiding a second parse.
+    /// Reads the routing headers only (see the module's notes on cost).
+    /// The resolver is not used; the parameter is kept for API compatibility.
     pub async fn new(message: &str, _did_resolver: &DIDCacheClient) -> Result<Self, String> {
         let sha256_hash = sha256::digest(message);
 
-        let value: serde_json::Value = serde_json::from_str(message)
+        let value: EnvelopeProbe = serde_json::from_str(message)
             .map_err(|e| format!("Cannot parse message as JSON: {e}"))?;
 
-        if value.get("ciphertext").is_some() && value.get("recipients").is_some() {
+        if value.ciphertext.is_some() && value.recipients.is_some() {
             // JWE envelope
             let mut to_did = None;
             let mut from_did = None;
             let mut sender_kid: Option<String> = None;
             let mut authenticated = false;
 
-            // Extract recipient KID to determine to_did
-            if let Some(recipients) = value["recipients"].as_array() {
-                for recipient in recipients {
-                    if let Some(kid) = recipient["header"]["kid"].as_str() {
-                        if let Some(hash_pos) = kid.find('#') {
-                            to_did = Some(kid[..hash_pos].to_string());
-                        } else {
-                            to_did = Some(kid.to_string());
-                        }
-                        break;
-                    }
-                }
+            // Every recipient key id, in order: `unpack` looks for a local
+            // secret among them. The first names the `to` DID.
+            let recipient_kids: Vec<String> = value
+                .recipients
+                .as_ref()
+                .and_then(|r| r.as_array())
+                .map(|recipients| {
+                    recipients
+                        .iter()
+                        .filter_map(|r| r["header"]["kid"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(kid) = recipient_kids.first() {
+                to_did = Some(match kid.find('#') {
+                    Some(hash_pos) => kid[..hash_pos].to_string(),
+                    None => kid.clone(),
+                });
             }
 
             // An authcrypt envelope names its sender by `skid`, which must be
             // bound to the `apu` the key derivation uses; one naming two
             // senders, or none, is refused here rather than routed on.
-            if let Some(protected_b64) = value.get("protected").and_then(|p| p.as_str())
+            if let Some(protected_b64) = value.protected.as_ref().and_then(|p| p.as_str())
                 && let Ok(protected_bytes) = BASE64_URL_SAFE_NO_PAD.decode(protected_b64)
                 && let Ok(header) = serde_json::from_slice::<serde_json::Value>(&protected_bytes)
                 && let Some(alg) = header.get("alg").and_then(|a| a.as_str())
@@ -119,10 +155,11 @@ impl MetaEnvelope {
                     encrypted: true,
                     authenticated,
                 },
-                parsed: value,
+                kind: EnvelopeKind::Jwe,
+                recipient_kids,
                 sender_kid,
             })
-        } else if value.get("payload").is_some() && value.get("signatures").is_some() {
+        } else if value.payload.is_some() && value.signatures.is_some() {
             // JWS envelope - signed but not encrypted
             Ok(MetaEnvelope {
                 raw: message.to_string(),
@@ -133,19 +170,22 @@ impl MetaEnvelope {
                     encrypted: false,
                     authenticated: false,
                 },
-                parsed: value,
+                kind: EnvelopeKind::Jws,
+                recipient_kids: Vec::new(),
                 sender_kid: None,
             })
-        } else if value.get("type").is_some() {
+        } else if value.typ.is_some() {
             // Plaintext message
             let to_did = value
-                .get("to")
+                .to
+                .as_ref()
                 .and_then(|t| t.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let from_did = value
-                .get("from")
+                .from
+                .as_ref()
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string());
 
@@ -158,7 +198,8 @@ impl MetaEnvelope {
                     encrypted: false,
                     authenticated: false,
                 },
-                parsed: value,
+                kind: EnvelopeKind::Plaintext,
+                recipient_kids: Vec::new(),
                 sender_kid: None,
             })
         } else {
@@ -166,26 +207,22 @@ impl MetaEnvelope {
         }
     }
 
-    /// Unpack (decrypt) this envelope using the pre-parsed JSON value.
-    ///
-    /// This avoids re-parsing the JSON — the parsed value from `new()` is reused.
+    /// Unpack (decrypt) this envelope, using what `new()` extracted.
     pub async fn unpack<S: SecretsResolver>(
         &self,
         did_resolver: &DIDCacheClient,
         secrets_resolver: &S,
     ) -> Result<(Message, UnpackMetadata), String> {
-        if self.parsed.get("ciphertext").is_some() && self.parsed.get("recipients").is_some() {
-            self.unpack_jwe(did_resolver, secrets_resolver).await
-        } else if self.parsed.get("payload").is_some() && self.parsed.get("signatures").is_some() {
-            unpack_jws(&self.raw, &self.sha256_hash, did_resolver).await
-        } else if self.parsed.get("type").is_some() {
-            let msg = Message::from_json(self.raw.as_bytes())
-                .map_err(|e| format!("Cannot parse plaintext message: {e}"))?;
-            let mut metadata = UnpackMetadata::default();
-            metadata.sha256_hash = self.sha256_hash.clone();
-            Ok((msg, metadata))
-        } else {
-            Err("Cannot detect message format".to_string())
+        match self.kind {
+            EnvelopeKind::Jwe => self.unpack_jwe(did_resolver, secrets_resolver).await,
+            EnvelopeKind::Jws => unpack_jws(&self.raw, &self.sha256_hash, did_resolver).await,
+            EnvelopeKind::Plaintext => {
+                let msg = Message::from_json(self.raw.as_bytes())
+                    .map_err(|e| format!("Cannot parse plaintext message: {e}"))?;
+                let mut metadata = UnpackMetadata::default();
+                metadata.sha256_hash = self.sha256_hash.clone();
+                Ok((msg, metadata))
+            }
         }
     }
 
@@ -195,17 +232,11 @@ impl MetaEnvelope {
         did_resolver: &DIDCacheClient,
         secrets_resolver: &S,
     ) -> Result<(Message, UnpackMetadata), String> {
-        let recipients = self.parsed["recipients"]
-            .as_array()
-            .ok_or("Invalid JWE: no recipients array")?;
-
         let mut recipient_kid_str = String::new();
         let mut recipient_private: Option<PrivateKeyAgreement> = None;
 
-        for recipient in recipients {
-            if let Some(kid) = recipient["header"]["kid"].as_str()
-                && let Some(secret) = secrets_resolver.get_secret(kid).await
-            {
+        for kid in &self.recipient_kids {
+            if let Some(secret) = secrets_resolver.get_secret(kid).await {
                 let Some(curve) = secret.get_key_type().key_agreement_curve() else {
                     continue;
                 };

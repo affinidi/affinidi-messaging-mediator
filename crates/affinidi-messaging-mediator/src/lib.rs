@@ -131,6 +131,8 @@ pub struct SharedData {
     /// `config.listen_address` plus any operator-declared
     /// `config.local_endpoints` aliases.
     pub self_authorities: Arc<HashSet<(String, u16)>>,
+    /// Trust Task signing key and proof verifier, cached across requests.
+    pub(crate) trust_task_keys: Arc<messages::protocols::trust_task_sign::TrustTaskKeys>,
     /// Live health of supervised background tasks, published by the
     /// [`TaskSupervisor`](tasks::supervisor::TaskSupervisor). The readiness
     /// handler reads this to fail `/readyz` when a load-bearing component is

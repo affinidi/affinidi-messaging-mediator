@@ -189,9 +189,8 @@ pub(crate) fn rewrap_inner_attachment(mediator_did: &str, msg: &Message) -> Opti
     if msg.typ != "https://didcomm.org/routing/2.0/forward" {
         return None;
     }
-    let next = serde_json::from_value::<ForwardRequest>(msg.body.clone())
-        .ok()?
-        .next?;
+    // Read from the body in place, not from a copy of it.
+    let next = ForwardRequest::deserialize(&msg.body).ok()?.next?;
     if next != mediator_did {
         return None;
     }
@@ -203,7 +202,7 @@ pub(crate) fn rewrap_inner_attachment(mediator_did: &str, msg: &Message) -> Opti
 /// Process a forward message, run checks and then if accepted place into FORWARD_TASKS stream
 /// Parse the `next` hop DID from a routing-2.0 forward body.
 fn parse_next_did(msg: &Message, session: &Session) -> Result<String, MediatorError> {
-    match serde_json::from_value::<ForwardRequest>(msg.body.to_owned()) {
+    match ForwardRequest::deserialize(&msg.body) {
         Ok(body) => match body.next {
             Some(next_str) => Ok(next_str),
             None => Err(MediatorError::problem(
@@ -387,36 +386,37 @@ async fn deliver_forward(
         remote_endpoint.is_none() == next_acls.is_some(),
         "a local next hop has ACLs here, a remote one does not"
     );
-    // Check attached message for routing information
-    let next_envelope = match MetaEnvelope::new(data, &state.did_resolver).await {
-        Ok(envelope) => envelope,
-        Err(e) => {
-            return Err(MediatorError::problem_with_log(
-                error_codes::MESSAGE_ENVELOPE_READ,
-                &session.session_id,
+    // A remote recipient's ANON_RECEIVE is checked by its own mediator, so
+    // only a local next hop carries ACLs here, and only for one is the
+    // attached envelope read: a remote hop's is relayed as it is and read by
+    // the mediator it goes to (#198).
+    if let Some(next_acls) = next_acls {
+        let next_envelope = match MetaEnvelope::new(data, &state.did_resolver).await {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Err(MediatorError::problem_with_log(
+                    error_codes::MESSAGE_ENVELOPE_READ,
+                    &session.session_id,
+                    Some(msg.id.to_string()),
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.envelope.read",
+                    "Couldn't read forward attached DIDComm envelope: {1}",
+                    vec![e.to_string()],
+                    StatusCode::BAD_REQUEST,
+                    format!("Couldn't read DIDComm envelope: {e}"),
+                ));
+            }
+        };
+        if next_envelope.from_did.is_none()
+            && authz::require_capability(next_acls, Capability::AnonReceive).is_err()
+        {
+            return Err(crate::messages::delivery_refused(
+                session,
                 Some(msg.id.to_string()),
-                ProblemReportSorter::Error,
-                ProblemReportScope::Protocol,
-                "message.envelope.read",
-                "Couldn't read forward attached DIDComm envelope: {1}",
-                vec![e.to_string()],
-                StatusCode::BAD_REQUEST,
-                format!("Couldn't read DIDComm envelope: {e}"),
+                "recipient is not accepting anonymous messages",
             ));
         }
-    };
-
-    // A remote recipient's ANON_RECEIVE is checked by its own mediator, so
-    // only a local next hop carries ACLs here.
-    if let Some(next_acls) = next_acls
-        && next_envelope.from_did.is_none()
-        && authz::require_capability(next_acls, Capability::AnonReceive).is_err()
-    {
-        return Err(crate::messages::delivery_refused(
-            session,
-            Some(msg.id.to_string()),
-            "recipient is not accepting anonymous messages",
-        ));
     }
 
     debug!(
@@ -957,8 +957,9 @@ pub(crate) async fn process(
         let next = parse_next_did(msg, session)?;
         let next_did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(&next);
 
-        let attachments = if let Some(attachments) = msg.attachments.as_ref().filter(|a| !a.is_empty()) {
-            attachments.to_owned()
+        // Borrowed, not copied: the attachment is the bulk of a forward.
+        let attachments: &[Attachment] = if let Some(attachments) = msg.attachments.as_deref().filter(|a| !a.is_empty()) {
+            attachments
         } else {
             return Err(MediatorError::problem(
                 error_codes::FORWARD_MISSING_ATTACHMENTS,
@@ -1133,7 +1134,7 @@ pub(crate) async fn process(
         // First step is to determine if the next hop is local to the mediator or remote?
         //if next_did_doc.service
 
-        let data = decode_first_attachment(msg, session, &attachments)?;
+        let data = decode_first_attachment(msg, session, attachments)?;
 
         let expires_at = if let Some(expires_at) = msg.expires_time {
             let now = state.clock.unix_secs();

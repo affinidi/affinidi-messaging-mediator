@@ -21,12 +21,21 @@
 //!   the existing `account_list` cursor. Account records already carry the
 //!   depth counters, so the entire depth half of the survey costs one paged
 //!   walk and no per-queue reads at all;
-//! - at most `MAX_AGE_PROBES` queues *per folder* are then probed for age,
-//!   chosen as the deepest ones seen. Each probe is a single range-read of one
-//!   entry.
+//! - at most `MAX_AGE_PROBES + MAX_ROTATING_PROBES` queues *per folder* are
+//!   then probed for age: the deepest ones seen, plus a window over every other
+//!   non-empty queue that rotates from cycle to cycle. Each probe is a single
+//!   range-read of the queue's oldest `DELIVERED_SAMPLE` entries, whose first
+//!   row is the age and whose rows are the delivered-unacked sample.
 //!
-//! So the expensive half is bounded by a constant rather than by account count,
-//! and it is spent on the queues most likely to be the problem.
+//! So the expensive half is bounded by a constant rather than by account count.
+//! Half of it goes to the queues most likely to be the problem; the rotating
+//! half guarantees a shallow queue that has stopped moving is aged within a
+//! bounded number of cycles even while deeper queues exist. Read the age gauge
+//! over a window (`max_over_time`) to see the whole rotation.
+//!
+//! A walk cut short by the account cap resumes where it stopped on the next
+//! cycle, so a deployment with more accounts than the cap is still surveyed
+//! in full, a cap's worth per cycle.
 //!
 //! # Why the oldest entry is a cheap read
 //!
@@ -86,27 +95,33 @@ pub(crate) trait QueueSource: Send + Sync {
     async fn accounts(&self, cursor: u32, limit: u32)
     -> Result<MediatorAccountList, MediatorError>;
 
-    /// Arrival time in **unix milliseconds** of the oldest message in
-    /// `did_hash`'s `folder`, or `None` when that queue is empty.
-    async fn oldest_arrival_ms(
-        &self,
-        did_hash: &str,
-        folder: Folder,
-    ) -> Result<Option<u64>, MediatorError>;
-
-    /// Of the `limit` oldest messages in `did_hash`'s `folder`, how many have
-    /// already been handed to their recipient — and how many were looked at.
+    /// Up to `limit` of the **oldest** entries in `did_hash`'s `folder`,
+    /// oldest first. Empty when the queue is.
     ///
-    /// The **oldest** end on purpose: a message that has been delivered and is
-    /// still queued has been that way for as long as it has been queued, so
-    /// the head of the queue is where it accumulates. Sampling the newest end
-    /// would mostly count messages nobody has had a chance to collect yet.
-    async fn delivered_unacked_sample(
+    /// One listing serves both halves of a probe: the first row is the
+    /// queue's oldest message (its age), and the page is the delivered-unacked
+    /// sample. The oldest end on purpose for the sample too: a message that
+    /// has been delivered and is still queued has been that way for as long as
+    /// it has been queued, so the head of the queue is where it accumulates.
+    async fn oldest_entries(
         &self,
         did_hash: &str,
         folder: Folder,
         limit: u32,
-    ) -> Result<(usize, usize), MediatorError>;
+    ) -> Result<Vec<QueuedEntry>, MediatorError>;
+
+    /// How many of `records` have already been handed to their recipient.
+    async fn delivered_count(&self, records: &[MessageRef]) -> Result<usize, MediatorError>;
+}
+
+/// One queued entry as a probe sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedEntry {
+    /// Arrival time in **unix milliseconds**.
+    pub arrival_ms: u64,
+    /// The recipient's copy this entry stands for: this DID's own in an
+    /// inbox, the entry's recipient in an outbox.
+    pub record: MessageRef,
 }
 
 #[async_trait]
@@ -119,52 +134,43 @@ impl<T: MediatorStore + ?Sized> QueueSource for T {
         self.account_list(cursor, limit).await
     }
 
-    async fn oldest_arrival_ms(
-        &self,
-        did_hash: &str,
-        folder: Folder,
-    ) -> Result<Option<u64>, MediatorError> {
-        // `("-", "+")` with a limit of 1 is the range-min read: inbox and
-        // outbox are arrival-ordered streams in every backend, so the first
-        // entry in a DID's range is its genuine oldest message.
-        Ok(self
-            .list_messages(did_hash, folder, Some(("-", "+")), 1)
-            .await?
-            .first()
-            .map(|m| m.timestamp))
-    }
-
-    async fn delivered_unacked_sample(
+    async fn oldest_entries(
         &self,
         did_hash: &str,
         folder: Folder,
         limit: u32,
-    ) -> Result<(usize, usize), MediatorError> {
+    ) -> Result<Vec<QueuedEntry>, MediatorError> {
+        // `("-", "+")` is the range-min read: inbox and outbox are
+        // arrival-ordered streams in every backend, so the first entry in a
+        // DID's range is its genuine oldest message.
         let page = self
             .list_messages(did_hash, folder.clone(), Some(("-", "+")), limit)
             .await?;
-        if page.is_empty() {
-            return Ok((0, 0));
-        }
-        // Each entry is one recipient's copy: this DID's own in an inbox, the
-        // entry's recipient in an outbox.
-        let records: Vec<MessageRef> = page
-            .iter()
+        Ok(page
+            .into_iter()
             .map(|m| {
                 let to = match folder {
-                    Folder::Inbox => did_hash,
-                    Folder::Outbox => m.to_address.as_deref().unwrap_or(did_hash),
+                    Folder::Inbox => did_hash.to_string(),
+                    Folder::Outbox => m.to_address.unwrap_or_else(|| did_hash.to_string()),
                 };
-                MessageRef::new(to, m.msg_id.clone())
+                QueuedEntry {
+                    arrival_ms: m.timestamp,
+                    record: MessageRef::new(to, m.msg_id),
+                }
             })
-            .collect();
+            .collect())
+    }
+
+    async fn delivered_count(&self, records: &[MessageRef]) -> Result<usize, MediatorError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
         // Batched: one round trip for the page rather than one per message.
-        let states = self.delivery_states(&records).await?;
-        let delivered = states
+        let states = self.delivery_states(records).await?;
+        Ok(states
             .iter()
             .filter(|state| state.as_ref().is_some_and(|s| s.delivered()))
-            .count();
-        Ok((delivered, page.len()))
+            .count())
     }
 }
 
@@ -173,9 +179,16 @@ impl<T: MediatorStore + ?Sized> QueueSource for T {
 /// returning a partial total.
 pub(crate) const MAX_ACCOUNTS_PER_SURVEY: u32 = 10_000;
 
-/// Ceiling on age probes per folder. The deepest queues are probed first, on
-/// the grounds that a queue nobody is draining is also a queue that grows.
+/// Ceiling on age probes per folder spent on the deepest queues, on the
+/// grounds that a queue nobody is draining is also a queue that grows.
 pub(crate) const MAX_AGE_PROBES: usize = 32;
+
+/// Further age probes per folder spent on a window of the *other* non-empty
+/// queues that rotates across cycles. A shallow queue that has not moved in
+/// days is the case the age signal exists for, and it is never among the
+/// deepest; the rotation guarantees it is aged within a bounded number of
+/// cycles.
+pub(crate) const MAX_ROTATING_PROBES: usize = 32;
 
 /// Messages sampled per probed queue when measuring how much of it is work
 /// already done.
@@ -228,6 +241,12 @@ pub(crate) struct FolderStats {
     /// gauge. A bare count would be meaningless without knowing whether it came
     /// from ten messages or a thousand.
     pub sampled: usize,
+    /// How many non-empty queues were successfully aged this cycle.
+    ///
+    /// With [`messages`](Self::messages) non-zero and this zero, the age is
+    /// **unknown**, not zero: every probe failed or none ran. The gauge
+    /// publisher uses it to avoid reporting a stuck fleet as an empty one.
+    pub aged: usize,
 }
 
 /// One surveyed account's two queues, as served by `messaging/queue/list`.
@@ -343,39 +362,49 @@ fn offer(heap: &mut BinaryHeap<Reverse<(u32, String)>>, depth: u32, did_hash: &s
     }
 }
 
-/// Age in seconds of the oldest message in `did_hash`'s `folder`, or `None`
-/// when the queue is empty.
+/// Where the next survey picks up.
 ///
-/// A message whose arrival stamp is in the future — a clock that went
-/// backwards, or a test clock behind the store's wall-clock stream IDs —
-/// yields `0` rather than a wrapped enormous age.
-async fn oldest_age(
-    store: &(impl QueueSource + ?Sized),
-    clock: &Arc<dyn Clock>,
-    did_hash: &str,
-    folder: Folder,
-) -> Result<Option<u64>, MediatorError> {
-    Ok(store
-        .oldest_arrival_ms(did_hash, folder)
-        .await?
-        .map(|arrival_ms| clock.unix_secs().saturating_sub(arrival_ms / 1_000)))
+/// Held by the statistics task across cycles. Without it every survey started
+/// at cursor 0 and stopped at the account cap, so accounts past the first
+/// [`MAX_ACCOUNTS_PER_SURVEY`] were never surveyed at all, and only the
+/// deepest [`MAX_AGE_PROBES`] queues were ever aged, so a shallow queue stuck
+/// for a week stayed invisible for as long as deeper ones existed.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SurveyCursor {
+    /// Account-list cursor the next walk starts from. Non-zero only after a
+    /// walk was cut short by the account cap.
+    resume_at: u32,
+    /// Offset into the non-deepest, non-empty queues for the next rotating
+    /// age probes.
+    rotation: usize,
 }
 
-/// Walk the account list, accumulating depth, then probe the deepest queues
-/// for age.
+/// Walk the account list, accumulating depth, then probe queues for age:
+/// the deepest ones, plus a window that rotates across cycles over every
+/// other non-empty queue.
 pub(crate) async fn survey(
     store: &(impl QueueSource + ?Sized),
     clock: &Arc<dyn Clock>,
     defaults: SurveyDefaults,
+    cursor: &mut SurveyCursor,
 ) -> Result<QueueSurvey, MediatorError> {
     let mut out = QueueSurvey::default();
     let mut inbox_probes: BinaryHeap<Reverse<(u32, String)>> = BinaryHeap::new();
     let mut outbox_probes: BinaryHeap<Reverse<(u32, String)>> = BinaryHeap::new();
 
-    let mut cursor = 0u32;
+    // A walk that resumes mid-listing wraps to the start once it runs out, so
+    // a cycle still reads up to the cap. Accounts already read this cycle are
+    // skipped after a wrap so nothing is counted twice.
+    let start = cursor.resume_at;
+    let mut wrapped = start == 0;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut next = start;
     loop {
-        let page = store.accounts(cursor, ACCOUNT_PAGE).await?;
+        let page = store.accounts(next, ACCOUNT_PAGE).await?;
         for account in &page.accounts {
+            if start != 0 && !seen.insert(account.did_hash.clone()) {
+                continue;
+            }
             out.accounts_surveyed += 1;
 
             out.inbox.messages += u64::from(account.receive_queue_count);
@@ -423,71 +452,133 @@ pub(crate) async fn survey(
         }
 
         // `cursor == 0` is the store's "listing exhausted" convention.
-        cursor = page.cursor;
-        if cursor == 0 {
-            break;
+        next = page.cursor;
+        if next == 0 {
+            cursor.resume_at = 0;
+            if wrapped {
+                break;
+            }
+            if out.accounts_surveyed >= MAX_ACCOUNTS_PER_SURVEY {
+                out.truncated = true;
+                break;
+            }
+            wrapped = true;
+            continue;
         }
         if out.accounts_surveyed >= MAX_ACCOUNTS_PER_SURVEY {
             out.truncated = true;
+            cursor.resume_at = next;
             break;
         }
     }
 
-    let (oldest, delivered, sampled, ages) =
-        probe_queues(store, clock, inbox_probes, Folder::Inbox).await;
-    out.inbox.oldest = oldest;
-    out.inbox.delivered_unacked = delivered;
-    out.inbox.sampled = sampled;
+    let rotation = cursor.rotation;
+    cursor.rotation = rotation.wrapping_add(MAX_ROTATING_PROBES);
+
+    let inbox_candidates = probe_set(
+        inbox_probes,
+        out.accounts
+            .iter()
+            .filter(|a| a.receive_count > 0)
+            .map(|a| a.did_hash.as_str()),
+        rotation,
+    );
+    let probed = probe_queues(store, clock, inbox_candidates, Folder::Inbox).await;
+    out.inbox.oldest = probed.oldest;
+    out.inbox.delivered_unacked = probed.delivered_unacked;
+    out.inbox.sampled = probed.sampled;
+    out.inbox.aged = probed.ages.len();
     for account in out.accounts.iter_mut() {
-        account.receive_oldest_secs = ages.get(&account.did_hash).copied();
+        account.receive_oldest_secs = probed.ages.get(&account.did_hash).copied();
     }
 
-    let (oldest, delivered, sampled, ages) =
-        probe_queues(store, clock, outbox_probes, Folder::Outbox).await;
-    out.outbox.oldest = oldest;
-    out.outbox.delivered_unacked = delivered;
-    out.outbox.sampled = sampled;
+    let outbox_candidates = probe_set(
+        outbox_probes,
+        out.accounts
+            .iter()
+            .filter(|a| a.send_count > 0)
+            .map(|a| a.did_hash.as_str()),
+        rotation,
+    );
+    let probed = probe_queues(store, clock, outbox_candidates, Folder::Outbox).await;
+    out.outbox.oldest = probed.oldest;
+    out.outbox.delivered_unacked = probed.delivered_unacked;
+    out.outbox.sampled = probed.sampled;
+    out.outbox.aged = probed.ages.len();
     for account in out.accounts.iter_mut() {
-        account.send_oldest_secs = ages.get(&account.did_hash).copied();
+        account.send_oldest_secs = probed.ages.get(&account.did_hash).copied();
     }
 
     Ok(out)
 }
 
+/// The queues to age this cycle: the `deepest`, then up to
+/// [`MAX_ROTATING_PROBES`] of the other non-empty ones starting at
+/// `rotation`, wrapping. Successive cycles advance `rotation`, so every
+/// non-empty queue the walk sees is aged within
+/// `ceil(non_empty / MAX_ROTATING_PROBES)` cycles however shallow it is.
+fn probe_set<'a>(
+    deepest: BinaryHeap<Reverse<(u32, String)>>,
+    non_empty: impl Iterator<Item = &'a str>,
+    rotation: usize,
+) -> Vec<String> {
+    let mut chosen: Vec<String> = deepest
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse((_, did))| did)
+        .collect();
+    let rest: Vec<&str> = non_empty
+        .filter(|did| !chosen.iter().any(|c| c == did))
+        .collect();
+    if !rest.is_empty() {
+        let take = MAX_ROTATING_PROBES.min(rest.len());
+        let from = rotation % rest.len();
+        chosen.extend(
+            rest.iter()
+                .cycle()
+                .skip(from)
+                .take(take)
+                .map(|did| (*did).to_string()),
+        );
+    }
+    chosen
+}
+
+/// What [`probe_queues`] found in one folder.
+#[derive(Debug, Default)]
+struct Probed {
+    oldest: Option<QueueAge>,
+    delivered_unacked: usize,
+    sampled: usize,
+    ages: std::collections::HashMap<String, u64>,
+}
+
 /// Probe each candidate and keep the oldest. A probe that errors is skipped:
 /// this is a metrics path, and one unreadable queue must not cost the whole
 /// survey.
+///
+/// Each probe is **one** listing of the queue's oldest
+/// [`DELIVERED_SAMPLE`] entries: the first row gives the age and the page is
+/// the delivered-unacked sample, so no queue is listed twice.
+///
+/// A message whose arrival stamp is in the future (a clock that went
+/// backwards, or a test clock behind the store's wall-clock stream IDs)
+/// yields an age of `0` rather than a wrapped enormous one.
 async fn probe_queues(
     store: &(impl QueueSource + ?Sized),
     clock: &Arc<dyn Clock>,
-    candidates: BinaryHeap<Reverse<(u32, String)>>,
+    candidates: Vec<String>,
     folder: Folder,
-) -> (
-    Option<QueueAge>,
-    usize,
-    usize,
-    std::collections::HashMap<String, u64>,
-) {
-    let mut ages = std::collections::HashMap::new();
-    let mut oldest: Option<QueueAge> = None;
-    let mut delivered_unacked = 0usize;
-    let mut sampled = 0usize;
+) -> Probed {
+    let mut out = Probed::default();
+    let now = clock.unix_secs();
 
-    for Reverse((_, did_hash)) in candidates.into_sorted_vec() {
-        match oldest_age(store, clock, &did_hash, folder.clone()).await {
-            Ok(Some(age_secs)) => {
-                ages.insert(did_hash.clone(), age_secs);
-                if oldest.as_ref().is_none_or(|o| age_secs > o.age_secs) {
-                    oldest = Some(QueueAge {
-                        did_hash: did_hash.clone(),
-                        age_secs,
-                    });
-                }
-            }
-            Ok(None) => {
-                // Empty queue: nothing to age and nothing to sample.
-                continue;
-            }
+    for did_hash in candidates {
+        let entries = match store
+            .oldest_entries(&did_hash, folder.clone(), DELIVERED_SAMPLE)
+            .await
+        {
+            Ok(entries) => entries,
             Err(e) => {
                 tracing::debug!(
                     did_hash = %did_hash,
@@ -496,17 +587,27 @@ async fn probe_queues(
                 );
                 continue;
             }
+        };
+        // Empty queue: nothing to age and nothing to sample.
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        let age_secs = now.saturating_sub(first.arrival_ms / 1_000);
+        out.ages.insert(did_hash.clone(), age_secs);
+        if out.oldest.as_ref().is_none_or(|o| age_secs > o.age_secs) {
+            out.oldest = Some(QueueAge {
+                did_hash: did_hash.clone(),
+                age_secs,
+            });
         }
 
-        // Independent of the age probe: a failure here costs the sample for
-        // one queue, not the age reading that already succeeded.
-        match store
-            .delivered_unacked_sample(&did_hash, folder.clone(), DELIVERED_SAMPLE)
-            .await
-        {
-            Ok((delivered, examined)) => {
-                delivered_unacked += delivered;
-                sampled += examined;
+        // Independent of the age reading: a failure here costs the sample for
+        // one queue, not the age that already succeeded.
+        let records: Vec<MessageRef> = entries.into_iter().map(|e| e.record).collect();
+        match store.delivered_count(&records).await {
+            Ok(delivered) => {
+                out.delivered_unacked += delivered;
+                out.sampled += records.len();
             }
             Err(e) => {
                 tracing::debug!(
@@ -517,7 +618,7 @@ async fn probe_queues(
             }
         }
     }
-    (oldest, delivered_unacked, sampled, ages)
+    out
 }
 
 /// `f64` has no `Ord`, and these are ratios that can legitimately be absent,
@@ -650,11 +751,12 @@ mod tests {
             })
         }
 
-        async fn oldest_arrival_ms(
+        async fn oldest_entries(
             &self,
             did_hash: &str,
             folder: Folder,
-        ) -> Result<Option<u64>, MediatorError> {
+            _limit: u32,
+        ) -> Result<Vec<QueuedEntry>, MediatorError> {
             if self.failing.iter().any(|d| d == did_hash) {
                 return Err(MediatorError::InternalError(
                     crate::error_codes::INTERNAL_ERROR,
@@ -662,30 +764,37 @@ mod tests {
                     "probe failed".into(),
                 ));
             }
-            Ok(self
-                .oldest
-                .get(&(did_hash.to_string(), folder.to_string()))
-                .copied())
+            let key = (did_hash.to_string(), folder.to_string());
+            let Some(arrival_ms) = self.oldest.get(&key).copied() else {
+                return Ok(Vec::new());
+            };
+            let rows = self.samples.get(&key).map_or(1, |(_, examined)| *examined);
+            // The folder rides in the message id so `delivered_count` can find
+            // the sample this page stands for.
+            Ok((0..rows.max(1))
+                .map(|i| QueuedEntry {
+                    arrival_ms: arrival_ms + i as u64,
+                    record: MessageRef::new(did_hash, format!("{folder}:{i}")),
+                })
+                .collect())
         }
 
-        async fn delivered_unacked_sample(
-            &self,
-            did_hash: &str,
-            folder: Folder,
-            _limit: u32,
-        ) -> Result<(usize, usize), MediatorError> {
-            if self.failing_sample.iter().any(|d| d == did_hash) {
+        async fn delivered_count(&self, records: &[MessageRef]) -> Result<usize, MediatorError> {
+            let Some(first) = records.first() else {
+                return Ok(0);
+            };
+            if self.failing_sample.contains(&first.to_did_hash) {
                 return Err(MediatorError::InternalError(
                     crate::error_codes::INTERNAL_ERROR,
                     "test".into(),
                     "sample failed".into(),
                 ));
             }
+            let folder = first.msg_id.split(':').next().unwrap_or_default();
             Ok(self
                 .samples
-                .get(&(did_hash.to_string(), folder.to_string()))
-                .copied()
-                .unwrap_or((0, 0)))
+                .get(&(first.to_did_hash.clone(), folder.to_string()))
+                .map_or(0, |(delivered, _)| *delivered))
         }
     }
 
@@ -693,9 +802,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_mediator_surveys_clean() {
-        let out = survey(&FakeSource::new(), &clock_at(1_000), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &FakeSource::new(),
+            &clock_at(1_000),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
         assert_eq!(out.accounts_surveyed, 0);
         assert!(!out.truncated);
         assert_eq!(out.inbox, FolderStats::default());
@@ -707,9 +821,14 @@ mod tests {
         let src = FakeSource::new()
             .with_account("alice", 0, 3)
             .with_account("bob", 3, 0);
-        let out = survey(&src, &clock_at(1_000), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(1_000),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         assert_eq!(out.accounts_surveyed, 2);
         assert_eq!(out.inbox.messages, 3);
@@ -728,9 +847,14 @@ mod tests {
             FakeSource::new()
                 .with_account("alice", 0, 5)
                 .aged("alice", Folder::Outbox, HOUR_MS);
-        let out = survey(&src, &clock_at(73 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(73 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         let oldest = out.outbox.oldest.expect("oldest");
         assert_eq!(oldest.age_secs, 72 * 3_600);
@@ -745,9 +869,14 @@ mod tests {
             .aged("recent", Folder::Outbox, 50 * HOUR_MS)
             .with_account("ancient", 0, 1)
             .aged("ancient", Folder::Outbox, 2 * HOUR_MS);
-        let out = survey(&src, &clock_at(100 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(100 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         let oldest = out.outbox.oldest.expect("oldest");
         assert_eq!(oldest.did_hash, "ancient");
@@ -763,9 +892,14 @@ mod tests {
             Folder::Outbox,
             900 * HOUR_MS,
         );
-        let out = survey(&src, &clock_at(3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
         assert_eq!(out.outbox.oldest.expect("oldest").age_secs, 0);
     }
 
@@ -777,9 +911,14 @@ mod tests {
             .failing_probe("broken")
             .with_account("fine", 0, 1)
             .aged("fine", Folder::Outbox, HOUR_MS);
-        let out = survey(&src, &clock_at(5 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(5 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         // Depth still counted for both, and the readable queue still aged.
         assert_eq!(out.outbox.messages, 10);
@@ -795,7 +934,9 @@ mod tests {
             .with_account("alice", 20, 0)
             .with_account("bob", 2, 0)
             .with_limits(Some(4), None);
-        let out = survey(&src, &clock_at(0), DEFAULTS).await.expect("survey");
+        let out = survey(&src, &clock_at(0), DEFAULTS, &mut SurveyCursor::default())
+            .await
+            .expect("survey");
         assert_eq!(out.inbox.max_saturation, Some(0.5));
     }
 
@@ -807,7 +948,9 @@ mod tests {
             .with_account("unlimited", 10_000, 0)
             .with_limits(Some(-1), None)
             .with_account("normal", 100, 0);
-        let out = survey(&src, &clock_at(0), DEFAULTS).await.expect("survey");
+        let out = survey(&src, &clock_at(0), DEFAULTS, &mut SurveyCursor::default())
+            .await
+            .expect("survey");
         assert_eq!(out.inbox.max_saturation, Some(0.5));
     }
 
@@ -818,7 +961,9 @@ mod tests {
             src = src.with_account(&format!("did{i}"), 1, 0);
         }
         src.page_size = 100;
-        let out = survey(&src, &clock_at(0), DEFAULTS).await.expect("survey");
+        let out = survey(&src, &clock_at(0), DEFAULTS, &mut SurveyCursor::default())
+            .await
+            .expect("survey");
         assert_eq!(out.accounts_surveyed, 250);
         assert_eq!(out.inbox.messages, 250);
         assert!(!out.truncated);
@@ -833,7 +978,9 @@ mod tests {
             src = src.with_account(&format!("did{i}"), 1, 0);
         }
         src.page_size = 100;
-        let out = survey(&src, &clock_at(0), DEFAULTS).await.expect("survey");
+        let out = survey(&src, &clock_at(0), DEFAULTS, &mut SurveyCursor::default())
+            .await
+            .expect("survey");
         assert!(out.truncated);
         assert!(out.accounts_surveyed >= MAX_ACCOUNTS_PER_SURVEY);
         assert!(out.accounts_surveyed < MAX_ACCOUNTS_PER_SURVEY + 200);
@@ -857,9 +1004,14 @@ mod tests {
             .with_account("deep", 0, 5_000)
             .aged("deep", Folder::Outbox, 10 * HOUR_MS);
 
-        let out = survey(&src, &clock_at(100 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(100 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         // With MAX_AGE_PROBES at 32 the deep queue is always probed; the
         // shallow ones fill the remaining slots, so an older one is still
@@ -928,9 +1080,14 @@ mod tests {
             .with_account("alice", 0, 10)
             .aged("alice", Folder::Outbox, HOUR_MS)
             .sampled("alice", Folder::Outbox, 7, 10);
-        let out = survey(&src, &clock_at(2 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(2 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         assert_eq!(out.outbox.delivered_unacked, 7);
         assert_eq!(
@@ -950,9 +1107,14 @@ mod tests {
             .with_account("b", 0, 5)
             .aged("b", Folder::Outbox, HOUR_MS)
             .sampled("b", Folder::Outbox, 3, 5);
-        let out = survey(&src, &clock_at(2 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(2 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
         assert_eq!(out.outbox.delivered_unacked, 5);
         assert_eq!(out.outbox.sampled, 10);
     }
@@ -963,9 +1125,14 @@ mod tests {
     async fn an_empty_queue_is_not_sampled() {
         let src = FakeSource::new().with_account("alice", 0, 3);
         // No `aged` entry: the queue reads as empty.
-        let out = survey(&src, &clock_at(1_000), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(1_000),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
         assert_eq!(out.outbox.sampled, 0);
         assert_eq!(out.outbox.delivered_unacked, 0);
     }
@@ -981,14 +1148,126 @@ mod tests {
             .with_account("fine", 0, 4)
             .aged("fine", Folder::Outbox, 2 * HOUR_MS)
             .sampled("fine", Folder::Outbox, 1, 4);
-        let out = survey(&src, &clock_at(10 * 3_600), DEFAULTS)
-            .await
-            .expect("survey");
+        let out = survey(
+            &src,
+            &clock_at(10 * 3_600),
+            DEFAULTS,
+            &mut SurveyCursor::default(),
+        )
+        .await
+        .expect("survey");
 
         // The oldest is still found, from the queue whose sample failed.
         assert_eq!(out.outbox.oldest.expect("oldest").did_hash, "broken");
         // And the readable queue still contributes its sample.
         assert_eq!(out.outbox.delivered_unacked, 1);
         assert_eq!(out.outbox.sampled, 4);
+    }
+
+    /// The case the age signal exists for (#144): one message stuck for a week
+    /// in a shallow queue, behind more deep-but-fresh queues than the deepest
+    /// probes cover. The rotating probes reach it within a bounded number of
+    /// cycles.
+    #[tokio::test]
+    async fn a_shallow_stuck_queue_is_aged_by_the_rotation() {
+        let mut src = FakeSource::new();
+        // Twice as many deep, fresh queues as the rotation window, so the
+        // stuck queue is not reached on the first cycle by accident.
+        let deep = MAX_AGE_PROBES + 2 * MAX_ROTATING_PROBES;
+        for i in 0..deep {
+            let did = format!("deep{i}");
+            src = src
+                .with_account(&did, 0, 1_000)
+                .aged(&did, Folder::Outbox, 199 * HOUR_MS);
+        }
+        src = src
+            .with_account("stuck", 0, 1)
+            .aged("stuck", Folder::Outbox, 30 * HOUR_MS);
+
+        let mut cursor = SurveyCursor::default();
+        let mut found = false;
+        let cycles = (deep / MAX_ROTATING_PROBES) + 1;
+        for _ in 0..cycles {
+            let out = survey(&src, &clock_at(200 * 3_600), DEFAULTS, &mut cursor)
+                .await
+                .expect("survey");
+            if out
+                .outbox
+                .oldest
+                .as_ref()
+                .is_some_and(|o| o.did_hash == "stuck")
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the shallow stuck queue was never aged");
+    }
+
+    /// Accounts past the cap are surveyed on a later cycle: the walk resumes
+    /// where the previous one stopped rather than always starting at 0.
+    #[tokio::test]
+    async fn a_capped_walk_resumes_where_it_stopped() {
+        let mut src = FakeSource::new();
+        for i in 0..MAX_ACCOUNTS_PER_SURVEY {
+            src = src.with_account(&format!("did{i}"), 0, 0);
+        }
+        src = src
+            .with_account("beyond", 0, 1)
+            .aged("beyond", Folder::Outbox, HOUR_MS);
+        src.page_size = 100;
+
+        let mut cursor = SurveyCursor::default();
+        let first = survey(&src, &clock_at(10 * 3_600), DEFAULTS, &mut cursor)
+            .await
+            .expect("survey");
+        assert!(first.truncated);
+        assert_eq!(
+            first.outbox.messages, 0,
+            "the first cycle stops short of it"
+        );
+
+        let second = survey(&src, &clock_at(10 * 3_600), DEFAULTS, &mut cursor)
+            .await
+            .expect("survey");
+        assert_eq!(second.outbox.messages, 1);
+        assert_eq!(
+            second.outbox.oldest.expect("oldest").did_hash,
+            "beyond",
+            "the account past the cap is surveyed and aged"
+        );
+    }
+
+    /// A wrapped walk never counts an account twice.
+    #[tokio::test]
+    async fn a_wrapped_walk_counts_each_account_once() {
+        let mut src = FakeSource::new();
+        for i in 0..250 {
+            src = src.with_account(&format!("did{i}"), 1, 0);
+        }
+        src.page_size = 100;
+        let mut cursor = SurveyCursor {
+            resume_at: 200,
+            rotation: 0,
+        };
+        let out = survey(&src, &clock_at(0), DEFAULTS, &mut cursor)
+            .await
+            .expect("survey");
+        assert_eq!(out.accounts_surveyed, 250);
+        assert_eq!(out.inbox.messages, 250);
+        assert!(!out.truncated);
+        assert_eq!(cursor.resume_at, 0);
+    }
+
+    #[test]
+    fn probe_set_rotates_over_the_rest_and_skips_the_deepest() {
+        let mut heap = BinaryHeap::new();
+        offer(&mut heap, 9, "deep", 1);
+        let all = ["deep", "a", "b", "c"];
+        let first = probe_set(heap.clone(), all.iter().copied(), 0);
+        assert_eq!(first[0], "deep");
+        assert!(!first[1..].contains(&"deep".to_string()));
+        // With fewer others than the window, every one is probed.
+        assert_eq!(first.len(), 4);
     }
 }

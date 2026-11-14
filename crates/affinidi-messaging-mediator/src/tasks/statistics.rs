@@ -1,6 +1,6 @@
 use crate::common::metrics::names;
 use crate::tasks::queue_survey::{
-    self, QueueSnapshot, QueueSnapshotCell, QueueSurvey, SurveyDefaults,
+    self, FolderStats, QueueSnapshot, QueueSnapshotCell, QueueSurvey, SurveyCursor, SurveyDefaults,
 };
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
@@ -76,6 +76,7 @@ async fn statistics_loop(
         let mut interval = tokio::time::interval(Duration::from_secs(60));
 
         let mut previous_stats = MetadataStats::default();
+        let mut survey_cursor = SurveyCursor::default();
 
         loop {
             interval.tick().await;
@@ -116,7 +117,15 @@ async fn statistics_loop(
             );
 
             publish_metrics(&database, &stats).await;
-            publish_queue_metrics(&database, &clock, queue_defaults(), &tags, &snapshot).await;
+            publish_queue_metrics(
+                &database,
+                &clock,
+                queue_defaults(),
+                &tags,
+                &snapshot,
+                &mut survey_cursor,
+            )
+            .await;
 
             previous_stats = stats;
         }
@@ -186,8 +195,9 @@ async fn publish_queue_metrics(
     defaults: SurveyDefaults,
     tags: &HashMap<String, String>,
     snapshot: &QueueSnapshotCell,
+    cursor: &mut SurveyCursor,
 ) {
-    let survey = match queue_survey::survey(database.as_ref(), clock, defaults).await {
+    let survey = match queue_survey::survey(database.as_ref(), clock, defaults, cursor).await {
         Ok(survey) => survey,
         Err(e) => {
             debug!("queue survey unavailable this cycle: {e}");
@@ -199,7 +209,7 @@ async fn publish_queue_metrics(
         metrics::gauge!(names::QUEUE_DEPTH_MESSAGES, "folder" => folder).set(stats.messages as f64);
         metrics::gauge!(names::QUEUE_DEPTH_BYTES, "folder" => folder).set(stats.bytes as f64);
         metrics::gauge!(names::QUEUE_OLDEST_AGE_SECONDS, "folder" => folder)
-            .set(stats.oldest.as_ref().map_or(0.0, |o| o.age_secs as f64));
+            .set(oldest_age_gauge(stats));
         metrics::gauge!(names::QUEUE_MAX_SATURATION_RATIO, "folder" => folder)
             .set(stats.max_saturation.unwrap_or(0.0));
         metrics::gauge!(names::QUEUE_DELIVERED_UNACKED, "folder" => folder)
@@ -215,6 +225,20 @@ async fn publish_queue_metrics(
     let taken_at = chrono::DateTime::from_timestamp(clock.unix_secs() as i64, 0)
         .unwrap_or_else(chrono::Utc::now);
     snapshot.publish(QueueSnapshot { taken_at, survey });
+}
+
+/// The value for the oldest-age gauge.
+///
+/// `0` only when the folder is genuinely empty. When messages are queued but
+/// no probe succeeded this cycle the age is **unknown**, and is published as
+/// `NaN` rather than `0`: a `0` would read exactly like a drained fleet and
+/// silence the alert that exists to catch a stuck one (R6.2).
+fn oldest_age_gauge(stats: &FolderStats) -> f64 {
+    match &stats.oldest {
+        Some(oldest) => oldest.age_secs as f64,
+        None if stats.messages == 0 => 0.0,
+        None => f64::NAN,
+    }
 }
 
 /// Log the survey alongside the `UpdateStats` events, so a deployment without
@@ -254,4 +278,33 @@ fn log_survey(survey: &QueueSurvey, tags: &HashMap<String, String>) {
         outbox_delivered_unacked = survey.outbox.delivered_unacked,
         outbox_sampled = survey.outbox.sampled,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::queue_survey::QueueAge;
+
+    /// An unknown age must not read as an empty, healthy fleet (#144).
+    #[test]
+    fn the_age_gauge_is_zero_only_when_empty_and_nan_when_unknown() {
+        let empty = FolderStats::default();
+        assert_eq!(oldest_age_gauge(&empty), 0.0);
+
+        let unknown = FolderStats {
+            messages: 3,
+            ..Default::default()
+        };
+        assert!(oldest_age_gauge(&unknown).is_nan());
+
+        let known = FolderStats {
+            messages: 3,
+            oldest: Some(QueueAge {
+                did_hash: "d".into(),
+                age_secs: 42,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(oldest_age_gauge(&known), 42.0);
+    }
 }

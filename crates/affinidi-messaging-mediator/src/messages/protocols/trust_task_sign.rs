@@ -11,7 +11,8 @@
 //! silent downgrade to unsigned.
 
 use crate::error_codes;
-use std::sync::Once;
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use affinidi_did_common::DocumentExt;
 use affinidi_messaging_mediator_common::errors::MediatorError;
@@ -19,9 +20,46 @@ use affinidi_secrets_resolver::SecretsResolver;
 use affinidi_secrets_resolver::secrets::{KeyType, Secret};
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
-use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};
+use trust_tasks_proof::affinidi::{SignOptions, Verifier, sign_trust_task};
 
 use crate::SharedData;
+
+/// How long a signing key found by [`signing_secret`] is reused before the
+/// mediator DID is resolved and its secrets walked again. Bounds how long a
+/// change to the DID's keys takes to reach response signing.
+const SIGNING_KEY_TTL: Duration = Duration::from_secs(300);
+
+/// Per-mediator Trust Task key material, held in `SharedData` so the hot path
+/// neither resolves the mediator's own DID and walks its secrets for every
+/// response, nor builds a fresh proof verifier for every request (#198).
+#[derive(Default)]
+pub(crate) struct TrustTaskKeys {
+    /// The last signing key found, and when. Only a key found is kept: a
+    /// failed resolution is retried on the next response rather than leaving
+    /// responses unsigned for the TTL.
+    signing: Mutex<Option<(Instant, Secret)>>,
+    verifier: OnceLock<Verifier>,
+}
+
+impl TrustTaskKeys {
+    /// The proof verifier, built on first use.
+    pub(crate) fn verifier(&self, state: &SharedData) -> &Verifier {
+        self.verifier
+            .get_or_init(|| super::trust_task_verify::proof_verifier(state.did_resolver.clone()))
+    }
+
+    fn cached_signing(&self) -> Option<Secret> {
+        let slot = self.signing.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .filter(|(at, _)| at.elapsed() < SIGNING_KEY_TTL)
+            .map(|(_, secret)| secret.clone())
+    }
+
+    fn remember_signing(&self, secret: &Secret) {
+        *self.signing.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), secret.clone()));
+    }
+}
 
 /// Sign a response document (a serialised `TrustTask<R>`) as the mediator.
 ///
@@ -69,6 +107,17 @@ pub(crate) async fn sign_response(
 /// The mediator's Ed25519 secret to sign with: an `assertionMethod` key if its
 /// DID declares one, else an `authentication` key.
 pub(crate) async fn signing_secret(state: &SharedData) -> Option<Secret> {
+    if let Some(secret) = state.trust_task_keys.cached_signing() {
+        return Some(secret);
+    }
+    let secret = find_signing_secret(state).await?;
+    state.trust_task_keys.remember_signing(&secret);
+    Some(secret)
+}
+
+/// [`signing_secret`] without the cache: resolve the mediator DID and walk
+/// its secrets.
+async fn find_signing_secret(state: &SharedData) -> Option<Secret> {
     let did = &state.config.mediator_did;
     let doc = match state.did_resolver.resolve(did).await {
         Ok(resolved) => resolved.doc,

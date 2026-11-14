@@ -20,6 +20,9 @@ use crate::{
     messages::client_delete::delete_for_client,
 };
 
+/// Deletes after a written response that run at once.
+const DELETE_PARALLEL: usize = 8;
+
 /// Delivers messages to the client for given message_ids
 /// outbound refers to outbound from the mediator perspective
 /// ACL_MODE: Rquires LOCAL access
@@ -88,9 +91,28 @@ pub async fn message_outbound_handler(
         let mut handed_over = HandedOver::new(&session.did_hash);
         let mut to_delete: Vec<String> = Vec::new();
 
-        for msg_id in &body.message_ids {
+        // One batched read for the whole request rather than a round trip per
+        // id (#159). Should the batch fail, each id is read on its own so a
+        // failure is still reported against the id it belongs to.
+        let fetched: Vec<Result<Option<_>, MediatorError>> = match state
+            .database
+            .get_messages(&session.did_hash, &body.message_ids)
+            .await
+        {
+            Ok(found) if found.len() == body.message_ids.len() => {
+                found.into_iter().map(Ok).collect()
+            }
+            _ => {
+                let mut each = Vec::with_capacity(body.message_ids.len());
+                for msg_id in &body.message_ids {
+                    each.push(state.database.get_message(&session.did_hash, msg_id).await);
+                }
+                each
+            }
+        };
+        for (msg_id, got) in body.message_ids.iter().zip(fetched) {
             debug!("getting message with id: {}", msg_id);
-            match state.database.get_message(&session.did_hash, msg_id).await {
+            match got {
                 Ok(Some(mut msg)) => {
                     debug!(msg_id = %msg.msg_id, size = msg.size, "Got message");
                     // Tag the message's wire protocol so the client can route it.
@@ -121,17 +143,33 @@ pub async fn message_outbound_handler(
             let state = state.clone();
             let owner = session.did_hash.clone();
             Box::pin(async move {
-                for msg_id in to_delete {
-                    // As `DELETE /delete`: the caller's own copy, else what it
-                    // sent unless this repeats an acknowledgement.
-                    match delete_for_client(
-                        &*state.database,
-                        std::slice::from_ref(&owner),
-                        &msg_id,
-                        true,
-                    )
-                    .await
-                    {
+                use futures_util::StreamExt;
+                // Ids are independent: a few deletes run at once rather than
+                // one round trip after another (#159). Each still deletes at
+                // most once (the store's delete is the arbiter).
+                let results: Vec<_> = futures_util::stream::iter(to_delete)
+                    .map(|msg_id| {
+                        let state = &state;
+                        let owner = &owner;
+                        async move {
+                            // As `DELETE /delete`: the caller's own copy, else
+                            // what it sent unless this repeats an
+                            // acknowledgement.
+                            let result = delete_for_client(
+                                &*state.database,
+                                std::slice::from_ref(owner),
+                                &msg_id,
+                                true,
+                            )
+                            .await;
+                            (msg_id, result)
+                        }
+                    })
+                    .buffer_unordered(DELETE_PARALLEL)
+                    .collect()
+                    .await;
+                for (msg_id, result) in results {
+                    match result {
                         Ok(removed) => {
                             for copy in &removed.copies {
                                 state.monitor.deleted(

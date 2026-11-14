@@ -695,13 +695,30 @@ fn downcast<P: serde::de::DeserializeOwned>(
     doc: &TrustTask<Value>,
     session: &Session,
 ) -> Result<TrustTask<P>, MediatorError> {
-    serde_json::from_value(serde_json::to_value(doc).map_err(serialize_err)?).map_err(|e| {
+    // Only the payload changes type, so only it is decoded, in place: the
+    // whole document is not serialised to a `Value` and parsed back (#198).
+    let payload = P::deserialize(&doc.payload).map_err(|e| {
         tt_problem(
             session,
             "malformedRequest",
             format!("payload does not match the task type: {e}"),
             StatusCode::BAD_REQUEST,
         )
+    })?;
+    Ok(TrustTask {
+        id: doc.id.clone(),
+        thread_id: doc.thread_id.clone(),
+        parent_thread_id: doc.parent_thread_id.clone(),
+        ceremony: doc.ceremony.clone(),
+        type_uri: doc.type_uri.clone(),
+        issuer: doc.issuer.clone(),
+        recipient: doc.recipient.clone(),
+        issued_at: doc.issued_at,
+        expires_at: doc.expires_at,
+        payload,
+        context: doc.context.clone(),
+        proof: doc.proof.clone(),
+        extra: doc.extra.clone(),
     })
 }
 
@@ -1157,6 +1174,9 @@ async fn apply_role_change(
             .account_set_role(target_hash, &new_type)
             .await?;
     }
+    // Open sockets, here and on every instance sharing the store, re-read
+    // their account on their next frame (`common::standing`).
+    crate::mux::connection::account_changed(state, target_hash).await;
     Ok(())
 }
 

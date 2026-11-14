@@ -148,112 +148,172 @@ pub(crate) async fn delete_for_session(
     let members =
         crate::mux::connection::members_with(state, &session.session_id, MuxCapability::Delete)
             .await;
-    let mut results = Vec::with_capacity(ids.len());
-    for message in ids {
-        // The owners this id may be deleted as: the session's own DID, then
-        // each member it belongs to (read first, to know it is that member's
-        // before its standing is checked) while the member's own account
-        // still stands — checked for the members the id belongs to, not for
-        // every member the connection carries. A member that already
-        // acknowledged its copy of the id is an owner too, so a repeat of
-        // that acknowledgement is told apart from a withdrawal; it holds
-        // nothing, so it can remove nothing.
-        let mut owners = vec![session.did_hash.clone()];
-        // Only while someone is watching: the body, so each `deleted` event
-        // names the wire protocol. The same in every copy.
-        let mut body_seen: Option<String> = None;
-        for member in &members {
-            let Ok(Some(stored)) = state.database.get_message(member, message).await else {
-                if state
-                    .database
-                    .acknowledged(member, message)
-                    .await
-                    .unwrap_or(false)
-                {
-                    owners.push(member.clone());
-                }
-                continue;
-            };
-            if !crate::mux::connection::allows(
-                state,
-                &session.session_id,
-                member,
-                MuxCapability::Delete,
-            )
+    let watching = state.monitor.is_active();
+
+    // Which member holds which id: one batched read per member for the whole
+    // request, not one read per id per member (#159). A failed read counts
+    // as "not held", as a failed single read did. Only while someone is
+    // watching is a body kept, so each `deleted` event names the wire
+    // protocol; it is the same in every copy.
+    let mut held: Vec<Vec<bool>> = Vec::with_capacity(members.len());
+    let mut bodies: Vec<Option<String>> = vec![None; ids.len()];
+    for member in &members {
+        let found = state
+            .database
+            .get_messages(member, ids)
             .await
-            {
-                continue;
+            .unwrap_or_default();
+        let mut row = vec![false; ids.len()];
+        for (i, copy) in found.into_iter().enumerate().take(ids.len()) {
+            let Some(copy) = copy else { continue };
+            row[i] = true;
+            if watching && bodies[i].is_none() {
+                bodies[i] = copy.msg;
             }
-            if body_seen.is_none() && state.monitor.is_active() {
-                body_seen = stored.msg;
-            }
-            owners.push(member.clone());
         }
-        if body_seen.is_none()
-            && state.monitor.is_active()
-            && let Ok(Some(stored)) = state.database.get_message(&session.did_hash, message).await
-        {
-            body_seen = stored.msg;
+        held.push(row);
+    }
+    if watching
+        && bodies.iter().any(Option::is_none)
+        && let Ok(own) = state.database.get_messages(&session.did_hash, ids).await
+    {
+        for (i, copy) in own.into_iter().enumerate().take(ids.len()) {
+            if bodies[i].is_none() {
+                bodies[i] = copy.and_then(|c| c.msg);
+            }
         }
+    }
 
-        // An owner's own copy (an acknowledgement), else — for
-        // `AcknowledgeOrWithdraw` — what an owner sent (a withdrawal) unless
-        // the delete repeats an acknowledgement.
-        let result = delete_for_client(
-            &*state.database,
-            &owners,
-            message,
-            kind == DeleteKind::AcknowledgeOrWithdraw,
-        )
-        .await;
-
-        let mut member_without_delete = false;
-        let outcome = match result {
-            Ok(removed) => {
-                // One event per copy removed: a withdrawal may remove
-                // several, one per recipient.
-                for copy in &removed.copies {
-                    state.monitor.deleted(
-                        message,
-                        &removed.owner,
-                        copy.from_did_hash.as_deref(),
-                        Some(copy.to_did_hash.as_str()),
-                        channel,
-                        body_seen.as_deref(),
-                    );
-                }
-                Ok(())
-            }
-            Err(err) => {
-                // Held for a member whose mail this connection reads, which
-                // may not delete it? Only such a member is told apart: for
-                // any other, the answer would confirm a message the principal
-                // was never shown (one it sent, say).
-                for member in
-                    crate::mux::connection::members_reading(state, &session.session_id).await
-                {
-                    if (!owners.contains(&member)
-                        || !crate::mux::connection::allows(
-                            state,
-                            &session.session_id,
-                            &member,
-                            MuxCapability::Delete,
-                        )
-                        .await)
-                        && let Ok(Some(_)) = state.database.get_message(&member, message).await
-                    {
-                        member_without_delete = true;
-                        break;
-                    }
-                }
-                Err(err)
-            }
-        };
-        results.push(DeleteResult {
-            id: message.clone(),
-            outcome,
-            member_without_delete,
-        });
+    // Ids are independent of each other, so a few run at once; results keep
+    // the order asked.
+    // In fixed-size waves of plain futures: a stream of closures borrowing
+    // `state` and `session` defeats the `Send` proof the socket task needs.
+    let mut results = Vec::with_capacity(ids.len());
+    let mut work = ids.iter().zip(bodies).enumerate();
+    loop {
+        let wave: Vec<_> = work
+            .by_ref()
+            .take(DELETE_PARALLEL)
+            .map(|(i, (message, body_seen))| {
+                delete_one(
+                    state, session, &members, &held, i, message, body_seen, channel, kind,
+                )
+            })
+            .collect();
+        if wave.is_empty() {
+            break;
+        }
+        results.extend(futures_util::future::join_all(wave).await);
     }
     results
+}
+
+/// Ids [`delete_for_session`] works on at once.
+const DELETE_PARALLEL: usize = 8;
+
+/// [`delete_for_session`] for the `i`th id, `message`, given which of
+/// `members` hold which id (`held[member][id]`).
+#[allow(clippy::too_many_arguments)]
+async fn delete_one(
+    state: &SharedData,
+    session: &Session,
+    members: &[String],
+    held: &[Vec<bool>],
+    i: usize,
+    message: &str,
+    body_seen: Option<String>,
+    channel: crate::monitor::Channel,
+    kind: DeleteKind,
+) -> DeleteResult {
+    use affinidi_messaging_mediator_common::store::mux::MuxCapability;
+    // The owners this id may be deleted as: the session's own DID, then each
+    // member it belongs to (read first, to know it is that member's before
+    // its standing is checked) while the member's own account still stands —
+    // checked for the members the id belongs to, not for every member the
+    // connection carries. A member that already acknowledged its copy of the
+    // id is an owner too, so a repeat of that acknowledgement is told apart
+    // from a withdrawal; it holds nothing, so it can remove nothing.
+    let mut owners = vec![session.did_hash.clone()];
+    for (member, row) in members.iter().zip(held) {
+        if !row.get(i).copied().unwrap_or(false) {
+            if state
+                .database
+                .acknowledged(member, message)
+                .await
+                .unwrap_or(false)
+            {
+                owners.push(member.clone());
+            }
+            continue;
+        }
+        if !crate::mux::connection::allows(
+            state,
+            &session.session_id,
+            member,
+            MuxCapability::Delete,
+        )
+        .await
+        {
+            continue;
+        }
+        owners.push(member.clone());
+    }
+
+    // An owner's own copy (an acknowledgement), else — for
+    // `AcknowledgeOrWithdraw` — what an owner sent (a withdrawal) unless
+    // the delete repeats an acknowledgement.
+    let result = delete_for_client(
+        &*state.database,
+        &owners,
+        message,
+        kind == DeleteKind::AcknowledgeOrWithdraw,
+    )
+    .await;
+
+    let mut member_without_delete = false;
+    let outcome = match result {
+        Ok(removed) => {
+            // One event per copy removed: a withdrawal may remove
+            // several, one per recipient.
+            for copy in &removed.copies {
+                state.monitor.deleted(
+                    message,
+                    &removed.owner,
+                    copy.from_did_hash.as_deref(),
+                    Some(copy.to_did_hash.as_str()),
+                    channel,
+                    body_seen.as_deref(),
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            // Held for a member whose mail this connection reads, which
+            // may not delete it? Only such a member is told apart: for
+            // any other, the answer would confirm a message the principal
+            // was never shown (one it sent, say).
+            for member in crate::mux::connection::members_reading(state, &session.session_id).await
+            {
+                if (!owners.contains(&member)
+                    || !crate::mux::connection::allows(
+                        state,
+                        &session.session_id,
+                        &member,
+                        MuxCapability::Delete,
+                    )
+                    .await)
+                    && let Ok(Some(_)) = state.database.get_message(&member, message).await
+                {
+                    member_without_delete = true;
+                    break;
+                }
+            }
+            Err(err)
+        }
+    };
+    DeleteResult {
+        id: message.to_string(),
+        outcome,
+        member_without_delete,
+    }
 }
