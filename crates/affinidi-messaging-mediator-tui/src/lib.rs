@@ -10,6 +10,11 @@
 //! The host owns the terminal: feed keys to [`App::handle_key`], background
 //! results to [`App::apply`], and draw with [`App::render`] — or hand a
 //! terminal to [`App::run`]. [`quota::QuotaBar`] is usable on its own.
+//!
+//! The `mediator-console` binary opens the console, or with a command
+//! (`stats`, `queues`, `accounts`, `audit`, `purge`, …) runs one operation
+//! and exits, printing JSON with `--json` and an exit code a script can act
+//! on.
 
 pub mod account_edit;
 pub mod app;

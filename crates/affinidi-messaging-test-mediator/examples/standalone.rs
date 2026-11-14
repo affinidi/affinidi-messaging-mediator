@@ -38,9 +38,13 @@ use affinidi_messaging_test_mediator::{AccessListModeType, TestMediator, acl::al
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Permissive ACL: any DID may connect/register and send/receive. Standalone
-    // harnesses typically connect with arbitrary, unregistered DIDs, which the
-    // default deny-by-default `ExplicitAllow` would 403.
+    // Permissive ACL: any DID may connect/register and send/receive.
+    // Standalone harnesses typically connect with arbitrary, unregistered
+    // DIDs, which take the global default ACL. The mediator's default one
+    // has no `local` (so no WebSocket upgrade); `allow_all` grants
+    // everything. `ExplicitDeny` is the builder's default mode too, set here
+    // so the harness reads as what it is: an access list that admits anyone
+    // not on it.
     let mut builder = TestMediator::builder()
         .acl_mode(AccessListModeType::ExplicitDeny)
         .global_acl_default(allow_all());

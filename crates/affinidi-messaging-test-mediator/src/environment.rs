@@ -6,20 +6,19 @@
 //!
 //! Typical flow:
 //!
-//! ```ignore
+//! ```no_run
 //! use affinidi_messaging_test_mediator::TestEnvironment;
 //!
-//! #[tokio::test]
-//! async fn round_trip() {
-//!     let env = TestEnvironment::spawn().await.unwrap();
-//!     let alice = env.add_user("Alice").await.unwrap();
-//!     let bob = env.add_user("Bob").await.unwrap();
+//! # async fn round_trip() {
+//! let env = TestEnvironment::spawn().await.unwrap();
+//! let alice = env.add_user("Alice").await.unwrap();
+//! let bob = env.add_user("Bob").await.unwrap();
 //!
-//!     // ... exercise the SDK against `env.atm` and the user
-//!     // profiles ...
+//! // ... exercise the SDK against `env.atm` and the user
+//! // profiles ...
 //!
-//!     env.shutdown().await.unwrap();
-//! }
+//! env.shutdown().await.unwrap();
+//! # }
 //! ```
 //!
 //! All identities are `did:peer:2.*` — the cache-SDK's built-in
@@ -126,9 +125,10 @@ pub struct TestUser {
 
 impl TestUser {
     /// SHA-256 hash of the DID string — the canonical key shape used
-    /// by the mediator's account / ACL / queue stores. Pass this to
-    /// admin-protocol calls (e.g. `acls_set`, `access_list_add`,
-    /// `account_remove`) that operate on hashed DIDs.
+    /// by the mediator's account / ACL / queue stores. Pass this to the
+    /// Trust Task calls that name an account by its hash (the SDK's
+    /// `account_update`, `acl_get`, `access_list_update`,
+    /// `account_remove`, …).
     pub fn did_hash(&self) -> String {
         affinidi_messaging_mediator_common::did_identity::did_hash(&self.did)
     }
@@ -136,7 +136,7 @@ impl TestUser {
 
 impl TestEnvironment {
     /// Spawn the default mediator and wire up the SDK against it.
-    /// Uses [`TestMediator::spawn`]'s defaults — loopback Redis,
+    /// Uses [`TestMediator::spawn`]'s defaults — an in-memory store,
     /// ephemeral port, no forwarding processor, no expiry sweep.
     pub async fn spawn() -> Result<Self, TestEnvironmentError> {
         Self::new(TestMediator::spawn().await?).await
@@ -215,8 +215,8 @@ impl TestEnvironment {
     }
 
     /// Use an existing [`TestMediatorHandle`] — for tests that want
-    /// custom mediator config (e.g. enable forwarding, override the
-    /// Redis URL) via [`TestMediator::builder`].
+    /// custom mediator config (e.g. enable forwarding, or another store
+    /// backend) via [`TestMediator::builder`].
     pub async fn new(mediator: TestMediatorHandle) -> Result<Self, TestEnvironmentError> {
         let tdk_config =
             TDKConfig::headless().map_err(|e| TestEnvironmentError::Sdk(e.to_string()))?;

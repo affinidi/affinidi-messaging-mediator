@@ -14,7 +14,7 @@ in another application ([Embedding](#embedding)).
 
 ```
  mediator-console  ADMIN  ● connected  b48a53fa…1f29 → did:peer:2.Vz6Mkkn…  updated 1s ago
- 1 Dashboard │ 2 Queues │ 3 Account │ 4 Audit
+ 1 Dashboard │ 2 Queues │ 3 Account │ 4 Audit │ 5 Accounts │ 6 Config │ 7 Mux │ 8 Grants
 ┌ Account 1f22bbf6…b9a1 ─────────────────────┐┌ Traffic — all traffic ● live ───────┐
 │receive: 0 / 200    oldest –                ││22:46:24 ▶ received  didcomm   rest …│
 │   send: 3 / 2000   oldest 4s               ││22:46:24 · stored    didcomm   …     │
@@ -68,10 +68,52 @@ cargo run --release -p affinidi-messaging-mediator-tui -- \
 | `--as <alias or DID>` | Which of several profiles to use. The default is the first. |
 | `--mediator <DID>` | Override the mediator from the profile and the DID document. |
 | `--address-book <file>` | Where to keep account nicknames ([Names for accounts](#names-for-accounts)). |
+| `--timeout <seconds>` | How long to wait for each answer from the mediator (default 30). |
+| `--connect-timeout <seconds>` | How long to wait for the connection: resolving, authenticating and reading the account (default 30). |
 
 Connection errors are printed before the console takes over the screen, so a
 wrong profile, an unreachable mediator, or an account the mediator doesn't know
 is reported plainly.
+
+## Scripting
+
+Give a command and `mediator-console` runs that one operation, prints the
+answer and exits, without opening the console. `--json` prints the mediator's
+answer as the Trust Task's own JSON, one document per line, for runbooks and
+monitoring; errors go to stderr.
+
+```bash
+mediator-console -p admin-monitor.json stats --json
+mediator-console -p admin-monitor.json queues --sort saturation --limit 20
+mediator-console -p admin-monitor.json purge <account> --send --dry-run
+```
+
+| Command | Answers |
+|---|---|
+| `stats` | Mediator statistics *(admin)*. |
+| `queues [--send] [--sort count\|bytes\|oldest\|saturation]` | The queue ranking *(admin)*. |
+| `accounts` | Every account *(admin)*. |
+| `account [<account>]` | One account's settings and queue depths; your own by default. |
+| `messages [<account>] [--send]` | A queue's messages, metadata only. |
+| `audit` | The audit log, newest first *(admin)*. |
+| `config` | The mediator's configuration *(admin)*. |
+| `access-list [<account>]` | An account's access list. |
+| `grants --principal <DID> \| --member <DID>` | Stored mux grants *(admin)*. |
+| `purge [<account>] [--send] [--peer <account>] [--older-than <s>] --dry-run \| --yes` | `--dry-run` counts what would go; `--yes` counts and then removes it, pinned to the count. One of the two is required. |
+
+`<account>` is a DID or its account hash. Lists take `--limit` and
+`--cursor`; a page with more after it ends with a `next_cursor` line (in
+JSON, the answer's `nextCursor`).
+
+The exit code says what happened, so a script can tell a retry from a fault:
+
+| Code | Meaning |
+|---|---|
+| `0` | Done. |
+| `1` | Failed for a reason trying again won't fix: a bad profile, a malformed request, an unexpected answer. |
+| `2` | Invalid arguments; nothing was sent. |
+| `3` | Refused: the mediator (or the console, knowing its rules) said no. |
+| `4` | Unreachable: the connection failed, dropped or timed out. Trying again may work; a change that timed out may have been made, so read before you retry. |
 
 ## Screens
 
@@ -160,9 +202,11 @@ A purge is always counted first. The console shows whose queue, which queue,
 and how many messages (and bytes) would go, and waits for `y`. The purge is
 then pinned to the moment of that count: a message that arrives after it is
 never removed. Fewer may go than were counted, when some are delivered in the
-meantime, and the console says how many did. (The pin is in whole seconds, so
-it can also leave out what arrived in the second before the count.) Purged
-messages are gone; they aren't returned to their senders.
+meantime, and the console says how many did. (The pin keeps a safety
+margin for the request's transit, the request timeout and at least 30 s, and is in whole seconds, so it also leaves
+out what arrived in that window before the count.) Purged messages are gone;
+they aren't returned to their senders. `mediator-console purge --yes` works
+the same way.
 
 A delete names the account, queue, message id, sender and recipient before it
 asks. Background answers are tied to what they were asked for: a slow answer
@@ -275,6 +319,10 @@ app.run(&mut terminal).await?;
   its own loop should do the same under heavy traffic.
 - `Update::Connection` carries the connection state into the header and the
   monitor; `App::new` subscribes to it for you.
+- Every `Update` carries the mediator's answer as the typed Trust Task
+  struct the admin crate returned (`specs::…::Response`), and the screens
+  draw from those types: a field the mediator renames or retypes fails to
+  compile here rather than showing as `–`.
 - The gradient `QuotaBar` widget (and `quota_line` for table cells) works on
   its own.
 - The engine underneath, including identities, purge plans and monitor feeds,

@@ -67,7 +67,9 @@ Anywhere you need an in-process mediator for tests:
 ```toml
 # Cargo.toml
 [dev-dependencies]
-affinidi-messaging-test-mediator = "0.49"
+# The same major.minor as the mediator you test against: the mediator's
+# crates are released together, under one version.
+affinidi-messaging-test-mediator = "0.52"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

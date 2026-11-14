@@ -19,7 +19,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use affinidi_messaging_mediator_admin::MonitorEvent;
+use affinidi_messaging_mediator_admin::specs::monitor::event::v0_3::{TrafficStage, WireProtocol};
 
 /// The window the "now" rate is measured over.
 const RECENT: Duration = Duration::from_secs(10);
@@ -78,11 +79,11 @@ impl ProtocolMix {
         (total > 0).then(|| self.tsp as f64 * 100.0 / total as f64)
     }
 
-    fn record(&mut self, protocol: Option<&str>) {
+    fn record(&mut self, protocol: WireProtocol) {
         let slot = match protocol {
-            Some("didcomm") => &mut self.didcomm,
-            Some("didcommV1") => &mut self.didcomm_v1,
-            Some("tsp") => &mut self.tsp,
+            WireProtocol::Didcomm => &mut self.didcomm,
+            WireProtocol::DidcommV1 => &mut self.didcomm_v1,
+            WireProtocol::Tsp => &mut self.tsp,
             _ => &mut self.other,
         };
         *slot = slot.saturating_add(1);
@@ -126,14 +127,14 @@ impl TrafficTally {
     }
 
     /// Count one monitor event.
-    pub fn record(&mut self, e: &Value, now: Instant) {
-        let from = e["from"].as_str();
-        let to = e["to"].as_str();
-        let size = e["size"].as_u64().unwrap_or(0);
-        match e["stage"].as_str() {
-            Some("received") => {
+    pub fn record(&mut self, e: &MonitorEvent, now: Instant) {
+        let from = e.from.as_deref().map(String::as_str);
+        let to = e.to.as_deref().map(String::as_str);
+        let size = e.size.unwrap_or(0);
+        match e.stage {
+            TrafficStage::Received => {
                 self.messages = self.messages.saturating_add(1);
-                self.protocols.record(e["protocol"].as_str());
+                self.protocols.record(e.protocol);
                 self.bytes = self.bytes.saturating_add(size);
                 match self.recent.back_mut() {
                     Some((start, n)) if now.duration_since(*start) < Duration::from_secs(1) => {
@@ -151,13 +152,13 @@ impl TrafficTally {
                     a.addressed = a.addressed.saturating_add(1);
                 }
             }
-            Some("delivered") => {
+            TrafficStage::Delivered => {
                 if let Some(to) = to {
                     let a = self.account(to, now);
                     a.delivered = a.delivered.saturating_add(1);
                 }
             }
-            Some("refused") => {
+            TrafficStage::Refused => {
                 self.refused = self.refused.saturating_add(1);
                 if let Some(from) = from {
                     let a = self.account(from, now);
@@ -241,12 +242,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn event(stage: &str, from: &str, to: &str, size: u64) -> Value {
-        json!({ "stage": stage, "from": from, "to": to, "size": size })
+    fn event_full(stage: &str, from: &str, to: &str, size: u64, protocol: &str) -> MonitorEvent {
+        serde_json::from_value(json!({
+            "stage": stage, "from": from, "to": to, "size": size, "protocol": protocol,
+            "channel": "rest", "direction": "inbound", "occurredAt": "2026-09-21T10:00:00Z",
+        }))
+        .expect("a monitor event")
     }
 
-    fn event_on(stage: &str, protocol: &str) -> Value {
-        json!({ "stage": stage, "from": "a", "to": "b", "size": 1, "protocol": protocol })
+    fn event(stage: &str, from: &str, to: &str, size: u64) -> MonitorEvent {
+        event_full(stage, from, to, size, "didcomm")
+    }
+
+    fn event_on(stage: &str, protocol: &str) -> MonitorEvent {
+        event_full(stage, "a", "b", 1, protocol)
     }
 
     #[test]
@@ -255,7 +264,7 @@ mod tests {
         let mut t = TrafficTally::new(t0);
         assert_eq!(t.protocols.tsp_share(), None, "no traffic, no share");
 
-        for protocol in ["tsp", "tsp", "didcomm", "didcommV1", "something-new"] {
+        for protocol in ["tsp", "tsp", "didcomm", "didcommV1", "other"] {
             t.record(&event_on("received", protocol), t0);
         }
         // A stage that is not an arrival is not counted twice.

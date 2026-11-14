@@ -14,9 +14,10 @@
 //! cases; for fine-grained ACLs, build a `MediatorACLSet` directly
 //! with `MediatorACLSet::default()` plus the bit setters.
 //!
-//! ```ignore
+//! ```no_run
 //! use affinidi_messaging_test_mediator::{TestMediator, acl};
 //!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mediator = TestMediator::builder()
 //!     .global_acl_default(acl::deny_all())     // typed, no string parsing
 //!     .spawn().await?;
@@ -24,12 +25,13 @@
 //! let alice = mediator
 //!     .add_user_with_acl("alice", acl::allow_all())
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! Any failure returned from the underlying bit-setters surfaces as
-//! [`crate::TestMediatorError::Acl`]. In practice the presets here
-//! cannot fail — they pass `admin = true` to every setter — but we
-//! propagate the type signature so the construction stays honest.
+//! The presets return the set itself: they cannot fail, since they pass
+//! `admin = true` to every setter (a setter's error would be a bug here,
+//! and panics with the reason).
 
 use crate::{AccessListModeType, MediatorACLSet, TestMediatorError};
 

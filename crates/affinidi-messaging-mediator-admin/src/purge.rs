@@ -18,12 +18,26 @@ use crate::console::Target;
 /// preview, to cover the request's transit and queueing before the mediator
 /// runs it. The age is measured on the mediator's clock when it executes, so
 /// without a margin a purge that executes more than about a second after it
-/// was sent could match a message stored just after the preview. It is the
-/// console's request timeout: a purge still being waited for executes within
-/// it. The cost is that messages stored in this window before the preview are
-/// spared too. The exact fix is the purge task's `storedBefore` member, which
-/// the console will send once the SDK supports it.
+/// was sent could match a message stored just after the preview. This is the
+/// least margin; a console whose request timeout is longer uses that instead
+/// (see `MediatorConsole::purge`), since a purge still being waited for
+/// executes within it. The cost is that messages stored in this window before
+/// the preview are spared too. The exact fix is the purge task's
+/// `storedBefore` member, which the console will send once the SDK supports
+/// it.
 pub const PURGE_TRANSIT_MARGIN_SECS: u64 = 30;
+
+/// The margin a console with `request_timeout` adds to a confirming purge:
+/// the timeout in whole seconds, rounded up, and at least
+/// [`PURGE_TRANSIT_MARGIN_SECS`].
+pub(crate) fn transit_margin_secs(request_timeout: std::time::Duration) -> u64 {
+    let secs = request_timeout
+        .as_millis()
+        .div_ceil(1_000)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    secs.max(PURGE_TRANSIT_MARGIN_SECS)
+}
 
 /// What to purge.
 #[derive(Clone, Debug)]
@@ -57,15 +71,19 @@ pub struct PurgePlan {
 /// without one) by `previewed_at`. At `now` that same set is the messages
 /// queued `older_than + (now - previewed_at)`. The elapsed time is rounded up
 /// to whole seconds (the member's unit) and is at least one, and
-/// [`PURGE_TRANSIT_MARGIN_SECS`] is added for the time the request takes to
-/// execute, so the cutoff never moves past the preview: the rounding and the
-/// margin can only leave a message out.
-pub(crate) fn pinned_to_preview(plan: &PurgePlan, now: DateTime<Utc>) -> PurgeRequest {
+/// `margin_secs` (from [`transit_margin_secs`]) is added for the time the
+/// request takes to execute, so the cutoff never moves past the preview: the
+/// rounding and the margin can only leave a message out.
+pub(crate) fn pinned_to_preview(
+    plan: &PurgePlan,
+    now: DateTime<Utc>,
+    margin_secs: u64,
+) -> PurgeRequest {
     let elapsed_ms = (now - plan.previewed_at).num_milliseconds().max(0) as u64;
     let elapsed = elapsed_ms
         .div_ceil(1_000)
         .max(1)
-        .saturating_add(PURGE_TRANSIT_MARGIN_SECS);
+        .saturating_add(margin_secs);
     PurgeRequest {
         older_than_seconds: Some(
             plan.request
@@ -101,15 +119,15 @@ mod tests {
         let ms = chrono::Duration::milliseconds;
         let margin = PURGE_TRANSIT_MARGIN_SECS;
         // 2.3 s after the preview: 3 s back, rounded up, plus the margin.
-        let r = pinned_to_preview(&plan(None, at), at + ms(2_300));
+        let r = pinned_to_preview(&plan(None, at), at + ms(2_300), PURGE_TRANSIT_MARGIN_SECS);
         assert_eq!(r.older_than_seconds, Some(3 + margin));
         assert_eq!(r.peer.as_deref(), Some("peer"));
         assert_eq!(r.target.as_deref(), Some("abc"));
         // Whole seconds stay whole.
-        let r = pinned_to_preview(&plan(None, at), at + ms(4_000));
+        let r = pinned_to_preview(&plan(None, at), at + ms(4_000), PURGE_TRANSIT_MARGIN_SECS);
         assert_eq!(r.older_than_seconds, Some(4 + margin));
         // At once, or with the clock stepped back: still a second.
-        let r = pinned_to_preview(&plan(None, at), at - ms(500));
+        let r = pinned_to_preview(&plan(None, at), at - ms(500), PURGE_TRANSIT_MARGIN_SECS);
         assert_eq!(r.older_than_seconds, Some(1 + margin));
     }
 
@@ -120,7 +138,7 @@ mod tests {
     fn a_message_stored_after_the_preview_survives_a_slow_purge() {
         let at = Utc::now();
         let sent = at + chrono::Duration::milliseconds(2_000);
-        let r = pinned_to_preview(&plan(None, at), sent);
+        let r = pinned_to_preview(&plan(None, at), sent, PURGE_TRANSIT_MARGIN_SECS);
         let age_cutoff = r.older_than_seconds.unwrap() as i64;
         // Stored 1 ms after the preview; the mediator runs the purge 29 s
         // after the console sent it.
@@ -138,10 +156,24 @@ mod tests {
         let r = pinned_to_preview(
             &plan(Some(3_600), at),
             at + chrono::Duration::milliseconds(10_001),
+            PURGE_TRANSIT_MARGIN_SECS,
         );
         assert_eq!(
             r.older_than_seconds,
             Some(3_611 + PURGE_TRANSIT_MARGIN_SECS)
         );
+    }
+
+    /// A console whose request timeout is longer than the least margin
+    /// waits longer for a purge, so its margin grows to match.
+    #[test]
+    fn the_margin_is_at_least_the_request_timeout() {
+        use std::time::Duration;
+        assert_eq!(
+            transit_margin_secs(Duration::from_secs(5)),
+            PURGE_TRANSIT_MARGIN_SECS
+        );
+        assert_eq!(transit_margin_secs(Duration::from_secs(30)), 30);
+        assert_eq!(transit_margin_secs(Duration::from_millis(90_001)), 91);
     }
 }

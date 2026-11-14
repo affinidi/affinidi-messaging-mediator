@@ -41,23 +41,22 @@
 //!
 //! # Quick start
 //!
-//! ```ignore
+//! ```no_run
 //! use affinidi_messaging_test_mediator::TestMediator;
 //!
-//! #[tokio::test]
-//! async fn end_to_end_round_trip() {
-//!     let mediator = TestMediator::spawn()
-//!         .await
-//!         .expect("test mediator spawn");
+//! # async fn end_to_end_round_trip() {
+//! let mediator = TestMediator::spawn()
+//!     .await
+//!     .expect("test mediator spawn");
 //!
-//!     let endpoint = mediator.endpoint();
-//!     let did = mediator.did();
-//!     // ... use SDK against `endpoint` and `did` ...
+//! let endpoint = mediator.endpoint();
+//! let did = mediator.did();
+//! // ... use SDK against `endpoint` and `did` ...
 //!
-//!     // Dropping `mediator` stops it; `shutdown` + `join` waits for the drain.
-//!     mediator.shutdown();
-//!     mediator.join().await.unwrap();
-//! }
+//! // Dropping `mediator` stops it; `shutdown` + `join` waits for the drain.
+//! mediator.shutdown();
+//! mediator.join().await.unwrap();
+//! # }
 //! ```
 //!
 //! Tests that authenticate a non-admin client over WebSocket must
@@ -65,12 +64,15 @@
 //! without the LOCAL ACL bit, and the fixture's default
 //! `global_acl_default` doesn't grant it on first auth:
 //!
-//! ```ignore
+//! ```no_run
+//! # use affinidi_messaging_test_mediator::TestMediator;
+//! # async fn example(client_did: String) {
 //! let mediator = TestMediator::builder()
 //!     .local_did(client_did.clone())
 //!     .spawn()
 //!     .await
 //!     .expect("spawn");
+//! # }
 //! ```
 //!
 //! See [`TestMediatorBuilder::local_did`] / [`TestMediatorBuilder::local_dids`].
@@ -101,9 +103,11 @@
 //! the users minted through the handle, and nothing of the mediator's
 //! (see [Key isolation](#key-isolation)):
 //!
-//! ```ignore
+//! ```no_run
+//! # async fn example(mediator: affinidi_messaging_test_mediator::TestMediatorHandle) {
 //! let resolver = mediator.secrets_resolver();
 //! // hand `resolver` to your SDK setup ...
+//! # }
 //! ```
 
 #![deny(rust_2018_idioms)]
@@ -990,12 +994,16 @@ impl TestMediatorBuilder {
     /// For those, bind all interfaces and advertise a stable, client-reachable
     /// hostname:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use affinidi_messaging_test_mediator::TestMediator;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mediator = TestMediator::builder()
     ///     .listen_addr("0.0.0.0:0".parse().unwrap()) // bind every interface
     ///     .advertise_host("host.docker.internal")    // ...but tell clients this
     ///     .spawn()
     ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// # What it does

@@ -43,7 +43,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::error::{ConsoleError, Result};
+use crate::error::{ConsoleError, Result, bounded};
 
 /// A monitor filter (DIDs, directions, stages, protocols, channels, message
 /// type prefixes, failures only).
@@ -66,6 +66,8 @@ const RENEW_MARGIN: Duration = Duration::from_secs(60);
 const RENEW_RETRY: Duration = Duration::from_secs(2);
 /// Longest wait between renewal retries.
 const RENEW_RETRY_MAX: Duration = Duration::from_secs(15);
+/// The task a feed subscribes and renews with.
+const SUBSCRIBE: &str = "messaging/monitor/subscribe";
 /// Batches buffered per feed before the oldest are dropped (and counted).
 const FEED_BUFFER: usize = 64;
 
@@ -140,16 +142,6 @@ struct Granted {
     expires_at: DateTime<Utc>,
     filter: MonitorFilter,
     membership: Option<MembershipFilter>,
-}
-
-/// Whether `e` is the mediator saying it doesn't serve the request's type.
-fn is_unsupported_type(e: &ATMError) -> bool {
-    e.mediator_code()
-        .is_some_and(|c| c.ends_with("protocol.trust_task.unsupported"))
-        || matches!(
-            e.refusal_code(),
-            Some("unsupportedType" | "unsupportedVersion")
-        )
 }
 
 /// Open (or, with `renew`, renew and re-filter) a subscription at `version`.
@@ -322,6 +314,9 @@ impl LiveStream {
     /// `monitor/subscribe` 0.2 offers. Without it, a mediator that refuses
     /// 0.2 as an unsupported type is asked again at 0.1; `v0_2` false (its
     /// version is known to predate 0.2) asks at 0.1 straight away.
+    ///
+    /// Each subscribe, renewal and the closing unsubscribe waits at most
+    /// `timeout` for its answer.
     pub(crate) async fn open_feed(
         &self,
         atm: &ATM,
@@ -329,25 +324,35 @@ impl LiveStream {
         filter: MonitorFilter,
         membership: Option<MembershipFilter>,
         v0_2: bool,
+        timeout: Duration,
     ) -> Result<MonitorFeed> {
         let mut version = if v0_2 || membership.is_some() {
             SubscribeVersion::V0_2
         } else {
             SubscribeVersion::V0_1
         };
-        let first = subscribe(atm, profile, version, &filter, membership.as_ref(), None).await;
+        let first = bounded(
+            SUBSCRIBE,
+            timeout,
+            subscribe(atm, profile, version, &filter, membership.as_ref(), None),
+        )
+        .await;
         let granted = match first {
             Err(e)
                 if version == SubscribeVersion::V0_2
                     && membership.is_none()
-                    && is_unsupported_type(&e) =>
+                    && e.is_unsupported() =>
             {
                 version = SubscribeVersion::V0_1;
-                subscribe(atm, profile, version, &filter, None, None).await
+                bounded(
+                    SUBSCRIBE,
+                    timeout,
+                    subscribe(atm, profile, version, &filter, None, None),
+                )
+                .await
             }
             other => other,
-        }
-        .map_err(ConsoleError::from_call)?;
+        }?;
         let id = granted.id.clone();
 
         let (batch_tx, batch_rx) = mpsc::channel(FEED_BUFFER);
@@ -368,17 +373,15 @@ impl LiveStream {
                 let mut failures = 0;
                 loop {
                     tokio::time::sleep(wait).await;
-                    match subscribe(
+                    let renewal = subscribe(
                         &atm,
                         &profile,
                         version,
                         &filter,
                         membership.as_ref(),
                         Some(&id),
-                    )
-                    .await
-                    .map_err(ConsoleError::from_call)
-                    {
+                    );
+                    match bounded(SUBSCRIBE, timeout, renewal).await {
                         Ok(renewed) => {
                             expires_at = renewed.expires_at;
                             wait = until_renewal(expires_at);
@@ -421,6 +424,7 @@ impl LiveStream {
             feeds: self.feeds.clone(),
             atm: atm.clone(),
             profile: profile.clone(),
+            timeout,
         })
     }
 }
@@ -461,19 +465,17 @@ fn until_renewal(expires_at: DateTime<Utc>) -> Duration {
 }
 
 /// When to try a failed renewal again: after a backoff, while the lease has
-/// not lapsed and the failure was in transit. `None` for a refusal (the
-/// mediator's answer won't change) or once the retry would land after expiry
-/// (the subscription is gone by then).
+/// not lapsed and the failure was transient (in transit, a timeout, a
+/// momentary refusal). `None` for anything else (asking again gets the same
+/// answer) or once the retry would land after expiry (the subscription is
+/// gone by then).
 fn retry_renewal(
     error: &ConsoleError,
     failures: u32,
     expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<Duration> {
-    if matches!(
-        error,
-        ConsoleError::Refused { .. } | ConsoleError::NotPermitted(_)
-    ) {
+    if !error.is_transient() {
         return None;
     }
     let after = RENEW_RETRY
@@ -503,6 +505,8 @@ pub struct MonitorFeed {
     feeds: Arc<Mutex<HashMap<String, mpsc::Sender<Payload>>>>,
     atm: ATM,
     profile: Arc<ATMProfile>,
+    /// How long the closing unsubscribe waits.
+    timeout: Duration,
 }
 
 impl MonitorFeed {
@@ -625,15 +629,18 @@ impl Drop for MonitorFeed {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let (feeds, atm, profile, id) = (
+        let (feeds, atm, profile, id, timeout) = (
             self.feeds.clone(),
             self.atm.clone(),
             self.profile.clone(),
             self.id.clone(),
+            self.timeout,
         );
         runtime.spawn(async move {
             feeds.lock().await.remove(&id);
-            let _ = atm.trust_tasks().monitor_unsubscribe(&profile, &id).await;
+            // Best effort: the lease lapses on its own if this is lost.
+            let tasks = atm.trust_tasks();
+            let _ = tokio::time::timeout(timeout, tasks.monitor_unsubscribe(&profile, &id)).await;
         });
     }
 }
@@ -766,18 +773,18 @@ mod tests {
 
     #[test]
     fn an_unsupported_type_is_told_apart_from_other_refusals() {
-        let unsupported = ATMError::ProblemReport(
+        let unsupported = ConsoleError::from_call(ATMError::ProblemReport(
             "e.p.protocol.trust_task.unsupported".into(),
             "no such type".into(),
             "NONE".into(),
-        );
-        let denied = ATMError::ProblemReport(
+        ));
+        let denied = ConsoleError::from_call(ATMError::ProblemReport(
             "e.p.authorization.admin_required".into(),
             "no".into(),
             "NONE".into(),
-        );
-        assert!(is_unsupported_type(&unsupported));
-        assert!(!is_unsupported_type(&denied));
+        ));
+        assert!(unsupported.is_unsupported());
+        assert!(!denied.is_unsupported());
     }
 
     #[test]
@@ -798,7 +805,7 @@ mod tests {
     #[test]
     fn a_renewal_lost_in_transit_is_retried_until_the_lease_lapses() {
         let now = Utc::now();
-        let transit = ConsoleError::Connect("socket closed".into());
+        let transit = ConsoleError::from_call(ATMError::TransportError("socket closed".into()));
         let lease = now + chrono::Duration::seconds(60);
         let waits: Vec<_> = (0..5)
             .map(|n| retry_renewal(&transit, n, lease, now))
@@ -824,6 +831,15 @@ mod tests {
         };
         let lease = now + chrono::Duration::seconds(60);
         assert_eq!(retry_renewal(&refused, 0, lease, now), None);
+        // Nor is a failure that would recur: a malformed request, say.
+        let local = ConsoleError::from_call(ATMError::MsgSendError("bad filter".into()));
+        assert_eq!(retry_renewal(&local, 0, lease, now), None);
+        // A renewal that timed out is.
+        let late = ConsoleError::Timeout {
+            operation: SUBSCRIBE,
+            after: Duration::from_secs(30),
+        };
+        assert!(retry_renewal(&late, 0, lease, now).is_some());
     }
 
     #[test]
