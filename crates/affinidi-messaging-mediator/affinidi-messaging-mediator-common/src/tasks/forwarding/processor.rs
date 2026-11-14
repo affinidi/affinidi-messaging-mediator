@@ -30,7 +30,7 @@
 
 use crate::error_codes;
 use crate::errors::MediatorError;
-use crate::store::{MediatorStore, types::ForwardQueueEntry};
+use crate::store::{prelude::*, types::ForwardQueueEntry};
 use crate::tasks::forwarding::config::ForwardingConfig;
 use crate::tasks::forwarding::observer::{ForwardOutcome, ForwardTransport, ForwardingObserver};
 use crate::tasks::forwarding::packer::SystemMessagePacker;
@@ -1169,7 +1169,7 @@ impl ForwardingProcessor {
     }
 
     /// Refresh this processor's claims on `stream_ids`; see
-    /// [`MediatorStore::forward_queue_refresh_claims`].
+    /// [`ForwardQueueStore::forward_queue_refresh_claims`].
     async fn refresh_claims(&self, stream_ids: &[&str]) -> Result<Vec<String>, MediatorError> {
         #[cfg(feature = "test-clock")]
         if self
@@ -1215,7 +1215,7 @@ impl ForwardingProcessor {
     }
 
     /// Finish with `msg` if this processor still holds it (see
-    /// [`MediatorStore::forward_queue_finish`]). `Ok(false)` means another
+    /// [`ForwardQueueStore::forward_queue_finish`]). `Ok(false)` means another
     /// processor has it now and decides its fate.
     async fn finish(
         &self,

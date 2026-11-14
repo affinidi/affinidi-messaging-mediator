@@ -4,7 +4,7 @@ use crate::tasks::queue_survey::{
 };
 use affinidi_messaging_mediator_common::{
     errors::MediatorError,
-    store::{MediatorStore, types::MetadataStats},
+    store::{prelude::*, types::MetadataStats},
     types::clock::Clock,
 };
 use std::collections::HashMap;

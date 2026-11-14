@@ -13,8 +13,8 @@
 //! [`MuxDidRecord`](crate::store::mux::MuxDidRecord) in this module, and a backend provides only two
 //! primitives:
 //!
-//! - [`MediatorStore::mux_record_get`] — read a member DID's record;
-//! - [`MediatorStore::mux_record_cas`] — replace it if its version is still
+//! - [`MuxStore::mux_record_get`] — read a member DID's record;
+//! - [`MuxStore::mux_record_cas`] — replace it if its version is still
 //!   the one that was read, updating the principal index in the same atomic
 //!   step.
 //!

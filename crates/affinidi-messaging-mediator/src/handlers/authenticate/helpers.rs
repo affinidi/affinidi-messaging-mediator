@@ -1,6 +1,7 @@
 use crate::SharedData;
 use crate::common::authz::{self, Capability};
 use crate::common::session::{SessionClaims, TokenUse};
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 // Production token creation now takes `now` from the injected clock; the only
 // remaining caller of this helper is the test module below.
 #[cfg(test)]

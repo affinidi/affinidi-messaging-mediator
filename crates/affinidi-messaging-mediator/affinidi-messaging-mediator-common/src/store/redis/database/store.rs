@@ -17,17 +17,11 @@ mod names {
     pub const MESSAGE_STORE_DURATION_SECONDS: &str = "message_store_duration_seconds";
     pub const MESSAGES_STORED_TOTAL: &str = "messages_stored_total";
 }
-use serde::{Deserialize, Serialize};
 use sha256::digest;
 use tracing::{Instrument, Level, debug, event, info, span, warn};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct MessageMetaData {
-    pub bytes: usize,
-    pub to_did_hash: String,
-    pub from_did_hash: Option<String>,
-    pub timestamp: u128,
-}
+/// A message's metadata, as the store trait reports it.
+pub use crate::store::types::MessageMetaData;
 
 impl Database {
     /// Stores a message in the database

@@ -11,6 +11,7 @@
 
 use crate::common;
 
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use std::time::Duration;
 
 use affinidi_messaging_didcomm::message::Message;

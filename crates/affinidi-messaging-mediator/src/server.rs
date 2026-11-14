@@ -300,7 +300,7 @@ pub async fn serve_internal(
     // tasks (statistics, expiry sweep, forwarding processor, websocket
     // streaming) all consume `Arc<dyn MediatorStore>`, so they run
     // unchanged regardless of which backend is in use.
-    use affinidi_messaging_mediator_common::store::MediatorStore;
+    use affinidi_messaging_mediator_common::store::prelude::*;
     // Outcome of the stored-function integrity check, published to `/readyz`
     // once the supervisor that owns the health registry exists. `None` on any
     // build or backend where there are no stored functions to check.
@@ -567,7 +567,7 @@ pub async fn serve_internal(
     let monitor = crate::monitor::TrafficMonitor::new();
 
     // Message expiry sweep — non-load-bearing housekeeping. Runs against
-    // any backend via `MediatorStore::sweep_expired_messages`. The
+    // any backend via `MessageStore::sweep_expired_messages`. The
     // standalone `message_expiry_cleanup` binary in mediator-processors
     // keeps its own direct-Redis loop for distributed deployments. Sweep
     // errors are logged and the next tick retries; the supervisor restarts

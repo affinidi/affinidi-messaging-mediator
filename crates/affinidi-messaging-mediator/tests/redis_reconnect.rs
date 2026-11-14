@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use affinidi_messaging_mediator::store::RedisStore;
 use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use affinidi_messaging_mediator_common::store::types::{ForwardQueueEntry, StreamingClientState};
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 use tokio::sync::broadcast::error::RecvError;

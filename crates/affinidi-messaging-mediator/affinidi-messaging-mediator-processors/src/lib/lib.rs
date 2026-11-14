@@ -31,7 +31,7 @@
 //!   `mediator_common::tasks::forwarding::ForwardingProcessor`. Same
 //!   processor type the mediator binary spawns in-process.
 //! - `message_expiry_cleanup` opens the same `RedisStore` and calls
-//!   `MediatorStore::sweep_expired_messages` on a one-second tick,
+//!   `MessageStore::sweep_expired_messages` on a one-second tick,
 //!   matching the mediator's in-process expiry sweep.
 //!
 //! No duplicated implementation lives in this crate — both binaries

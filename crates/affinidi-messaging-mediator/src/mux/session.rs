@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use affinidi_messaging_mediator_common::{
     did_identity::did_hash,
     store::{
-        MediatorStore,
         mux::{self, MuxCapability, MuxGrant, MuxScope},
+        prelude::*,
     },
     types::acls::MediatorACLSet,
 };
@@ -741,7 +741,7 @@ mod tests {
     use crate::mux::proof::StatementVerifier;
     use crate::store::MemoryStore;
     use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
-    use affinidi_messaging_mediator_common::store::{MediatorStore, mux::MuxLimits};
+    use affinidi_messaging_mediator_common::store::mux::MuxLimits;
     use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
     use affinidi_secrets_resolver::secrets::Secret;
     use serde_json::json;

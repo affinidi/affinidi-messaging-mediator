@@ -33,7 +33,7 @@
 //! restart. The same bounds apply to stored overrides at startup, so if the
 //! operator lowers the configured value, it wins.
 //!
-//! [`MediatorStore::config_overrides_get`]: affinidi_messaging_mediator_common::store::MediatorStore::config_overrides_get
+//! [`MediatorStore::config_overrides_get`]: affinidi_messaging_mediator_common::store::AuxiliaryStore::config_overrides_get
 
 use std::sync::{Arc, OnceLock, RwLock};
 

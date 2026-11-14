@@ -16,7 +16,7 @@ use std::time::Duration;
 use affinidi_messaging_mediator::store::RedisStore;
 use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
 use affinidi_messaging_mediator_common::errors::MediatorError;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use affinidi_messaging_mediator_common::store::types::{DeletionAuthority, Session};
 use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 

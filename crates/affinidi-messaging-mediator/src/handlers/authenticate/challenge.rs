@@ -7,6 +7,7 @@ use crate::{
     common::session::{Session, SessionState},
 };
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use affinidi_messaging_sdk::{
     messages::problem_report::{ProblemReportScope, ProblemReportSorter},
     protocols::mediator::{

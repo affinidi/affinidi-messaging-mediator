@@ -19,6 +19,7 @@
 //! with its account, is deleted from the record, so its `grantsRevoked`
 //! notice is best effort; `messaging/mux/list` remains the source of truth.
 
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use affinidi_messaging_mediator_common::store::mux::{self, MuxGrant, MuxGrantState, NoticeWire};

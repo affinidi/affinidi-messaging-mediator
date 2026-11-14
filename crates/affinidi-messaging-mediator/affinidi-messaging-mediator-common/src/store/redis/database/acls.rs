@@ -1,7 +1,7 @@
 use super::Database;
 use crate::error_codes;
 use crate::errors::MediatorError;
-use crate::store::{DeliveryDecision, ops};
+use crate::store::{AccessListUpdate, AccessListUpdateOutcome, DeliveryDecision, ops};
 use crate::types::{
     acls::{AccessListModeType, MediatorACLSet},
     acls_handler::{
@@ -515,3 +515,82 @@ return {truncated, added}
 "#,
     )
 });
+
+/// One `access-list/update` on the set KEYS[1]: `clear`, then `add` up to
+/// the limit, then `remove`, in one step.
+///
+/// ARGV: limit, clear (`1`/`0`), the number of hashes to add `n`, then the
+/// `n` hashes to add, then the hashes to remove. Returns `{truncated (0/1),
+/// added, removed, count}`, following `ops::plan_access_list_update`.
+///
+/// The shebang makes Redis refuse the whole script up front when it is out of
+/// memory, so a `clear` is never applied without the `add` that follows it.
+static ACCESS_LIST_UPDATE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"#!lua
+local limit = tonumber(ARGV[1])
+local n = tonumber(ARGV[3])
+if ARGV[2] == '1' then redis.call('DEL', KEYS[1]) end
+local count = redis.call('SCARD', KEYS[1])
+local take = n
+local truncated = 0
+if count + n > limit then
+  truncated = 1
+  take = limit - count
+  if take < 0 then take = 0 end
+end
+local added = {}
+for i = 4, take + 3 do added[#added + 1] = ARGV[i] end
+for i = 1, #added, 500 do
+  redis.call('SADD', KEYS[1], unpack(added, i, math.min(i + 499, #added)))
+end
+local removed = {}
+for i = n + 4, #ARGV do
+  if redis.call('SREM', KEYS[1], ARGV[i]) == 1 then removed[#removed + 1] = ARGV[i] end
+end
+return { truncated, added, removed, redis.call('SCARD', KEYS[1]) }
+"#,
+    )
+});
+
+impl Database {
+    /// [`AclStore::access_list_update`](crate::store::AclStore::access_list_update):
+    /// one script on the access list's key.
+    pub(crate) async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        // The script never adds more than the limit, so no more are sent: a
+        // request past the limit costs no more than one at it, and reports
+        // truncated.
+        let over_limit = update.add.len() > access_list_limit;
+        let add = &update.add[..update.add.len().min(access_list_limit)];
+
+        let mut con = self.get_connection().await?;
+        let mut invocation = ACCESS_LIST_UPDATE.prepare_invoke();
+        invocation
+            .key(self.keys().access_list(did_hash))
+            .arg(access_list_limit)
+            .arg(if update.clear { "1" } else { "0" })
+            .arg(add.len())
+            .arg(add)
+            .arg(&update.remove);
+        let (truncated, added, removed, count): (i64, Vec<String>, Vec<String>, usize) =
+            invocation.invoke_async(&mut con).await.map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    did_hash.into(),
+                    &err,
+                    format!("access_list_update failed. Reason: {err}"),
+                )
+            })?;
+        Ok(AccessListUpdateOutcome {
+            added,
+            truncated: over_limit || truncated != 0,
+            removed,
+            count,
+        })
+    }
+}

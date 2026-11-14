@@ -12,7 +12,7 @@ use crate::types::{accounts::AccountType, acls::MediatorACLSet};
 impl RedisStore {
     /// Run schema migrations and seed the mediator + root-admin
     /// accounts. Called once at startup before the trait's
-    /// [`initialize`](crate::store::MediatorStore::initialize)
+    /// [`initialize`](crate::store::StoreLifecycle::initialize)
     /// hook (which loads Lua functions). Named `initialize_redis` to
     /// avoid colliding with the trait method.
     pub async fn initialize_redis(&self, config: &RedisInitConfig) -> Result<(), MediatorError> {

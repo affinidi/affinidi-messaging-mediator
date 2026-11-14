@@ -140,8 +140,10 @@ use affinidi_messaging_mediator::{
     store::MemoryStore,
 };
 use affinidi_messaging_mediator_common::{
-    MediatorSecrets, errors::MediatorError, secrets::backends::MemoryStore as SecretsMemoryStore,
-    store::MediatorStore,
+    MediatorSecrets,
+    errors::MediatorError,
+    secrets::backends::MemoryStore as SecretsMemoryStore,
+    store::{MediatorStore, MediatorStoreExt},
 };
 // Re-exported so tests can pick the Trust Task acceptance mode.
 pub use affinidi_messaging_mediator::common::config::{CorsOriginPolicy, TrustTaskVerification};
@@ -1656,7 +1658,7 @@ impl TestMediatorHandle {
     }
 
     /// Replace a registered DID's ACL bitmask. Goes directly through
-    /// the underlying [`MediatorStore::set_did_acl`] — no admin session
+    /// the underlying [`AclStore::set_did_acl`](affinidi_messaging_mediator_common::store::AclStore::set_did_acl) — no admin session
     /// is required, no permission checks run. Tests use this to
     /// simulate ACL changes mid-flow ("mint user, run code, revoke
     /// ACL, run more code") without round-tripping through the

@@ -164,7 +164,7 @@ impl Database {
                     == 1
             {
                 // The sent counters move when a handover is recorded, not
-                // on a read (see `MediatorStore::count_sent`).
+                // on a read (see `MediatorStoreExt::count_sent`).
                 Ok(Some(message))
             } else {
                 // Requesting DID is neither sender nor receiver

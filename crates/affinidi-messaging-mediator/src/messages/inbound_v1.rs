@@ -25,11 +25,11 @@
 //!
 //! v1 has no DID anywhere in the envelope. The `to` is a bare Ed25519 verkey,
 //! resolved to a local account through the store's routing-key index (see
-//! [`MediatorStore::v1_routing_key_bind`]). Until the coordinate-mediation
+//! [`V1RoutingKeyStore::v1_routing_key_bind`]). Until the coordinate-mediation
 //! protocol lands there is no client-facing way to create those bindings, so a
 //! forward for an unbound verkey is refused as "not local".
 //!
-//! [`MediatorStore::v1_routing_key_bind`]: affinidi_messaging_mediator_common::store::MediatorStore::v1_routing_key_bind
+//! [`V1RoutingKeyStore::v1_routing_key_bind`]: affinidi_messaging_mediator_common::store::V1RoutingKeyStore::v1_routing_key_bind
 
 use crate::error_codes;
 use affinidi_messaging_didcomm_v1::envelope::{

@@ -16,14 +16,10 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::database::keys::Keys;
 use crate::error_codes;
 use crate::store::redis::database::cluster_scripts::MARK_DELIVERED;
-use crate::store::redis::database::{
-    forwarding::ForwardQueueEntry as InnerForwardEntry, stats::MetadataStats as InnerMetadataStats,
-    store::MessageMetaData as InnerMessageMetaData,
-};
 use crate::store::{
     DeliveryDecision, DeliveryMarkReport, DeliveryState, MessageRef, MessageScope,
     OUTBOX_RECEIPT_TTL, OutboxReceipt, POISON_ATTEMPTS, RemovedCopy, SentMessageState,
-    StoredMessageRef, mux, ops,
+    StoredMessageRef, mux, ops, prelude::*,
 };
 
 /// Whether a per-recipient receipt is still within [`OUTBOX_RECEIPT_TTL`]. Its
@@ -52,10 +48,10 @@ use crate::{
     database::{DatabaseHandler, RedisConnection},
     errors::MediatorError,
     store::{
-        DeletionAuthority, ExpiryReport, ForwardQueueClaimPage, ForwardQueueEntry,
-        InboxStatusReply, MediatorStore, MessageMetaData, MetadataStats, PubSubRecord,
-        RefreshRotation, Session, SessionState, StatCounter, StoreHealth, StreamingClientState,
-        TrustTaskClaim,
+        AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, DeletionAuthority, ExpiryReport,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MetadataStats,
+        PubSubRecord, RefreshRotation, Session, SessionSweepReport, StatCounter, StoreHealth,
+        StreamingClientState, TrustTaskClaim,
     },
 };
 use async_trait::async_trait;
@@ -188,7 +184,7 @@ pub struct RedisStore {
     pub(crate) handler: DatabaseHandler,
     circuit_breaker: Arc<CircuitBreaker>,
     lua_scripts_path: Option<String>,
-    /// The library source [`MediatorStore::initialize`] loads, when given
+    /// The library source [`StoreLifecycle::initialize`] loads, when given
     /// (see [`with_library`](Self::with_library)); else the file at
     /// `lua_scripts_path`.
     library_source: Option<(Arc<str>, String)>,
@@ -214,7 +210,7 @@ impl RedisStore {
     /// Construct a new `RedisStore` from a connected `DatabaseHandler`.
     ///
     /// `lua_scripts_path` should match `config.database.functions_file`
-    /// from the mediator config. When `None`, [`MediatorStore::initialize`]
+    /// from the mediator config. When `None`, [`StoreLifecycle::initialize`]
     /// returns an error — the Redis backend cannot operate without its
     /// Lua functions loaded.
     pub fn new(
@@ -241,7 +237,7 @@ impl RedisStore {
     }
 
     /// Load `source` (an `atm-functions.lua` library; `origin` names it in
-    /// the log) on [`MediatorStore::initialize`], rather than reading the
+    /// the log) on [`StoreLifecycle::initialize`], rather than reading the
     /// file at `lua_scripts_path`. The mediator passes the library compiled
     /// into it, so the library it loads is always the one it was built with.
     pub fn with_library(mut self, source: impl Into<Arc<str>>, origin: impl Into<String>) -> Self {
@@ -516,99 +512,6 @@ impl std::fmt::Debug for RedisStore {
     }
 }
 
-// ─── Type conversions ───────────────────────────────────────────────────────
-//
-// The `mediator-common::store::types` module defines a fresh set of
-// types that mirror the legacy ones in `crate::store::redis::database::*`. The
-// duplication is intentional during the migration: legacy call sites
-// still use the legacy types, the trait uses the new types, and the
-// store impl converts at the boundary. Commit 6 unifies them.
-
-fn session_state_into_new(s: SessionState) -> SessionState {
-    s
-}
-
-fn session_state_into_old(s: SessionState) -> SessionState {
-    s
-}
-
-fn session_into_new(inner: Session, refresh_token_hash: Option<String>) -> Session {
-    Session {
-        session_id: inner.session_id,
-        challenge: inner.challenge,
-        state: session_state_into_new(inner.state),
-        did: inner.did,
-        did_hash: inner.did_hash,
-        authenticated: inner.authenticated,
-        acls: inner.acls,
-        account_type: inner.account_type,
-        expires_at: inner.expires_at,
-        refresh_token_hash,
-    }
-}
-
-fn fwd_entry_into_new(inner: InnerForwardEntry) -> ForwardQueueEntry {
-    ForwardQueueEntry {
-        stream_id: inner.stream_id,
-        message: inner.message,
-        to_did_hash: inner.to_did_hash,
-        from_did_hash: inner.from_did_hash,
-        from_did: inner.from_did,
-        to_did: inner.to_did,
-        endpoint_url: inner.endpoint_url,
-        received_at_ms: inner.received_at_ms,
-        delay_milli: inner.delay_milli,
-        expires_at: inner.expires_at,
-        retry_count: inner.retry_count,
-        hop_count: inner.hop_count,
-        not_before_ms: inner.not_before_ms,
-    }
-}
-
-fn fwd_entry_into_old(new: &ForwardQueueEntry) -> InnerForwardEntry {
-    InnerForwardEntry {
-        stream_id: new.stream_id.clone(),
-        message: new.message.clone(),
-        to_did_hash: new.to_did_hash.clone(),
-        from_did_hash: new.from_did_hash.clone(),
-        from_did: new.from_did.clone(),
-        to_did: new.to_did.clone(),
-        endpoint_url: new.endpoint_url.clone(),
-        received_at_ms: new.received_at_ms,
-        delay_milli: new.delay_milli,
-        expires_at: new.expires_at,
-        retry_count: new.retry_count,
-        hop_count: new.hop_count,
-        not_before_ms: new.not_before_ms,
-    }
-}
-
-fn message_meta_into_new(inner: InnerMessageMetaData) -> MessageMetaData {
-    MessageMetaData {
-        bytes: inner.bytes,
-        to_did_hash: inner.to_did_hash,
-        from_did_hash: inner.from_did_hash,
-        timestamp: inner.timestamp,
-    }
-}
-
-fn stats_into_new(inner: InnerMetadataStats) -> MetadataStats {
-    MetadataStats {
-        received_bytes: inner.received_bytes,
-        sent_bytes: inner.sent_bytes,
-        deleted_bytes: inner.deleted_bytes,
-        received_count: inner.received_count,
-        sent_count: inner.sent_count,
-        deleted_count: inner.deleted_count,
-        websocket_open: inner.websocket_open,
-        websocket_close: inner.websocket_close,
-        sessions_created: inner.sessions_created,
-        sessions_success: inner.sessions_success,
-        oob_invites_created: inner.oob_invites_created,
-        oob_invites_claimed: inner.oob_invites_claimed,
-    }
-}
-
 fn stat_counter_redis_field(counter: StatCounter) -> &'static str {
     match counter {
         StatCounter::SentBytes => "SENT_BYTES",
@@ -623,12 +526,16 @@ fn stat_counter_redis_field(counter: StatCounter) -> &'static str {
 }
 
 #[async_trait]
-impl MediatorStore for RedisStore {
+impl StoreLifecycle for RedisStore {
     fn spans_processes(&self) -> bool {
         true
     }
 
-    // ─── Bootstrap & health ─────────────────────────────────────────────────
+    fn circuit_breaker_state(&self) -> &'static str {
+        // Read-only: the breaker moves on the next request it guards (the
+        // readiness probe's storage check is one), not on this read.
+        self.circuit_breaker.state_str()
+    }
 
     async fn initialize(&self) -> Result<(), MediatorError> {
         if let Some((source, origin)) = &self.library_source {
@@ -661,9 +568,10 @@ impl MediatorStore for RedisStore {
         self.mux_channels.lock().await.clear();
         Ok(())
     }
+}
 
-    // ─── Messages ───────────────────────────────────────────────────────────
-
+#[async_trait]
+impl MessageStore for RedisStore {
     async fn store_message(
         &self,
         session_id: &str,
@@ -774,7 +682,7 @@ impl MediatorStore for RedisStore {
         // mark racing a delete or the expiry sweeper cannot recreate the
         // metadata hash as an orphan — `HSETNX`/`HINCRBY` would create it on
         // a missing key. The script is not part of the function library, for
-        // the reasons on `MediatorStore::mark_delivered`.
+        // the reasons on `MessageStore::mark_delivered`.
         //
         // `HSETNX` on the first-delivery stamp is what makes the stamp itself
         // idempotent: the first handover wins and a redelivery leaves it
@@ -1151,13 +1059,9 @@ impl MediatorStore for RedisStore {
         recipient_did_hash: &str,
         message_hash: &str,
     ) -> Result<MessageMetaData, MediatorError> {
-        let inner = self
-            .get_message_metadata(recipient_did_hash, message_hash)
-            .await?;
-        Ok(message_meta_into_new(inner))
+        self.get_message_metadata(recipient_did_hash, message_hash)
+            .await
     }
-
-    // ─── Inbox & outbox ────────────────────────────────────────────────────
 
     async fn list_messages(
         &self,
@@ -1317,7 +1221,181 @@ impl MediatorStore for RedisStore {
         })
     }
 
-    // ─── Sessions ───────────────────────────────────────────────────────────
+    async fn sweep_expired_messages(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+    ) -> Result<ExpiryReport, MediatorError> {
+        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
+            .await
+    }
+
+    async fn sweep_expired_messages_observed(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+        on_expired: Option<crate::store::OnExpired<'_>>,
+    ) -> Result<ExpiryReport, MediatorError> {
+        // Replicates the legacy two-step `timeslot_scan` +
+        // `expire_messages_from_timeslot` flow inline so the trait
+        // doesn't have to expose the timeslot abstraction.
+        let mut conn = self.get_connection().await?;
+        let timeslot_keys: Vec<String> = redis::cmd("ZRANGE")
+            .arg("MSG_EXPIRY")
+            .arg("-inf")
+            .arg(now_secs)
+            .arg("BYSCORE")
+            .arg("LIMIT")
+            .arg(0)
+            .arg(STATIC_TIMESLOT_BATCH)
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "expiry".into(),
+                    &err,
+                    format!("sweep_expired_messages timeslot_scan failed: {err}"),
+                )
+            })?;
+
+        let mut report = ExpiryReport {
+            timeslots_swept: timeslot_keys.len() as u32,
+            ..Default::default()
+        };
+
+        for key in &timeslot_keys {
+            let mut conn = self.get_connection().await?;
+            // The bucket's own time, from its name: a deferred bucket keeps
+            // its name but not its score. Records are due at or after it.
+            let slot: Option<u64> = key
+                .strip_prefix("MSG_EXPIRY:")
+                .and_then(|ts| ts.parse().ok());
+            // A message leaves its bucket only after its delete has
+            // succeeded or found it already gone. Removing it first (SPOP)
+            // and putting it back on failure loses it for good when the
+            // put-back is refused (SADD is DENYOOM on a full database) or
+            // the process dies in between. SREM and ZREM free memory, so
+            // they still run at maxmemory.
+            let mut bucket_cleared = true;
+            // SSCAN may return a member more than once across batches.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut cursor: u64 = 0;
+            loop {
+                let (next, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
+                    .arg(key)
+                    .arg(cursor)
+                    .arg("COUNT")
+                    .arg(STATIC_TIMESLOT_BATCH)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        MediatorError::database_from_redis(
+                            error_codes::DB_OPERATION_ERROR,
+                            "expiry".into(),
+                            &err,
+                            format!("sweep_expired_messages SSCAN failed: {err}"),
+                        )
+                    })?;
+
+                // The batch's deletes run together (pipelined over the one
+                // multiplexed connection), not one round trip after another.
+                let fresh: Vec<String> = batch
+                    .into_iter()
+                    .filter(|member| seen.insert(member.clone()))
+                    .collect();
+                let outcomes = futures_util::future::join_all(fresh.iter().map(|member| {
+                    let conn = conn.clone();
+                    async move {
+                        (
+                            member,
+                            self.expire_member(conn, member, admin_did_hash, slot, on_expired)
+                                .await,
+                        )
+                    }
+                }))
+                .await;
+                let mut done: Vec<String> = Vec::new();
+                for (member, outcome) in outcomes {
+                    match outcome {
+                        ExpireOutcome::Expired => {
+                            report.expired += 1;
+                            done.push(member.clone());
+                        }
+                        ExpireOutcome::Gone => {
+                            report.already_deleted += 1;
+                            done.push(member.clone());
+                        }
+                        ExpireOutcome::Failed => {
+                            // Left in the bucket; the next sweep retries it.
+                            bucket_cleared = false;
+                        }
+                    }
+                }
+
+                // On failure the messages are gone but still listed; the next
+                // sweep finds them not-found and unlists them then.
+                if !done.is_empty()
+                    && let Err(err) = redis::cmd("SREM")
+                        .arg(key)
+                        .arg(&done)
+                        .exec_async(&mut conn)
+                        .await
+                {
+                    warn!("sweep_expired_messages SREM on {key} failed: {err}");
+                    bucket_cleared = false;
+                }
+
+                cursor = next;
+                if cursor == 0 {
+                    break;
+                }
+            }
+
+            if !bucket_cleared {
+                // Move the bucket back so it can't hold up the due ones: the
+                // scan takes only the first STATIC_TIMESLOT_BATCH buckets, and
+                // a message whose delete keeps failing would otherwise pin
+                // its bucket at the front for good. Best-effort: on a full
+                // database the write is refused and the bucket stays put.
+                if let Err(err) = redis::cmd("ZADD")
+                    .arg("MSG_EXPIRY")
+                    .arg("XX")
+                    .arg(now_secs + EXPIRY_RETRY_SECS)
+                    .arg(key)
+                    .exec_async(&mut conn)
+                    .await
+                {
+                    warn!("sweep_expired_messages couldn't defer bucket {key}: {err}");
+                }
+            } else {
+                self.drop_empty_expiry_bucket(&mut conn, key, slot)
+                    .await
+                    .map_err(|err| {
+                        MediatorError::database_from_redis(
+                            error_codes::DB_OPERATION_ERROR,
+                            "expiry".into(),
+                            &err,
+                            format!("sweep_expired_messages ZREM failed: {err}"),
+                        )
+                    })?;
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl SessionStore for RedisStore {
+    /// Sessions carry a Redis `EXPIRE`, so Redis reclaims them itself and
+    /// there is nothing to sweep.
+    async fn sweep_expired_sessions(
+        &self,
+        _now_secs: u64,
+    ) -> Result<SessionSweepReport, MediatorError> {
+        Ok(SessionSweepReport::default())
+    }
 
     async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
         let mut conn = self.get_connection().await?;
@@ -1329,7 +1407,7 @@ impl MediatorStore for RedisStore {
             .arg("challenge")
             .arg(&session.challenge)
             .arg("state")
-            .arg(session_state_into_old(session.state).to_string())
+            .arg(session.state.to_string())
             .arg("did")
             .arg(&session.did);
         if let Some(hash) = &session.refresh_token_hash {
@@ -1353,9 +1431,12 @@ impl MediatorStore for RedisStore {
     }
 
     async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
-        let inner = self.get_session(session_id, did).await?;
-        let refresh = self.get_refresh_token_hash(session_id).await?;
-        Ok(session_into_new(inner, refresh))
+        let session = self.get_session(session_id, did).await?;
+        let refresh_token_hash = self.get_refresh_token_hash(session_id).await?;
+        Ok(Session {
+            refresh_token_hash,
+            ..session
+        })
     }
 
     /// Override the trait default with the legacy atomic RENAME path.
@@ -1450,330 +1531,20 @@ impl MediatorStore for RedisStore {
             })?;
         Ok(())
     }
+}
 
-    // ─── Accounts ───────────────────────────────────────────────────────────
+#[async_trait]
+impl AccountStore for RedisStore {
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        self.account_update(did_hash, update).await
+    }
 
     async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
         self.account_exists(did_hash).await
-    }
-
-    // ─── DID multiplexing ────────────────────────────────────────────────────
-
-    fn supports_mux(&self) -> bool {
-        true
-    }
-
-    async fn mux_record_get(
-        &self,
-        did_hash: &str,
-    ) -> Result<Option<crate::store::mux::MuxDidRecord>, MediatorError> {
-        let mut conn = self.get_connection().await?;
-        let raw: Option<String> = redis::cmd("HGET")
-            .arg(self.keys().mux_record(did_hash))
-            .arg("r")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("mux_record_get: {e}"),
-                )
-            })?;
-        raw.map(|r| {
-            serde_json::from_str(&r).map_err(|e| {
-                MediatorError::InternalError(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    format!("mux record decode: {e}"),
-                )
-            })
-        })
-        .transpose()
-    }
-
-    async fn mux_record_cas(
-        &self,
-        did_hash: &str,
-        expected_version: Option<u64>,
-        new: Option<&crate::store::mux::MuxDidRecord>,
-        index: &crate::store::mux::MuxIndexDelta,
-    ) -> Result<bool, MediatorError> {
-        // One script, so the version check, the record write and every
-        // principal-index update happen as a single atomic step on the server
-        // — and on every mediator instance sharing this Redis.
-        //
-        // KEYS[1] = record; KEYS[2 .. 1+n_add] = indexes to add to;
-        // the rest = indexes to remove from.
-        // ARGV = expected version ('' = must not exist), new version,
-        // record JSON ('' = delete), n_add, member did_hash.
-        const SCRIPT: &str = "\
-            local cur = redis.call('HGET', KEYS[1], 'v') \
-            if cur == false then cur = '' end \
-            if cur ~= ARGV[1] then return 0 end \
-            if ARGV[3] == '' then redis.call('DEL', KEYS[1]) \
-            else redis.call('HSET', KEYS[1], 'v', ARGV[2], 'r', ARGV[3]) end \
-            local n_add = tonumber(ARGV[4]) \
-            for i = 2, #KEYS do \
-              if i <= 1 + n_add then redis.call('ZADD', KEYS[i], 0, ARGV[5]) \
-              else redis.call('ZREM', KEYS[i], ARGV[5]) end \
-            end \
-            return 1";
-
-        let record = match new {
-            Some(rec) => serde_json::to_string(rec).map_err(|e| {
-                MediatorError::InternalError(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    format!("mux record encode: {e}"),
-                )
-            })?,
-            None => String::new(),
-        };
-        let new_version = new.map(|r| r.version.to_string()).unwrap_or_default();
-
-        let script = redis::Script::new(SCRIPT);
-        let mut inv = script.key(self.keys().mux_record(did_hash));
-        for p in index.add.iter().chain(index.remove.iter()) {
-            inv.key(self.keys().mux_principal(p));
-        }
-        inv.arg(expected_version.map(|v| v.to_string()).unwrap_or_default())
-            .arg(new_version)
-            .arg(record)
-            .arg(index.add.len())
-            .arg(did_hash);
-
-        let mut conn = self.get_connection().await?;
-        let won: i64 = inv.invoke_async(&mut conn).await.map_err(|e| {
-            MediatorError::database_from_redis(
-                error_codes::DB_OPERATION_ERROR,
-                "NA".into(),
-                &e,
-                format!("mux_record_cas: {e}"),
-            )
-        })?;
-        Ok(won == 1)
-    }
-
-    async fn mux_principal_dids(
-        &self,
-        principal_hash: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<String>, MediatorError> {
-        let min = match after {
-            Some(a) => format!("({a}"),
-            None => "-".to_string(),
-        };
-        let mut conn = self.get_connection().await?;
-        redis::cmd("ZRANGEBYLEX")
-            .arg(self.keys().mux_principal(principal_hash))
-            .arg(min)
-            .arg("+")
-            .arg("LIMIT")
-            .arg(0)
-            .arg(limit)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("mux_principal_dids: {e}"),
-                )
-            })
-    }
-
-    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
-        let mut conn = self.get_connection().await?;
-        redis::cmd("ZCARD")
-            .arg(self.keys().mux_principal(principal_hash))
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("mux_principal_count: {e}"),
-                )
-            })
-    }
-
-    async fn mux_changes_publish(
-        &self,
-        record: &mux::MuxChangeRecord,
-    ) -> Result<(), MediatorError> {
-        let payload = serde_json::to_string(record).map_err(|e| {
-            MediatorError::InternalError(
-                error_codes::DB_OPERATION_ERROR,
-                "NA".into(),
-                format!("mux_changes_publish: {e}"),
-            )
-        })?;
-        let mut conn = self.get_connection().await?;
-        redis::cmd("PUBLISH")
-            .arg(MUX_CHANGES_CHANNEL)
-            .arg(payload)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("mux_changes_publish: {e}"),
-                )
-            })
-    }
-
-    async fn mux_changes_subscribe(
-        &self,
-    ) -> Result<Option<broadcast::Receiver<mux::MuxChangeRecord>>, MediatorError> {
-        // Same shape as `streaming_subscribe`: one Redis subscription per
-        // process, fanned out through a broadcast channel, and retired when
-        // the pub/sub connection drops so subscribers see `Closed`.
-        let mut channels = self.mux_channels.lock().await;
-        if let Some(sender) = channels.get(MUX_CHANGES_CHANNEL) {
-            return Ok(Some(sender.subscribe()));
-        }
-        let (sender, receiver) = broadcast::channel(MUX_CHANGES_CAPACITY);
-        let mut pubsub = self.handler.get_pubsub_connection().await?;
-        pubsub.subscribe(MUX_CHANGES_CHANNEL).await.map_err(|err| {
-            MediatorError::database_from_redis(
-                error_codes::DB_OPERATION_ERROR,
-                "NA".into(),
-                &err,
-                format!("mux_changes_subscribe SUBSCRIBE failed: {err}"),
-            )
-        })?;
-        debug!("RedisStore: opened pubsub bridge for channel {MUX_CHANGES_CHANNEL}");
-
-        let inner_sender = sender.clone();
-        let bridge_channels = self.mux_channels.clone();
-        tokio::spawn(async move {
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = stream.next().await {
-                match msg
-                    .get_payload::<String>()
-                    .map_err(|e| e.to_string())
-                    .and_then(|p| {
-                        serde_json::from_str::<mux::MuxChangeRecord>(&p).map_err(|e| e.to_string())
-                    }) {
-                    // No subscriber right now is fine.
-                    Ok(record) => {
-                        let _ = inner_sender.send(record);
-                    }
-                    Err(e) => warn!("RedisStore mux change bridge: malformed payload: {e}"),
-                }
-            }
-            retire_bridge(&bridge_channels, MUX_CHANGES_CHANNEL, &inner_sender).await;
-            drop(inner_sender);
-            warn!("RedisStore mux change bridge lost its connection; subscribers will resubscribe");
-        });
-
-        channels.insert(MUX_CHANGES_CHANNEL.to_string(), sender);
-        Ok(Some(receiver))
-    }
-
-    async fn monitor_fanout_publish(
-        &self,
-        scope: &str,
-        payload: &str,
-    ) -> Result<(), MediatorError> {
-        let mut conn = self.get_connection().await?;
-        redis::cmd("PUBLISH")
-            .arg(monitor_fanout_channel(scope))
-            .arg(payload)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("monitor_fanout_publish: {e}"),
-                )
-            })
-    }
-
-    async fn monitor_fanout_subscribe(
-        &self,
-        scope: &str,
-    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
-        // As `mux_changes_subscribe`: one Redis subscription per process and
-        // channel, retired when its connection drops.
-        let channel = monitor_fanout_channel(scope);
-        let mut channels = self.monitor_channels.lock().await;
-        if let Some(sender) = channels.get(&channel) {
-            return Ok(Some(sender.subscribe()));
-        }
-        let (sender, receiver) = broadcast::channel(MONITOR_FANOUT_CAPACITY);
-        let mut pubsub = self.handler.get_pubsub_connection().await?;
-        pubsub.subscribe(&channel).await.map_err(|err| {
-            MediatorError::database_from_redis(
-                error_codes::DB_OPERATION_ERROR,
-                "NA".into(),
-                &err,
-                format!("monitor_fanout_subscribe SUBSCRIBE failed: {err}"),
-            )
-        })?;
-        debug!("RedisStore: opened pubsub bridge for channel {channel}");
-
-        let inner_sender = sender.clone();
-        let bridge_channels = self.monitor_channels.clone();
-        let bridge_channel = channel.clone();
-        tokio::spawn(async move {
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = stream.next().await {
-                match msg.get_payload::<String>() {
-                    Ok(payload) => {
-                        let _ = inner_sender.send(payload);
-                    }
-                    Err(e) => warn!("RedisStore monitor fan-out bridge: unreadable payload: {e}"),
-                }
-            }
-            retire_bridge(&bridge_channels, &bridge_channel, &inner_sender).await;
-            drop(inner_sender);
-            warn!(
-                "RedisStore monitor fan-out bridge lost its connection; subscribers will resubscribe"
-            );
-        });
-
-        channels.insert(channel, sender);
-        Ok(Some(receiver))
-    }
-
-    // ─── DIDComm v1 routing keys ─────────────────────────────────────────────
-
-    fn supports_v1_routing_keys(&self) -> bool {
-        true
-    }
-
-    async fn v1_routing_key_bind(&self, verkey: &str, did_hash: &str) -> Result<(), MediatorError> {
-        self.v1_routing_key_bind(verkey, did_hash).await
-    }
-
-    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
-        self.v1_routing_key_lookup(verkey).await
-    }
-
-    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
-        self.v1_routing_key_unbind(verkey).await
-    }
-
-    async fn v1_routing_key_unbind_if_owner(
-        &self,
-        verkey: &str,
-        did: &str,
-    ) -> Result<bool, MediatorError> {
-        self.v1_routing_key_unbind_if_owner(verkey, did).await
-    }
-
-    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
-        self.v1_routing_keys_for(did_hash).await
     }
 
     async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
@@ -1893,7 +1664,162 @@ impl MediatorStore for RedisStore {
             .await
     }
 
-    // ─── ACLs ───────────────────────────────────────────────────────────────
+    async fn setup_admin_account(
+        &self,
+        admin_did_hash: &str,
+        admin_type: AccountType,
+        acls: &MediatorACLSet,
+    ) -> Result<(), MediatorError> {
+        self.setup_admin_account(admin_did_hash, admin_type, acls)
+            .await
+    }
+
+    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        self.check_admin_account(did_hash).await
+    }
+
+    async fn account_activity_record(
+        &self,
+        did_hash: &str,
+        kind: ActivityKind,
+        at: u64,
+    ) -> Result<(), MediatorError> {
+        let Some(field) = activity_field(kind) else {
+            return Ok(());
+        };
+        // Only for an account that exists, so a removed account's record is
+        // not written back by a message still in flight.
+        let mut conn = self.get_connection().await?;
+        redis::Script::new(
+            "if redis.call('EXISTS', KEYS[1]) == 1 then \
+               return redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) \
+             end return 0",
+        )
+        .key(self.keys().did(did_hash))
+        .key(self.keys().activity(did_hash))
+        .arg(field)
+        .arg(at)
+        .invoke_async::<i64>(&mut conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                did_hash.into(),
+                &e,
+                format!("recording account activity: {e}"),
+            )
+        })
+    }
+
+    async fn account_activity(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountActivity>, MediatorError> {
+        if did_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let mut pipe = redis::pipe();
+        for hash in did_hashes {
+            pipe.cmd("HMGET")
+                .arg(self.keys().activity(hash))
+                .arg(ACTIVITY_RECEIVED)
+                .arg(ACTIVITY_AUTHENTICATED);
+        }
+        let rows: Vec<(Option<u64>, Option<u64>)> =
+            self.query_each(&mut conn, pipe).await.map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("reading account activity: {e}"),
+                )
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|(last_received, last_authenticated)| {
+                let mut activity = AccountActivity::default();
+                activity.last_received = last_received;
+                activity.last_authenticated = last_authenticated;
+                activity
+            })
+            .collect())
+    }
+
+    async fn account_stats_bump(
+        &self,
+        did_hash: &str,
+        delta: AccountStatsDelta,
+    ) -> Result<(), MediatorError> {
+        // Only for an account that exists, and all of it in one round trip:
+        // this runs on the message path.
+        let Some((count, bytes, protocol)) = stats_fields(delta) else {
+            return Ok(());
+        };
+        let mut conn = self.get_connection().await?;
+        redis::Script::new(
+            "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
+             redis.call('HINCRBY', KEYS[2], ARGV[1], 1) \
+             redis.call('HINCRBY', KEYS[2], ARGV[2], ARGV[4]) \
+             redis.call('HINCRBY', KEYS[2], ARGV[3], 1) \
+             return 1",
+        )
+        .key(self.keys().did(did_hash))
+        .key(self.keys().stats(did_hash))
+        .arg(count)
+        .arg(bytes)
+        .arg(protocol)
+        .arg(delta.bytes)
+        .invoke_async::<i64>(&mut conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                did_hash.into(),
+                &e,
+                format!("counting a message against the account: {e}"),
+            )
+        })
+    }
+
+    async fn account_stats(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountStats>, MediatorError> {
+        if did_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let mut pipe = redis::pipe();
+        for hash in did_hashes {
+            pipe.cmd("HGETALL").arg(self.keys().stats(hash));
+        }
+        let rows: Vec<HashMap<String, i64>> =
+            self.query_each(&mut conn, pipe).await.map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("reading account stats: {e}"),
+                )
+            })?;
+        Ok(rows.into_iter().map(stats_from_hash).collect())
+    }
+}
+
+#[async_trait]
+impl AclStore for RedisStore {
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        self.access_list_update(access_list_limit, did_hash, update)
+            .await
+    }
 
     async fn set_did_acl(
         &self,
@@ -1964,240 +1890,12 @@ impl MediatorStore for RedisStore {
     ) -> Result<MediatorAccessListGetResponse, MediatorError> {
         self.access_list_get(did_hash, hashes).await
     }
+}
 
-    // ─── Admin accounts ─────────────────────────────────────────────────────
-
-    async fn setup_admin_account(
-        &self,
-        admin_did_hash: &str,
-        admin_type: AccountType,
-        acls: &MediatorACLSet,
-    ) -> Result<(), MediatorError> {
-        self.setup_admin_account(admin_did_hash, admin_type, acls)
-            .await
-    }
-
-    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
-        self.check_admin_account(did_hash).await
-    }
-
-    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
-        self.audit_log_record(entry).await
-    }
-
-    async fn audit_log_list(
-        &self,
-        cursor: u32,
-        limit: u32,
-    ) -> Result<MediatorAuditLogList, MediatorError> {
-        self.audit_log_list(cursor, limit).await
-    }
-
-    // ─── OOB Discovery invitations ──────────────────────────────────────────
-
-    async fn trust_task_claim(
-        &self,
-        key: &str,
-        digest: &str,
-        retain_until: u64,
-        now: u64,
-    ) -> Result<TrustTaskClaim, MediatorError> {
-        let _ = now; // Redis expires the key itself at `retain_until`.
-        let redis_key = format!("TRUST_TASK_CLAIM:{key}");
-        let mut conn = self.get_connection().await?;
-        let db_err = |op: &str, err: redis::RedisError| {
-            MediatorError::database_from_redis(
-                error_codes::DB_OPERATION_ERROR,
-                "NA".into(),
-                &err,
-                format!("trust_task_claim {op}: {err}"),
-            )
-        };
-
-        // SET NX is the atomic check-and-record: exactly one caller across all
-        // instances sharing this Redis wins the first claim.
-        let set: Option<String> = redis::cmd("SET")
-            .arg(&redis_key)
-            .arg(digest)
-            .arg("NX")
-            .arg("EXAT")
-            .arg(retain_until)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| db_err("SET", e))?;
-        if set.is_some() {
-            return Ok(TrustTaskClaim::Fresh);
-        }
-
-        let recorded: Option<String> = redis::cmd("GET")
-            .arg(&redis_key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| db_err("GET", e))?;
-        Ok(match recorded {
-            Some(recorded) if recorded == digest => TrustTaskClaim::Duplicate,
-            Some(_) => TrustTaskClaim::Conflict,
-            // Expired between the SET and the GET: the record is gone, so this
-            // is a first sight after all. Try once more to record it.
-            None => {
-                let set: Option<String> = redis::cmd("SET")
-                    .arg(&redis_key)
-                    .arg(digest)
-                    .arg("NX")
-                    .arg("EXAT")
-                    .arg(retain_until)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| db_err("SET", e))?;
-                if set.is_some() {
-                    TrustTaskClaim::Fresh
-                } else {
-                    TrustTaskClaim::Conflict
-                }
-            }
-        })
-    }
-
-    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
-        let mut conn = self.get_connection().await?;
-        let _: () = redis::cmd("HSET")
-            .arg("SCID_SOURCES")
-            .arg(did_hash)
-            .arg(record)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("scid_source_put: {e}"),
-                )
-            })?;
-        Ok(())
-    }
-
-    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
-        let mut conn = self.get_connection().await?;
-        redis::cmd("HVALS")
-            .arg("SCID_SOURCES")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "NA".into(),
-                    &e,
-                    format!("scid_source_list: {e}"),
-                )
-            })
-    }
-
-    async fn oob_discovery_store(
-        &self,
-        did_hash: &str,
-        invite_b64: &str,
-        expires_at: u64,
-    ) -> Result<String, MediatorError> {
-        // The legacy `oob_discovery_store` takes a `Message` and an
-        // `oob_invite_ttl`, then computes the absolute expiry inside.
-        // The trait already takes the absolute `expires_at`, so we
-        // call the underlying Redis ops directly here.
-        use sha256::digest;
-
-        let invite_hash = digest(invite_b64);
-        let key = format!("OOB_INVITES:{invite_hash}");
-        let mut conn = self.get_connection().await?;
-
-        let mut invite = redis::pipe();
-        invite
-            .cmd("HMSET")
-            .arg(&key)
-            .arg("INVITE")
-            .arg(invite_b64)
-            .arg("DID")
-            .arg(did_hash)
-            .cmd("EXPIREAT")
-            .arg(&key)
-            .arg(expires_at);
-        let mut counted = redis::pipe();
-        counted
-            .cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("OOB_INVITES_CREATED")
-            .arg(1);
-
-        self.exec_steps(&mut conn, vec![invite, counted])
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    did_hash.into(),
-                    &err,
-                    format!("oob_discovery_store failed: {err}"),
-                )
-            })?;
-
-        Ok(invite_hash)
-    }
-
-    async fn oob_discovery_get(
-        &self,
-        oob_id: &str,
-    ) -> Result<Option<(String, String)>, MediatorError> {
-        let key = format!("OOB_INVITES:{oob_id}");
-        let mut conn = self.get_connection().await?;
-        let result: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(&key)
-            .arg("INVITE")
-            .arg("DID")
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    oob_id.into(),
-                    &err,
-                    format!("oob_discovery_get failed: {err}"),
-                )
-            })?;
-        let (invite, did_hash) = match result.as_slice() {
-            [Some(i), Some(d)] => (i.clone(), d.clone()),
-            _ => return Ok(None),
-        };
-        // Best-effort stats bump: don't fail the request if the counter update fails.
-        let _ = redis::cmd("HINCRBY")
-            .arg("GLOBAL")
-            .arg("OOB_INVITES_CLAIMED")
-            .arg(1)
-            .exec_async(&mut conn)
-            .await;
-        Ok(Some((invite, did_hash)))
-    }
-
-    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
-        let key = format!("OOB_INVITES:{oob_id}");
-        let mut conn = self.get_connection().await?;
-        let deleted: i64 = redis::cmd("DEL")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    oob_id.into(),
-                    &err,
-                    format!("oob_discovery_delete failed: {err}"),
-                )
-            })?;
-        Ok(deleted > 0)
-    }
-
-    // ─── Stats / counters ───────────────────────────────────────────────────
-
+#[async_trait]
+impl StatsStore for RedisStore {
     async fn get_global_stats(&self) -> Result<MetadataStats, MediatorError> {
-        let inner = self.get_db_metadata().await?;
-        Ok(stats_into_new(inner))
+        self.get_db_metadata().await
     }
 
     async fn stats_increment(&self, counter: StatCounter, by: i64) -> Result<(), MediatorError> {
@@ -2219,16 +1917,16 @@ impl MediatorStore for RedisStore {
             })?;
         Ok(())
     }
+}
 
-    // ─── Forwarding queue ───────────────────────────────────────────────────
-
+#[async_trait]
+impl ForwardQueueStore for RedisStore {
     async fn forward_queue_enqueue(
         &self,
         entry: &ForwardQueueEntry,
         max_len: usize,
     ) -> Result<String, MediatorError> {
-        let inner = fwd_entry_into_old(entry);
-        self.forward_queue_enqueue_with_limit(&inner, max_len).await
+        self.forward_queue_enqueue_with_limit(entry, max_len).await
     }
 
     async fn forward_queue_len(&self) -> Result<usize, MediatorError> {
@@ -2274,7 +1972,7 @@ impl MediatorStore for RedisStore {
             }
             other => other?,
         };
-        Ok(inner.into_iter().map(fwd_entry_into_new).collect())
+        Ok(inner)
     }
 
     async fn forward_queue_ack(
@@ -2326,7 +2024,7 @@ impl MediatorStore for RedisStore {
             )
             .await?;
         Ok(ForwardQueueClaimPage {
-            entries: entries.into_iter().map(fwd_entry_into_new).collect(),
+            entries,
             next_cursor: (next != "0-0").then_some(next),
         })
     }
@@ -2351,8 +2049,77 @@ impl MediatorStore for RedisStore {
         self.forward_queue_refresh_claims(group_name, consumer_name, stream_ids)
             .await
     }
+}
 
-    // ─── Live streaming (WebSocket pub/sub) ─────────────────────────────────
+#[async_trait]
+impl StreamingStore for RedisStore {
+    async fn monitor_fanout_publish(
+        &self,
+        scope: &str,
+        payload: &str,
+    ) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("PUBLISH")
+            .arg(monitor_fanout_channel(scope))
+            .arg(payload)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("monitor_fanout_publish: {e}"),
+                )
+            })
+    }
+
+    async fn monitor_fanout_subscribe(
+        &self,
+        scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        // As `mux_changes_subscribe`: one Redis subscription per process and
+        // channel, retired when its connection drops.
+        let channel = monitor_fanout_channel(scope);
+        let mut channels = self.monitor_channels.lock().await;
+        if let Some(sender) = channels.get(&channel) {
+            return Ok(Some(sender.subscribe()));
+        }
+        let (sender, receiver) = broadcast::channel(MONITOR_FANOUT_CAPACITY);
+        let mut pubsub = self.handler.get_pubsub_connection().await?;
+        pubsub.subscribe(&channel).await.map_err(|err| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                &err,
+                format!("monitor_fanout_subscribe SUBSCRIBE failed: {err}"),
+            )
+        })?;
+        debug!("RedisStore: opened pubsub bridge for channel {channel}");
+
+        let inner_sender = sender.clone();
+        let bridge_channels = self.monitor_channels.clone();
+        let bridge_channel = channel.clone();
+        tokio::spawn(async move {
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = stream.next().await {
+                match msg.get_payload::<String>() {
+                    Ok(payload) => {
+                        let _ = inner_sender.send(payload);
+                    }
+                    Err(e) => warn!("RedisStore monitor fan-out bridge: unreadable payload: {e}"),
+                }
+            }
+            retire_bridge(&bridge_channels, &bridge_channel, &inner_sender).await;
+            drop(inner_sender);
+            warn!(
+                "RedisStore monitor fan-out bridge lost its connection; subscribers will resubscribe"
+            );
+        });
+
+        channels.insert(channel, sender);
+        Ok(Some(receiver))
+    }
 
     async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
         self.streaming_clean_start(mediator_uuid).await
@@ -2578,137 +2345,480 @@ impl MediatorStore for RedisStore {
         channels.insert(mediator_uuid.to_string(), sender);
         Ok(receiver)
     }
+}
 
-    // ─── Message expiry processor ───────────────────────────────────────────
-
-    async fn account_activity_record(
-        &self,
-        did_hash: &str,
-        kind: ActivityKind,
-        at: u64,
-    ) -> Result<(), MediatorError> {
-        let Some(field) = activity_field(kind) else {
-            return Ok(());
-        };
-        // Only for an account that exists, so a removed account's record is
-        // not written back by a message still in flight.
-        let mut conn = self.get_connection().await?;
-        redis::Script::new(
-            "if redis.call('EXISTS', KEYS[1]) == 1 then \
-               return redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) \
-             end return 0",
-        )
-        .key(self.keys().did(did_hash))
-        .key(self.keys().activity(did_hash))
-        .arg(field)
-        .arg(at)
-        .invoke_async::<i64>(&mut conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            MediatorError::database_from_redis(
-                error_codes::DB_OPERATION_ERROR,
-                did_hash.into(),
-                &e,
-                format!("recording account activity: {e}"),
-            )
-        })
+#[async_trait]
+impl MuxStore for RedisStore {
+    fn supports_mux(&self) -> bool {
+        true
     }
 
-    async fn account_activity(
+    async fn mux_record_get(
         &self,
-        did_hashes: &[String],
-    ) -> Result<Vec<AccountActivity>, MediatorError> {
-        if did_hashes.is_empty() {
-            return Ok(Vec::new());
-        }
+        did_hash: &str,
+    ) -> Result<Option<crate::store::mux::MuxDidRecord>, MediatorError> {
         let mut conn = self.get_connection().await?;
-        let mut pipe = redis::pipe();
-        for hash in did_hashes {
-            pipe.cmd("HMGET")
-                .arg(self.keys().activity(hash))
-                .arg(ACTIVITY_RECEIVED)
-                .arg(ACTIVITY_AUTHENTICATED);
-        }
-        let rows: Vec<(Option<u64>, Option<u64>)> =
-            self.query_each(&mut conn, pipe).await.map_err(|e| {
+        let raw: Option<String> = redis::cmd("HGET")
+            .arg(self.keys().mux_record(did_hash))
+            .arg("r")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
                 MediatorError::database_from_redis(
                     error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &e,
-                    format!("reading account activity: {e}"),
+                    format!("mux_record_get: {e}"),
                 )
             })?;
-        Ok(rows
-            .into_iter()
-            .map(|(last_received, last_authenticated)| {
-                let mut activity = AccountActivity::default();
-                activity.last_received = last_received;
-                activity.last_authenticated = last_authenticated;
-                activity
+        raw.map(|r| {
+            serde_json::from_str(&r).map_err(|e| {
+                MediatorError::InternalError(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    format!("mux record decode: {e}"),
+                )
             })
-            .collect())
+        })
+        .transpose()
     }
 
-    async fn account_stats_bump(
+    async fn mux_record_cas(
         &self,
         did_hash: &str,
-        delta: AccountStatsDelta,
-    ) -> Result<(), MediatorError> {
-        // Only for an account that exists, and all of it in one round trip:
-        // this runs on the message path.
-        let Some((count, bytes, protocol)) = stats_fields(delta) else {
-            return Ok(());
+        expected_version: Option<u64>,
+        new: Option<&crate::store::mux::MuxDidRecord>,
+        index: &crate::store::mux::MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        // One script, so the version check, the record write and every
+        // principal-index update happen as a single atomic step on the server
+        // — and on every mediator instance sharing this Redis.
+        //
+        // KEYS[1] = record; KEYS[2 .. 1+n_add] = indexes to add to;
+        // the rest = indexes to remove from.
+        // ARGV = expected version ('' = must not exist), new version,
+        // record JSON ('' = delete), n_add, member did_hash.
+        const SCRIPT: &str = "\
+            local cur = redis.call('HGET', KEYS[1], 'v') \
+            if cur == false then cur = '' end \
+            if cur ~= ARGV[1] then return 0 end \
+            if ARGV[3] == '' then redis.call('DEL', KEYS[1]) \
+            else redis.call('HSET', KEYS[1], 'v', ARGV[2], 'r', ARGV[3]) end \
+            local n_add = tonumber(ARGV[4]) \
+            for i = 2, #KEYS do \
+              if i <= 1 + n_add then redis.call('ZADD', KEYS[i], 0, ARGV[5]) \
+              else redis.call('ZREM', KEYS[i], ARGV[5]) end \
+            end \
+            return 1";
+
+        let record = match new {
+            Some(rec) => serde_json::to_string(rec).map_err(|e| {
+                MediatorError::InternalError(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    format!("mux record encode: {e}"),
+                )
+            })?,
+            None => String::new(),
         };
+        let new_version = new.map(|r| r.version.to_string()).unwrap_or_default();
+
+        let script = redis::Script::new(SCRIPT);
+        let mut inv = script.key(self.keys().mux_record(did_hash));
+        for p in index.add.iter().chain(index.remove.iter()) {
+            inv.key(self.keys().mux_principal(p));
+        }
+        inv.arg(expected_version.map(|v| v.to_string()).unwrap_or_default())
+            .arg(new_version)
+            .arg(record)
+            .arg(index.add.len())
+            .arg(did_hash);
+
         let mut conn = self.get_connection().await?;
-        redis::Script::new(
-            "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
-             redis.call('HINCRBY', KEYS[2], ARGV[1], 1) \
-             redis.call('HINCRBY', KEYS[2], ARGV[2], ARGV[4]) \
-             redis.call('HINCRBY', KEYS[2], ARGV[3], 1) \
-             return 1",
-        )
-        .key(self.keys().did(did_hash))
-        .key(self.keys().stats(did_hash))
-        .arg(count)
-        .arg(bytes)
-        .arg(protocol)
-        .arg(delta.bytes)
-        .invoke_async::<i64>(&mut conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| {
+        let won: i64 = inv.invoke_async(&mut conn).await.map_err(|e| {
             MediatorError::database_from_redis(
                 error_codes::DB_OPERATION_ERROR,
-                did_hash.into(),
+                "NA".into(),
                 &e,
-                format!("counting a message against the account: {e}"),
+                format!("mux_record_cas: {e}"),
             )
-        })
+        })?;
+        Ok(won == 1)
     }
 
-    async fn account_stats(
+    async fn mux_principal_dids(
         &self,
-        did_hashes: &[String],
-    ) -> Result<Vec<AccountStats>, MediatorError> {
-        if did_hashes.is_empty() {
-            return Ok(Vec::new());
-        }
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let min = match after {
+            Some(a) => format!("({a}"),
+            None => "-".to_string(),
+        };
         let mut conn = self.get_connection().await?;
-        let mut pipe = redis::pipe();
-        for hash in did_hashes {
-            pipe.cmd("HGETALL").arg(self.keys().stats(hash));
-        }
-        let rows: Vec<HashMap<String, i64>> =
-            self.query_each(&mut conn, pipe).await.map_err(|e| {
+        redis::cmd("ZRANGEBYLEX")
+            .arg(self.keys().mux_principal(principal_hash))
+            .arg(min)
+            .arg("+")
+            .arg("LIMIT")
+            .arg(0)
+            .arg(limit)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
                 MediatorError::database_from_redis(
                     error_codes::DB_OPERATION_ERROR,
                     "NA".into(),
                     &e,
-                    format!("reading account stats: {e}"),
+                    format!("mux_principal_dids: {e}"),
+                )
+            })
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("ZCARD")
+            .arg(self.keys().mux_principal(principal_hash))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("mux_principal_count: {e}"),
+                )
+            })
+    }
+
+    async fn mux_changes_publish(
+        &self,
+        record: &mux::MuxChangeRecord,
+    ) -> Result<(), MediatorError> {
+        let payload = serde_json::to_string(record).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                format!("mux_changes_publish: {e}"),
+            )
+        })?;
+        let mut conn = self.get_connection().await?;
+        redis::cmd("PUBLISH")
+            .arg(MUX_CHANGES_CHANNEL)
+            .arg(payload)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("mux_changes_publish: {e}"),
+                )
+            })
+    }
+
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<mux::MuxChangeRecord>>, MediatorError> {
+        // Same shape as `streaming_subscribe`: one Redis subscription per
+        // process, fanned out through a broadcast channel, and retired when
+        // the pub/sub connection drops so subscribers see `Closed`.
+        let mut channels = self.mux_channels.lock().await;
+        if let Some(sender) = channels.get(MUX_CHANGES_CHANNEL) {
+            return Ok(Some(sender.subscribe()));
+        }
+        let (sender, receiver) = broadcast::channel(MUX_CHANGES_CAPACITY);
+        let mut pubsub = self.handler.get_pubsub_connection().await?;
+        pubsub.subscribe(MUX_CHANGES_CHANNEL).await.map_err(|err| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                &err,
+                format!("mux_changes_subscribe SUBSCRIBE failed: {err}"),
+            )
+        })?;
+        debug!("RedisStore: opened pubsub bridge for channel {MUX_CHANGES_CHANNEL}");
+
+        let inner_sender = sender.clone();
+        let bridge_channels = self.mux_channels.clone();
+        tokio::spawn(async move {
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = stream.next().await {
+                match msg
+                    .get_payload::<String>()
+                    .map_err(|e| e.to_string())
+                    .and_then(|p| {
+                        serde_json::from_str::<mux::MuxChangeRecord>(&p).map_err(|e| e.to_string())
+                    }) {
+                    // No subscriber right now is fine.
+                    Ok(record) => {
+                        let _ = inner_sender.send(record);
+                    }
+                    Err(e) => warn!("RedisStore mux change bridge: malformed payload: {e}"),
+                }
+            }
+            retire_bridge(&bridge_channels, MUX_CHANGES_CHANNEL, &inner_sender).await;
+            drop(inner_sender);
+            warn!("RedisStore mux change bridge lost its connection; subscribers will resubscribe");
+        });
+
+        channels.insert(MUX_CHANGES_CHANNEL.to_string(), sender);
+        Ok(Some(receiver))
+    }
+}
+
+#[async_trait]
+impl V1RoutingKeyStore for RedisStore {
+    fn supports_v1_routing_keys(&self) -> bool {
+        true
+    }
+
+    async fn v1_routing_key_bind(&self, verkey: &str, did_hash: &str) -> Result<(), MediatorError> {
+        self.v1_routing_key_bind(verkey, did_hash).await
+    }
+
+    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
+        self.v1_routing_key_lookup(verkey).await
+    }
+
+    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
+        self.v1_routing_key_unbind(verkey).await
+    }
+
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        self.v1_routing_key_unbind_if_owner(verkey, did).await
+    }
+
+    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        self.v1_routing_keys_for(did_hash).await
+    }
+}
+
+#[async_trait]
+impl AuditStore for RedisStore {
+    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
+        self.audit_log_record(entry).await
+    }
+
+    async fn audit_log_list(
+        &self,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAuditLogList, MediatorError> {
+        self.audit_log_list(cursor, limit).await
+    }
+}
+
+#[async_trait]
+impl AuxiliaryStore for RedisStore {
+    /// Claims carry a Redis expiry at their `retain_until`, so Redis drops
+    /// them itself and there is nothing to sweep.
+    async fn sweep_expired_trust_task_claims(&self, _now: u64) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
+    async fn trust_task_claim(
+        &self,
+        key: &str,
+        digest: &str,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<TrustTaskClaim, MediatorError> {
+        let _ = now; // Redis expires the key itself at `retain_until`.
+        let redis_key = format!("TRUST_TASK_CLAIM:{key}");
+        let mut conn = self.get_connection().await?;
+        let db_err = |op: &str, err: redis::RedisError| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                &err,
+                format!("trust_task_claim {op}: {err}"),
+            )
+        };
+
+        // SET NX is the atomic check-and-record: exactly one caller across all
+        // instances sharing this Redis wins the first claim.
+        let set: Option<String> = redis::cmd("SET")
+            .arg(&redis_key)
+            .arg(digest)
+            .arg("NX")
+            .arg("EXAT")
+            .arg(retain_until)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| db_err("SET", e))?;
+        if set.is_some() {
+            return Ok(TrustTaskClaim::Fresh);
+        }
+
+        let recorded: Option<String> = redis::cmd("GET")
+            .arg(&redis_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| db_err("GET", e))?;
+        Ok(match recorded {
+            Some(recorded) if recorded == digest => TrustTaskClaim::Duplicate,
+            Some(_) => TrustTaskClaim::Conflict,
+            // Expired between the SET and the GET: the record is gone, so this
+            // is a first sight after all. Try once more to record it.
+            None => {
+                let set: Option<String> = redis::cmd("SET")
+                    .arg(&redis_key)
+                    .arg(digest)
+                    .arg("NX")
+                    .arg("EXAT")
+                    .arg(retain_until)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| db_err("SET", e))?;
+                if set.is_some() {
+                    TrustTaskClaim::Fresh
+                } else {
+                    TrustTaskClaim::Conflict
+                }
+            }
+        })
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        let _: () = redis::cmd("HSET")
+            .arg("SCID_SOURCES")
+            .arg(did_hash)
+            .arg(record)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("scid_source_put: {e}"),
                 )
             })?;
-        Ok(rows.into_iter().map(stats_from_hash).collect())
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("HVALS")
+            .arg("SCID_SOURCES")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("scid_source_list: {e}"),
+                )
+            })
+    }
+
+    async fn oob_discovery_store(
+        &self,
+        did_hash: &str,
+        invite_b64: &str,
+        expires_at: u64,
+    ) -> Result<String, MediatorError> {
+        // The legacy `oob_discovery_store` takes a `Message` and an
+        // `oob_invite_ttl`, then computes the absolute expiry inside.
+        // The trait already takes the absolute `expires_at`, so we
+        // call the underlying Redis ops directly here.
+        use sha256::digest;
+
+        let invite_hash = digest(invite_b64);
+        let key = format!("OOB_INVITES:{invite_hash}");
+        let mut conn = self.get_connection().await?;
+
+        let mut invite = redis::pipe();
+        invite
+            .cmd("HMSET")
+            .arg(&key)
+            .arg("INVITE")
+            .arg(invite_b64)
+            .arg("DID")
+            .arg(did_hash)
+            .cmd("EXPIREAT")
+            .arg(&key)
+            .arg(expires_at);
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("OOB_INVITES_CREATED")
+            .arg(1);
+
+        self.exec_steps(&mut conn, vec![invite, counted])
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    did_hash.into(),
+                    &err,
+                    format!("oob_discovery_store failed: {err}"),
+                )
+            })?;
+
+        Ok(invite_hash)
+    }
+
+    async fn oob_discovery_get(
+        &self,
+        oob_id: &str,
+    ) -> Result<Option<(String, String)>, MediatorError> {
+        let key = format!("OOB_INVITES:{oob_id}");
+        let mut conn = self.get_connection().await?;
+        let result: Vec<Option<String>> = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("INVITE")
+            .arg("DID")
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    oob_id.into(),
+                    &err,
+                    format!("oob_discovery_get failed: {err}"),
+                )
+            })?;
+        let (invite, did_hash) = match result.as_slice() {
+            [Some(i), Some(d)] => (i.clone(), d.clone()),
+            _ => return Ok(None),
+        };
+        // Best-effort stats bump: don't fail the request if the counter update fails.
+        let _ = redis::cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("OOB_INVITES_CLAIMED")
+            .arg(1)
+            .exec_async(&mut conn)
+            .await;
+        Ok(Some((invite, did_hash)))
+    }
+
+    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
+        let key = format!("OOB_INVITES:{oob_id}");
+        let mut conn = self.get_connection().await?;
+        let deleted: i64 = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    oob_id.into(),
+                    &err,
+                    format!("oob_discovery_delete failed: {err}"),
+                )
+            })?;
+        Ok(deleted > 0)
     }
 
     async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError> {
@@ -2742,170 +2852,6 @@ impl MediatorStore for RedisStore {
                     format!("storing configuration overrides: {e}"),
                 )
             })
-    }
-
-    async fn sweep_expired_messages(
-        &self,
-        now_secs: u64,
-        admin_did_hash: &str,
-    ) -> Result<ExpiryReport, MediatorError> {
-        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
-            .await
-    }
-
-    async fn sweep_expired_messages_observed(
-        &self,
-        now_secs: u64,
-        admin_did_hash: &str,
-        on_expired: Option<crate::store::OnExpired<'_>>,
-    ) -> Result<ExpiryReport, MediatorError> {
-        // Replicates the legacy two-step `timeslot_scan` +
-        // `expire_messages_from_timeslot` flow inline so the trait
-        // doesn't have to expose the timeslot abstraction.
-        let mut conn = self.get_connection().await?;
-        let timeslot_keys: Vec<String> = redis::cmd("ZRANGE")
-            .arg("MSG_EXPIRY")
-            .arg("-inf")
-            .arg(now_secs)
-            .arg("BYSCORE")
-            .arg("LIMIT")
-            .arg(0)
-            .arg(STATIC_TIMESLOT_BATCH)
-            .query_async(&mut conn)
-            .await
-            .map_err(|err| {
-                MediatorError::database_from_redis(
-                    error_codes::DB_OPERATION_ERROR,
-                    "expiry".into(),
-                    &err,
-                    format!("sweep_expired_messages timeslot_scan failed: {err}"),
-                )
-            })?;
-
-        let mut report = ExpiryReport {
-            timeslots_swept: timeslot_keys.len() as u32,
-            ..Default::default()
-        };
-
-        for key in &timeslot_keys {
-            let mut conn = self.get_connection().await?;
-            // The bucket's own time, from its name: a deferred bucket keeps
-            // its name but not its score. Records are due at or after it.
-            let slot: Option<u64> = key
-                .strip_prefix("MSG_EXPIRY:")
-                .and_then(|ts| ts.parse().ok());
-            // A message leaves its bucket only after its delete has
-            // succeeded or found it already gone. Removing it first (SPOP)
-            // and putting it back on failure loses it for good when the
-            // put-back is refused (SADD is DENYOOM on a full database) or
-            // the process dies in between. SREM and ZREM free memory, so
-            // they still run at maxmemory.
-            let mut bucket_cleared = true;
-            // SSCAN may return a member more than once across batches.
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut cursor: u64 = 0;
-            loop {
-                let (next, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
-                    .arg(key)
-                    .arg(cursor)
-                    .arg("COUNT")
-                    .arg(STATIC_TIMESLOT_BATCH)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|err| {
-                        MediatorError::database_from_redis(
-                            error_codes::DB_OPERATION_ERROR,
-                            "expiry".into(),
-                            &err,
-                            format!("sweep_expired_messages SSCAN failed: {err}"),
-                        )
-                    })?;
-
-                // The batch's deletes run together (pipelined over the one
-                // multiplexed connection), not one round trip after another.
-                let fresh: Vec<String> = batch
-                    .into_iter()
-                    .filter(|member| seen.insert(member.clone()))
-                    .collect();
-                let outcomes = futures_util::future::join_all(fresh.iter().map(|member| {
-                    let conn = conn.clone();
-                    async move {
-                        (
-                            member,
-                            self.expire_member(conn, member, admin_did_hash, slot, on_expired)
-                                .await,
-                        )
-                    }
-                }))
-                .await;
-                let mut done: Vec<String> = Vec::new();
-                for (member, outcome) in outcomes {
-                    match outcome {
-                        ExpireOutcome::Expired => {
-                            report.expired += 1;
-                            done.push(member.clone());
-                        }
-                        ExpireOutcome::Gone => {
-                            report.already_deleted += 1;
-                            done.push(member.clone());
-                        }
-                        ExpireOutcome::Failed => {
-                            // Left in the bucket; the next sweep retries it.
-                            bucket_cleared = false;
-                        }
-                    }
-                }
-
-                // On failure the messages are gone but still listed; the next
-                // sweep finds them not-found and unlists them then.
-                if !done.is_empty()
-                    && let Err(err) = redis::cmd("SREM")
-                        .arg(key)
-                        .arg(&done)
-                        .exec_async(&mut conn)
-                        .await
-                {
-                    warn!("sweep_expired_messages SREM on {key} failed: {err}");
-                    bucket_cleared = false;
-                }
-
-                cursor = next;
-                if cursor == 0 {
-                    break;
-                }
-            }
-
-            if !bucket_cleared {
-                // Move the bucket back so it can't hold up the due ones: the
-                // scan takes only the first STATIC_TIMESLOT_BATCH buckets, and
-                // a message whose delete keeps failing would otherwise pin
-                // its bucket at the front for good. Best-effort: on a full
-                // database the write is refused and the bucket stays put.
-                if let Err(err) = redis::cmd("ZADD")
-                    .arg("MSG_EXPIRY")
-                    .arg("XX")
-                    .arg(now_secs + EXPIRY_RETRY_SECS)
-                    .arg(key)
-                    .exec_async(&mut conn)
-                    .await
-                {
-                    warn!("sweep_expired_messages couldn't defer bucket {key}: {err}");
-                }
-            } else {
-                self.drop_empty_expiry_bucket(&mut conn, key, slot)
-                    .await
-                    .map_err(|err| {
-                        MediatorError::database_from_redis(
-                            error_codes::DB_OPERATION_ERROR,
-                            "expiry".into(),
-                            &err,
-                            format!("sweep_expired_messages ZREM failed: {err}"),
-                        )
-                    })?;
-            }
-        }
-
-        Ok(report)
     }
 }
 
@@ -2997,7 +2943,7 @@ impl RedisStore {
             return ExpireOutcome::Gone;
         };
         let meta = match on_expired {
-            Some(_) => MediatorStore::get_message_metadata(self, &to, msg_id)
+            Some(_) => MessageStore::get_message_metadata(self, &to, msg_id)
                 .await
                 .ok(),
             None => None,

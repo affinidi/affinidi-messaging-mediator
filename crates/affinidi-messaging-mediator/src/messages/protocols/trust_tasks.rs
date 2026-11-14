@@ -35,6 +35,7 @@ use crate::task_specs::{audit, config};
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_mediator_common::redact::redact_url;
+use affinidi_messaging_mediator_common::store::{AccessListUpdate, AccountUpdate};
 use affinidi_messaging_mediator_common::types::accounts::{Account, AccountType};
 use affinidi_messaging_mediator_common::types::acls::{
     ACLError, AccessListModeType, MediatorACLSet,
@@ -1044,23 +1045,40 @@ async fn consume_account_update(
         })
         .transpose()?;
 
-    // ---- Apply: capabilities, then queue limits, then the role. ----
+    // ---- Apply: every member in one atomic store write. ----
     //
-    // Three writes, not one transaction: the store has no compound update.
-    // Every refusal was decided above, so only a store failure can stop this
-    // part-way; when it does after an earlier write landed, that is audited
-    // as a partial update before the error goes back.
-    let mut applied: Vec<&'static str> = Vec::new();
+    // Every refusal was decided above, and the store applies the ACL, the
+    // queue limits and the role together, so a failure leaves the account as
+    // it was rather than part-updated.
+    let acls = match acl_value {
+        Some(acl_value) => {
+            let base = state
+                .database
+                .get_did_acl(&target_hash)
+                .await?
+                .unwrap_or_default();
+            Some(merge_wire_acl(acl_value, base)?)
+        }
+        None => None,
+    };
+    let role = new_type.filter(|new_type| *new_type != current._type);
+    let update = AccountUpdate {
+        acls,
+        send_queue_limit: queue_limits.and_then(|(send, _)| send),
+        receive_queue_limit: queue_limits.and_then(|(_, receive)| receive),
+        role,
+    };
+    if !state.database.account_update(&target_hash, &update).await? {
+        // Removed between the read above and the write: nothing was applied.
+        return Err(tt_problem(
+            session,
+            "messaging/account/update:unknownAccount",
+            format!("account {target_hash} not found"),
+            StatusCode::NOT_FOUND,
+        ));
+    }
 
-    if let Some(acl_value) = acl_value {
-        let base = state
-            .database
-            .get_did_acl(&target_hash)
-            .await?
-            .unwrap_or_default();
-        let merged = merge_wire_acl(acl_value, base)?;
-        let stored = state.database.set_did_acl(&target_hash, &merged).await?;
-        applied.push("acl");
+    if let Some(stored) = &update.acls {
         record_audit(
             state,
             session,
@@ -1069,22 +1087,8 @@ async fn consume_account_update(
             format!("acl -> {:#018x}", stored.to_u64()),
         )
         .await;
-        // A live mux connection carrying the account as a member drops it
-        // now if the new ACLs no longer cover its scope, before this answers;
-        // other instances are told to do the same.
-        crate::mux::connection::account_changed(state, &target_hash).await;
     }
-
     if let Some((send_queue_limit, receive_queue_limit)) = queue_limits {
-        if let Err(e) = state
-            .database
-            .account_change_queue_limits(&target_hash, send_queue_limit, receive_queue_limit)
-            .await
-        {
-            audit_partial_update(state, session, &target_hash, &applied, "queue limits", &e).await;
-            return Err(e);
-        }
-        applied.push("queue limits");
         record_audit(
             state,
             session,
@@ -1094,26 +1098,22 @@ async fn consume_account_update(
         )
         .await;
     }
-
-    if let Some(new_type) = new_type {
-        // A faithful port of the legacy admin-set transitions (promote / demote /
-        // switch); the guards above already authorized the change.
-        if current._type != new_type
-            && let Err(e) = apply_role_change(state, &target_hash, &current, new_type).await
-        {
-            audit_partial_update(state, session, &target_hash, &applied, "role", &e).await;
-            return Err(e);
-        }
-        if current._type != new_type {
-            record_audit(
-                state,
-                session,
-                &target_hash,
-                AuditAction::AccountChangeType,
-                format!("type -> {new_type}"),
-            )
-            .await;
-        }
+    if let Some(new_type) = update.role {
+        record_audit(
+            state,
+            session,
+            &target_hash,
+            AuditAction::AccountChangeType,
+            format!("type -> {new_type}"),
+        )
+        .await;
+    }
+    if update.acls.is_some() || update.role.is_some() {
+        // A live mux connection carrying the account as a member drops it now
+        // if the new ACLs no longer cover its scope, before this answers; open
+        // sockets here and on every instance sharing the store re-read their
+        // account on their next frame (`common::standing`).
+        crate::mux::connection::account_changed(state, &target_hash).await;
     }
 
     let account = state
@@ -1134,77 +1134,6 @@ async fn consume_account_update(
     )?;
     let response_doc = typed.respond_with(Uuid::new_v4().to_string(), response);
     serde_json::to_value(&response_doc).map_err(serialize_err)
-}
-
-/// Change `target_hash`'s role from `current`'s to `new_type`: a faithful port
-/// of the legacy admin-set transitions (promote / demote / switch).
-async fn apply_role_change(
-    state: &SharedData,
-    target_hash: &str,
-    current: &Account,
-    new_type: AccountType,
-) -> Result<(), MediatorError> {
-    if current._type.is_admin() && !new_type.is_admin() {
-        // Demotion — strip admin rights first, then set the plain role.
-        state
-            .database
-            .strip_admin_accounts(vec![target_hash.to_string()])
-            .await?;
-        state
-            .database
-            .account_set_role(target_hash, &new_type)
-            .await?;
-    } else if !current._type.is_admin() && new_type.is_admin() {
-        // Promotion — add admin rights, carrying the account's current ACL
-        // set (re-read so an `acl` member in this same update is honoured).
-        let acls = state
-            .database
-            .account_get(target_hash)
-            .await?
-            .map(|a| a.acls)
-            .unwrap_or(current.acls);
-        state
-            .database
-            .setup_admin_account(target_hash, new_type, &MediatorACLSet::from_u64(acls))
-            .await?;
-    } else {
-        // Switching between admin roles is a plain set-role.
-        state
-            .database
-            .account_set_role(target_hash, &new_type)
-            .await?;
-    }
-    // Open sockets, here and on every instance sharing the store, re-read
-    // their account on their next frame (`common::standing`).
-    crate::mux::connection::account_changed(state, target_hash).await;
-    Ok(())
-}
-
-/// Audit an `account/update` that a store failure stopped after `applied`
-/// had already been written: the record says the update is partial and what
-/// did and did not land. Nothing is recorded when nothing was applied.
-async fn audit_partial_update(
-    state: &SharedData,
-    session: &Session,
-    target_hash: &str,
-    applied: &[&str],
-    failed: &str,
-    error: &MediatorError,
-) {
-    if applied.is_empty() {
-        return;
-    }
-    record_audit(
-        state,
-        session,
-        target_hash,
-        AuditAction::SetAcl,
-        format!(
-            "outcome partial: account/update applied {} but its {failed} failed: {error}",
-            applied.join(", ")
-        ),
-    )
-    .await;
 }
 
 /// The stored `(send, receive)` queue limits for a `(requested send, requested
@@ -1839,15 +1768,20 @@ async fn consume_access_list_update(
     let target_hash = typed.payload.did.to_string();
     authorize_access_list(state, session, sender_kid, &target_hash, true).await?;
 
-    // Up to three writes (clear, add, remove), not one transaction. Each
-    // audits itself once it lands; a store failure after an earlier one
-    // landed is audited as a partial update before the error goes back.
-    let mut applied: Vec<&'static str> = Vec::new();
+    // One atomic store write: `clear`, `add` and `remove` land together, so
+    // no reader sees the list cleared and not yet refilled, and a failure
+    // leaves it as it was.
+    let update = AccessListUpdate {
+        clear: typed.payload.clear == Some(true),
+        add: typed.payload.add.iter().map(|v| v.to_string()).collect(),
+        remove: typed.payload.remove.iter().map(|v| v.to_string()).collect(),
+    };
+    let outcome = state
+        .database
+        .access_list_update(state.limits().access_list_limit, &target_hash, &update)
+        .await?;
 
-    // 1. `clear` empties the list before any additions.
-    if typed.payload.clear == Some(true) {
-        state.database.access_list_clear(&target_hash).await?;
-        applied.push("clear");
+    if update.clear {
         record_audit(
             state,
             session,
@@ -1857,115 +1791,44 @@ async fn consume_access_list_update(
         )
         .await;
     }
-
-    // 2. `add` — idempotent at the set level, truncated at the mediator limit.
-    let mut added: Vec<Vid> = Vec::new();
-    if !typed.payload.add.is_empty() {
-        let hashes: Vec<String> = typed.payload.add.iter().map(|v| v.to_string()).collect();
-        let result = match state
-            .database
-            .access_list_add(state.limits().access_list_limit, &target_hash, &hashes)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                audit_partial_access_list(state, session, &target_hash, &applied, "add", &e).await;
-                return Err(e);
-            }
-        };
-        applied.push("add");
+    if !update.add.is_empty() {
         record_audit(
             state,
             session,
             &target_hash,
             AuditAction::AccessListAdd,
-            format!("added {} entries", result.did_hashes.len()),
+            format!("added {} entries", outcome.added.len()),
         )
         .await;
-        added = result
-            .did_hashes
-            .iter()
-            .map(|h| Vid::from_str(h).expect("a stored hash is a valid Vid"))
-            .collect();
     }
-
-    // 3. `remove` — those present before removal are exactly those removed.
-    let mut removed: Vec<Vid> = Vec::new();
-    if !typed.payload.remove.is_empty() {
-        let hashes: Vec<String> = typed.payload.remove.iter().map(|v| v.to_string()).collect();
-        let removal = async {
-            let present = state
-                .database
-                .access_list_get(&target_hash, &hashes)
-                .await?
-                .did_hashes;
-            state
-                .database
-                .access_list_remove(&target_hash, &hashes)
-                .await?;
-            Ok::<_, MediatorError>(present)
-        };
-        let present = match removal.await {
-            Ok(present) => present,
-            Err(e) => {
-                audit_partial_access_list(state, session, &target_hash, &applied, "remove", &e)
-                    .await;
-                return Err(e);
-            }
-        };
+    if !update.remove.is_empty() {
         record_audit(
             state,
             session,
             &target_hash,
             AuditAction::AccessListRemove,
-            format!("removed {} entries", present.len()),
+            format!("removed {} entries", outcome.removed.len()),
         )
         .await;
-        removed = present
+    }
+    let vids = |hashes: &[String]| -> Vec<Vid> {
+        hashes
             .iter()
             .map(|h| Vid::from_str(h).expect("a stored hash is a valid Vid"))
-            .collect();
-    }
+            .collect()
+    };
+    let added = vids(&outcome.added);
+    let removed = vids(&outcome.removed);
 
     let response: Response = build(
         Response::builder()
-            .access_list_count(access_list_count(state, &target_hash).await)
+            .access_list_count(outcome.count as u64)
             .added(added)
             .did(typed.payload.did.clone())
             .removed(removed),
     )?;
     serde_json::to_value(typed.respond_with(Uuid::new_v4().to_string(), response))
         .map_err(serialize_err)
-}
-
-/// Audit an `access-list/update` that a store failure stopped after `applied`
-/// had already been written. Nothing is recorded when nothing was applied.
-async fn audit_partial_access_list(
-    state: &SharedData,
-    session: &Session,
-    target_hash: &str,
-    applied: &[&str],
-    failed: &str,
-    error: &MediatorError,
-) {
-    if applied.is_empty() {
-        return;
-    }
-    record_audit(
-        state,
-        session,
-        target_hash,
-        if failed == "add" {
-            AuditAction::AccessListAdd
-        } else {
-            AuditAction::AccessListRemove
-        },
-        format!(
-            "outcome partial: access-list update applied {} but its {failed} failed: {error}",
-            applied.join(", ")
-        ),
-    )
-    .await;
 }
 
 /// Handle `messaging/access-list/list`: self-or-admin, read-only, cursor-paged.

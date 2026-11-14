@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_mediator::store::MemoryStore;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 use affinidi_messaging_mediator_common::tasks::forwarding::relay_ack::{
     RELAY_ACK_SUBPROTOCOL, RelayAck, frame_id,
 };

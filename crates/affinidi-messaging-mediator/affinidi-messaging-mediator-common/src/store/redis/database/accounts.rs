@@ -2,7 +2,7 @@
 use super::Database;
 use crate::error_codes;
 use crate::errors::MediatorError;
-use crate::store::types::{DeletionAuthority, Session};
+use crate::store::types::{AccountUpdate, DeletionAuthority, Session};
 use crate::types::{
     accounts::{Account, AccountType, MediatorAccountList},
     acls::MediatorACLSet,
@@ -392,11 +392,11 @@ return 1
     /// - `did_hash` - SHA256 hash of the DID
     /// - `_type` - AccountType to change to
     ///
-    /// Superseded by [`MediatorStore::account_set_role`]; kept here as
+    /// Superseded by [`AccountStore::account_set_role`]; kept here as
     /// a Redis-specific helper in case operator tooling needs the
     /// legacy entry point.
     ///
-    /// [`MediatorStore::account_set_role`]: crate::store::MediatorStore::account_set_role
+    /// [`AccountStore::account_set_role`]: crate::store::AccountStore::account_set_role
     #[allow(dead_code)]
     pub(crate) async fn account_change_type(
         &self,
@@ -525,5 +525,144 @@ return 1
             queue_name, queue_limit
         );
         Ok(())
+    }
+}
+
+/// One `account/update` on the account hash KEYS[1], and with KEYS[2] (cluster
+/// mode off) the `ADMINS` set, in one step.
+///
+/// ARGV: ACLs hex (`''` = unchanged), send limit and receive limit (`''` =
+/// unchanged, `reset` = remove the field, else the value), role (`''` =
+/// unchanged), the DID hash, and the admin listing (`1` add, `0` remove, `''`
+/// leave; used only with KEYS[2]). Returns 0, writing nothing, when the hash
+/// is not an account (neither `ACLS` nor `ROLE_TYPE`), else 1.
+///
+/// The shebang makes Redis refuse the whole script up front when it is out of
+/// memory, rather than fail at a write part-way through.
+static ACCOUNT_UPDATE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"#!lua
+if redis.call('HEXISTS', KEYS[1], 'ACLS') == 0
+    and redis.call('HEXISTS', KEYS[1], 'ROLE_TYPE') == 0 then
+  return 0
+end
+if ARGV[1] ~= '' then redis.call('HSET', KEYS[1], 'ACLS', ARGV[1]) end
+local limits = { 'SEND_QUEUE_LIMIT', 'RECEIVE_QUEUE_LIMIT' }
+for i = 1, 2 do
+  local v = ARGV[i + 1]
+  if v == 'reset' then
+    redis.call('HDEL', KEYS[1], limits[i])
+  elseif v ~= '' then
+    redis.call('HSET', KEYS[1], limits[i], v)
+  end
+end
+if ARGV[4] ~= '' then redis.call('HSET', KEYS[1], 'ROLE_TYPE', ARGV[4]) end
+if #KEYS > 1 then
+  if ARGV[6] == '1' then
+    redis.call('SADD', KEYS[2], ARGV[5])
+  elseif ARGV[6] == '0' then
+    redis.call('SREM', KEYS[2], ARGV[5])
+  end
+end
+return 1
+"#,
+    )
+});
+
+/// A queue-limit member of [`AccountUpdate`] as [`ACCOUNT_UPDATE`] takes it.
+fn queue_limit_arg(limit: Option<i32>) -> String {
+    match limit {
+        None => String::new(),
+        Some(-2) => "reset".into(),
+        Some(n) => n.to_string(),
+    }
+}
+
+impl Database {
+    /// [`AccountStore::account_update`](crate::store::AccountStore::account_update):
+    /// one script on the account's slot. With cluster mode off the `ADMINS`
+    /// set is in the same script; with it on, `ADMINS` is in another slot and
+    /// is written in its own step — before a promotion, after a demotion —
+    /// so a failure between the two never grants more than either end state
+    /// (`ROLE_TYPE` alone grants admin rights, and it is always in the
+    /// script).
+    pub(crate) async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        let err = |err: redis::RedisError| {
+            MediatorError::database_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                did_hash.into(),
+                &err,
+                format!("account_update failed: {err}"),
+            )
+        };
+        let listing = update.role.map(|role| role.is_admin());
+        let cluster = self.keys().cluster_mode();
+        let mut con = self.get_connection().await?;
+
+        // Cluster mode, promotion: list as an admin first. Undone below if
+        // there was no account to promote.
+        let mut listed_here = false;
+        if cluster && listing == Some(true) {
+            let added: i64 = redis::cmd("SADD")
+                .arg("ADMINS")
+                .arg(did_hash)
+                .query_async(&mut con)
+                .await
+                .map_err(err)?;
+            listed_here = added == 1;
+        }
+
+        let mut invocation = ACCOUNT_UPDATE.prepare_invoke();
+        invocation.key(self.keys().did(did_hash));
+        if !cluster {
+            invocation.key("ADMINS");
+        }
+        invocation
+            .arg(
+                update
+                    .acls
+                    .as_ref()
+                    .map(MediatorACLSet::to_hex_string)
+                    .unwrap_or_default(),
+            )
+            .arg(queue_limit_arg(update.send_queue_limit))
+            .arg(queue_limit_arg(update.receive_queue_limit))
+            .arg(update.role.map(String::from).unwrap_or_default())
+            .arg(did_hash)
+            .arg(match listing {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "",
+            });
+        let updated: i64 = invocation.invoke_async(&mut con).await.map_err(err)?;
+
+        if cluster {
+            if updated == 0 && listed_here {
+                // No account: take back the listing this call added.
+                if let Err(e) = redis::cmd("SREM")
+                    .arg("ADMINS")
+                    .arg(did_hash)
+                    .exec_async(&mut con)
+                    .await
+                {
+                    tracing::warn!(
+                        "account_update: could not unlist {did_hash} after finding no account: {e}"
+                    );
+                }
+            } else if updated == 1 && listing == Some(false) {
+                // Demotion: unlist after the role no longer grants anything.
+                redis::cmd("SREM")
+                    .arg("ADMINS")
+                    .arg(did_hash)
+                    .exec_async(&mut con)
+                    .await
+                    .map_err(err)?;
+            }
+        }
+        Ok(updated == 1)
     }
 }

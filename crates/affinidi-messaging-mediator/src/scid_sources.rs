@@ -209,6 +209,7 @@ mod tests {
     use affinidi_did_resolver_cache_sdk::{
         config::DIDCacheConfigBuilder, network_resolvers::ScidVersion,
     };
+    use affinidi_messaging_mediator_common::store::MediatorStoreExt;
     use affinidi_messaging_sdk::protocols::mediator::acls::MediatorACLSet;
 
     const ACCOUNT: &str = "did:scid:vh:1:QmAccount";

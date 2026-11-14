@@ -23,8 +23,8 @@ use crate::common::now;
 use std::time::Duration;
 
 use affinidi_messaging_mediator_common::store::{
-    MediatorStore,
     mux::{self, MuxChange, MuxChangeRecord, MuxGrant, MuxLimits},
+    prelude::*,
 };
 use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator, TestUser};
 use common::init_tracing;

@@ -21,7 +21,7 @@ use crate::common;
 
 use affinidi_messaging_mediator::store::MemoryStore;
 use affinidi_messaging_mediator_common::{
-    store::{MediatorStore, types::ForwardQueueEntry},
+    store::{prelude::*, types::ForwardQueueEntry},
     tasks::forwarding::{
         ForwardOutcome, ForwardingConfig, ForwardingObserver, ForwardingProcessor,
         SystemMessagePacker,

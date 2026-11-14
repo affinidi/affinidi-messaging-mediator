@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use affinidi_messaging_mediator_common::store::{
-    MediatorStore,
     mux::{self, MuxGrant, MuxGrantState, MuxLimits},
+    prelude::*,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};

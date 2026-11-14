@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 
 use affinidi_messaging_didcomm::Message;
 use affinidi_messaging_mediator::store::MemoryStore;
-use affinidi_messaging_mediator_common::store::{MediatorStore, Session};
+use affinidi_messaging_mediator_common::store::{Session, prelude::*};
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_test_mediator::{
     AccessListModeType, TestEnvironment, TestMediator, TestMediatorHandle, acl,

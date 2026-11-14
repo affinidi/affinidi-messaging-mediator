@@ -8,7 +8,7 @@
 compile_error!("At least one of the `didcomm` or `tsp` features must be enabled");
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::store::prelude::*;
 #[cfg(feature = "didcomm")]
 use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
 use axum::extract::{FromRef, FromRequestParts};

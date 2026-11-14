@@ -472,7 +472,7 @@ impl Database {
         Ok((result.0, entries))
     }
 
-    /// See [`MediatorStore::forward_queue_finish`](crate::store::MediatorStore::forward_queue_finish).
+    /// See [`ForwardQueueStore::forward_queue_finish`](crate::store::ForwardQueueStore::forward_queue_finish).
     pub async fn forward_queue_finish(
         &self,
         group_name: &str,
@@ -593,7 +593,7 @@ fn entry_fields(entry: &ForwardQueueEntry) -> [(&'static str, String); 12] {
 const REFRESH_CHUNK: usize = 256;
 
 impl Database {
-    /// See [`MediatorStore::forward_queue_refresh_claims`](crate::store::MediatorStore::forward_queue_refresh_claims).
+    /// See [`ForwardQueueStore::forward_queue_refresh_claims`](crate::store::ForwardQueueStore::forward_queue_refresh_claims).
     pub async fn forward_queue_refresh_claims(
         &self,
         group_name: &str,

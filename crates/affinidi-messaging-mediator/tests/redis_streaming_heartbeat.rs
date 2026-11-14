@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use affinidi_messaging_mediator::store::RedisStore;
 use affinidi_messaging_mediator_common::database::{DatabaseHandler, config::DatabaseConfig};
-use affinidi_messaging_mediator_common::store::{MediatorStore, StreamingKind, StreamingWrite};
+use affinidi_messaging_mediator_common::store::{StreamingKind, StreamingWrite, prelude::*};
 use uuid::Uuid;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);

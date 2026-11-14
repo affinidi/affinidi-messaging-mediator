@@ -4,7 +4,7 @@
 //! changes are emitted there ([`TrafficMonitor::emit_membership`]). Behind a
 //! shared Redis, a membership subscriber may be connected to another
 //! instance. This module carries the events between them over one pub/sub
-//! channel per mediator (`MediatorStore::monitor_fanout_publish`):
+//! channel per mediator (`StreamingStore::monitor_fanout_publish`):
 //!
 //! - **Only while someone listens.** An instance with an opted-in
 //!   subscription announces it ([`Record::Listening`]) when one opens and

@@ -14,6 +14,7 @@
 #![allow(deprecated)]
 
 use crate::error_codes;
+use affinidi_messaging_mediator_common::store::MediatorStoreExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -718,7 +719,7 @@ pub(crate) async fn consume_message_get(
 /// any message it did not send, identically to one that never existed, so
 /// there is no administrative form and nothing to learn about another
 /// account's traffic. A removed message answers from the receipt its removal
-/// left (`MediatorStore::delete_message`). The `local` capability is required,
+/// left (`MediatorStoreExt::delete_message`). The `local` capability is required,
 /// as for every other operation on the account's own queues.
 pub(crate) async fn consume_message_status(
     typed: TrustTask<message::status::v0_1::Payload>,

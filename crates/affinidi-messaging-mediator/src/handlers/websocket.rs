@@ -26,7 +26,7 @@ use affinidi_messaging_didcomm::message::Message as DidcommMessage;
 use affinidi_messaging_mediator_common::errors::{AppError, MediatorError};
 #[cfg(feature = "tsp")]
 use affinidi_messaging_mediator_common::store::{DeletionAuthority, MessageScope};
-use affinidi_messaging_mediator_common::store::{MediatorStore, StatCounter};
+use affinidi_messaging_mediator_common::store::{StatCounter, prelude::*};
 use affinidi_messaging_mediator_common::tasks::forwarding::relay_ack::{
     RELAY_ACK_SUBPROTOCOL, RelayAck, frame_id,
 };
@@ -3715,7 +3715,7 @@ mod connection_slot_tests {
     use super::PerDidConnectionGuard;
     use crate::store::memory_store::MemoryStore;
     use crate::tasks::websocket_streaming::{QueuedCommand, StreamingUpdate, StreamingUpdateState};
-    use affinidi_messaging_mediator_common::store::MediatorStore;
+    use affinidi_messaging_mediator_common::store::prelude::*;
     use dashmap::DashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
