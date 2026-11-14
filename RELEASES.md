@@ -48,11 +48,11 @@ On a release branch the current version is its `RELEASE` file; the tag is `v`
 | **Stabilise** — backport fixes; each prep is another candidate | `0.42.0-rc.1`, … | `v0.42.0-rc.1`, … (prerelease) | — | `:v0.42.0-rc.N` |
 | **GA** | `0.42.0` | `v0.42.0` | publish `0.42.0` | `:v0.42.0`, `:latest` |
 | **Patch** as fixes are backported | `0.42.1`, `0.42.2`, … | `v0.42.1`, … | publish `0.42.N` | `:v0.42.N`, `:latest`* |
-| **EOL** — marked in the table below; the branch stays, read-only | — | — | — | — |
+| **EOL** — 90 days after GA, once a newer GA exists (see [Support](#support)); the branch stays, read-only | — | — | — | — |
 
 \* `:latest` moves only to the highest released GA/patch version: a patch to
-N-1 after N is out publishes `:v<version>` but leaves `:latest` on N. A release
-candidate **never** moves `:latest`.
+an older supported release publishes `:v<version>` but leaves `:latest` on
+the newest. A release candidate **never** moves `:latest`.
 
 `main` never publishes and never edits the version: the cut moves it to the
 next minor. A patch never changes a public API in a breaking way — the
@@ -67,27 +67,44 @@ first lockstep release from this repository.
 
 ## Schedule
 
-| Release | Branch | First RC | GA | Latest | Status |
-|---|---|---|---|---|---|
-| ≤ 0.41 | — | — | — | `0.41.x` | released from affinidi-tdk-rs, per-crate versions |
-| 0.42 | `release/0.42` | 2026-10-14 | 2026-10-14 | `0.42.0` | end of life |
-| 0.43 | `release/0.43` | 2026-10-18 | 2026-10-18 | `0.43.0` | end of life |
-| 0.44 | `release/0.44` | — | 2026-10-21 | `0.44.0` | end of life |
-| 0.45 | `release/0.45` | — | 2026-10-24 | `0.45.0` | end of life |
-| 0.46 | `release/0.46` | 2026-10-26 | 2026-10-26 | `0.46.0` | end of life |
-| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | end of life |
-| 0.48 | `release/0.48` | — | 2026-10-28 | `0.48.0` | end of life |
-| 0.49 | `release/0.49` | 2026-11-02 | 2026-11-02 | `0.49.0` | end of life |
-| 0.50 | `release/0.50` | 2026-11-04 | 2026-11-04 | `0.50.0` | supported (N-1) |
-| 0.51 | `release/0.51` | 2026-11-09 | 2026-11-09 | `0.51.0` | supported (N) |
-| 0.52 | — | TBD | TBD | — | in development on `main` |
+| Release | Branch | First RC | GA | Latest | Supported until | Status |
+|---|---|---|---|---|---|---|
+| ≤ 0.41 | — | — | — | `0.41.x` | — | released from affinidi-tdk-rs, per-crate versions; not patched here |
+| 0.42 | `release/0.42` | 2026-10-14 | 2026-10-14 | `0.42.0` | 2027-01-12 | supported |
+| 0.43 | `release/0.43` | 2026-10-18 | 2026-10-18 | `0.43.0` | 2027-01-16 | supported |
+| 0.44 | `release/0.44` | — | 2026-10-21 | `0.44.0` | 2027-01-19 | supported |
+| 0.45 | `release/0.45` | — | 2026-10-24 | `0.45.0` | 2027-01-22 | supported |
+| 0.46 | `release/0.46` | 2026-10-26 | 2026-10-26 | `0.46.0` | 2027-01-24 | supported |
+| 0.47 | `release/0.47` | 2026-10-27 | 2026-10-27 | `0.47.0` | 2027-01-25 | supported |
+| 0.48 | `release/0.48` | — | 2026-10-28 | `0.48.0` | 2027-01-26 | supported |
+| 0.49 | `release/0.49` | 2026-11-02 | 2026-11-02 | `0.49.0` | 2027-01-31 | supported |
+| 0.50 | `release/0.50` | 2026-11-04 | 2026-11-04 | `0.50.0` | 2027-02-02 | supported |
+| 0.51 | `release/0.51` | 2026-11-09 | 2026-11-09 | `0.51.0` | 2027-02-07 | supported |
+| 0.52 | — | TBD | TBD | — | — | in development on `main` |
 
 ## Support
 
-The newest two GA releases (N and N-1) are supported. When a release goes GA,
-the release before N-1 reaches end of life. "Supported" means fixes for
-security problems and for defects that break a deployment are backported and
-released. Features never are.
+Support is by time, not by count: **a release is supported for 90 days
+after its GA** (the "Supported until" column above), and the newest GA
+release is always supported, however old it is. Releases are cut often, so
+several lines are usually supported at once.
+
+"Supported" means fixes for security problems and for defects that break a
+deployment are backported to the release branch and released as a patch.
+Features never are. A fix that would need a breaking change cannot be
+backported (see [What goes on a release branch](#what-goes-on-a-release-branch));
+it ships in the next release, and the advisory or changelog says so.
+
+When a release passes its "Supported until" date and a newer GA exists, it
+reaches end of life: set its Status to `end of life` in the table. Nothing
+is deleted (see [End of life](#end-of-life)).
+
+**Which line to track.** Under Cargo's rules for `0.x` versions every minor
+release is a breaking release, so a dependency on `"0.51"` never picks up
+`0.52`. Track the newest release, and move to each new minor within the 90
+days its predecessor stays supported. Delivery, ack and auth behaviour can
+change between minors even where no signature does: read the release's
+`CHANGELOG.md` section (its **Breaking** entries first) before you move.
 
 ## What goes on a release branch
 
@@ -172,6 +189,8 @@ Actions → **Prepare a release** → choose the release branch as the ref and
 patch: a new section listing the commits since the last tag), moves the whole
 workspace for a patch, and
 opens a `chore(release): v…` PR from `release-prep/<major.minor>/<version>`.
+After a GA, fill in its GA date and its "Supported until" date (GA + 90
+days) in the schedule table.
 
 **Merging it is the release.** On that push to the release branch:
 
@@ -210,8 +229,9 @@ publisher. `publish.yml` stops with an explanation. To add a crate:
 
 ### End of life
 
-Set the status in the table. Nothing is deleted: the branch, its tags, its
-crates and its images stay.
+A release reaches end of life 90 days after its GA, provided a newer GA
+exists (see [Support](#support)). Set its status in the table. Nothing is
+deleted: the branch, its tags, its crates and its images stay.
 
 ## Repository settings this relies on
 
