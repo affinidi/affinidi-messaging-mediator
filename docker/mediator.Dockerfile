@@ -74,7 +74,7 @@ RUN cargo build ${BUILD_ARGS}
 # digest is the only thing fixing what ships. Dependabot proposes digest bumps
 # (which is how CVE fixes arrive); there is deliberately no `apt-get upgrade`,
 # which would make the pinned image non-reproducible.
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 ARG PORT
 LABEL org.opencontainers.image.source="https://github.com/affinidi/affinidi-messaging-mediator" \
       org.opencontainers.image.title="messaging-mediator" \
