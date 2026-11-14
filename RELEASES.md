@@ -80,7 +80,8 @@ first lockstep release from this repository.
 | 0.49 | `release/0.49` | 2026-11-02 | 2026-11-02 | `0.49.0` | 2027-01-31 | supported |
 | 0.50 | `release/0.50` | 2026-11-04 | 2026-11-04 | `0.50.0` | 2027-02-02 | supported |
 | 0.51 | `release/0.51` | 2026-11-09 | 2026-11-09 | `0.51.0` | 2027-02-07 | supported |
-| 0.52 | — | TBD | TBD | — | — | in development on `main` |
+| 0.52 | `release/0.52` | 2026-11-14 | 2026-11-14 | `0.52.0` | 2027-02-12 | supported |
+| 0.53 | — | TBD | TBD | — | — | in development on `main` |
 
 ## Support
 
