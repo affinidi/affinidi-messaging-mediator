@@ -1,6 +1,6 @@
 ### Changed — the vta feature is back
 
-- `affinidi-messaging-mediator` depends on `vta-sdk` X (TODO: set the published version) again,
+- `affinidi-messaging-mediator` depends on `vta-sdk` 0.90 again,
   released on the same line as this workspace (`affinidi-messaging-sdk` 0.47 /
   `affinidi-tdk` 0.45 / `trust-tasks` 0.39 / `affinidi-crypto` 0.3), so every
   `affinidi-*` and `trust-tasks-*` crate still resolves once.

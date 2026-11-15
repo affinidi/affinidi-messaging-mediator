@@ -65,8 +65,8 @@ trust-tasks-rs = { version = "0.39.0", default-features = false }
 # vta-sdk on the same line as the requirements above (affinidi-messaging-sdk
 # 0.47 / affinidi-tdk 0.45 / trust-tasks 0.39 / affinidi-crypto 0.3), so
 # every affinidi-* and trust-tasks-* crate still resolves once.
-# TODO: set to the published vta-sdk version on that line.
-vta-sdk = "0.89"
+# 0.90 is the first vta-sdk on affinidi-messaging-sdk 0.47 / trust-tasks 0.39 (0.89.0 is still on the old line).
+vta-sdk = "0.90"
 
 # ── AWS SDK ──────────────────────────────────────────────────────────────
 aws-config = "1.13"
