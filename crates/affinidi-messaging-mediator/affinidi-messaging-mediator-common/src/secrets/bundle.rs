@@ -910,8 +910,16 @@ mod tests {
     }
 
     /// A per-key value as the mediator writes it: a sealed envelope.
+    /// A sealed test entry. `created_at` is fixed so two entries for the same
+    /// tag are byte-equal whenever they were made (a wall-clock stamp made
+    /// these comparisons flaky across a second boundary).
     fn entry(tag: &str) -> Vec<u8> {
-        Envelope::new("test", tag.to_string()).seal().unwrap()
+        Envelope {
+            created_at: Some(1_700_000_000),
+            ..Envelope::new("test", tag.to_string())
+        }
+        .seal()
+        .unwrap()
     }
 
     fn seed_index_bytes(ids: &[&str]) -> Vec<u8> {
