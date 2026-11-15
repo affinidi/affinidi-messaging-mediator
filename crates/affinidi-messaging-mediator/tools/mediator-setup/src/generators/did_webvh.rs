@@ -146,14 +146,12 @@ fn render_mediator_document(
 
 /// Build the mediator's DID document without vta-sdk.
 ///
-/// vta-sdk (and with it the built-in `didcomm-mediator` template) is out of
-/// the dependency graph for this release, so this produces the document that
+/// A build without the `vta` feature has no vta-sdk (and with it no built-in
+/// `didcomm-mediator` template), so this produces the document that
 /// template renders with the same inputs: `#key-0` signing, `#key-1` key
 /// agreement, optional P-256 `#key-2` / `#key-3`, a `DIDCommMessaging`
 /// service on `URL` and on the derived WebSocket URL, and the `#auth`
-/// service. No `#tsp` service — the caller adds or strips it. Step 3 of the
-/// release order (vta-sdk back in the graph) can drop this in favour of the
-/// template again.
+/// service. No `#tsp` service — the caller adds or strips it.
 #[cfg(not(feature = "vta"))]
 fn render_mediator_document(
     service_url: &str,

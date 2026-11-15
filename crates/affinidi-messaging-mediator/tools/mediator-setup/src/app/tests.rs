@@ -162,7 +162,7 @@ fn cargo_features_default_matches_crate_defaults() {
     let cfg = WizardConfig::default();
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "tsp", "redis-backend", "jemalloc"]
+        vec!["didcomm", "tsp", "redis-backend", "jemalloc", "vta"]
     );
     assert!(!cfg.needs_explicit_features());
 }
@@ -188,13 +188,11 @@ fn mediator_default_features_match_the_mediator_crate() {
     assert_eq!(actual, expected);
 }
 
-/// Every explicit feature list the wizard renders keeps `jemalloc`, and none
-/// asks for the mediator's `vta` feature, which cannot be built in this
-/// release (vta-sdk is out of the dependency graph). Step 3 of the release
-/// order puts `vta` back: then every list must keep it again, or the mediator
-/// silently skips the VTA integration a VTA-linked config relies on.
+/// Every explicit feature list the wizard renders keeps `vta`: without it
+/// the mediator silently skips the VTA integration a VTA-linked config
+/// relies on.
 #[test]
-fn explicit_feature_lists_keep_jemalloc_and_leave_out_vta() {
+fn explicit_feature_lists_keep_vta_and_jemalloc() {
     for cfg in [
         WizardConfig {
             storage_backend: "fjall".into(),
@@ -211,7 +209,7 @@ fn explicit_feature_lists_keep_jemalloc_and_leave_out_vta() {
     ] {
         assert!(cfg.needs_explicit_features());
         let f = cfg.cargo_features();
-        assert!(!f.contains(&"vta") && f.contains(&"jemalloc"), "{f:?}");
+        assert!(f.contains(&"vta") && f.contains(&"jemalloc"), "{f:?}");
     }
 }
 
@@ -228,7 +226,7 @@ fn cargo_features_fjall_backend_emits_fjall_feature() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "tsp", "fjall-backend", "jemalloc"]
+        vec!["didcomm", "tsp", "fjall-backend", "jemalloc", "vta"]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -247,7 +245,14 @@ fn cargo_features_redis_with_secret_backend_keeps_redis() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "tsp", "redis-backend", "jemalloc", "secrets-aws"]
+        vec![
+            "didcomm",
+            "tsp",
+            "redis-backend",
+            "jemalloc",
+            "vta",
+            "secrets-aws"
+        ]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -266,6 +271,7 @@ fn cargo_features_fjall_with_secret_backend_uses_fjall() {
             "tsp",
             "fjall-backend",
             "jemalloc",
+            "vta",
             "secrets-vault"
         ]
     );
@@ -292,7 +298,7 @@ fn cargo_features_didcomm_only_leaves_tsp_out() {
     };
     assert_eq!(
         cfg.cargo_features(),
-        vec!["didcomm", "redis-backend", "jemalloc"]
+        vec!["didcomm", "redis-backend", "jemalloc", "vta"]
     );
     assert!(cfg.needs_explicit_features());
 }
@@ -2989,7 +2995,7 @@ fn without_vta_the_vta_step_offers_only_no_vta_and_says_why() {
     assert!(
         app.current_step_data()
             .description
-            .contains("unavailable in this release"),
+            .contains("no VTA integration"),
         "{}",
         app.current_step_data().description
     );

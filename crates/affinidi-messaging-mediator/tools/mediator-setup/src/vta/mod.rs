@@ -60,9 +60,8 @@ pub use vta_sdk::provision_client::{
 ///
 /// It has no values, so `Option<&VtaSession>` is always `None`: the
 /// provisioning and summary code keep their signatures, and every branch that
-/// would read a session is statically dead. Step 3 of the release order
-/// (vta-sdk back in the graph) makes the real `session::VtaSession` the
-/// only one again.
+/// would read a session is statically dead. A `vta` build uses the real
+/// `session::VtaSession`.
 #[cfg(not(feature = "vta"))]
 #[derive(Clone, Debug)]
 pub enum VtaSession {}
@@ -83,7 +82,6 @@ impl VtaSession {
 /// Why a VTA option is refused in a build without the `vta` feature. Shown by
 /// the wizard's VTA step and returned by every headless VTA entry point.
 #[cfg(not(feature = "vta"))]
-pub const VTA_UNAVAILABLE: &str = "VTA integration is unavailable in this release: \
-    vta-sdk is not built in until it is released on affinidi-messaging-sdk 0.47 / \
-    affinidi-tdk 0.45. Configure the mediator without a VTA (No VTA), or use a \
-    release that includes VTA integration.";
+pub const VTA_UNAVAILABLE: &str = "This mediator-setup was built with no VTA integration \
+    (without the `vta` feature). Configure the mediator without a VTA (No VTA), or \
+    rebuild mediator-setup with the `vta` feature (it is in the default set).";

@@ -261,7 +261,7 @@ pub(crate) async fn run_headless(args: &Args) -> anyhow::Result<()> {
 }
 
 /// `--setup-key-file` without the `vta` feature: refused, the VTA flows are
-/// not built in this release.
+/// not in this build.
 #[cfg(not(feature = "vta"))]
 pub(crate) async fn run_setup_key_phase2(_args: &Args, _key_path: &Path) -> anyhow::Result<()> {
     Err(exit::error(exit::NO_VTA_SESSION, vta::VTA_UNAVAILABLE))

@@ -24,16 +24,16 @@
 ARG PORT=7037
 
 # Both binaries in ONE cargo invocation, so the dependency graph is compiled
-# once: didcomm, tsp, redis-backend and jemalloc come from the mediator's
-# defaults (no `vta`: vta-sdk is out of the graph for this release, so the
-# image has no VTA integration), plus secrets-aws (which pulls in the `aws` feature required by
+# once: didcomm, tsp, redis-backend, jemalloc and vta come from the mediator's
+# defaults, plus secrets-aws (which pulls in the `aws` feature required by
 # aws_secrets:// / aws_parameter_store://); mediator-setup gets only the AWS
-# backends the cloud deployment uses. `--no-default-features` applies to both
-# packages, which is why the mediator's `default` is named explicitly.
+# backends the cloud deployment uses, plus its `vta` flows. `--no-default-features`
+# applies to both packages, which is why the mediator's `default` and setup's
+# `vta` are named explicitly.
 ARG BUILD_ARGS="--release --locked \
     -p affinidi-messaging-mediator -p affinidi-messaging-mediator-setup \
     --no-default-features \
-    --features affinidi-messaging-mediator/default,affinidi-messaging-mediator/secrets-aws,affinidi-messaging-mediator-setup/secrets-aws,affinidi-messaging-mediator-setup/publish-aws"
+    --features affinidi-messaging-mediator/default,affinidi-messaging-mediator/secrets-aws,affinidi-messaging-mediator-setup/secrets-aws,affinidi-messaging-mediator-setup/publish-aws,affinidi-messaging-mediator-setup/vta"
 
 # Builder base pinned by digest, like the runtime base below: a tag alone can be
 # re-pointed upstream. Written out literally (no ARG) so Dependabot can read and

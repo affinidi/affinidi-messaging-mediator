@@ -80,7 +80,7 @@ pub fn render_summary(
     #[cfg(not(feature = "vta"))]
     let vta_display = {
         let _ = vta_session;
-        "Disabled (VTA integration is unavailable in this release)".to_string()
+        "Disabled (this build has no VTA integration)".to_string()
     };
     #[cfg(feature = "vta")]
     let vta_display = if config.use_vta {

@@ -1,10 +1,9 @@
 //! The VTA step in a build without the `vta` feature.
 //!
-//! vta-sdk is out of the dependency graph for this release, so the online
-//! and sealed-handoff sub-flows (`vta_flow.rs`) are not built. The VTA step
-//! offers only "No VTA" (see `VTA_INTENT_CHOICES`); these are the entry points
-//! the rest of the wizard calls, with the sub-flows never active. Step 3 of
-//! the release order (vta-sdk back in the graph) deletes this file.
+//! Such a build has no vta-sdk, so the online and sealed-handoff sub-flows
+//! (`vta_flow.rs`) are not built. The VTA step offers only "No VTA" (see
+//! `VTA_INTENT_CHOICES`); these are the entry points the rest of the wizard
+//! calls, with the sub-flows never active.
 
 use crate::vta::{VTA_UNAVAILABLE, VtaIntent};
 

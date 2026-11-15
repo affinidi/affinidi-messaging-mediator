@@ -1,6 +1,5 @@
-// Without the `vta` feature the docs of the VTA modules still name the
-// vta-sdk types and the gated items they describe. Step 3 of the release order
-// (vta-sdk back in the graph) removes this.
+// In a build without the `vta` feature the docs of the VTA modules still name
+// the vta-sdk types and the gated items they describe.
 #![cfg_attr(not(feature = "vta"), allow(rustdoc::broken_intra_doc_links))]
 
 /// Serialises every test that reads or writes the process-wide current
@@ -27,17 +26,6 @@ pub(crate) fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
     // would turn one failure into a cascade of unrelated ones.
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-// `vta-sdk` is out of the dependency graph for this release (no published
-// vta-sdk builds against affinidi-messaging-sdk 0.47 / affinidi-tdk 0.45 yet),
-// so the wizard's VTA flows cannot be built. Step 3 of the release order —
-// vta-sdk back on the new line — restores `dep:vta-sdk` and removes this.
-#[cfg(feature = "vta")]
-compile_error!(
-    "the `vta` feature is unavailable in this release: vta-sdk is not in the \
-     dependency graph until it is released on affinidi-messaging-sdk 0.47 / \
-     affinidi-tdk 0.45 (see changelog.d/sdk-0-47-without-vta.md)"
-);
 
 #[macro_use]
 mod style;
