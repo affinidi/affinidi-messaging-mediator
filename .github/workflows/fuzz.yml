@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [tsp_meta_envelope, didcomm_message_json, didcomm_jws, envelope_detect]
+        target: [tsp_meta_envelope, didcomm_message_json, didcomm_jws, envelope_detect, meta_envelope_new, config_parse, forward_queue_roundtrip, pubsub_record_roundtrip]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
