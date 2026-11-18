@@ -163,15 +163,20 @@ These are sent as problem reports outside a request, so they have no
 
 ## Trust Task errors
 
-A refused Trust Task is answered with a `trust-task-error` document (Trust
-Tasks SPEC §8), signed by the mediator as a response is, over whichever
-transport carried the request: DIDComm (REST or WebSocket), TSP, or a mux
-connection. Its `code` is one of the framework's standard codes below, or a
+A refused Trust Task that asked for it, with the top-level member
+`"x-errorFormat": "trust-task-error"`, is answered with a `trust-task-error`
+document (Trust Tasks SPEC §8), signed by the mediator as a response is, over
+whichever transport carried the request: DIDComm (REST or WebSocket), TSP, or
+a mux connection. `affinidi-messaging-sdk` asks on every Trust Task from
+0.46.2. Its `code` is one of the framework's standard codes below, or a
 `<task>:<code>` the task's specification declares. The mediator uses no
 other codes for Trust Tasks.
 
-Where no document can be sent, the same code comes back as the problem code
-`e.p.<code>` (for example `e.p.permissionDenied`):
+A request that does not ask gets the same code as the problem code
+`e.p.<code>` (for example `e.p.permissionDenied`), the only form releases up
+to 0.51 sent. This lasts while 0.51 is supported (until 2027-02-07); the ask
+is to be withdrawn after that. A request that asks gets the problem code
+too where no document can be sent:
 
 - the request is not a Trust Task document (no `id` or `type` to answer), or
   it arrived without an authenticated sender;

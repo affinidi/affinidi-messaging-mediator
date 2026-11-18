@@ -1,5 +1,5 @@
-//! Refusing a Trust Task with a `trust-task-error` document (Trust Tasks SPEC
-//! §8) instead of a DIDComm problem report.
+//! Refusing a Trust Task that asks with a `trust-task-error` document (Trust
+//! Tasks SPEC §8) instead of a DIDComm problem report.
 //!
 //! Every Trust Task refusal carries a Trust Task error code: one of the
 //! framework's standard codes (SPEC §8.3: `permissionDenied`,
@@ -11,11 +11,14 @@
 //! code that says the same thing, at the one boundary every transport passes
 //! through ([`consume`](super::trust_tasks::consume)).
 //!
-//! A refusal is sent as a `trust-task-error` document, signed by the mediator
-//! as a response is, over whichever transport carried the request (DIDComm
-//! over REST or WebSocket, TSP, a mux connection). It falls back to a problem
-//! report `e.p.<code>`, with the same code, only where no document can be
-//! sent:
+//! A request that asks, with the top-level member [`ERROR_FORMAT_MEMBER`]
+//! (SPEC §4.2 allows additional top-level members; the proof covers it), is
+//! refused with a `trust-task-error` document, signed by the mediator as a
+//! response is, over whichever transport carried the request (DIDComm over
+//! REST or WebSocket, TSP, a mux connection). `affinidi-messaging-sdk` asks
+//! on every Trust Task from 0.46.2. Any other request is refused with a
+//! problem report `e.p.<code>`, with the same code, as is a request that
+//! asks where no document can be sent:
 //!
 //! - the request is not a Trust Task document (there is no `id` or `type` to
 //!   answer), or it arrived without an authenticated sender;
@@ -29,14 +32,16 @@
 //!
 //! The DIDComm binding is explicit that a problem report is not an error
 //! response (`didcomm/0.2` §4.1), which is why the document is the answer.
-//! A request may still carry `x-errorFormat: trust-task-error` (SDK 0.46
-//! sends it); it is no longer needed.
+//! Releases up to 0.51 sent only problem reports, and their clients cannot
+//! parse the document, so it waits for the ask while 0.51 is supported
+//! (until 2027-02-07); the ask is to be withdrawn after that.
 //!
 //! An internal failure says only that there was one: its text stays in the
 //! log, as it does for an HTTP client.
 
 use affinidi_messaging_mediator_common::errors::MediatorError;
 use affinidi_messaging_sdk::messages::problem_report::{ProblemReportScope, ProblemReportSorter};
+use affinidi_messaging_sdk::protocols::trust_tasks::{ERROR_FORMAT_DOCUMENT, ERROR_FORMAT_MEMBER};
 use http::StatusCode;
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -57,6 +62,8 @@ pub(crate) struct Refusing {
     /// The request without its payload: the builders read its `id`, `type`,
     /// `threadId` and `ceremony`.
     request: TrustTask<Value>,
+    /// The request asked to be refused with a `trust-task-error`.
+    asked: bool,
 }
 
 impl Refusing {
@@ -66,7 +73,9 @@ impl Refusing {
         request.thread_id = doc.thread_id.clone();
         request.parent_thread_id = doc.parent_thread_id.clone();
         request.ceremony = doc.ceremony.clone();
-        Self { request }
+        let asked = doc.extra.get(ERROR_FORMAT_MEMBER).and_then(Value::as_str)
+            == Some(ERROR_FORMAT_DOCUMENT);
+        Self { request, asked }
     }
 
     /// The `trust-task-error` refusing the request with `e`, from the
@@ -74,11 +83,11 @@ impl Refusing {
     /// also the address SPEC §8.1 requires under `identityMismatch`), signed
     /// as a success response is.
     ///
-    /// `None` when `e` is not a refusal of the task (a session or transport
-    /// failure), when `session` is not an authenticated session of
-    /// `sender_did`, or when the document could not be built or signed: the
-    /// request is then refused with `e` as a problem report (see the module
-    /// documentation).
+    /// `None` when the request did not ask for one, when `e` is not a refusal
+    /// of the task (a session or transport failure), when `session` is not an
+    /// authenticated session of `sender_did`, or when the document could not
+    /// be built or signed: the request is then refused with `e` as a problem
+    /// report (see the module documentation).
     pub(crate) async fn document(
         &self,
         e: &MediatorError,
@@ -86,6 +95,9 @@ impl Refusing {
         sender_did: &str,
         state: &SharedData,
     ) -> Option<Value> {
+        if !self.asked {
+            return None;
+        }
         if crate::common::authz::require_session_sender(session, Some(sender_did), None).is_err() {
             return None;
         }
@@ -546,6 +558,21 @@ mod tests {
         );
         assert!(error_payload(&e).is_none());
         assert!(matches!(normalize(e), MediatorError::SessionError(..)));
+    }
+
+    #[test]
+    fn only_a_request_that_asks_is_refused_with_a_document() {
+        let mut doc = json!({
+            "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+            "type": "https://trusttasks.org/spec/messaging/mux/revoke-all/0.1",
+            "payload": {},
+        });
+        let asked = |doc: &Value| Refusing::of(&serde_json::from_value(doc.clone()).unwrap()).asked;
+        assert!(!asked(&doc));
+        doc[ERROR_FORMAT_MEMBER] = json!(ERROR_FORMAT_DOCUMENT);
+        assert!(asked(&doc));
+        doc[ERROR_FORMAT_MEMBER] = json!("problem-report");
+        assert!(!asked(&doc));
     }
 
     #[test]

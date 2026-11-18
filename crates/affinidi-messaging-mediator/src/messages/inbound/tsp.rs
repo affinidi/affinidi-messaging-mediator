@@ -493,8 +493,9 @@ async fn dispatch_tsp_trust_task(
     // The sender VID is the framework identity; TSP VIDs carry no key fragment,
     // so it is already the shape `consume` wants.
     let request_type = doc.type_uri.to_string();
-    // A refusal is answered with a `trust-task-error` document, sealed back
-    // like a response, where one can be sent (see `trust_task_error`).
+    // A request that asks is refused with a `trust-task-error` document,
+    // sealed back like a response, where one can be sent (see
+    // `trust_task_error`).
     let refusing = trust_task_error::Refusing::of(&doc);
     let consumed = trust_tasks::consume(
         doc,

@@ -166,8 +166,8 @@ pub(crate) async fn process(
     let now_secs = state.clock.unix_secs();
     let sender_did = vid_of(&sender_kid);
     let request_type = doc.type_uri.to_string();
-    // A refusal is answered with a `trust-task-error` document where one can
-    // be sent (see `trust_task_error`).
+    // A request that asks is refused with a `trust-task-error` document
+    // where one can be sent (see `trust_task_error`).
     let refusing = crate::messages::protocols::trust_task_error::Refusing::of(&doc);
     let consumed = consume(
         doc,
