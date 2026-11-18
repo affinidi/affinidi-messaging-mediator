@@ -29,8 +29,8 @@ mod common;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
+use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use proptest::prelude::*;
 use serde::Serialize;
@@ -91,7 +91,13 @@ fn alg_none_token(aud: &str, sub: &str, session_id: &str, exp: u64) -> String {
 /// attack, adapted for EdDSA. Expected to be rejected because the fixed
 /// `algorithms = [EdDSA]` validation refuses the header's `HS256` before
 /// any key material is even consulted.
-fn alg_confusion_hs256_token(pub_key_bytes: &[u8], aud: &str, sub: &str, session_id: &str, exp: u64) -> String {
+fn alg_confusion_hs256_token(
+    pub_key_bytes: &[u8],
+    aud: &str,
+    sub: &str,
+    session_id: &str,
+    exp: u64,
+) -> String {
     let key = EncodingKey::from_secret(pub_key_bytes);
     encode(
         &Header::new(Algorithm::HS256),
@@ -141,7 +147,7 @@ async fn whoami_status(base_url: &str, token: &str) -> Option<u16> {
 
 /// Oversized bearer token, sent as a raw header value when it still forms
 /// valid header bytes (ASCII, no control chars) — boundary-value class
-/// from the skill's Step 6 table ("A" × 65_535).
+/// ("A" × 65_535).
 fn oversized_token() -> String {
     "A".repeat(65_535)
 }
@@ -191,7 +197,9 @@ async fn deterministic_boundary_matrix() {
         "HS256-signed-with-public-key-bytes token must never be accepted"
     );
 
-    // 4. Expired beyond the 60s leeway. MUST be 401.
+    // 4. Expired just beyond the 60s leeway. MUST be 401. (The clock only
+    //    moves forward between minting and the server's check, so this
+    //    cannot flake.)
     let expired = sign(&fx.jwt_pkcs8, "ATM", did, session_id, n.saturating_sub(61));
     assert_eq!(
         whoami_status(&fx.base_url, &expired).await.unwrap(),
@@ -199,50 +207,39 @@ async fn deterministic_boundary_matrix() {
         "a token expired beyond the leeway must be rejected"
     );
 
-    // 5. Exactly at the leeway boundary (exp + 60 == now): the unit test
-    //    `jwt_exp_uses_the_same_leeway_as_jsonwebtoken` asserts this is
-    //    STILL accepted. Confirm the same boundary holds over real HTTP.
-    let at_boundary = sign(&fx.jwt_pkcs8, "ATM", did, session_id, n.saturating_sub(60));
+    // 5. Expired, but inside the leeway: still accepted over real HTTP. The
+    //    exact inclusive boundary (exp + 60 == now) is pinned by the unit test
+    //    `jwt_exp_uses_the_same_leeway_as_jsonwebtoken`; asserting it here
+    //    would flake whenever the wall clock ticks between minting and the
+    //    server's check, so this case keeps a few seconds of margin.
+    let within_leeway = sign(&fx.jwt_pkcs8, "ATM", did, session_id, n.saturating_sub(55));
     assert_eq!(
-        whoami_status(&fx.base_url, &at_boundary).await.unwrap(),
+        whoami_status(&fx.base_url, &within_leeway).await.unwrap(),
         200,
-        "exp + 60s == now must still be accepted (inclusive leeway boundary)"
+        "a token expired by less than the 60s leeway must still be accepted"
     );
 
-    // 6. One second past the boundary. MUST be 401.
-    let past_boundary = sign(&fx.jwt_pkcs8, "ATM", did, session_id, n.saturating_sub(61));
-    assert_eq!(
-        whoami_status(&fx.base_url, &past_boundary).await.unwrap(),
-        401,
-        "one second past the leeway boundary must be rejected"
-    );
-
-    // 7. Wrong audience. MUST be 401 (decode-time required-claim check).
+    // 6. Wrong audience. MUST be 401 (decode-time required-claim check).
     let wrong_aud = sign(&fx.jwt_pkcs8, "NOT-ATM", did, session_id, n + 900);
     assert_eq!(whoami_status(&fx.base_url, &wrong_aud).await.unwrap(), 401);
 
-    // 8. Unknown session_id (never stored) but otherwise validly signed —
-    //    see technique-05 report §4 for the 500-vs-401 observation this
-    //    confirms deterministically.
+    // 7. Unknown session_id (never stored) but otherwise validly signed.
     let unknown_session = sign(&fx.jwt_pkcs8, "ATM", did, "never-created-session", n + 900);
     let status = whoami_status(&fx.base_url, &unknown_session).await.unwrap();
     assert_ne!(
         status, 200,
         "an unknown session must never be treated as authenticated"
     );
-    // AMM-01 (technique-05 report §4) is now FIXED on current `main`: a
-    // validly-signed token naming a session the store doesn't have returns
-    // 401 (unauthorized), not the former 500 (internal error) — the
-    // `get_session` `Err` path was previously mapped to
-    // `AuthError::InternalServerError`. This harness detected the fix; the
-    // assertion is pinned to 401 so the mapping can't silently regress to 500.
+    // A validly-signed token naming a session the store doesn't have is
+    // 401 (unauthorized), not 500: the `get_session` `Err` path was once
+    // mapped to `AuthError::InternalServerError`. Pinned so it can't regress.
     assert_eq!(
         status, 401,
-        "an unknown-session JWT must map to 401 (AMM-01 fix) — a 500 here \
-         means the status-code classification regressed; see technique-05 report §4"
+        "an unknown-session JWT must map to 401 — a 500 here means the \
+         status-code classification regressed"
     );
 
-    // 9. sub/DID mismatch: valid session_id, but claims a different DID.
+    // 8. sub/DID mismatch: valid session_id, but claims a different DID.
     let other_did = "did:example:mallory";
     let mismatched = sign(&fx.jwt_pkcs8, "ATM", other_did, session_id, n + 900);
     assert_eq!(
@@ -251,33 +248,44 @@ async fn deterministic_boundary_matrix() {
         "JWT sub not matching the session's stored DID must be rejected"
     );
 
-    // 10. Blocked ACL with an otherwise perfectly valid token. MUST be 401.
+    // 9. Blocked ACL with an otherwise perfectly valid token. MUST be 401.
     let blocked_did = "did:example:blocked";
     let blocked_session = "fuzz-session-blocked";
     let mut blocked_acls = MediatorACLSet::from_string_ruleset("ALLOW_ALL").unwrap();
     blocked_acls.set_blocked(true);
-    fx.register_session(blocked_did, blocked_session, blocked_acls, AccountType::Standard)
-        .await;
+    fx.register_session(
+        blocked_did,
+        blocked_session,
+        blocked_acls,
+        AccountType::Standard,
+    )
+    .await;
     let blocked_tok = sign(&fx.jwt_pkcs8, "ATM", blocked_did, blocked_session, n + 900);
-    assert_eq!(whoami_status(&fx.base_url, &blocked_tok).await.unwrap(), 401);
+    assert_eq!(
+        whoami_status(&fx.base_url, &blocked_tok).await.unwrap(),
+        401
+    );
 
-    // 11. Oversized token (boundary-value class, Step 6). Must not hang or
+    // 10. Oversized token (boundary-value class). Must not hang or
     //     crash the server; any terminal HTTP status is acceptable, 200 is not.
     let big = oversized_token();
     let status = whoami_status(&fx.base_url, &big).await.unwrap();
-    assert_ne!(status, 200, "a 65KB garbage bearer token must never authenticate");
+    assert_ne!(
+        status, 200,
+        "a 65KB garbage bearer token must never authenticate"
+    );
 
-    // 12. Empty bearer token.
+    // 11. Empty bearer token.
     assert_ne!(whoami_status(&fx.base_url, "").await.unwrap(), 200);
 
-    // 13. Single dot (malformed structure, 2 empty segments).
+    // 12. Single dot (malformed structure, 2 empty segments).
     assert_ne!(whoami_status(&fx.base_url, ".").await.unwrap(), 200);
 
-    // 14. Only two segments (no signature at all).
+    // 13. Only two segments (no signature at all).
     let no_sig = valid.rsplit_once('.').map(|(h, _)| h).unwrap().to_string();
     assert_ne!(whoami_status(&fx.base_url, &no_sig).await.unwrap(), 200);
 
-    // 15. Bit-flip the last byte of a genuinely valid token's signature —
+    // 14. Bit-flip the last byte of a genuinely valid token's signature —
     //     tampered-signature class.
     let mut tampered = valid.clone().into_bytes();
     let last = tampered.len() - 1;

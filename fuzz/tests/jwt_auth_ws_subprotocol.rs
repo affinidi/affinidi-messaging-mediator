@@ -11,7 +11,7 @@
 //! subprotocol path browsers use, since `new WebSocket(...)` cannot set
 //! request headers). Both call the exact same `pub(crate) async fn
 //! authenticate_token` with the exact same `Session` result — per that
-//! function's own doc comment — so the 600 proptest cases already run
+//! function's own doc comment — so the proptest cases already run
 //! against the header path exercise the identical verification logic. This
 //! file is the complementary, deterministic proof that the SECOND entry
 //! point is wired to the same function and rejects the same hostile inputs,
@@ -35,7 +35,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[derive(Serialize)]

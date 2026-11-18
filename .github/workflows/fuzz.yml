@@ -11,6 +11,10 @@ name: Fuzz
 # A crash uploads the reproducer as an artifact. Reproduce locally with
 #   cargo +nightly fuzz run --fuzz-dir fuzz <target> <artifact>
 #
+# The `harnesses` job runs the loopback case-harnesses in fuzz/tests/
+# (proptest against a real in-process mediator: JWT auth, ACLs, forward
+# routing, trust-task freshness) on the pinned stable toolchain.
+#
 # Not part of ci.yml, so it never gates `nightly`.
 
 on:
@@ -28,6 +32,21 @@ permissions:
   contents: read
 
 jobs:
+  harnesses:
+    name: loopback harnesses
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: ./.github/actions/native-deps
+      - name: cargo test (fuzz/tests)
+        run: cargo test --manifest-path fuzz/Cargo.toml --tests
+
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest

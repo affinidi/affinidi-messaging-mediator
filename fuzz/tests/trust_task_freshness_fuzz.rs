@@ -4,11 +4,9 @@
 //! `TrustTask::{validate_freshness,validate_basic}`,
 //! `DEFAULT_MAX_AGE`/`DEFAULT_EXPIRY_HORIZON`/`DEFAULT_SKEW`).
 //!
-//! Recon tag: T9 (P0) — new in this diff (commit `521618c`, "replay record to
-//! record_expiry"), on the exact attack-surface shape that produced the
-//! predecessor repo's WebSocket session-expiry integer-underflow bug: an
-//! inbound document's attacker-controlled `issuedAt`/`expiresAt` timestamps
-//! flow into `DateTime<Utc>` arithmetic. Reachable, authenticated-remote, via
+//! An inbound document's attacker-controlled `issuedAt`/`expiresAt`
+//! timestamps flow into `DateTime<Utc>` arithmetic — the same shape as an
+//! earlier WebSocket session-expiry integer-underflow bug. Reachable, authenticated-remote, via
 //! `crate::messages::protocols::trust_tasks::process` -> `::consume` ->
 //! `trust_task_verify::accept` -> `::check` (freshness) -> `::claim`
 //! (`retention_end`) for any served task other than `ping`; `validate_basic`
@@ -16,12 +14,10 @@
 //! task, inside each handler after `accept()` has already returned `Ok`.
 //!
 //! `freshness_for`/`retention_end`/`claim`/`check`/`accept` in the mediator
-//! crate are `pub(crate)` or module-private — this engagement's rules forbid
-//! a `pub(crate)` reach-around, so they are never called directly. Instead
-//! this harness calls the `pub` `trust-tasks-rs` functions they wrap, with
-//! the IDENTICAL policy construction `freshness_for` uses (confirmed by
-//! reading `trust_task_verify.rs` lines 249-255 and 308-315 at the pinned
-//! HEAD, `137e192f789c21789b4a24ae25c64a7ba4722976`):
+//! crate are `pub(crate)` or module-private, so they are never called
+//! directly. Instead this harness calls the `pub` `trust-tasks-rs` functions
+//! they wrap, with the same policy construction `freshness_for` uses in
+//! `trust_task_verify.rs` (keep the two in step if that file changes):
 //!
 //! ```ignore
 //! fn freshness_for(policy: SpecPolicy) -> FreshnessPolicy {
@@ -46,15 +42,13 @@
 //!   Tier 5 — differential: `record_expiry`'s three documented branches
 //!     (expiry-within-horizon, expiry-clamped-to-horizon,
 //!     no-expiry/max-age fallback) reproduced independently with checked
-//!     arithmetic and compared against the live call, including where the
-//!     live call overflows and the checked reference does not — which is
-//!     itself how Finding T9-01 (below) was characterized.
+//!     arithmetic and compared against the live call. Outside the guarded
+//!     order the live call can overflow near `DateTime::<Utc>::MAX_UTC`; that
+//!     is tolerated only where the checked reference also has no
+//!     representable answer.
 //!
-//! A second, clearly-separated family of tests (`shield_probe_*`) calls the
-//! same `pub` functions OUTSIDE the realistic guard order on purpose, to
-//! characterize what the pinned dependency (`trust-tasks-rs = "=0.37.0"`)
-//! does in isolation — this is Step 8's "prove reachability or demote to
-//! comment" exercise, not a claim that HEAD is vulnerable end-to-end.
+//! Part 3 pins the two structural facts that keep `retention_end`'s
+//! unchecked fallback formula out of reach in production.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use proptest::prelude::*;
@@ -100,7 +94,7 @@ fn default_policy() -> FreshnessPolicy {
     FreshnessPolicy::default()
 }
 
-/// Boundary-value-injected candidate timestamps (skill Step 6, adapted to
+/// Boundary-value-injected candidate timestamps (adapted to
 /// `DateTime<Utc>`): the representable-range extremes and points near them,
 /// the Unix epoch, and points near "now".
 fn boundary_timestamps(now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
@@ -159,11 +153,21 @@ fn realistic_boundary_matrix_through_the_guarded_order_never_panics() {
     let mut accepted = 0usize;
     let mut panics = Vec::new();
     for (name, policy) in &policies {
-        for issued in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
+        for issued in stamps
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             if !realistically_reachable(issued, now) {
                 continue; // validate_freshness would have already refused this upstream of claim().
             }
-            for expires in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
+            for expires in stamps
+                .iter()
+                .copied()
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
                 ran += 1;
                 let d = doc(issued, expires);
                 let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -181,7 +185,10 @@ fn realistic_boundary_matrix_through_the_guarded_order_never_panics() {
                 if let Ok(()) = verdict {
                     accepted += 1;
                     if let (Some(i), Some(e)) = (issued, expires) {
-                        assert!(e > i, "accepted expiresAt <= issuedAt: issued={i} expires={e}");
+                        assert!(
+                            e > i,
+                            "accepted expiresAt <= issuedAt: issued={i} expires={e}"
+                        );
                     }
                     if let Some(i) = issued {
                         assert!(
@@ -331,19 +338,32 @@ fn reference_record_expiry(
         });
     }
     let max_age = policy.max_age?;
-    issued_at.unwrap_or(now).checked_add_signed(max_age)?.checked_add_signed(policy.skew)
+    issued_at
+        .unwrap_or(now)
+        .checked_add_signed(max_age)?
+        .checked_add_signed(policy.skew)
 }
 
 #[test]
-fn record_expiry_matches_its_documented_formula_or_the_live_call_overflows() {
+fn record_expiry_matches_its_documented_formula() {
     let now = Utc::now();
     let stamps = boundary_timestamps(now);
     let mut matched = 0usize;
     let mut unexpected_divergence = Vec::new();
     let mut live_panics = Vec::new();
     for policy in [default_policy(), consequential()] {
-        for issued in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
-            for expires in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
+        for issued in stamps
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            for expires in stamps
+                .iter()
+                .copied()
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
                 if let (Some(i), Some(e)) = (issued, expires) {
                     if e <= i {
                         continue; // not a validly-ordered pair; not what record_expiry documents.
@@ -366,14 +386,21 @@ fn record_expiry_matches_its_documented_formula_or_the_live_call_overflows() {
                         }
                     }
                     Err(_) => {
-                        // Finding T9-01: the live, unchecked-arithmetic
-                        // implementation panics on genuine `DateTime<Utc>`
-                        // overflow instead of returning `None` the way its
-                        // `Option<DateTime<Utc>>` signature otherwise uses
-                        // `None` for ("no policy bound configured") — here
-                        // it means "no representable answer", which the
-                        // all-`checked_*` reference confirms by itself
-                        // computing `None` for the same input.
+                        // The live implementation uses unchecked arithmetic
+                        // and panics on genuine `DateTime<Utc>` overflow.
+                        // Acceptable only where there is no representable
+                        // answer, i.e. the checked reference is `None` too
+                        // (asserted below). Unreachable in production: the
+                        // guard-first order (Part 1) never gets this far
+                        // with such a timestamp.
+                        if expected.is_some() {
+                            unexpected_divergence.push(format!(
+                                "record_expiry panicked where a representable answer exists: \
+                                 issued={issued:?} expires={expires:?} skew={:?} expected={expected:?}",
+                                policy.skew
+                            ));
+                            continue;
+                        }
                         live_panics.push(format!(
                             "issued={issued:?} expires={expires:?} skew={:?} reference_result={expected:?}",
                             policy.skew
@@ -384,79 +411,70 @@ fn record_expiry_matches_its_documented_formula_or_the_live_call_overflows() {
         }
     }
     eprintln!(
-        "record_expiry differential: {matched} matched exactly, {} divergent-but-non-panicking, \
-         {} live-overflow panics (Finding T9-01)",
+        "record_expiry differential: {matched} matched exactly, {} divergent, \
+         {} overflow panics with no representable answer",
         unexpected_divergence.len(),
         live_panics.len()
     );
     assert!(
         unexpected_divergence.is_empty(),
-        "record_expiry diverged from its documented formula without panicking:\n{}",
+        "record_expiry diverged from its documented formula:\n{}",
         unexpected_divergence.join("\n")
     );
+}
+
+// ============================================================================
+// Part 3 — why `retention_end`'s fallback formula
+// (`doc.issued_at.unwrap_or(now) + DEFAULT_MAX_AGE + freshness.skew`, unchecked
+// arithmetic) cannot overflow in production.
+// ============================================================================
+
+/// First reason: the guard that runs first in production (`now` is the real
+/// wall clock, nowhere near `MAX_UTC`) rejects a document stamped close
+/// enough to `DateTime::<Utc>::MAX_UTC` to overflow the fallback formula, as
+/// future-dated, before any retention arithmetic runs.
+#[test]
+fn freshness_guard_rejects_an_issued_at_that_would_overflow_retention() {
+    let near_max = DateTime::<Utc>::MAX_UTC - TimeDelta::seconds(30);
     assert!(
-        !live_panics.is_empty(),
-        "expected at least the known near-MAX_UTC overflow case to reproduce \
-         (Finding T9-01) — if this now passes empty, the dependency may have \
-         fixed it; update the technique report.\nAll live_panics: {live_panics:?}"
+        near_max
+            .checked_add_signed(DEFAULT_MAX_AGE + DEFAULT_SKEW)
+            .is_none(),
+        "test premise: this issuedAt overflows the fallback formula"
     );
-    for p in &live_panics {
-        eprintln!("  T9-01 overflow case: {p}");
+    let now = Utc::now();
+    for policy in [default_policy(), consequential()] {
+        let d = doc(Some(near_max), None);
+        assert!(
+            d.validate_freshness(now, &policy).is_err(),
+            "a document stamped near DateTime::<Utc>::MAX_UTC must be rejected as \
+             future-dated before any retention arithmetic runs"
+        );
     }
 }
 
-// ============================================================================
-// Part 3 — shield probes (Step 8): characterize what the pinned dependency
-// does OUTSIDE the realistic guard order. Not a claim HEAD is vulnerable.
-// ============================================================================
-
-/// The `retention_end` fallback formula in `trust_task_verify.rs` line 313 —
-/// `doc.issued_at.unwrap_or(now) + DEFAULT_MAX_AGE + freshness.skew` —
-/// reproduced VERBATIM with the same public constants, fed an UNVALIDATED,
-/// attacker-shaped `issued_at` (bypassing `validate_freshness` on purpose).
-/// In the real pipeline this fallback is additionally dead code for
-/// `consequential()` specifically (see
-/// `consequential_record_expiry_never_returns_none`, below) — two
-/// independent reasons it cannot fire on HEAD today, both pinned here as
-/// executable facts.
-#[test]
-fn shield_probe_retention_end_fallback_overflows_without_the_upfront_guard() {
-    let skew = DEFAULT_SKEW; // == FreshnessPolicy::{default,consequential}().skew
-    let near_max_but_overflows = DateTime::<Utc>::MAX_UTC - TimeDelta::seconds(30);
-    let result = std::panic::catch_unwind(|| near_max_but_overflows + DEFAULT_MAX_AGE + skew);
-    assert!(
-        result.is_err(),
-        "expected the unguarded fallback formula to panic on an issuedAt within \
-         {:?} of DateTime::<Utc>::MAX_UTC — got {result:?} instead",
-        DEFAULT_MAX_AGE + skew
-    );
-
-    // And confirm the guard that actually runs first in production (`now` is
-    // the real wall clock, nowhere near MAX_UTC) rejects this same document
-    // as future-dated before any retention arithmetic runs — i.e. the shield
-    // is a structural fact of the call order, not a timing coincidence.
-    let now = Utc::now();
-    let d = doc(Some(near_max_but_overflows), None);
-    let verdict = d.validate_freshness(now, &consequential());
-    assert!(
-        verdict.is_err(),
-        "a document stamped near DateTime::<Utc>::MAX_UTC must be rejected as \
-         future-dated by the real wall clock before any retention arithmetic runs"
-    );
-}
-
-/// Pins the SECOND, independent reason the fallback formula above is dead
-/// code on HEAD: `record_expiry` never returns `None` for `consequential()`,
+/// Second, independent reason: the fallback formula is dead code for a
+/// recorded (consequential) task: `record_expiry` never returns `None` for `consequential()`,
 /// because `consequential()` always sets `max_age`. Exhaustive over the
 /// boundary matrix, standing in for the infinite-domain claim ("for every
-/// `doc`") the way Wave 2's ACL exhaustiveness argument did.
+/// `doc`").
 #[test]
 fn consequential_record_expiry_never_returns_none() {
     let now = Utc::now();
     let stamps = boundary_timestamps(now);
     let policy = consequential();
-    for issued in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
-        for expires in stamps.iter().copied().map(Some).chain(std::iter::once(None)) {
+    for issued in stamps
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        for expires in stamps
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             let d = doc(issued, expires);
             if let Ok(end) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 policy.record_expiry(&d, now)
@@ -468,53 +486,9 @@ fn consequential_record_expiry_never_returns_none() {
                      code just broke (issued={issued:?}, expires={expires:?})"
                 );
             }
-            // A panic here is the known T9-01 overflow, already characterized
-            // above — not re-asserted against in this invariant-only test.
+            // A panic here is the out-of-order overflow covered by
+            // `record_expiry_matches_its_documented_formula`, not re-asserted
+            // in this invariant-only test.
         }
     }
-}
-
-/// Minimal, literal reproducer for the behavioural finding T9-02: a document
-/// whose own `expiresAt` already lies in the past relative to the real clock
-/// is nonetheless accepted as "fresh" by `validate_freshness` under
-/// `consequential()` — because the only staleness check run when `expiresAt`
-/// is present compares it against the `issuedAt + expiry_horizon` HORIZON,
-/// never against `now` — so `trust_task_verify::claim()` burns the
-/// duplicate-execution id for a document that `validate_basic` (run later,
-/// per-task, after `accept()` has already returned `Ok`) will then refuse as
-/// `Expired`. No panic; a behavioural/ordering quirk, not a bypass — see the
-/// technique report's Finding T9-02 for full analysis and severity.
-#[test]
-fn t9_02_minimal_repro_already_expired_document_passes_validate_freshness() {
-    let now = Utc::now();
-    let issued_at = now - TimeDelta::minutes(20);
-    let expires_at = now - TimeDelta::minutes(10); // already expired by 10 minutes
-    let d = doc(Some(issued_at), Some(expires_at));
-
-    // 1. accept()'s freshness check (the new diff) says this document is
-    //    fine — not stale, not malformed.
-    assert!(
-        d.validate_freshness(now, &consequential()).is_ok(),
-        "expected validate_freshness to accept an issuedAt/expiresAt pair whose \
-         expiresAt already passed, as long as it is within the horizon"
-    );
-
-    // 2. claim()/record_expiry would bound the replay-guard record to
-    //    exactly that already-past expiresAt.
-    let retain_until = consequential().record_expiry(&d, now).expect("Some for consequential()");
-    assert_eq!(retain_until, expires_at);
-    assert!(
-        retain_until < now,
-        "the duplicate-execution record is bounded to an instant already in \
-         the past at the moment it is created: retain_until={retain_until} now={now}"
-    );
-
-    // 3. validate_basic (pre-existing, unrelated to this diff; runs LATER,
-    //    per-task, in trust_tasks.rs — not reachable from this crate without
-    //    a `pub(crate)` reach-around) is what would actually catch this as
-    //    Expired. We cannot call it from here, but its documented rule
-    //    (`expires_at <= now` => Expired) is exactly `expires_at <= now`,
-    //    which this constructed document satisfies by 10 minutes — i.e. the
-    //    task WILL be refused, just one step later than the id was burned.
-    assert!(expires_at <= now, "document is expired per validate_basic's own rule");
 }

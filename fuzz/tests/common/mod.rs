@@ -60,7 +60,13 @@ impl Fixture {
     /// reach-around of the function under test, which still runs the real
     /// `jsonwebtoken::decode` + expiry + DID-match + ACL checks on every
     /// request.
-    pub async fn register_session(&self, did: &str, session_id: &str, acls: MediatorACLSet, account_type: AccountType) {
+    pub async fn register_session(
+        &self,
+        did: &str,
+        session_id: &str,
+        acls: MediatorACLSet,
+        account_type: AccountType,
+    ) {
         let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
         self.store
             .account_add(&did_hash, &acls, None)
@@ -78,7 +84,10 @@ impl Fixture {
             expires_at: 0,
             refresh_token_hash: None,
         };
-        self.store.create_session(&session).await.expect("create_session");
+        self.store
+            .create_session(&session)
+            .await
+            .expect("create_session");
     }
 
     pub fn shutdown(&self) {

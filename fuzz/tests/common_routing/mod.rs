@@ -1,7 +1,8 @@
 //! Shared fixture for `routing_endpoint_classify_fuzz.rs`.
 //!
 //! Spawns a real mediator via `affinidi-messaging-test-mediator`'s `pub`
-//! `TestMediator`/`TestEnvironment` fixture (forwarding enabled, real
+//! `TestMediator`/`TestEnvironment` fixture (external forwarding enabled so
+//! next hops are classified, but the forwarding processor off; real
 //! `did:peer` DIDs, no network — `did:peer` resolves locally), with one
 //! pre-registered authenticated sender wired to the SDK so the test can
 //! drive the real `routing/2.0/forward` HTTP flow end-to-end.
@@ -29,8 +30,14 @@ impl RoutingFixture {
 }
 
 pub async fn spawn() -> RoutingFixture {
+    // External forwarding on: `classify_next_hop` classifies a next hop
+    // only when it is set, and a Remote verdict lands in FORWARD_Q, which is
+    // what the harness observes. The forwarding processor stays off (the
+    // mediator starts it only when both flags are set), so nothing drains
+    // FORWARD_Q under the harness and nothing relays to the fuzzed endpoints:
+    // the test makes no outbound connections.
     let mediator = TestMediator::builder()
-        .enable_forwarding(true)
+        .enable_forwarding(false)
         .enable_external_forwarding(true)
         .global_acl_default(acl::allow_all())
         .spawn()

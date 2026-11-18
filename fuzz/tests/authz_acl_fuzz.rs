@@ -33,8 +33,8 @@
 
 mod common;
 
-use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
 use affinidi_messaging_mediator_common::types::accounts::AccountType;
+use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use proptest::prelude::*;
 use serde::Serialize;
@@ -42,7 +42,10 @@ use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[derive(Serialize)]
