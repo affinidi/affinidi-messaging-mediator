@@ -107,3 +107,27 @@ path = "fuzz_targets/pubsub_record_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+# ── Loopback case-harnesses (fuzz/tests/) — PR: fuzz-loopback-harnesses ──
+# proptest + #[tokio::test] that drive the real axum router via the crate's
+# own MediatorBuilder on a loopback socket (see fuzz/tests/common/mod.rs).
+# Versions track current main; test-mediator is the workspace fixture crate.
+[dev-dependencies]
+affinidi-messaging-test-mediator = { path = "../crates/affinidi-messaging-test-mediator" }
+affinidi-secrets-resolver = "0.5"
+affinidi-tdk = { version = "0.45", default-features = false, features = ["did-peer"] }
+affinidi-messaging-sdk = "0.47"
+affinidi-messaging-didcomm = "0.15"
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+ring = { version = "0.17", features = ["std"] }
+trust-tasks-rs = { version = "0.39", default-features = false }
+chrono = { version = "0.4", features = ["clock"] }
+proptest = "1"
+tokio-util = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+http = "1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
