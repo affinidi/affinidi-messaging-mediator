@@ -24,6 +24,34 @@ affinidi-messaging-didcomm = "0.15"
 # Lean (types-only) build: the inbound protocol classifier.
 affinidi-messaging-mediator-common = { path = "../crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common", default-features = false }
 
+# ── Deeper, mediator-specific targets (Security Labs engagement — SEC-4245). ──
+# These reach past the edge parsers above into the mediator's own envelope
+# classifier, the operator config parser, and the Redis wire types behind past
+# findings (forward-queue / pub-sub). serde_json + arbitrary drive the
+# encoder-side round-trip oracles; sha256 backs MetaEnvelope's hash invariant.
+serde_json = "1"
+sha256 = "1"
+arbitrary = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+# A local, no-network DID cache for MetaEnvelope::new's (unused) resolver arg.
+affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["did_example"] }
+# The mediator's own envelope classifier (MetaEnvelope::new): full inbound
+# DIDComm JWE/JWS/plaintext classification, recipient-kid split and protected-
+# header base64url decode, before any auth or decryption. Pulls the mediator
+# crate, so this is heavier than the lean types-only build above — scoped to
+# default-features = false + the two features the classifier actually needs.
+affinidi-messaging-mediator = { path = "../crates/affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
+# Operator TOML/env parsing (env::parse_config): a malformed --config is a
+# startup DoS an operator can trigger; two consumers depend on this pub fn.
+affinidi-messaging-mediator-config = { path = "../crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config" }
+
+# overflow-checks turns a silent integer wrap (the forward-queue counters are
+# attacker-influenced u128/u64/u32) into a catchable panic the oracle sees;
+# debug = 1 keeps backtraces useful. Applies to every target in this crate.
+[profile.release]
+debug = 1
+overflow-checks = true
+
 [[bin]]
 name = "tsp_meta_envelope"
 path = "fuzz_targets/tsp_meta_envelope.rs"
@@ -48,6 +76,34 @@ bench = false
 [[bin]]
 name = "envelope_detect"
 path = "fuzz_targets/envelope_detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_envelope_new"
+path = "fuzz_targets/meta_envelope_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forward_queue_roundtrip"
+path = "fuzz_targets/forward_queue_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pubsub_record_roundtrip"
+path = "fuzz_targets/pubsub_record_roundtrip.rs"
 test = false
 doc = false
 bench = false
