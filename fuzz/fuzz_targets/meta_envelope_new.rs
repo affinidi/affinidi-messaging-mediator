@@ -35,11 +35,10 @@ fn resolver() -> &'static DIDCacheClient {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Lossy UTF-8: the real entry point is a WebSocket Text frame / HTTP body
-    // read as `&str`, but this still exercises the invalid-UTF-8 input class
-    // (axum/tungstenite reject non-UTF-8 Text frames upstream; this keeps
-    // libFuzzer's byte corpus directly usable without a String-only Arbitrary
-    // wrapper narrowing the search space away from boundary byte sequences).
+    // The real entry points (a WebSocket Text frame, an HTTP body read as
+    // `&str`) only ever hand `MetaEnvelope::new` valid UTF-8 — axum and
+    // tungstenite reject anything else upstream — so non-UTF-8 inputs are
+    // skipped rather than lossily converted.
     let Ok(s) = std::str::from_utf8(data) else {
         return;
     };

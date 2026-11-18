@@ -7,7 +7,7 @@
 //! matches on `serde_json::from_str::<PubSubRecord>(..)` instead of
 //! unwrapping (see recon report), so this harness is the regression tripwire
 //! for that fix plus a round-trip check on the two `#[serde(default)]`
-//! fields (`verbatim`, and the optional tag field) that make this type
+//! fields (`verbatim` and `stored`) that make this type
 //! deliberately backward-compatible with records from an older mediator
 //! version sharing the same Redis.
 //! Technique: cargo-fuzz + libFuzzer. Tier 1 (no-panic on raw JSON) + Tier 3

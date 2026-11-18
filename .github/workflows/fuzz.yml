@@ -1,10 +1,12 @@
 name: Fuzz
 
-# Runs the cargo-fuzz targets in fuzz/ (the TSP meta-envelope, DIDComm message
-# and JWS parsers, and the inbound protocol classifier: what the mediator runs
-# first on bytes from the network) for a few minutes each. Weekly and on
-# demand: a time-boxed run finds shallow crashes, and these parsers change
-# rarely here (most live in affinidi-tdk-rs).
+# Runs the cargo-fuzz targets in fuzz/ for a few minutes each: the TSP
+# meta-envelope, DIDComm message and JWS parsers and the inbound protocol
+# classifier (what the mediator runs first on bytes from the network), the
+# mediator's own MetaEnvelope classifier and config parser, and round-trip
+# checks on the Redis forward-queue and pub/sub wire types. fuzz/HARNESS_MAP.md
+# maps each target to the code it reaches. Weekly and on demand: a time-boxed
+# run finds shallow crashes, and these surfaces change rarely.
 #
 # A crash uploads the reproducer as an artifact. Reproduce locally with
 #   cargo +nightly fuzz run --fuzz-dir fuzz <target> <artifact>
