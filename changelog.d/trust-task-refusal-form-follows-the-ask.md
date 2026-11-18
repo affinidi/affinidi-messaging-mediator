@@ -10,6 +10,10 @@
   document: unknown field 'code'`.
 - `affinidi-messaging-sdk` asks on every Trust Task from 0.46.2, so a client
   on it sees no change.
+- A `messaging/mux/ack` that does not ask, sent on a raw-TSP socket that is
+  not a mux connection, closes the socket with 1008 again, as a refused frame
+  on such a socket does. One that asks still gets the sealed
+  `trust-task-error` (`messaging/mux:notMuxConnection`).
 - The codes do not change: both forms carry the Trust Task code (`e.p.`
   before it in a problem report). A client that matched the mediator's old
   codes (`account.not_found`, `authorization.*`) must still move to the new

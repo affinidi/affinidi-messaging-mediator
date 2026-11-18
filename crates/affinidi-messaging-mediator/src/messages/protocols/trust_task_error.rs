@@ -567,7 +567,9 @@ mod tests {
             "type": "https://trusttasks.org/spec/messaging/mux/revoke-all/0.1",
             "payload": {},
         });
-        let asked = |doc: &Value| Refusing::of(&serde_json::from_value(doc.clone()).unwrap()).asked;
+        let asked = |doc: &Value| {
+            Refusing::of(&serde_json::from_value(doc.clone()).expect("a Trust Task document")).asked
+        };
         assert!(!asked(&doc));
         doc[ERROR_FORMAT_MEMBER] = json!(ERROR_FORMAT_DOCUMENT);
         assert!(asked(&doc));

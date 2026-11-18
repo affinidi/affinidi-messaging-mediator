@@ -1358,58 +1358,81 @@ async fn acks_on_the_socket_follow_each_members_delete_scope() {
     env.shutdown().await.expect("shutdown");
 }
 
-/// Not on a mux connection, the ack is refused (`notMuxConnection`). A plain
-/// `tsp-ack` socket reports a refused frame by closing, as it always has; only
-/// `tsp-mux` reports refusals in band.
+/// Not on a mux connection, the ack is refused (`notMuxConnection`). One that
+/// asks gets a `trust-task-error` sealed back on the connection (an ack's
+/// answer is pushed, not stored). One that does not is refused as a plain
+/// `tsp-ack` socket reports any refused frame, by closing.
 #[tokio::test]
 async fn an_ack_off_a_mux_connection_is_refused() {
+    use affinidi_messaging_sdk::protocols::trust_tasks::{
+        ERROR_FORMAT_DOCUMENT, ERROR_FORMAT_MEMBER,
+    };
+
     init_tracing();
     let env = mux_env().await;
     let principal = env.add_user("device").await.unwrap();
     relate_to_mediator(&env, &principal).await;
-    let (mut ws, selected, _) = connect(&env, &principal, &["tsp", "tsp-ack"]).await;
-    assert_eq!(selected.as_deref(), Some("tsp-ack"));
-    let doc = json!({
-        "id": format!("urn:uuid:{}", Uuid::new_v4()),
-        "type": ACK_TYPE,
-        "issuer": principal.did,
-        "recipient": env.mediator.did(),
-        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "payload": { "messageIds": [sha256::digest("x")] },
-    });
-    let frame = env
-        .atm
-        .tsp()
-        .pack(
-            &principal.profile,
-            env.mediator.did(),
-            &serde_json::to_vec(&doc).unwrap(),
-        )
-        .await
-        .expect("pack the ack");
-    ws.send(Message::Binary(frame.into())).await.expect("write");
-    // Refused with a `trust-task-error` under the code the spec declares,
-    // sealed back on the connection (an ack's answer is pushed, not stored).
-    let sealed = next_binary(&mut ws).await;
-    let (payload, _) = env
-        .atm
-        .tsp()
-        .unpack(&principal.profile, &{
-            use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-            BASE64_URL_SAFE_NO_PAD.encode(&sealed)
-        })
-        .await
-        .expect("unpack the refusal");
-    let refusal: serde_json::Value = serde_json::from_slice(&payload).expect("a document");
-    assert_eq!(
-        refusal["type"], "https://trusttasks.org/spec/trust-task-error/0.6",
-        "{refusal:#}"
-    );
-    assert_eq!(refusal["threadId"], doc["id"], "{refusal:#}");
-    assert_eq!(
-        refusal["payload"]["code"], "messaging/mux:notMuxConnection",
-        "{refusal:#}"
-    );
+    for ask in [false, true] {
+        let (mut ws, selected, _) = connect(&env, &principal, &["tsp", "tsp-ack"]).await;
+        assert_eq!(selected.as_deref(), Some("tsp-ack"));
+        let mut doc = json!({
+            "id": format!("urn:uuid:{}", Uuid::new_v4()),
+            "type": ACK_TYPE,
+            "issuer": principal.did,
+            "recipient": env.mediator.did(),
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": { "messageIds": [sha256::digest("x")] },
+        });
+        if ask {
+            doc[ERROR_FORMAT_MEMBER] = json!(ERROR_FORMAT_DOCUMENT);
+        }
+        let frame = env
+            .atm
+            .tsp()
+            .pack(
+                &principal.profile,
+                env.mediator.did(),
+                &serde_json::to_vec(&doc).unwrap(),
+            )
+            .await
+            .expect("pack the ack");
+        ws.send(Message::Binary(frame.into())).await.expect("write");
+        if !ask {
+            let closed = loop {
+                match timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .expect("a frame within 5s")
+                    .expect("socket open")
+                    .expect("frame")
+                {
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    other => break other,
+                }
+            };
+            assert!(matches!(closed, Message::Close(_)), "{closed:?}");
+            continue;
+        }
+        let sealed = next_binary(&mut ws).await;
+        let (payload, _) = env
+            .atm
+            .tsp()
+            .unpack(&principal.profile, &{
+                use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+                BASE64_URL_SAFE_NO_PAD.encode(&sealed)
+            })
+            .await
+            .expect("unpack the refusal");
+        let refusal: serde_json::Value = serde_json::from_slice(&payload).expect("a document");
+        assert_eq!(
+            refusal["type"], "https://trusttasks.org/spec/trust-task-error/0.6",
+            "{refusal:#}"
+        );
+        assert_eq!(refusal["threadId"], doc["id"], "{refusal:#}");
+        assert_eq!(
+            refusal["payload"]["code"], "messaging/mux:notMuxConnection",
+            "{refusal:#}"
+        );
+    }
     env.shutdown().await.expect("shutdown");
 }
 
