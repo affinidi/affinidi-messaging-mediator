@@ -324,6 +324,47 @@ pub struct SecurityConfig {
     /// time at or after the deadline. A transition setting: it is logged at
     /// boot and on every login that uses it.
     pub tsp_auth_accept_unbound_until: Option<u64>,
+    /// Whether the mediator keeps only DID hashes, or also the DID behind
+    /// each hash. See [`DidPrivacyMode`].
+    pub did_privacy_mode: DidPrivacyMode,
+}
+
+/// Whether the mediator knows the DIDs behind its account and access-list
+/// hashes.
+///
+/// `Strict` (the default, and the behaviour before this setting existed)
+/// keeps only the SHA-256 hash of each DID; nothing stores a DID.
+///
+/// `Permissive` also keeps a `hash → DID` record: the DID of every account
+/// that authenticates, and any DID a caller names in a Trust Task's
+/// `ext["com.affinidi.messaging"].dids` whose hash the task touched. Responses
+/// then carry `ext["com.affinidi.messaging"].dids`, a `hash → DID` map for the
+/// hashes they name. Every existing field keeps the hash, so a client that
+/// ignores `ext` sees no change. See `crate::did_map`.
+///
+/// Read at each use, so a mediator moved between modes across a restart
+/// starts or stops recording and returning DIDs; records kept while
+/// permissive stay in the store (and are removed with their account).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DidPrivacyMode {
+    #[default]
+    Strict,
+    Permissive,
+}
+
+impl std::str::FromStr for DidPrivacyMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "strict" => Ok(Self::Strict),
+            "permissive" => Ok(Self::Permissive),
+            other => Err(format!(
+                "security.did_privacy_mode must be \"strict\" or \"permissive\", not {other:?}"
+            )),
+        }
+    }
 }
 
 /// What the mediator does with a Trust Task that fails its acceptance checks —
@@ -408,6 +449,7 @@ impl Debug for SecurityConfig {
             .field("force_session_did_match", &self.force_session_did_match)
             .field("block_remote_admin_msgs", &self.block_remote_admin_msgs)
             .field("trust_task_verification", &self.trust_task_verification)
+            .field("did_privacy_mode", &self.did_privacy_mode)
             .field(
                 "tsp_auth_accept_unbound_until",
                 &self.tsp_auth_accept_unbound_until,
@@ -507,6 +549,7 @@ impl SecurityConfig {
             trust_task_verification: TrustTaskVerification::Warn,
             enable_inter_mediator_relay: defaults::ENABLE_INTER_MEDIATOR_RELAY,
             tsp_auth_accept_unbound_until: None,
+            did_privacy_mode: DidPrivacyMode::Strict,
         }
     }
 }
@@ -529,6 +572,7 @@ pub(crate) struct SecurityValues {
     pub enable_inter_mediator_relay: bool,
     pub trust_task_verification: TrustTaskVerification,
     pub tsp_auth_accept_unbound_until: Option<u64>,
+    pub did_privacy_mode: DidPrivacyMode,
 }
 
 /// The legal `security.mediator_acl_mode` values.
@@ -789,6 +833,8 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             // quietly become "no deadline" or "accept for ever".
             tsp_auth_accept_unbound_until: parse_accept_until(&self.tsp_auth_accept_unbound_until)
                 .map_err(msg_err)?,
+            // Also a hard error: a typo must not quietly pick a mode.
+            did_privacy_mode: self.did_privacy_mode.parse().map_err(msg_err)?,
         })
     }
 
@@ -833,6 +879,7 @@ impl SecurityConfigRawExt for SecurityConfigRaw {
             enable_inter_mediator_relay: values.enable_inter_mediator_relay,
             trust_task_verification: values.trust_task_verification,
             tsp_auth_accept_unbound_until: values.tsp_auth_accept_unbound_until,
+            did_privacy_mode: values.did_privacy_mode,
             ..SecurityConfig::default(secrets_resolver)
         };
 
@@ -1278,6 +1325,7 @@ mod tests {
             enable_inter_mediator_relay: String::new(),
             trust_task_verification: String::new(),
             tsp_auth_accept_unbound_until: String::new(),
+            did_privacy_mode: String::new(),
         }
     }
 

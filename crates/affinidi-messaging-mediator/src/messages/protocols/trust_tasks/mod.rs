@@ -343,6 +343,8 @@ async fn consume_task(
         Some(newer) => newer.to_v0_1_request(doc),
         None => doc,
     };
+    // Permissive DID privacy mode only: DIDs the caller offers in `ext`.
+    let offered_dids = crate::did_map::offered(state, &doc.payload);
 
     let response_value: Value = match task {
         ServedTask::Ping => {
@@ -609,6 +611,9 @@ async fn consume_task(
             .map_err(serialize_err_msg)?,
         None => response_value,
     };
+
+    // Permissive DID privacy mode only: `hash → DID` in the response's `ext`.
+    let response_value = crate::did_map::annotate(state, offered_dids, response_value).await;
 
     // Every success response is signed as the mediator (see `trust_task_sign`).
     let response_value = trust_task_sign::sign_response(response_value, state).await?;
