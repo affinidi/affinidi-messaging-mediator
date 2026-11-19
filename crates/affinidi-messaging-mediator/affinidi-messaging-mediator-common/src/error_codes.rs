@@ -26,8 +26,9 @@
 //!
 //! Trust Task refusals carry a Trust Task error code on the wire (the
 //! framework's standard codes, SPEC §8.3, or a `<task>:<code>` a task's
-//! specification declares), in a `trust-task-error` document or, where no
-//! document can be sent, as the problem code `e.p.<code>`. The number is the
+//! specification declares): in a `trust-task-error` document to a request
+//! that asks for one (`x-errorFormat`), and otherwise, or where no document
+//! can be sent, as the problem code `e.p.<code>`. The number is the
 //! mediator's own, for logs and REST error bodies.
 
 // ── Infrastructure and storage ────────────────────────────────────────────

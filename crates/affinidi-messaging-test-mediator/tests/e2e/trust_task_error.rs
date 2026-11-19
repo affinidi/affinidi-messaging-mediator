@@ -1,7 +1,7 @@
-//! A refused Trust Task is answered with a `trust-task-error` document
-//! (Trust Tasks SPEC §8) instead of a DIDComm problem report, over DIDComm
-//! and over TSP, whether or not it asks (`"x-errorFormat":
-//! "trust-task-error"`). The code is always a Trust Task code: a standard
+//! A refused Trust Task that asks (`"x-errorFormat": "trust-task-error"`) is
+//! answered with a `trust-task-error` document (Trust Tasks SPEC §8), over
+//! DIDComm and over TSP; one that does not ask, with a DIDComm problem
+//! report. The code is always a Trust Task code: a standard
 //! one or one the task's specification declares.
 //!
 //! The documents are built and signed by hand, so each test controls whether
@@ -14,7 +14,9 @@ use affinidi_messaging_mediator_common::types::accounts::AccountType;
 use affinidi_messaging_sdk::messages::FetchDeletePolicy;
 use affinidi_messaging_sdk::messages::fetch::FetchOptions;
 use affinidi_messaging_sdk::protocols::mux::sign_revoke_all;
-use affinidi_messaging_sdk::protocols::trust_tasks::ENVELOPE_TYPE;
+use affinidi_messaging_sdk::protocols::trust_tasks::{
+    ENVELOPE_TYPE, ERROR_FORMAT_DOCUMENT, ERROR_FORMAT_MEMBER,
+};
 use affinidi_messaging_sdk::transports::SendMessageResponse;
 use affinidi_messaging_test_mediator::{
     TestEnvironment, TestMediator, TestUser, TrustTaskVerification,
@@ -25,7 +27,6 @@ use serde_json::{Value, json};
 use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};
 use uuid::Uuid;
 
-const ASK: &str = "x-errorFormat";
 const ERROR_TYPE: &str = "https://trusttasks.org/spec/trust-task-error/0.6";
 const REVOKE_ALL: &str = "https://trusttasks.org/spec/messaging/mux/revoke-all/0.1";
 const ADMIN_REVOKE_ALL: &str = "https://trusttasks.org/spec/messaging/mux/admin-revoke-all/0.1";
@@ -77,7 +78,7 @@ async fn request(
         "payload": payload,
     });
     if ask {
-        doc[ASK] = json!("trust-task-error");
+        doc[ERROR_FORMAT_MEMBER] = json!(ERROR_FORMAT_DOCUMENT);
     }
     let key = from
         .secrets
@@ -185,7 +186,7 @@ async fn an_epoch_mismatch_carries_the_current_epoch_as_a_typed_detail() {
 }
 
 #[tokio::test]
-async fn a_request_that_does_not_ask_is_refused_with_a_document_too() {
+async fn a_request_that_does_not_ask_is_refused_with_a_problem_report() {
     init_tracing();
     let env = env().await;
     let member = online(&env, "member", None).await;
@@ -200,10 +201,13 @@ async fn a_request_that_does_not_ask_is_refused_with_a_document_too() {
         false,
     )
     .await;
-    let reply = send(&env, &member, doc.clone()).await.expect("an answer");
-    let p = error_for(&env, &reply, &doc);
-    assert_eq!(p["code"], "messaging/mux/revoke-all:epochMismatch");
-    assert_eq!(p["details"], json!({ "currentEpoch": 0 }));
+    let refused = send(&env, &member, doc)
+        .await
+        .expect_err("a problem report");
+    assert!(
+        refused.contains("e.p.messaging/mux/revoke-all:epochMismatch"),
+        "{refused}"
+    );
 }
 
 #[tokio::test]

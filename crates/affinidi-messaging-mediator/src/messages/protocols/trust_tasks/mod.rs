@@ -166,8 +166,8 @@ pub(crate) async fn process(
     let now_secs = state.clock.unix_secs();
     let sender_did = vid_of(&sender_kid);
     let request_type = doc.type_uri.to_string();
-    // A refusal is answered with a `trust-task-error` document where one can
-    // be sent (see `trust_task_error`).
+    // A request that asks is refused with a `trust-task-error` document
+    // where one can be sent (see `trust_task_error`).
     let refusing = crate::messages::protocols::trust_task_error::Refusing::of(&doc);
     let consumed = consume(
         doc,
@@ -792,9 +792,10 @@ pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), Mediato
 
 /// A Trust Task refusal under `code`: one of the framework's standard codes
 /// (SPEC §8.3: `permissionDenied`, `malformedRequest`, …) or a
-/// `<task>:<code>` the task's specification declares. It is answered with a
-/// `trust-task-error` document carrying `code`, or, where no document can be
-/// sent, a problem report `e.p.<code>`
+/// `<task>:<code>` the task's specification declares. A request that asks
+/// (`x-errorFormat`) is answered with a `trust-task-error` document carrying
+/// `code`; every other request, and one that asks where no document can be
+/// sent, gets the problem report `e.p.<code>`
 /// ([`trust_task_error`](crate::messages::protocols::trust_task_error)).
 pub(crate) fn tt_problem(
     session: &Session,
