@@ -76,6 +76,13 @@ enum Seen {
 #[cfg(feature = "secrets-aws")]
 const AWSCURRENT: &str = "AWSCURRENT";
 
+/// The stage a conditional write is staged under until it is made current.
+/// The mediator's own label, not `AWSPENDING`, which Secrets Manager rotation
+/// owns; it is removed again once the write is current, and a label sits on
+/// one version only, so a refused write leaves at most one version holding it.
+#[cfg(feature = "secrets-aws")]
+const STAGED: &str = "MEDIATOR_STAGED";
+
 #[cfg(feature = "secrets-aws")]
 impl AwsStore {
     fn secret_name(&self, key: &str) -> String {
@@ -109,7 +116,8 @@ impl AwsStore {
         }
     }
 
-    /// `CreateSecret`; a name created meanwhile is a conflict.
+    /// `CreateSecret`; a name created meanwhile is a conflict, unless it was
+    /// this very create (`token`), retried after its reply was lost.
     async fn create(
         &self,
         key: &str,
@@ -134,9 +142,62 @@ impl AwsStore {
         match created {
             Ok(r) => Ok(r.version_id),
             Err(err) if format_error_chain(&err).contains("ResourceExistsException") => {
-                Err(Self::conflict(key))
+                if self.holds_version(name, token).await {
+                    Ok(Some(token.to_string()))
+                } else {
+                    Err(Self::conflict(key))
+                }
             }
             Err(err) => Err(Self::failed("CreateSecret", name, &err)),
+        }
+    }
+
+    /// Whether `name` has a version `token`: a create or write with that
+    /// client request token landed. A failed check counts as no.
+    async fn holds_version(&self, name: &str, token: &str) -> bool {
+        let client = self.client().await;
+        with_retry(&format!("GetSecretValue({name})"), &AwsRetryPolicy, || {
+            let client = client.clone();
+            async move {
+                client
+                    .get_secret_value()
+                    .secret_id(name)
+                    .version_id(token)
+                    .send()
+                    .await
+            }
+        })
+        .await
+        .is_ok_and(|r| r.version_id.as_deref() == Some(token))
+    }
+
+    /// Take [`STAGED`] off `version`, now current. Best effort: a label left
+    /// behind moves to the next staged write.
+    async fn unstage(&self, name: &str, version: &str) {
+        let client = self.client().await;
+        let removed = with_retry(
+            &format!("UpdateSecretVersionStage({name})"),
+            &AwsRetryPolicy,
+            || {
+                let client = client.clone();
+                async move {
+                    client
+                        .update_secret_version_stage()
+                        .secret_id(name)
+                        .version_stage(STAGED)
+                        .remove_from_version_id(version)
+                        .send()
+                        .await
+                }
+            },
+        )
+        .await;
+        if let Err(err) = removed {
+            tracing::warn!(
+                secret = name,
+                error = %format_error_chain(&err),
+                "could not remove the {STAGED} stage from a written secret version"
+            );
         }
     }
 
@@ -159,7 +220,7 @@ impl AwsStore {
                 .secret_string(encoded)
                 .client_request_token(&token);
             if seen.is_some() {
-                put = put.version_stages("AWSPENDING");
+                put = put.version_stages(STAGED);
             }
             async move { put.send().await }
         })
@@ -182,7 +243,13 @@ impl AwsStore {
             .iter()
             .any(|stage| stage == AWSCURRENT);
         let last = match after_stage(seen.as_ref(), current) {
-            Next::Done => return Ok(staged.version_id),
+            Next::Done => {
+                if seen.is_some() {
+                    // A first version: current, but staged too.
+                    self.unstage(name, &token).await;
+                }
+                return Ok(staged.version_id);
+            }
             Next::Conflict => return Err(Self::conflict(key)),
             Next::Move(last) => last.to_string(),
         };
@@ -207,7 +274,10 @@ impl AwsStore {
         )
         .await;
         let err = match moved {
-            Ok(_) => return Ok(staged.version_id),
+            Ok(_) => {
+                self.unstage(name, &token).await;
+                return Ok(staged.version_id);
+            }
             Err(err) => err,
         };
         let msg = format_error_chain(&err);
@@ -216,6 +286,7 @@ impl AwsStore {
         }
         // The refusal names the current version: ours if only a retry's reply was lost.
         if msg.to_ascii_lowercase().contains(&token) {
+            self.unstage(name, &token).await;
             Ok(staged.version_id)
         } else {
             Err(Self::conflict(key))
@@ -392,14 +463,23 @@ impl SecretStore for AwsStore {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 
         let name = self.secret_name(key);
+        let before = self.seen(&name);
         let written = self
-            .write(key, &name, &B64URL.encode(value), self.seen(&name))
+            .write(key, &name, &B64URL.encode(value), before.clone())
             .await;
-        let seen = match &written {
-            Ok(Some(version)) => Some(Seen::Version(version.clone())),
-            _ => None,
-        };
-        self.remember(&name, seen);
+        match &written {
+            Ok(Some(version)) => self.remember(&name, Some(Seen::Version(version.clone()))),
+            Ok(None) => self.remember(&name, None),
+            // Refused: the secret moved on from `before`. Keep a condition, so
+            // a write retried without reading again is refused too rather than
+            // made blind; a write that never read now knows the name exists.
+            Err(SecretStoreError::Conflict { .. }) => {
+                self.remember(&name, Some(before.unwrap_or(Seen::Absent)));
+            }
+            // Failed for another reason (throttled, denied): what was seen is
+            // still the condition for a retry.
+            Err(_) => {}
+        }
         written.map(|_| ())
     }
 
@@ -699,7 +779,9 @@ mod policy_tests {
         assert_eq!(theirs.get(&key).await.unwrap(), Some(vec![1]));
         theirs.put(&key, &[2]).await.unwrap();
 
-        // A write built on an older version is refused too.
+        // A write built on an older version is refused too, and so is the
+        // same write retried without reading again.
+        assert!(conflict(ours.put(&key, &[3]).await));
         assert!(conflict(ours.put(&key, &[3]).await));
         assert_eq!(ours.get(&key).await.unwrap(), Some(vec![2]));
         ours.put(&key, &[3]).await.unwrap();

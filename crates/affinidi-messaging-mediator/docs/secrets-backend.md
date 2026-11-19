@@ -346,7 +346,9 @@ on the per-key layout also needs delete on the old per-key names so the
 cutover can remove them. On GCP, also grant `secretmanager.versions.destroy`
 (see below). On AWS, write is `secretsmanager:PutSecretValue` plus
 `secretsmanager:UpdateSecretVersionStage`, also for whoever runs
-`mediator rotate-admin`.
+`mediator rotate-admin`. A write is staged under the mediator's own
+`MEDIATOR_STAGED` label before it is made `AWSCURRENT`; leave Secrets Manager
+rotation off on these secrets.
 
 ### API call volume
 
