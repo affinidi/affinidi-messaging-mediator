@@ -367,10 +367,7 @@ impl SecretStore for AwsStore {
                     self.remember(&name, Some(Seen::Absent));
                     return Ok(None);
                 }
-                return Err(SecretStoreError::Unreachable {
-                    backend: BACKEND_LABEL,
-                    reason: format!("GetSecretValue({name}) failed: {msg}"),
-                });
+                return Err(Self::failed("GetSecretValue", &name, &sdk_err));
             }
         };
         self.remember(&name, response.version_id.clone().map(Seen::Version));
@@ -427,10 +424,7 @@ impl SecretStore for AwsStore {
         match result {
             Ok(_) => Ok(()),
             Err(err) if format_error_chain(&err).contains("ResourceNotFoundException") => Ok(()),
-            Err(err) => Err(SecretStoreError::Unreachable {
-                backend: BACKEND_LABEL,
-                reason: format!("DeleteSecret({name}) failed: {}", format_error_chain(&err)),
-            }),
+            Err(err) => Err(Self::failed("DeleteSecret", &name, &err)),
         }
     }
 
