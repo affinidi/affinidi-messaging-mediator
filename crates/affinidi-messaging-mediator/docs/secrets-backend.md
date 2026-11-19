@@ -345,7 +345,8 @@ Grant read and write on `<prefix>mediator_secrets_bundle`. A deployment still
 on the per-key layout also needs delete on the old per-key names so the
 cutover can remove them. On GCP, also grant `secretmanager.versions.destroy`
 (see below). On AWS, write is `secretsmanager:PutSecretValue` plus
-`secretsmanager:UpdateSecretVersionStage`.
+`secretsmanager:UpdateSecretVersionStage`, also for whoever runs
+`mediator rotate-admin`.
 
 ### API call volume
 
