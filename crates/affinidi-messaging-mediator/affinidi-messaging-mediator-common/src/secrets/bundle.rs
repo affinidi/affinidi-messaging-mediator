@@ -359,6 +359,7 @@ impl BundledStore {
     /// caller checking that its write survived another process's.
     pub async fn get_fresh(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.layout().await?;
+        let _guard = self.write_lock.lock().await;
         match self.read_bundle().await? {
             Some(bundle) => bundle.entry(key),
             None => Ok(None),
@@ -715,6 +716,8 @@ impl BundledStore {
         {
             return Ok(bundle.clone());
         }
+        // A backend read sets what the next write is checked against.
+        let _guard = self.write_lock.lock().await;
         let bundle = self.load_bundle().await?.map(Arc::new);
         self.remember(bundle.clone());
         Ok(bundle)

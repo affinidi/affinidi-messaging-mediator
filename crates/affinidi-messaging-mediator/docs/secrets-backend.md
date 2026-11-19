@@ -315,7 +315,7 @@ while you fix it.
 
 | Message contains | Do |
 |------------|----|
-| `mediator_secrets_bundle could not be read` / `could not be written` | Grant the mediator's role read, create and write on `<prefix>mediator_secrets_bundle`, then start again. Typical when IAM grants only the per-key names. |
+| `mediator_secrets_bundle could not be read` / `could not be written` | Grant the mediator's role read, create and write on `<prefix>mediator_secrets_bundle` (see [Permissions](#permissions)), then start again. Typical when IAM grants only the per-key names. |
 | `the per-key secret <key> is not a readable entry` | Repair or remove that secret. An older mediator would fail on it too. |
 | `read back differently from what was written` | Check whether another process writes `mediator_secrets_bundle`. |
 | `the partial copy could not be removed` | The copy is marked unfinished, so it's ignored and the per-key secrets are untouched. Optionally delete it by hand. |
@@ -344,7 +344,8 @@ secrets.
 Grant read and write on `<prefix>mediator_secrets_bundle`. A deployment still
 on the per-key layout also needs delete on the old per-key names so the
 cutover can remove them. On GCP, also grant `secretmanager.versions.destroy`
-(see below).
+(see below). On AWS, write is `secretsmanager:PutSecretValue` plus
+`secretsmanager:UpdateSecretVersionStage`.
 
 ### API call volume
 

@@ -10,6 +10,9 @@
 //! InternalServiceError / RequestTimeout / connection-level failures
 //! retry; ResourceNotFoundException, validation, and access-denied
 //! errors short-circuit so the caller's error path runs unchanged.
+//!
+//! A write after a read is conditional, like Vault's `cas`: a read can lag
+//! a write, and an unconditional write would drop what it did not see.
 
 use crate::secrets::error::{Result, SecretStoreError};
 use crate::secrets::store::DynSecretStore;
@@ -35,6 +38,7 @@ pub(crate) fn open(url: BackendUrl) -> Result<DynSecretStore> {
         region,
         namespace,
         client: tokio::sync::OnceCell::new(),
+        seen: Default::default(),
     }))
 }
 
@@ -56,12 +60,166 @@ pub struct AwsStore {
     /// provider chain (IMDS / STS on IRSA and ECS roles), and the client
     /// owns the connection pool and credential cache.
     client: tokio::sync::OnceCell<aws_sdk_secretsmanager::Client>,
+    /// Per secret name, the condition for the next write; none: unconditional.
+    seen: std::sync::Mutex<std::collections::HashMap<String, Seen>>,
 }
+
+#[cfg(feature = "secrets-aws")]
+#[derive(Clone, Debug)]
+enum Seen {
+    /// Read with no current value.
+    Absent,
+    /// Read or written at this `VersionId`.
+    Version(String),
+}
+
+#[cfg(feature = "secrets-aws")]
+const AWSCURRENT: &str = "AWSCURRENT";
 
 #[cfg(feature = "secrets-aws")]
 impl AwsStore {
     fn secret_name(&self, key: &str) -> String {
         format!("{}{}", self.namespace, key)
+    }
+
+    fn seen(&self, name: &str) -> Option<Seen> {
+        self.seen.lock().ok()?.get(name).cloned()
+    }
+
+    fn remember(&self, name: &str, seen: Option<Seen>) {
+        if let Ok(mut map) = self.seen.lock() {
+            match seen {
+                Some(seen) => map.insert(name.to_string(), seen),
+                None => map.remove(name),
+            };
+        }
+    }
+
+    fn conflict(key: &str) -> SecretStoreError {
+        SecretStoreError::Conflict {
+            backend: BACKEND_LABEL,
+            key: key.to_string(),
+        }
+    }
+
+    fn failed(call: &str, name: &str, err: &(dyn std::error::Error + 'static)) -> SecretStoreError {
+        SecretStoreError::Unreachable {
+            backend: BACKEND_LABEL,
+            reason: format!("{call}({name}) failed: {}", format_error_chain(err)),
+        }
+    }
+
+    /// `CreateSecret`; a name created meanwhile is a conflict.
+    async fn create(
+        &self,
+        key: &str,
+        name: &str,
+        encoded: &str,
+        token: &str,
+    ) -> Result<Option<String>> {
+        let client = self.client().await;
+        let created = with_retry(&format!("CreateSecret({name})"), &AwsRetryPolicy, || {
+            let client = client.clone();
+            async move {
+                client
+                    .create_secret()
+                    .name(name)
+                    .secret_string(encoded)
+                    .client_request_token(token)
+                    .send()
+                    .await
+            }
+        })
+        .await;
+        match created {
+            Ok(r) => Ok(r.version_id),
+            Err(err) if format_error_chain(&err).contains("ResourceExistsException") => {
+                Err(Self::conflict(key))
+            }
+            Err(err) => Err(Self::failed("CreateSecret", name, &err)),
+        }
+    }
+
+    /// Writes `encoded` as current if `seen` still holds; returns the new `VersionId`.
+    async fn write(
+        &self,
+        key: &str,
+        name: &str,
+        encoded: &str,
+        seen: Option<Seen>,
+    ) -> Result<Option<String>> {
+        let client = self.client().await;
+        // One token per write, reused by its retries: no duplicate version.
+        let token = uuid::Uuid::new_v4().to_string();
+        let staged = with_retry(&format!("PutSecretValue({name})"), &AwsRetryPolicy, || {
+            let client = client.clone();
+            let mut put = client
+                .put_secret_value()
+                .secret_id(name)
+                .secret_string(encoded)
+                .client_request_token(&token);
+            if seen.is_some() {
+                put = put.version_stages("AWSPENDING");
+            }
+            async move { put.send().await }
+        })
+        .await;
+        let staged = match staged {
+            Ok(r) => r,
+            Err(err) if format_error_chain(&err).contains("ResourceNotFoundException") => {
+                return match seen {
+                    // Deleted since it was read.
+                    Some(Seen::Version(_)) => Err(Self::conflict(key)),
+                    None | Some(Seen::Absent) => self.create(key, name, encoded, &token).await,
+                };
+            }
+            Err(err) => return Err(Self::failed("PutSecretValue", name, &err)),
+        };
+        let current = staged
+            .version_stages
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|stage| stage == AWSCURRENT);
+        let last = match after_stage(seen.as_ref(), current) {
+            Next::Done => return Ok(staged.version_id),
+            Next::Conflict => return Err(Self::conflict(key)),
+            Next::Move(last) => last.to_string(),
+        };
+        let moved = with_retry(
+            &format!("UpdateSecretVersionStage({name})"),
+            &AwsRetryPolicy,
+            || {
+                let client = client.clone();
+                let token = token.clone();
+                let last = last.clone();
+                async move {
+                    client
+                        .update_secret_version_stage()
+                        .secret_id(name)
+                        .version_stage(AWSCURRENT)
+                        .move_to_version_id(token)
+                        .remove_from_version_id(last)
+                        .send()
+                        .await
+                }
+            },
+        )
+        .await;
+        let err = match moved {
+            Ok(_) => return Ok(staged.version_id),
+            Err(err) => err,
+        };
+        let msg = format_error_chain(&err);
+        if !is_stale_label_move(&msg) {
+            return Err(Self::failed("UpdateSecretVersionStage", name, &err));
+        }
+        // The refusal names the current version: ours if only a retry's reply was lost.
+        if msg.to_ascii_lowercase().contains(&token) {
+            Ok(staged.version_id)
+        } else {
+            Err(Self::conflict(key))
+        }
     }
 
     /// The shared client (cheap to clone: internally `Arc`-wrapped).
@@ -103,6 +261,33 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         cur = src.source();
     }
     parts.join(" | ")
+}
+
+/// What a staged write still needs, given what was seen before it.
+#[cfg(feature = "secrets-aws")]
+#[derive(Debug, PartialEq, Eq)]
+enum Next<'a> {
+    Done,
+    Conflict,
+    Move(&'a str),
+}
+
+#[cfg(feature = "secrets-aws")]
+fn after_stage(seen: Option<&Seen>, current: bool) -> Next<'_> {
+    match seen {
+        None => Next::Done,
+        // A secret's first version is made current whatever stage is asked.
+        Some(_) if current => Next::Done,
+        // Read as absent, but it has a value now.
+        Some(Seen::Absent) => Next::Conflict,
+        Some(Seen::Version(last)) => Next::Move(last),
+    }
+}
+
+/// Whether moving `AWSCURRENT` was refused because `RemoveFromVersionId` is stale.
+#[cfg(feature = "secrets-aws")]
+fn is_stale_label_move(msg: &str) -> bool {
+    msg.contains("InvalidParameterException") && msg.contains("RemoveFromVersionId")
 }
 
 #[cfg(feature = "secrets-aws")]
@@ -179,6 +364,7 @@ impl SecretStore for AwsStore {
             Err(sdk_err) => {
                 let msg = format_error_chain(&sdk_err);
                 if msg.contains("ResourceNotFoundException") {
+                    self.remember(&name, Some(Seen::Absent));
                     return Ok(None);
                 }
                 return Err(SecretStoreError::Unreachable {
@@ -187,6 +373,7 @@ impl SecretStore for AwsStore {
                 });
             }
         };
+        self.remember(&name, response.version_id.clone().map(Seen::Version));
         let Some(encoded) = response.secret_string else {
             return Err(SecretStoreError::InvalidShape {
                 key: key.to_string(),
@@ -208,63 +395,20 @@ impl SecretStore for AwsStore {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 
         let name = self.secret_name(key);
-        let client = self.client().await;
-        let encoded = B64URL.encode(value);
-
-        // PutSecretValue → CreateSecret on first write. Each SDK call
-        // is wrapped independently because they have distinct
-        // throttling buckets in AWS.
-        let put_label = format!("PutSecretValue({name})");
-        let put_result = with_retry(&put_label, &AwsRetryPolicy, || {
-            let client = client.clone();
-            let name = name.clone();
-            let encoded = encoded.clone();
-            async move {
-                client
-                    .put_secret_value()
-                    .secret_id(&name)
-                    .secret_string(&encoded)
-                    .send()
-                    .await
-            }
-        })
-        .await;
-        match put_result {
-            Ok(_) => Ok(()),
-            Err(err) if format_error_chain(&err).contains("ResourceNotFoundException") => {
-                let create_label = format!("CreateSecret({name})");
-                with_retry(&create_label, &AwsRetryPolicy, || {
-                    let client = client.clone();
-                    let name = name.clone();
-                    let encoded = encoded.clone();
-                    async move {
-                        client
-                            .create_secret()
-                            .name(&name)
-                            .secret_string(&encoded)
-                            .send()
-                            .await
-                    }
-                })
-                .await
-                .map_err(|e| SecretStoreError::Unreachable {
-                    backend: BACKEND_LABEL,
-                    reason: format!("CreateSecret({name}) failed: {}", format_error_chain(&e)),
-                })?;
-                Ok(())
-            }
-            Err(err) => Err(SecretStoreError::Unreachable {
-                backend: BACKEND_LABEL,
-                reason: format!(
-                    "PutSecretValue({name}) failed: {}",
-                    format_error_chain(&err)
-                ),
-            }),
-        }
+        let written = self
+            .write(key, &name, &B64URL.encode(value), self.seen(&name))
+            .await;
+        let seen = match &written {
+            Ok(Some(version)) => Some(Seen::Version(version.clone())),
+            _ => None,
+        };
+        self.remember(&name, seen);
+        written.map(|_| ())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let name = self.secret_name(key);
+        self.remember(&name, None);
         let client = self.client().await;
         let label = format!("DeleteSecret({name})");
         let result = with_retry(&label, &AwsRetryPolicy, || {
@@ -401,6 +545,7 @@ mod policy_tests {
             region: "us-east-1".into(),
             namespace: String::new(),
             client: tokio::sync::OnceCell::new(),
+            seen: Default::default(),
         };
         assert!(!store.client.initialized());
         let first = store.client().await;
@@ -495,5 +640,78 @@ mod policy_tests {
             formatted.contains(" | "),
             "expected ' | ' separator: {formatted}"
         );
+    }
+
+    #[test]
+    fn only_a_moved_label_is_a_stale_label_move() {
+        // Messages as AWS returns them (live, 2026-11-19).
+        let cases = [
+            (
+                "InvalidParameterException: When you move staging label AWSCURRENT, if you \
+                 specify RemoveFromVersionId, it must be set to the version that currently \
+                 has the staging label 2F42BDF8-0B67-4F53-9EAA-FE6069C7914D.",
+                true,
+            ),
+            ("InvalidParameterException: bad name", false),
+            ("AccessDeniedException: User is not authorized", false),
+        ];
+        for (msg, stale) in cases {
+            assert_eq!(is_stale_label_move(msg), stale, "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_staged_write_is_done_refused_or_moved_by_what_was_seen() {
+        let v = Seen::Version("v1".into());
+        let cases = [
+            (None, false, Next::Done),
+            (None, true, Next::Done),
+            (Some(&Seen::Absent), true, Next::Done),
+            (Some(&Seen::Absent), false, Next::Conflict),
+            (Some(&v), true, Next::Done),
+            (Some(&v), false, Next::Move("v1")),
+        ];
+        for (seen, current, next) in cases {
+            assert_eq!(
+                after_stage(seen, current),
+                next,
+                "{seen:?} current={current}"
+            );
+        }
+    }
+
+    /// Opt-in live test of conditional writes. Needs AWS credentials that
+    /// may create, write, move stages on and delete secrets under the URL's
+    /// prefix. Run with:
+    ///   MEDIATOR_TEST_AWS_URL=aws_secrets://ap-southeast-1/ci-mediator/ \
+    ///   cargo test -p affinidi-messaging-mediator-common \
+    ///     --features secrets-aws aws_live_conditional_writes -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn aws_live_conditional_writes() {
+        use crate::secrets::url::parse_url;
+        let url = std::env::var("MEDIATOR_TEST_AWS_URL")
+            .expect("set MEDIATOR_TEST_AWS_URL to run the live AWS test");
+        let ours = open(parse_url(&url).unwrap()).unwrap();
+        let theirs = open(parse_url(&url).unwrap()).unwrap();
+        let key = format!("mediator_probe_{}", uuid::Uuid::new_v4().simple());
+        let conflict = |r: Result<()>| matches!(r, Err(SecretStoreError::Conflict { .. }));
+
+        // A write built on a read that showed no value is refused once
+        // there is one, as a stale read would be.
+        assert_eq!(theirs.get(&key).await.unwrap(), None);
+        ours.put(&key, &[1]).await.unwrap();
+        assert!(conflict(theirs.put(&key, &[2]).await));
+        assert_eq!(theirs.get(&key).await.unwrap(), Some(vec![1]));
+        theirs.put(&key, &[2]).await.unwrap();
+
+        // A write built on an older version is refused too.
+        assert!(conflict(ours.put(&key, &[3]).await));
+        assert_eq!(ours.get(&key).await.unwrap(), Some(vec![2]));
+        ours.put(&key, &[3]).await.unwrap();
+        ours.put(&key, &[4]).await.unwrap();
+        assert_eq!(theirs.get(&key).await.unwrap(), Some(vec![4]));
+
+        ours.delete(&key).await.unwrap();
     }
 }
