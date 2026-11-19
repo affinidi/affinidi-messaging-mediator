@@ -147,7 +147,9 @@ use affinidi_messaging_mediator_common::{
     store::{MediatorStore, MediatorStoreExt},
 };
 // Re-exported so tests can pick the Trust Task acceptance mode.
-pub use affinidi_messaging_mediator::common::config::{CorsOriginPolicy, TrustTaskVerification};
+pub use affinidi_messaging_mediator::common::config::{
+    CorsOriginPolicy, DidPrivacyMode, TrustTaskVerification,
+};
 // Re-exported so tests can build/inject a clock from one import.
 pub use affinidi_messaging_mediator_common::types::clock::{Clock, SystemClock, TestClock};
 use affinidi_secrets_resolver::{SecretsResolver, ThreadedSecretsResolver, secrets::Secret};
@@ -386,6 +388,8 @@ pub struct TestMediatorBuilder {
     enable_inter_mediator_relay: Option<bool>,
     /// Override for `SecurityConfig.trust_task_verification`.
     trust_task_verification: Option<TrustTaskVerification>,
+    /// Override for `SecurityConfig.did_privacy_mode`.
+    did_privacy_mode: Option<DidPrivacyMode>,
     /// Override for `SecurityConfig.tsp_auth_accept_unbound_until`.
     tsp_auth_accept_unbound_until: Option<Option<u64>>,
     /// Override for the CORS origin policy (`security.cors_allow_origin`).
@@ -479,6 +483,7 @@ impl Default for TestMediatorBuilder {
             block_remote_admin_msgs: None,
             enable_inter_mediator_relay: None,
             trust_task_verification: None,
+            did_privacy_mode: None,
             tsp_auth_accept_unbound_until: None,
             cors_origins: None,
             jwt_access_expiry_secs: None,
@@ -945,6 +950,13 @@ impl TestMediatorBuilder {
         self
     }
 
+    /// Override `did_privacy_mode`. Defaults to the production value
+    /// (`Strict`).
+    pub fn did_privacy_mode(mut self, mode: DidPrivacyMode) -> Self {
+        self.did_privacy_mode = Some(mode);
+        self
+    }
+
     /// Override `tsp_auth_accept_unbound_until`: the Unix time until which
     /// `POST /tsp/authenticate` also accepts the older request that signs only
     /// the challenge string. Defaults to the production value, `None` (never).
@@ -1227,6 +1239,9 @@ impl TestMediatorBuilder {
         }
         if let Some(mode) = self.trust_task_verification {
             security.trust_task_verification = mode;
+        }
+        if let Some(mode) = self.did_privacy_mode {
+            security.did_privacy_mode = mode;
         }
         if let Some(secs) = self.jwt_access_expiry_secs {
             security.jwt_access_expiry = secs;

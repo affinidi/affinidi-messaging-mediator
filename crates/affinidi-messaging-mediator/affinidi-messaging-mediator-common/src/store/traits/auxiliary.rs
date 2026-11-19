@@ -3,6 +3,7 @@
 use crate::errors::MediatorError;
 use crate::store::TrustTaskClaim;
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 /// Small keyed records outside the message and account model: OOB invitations, Trust Task duplicate-execution claims, did:scid source records and the stored configuration overrides.
 #[async_trait]
@@ -116,4 +117,16 @@ pub trait AuxiliaryStore: Send + Sync + std::fmt::Debug {
     /// A store that cannot keep them must return an error: a patch must not
     /// report a value as stored when the store kept nothing.
     async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError>;
+
+    /// Record the DID behind `did_hash`, or forget it when `did` is `None`.
+    /// Used only when `security.did_privacy_mode` is `permissive`; a strict
+    /// mediator never calls it. Removing the account removes its record.
+    async fn did_map_set(&self, did_hash: &str, did: Option<&str>) -> Result<(), MediatorError>;
+
+    /// The DIDs [`Self::did_map_set`] recorded for `did_hashes`, as
+    /// `hash → DID`. Hashes with no record are left out.
+    async fn did_map_get(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<HashMap<String, String>, MediatorError>;
 }

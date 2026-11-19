@@ -38,4 +38,10 @@ pub struct SecurityConfigRaw {
     /// without it.
     #[serde(default)]
     pub tsp_auth_accept_unbound_until: String,
+    /// `strict` or `permissive` — whether the mediator keeps only DID hashes
+    /// (strict) or also a `hash → DID` record it returns to callers
+    /// (permissive). `#[serde(default)]` so configs that predate the setting
+    /// deserialize without it (empty → `strict`).
+    #[serde(default)]
+    pub did_privacy_mode: String,
 }
