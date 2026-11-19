@@ -14,6 +14,7 @@
 
 use affinidi_messaging_didcomm::message::Message;
 use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_sdk::protocols::trust_tasks::{ERROR_FORMAT_DOCUMENT, ERROR_FORMAT_MEMBER};
 use serde_json::Value;
 use trust_tasks_proof::affinidi::{SignOptions, sign_trust_task};
 use trust_tasks_rs::TrustTask;
@@ -63,7 +64,12 @@ pub(crate) async fn push_wake_document(
     task.issuer = Some(mediator_did.clone());
     task.recipient = Some(record.gateway.clone());
     task.issued_at = chrono::DateTime::from_timestamp(state.clock.unix_secs() as i64, 0);
-    let doc = serde_json::to_value(&task).map_err(|e| internal(format!("push/wake: {e}")))?;
+    let mut doc = serde_json::to_value(&task).map_err(|e| internal(format!("push/wake: {e}")))?;
+    // Ask for a refusal as a `trust-task-error` document, the only form
+    // [`verdict`] reads: a gateway that follows the same convention as this
+    // mediator otherwise refuses with a problem report, and a `notAllowed`
+    // would go unnoticed. The proof covers the member.
+    doc[ERROR_FORMAT_MEMBER] = Value::from(ERROR_FORMAT_DOCUMENT);
 
     // The gateway authenticates a trigger by the proof alone, so an unsigned
     // ring is one it refuses: no key, no ring.

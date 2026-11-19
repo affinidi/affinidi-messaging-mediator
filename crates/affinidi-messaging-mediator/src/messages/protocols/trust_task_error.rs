@@ -53,6 +53,15 @@ use crate::common::session::Session;
 use crate::error_codes;
 use crate::messages::protocols::trust_task_sign;
 
+/// The last day 0.51 is supported. Until then a refusal is a document only for
+/// a request that asks; the first release cut after it withdraws the ask
+/// ([`Refusing::document`]) and answers every refusal with a document.
+/// `the_ask_is_withdrawn_once_0_51_support_ends` fails past this date, so the
+/// gate cannot outlive it unnoticed: withdraw it, or re-date this with a
+/// reason.
+#[cfg(test)]
+const ASK_REQUIRED_UNTIL: &str = "2027-02-07";
+
 /// `message` is bounded by the `trust-task-error` schema.
 const MESSAGE_MAX: usize = 1024;
 
@@ -95,6 +104,7 @@ impl Refusing {
         sender_did: &str,
         state: &SharedData,
     ) -> Option<Value> {
+        // Withdrawn after ASK_REQUIRED_UNTIL.
         if !self.asked {
             return None;
         }
@@ -558,6 +568,19 @@ mod tests {
         );
         assert!(error_payload(&e).is_none());
         assert!(matches!(normalize(e), MediatorError::SessionError(..)));
+    }
+
+    #[test]
+    fn the_ask_is_withdrawn_once_0_51_support_ends() {
+        let until = chrono::NaiveDate::parse_from_str(ASK_REQUIRED_UNTIL, "%Y-%m-%d")
+            .expect("ASK_REQUIRED_UNTIL is a YYYY-MM-DD date");
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            today <= until,
+            "0.51 support ended on {ASK_REQUIRED_UNTIL}: withdraw the x-errorFormat ask in \
+             Refusing::document so every refusal is a trust-task-error document, or re-date \
+             ASK_REQUIRED_UNTIL with a reason"
+        );
     }
 
     #[test]

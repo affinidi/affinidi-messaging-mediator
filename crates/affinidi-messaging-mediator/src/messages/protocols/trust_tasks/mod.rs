@@ -792,9 +792,10 @@ pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), Mediato
 
 /// A Trust Task refusal under `code`: one of the framework's standard codes
 /// (SPEC §8.3: `permissionDenied`, `malformedRequest`, …) or a
-/// `<task>:<code>` the task's specification declares. It is answered with a
-/// `trust-task-error` document carrying `code`, or, where no document can be
-/// sent, a problem report `e.p.<code>`
+/// `<task>:<code>` the task's specification declares. A request that asks
+/// (`x-errorFormat`) is answered with a `trust-task-error` document carrying
+/// `code`; every other request, and one that asks where no document can be
+/// sent, gets the problem report `e.p.<code>`
 /// ([`trust_task_error`](crate::messages::protocols::trust_task_error)).
 pub(crate) fn tt_problem(
     session: &Session,

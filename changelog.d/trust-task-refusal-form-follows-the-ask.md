@@ -1,4 +1,4 @@
-### Changed — a Trust Task that does not ask is refused with a problem report again (R3.6)
+### Breaking — a Trust Task that does not ask is refused with a problem report again (R3.6)
 
 - **Wire change (R3.6), only for a request that does not ask.** A refused
   Trust Task is answered with a `trust-task-error` document when the request
@@ -10,10 +10,17 @@
   document: unknown field 'code'`.
 - `affinidi-messaging-sdk` asks on every Trust Task from 0.46.2, so a client
   on it sees no change.
-- A `messaging/mux/ack` that does not ask, sent on a raw-TSP socket that is
-  not a mux connection, closes the socket with 1008 again, as a refused frame
-  on such a socket does. One that asks still gets the sealed
-  `trust-task-error` (`messaging/mux:notMuxConnection`).
+- **A raw-TSP socket closes on a refusal that does not ask.** Over a `tsp` or
+  `tsp-ack` WebSocket, any refused Trust Task that does not ask (an
+  `account/add` the sender may not make, a `messaging/mux/ack` off a mux
+  connection, …) closes the socket with 1008 again, as any refused frame on
+  such a socket does: a raw-TSP socket has no in-band error frame. 0.52 and
+  0.53.0 kept the socket open and sealed the document back instead, so a
+  hand-built TSP client written for them that does not ask loses its live
+  delivery on a refusal and must reconnect. One that asks still gets the
+  sealed `trust-task-error` (`messaging/mux:notMuxConnection` for the mux
+  ack). A `tsp-mux` socket is unaffected: it reports the refusal with its
+  `refused` event.
 - The codes do not change: both forms carry the Trust Task code (`e.p.`
   before it in a problem report). A client that matched the mediator's old
   codes (`account.not_found`, `authorization.*`) must still move to the new
