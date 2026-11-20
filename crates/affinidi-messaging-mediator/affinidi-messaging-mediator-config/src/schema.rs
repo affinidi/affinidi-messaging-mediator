@@ -25,8 +25,13 @@ pub struct DatabaseConfigRaw {
     /// mediator. Absent or empty: the built-in library.
     #[serde(default)]
     pub functions_file: String,
+    /// Redis connection URL (`redis://`, or `rediss://` for TLS), credentials
+    /// and database number included.
     pub database_url: String,
+    /// Timeout for one database operation, in whole seconds.
     pub database_timeout: String,
+    /// Accepted so older files still parse; not read. The stored-function
+    /// library comes from `functions_file`.
     pub scripts_path: Option<String>,
     /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
     #[serde(default)]
@@ -75,10 +80,17 @@ impl Default for DatabaseConfigRaw {
     }
 }
 
+/// Raw `[server]` section: listener, routing and the identities the server
+/// answers as.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// `<ip>:<port>` the HTTP listener binds.
     pub listen_address: String,
+    /// Prefix every HTTP route mounts under. Leading and trailing slashes are
+    /// normalised; `""` or `"/"` mounts at the root.
     pub api_prefix: String,
+    /// DID of the root administrator. Required, and must differ from
+    /// `mediator_did`.
     pub admin_did: String,
     /// Reverse proxies whose `X-Forwarded-For` header may be trusted.
     ///
@@ -108,6 +120,9 @@ pub struct ServerConfig {
     /// When set, `/metrics` also requires `Authorization: Bearer <token>`.
     #[serde(default)]
     pub metrics_bearer_token: Option<RedactedString>,
+    /// Where to load a self-hosted `did:web` document or `did:webvh` log from
+    /// (`file://`, `aws_parameter_store://` or `s3://`). When set, the mediator
+    /// serves it under `/.well-known/`.
     pub did_web_self_hosted: Option<String>,
     /// Additional URL aliases the mediator should treat as
     /// pointing at *itself* when resolving a routing-2.0 next-hop.
@@ -135,7 +150,10 @@ impl std::fmt::Debug for RedactedString {
 /// Live streaming configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamingConfig {
+    /// `"true"` enables live streaming over WebSockets.
     pub enabled: String,
+    /// Identifier of this subscriber instance: `hostname://` (the host name) or
+    /// `string://<id>`.
     pub uuid: String,
 }
 
@@ -147,10 +165,15 @@ pub struct StreamingConfig {
 /// free of the DID-resolver SDK.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DIDResolverConfig {
+    /// Address of a remote DID resolver service. Absent: resolve locally.
     pub address: Option<String>,
+    /// DID documents held in the in-memory cache.
     pub cache_capacity: String,
+    /// Seconds a cached DID document is kept.
     pub cache_ttl: String,
+    /// Timeout for one DID resolution, in **milliseconds**.
     pub network_timeout: String,
+    /// Concurrent DID resolution requests.
     pub network_limit: String,
 }
 
@@ -194,15 +217,28 @@ pub struct SecretsConfigRaw {
 /// `Config` in the mediator binary.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigRaw {
+    /// One of `trace`, `debug`, `info`, `warn`, `error`. `RUST_LOG`, when set,
+    /// takes over filtering.
     pub log_level: String,
+    /// `"true"` writes logs as JSON.
     pub log_json: String,
+    /// The mediator's own DID, as `did://<did>` or
+    /// `aws_parameter_store://<name>[?region=<region>]`. Ignored when VTA
+    /// integration supplies the DID.
     pub mediator_did: String,
+    /// `[server]`.
     pub server: ServerConfig,
+    /// `[database]`: the Redis backend's connection.
     pub database: DatabaseConfigRaw,
+    /// `[security]`.
     pub security: SecurityConfigRaw,
+    /// `[streaming]`.
     pub streaming: StreamingConfig,
+    /// `[did_resolver]`.
     pub did_resolver: DIDResolverConfig,
+    /// `[limits]`.
     pub limits: LimitsConfigRaw,
+    /// `[processors]`.
     pub processors: ProcessorsConfigRaw,
     /// Unified secret backend — required whenever the mediator has any
     /// persistent identity (which is effectively always).

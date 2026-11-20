@@ -6,15 +6,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Raw `[limits]` section: operational limits, each a whole number written
+/// as a string (or `"true"`/`"false"` where noted) and read strictly into
+/// the mediator's `LimitsConfig`. A field without a serde default must be in
+/// the file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitsConfigRaw {
+    /// Attachments accepted on one message.
     pub attachments_max_count: String,
+    /// Crypto operations (recipients × keys) one message may cost to unpack.
     pub crypto_operations_per_message: String,
+    /// Message ids one delete call may name.
     pub deleted_messages: String,
+    /// Forward tasks the forwarding queue may hold.
     pub forward_task_queue: String,
+    /// Largest HTTP request body, in bytes. At least `message_size`.
     pub http_size: String,
+    /// Messages one list call returns.
     pub listed_messages: String,
+    /// ACL entries one DID may hold.
     pub local_max_acl: String,
+    /// Seconds a stored message lives before it expires.
     pub message_expiry_seconds: String,
     /// How long a message is kept after it has first been handed to its
     /// recipient. `"0"` (the default) means "no different from any other
@@ -25,32 +37,58 @@ pub struct LimitsConfigRaw {
     /// head-first. `"true"` by default.
     #[serde(default = "default_pickup_round_robin")]
     pub pickup_round_robin: String,
+    /// Largest message, in bytes. At least 1, and no more than `http_size` or
+    /// `ws_size`.
     pub message_size: String,
+    /// Messages one sender may have queued for one specific recipient
+    /// (`-1` = no limit).
     #[serde(default = "default_queued_send_messages_per_peer")]
     pub queued_send_messages_per_peer: String,
+    /// Outbound queue limit an account starts on, summed across all its
+    /// recipients (`-1` = no limit).
     pub queued_send_messages_soft: String,
+    /// Highest outbound queue limit a non-admin may set (`-1` = no limit). At
+    /// least `queued_send_messages_soft`.
     pub queued_send_messages_hard: String,
+    /// Inbound queue limit an account starts on (`-1` = no limit).
     pub queued_receive_messages_soft: String,
+    /// Highest inbound queue limit a non-admin may set (`-1` = no limit). At
+    /// least `queued_receive_messages_soft`.
     pub queued_receive_messages_hard: String,
+    /// Key-agreement keys considered per recipient DID.
     pub to_keys_per_recipient: String,
+    /// Recipients one message may address.
     pub to_recipients: String,
+    /// Largest WebSocket message, in bytes. At least `message_size`.
     pub ws_size: String,
+    /// Access-list entries one DID may hold.
     pub access_list_limit: String,
+    /// Seconds an out-of-band invitation lives.
     pub oob_invite_ttl: String,
+    /// HTTP requests per second per client address (`"0"` = off).
     #[serde(default = "default_rate_limit_per_ip")]
     pub rate_limit_per_ip: String,
+    /// Token-bucket depth above `rate_limit_per_ip`.
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: String,
+    /// Concurrent WebSockets across the instance (`"0"` = unlimited).
     #[serde(default = "default_max_websocket_connections")]
     pub max_websocket_connections: String,
+    /// Concurrent WebSockets one DID may hold (`"0"` = unlimited).
     #[serde(default = "default_max_websocket_connections_per_did")]
     pub max_websocket_connections_per_did: String,
+    /// Requests per second per authenticated DID (`"0"` = off).
     #[serde(default = "default_did_rate_limit_per_second")]
     pub did_rate_limit_per_second: String,
+    /// Token-bucket depth above `did_rate_limit_per_second`.
     #[serde(default = "default_did_rate_limit_burst")]
     pub did_rate_limit_burst: String,
+    /// Bytes of queued live-delivery frames across every WebSocket, one shared
+    /// pool. Past it live pushes are dropped; the messages stay in the inbox.
     #[serde(default = "default_ws_send_buffer")]
     pub ws_send_buffer: String,
+    /// Bytes reserved for the live-delivery pub/sub ring; its slot count is this
+    /// divided by `message_size`.
     #[serde(default = "default_pubsub_buffer")]
     pub pubsub_buffer: String,
     /// Concurrent anonymous inter-mediator relay WebSockets one source address
@@ -119,13 +157,23 @@ pub struct LimitsConfigRaw {
 pub struct MuxConfigRaw {
     /// `"true"` to enable. Anything else, including absence, is off.
     pub enabled: String,
+    /// Member DIDs one connection may carry at once.
     pub max_dids_per_connection: String,
+    /// Stored grants one principal may hold.
     pub max_grants_per_principal: String,
+    /// Active grants one member DID may have issued.
     pub max_grants_per_did: String,
+    /// Longest lifetime (`exp - iat`) a grant may ask for, in seconds.
     pub max_grant_lifetime_secs: String,
+    /// Longest a session attach proof may be valid for, in seconds.
     pub max_attach_lifetime_secs: String,
+    /// Seconds between re-checks of an attached member's signing key against its
+    /// current DID document.
     pub revalidate_interval_secs: String,
+    /// Send-queue depth of one mux connection across all its DIDs; each DID holds
+    /// at most 8. Must be 8..=65536.
     pub max_channel_slots: String,
+    /// Seconds a dead grant stays listable after its expiry before it is pruned.
     pub dead_retention_secs: String,
 }
 

@@ -55,6 +55,7 @@ pub enum KeyClass {
 pub struct Patchable {
     /// `limits.<field>`.
     pub key: &'static str,
+    /// Whether a patch takes effect now or at the next start.
     pub class: KeyClass,
     /// The lowest value accepted: above any "unlimited" or "disabled" value.
     pub floor: i64,
@@ -556,6 +557,9 @@ pub struct ReloadPlan {
     pub skipped: Vec<(String, String)>,
 }
 
+/// Work out the [`ReloadPlan`] for a `config/reload`: `live` is what runs now,
+/// `baseline` the limits just read from the file and environment, `overrides`
+/// the stored `config/patch` values. Changes nothing itself.
 pub fn reload_plan(
     live: &LimitsConfig,
     baseline: &LimitsConfig,

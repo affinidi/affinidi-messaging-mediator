@@ -1,7 +1,12 @@
 pub mod helpers;
+/// The typed `[limits]` section, [`LimitsConfig`], and its `[limits.mux]`
+/// part, [`MuxConfig`].
 pub mod limits;
 pub mod overrides;
+/// The typed `[processors]` section: forwarding, the expiry sweeps and wake.
 pub mod processors;
+/// The typed `[security]` section, [`SecurityConfig`]: ACL policy, TLS, JWT
+/// lifetimes and keys, CORS and the envelope rules.
 pub mod security;
 pub mod validate;
 #[cfg(feature = "vta")]
@@ -235,7 +240,9 @@ pub(crate) fn validate_raw(raw: &ConfigRaw) -> Result<LimitsConfig, MediatorErro
 /// for what each knob means and why `allow_unauthenticated_forwards` exists.
 #[derive(Clone, Debug, Serialize)]
 pub struct DidCommV1Config {
+    /// DIDComm v1 (Aries RFC 0019) is served.
     pub enabled: bool,
+    /// A v1 forward from an unauthenticated sender is accepted.
     pub allow_unauthenticated_forwards: bool,
     /// `keylist-update` may register a key other than the request's own
     /// authenticated verkey.
@@ -261,14 +268,23 @@ impl From<affinidi_messaging_mediator_config::DidCommV1ConfigRaw> for DidCommV1C
     }
 }
 
+/// The mediator's runtime configuration: `mediator.toml` (with environment
+/// overrides) read and validated by [`init`], or built in code through
+/// [`MediatorBuilder`](crate::builder::MediatorBuilder).
 #[derive(Clone, Serialize)]
 pub struct Config {
+    /// Log filter level. `RUST_LOG`, when set, takes over.
     #[serde(skip_serializing)]
     pub log_level: LevelFilter,
+    /// Logs are written as JSON.
     #[serde(skip_serializing)]
     pub log_json: bool,
+    /// `<ip>:<port>` the HTTP listener binds.
     pub listen_address: String,
+    /// The mediator's own DID.
     pub mediator_did: String,
+    /// Account hash of `mediator_did`: `sha256` (lowercase hex) of its account
+    /// DID, the key the store files it under.
     pub mediator_did_hash: String,
     /// Extracted DID document JSON served at `/.well-known/did.json`
     /// when self-hosting. Populated whether the on-disk source was a
@@ -290,7 +306,10 @@ pub struct Config {
     /// (did:webvh self-host); `None` for the did:web shape, where the
     /// jsonl route is not registered.
     pub mediator_did_log: Option<String>,
+    /// DID of the root administrator. Differs from `mediator_did`.
     pub admin_did: String,
+    /// Prefix every HTTP route mounts under, normalised to `/<path>` with no
+    /// trailing slash (empty mounts at the root).
     pub api_prefix: String,
     /// Operator-declared URL aliases the mediator considers local. See
     /// [`ServerConfig::local_endpoints`]. Used by the routing 2.0
@@ -308,7 +327,10 @@ pub struct Config {
     /// When set, `/metrics` also requires this bearer token.
     #[serde(skip_serializing)]
     pub metrics_bearer_token: Option<affinidi_messaging_mediator_config::RedactedString>,
+    /// Live streaming over WebSockets is on.
     pub streaming_enabled: bool,
+    /// This instance's identifier as a streaming subscriber, so instances
+    /// sharing a store tell their sessions apart.
     pub streaming_uuid: String,
     /// Heartbeat and ownership-recheck timing of the streaming task. Not in
     /// the config file: the defaults suit production, and
@@ -322,12 +344,20 @@ pub struct Config {
     /// by default.
     #[serde(skip)]
     pub withheld_task_types: Vec<String>,
+    /// The Redis connection settings (`[database]`).
     pub database: DatabaseConfig,
+    /// The `[security]` settings.
     pub security: SecurityConfig,
+    /// DID resolver cache settings (`[did_resolver]`).
     #[serde(skip_serializing)]
     pub did_resolver_config: DIDCacheConfig,
+    /// The background processors' settings (`[processors]`).
     pub processors: ProcessorsConfig,
+    /// The `[limits]` read at startup. Live `config/patch` changes are in
+    /// [`SharedData::live_limits`](crate::SharedData::live_limits), not here.
     pub limits: LimitsConfig,
+    /// Labels on the mediator's statistics: `app = mediator`, plus one per
+    /// `MEDIATOR_TAG_<NAME>` environment variable (name lowercased).
     pub tags: HashMap<String, String>,
     /// URL of the unified secret backend (`[secrets].backend` from
     /// the config file). Used by the secret-backend probe and surfaced
@@ -1499,6 +1529,14 @@ fn resolve_configured_paths(config: &mut ConfigRaw, config_file: &Path) {
     }
 }
 
+/// Read `config_file` (with its environment overrides), install the
+/// global tracing subscriber (`with_ansi` colours its output), and validate
+/// the result into a [`Config`].
+///
+/// # Errors
+///
+/// [`MediatorError::ConfigError`] when the file cannot be read or parsed, or a
+/// value is invalid; an error too if a global subscriber is already set.
 pub async fn init(config_file: &str, with_ansi: bool) -> Result<Config, MediatorError> {
     // Read configuration file parameters. `read_config_file` lives in the config
     // crate now (returns its lean `ConfigError`); map it back to MediatorError.
