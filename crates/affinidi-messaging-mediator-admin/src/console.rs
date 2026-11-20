@@ -36,7 +36,10 @@ pub enum Mode {
     /// granting or changing a privileged role — admin, rootAdmin, mediator —
     /// changing, removing or acting on the queues of another privileged
     /// account, and changing or reloading the configuration).
-    Admin { root: bool },
+    Admin {
+        /// The account is a rootAdmin, not just an admin.
+        root: bool,
+    },
     /// Any other account: its own queues, messages, settings and traffic.
     SelfService,
 }
@@ -67,6 +70,9 @@ pub struct Capabilities {
 /// A stored message fetched raw, and opened when this session can.
 #[derive(Debug)]
 pub struct InspectedMessage {
+    /// What the mediator records about the message: id, queue, sender and
+    /// recipient, size in bytes, wire protocol, delivery state and when it
+    /// was received, delivered and expires.
     pub meta: message::get::v0_1::MessageMeta,
     /// The envelope exactly as the mediator stores it.
     pub envelope: String,
@@ -446,6 +452,7 @@ impl MediatorConsole {
         self.require_release(OPERATIONS_SINCE, task)
     }
 
+    /// The DID this console is connected as.
     pub fn did(&self) -> &str {
         &self.did
     }
@@ -453,12 +460,17 @@ impl MediatorConsole {
     pub fn did_hash(&self) -> &str {
         &self.did_hash
     }
+    /// The DID of the mediator this console is connected to.
     pub fn mediator_did(&self) -> &str {
         &self.mediator_did
     }
+    /// Whether the connected account administers the mediator or manages
+    /// only itself, as the mediator's record of it said at connect time.
     pub fn mode(&self) -> Mode {
         self.mode
     }
+    /// What this session may do, derived from [`mode`](Self::mode) and the
+    /// account's ACL at connect time.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
     }
@@ -512,6 +524,10 @@ impl MediatorConsole {
 
     // ─── Mediator-wide (administrators) ─────────────────────────────────
 
+    /// Mediator-wide statistics (`messaging/stats/show`). Needs an
+    /// administrator ([`ConsoleError::NotPermitted`] otherwise) and a mediator
+    /// that serves the operations tasks ([`ConsoleError::Refused`] with
+    /// `protocol.trust_task.unsupported` otherwise).
     pub async fn stats(&self) -> Result<stats::show::v0_1::Response> {
         self.require_admin("mediator statistics")?;
         self.require_operations("messaging/stats/show")?;
@@ -721,6 +737,11 @@ impl MediatorConsole {
 
     // ─── One account (self, or any for an administrator) ────────────────
 
+    /// One account's record (`messaging/account/get`): its role, ACL and
+    /// queue limits, plus its activity and counters when the mediator serves
+    /// them ([`serves_activity`](Self::serves_activity),
+    /// [`serves_stats`](Self::serves_stats)). Another account needs an
+    /// administrator.
     pub async fn account_of(&self, target: Target) -> Result<account::get::v0_2::Account> {
         self.require_target(&target, "another account")?;
         self.call(
