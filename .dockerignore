@@ -15,6 +15,11 @@ tasks/
 interop/
 scripts/
 changelog.d/
+# Not workspace members and not read by any build script or include_str!:
+# fuzz/ is its own workspace, docs/ is prose, deny.toml is for cargo-deny.
+fuzz/
+docs/
+deny.toml
 # Only docker/conf/mediator.toml is copied into the image.
 docker/ci/
 docker/did-web/

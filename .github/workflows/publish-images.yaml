@@ -5,7 +5,9 @@ name: publish-images
 #   ECR Public (optional): mirrors the same GHCR digest; only runs when the
 #                          AWS_ROLE_ARN variable is set (GitHub -> AWS OIDC).
 # Multi-arch is built once on native runners and merged into one manifest list.
-# The production image must build and boot-probe (verify-image) before publishing.
+# Each arch is built exactly once (verify-image) and boot-probed on its own
+# architecture, and that same archive is pushed by digest (push): what is
+# published is byte for byte what was probed.
 #
 # The image is a full `cargo build --release`, so it is NOT built on every push —
 # it runs only when it can pay for itself:
@@ -144,16 +146,25 @@ jobs:
   # This is the gate that catches a broken production image (wrong feature
   # set, unreadable config, panics on startup) before anything is published.
   #
-  # Each arch caches to its own GHA scope with mode=max, and `build` below
-  # builds from that same scope on the same runner type, so the publishing
-  # build replays the verified layers instead of compiling again. (It cannot
-  # simply push this job's image: pushing needs `packages: write`, which only
-  # the `release` environment grants, and PR runs must not enter it.)
+  # This is the ONLY build. Each arch is built once, on a native runner, into
+  # an OCI archive carrying the same provenance and SBOM attestations that get
+  # published; the boot probe runs the image unpacked from that archive, and
+  # `push` below pushes the archive's bytes unchanged, by digest. So what is
+  # published is exactly what was probed, and nothing is compiled twice. (This
+  # job cannot push itself: pushing needs `packages: write`, which only the
+  # `release` environment grants, and PR runs must not enter it.)
   verify-image:
     name: verify image boots (${{ matrix.arch }})
     needs: [version]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    # The digest of the archive this job built and probed, one output per arch
+    # (each matrix leg sets only its own). `push` takes it from here, not from
+    # the artifact the archive travels in, so an archive swapped in transit
+    # cannot bring its own matching digest along.
+    outputs:
+      digest_amd64: ${{ steps.load.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.load.outputs.digest_arm64 }}
     strategy:
       fail-fast: false
       matrix:
@@ -188,28 +199,81 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Build image (${{ matrix.arch }}, load locally)
+      - name: Prepare archive directory
+        run: mkdir -p "$RUNNER_TEMP/image"
+
+      # Each arch caches to its own GHA scope. cargo-chef (see the Dockerfile)
+      # keeps the dependency graph in its own layers, so a source-only change
+      # replays them from this cache and recompiles only the workspace crates.
+      - name: Build image (${{ matrix.arch }}) to an OCI archive
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ env.DOCKERFILE }}
           platforms: ${{ matrix.platform }}
-          load: true
-          tags: ${{ env.IMAGE_NAME }}:verify
+          provenance: true
+          sbom: true
+          outputs: type=oci,dest=${{ runner.temp }}/image/image.tar
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # skopeo is preinstalled on the x64 runner image, and installed here if a
+      # runner image lacks it. The archive goes in through `docker load` (not
+      # skopeo's docker-daemon transport, whose pinned Docker API version a
+      # current daemon may refuse), and the loaded image's layers are checked
+      # against the archive's, so the probe below runs the archived filesystem.
+      - name: Load the archived image for the probe
+        id: load
+        env:
+          VERIFY_TAG: ${{ env.IMAGE_NAME }}:verify
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/image/image.tar"
+          command -v skopeo >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q skopeo; }
+          digest=$(tar -xOf "$archive" index.json \
+            | jq -er '.manifests | if length == 1 then .[0].digest else error("expected one top-level manifest") end')
+          echo "digest_${ARCH}=${digest}" >> "$GITHUB_OUTPUT"
+          skopeo copy "oci-archive:$archive" "docker-archive:$RUNNER_TEMP/verify.tar:$VERIFY_TAG"
+          docker load -i "$RUNNER_TEMP/verify.tar"
+          rm -f "$RUNNER_TEMP/verify.tar"
+          want=$(skopeo inspect --config "oci-archive:$archive" | jq -c '.rootfs.diff_ids')
+          got=$(docker image inspect --format '{{json .RootFS.Layers}}' "$VERIFY_TAG" | jq -c .)
+          if [ "$want" != "$got" ]; then
+            echo "::error::loaded image layers ${got} differ from the archive's ${want}" >&2
+            exit 1
+          fi
+          echo "Archive ${digest}: layers match the loaded image"
 
       - name: Boot probe
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:verify
         run: bash docker/ci/boot-probe.sh
 
-  build:
-    name: build ${{ matrix.platform }}
+      # Only runs that publish need the archive.
+      - name: Upload the verified archive
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image/image.tar
+          if-no-files-found: error
+          retention-days: 1
+          # The layers are already gzip-compressed.
+          compression-level: 0
+
+  # Push each verified archive to GHCR by digest, byte for byte: no build here.
+  # `--preserve-digests` makes skopeo fail rather than push anything whose
+  # digest differs from the archive's. The archive is checked first against
+  # the digest verify-image recorded as a job output (not a file shipped with
+  # the archive), and the digest GHCR then serves is checked against it too,
+  # before publish-ghcr uses it.
+  push:
+    name: push ${{ matrix.arch }} by digest
     needs: [version, verify-image]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: release
     permissions:
       contents: read
@@ -217,36 +281,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            arch: amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            arch: arm64
+        arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the verified archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          persist-credentials: false
-
-      - name: Add swap
-        # A release build of `trust-tasks-rs` peaks at several GB in one rustc,
-        # and while the graph holds two copies of it (via vta-sdk and direct;
-        # scripts/version-duplicates-allow.txt) they can compile at once. Thin
-        # LTO lowered the link peak, but swap still lets a peak page instead of
-        # the hosted runner dying as "received a shutdown signal". Memory is
-        # printed so a runner that still dies says so.
-        run: |
-          free -h
-          sudo swapoff -a || true
-          sudo fallocate -l 16G /swapfile-build
-          sudo chmod 600 /swapfile-build
-          sudo mkswap /swapfile-build > /dev/null
-          sudo swapon /swapfile-build
-          free -h
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image
 
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -255,24 +296,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest to GHCR
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ env.DOCKERFILE }}
-          platforms: ${{ matrix.platform }}
-          provenance: true
-          sbom: true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digest
+      - name: Push by digest to GHCR
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          VERIFIED: ${{ needs.verify-image.outputs[format('digest_{0}', matrix.arch)] }}
         run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/image/image.tar"
+          verified="$VERIFIED"
+          if ! [[ "$verified" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::verify-image recorded no valid digest for this arch: '${verified}'" >&2
+            exit 1
+          fi
+          digest=$(tar -xOf "$archive" index.json \
+            | jq -er '.manifests | if length == 1 then .[0].digest else error("expected one top-level manifest") end')
+          if [ "$digest" != "$verified" ]; then
+            echo "::error::archive digest ${digest} is not the verified ${verified}" >&2
+            exit 1
+          fi
+          # This job holds a packages: write token, so it installs nothing at
+          # run time: the hosted x64 image ships skopeo, and its absence fails.
+          command -v skopeo >/dev/null || { echo "::error::skopeo is missing from the runner image" >&2; exit 1; }
+          # skopeo reads the credentials docker/login-action wrote.
+          skopeo copy --all --preserve-digests "oci-archive:$archive" "docker://${IMAGE}@${digest}"
+          pushed="sha256:$(skopeo inspect --raw "docker://${IMAGE}@${digest}" | sha256sum | cut -d' ' -f1)"
+          if [ "$pushed" != "$digest" ]; then
+            echo "::error::GHCR serves ${pushed} for ${IMAGE}@${digest}" >&2
+            exit 1
+          fi
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+          echo "Pushed ${IMAGE}@${digest}"
 
       - name: Upload digest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -284,7 +338,7 @@ jobs:
 
   publish-ghcr:
     name: publish GHCR manifest
-    needs: [version, build]
+    needs: [version, push]
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
