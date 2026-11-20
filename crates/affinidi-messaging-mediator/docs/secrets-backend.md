@@ -315,7 +315,7 @@ while you fix it.
 
 | Message contains | Do |
 |------------|----|
-| `mediator_secrets_bundle could not be read` / `could not be written` | Grant the mediator's role read, create and write on `<prefix>mediator_secrets_bundle`, then start again. Typical when IAM grants only the per-key names. |
+| `mediator_secrets_bundle could not be read` / `could not be written` | Grant the mediator's role read, create and write on `<prefix>mediator_secrets_bundle` (see [Permissions](#permissions)), then start again. Typical when IAM grants only the per-key names. |
 | `the per-key secret <key> is not a readable entry` | Repair or remove that secret. An older mediator would fail on it too. |
 | `read back differently from what was written` | Check whether another process writes `mediator_secrets_bundle`. |
 | `the partial copy could not be removed` | The copy is marked unfinished, so it's ignored and the per-key secrets are untouched. Optionally delete it by hand. |
@@ -342,9 +342,17 @@ secrets.
 ### Permissions
 
 Grant read and write on `<prefix>mediator_secrets_bundle`. A deployment still
-on the per-key layout also needs delete on the old per-key names so the
-cutover can remove them. On GCP, also grant `secretmanager.versions.destroy`
-(see below).
+on the per-key layout also needs, until the cutover, read and write on the old
+per-key names (every write goes to the per-key secret first) and delete on
+them so the cutover can remove them. On GCP, also grant
+`secretmanager.versions.destroy` (see below). On AWS, write is
+`secretsmanager:PutSecretValue` plus `secretsmanager:UpdateSecretVersionStage`
+(plus `secretsmanager:CreateSecret` for a name that does not exist yet), on the
+bundle and, until the cutover, on the per-key names, for every role that
+writes: `mediator-setup`, the mediator, and whoever runs `mediator
+rotate-admin`. A write is staged under the mediator's own `MEDIATOR_STAGED`
+label before it is made `AWSCURRENT`; leave Secrets Manager rotation off on
+these secrets.
 
 ### API call volume
 

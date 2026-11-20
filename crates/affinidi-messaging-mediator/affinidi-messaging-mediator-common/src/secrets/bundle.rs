@@ -95,8 +95,8 @@ const KIND_BUNDLE: &str = "secrets-bundle";
 /// within this window.
 const READ_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// How many times [`BundledStore::update`] redoes a read-modify-write the
-/// backend refused as a [`SecretStoreError::Conflict`], and the first
+/// How many times a read-modify-write the backend refused as a
+/// [`SecretStoreError::Conflict`] is redone, and the first
 /// pause between attempts (doubled each time; about 1.5 s in all) — long
 /// enough for a lagging replica to catch up.
 const CONFLICT_ATTEMPTS: u32 = 5;
@@ -204,6 +204,13 @@ impl Bundle {
         true
     }
 
+    /// Whether every entry here is in `other` with the same value.
+    fn covered_by(&self, other: &Bundle) -> bool {
+        self.entries
+            .iter()
+            .all(|(key, value)| other.entries.get(key) == Some(value))
+    }
+
     /// Whether `entries` holds exactly `legacy`, byte for byte.
     fn matches(&self, legacy: &BTreeMap<String, Vec<u8>>) -> bool {
         self.entries.len() == legacy.len()
@@ -271,38 +278,72 @@ impl BundledStore {
             return Ok(false);
         }
         let _guard = self.write_lock.lock().await;
-        let Some(mut bundle) = self.read_bundle().await? else {
-            return Err(migration_failed(
-                format!("{SECRETS_BUNDLE} disappeared before the cutover. Nothing was deleted"),
-                format!("check whether another process deletes {SECRETS_BUNDLE}"),
-            ));
-        };
-        if bundle.state != State::Mirrored {
+        let marked = self
+            .retry_conflicts(|| async move {
+                let Some(mut bundle) = self.read_bundle().await? else {
+                    return Err(migration_failed(
+                        format!(
+                            "{SECRETS_BUNDLE} disappeared before the cutover. Nothing was deleted"
+                        ),
+                        format!("check whether another process deletes {SECRETS_BUNDLE}"),
+                    ));
+                };
+                if bundle.state != State::Mirrored {
+                    return Ok(None);
+                }
+                let legacy = self.collect_legacy().await?;
+                if !legacy.is_empty() && !bundle.matches(&legacy) {
+                    return Err(migration_failed(
+                        format!(
+                            "the per-key secrets changed while this mediator was starting, so \
+                             another process (likely an older mediator) is writing to them. \
+                             Nothing was deleted: the per-key secrets and {SECRETS_BUNDLE} are \
+                             both intact, and the next start copies them again"
+                        ),
+                        "stop every other mediator using this secret store",
+                    ));
+                }
+                let mirrored = bundle.clone();
+                bundle.state = State::Active;
+                self.forget();
+                self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await?;
+                Ok(Some((bundle, legacy, mirrored)))
+            })
+            .await?;
+        let Some((mut bundle, legacy, mirrored)) = marked else {
             return Ok(false);
-        }
-        let legacy = self.collect_legacy().await?;
-        if !legacy.is_empty() && !bundle.matches(&legacy) {
-            return Err(migration_failed(
-                format!(
-                    "the per-key secrets changed while this mediator was starting, so \
-                     another process (likely an older mediator) is writing to them. \
-                     Nothing was deleted: the per-key secrets and {SECRETS_BUNDLE} are \
-                     both intact, and the next start copies them again"
-                ),
-                "stop every other mediator using this secret store",
-            ));
-        }
-
-        let mirrored = bundle.seal()?;
-        bundle.state = State::Active;
-        self.forget();
-        self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await?;
+        };
         if let Err(why) = self.verify(&bundle, &legacy).await {
             // An unverified `active` bundle would have the next start delete
             // the per-key secrets on its word: put the mirrored one back.
             self.forget();
-            return Err(match self.inner.put(SECRETS_BUNDLE, &mirrored).await {
-                Ok(()) => migration_failed(
+            let mirrored = &mirrored;
+            let undone = self
+                .retry_conflicts(|| async move {
+                    // Undo only what puts back no less than is stored: the
+                    // cutover itself, a short write of it, or a read still
+                    // behind it (whose write the backend refuses as a
+                    // conflict). An entry the mirrored copy lacks is another
+                    // writer's, and putting the copy over it would drop it.
+                    match self.load_bundle().await? {
+                        Some(stored) if stored.covered_by(mirrored) => {}
+                        _ => return Ok(false),
+                    }
+                    self.inner.put(SECRETS_BUNDLE, &mirrored.seal()?).await?;
+                    Ok(true)
+                })
+                .await;
+            return Err(match undone {
+                Ok(false) => migration_failed(
+                    format!(
+                        "recording the cutover to {SECRETS_BUNDLE} failed: {why}. Another \
+                         process has written {SECRETS_BUNDLE} since, so it was left as that \
+                         process wrote it, and nothing was deleted"
+                    ),
+                    "stop every other mediator using this secret store, then compare \
+                     the bundle with the per-key secrets before starting again",
+                ),
+                Ok(true) => migration_failed(
                     format!(
                         "recording the cutover to {SECRETS_BUNDLE} failed: {why}. It was \
                          undone and nothing was deleted"
@@ -359,6 +400,7 @@ impl BundledStore {
     /// caller checking that its write survived another process's.
     pub async fn get_fresh(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.layout().await?;
+        let _guard = self.write_lock.lock().await;
         match self.read_bundle().await? {
             Some(bundle) => bundle.entry(key),
             None => Ok(None),
@@ -512,6 +554,9 @@ impl BundledStore {
         }
         self.forget();
         if let Err(e) = self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await {
+            if matches!(e, SecretStoreError::Conflict { .. }) {
+                return Err(Self::copy_raced("the copy was started"));
+            }
             return Err(migration_failed(
                 format!("{SECRETS_BUNDLE} could not be written ({e}). Nothing was changed"),
                 format!(
@@ -528,6 +573,10 @@ impl BundledStore {
         bundle.state = State::Mirrored;
         if let Err(why) = match self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await {
             Ok(()) => self.verify(&bundle, &legacy).await,
+            // Someone else's bundle now: not ours to delete.
+            Err(SecretStoreError::Conflict { .. }) => {
+                return Err(Self::copy_raced("the copy was read back"));
+            }
             Err(e) => Err(format!("it could not be marked verified ({e})")),
         } {
             return Err(self.roll_back(&why).await);
@@ -550,17 +599,40 @@ impl BundledStore {
         bundle: &Bundle,
         legacy: &BTreeMap<String, Vec<u8>>,
     ) -> std::result::Result<(), String> {
-        let stored = match self.read_bundle().await {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return Err(format!("{SECRETS_BUNDLE} was missing on read-back")),
-            Err(e) => return Err(format!("{SECRETS_BUNDLE} could not be read back ({e})")),
-        };
-        if &stored != bundle || !stored.matches(legacy) {
-            return Err(format!(
-                "{SECRETS_BUNDLE} read back differently from what was written"
-            ));
+        let mut backoff = CONFLICT_BACKOFF;
+        let mut tries = 1;
+        loop {
+            let why = match self.read_bundle().await {
+                Ok(Some(stored)) if &stored == bundle && stored.matches(legacy) => return Ok(()),
+                Ok(Some(_)) => "read back differently from what was written",
+                Ok(None) => "was missing on read-back",
+                Err(e) => return Err(format!("{SECRETS_BUNDLE} could not be read back ({e})")),
+            };
+            // A read can be served from before the write (AWS): read again
+            // before calling the write lost.
+            if tries >= CONFLICT_ATTEMPTS {
+                return Err(format!("{SECRETS_BUNDLE} {why}"));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
+            tries += 1;
         }
-        Ok(())
+    }
+
+    /// The bundle changed under a migration's own write: another process
+    /// created or rewrote it, or the read the migration started from was
+    /// served from before its latest write. Nothing is deleted, as the
+    /// bundle may not be this copy any more.
+    fn copy_raced(when: &str) -> SecretStoreError {
+        migration_failed(
+            format!(
+                "{SECRETS_BUNDLE} changed after {when} (another process wrote it, or a read \
+                 lagged its latest write), so the copy stopped. Nothing was deleted, and \
+                 the next start decides again from what {SECRETS_BUNDLE} holds"
+            ),
+            "start the mediator again; if this repeats, stop every other mediator using \
+             this secret store",
+        )
     }
 
     /// Undo a failed copy: delete the partial bundle, and say how that went.
@@ -643,12 +715,12 @@ impl BundledStore {
     /// then record which are left. Failures are logged and retried on the
     /// next start; they never fail the caller, whose data is in the bundle.
     async fn finish_cleanup(&self, bundle: &mut Bundle) {
-        let mut changed = false;
+        let mut deleted = Vec::new();
         for list in [&mut bundle.legacy_keys, &mut bundle.stray_keys] {
             let mut left = Vec::new();
             for key in std::mem::take(list) {
                 match self.inner.delete(&key).await {
-                    Ok(()) => changed = true,
+                    Ok(()) => deleted.push(key),
                     Err(e) => {
                         warn!(
                             key = %key,
@@ -662,14 +734,27 @@ impl BundledStore {
             }
             *list = left;
         }
-        if !changed {
+        if deleted.is_empty() {
             return;
         }
         self.forget();
-        let written = match bundle.seal() {
-            Ok(bytes) => self.inner.put(SECRETS_BUNDLE, &bytes).await,
-            Err(e) => Err(e),
-        };
+        // Strike the deleted names from the bundle as it is now, not as it
+        // was read: another write may have landed since.
+        let deleted = &deleted;
+        let written = self
+            .retry_conflicts(|| async move {
+                let Some(mut stored) = self.load_bundle().await? else {
+                    return Ok(());
+                };
+                let listed = stored.legacy_keys.len() + stored.stray_keys.len();
+                stored.legacy_keys.retain(|k| !deleted.contains(k));
+                stored.stray_keys.retain(|k| !deleted.contains(k));
+                if stored.legacy_keys.len() + stored.stray_keys.len() == listed {
+                    return Ok(());
+                }
+                self.inner.put(SECRETS_BUNDLE, &stored.seal()?).await
+            })
+            .await;
         if let Err(e) = written {
             warn!(
                 error = %e,
@@ -715,6 +800,15 @@ impl BundledStore {
         {
             return Ok(bundle.clone());
         }
+        // A backend read sets what the next write is checked against.
+        let _guard = self.write_lock.lock().await;
+        // Whoever held the lock may have just read or written it.
+        if let Ok(cached) = self.cached.lock()
+            && let Some((at, bundle)) = cached.as_ref()
+            && at.elapsed() < READ_CACHE_TTL
+        {
+            return Ok(bundle.clone());
+        }
         let bundle = self.load_bundle().await?.map(Arc::new);
         self.remember(bundle.clone());
         Ok(bundle)
@@ -739,9 +833,8 @@ impl BundledStore {
     /// [`SecretStoreError::Conflict`] is redone from a fresh read.
     async fn update(&self, edit: impl Fn(&mut Bundle) -> bool + Send + Sync) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        let mut backoff = CONFLICT_BACKOFF;
-        let mut attempt = 1;
-        loop {
+        let edit = &edit;
+        self.retry_conflicts(|| async move {
             let loaded = self.load_bundle().await?;
             let existed = loaded.is_some();
             let mut bundle = loaded.unwrap_or_default();
@@ -749,25 +842,38 @@ impl BundledStore {
                 self.remember(existed.then(|| Arc::new(bundle)));
                 return Ok(());
             }
-            match self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await {
-                Ok(()) => {
-                    self.remember(Some(Arc::new(bundle)));
-                    return Ok(());
-                }
-                Err(SecretStoreError::Conflict { .. }) if attempt < CONFLICT_ATTEMPTS => {
+            self.inner.put(SECRETS_BUNDLE, &bundle.seal()?).await?;
+            self.remember(Some(Arc::new(bundle)));
+            Ok(())
+        })
+        .await
+    }
+
+    /// Runs `attempt`, a read then a write, again while the backend refuses
+    /// the write as a [`SecretStoreError::Conflict`].
+    async fn retry_conflicts<T, Fut>(&self, attempt: impl Fn() -> Fut) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let mut backoff = CONFLICT_BACKOFF;
+        let mut tries = 1;
+        loop {
+            match attempt().await {
+                Err(SecretStoreError::Conflict { .. }) if tries < CONFLICT_ATTEMPTS => {
                     self.forget();
                     warn!(
-                        attempt,
+                        attempt = tries,
                         "{SECRETS_BUNDLE} changed since it was read; reading it again"
                     );
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
-                    attempt += 1;
+                    tries += 1;
                 }
                 Err(e) => {
                     self.forget();
                     return Err(e);
                 }
+                ok => return ok,
             }
         }
     }
@@ -869,19 +975,33 @@ impl SecretStore for BundledStore {
     async fn probe(&self) -> Result<()> {
         self.layout().await?;
         let _guard = self.write_lock.lock().await;
-        let expected = match self.get_bundle_bytes().await? {
-            Some(bytes) => bytes,
-            None => Bundle::default().seal()?,
-        };
-        self.inner.put(SECRETS_BUNDLE, &expected).await?;
-        let got = self.inner.get(SECRETS_BUNDLE).await?;
-        if got.as_deref() != Some(&expected[..]) {
-            return Err(SecretStoreError::ProbeFailed {
-                backend: self.inner.backend(),
-                reason: format!("{SECRETS_BUNDLE} read back differently from what was written"),
-            });
+        let expected = self
+            .retry_conflicts(|| async move {
+                let expected = match self.get_bundle_bytes().await? {
+                    Some(bytes) => bytes,
+                    None => Bundle::default().seal()?,
+                };
+                self.inner.put(SECRETS_BUNDLE, &expected).await?;
+                Ok(expected)
+            })
+            .await?;
+        // A read can be served from before the write (AWS): read again
+        // before calling the write lost.
+        let mut backoff = CONFLICT_BACKOFF;
+        for tries in 1.. {
+            if self.inner.get(SECRETS_BUNDLE).await?.as_deref() == Some(&expected[..]) {
+                return Ok(());
+            }
+            if tries >= CONFLICT_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
         }
-        Ok(())
+        Err(SecretStoreError::ProbeFailed {
+            backend: self.inner.backend(),
+            reason: format!("{SECRETS_BUNDLE} read back differently from what was written"),
+        })
     }
 
     /// The backend's own read-only probe: it must not mutate anything, so
@@ -1549,6 +1669,213 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_and_cutover_redo_a_write_refused_as_a_conflict() {
+        for conflicts in [1, usize::MAX] {
+            let redone = conflicts == 1;
+            let contended = |inner: &Arc<MemoryStore>| {
+                Arc::new(Contended {
+                    inner: inner.clone(),
+                    conflicts: AtomicUsize::new(0),
+                    rival: None,
+                })
+            };
+
+            let inner = memory();
+            BundledStore::new(inner.clone())
+                .put(JWT_SECRET, b"jwt")
+                .await
+                .unwrap();
+            let backend = contended(&inner);
+            let store = BundledStore::new(backend.clone());
+            backend.conflicts.store(conflicts, Ordering::SeqCst);
+            let probed = store.probe().await;
+            assert_eq!(probed.is_ok(), redone, "probe: {probed:?}");
+
+            let inner = per_key_deployment().await;
+            let backend = contended(&inner);
+            let store = BundledStore::new(backend.clone());
+            store.get(JWT_SECRET).await.unwrap();
+            backend.conflicts.store(conflicts, Ordering::SeqCst);
+            let cut = store.confirm_cutover().await;
+            assert_eq!(cut.is_ok(), redone, "cutover: {cut:?}");
+            let state = if redone {
+                State::Active
+            } else {
+                State::Mirrored
+            };
+            assert_eq!(stored_bundle(&inner).await.state, state);
+        }
+    }
+
+    /// Backend where another writer adds `rival` to the bundle right after
+    /// the cutover's write lands.
+    struct RivalAfterCutover {
+        inner: Arc<MemoryStore>,
+        rival: &'static str,
+    }
+
+    #[async_trait]
+    impl SecretStore for RivalAfterCutover {
+        fn backend(&self) -> &'static str {
+            "rival"
+        }
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.inner.put(key, value).await?;
+            if key == SECRETS_BUNDLE && Bundle::open(value).unwrap().state == State::Active {
+                let mut bundle = stored_bundle(&self.inner).await;
+                if bundle.insert(self.rival, b"rival") {
+                    self.inner
+                        .put(SECRETS_BUNDLE, &bundle.seal().unwrap())
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_cutover_is_not_undone_over_another_writers_entry() {
+        let inner = per_key_deployment().await;
+        let store = BundledStore::new(Arc::new(RivalAfterCutover {
+            inner: inner.clone(),
+            rival: "rival_entry",
+        }));
+        store.get(JWT_SECRET).await.unwrap();
+
+        let err = store.confirm_cutover().await.unwrap_err();
+        assert!(
+            matches!(&err, SecretStoreError::MigrationFailed { reason, .. }
+                if reason.contains("left as that process wrote it")),
+            "{err}"
+        );
+        let stored = stored_bundle(&inner).await;
+        assert_eq!(
+            stored.entry("rival_entry").unwrap().as_deref(),
+            Some(&b"rival"[..]),
+            "the other writer's entry survives"
+        );
+        assert!(
+            inner.get(JWT_SECRET).await.unwrap().is_some(),
+            "nothing deleted"
+        );
+    }
+
+    /// Backend whose read of the bundle right after a write is served from
+    /// before it, `lag` times, as an AWS read can be.
+    struct Lagging {
+        inner: Arc<MemoryStore>,
+        lag: usize,
+        stale: std::sync::Mutex<(usize, Option<Vec<u8>>)>,
+    }
+
+    #[async_trait]
+    impl SecretStore for Lagging {
+        fn backend(&self) -> &'static str {
+            "lagging"
+        }
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            if key == SECRETS_BUNDLE {
+                let mut stale = self.stale.lock().unwrap();
+                if stale.0 > 0 {
+                    stale.0 -= 1;
+                    return Ok(stale.1.clone());
+                }
+            }
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+            if key == SECRETS_BUNDLE {
+                let before = self.inner.get(key).await?;
+                *self.stale.lock().unwrap() = (self.lag, before);
+            }
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_back_served_from_before_the_write_is_read_again() {
+        let inner = per_key_deployment().await;
+        let store = BundledStore::new(Arc::new(Lagging {
+            inner: inner.clone(),
+            lag: 2,
+            stale: Default::default(),
+        }));
+
+        store.ensure_migrated().await.unwrap();
+        assert_eq!(stored_bundle(&inner).await.state, State::Mirrored);
+        assert!(store.confirm_cutover().await.unwrap());
+        assert_eq!(physical_keys(&inner).await, vec![SECRETS_BUNDLE]);
+        store.put(JWT_SECRET, b"jwt2").await.unwrap();
+        store.probe().await.unwrap();
+    }
+
+    /// Backend that refuses the `nth` bundle write (1-based) once as a
+    /// [`SecretStoreError::Conflict`].
+    struct ConflictOnNth {
+        inner: Arc<MemoryStore>,
+        nth: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretStore for ConflictOnNth {
+        fn backend(&self) -> &'static str {
+            "conflict-on-nth"
+        }
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+            if key == SECRETS_BUNDLE && self.nth.fetch_sub(1, Ordering::SeqCst) == 1 {
+                return Err(SecretStoreError::Conflict {
+                    backend: "conflict-on-nth",
+                    key: key.to_string(),
+                });
+            }
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_migration_write_refused_as_a_conflict_says_so_and_deletes_nothing() {
+        for nth in [1, 2] {
+            let inner = per_key_deployment().await;
+            let store = BundledStore::new(Arc::new(ConflictOnNth {
+                inner: inner.clone(),
+                nth: AtomicUsize::new(nth),
+            }));
+            let err = store.ensure_migrated().await.unwrap_err();
+            assert!(
+                matches!(&err, SecretStoreError::MigrationFailed { reason, action }
+                    if reason.contains("changed after") && !action.contains("grant")),
+                "write {nth}: {err}"
+            );
+            if nth == 2 {
+                assert_eq!(
+                    stored_bundle(&inner).await.state,
+                    State::Staged,
+                    "not rolled back over a bundle that may be someone else's"
+                );
+            }
+            // The next start copies again.
+            let store = BundledStore::new(inner.clone());
+            store.ensure_migrated().await.unwrap();
+            assert_eq!(stored_bundle(&inner).await.state, State::Mirrored);
+        }
     }
 
     #[test]
