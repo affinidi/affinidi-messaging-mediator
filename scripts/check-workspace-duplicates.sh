@@ -201,10 +201,12 @@ other's. Find what pulls each copy with
 
   cargo tree --workspace --all-features -i <crate>@<version>
 
-then align the requirements (usually: wait for, or ask for, an upstream
-release on the newer version, and bump ours). If it cannot be fixed from this
-repository yet, add it to $VERSION_ALLOW_FILE as
-'<crate> <review-by YYYY-MM-DD> <what pulls it and what clears it>'.
+then align the requirements. When the fix belongs upstream (a TDK crate still
+on the older version, say), land and release it in affinidi-tdk-rs first, then
+bump the requirement here. Do NOT add a '[patch.crates-io]' entry or a git or
+path dependency: this workspace takes none (CLAUDE.md, "TDK dependencies").
+If it cannot be fixed from this repository yet, add it to $VERSION_ALLOW_FILE
+as '<crate> <review-by YYYY-MM-DD> <what pulls it and what clears it>'.
 EOF
     status=1
 fi
