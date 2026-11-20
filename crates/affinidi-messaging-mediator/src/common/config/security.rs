@@ -352,10 +352,10 @@ pub(crate) fn parse_accept_until(raw: &str) -> Result<Option<u64>, String> {
     if raw.is_empty() {
         return Ok(None);
     }
-    let at = humantime::parse_rfc3339_weak(raw).map_err(|e| {
+    let at = affinidi_messaging_mediator_config::time::parse_utc_timestamp(raw).map_err(|e| {
         format!(
-            "security.tsp_auth_accept_unbound_until must be empty or an RFC 3339 time \
-             (e.g. \"2027-03-01T00:00:00Z\"), not {raw:?}: {e}"
+            "security.tsp_auth_accept_unbound_until must be empty or {}, not {raw:?}: {e}",
+            affinidi_messaging_mediator_config::time::TIMESTAMP_SYNTAX
         )
     })?;
     let secs = at
@@ -1349,6 +1349,28 @@ mod tests {
         assert_eq!(
             parse_accept_until("2027-03-01T00:00:00Z").unwrap(),
             Some(1_803_859_200)
+        );
+        // Still read as before: no offset is UTC, a space may stand for `T`.
+        for same in [
+            "2027-03-01T00:00:00",
+            "2027-03-01 00:00:00",
+            " 2027-03-01T00:00:00+00:00 ",
+        ] {
+            assert_eq!(
+                parse_accept_until(same).unwrap(),
+                Some(1_803_859_200),
+                "{same:?}"
+            );
+        }
+        assert!(
+            parse_accept_until("1969-12-31T23:59:59Z")
+                .unwrap_err()
+                .contains("before 1970")
+        );
+        let err = parse_accept_until("next month").unwrap_err();
+        assert!(
+            err.contains("RFC 3339") && !err.contains("humantime"),
+            "{err}"
         );
         for bad in ["true", "yes", "1803772800", "2027-03-01", "next month"] {
             assert!(parse_accept_until(bad).is_err(), "{bad:?} must be refused");

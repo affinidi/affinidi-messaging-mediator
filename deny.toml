@@ -21,15 +21,13 @@ version = 2
 # `cargo deny check advisories` daily, so a new RUSTSEC advisory against the
 # committed lockfile surfaces without waiting for a PR.
 ignore = [
-  # Accepted 2026-11-17: status-only "unmaintained" advisories with no fixed
+  # Accepted 2026-11-17: a status-only "unmaintained" advisory with no fixed
   # release and no reported vulnerability.
   # chrono is used across this workspace and arrives again through the
   # affinidi-tdk stack (affinidi-data-integrity, …), so it cannot leave the
-  # graph from here alone.
-  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (chronotope/chrono#1768): status only, no vulnerability, no fixed release. Used directly and through the affinidi-tdk stack. Remove when this workspace and affinidi-tdk-rs have migrated to `jiff` or `time`." },
-  # humantime parses the config's duration strings (mediator-config, -common,
-  # -setup and the binary).
-  { id = "RUSTSEC-2026-0542", reason = "humantime marked unmaintained because chrono is: status only, no vulnerability; humantime 2.4.0 has no dependencies, so chrono's status does not reach it. Remove with RUSTSEC-2026-0543, or when nothing here depends on humantime." },
+  # graph from here alone. (Its companion RUSTSEC-2026-0542, humantime, is
+  # gone: config durations and timestamps are parsed with jiff, #298.)
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (chronotope/chrono#1768): status only, no vulnerability, no fixed release. Used directly and through the affinidi-tdk stack; humantime, the other crate this advisory reached, has been replaced by jiff here. Remove when this workspace and affinidi-tdk-rs have migrated to `jiff` or `time`." },
 ]
 
 [bans]

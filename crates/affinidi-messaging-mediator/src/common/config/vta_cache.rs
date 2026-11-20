@@ -23,7 +23,7 @@ pub struct MediatorSecretCache {
 
 impl MediatorSecretCache {
     /// Construct the cache adapter. `ttl_secs` is parsed from
-    /// `[secrets].cache_ttl` (humantime) — `0` means no expiry.
+    /// `[secrets].cache_ttl` (a duration such as `"30d"`) — `0` means no expiry.
     pub fn new(secrets: MediatorSecrets, ttl_secs: u64) -> Self {
         Self { secrets, ttl_secs }
     }
