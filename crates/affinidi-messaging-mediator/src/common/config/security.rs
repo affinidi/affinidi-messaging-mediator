@@ -270,16 +270,27 @@ pub fn build_cors_layer(policy: &CorsOriginPolicy) -> CorsLayer {
     }
 }
 
+/// The typed `[security]` section. The JWT keys are private: set them with
+/// [`SecurityConfig::set_jwt_keys_from_pkcs8`].
 #[derive(Clone, Serialize)]
 pub struct SecurityConfig {
+    /// Open (`ExplicitDeny`: unknown DIDs self-register) or closed
+    /// (`ExplicitAllow`: only pre-registered DIDs authenticate).
     pub mediator_acl_mode: AccessListModeType,
+    /// ACL given to a DID that authenticates with no account yet.
     pub global_acl_default: MediatorACLSet,
+    /// A message addressed directly to a local DID is delivered.
     pub local_direct_delivery_allowed: bool,
+    /// An anonymous message may be delivered directly to a local DID.
     pub local_direct_delivery_allow_anon: bool,
+    /// Resolver holding the mediator's operating keys.
     #[serde(skip_serializing)]
     pub mediator_secrets: Arc<ThreadedSecretsResolver>,
+    /// The mediator terminates TLS itself.
     pub use_ssl: bool,
+    /// TLS certificate file, used when `use_ssl` is on.
     pub ssl_certificate_file: Option<String>,
+    /// Private key file for the TLS certificate.
     #[serde(skip_serializing)]
     pub ssl_key_file: Option<String>,
     // Private on purpose. These are `jsonwebtoken` types, and while they were
@@ -295,18 +306,24 @@ pub struct SecurityConfig {
     jwt_encoding_key: EncodingKey,
     #[serde(skip_serializing)]
     jwt_decoding_key: DecodingKey,
+    /// Access-token lifetime in seconds. At least 10 and below
+    /// `jwt_refresh_expiry`.
     pub jwt_access_expiry: u64,
     /// A refresh token is valid for `jwt_refresh_expiry - jwt_access_expiry`
     /// seconds from when it is issued, not `jwt_refresh_expiry`.
     pub jwt_refresh_expiry: u64,
+    /// CORS layer for the REST endpoints, built from `cors_allow_origin`.
     #[serde(skip_serializing)]
     pub cors_allow_origin: CorsLayer,
     /// The same origin policy the `cors_allow_origin` layer enforces,
     /// kept in an inspectable form for the WebSocket `Origin` check.
     #[serde(skip_serializing)]
     pub cors_origins: CorsOriginPolicy,
+    /// Every message sent to the mediator must be signed.
     pub block_anonymous_outer_envelope: bool,
+    /// The outer envelope's signer must be the session's DID.
     pub force_session_did_match: bool,
+    /// Admin messages must arrive directly, not through another mediator.
     pub block_remote_admin_msgs: bool,
     /// When `true`, this mediator explicitly acts as an inter-mediator relay
     /// (accepts anonymous `/inbound` forwards). Defaults to `false`. Today
@@ -339,8 +356,10 @@ pub struct SecurityConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustTaskVerification {
+    /// Log and count the failure, then run the task.
     #[default]
     Warn,
+    /// Refuse the task with a problem report.
     Enforce,
 }
 

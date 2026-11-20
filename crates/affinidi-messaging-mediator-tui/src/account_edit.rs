@@ -23,7 +23,9 @@ const MODES: [AccessListMode; 2] = [AccessListMode::ExplicitDeny, AccessListMode
 /// Which queue limit a [`Setting::Limit`] row is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitKind {
+    /// The account's send-queue limit (`sendQueueLimit`).
     Send,
+    /// The account's receive-queue limit (`receiveQueueLimit`).
     Receive,
 }
 
@@ -40,9 +42,12 @@ impl LimitKind {
 /// One editable setting.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Setting {
+    /// The account's role. Offered only to a rootAdmin; `mediator` is never
+    /// assignable.
     Role(Role),
     /// An ACL flag, by its wire name (one of [`ACL_FLAGS`]).
     Flag(&'static str, bool),
+    /// Whether the account's access list is a denylist or an allowlist.
     AccessListMode(AccessListMode),
     /// A queue limit; `-1` is unlimited, `None` is not set on the account
     /// (the mediator default).
@@ -158,8 +163,11 @@ fn mode_of(mode: get::MediatorAclAccessListMode) -> Option<AccessListMode> {
 /// nothing in it changed.
 #[derive(Clone, Debug, Default)]
 pub struct AccountChanges {
+    /// The new role, when the role row changed.
     pub role: Option<Role>,
+    /// The changed ACL flags and access-list mode only.
     pub acl: Option<update::MediatorAcl>,
+    /// The changed queue limits only.
     pub limits: Option<update::QueueLimits>,
 }
 
@@ -168,8 +176,11 @@ pub struct AccountChanges {
 pub struct AccountEdit {
     /// The account hash.
     pub target: String,
+    /// The settings being edited, in display order, with their current
+    /// (possibly edited) values.
     pub rows: Vec<Setting>,
     original: Vec<Setting>,
+    /// Index into `rows` of the highlighted row.
     pub selected: usize,
     /// Digits typed into the selected limit, not yet applied.
     pub typing: Option<String>,
@@ -210,11 +221,15 @@ impl AccountEdit {
         }
     }
 
+    /// Select the previous row, applying any digits typed into the current
+    /// one first.
     pub fn up(&mut self) {
         self.commit_typing();
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Select the next row, applying any digits typed into the current one
+    /// first.
     pub fn down(&mut self) {
         self.commit_typing();
         self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
@@ -243,6 +258,7 @@ impl AccountEdit {
         }
     }
 
+    /// Remove the last character typed into a limit row.
     pub fn backspace(&mut self) {
         if let Some(t) = &mut self.typing {
             t.pop();

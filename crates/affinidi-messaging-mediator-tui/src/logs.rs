@@ -31,10 +31,15 @@ const KEEP: usize = 1000;
 /// How serious a captured line is, read from the level the subscriber printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
+    /// `TRACE`: the most verbose.
     Trace,
+    /// `DEBUG`.
     Debug,
+    /// `INFO`.
     Info,
+    /// `WARN`: counted by [`LogCapture::unseen`].
     Warn,
+    /// `ERROR`: counted by [`LogCapture::unseen`].
     Error,
 }
 
@@ -72,6 +77,8 @@ pub struct LogCapture {
 }
 
 impl LogCapture {
+    /// A capture holding no lines, passing output through until
+    /// [`hold`](Self::hold) is called.
     pub fn new() -> Self {
         Self::default()
     }
@@ -109,6 +116,8 @@ impl LogCapture {
         self.lock().unseen
     }
 
+    /// Reset [`unseen`](Self::unseen) to zero, once the user has looked at
+    /// the logs.
     pub fn mark_seen(&self) {
         self.lock().unseen = 0;
     }

@@ -25,6 +25,12 @@
 //! before sending one. The live [`MonitorFeed`] reports lost batches and
 //! dead taps rather than going quiet.
 
+// The README's examples, compiled (not run) by `cargo test --doc`. Only
+// doctest builds see this item, so it never reaches the docs or the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod address_book;
 mod console;
 mod error;

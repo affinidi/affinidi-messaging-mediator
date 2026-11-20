@@ -165,6 +165,7 @@ strip = "symbols"
 # existing site carries `#[allow(unsafe_code)]` and a `// SAFETY:` comment; a
 # new one fails the build until it gets both.
 unsafe_code = "deny"
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 uninlined_format_args = "warn"

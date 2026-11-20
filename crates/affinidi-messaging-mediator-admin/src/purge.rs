@@ -44,6 +44,8 @@ pub(crate) fn transit_margin_secs(request_timeout: std::time::Duration) -> u64 {
 pub struct PurgeRequest {
     /// Whose queue: `None` is the console's own account.
     pub target: Target,
+    /// Which of the account's queues: its inbox (`Receive`), or the messages
+    /// it sent that still wait for their recipients (`Send`).
     pub queue: Queue,
     /// Only messages exchanged with this counterparty.
     pub peer: Option<String>,
@@ -54,10 +56,13 @@ pub struct PurgeRequest {
 /// A counted purge, ready to confirm.
 #[derive(Clone, Debug)]
 pub struct PurgePlan {
+    /// The request the preview counted, which the purge sends again.
     pub request: PurgeRequest,
     /// Messages the preview matched — what the user is asked to confirm. The
     /// purge removes at most these.
     pub matched: u64,
+    /// Total size of the matched messages, in bytes; `0` when the mediator
+    /// does not report it.
     pub matched_bytes: u64,
     /// When the preview was asked for (just before it was sent). The purge
     /// is pinned to this instant.

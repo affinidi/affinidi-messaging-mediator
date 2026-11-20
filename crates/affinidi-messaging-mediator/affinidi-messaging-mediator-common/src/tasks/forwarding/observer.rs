@@ -17,7 +17,9 @@ use crate::store::types::ForwardQueueEntry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ForwardTransport {
+    /// An HTTP(S) POST to the peer's endpoint.
     Rest,
+    /// A WebSocket connection to the peer.
     Websocket,
 }
 
@@ -27,18 +29,32 @@ pub enum ForwardTransport {
 pub enum ForwardOutcome {
     /// The peer accepted it: a 2xx over REST, or a positive relay-ack over a
     /// websocket. The entry has left the queue.
-    Relayed { transport: ForwardTransport },
+    Relayed {
+        /// How it reached the peer.
+        transport: ForwardTransport,
+    },
     /// This attempt failed, and the entry is queued again. `attempt` counts
     /// from 1; the entry is abandoned after `max_retries` retries.
-    Retrying { attempt: u32, max_retries: u32 },
+    Retrying {
+        /// The attempt that failed, counting from 1.
+        attempt: u32,
+        /// The configured `max_retries`.
+        max_retries: u32,
+    },
     /// The entry was dropped undelivered: its retries are exhausted (the
     /// sender is then sent a problem report, when the processor can pack one),
     /// or it could not be queued again for its retry.
-    Abandoned { attempts: u32 },
+    Abandoned {
+        /// Attempts made in all.
+        attempts: u32,
+    },
     /// The peer answered and refused it (`status` is its HTTP status, a 4xx
     /// other than 408/425/429). It was dropped without a retry, and the
     /// sender is sent a problem report.
-    Refused { status: u16 },
+    Refused {
+        /// The peer's HTTP status.
+        status: u16,
+    },
     /// The next-hop endpoint is not one this mediator forwards to: its URL
     /// does not parse, or the egress policy does not admit it (scheme or
     /// address class). No request was made, it was dropped without a retry,
@@ -51,5 +67,7 @@ pub enum ForwardOutcome {
 
 /// Told the outcome of every relay attempt.
 pub trait ForwardingObserver: Send + Sync {
+    /// Called once per entry per attempt, inline on the delivery path: must
+    /// be cheap and must not block.
     fn observe(&self, entry: &ForwardQueueEntry, outcome: ForwardOutcome);
 }

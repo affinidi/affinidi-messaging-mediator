@@ -77,6 +77,7 @@ pub struct AddressBook {
 }
 
 impl AddressBook {
+    /// An empty book, saved nowhere until [`save`](Self::save).
     pub fn new() -> Self {
         Self::default()
     }

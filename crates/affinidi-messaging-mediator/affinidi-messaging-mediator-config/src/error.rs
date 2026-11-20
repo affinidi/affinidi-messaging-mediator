@@ -11,7 +11,9 @@ pub enum ConfigError {
     /// The config file could not be opened/read.
     #[error("could not open config file ({path}): {source}")]
     FileRead {
+        /// The path that was tried.
         path: String,
+        /// Why it could not be read.
         source: std::io::Error,
     },
     /// The TOML did not deserialize into [`ConfigRaw`](crate::ConfigRaw).

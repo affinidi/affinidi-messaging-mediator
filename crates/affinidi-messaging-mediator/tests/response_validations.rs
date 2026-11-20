@@ -1,3 +1,7 @@
+//! Assertions on the mediator's answers in the integration tests.
+//!
+//! Included as a module by `integration_test_messaging`; Cargo also builds it
+//! as a test target of its own, which holds no tests.
 #![cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_didcomm::message::Message;
@@ -14,6 +18,8 @@ use affinidi_secrets_resolver::SecretsResolver;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use sha256::digest;
 
+/// Asserts that a REST `status-request` answer is a pickup status reply for
+/// `recipient_did` with exactly one queued message and no live delivery.
 #[allow(dead_code)]
 pub async fn validate_status_reply<S>(
     status_reply: SendMessageResponse,
@@ -47,6 +53,10 @@ pub async fn validate_status_reply<S>(
     }
 }
 
+/// Unpacks every message attached to a pickup `delivery` answer and returns
+/// their ids, for a later `messages-received`. Asserts that the first is the
+/// reply threaded on `pong_msg_id`; panics on an attachment that is not base64
+/// or does not unpack.
 #[allow(dead_code)]
 pub async fn validate_message_delivery<S>(
     message_delivery: SendMessageResponse,
@@ -132,6 +142,8 @@ where
     response
 }
 
+/// Asserts that the status reply to a `messages-received` shows the queue for
+/// `recipient_did` now empty: no messages, no bytes, nothing waiting.
 #[allow(dead_code)]
 pub async fn validate_message_received_status_reply<S>(
     status_reply: SendMessageResponse,
@@ -164,6 +176,8 @@ pub async fn validate_message_received_status_reply<S>(
     }
 }
 
+/// Asserts that the mediator answered a forward with `Forwarded`, and returns
+/// whether it did.
 #[allow(dead_code)]
 pub async fn validate_forward_request_response(
     forward_request_response: SendMessageResponse,
@@ -181,6 +195,8 @@ pub async fn validate_forward_request_response(
     forwarded
 }
 
+/// Asserts that every fetched message was addressed to `actor_did` (by its
+/// hash) and unpacks.
 #[allow(dead_code)]
 pub async fn validate_get_message_response<S>(
     list: GetMessagesResponse,
@@ -199,6 +215,8 @@ pub async fn validate_get_message_response<S>(
     }
 }
 
+/// Asserts that an inbox listing holds four messages, the middle two from the
+/// mediator.
 #[allow(dead_code)]
 pub fn validate_list_messages(list: Vec<MessageListElement>, mediator_did: &str) {
     assert_eq!(list.len(), 4);

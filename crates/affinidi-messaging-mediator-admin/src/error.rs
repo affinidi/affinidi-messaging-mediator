@@ -40,7 +40,9 @@ pub enum ConsoleError {
         .source.as_ref().map(|s| format!(": {s}")).unwrap_or_default()
     )]
     Connect {
+        /// The step that failed, e.g. resolving the DID or authenticating.
         context: String,
+        /// The underlying error, when there is one.
         #[source]
         source: Option<BoxError>,
     },
@@ -51,8 +53,13 @@ pub enum ConsoleError {
     /// `…:epochMismatch`, the epoch in force.
     #[error("the mediator refused ({code}): {comment}")]
     Refused {
+        /// The mediator's stable refusal code, e.g.
+        /// `protocol.trust_task.unsupported`.
         code: String,
+        /// The mediator's human-readable explanation.
         comment: String,
+        /// For an `…:epochMismatch`, the member's epoch now in force;
+        /// otherwise `None`.
         current_epoch: Option<u64>,
     },
     /// The console's session cannot do this, so nothing was sent.
@@ -62,7 +69,12 @@ pub enum ConsoleError {
     /// [`MediatorConsole::purge`](crate::MediatorConsole::purge) no longer
     /// returns it: a purge is pinned to its preview instead.
     #[error("the queue changed since the purge was previewed ({previewed} then, {now} now)")]
-    PlanStale { previewed: u64, now: u64 },
+    PlanStale {
+        /// Messages the preview counted.
+        previewed: u64,
+        /// Messages that matched when the purge was confirmed.
+        now: u64,
+    },
     /// The request was malformed, so nothing was sent.
     #[error("{0}")]
     Invalid(String),
@@ -82,7 +94,10 @@ pub enum ConsoleError {
     /// was abandoned; the request may still have reached the mediator.
     #[error("{operation}: no answer from the mediator within {}s", .after.as_secs_f32())]
     Timeout {
+        /// What timed out, as the error message names it: a Trust Task
+        /// such as `"audit/list"`, or `"connecting to the mediator"`.
         operation: &'static str,
+        /// How long it waited.
         after: Duration,
     },
     /// Anything else the SDK reported: a local or configuration failure that

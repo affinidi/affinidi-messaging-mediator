@@ -57,9 +57,14 @@ impl AccountTally {
 /// classify.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProtocolMix {
+    /// Arrivals over DIDComm v2.
     pub didcomm: u64,
+    /// Arrivals over DIDComm v1 (Aries RFC 0019).
     pub didcomm_v1: u64,
+    /// Arrivals over TSP.
     pub tsp: u64,
+    /// Arrivals the monitor could not classify, or on a wire this console
+    /// does not know.
     pub other: u64,
 }
 
@@ -109,6 +114,7 @@ pub struct TrafficTally {
 }
 
 impl TrafficTally {
+    /// Empty totals, counted from `now`.
     pub fn new(now: Instant) -> Self {
         Self {
             started: now,

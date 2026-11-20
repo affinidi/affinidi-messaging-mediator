@@ -43,7 +43,10 @@ pub enum Retryable {
     /// Try again. `retry_after` overrides the helper's exponential
     /// step when present (typically populated from the provider's
     /// `Retry-After` / throttle hint).
-    Yes { retry_after: Option<Duration> },
+    Yes {
+        /// The provider's hint for how long to wait, if it gave one.
+        retry_after: Option<Duration>,
+    },
     /// Stop. The error will be returned to the caller as-is.
     No,
 }

@@ -12,7 +12,7 @@ Connect as any DID with an account on the mediator:
 The same screens are also available as ratatui components, which you can embed
 in another application ([Embedding](#embedding)).
 
-```
+```text
  mediator-console  ADMIN  ● connected  b48a53fa…1f29 → did:peer:2.Vz6Mkkn…  updated 1s ago
  1 Dashboard │ 2 Queues │ 3 Account │ 4 Audit │ 5 Accounts │ 6 Config │ 7 Mux │ 8 Grants
 ┌ Account 1f22bbf6…b9a1 ─────────────────────┐┌ Traffic — all traffic ● live ───────┐
@@ -284,31 +284,53 @@ quit, logging goes back to stderr.
 
 The console is a library as well as a binary:
 
-```rust
+```rust,no_run
 use affinidi_messaging_mediator_admin::{Identity, MediatorConsole};
-use affinidi_messaging_mediator_tui::{App, Control};
+use affinidi_messaging_mediator_tui::App;
+use ratatui::{Terminal, backend::Backend};
 
-let console = MediatorConsole::connect(identity).await?;
-let mut app = App::new(console);
+async fn embed<B: Backend>(
+    identity: Identity,
+    terminal: &mut Terminal<B>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    std::io::Error: From<B::Error>,
+{
+    let console = MediatorConsole::connect(identity).await?;
+    let app = App::new(console);
 
-// Hand over a terminal and let the console run its own loop…
-app.run(&mut terminal).await?;
+    // Hand over a terminal and let the console run its own loop…
+    app.run(terminal).await?;
 
-// …or keep your own loop and feed the console:
-//   app.handle_key(key)                  on a key press (Control::Quit when done)
-//   app.apply(app.next_update().await?)  when background work finishes
-//   app.render(frame, area)              to draw into any area of your layout
+    // …or keep your own loop and feed the console:
+    //   app.handle_key(key)        on a key press (Control::Quit when done)
+    //   app.next_update().await    background results, for app.apply(update)
+    //   app.render(frame, area)    to draw into any area of your layout
+    Ok(())
+}
 ```
 
 - `App::with_logs(capture)` keeps your log output off the console's screen.
   Give the same `LogCapture` to your `tracing` subscriber as its writer. It
   prints to stderr as usual, except while a console holds it:
 
-  ```rust
-  let logs = LogCapture::new();
-  tracing_subscriber::fmt().with_writer(logs.make_writer()).init();
-  // …
-  App::new(console).with_logs(logs.clone()).run(&mut terminal).await?;
+  ```rust,no_run
+  use affinidi_messaging_mediator_admin::MediatorConsole;
+  use affinidi_messaging_mediator_tui::{App, LogCapture};
+  use ratatui::{Terminal, backend::Backend};
+
+  async fn with_logs<B: Backend>(
+      console: MediatorConsole,
+      terminal: &mut Terminal<B>,
+  ) -> std::io::Result<()>
+  where
+      std::io::Error: From<B::Error>,
+  {
+      let logs = LogCapture::new();
+      tracing_subscriber::fmt().with_writer(logs.make_writer()).init();
+      // …
+      App::new(console).with_logs(logs.clone()).run(terminal).await
+  }
   ```
 
   A host with its own loop redraws when `app.log_changed()` resolves.

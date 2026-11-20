@@ -732,6 +732,9 @@ pub struct ForwardingProcessor {
 }
 
 impl ForwardingProcessor {
+    /// Builds a processor that reads `FORWARD_Q` as a new consumer
+    /// (`processor_<uuid>`) of `config.consumer_group`. Nothing runs until it
+    /// is started. Fails if the HTTP client pool cannot be built.
     pub fn new(
         config: ForwardingConfig,
         database: Arc<dyn MediatorStore>,

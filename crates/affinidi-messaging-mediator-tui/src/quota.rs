@@ -20,9 +20,13 @@ use ratatui::widgets::Widget;
 /// How many colours the terminal can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorDepth {
+    /// 24-bit RGB (`COLORTERM` says `truecolor` or `24bit`).
     TrueColor,
+    /// The 256-colour palette (`TERM` names `256color`).
     Indexed256,
+    /// The basic ANSI colours: anything else.
     Basic,
+    /// No colour (`NO_COLOR` is set): the bar is drawn in shading only.
     Monochrome,
 }
 
@@ -92,6 +96,8 @@ pub struct QuotaBar {
 }
 
 impl QuotaBar {
+    /// A bar filled to `ratio` (used ÷ limit; above 1 is drawn full), or an
+    /// empty track for `None`, coloured for `depth`.
     pub fn new(ratio: Option<f64>, depth: ColorDepth) -> Self {
         Self { ratio, depth }
     }

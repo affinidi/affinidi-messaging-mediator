@@ -12,7 +12,7 @@
 //! Switching the rule outright would move where a running deployment finds its
 //! TLS private key, so the old behaviour is kept as a **fallback**: a path that
 //! is absent beside the config file but present relative to the working
-//! directory still resolves, and says so through [`PathSource::WorkingDir`](crate::config_path::PathSource::WorkingDir) so
+//! directory still resolves, and says so through [`WorkingDir`](crate::config_path::PathSource::WorkingDir) so
 //! the caller can warn. This module logs nothing: config is read before the
 //! tracing subscriber exists, and a warning emitted then is silently dropped.
 //! Callers warn once logging is up.
@@ -40,7 +40,11 @@ pub enum PathSource {
 /// A configured path after resolution, and how it was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
+    /// The path to use: absolute as written, or `raw` joined to the
+    /// configuration file's directory (the working directory for
+    /// [`PathSource::WorkingDir`]).
     pub path: PathBuf,
+    /// Which rule produced `path`.
     pub source: PathSource,
 }
 

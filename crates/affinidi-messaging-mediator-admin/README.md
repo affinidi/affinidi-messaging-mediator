@@ -29,20 +29,25 @@ access-list, audit and configuration calls work on older mediators too.
 
 ## Connecting
 
-```rust
+```rust,no_run
 use affinidi_messaging_mediator_admin::{Identity, MediatorConsole, Mode};
+use affinidi_secrets_resolver::secrets::Secret;
 
-let console = MediatorConsole::connect(Identity {
-    alias: "operator".into(),
-    did: "did:peer:2...".into(),
-    secrets,                 // the DID's Ed25519 and key-agreement secrets
-    mediator_did: None,      // None = use the mediator from the DID's DIDCommMessaging service
-})
-.await?;
+// `secrets`: the DID's Ed25519 and key-agreement secrets.
+async fn connect(secrets: Vec<Secret>) -> affinidi_messaging_mediator_admin::Result<()> {
+    let console = MediatorConsole::connect(Identity {
+        alias: "operator".into(),
+        did: "did:peer:2...".into(),
+        secrets,
+        mediator_did: None, // None = use the mediator from the DID's DIDCommMessaging service
+    })
+    .await?;
 
-match console.mode() {
-    Mode::Admin { root } => println!("administering (rootAdmin: {root})"),
-    Mode::SelfService => println!("managing {}", console.did_hash()),
+    match console.mode() {
+        Mode::Admin { root } => println!("administering (rootAdmin: {root})"),
+        Mode::SelfService => println!("managing {}", console.did_hash()),
+    }
+    Ok(())
 }
 ```
 
@@ -58,10 +63,14 @@ instance is dedicated to the console. (`connect_with` is deprecated: it is
 it: `ConnState::Disconnected` on every drop, `Connected` on every reconnect.
 Show it rather than inferring connectivity from failed calls:
 
-```rust
-if let Some(mut state) = console.connection_state() {
-    while state.changed().await.is_ok() {
-        println!("mediator connection: {:?}", *state.borrow_and_update());
+```rust,no_run
+use affinidi_messaging_mediator_admin::MediatorConsole;
+
+async fn watch_connection(console: &MediatorConsole) {
+    if let Some(mut state) = console.connection_state() {
+        while state.changed().await.is_ok() {
+            println!("mediator connection: {:?}", *state.borrow_and_update());
+        }
     }
 }
 ```
@@ -86,14 +95,17 @@ you choose, including its secrets:
 The mediator knows an account only by `sha256(did)`, as lowercase hex.
 `AddressBook` maps that hash back to a DID and a nickname:
 
-```rust
+```rust,no_run
 use affinidi_messaging_mediator_admin::{AddressBook, account_hash};
+use std::path::Path;
 
-let mut book = AddressBook::load(&path)?;       // a JSON list of { name, did }
-book.insert("did:peer:2.Vz6Mk…", "alice's phone"); // saved
-book.know(&vta_did, "billing context");          // supplied by the app, not saved
-assert_eq!(book.name_of(&account_hash("did:peer:2.Vz6Mk…")), Some("alice's phone"));
-book.save(&path)?;
+fn names(path: &Path, vta_did: &str) -> std::io::Result<()> {
+    let mut book = AddressBook::load(path)?; // a JSON list of { name, did }
+    book.insert("did:peer:2.Vz6Mk…", "alice's phone"); // saved
+    book.know(vta_did, "billing context"); // supplied by the app, not saved
+    assert_eq!(book.name_of(&account_hash("did:peer:2.Vz6Mk…")), Some("alice's phone"));
+    book.save(path)
+}
 ```
 
 A name you save wins over one the application supplies, so an embedding
@@ -108,16 +120,21 @@ authenticating, reading the account) and `request_timeout` for each call
 after (both default to 30 s). To bound one call differently, wrap it in
 `with_deadline`; to cancel one, drop its future.
 
-```rust
+```rust,no_run
 use std::time::Duration;
-use affinidi_messaging_mediator_admin::{ConsoleOptions, MediatorConsole, with_deadline};
+use affinidi_messaging_mediator_admin::{
+    ConsoleOptions, Identity, MediatorConsole, Result, with_deadline,
+};
 
-let console = MediatorConsole::connect_with_options(
-    identity,
-    ConsoleOptions::default().with_request_timeout(Duration::from_secs(10)),
-)
-.await?;
-let stats = with_deadline("stats", Duration::from_secs(2), console.stats()).await?;
+async fn bounded(identity: Identity) -> Result<()> {
+    let console = MediatorConsole::connect_with_options(
+        identity,
+        ConsoleOptions::default().with_request_timeout(Duration::from_secs(10)),
+    )
+    .await?;
+    let stats = with_deadline("stats", Duration::from_secs(2), console.stats()).await?;
+    Ok(())
+}
 ```
 
 Through an existing SDK instance, `connect_exclusive_with_options` and
@@ -157,21 +174,28 @@ A purge is counted before it runs. The other changes — `delete`,
 single calls: a front end shows what will change and asks before it sends
 one.
 
-```rust
-use affinidi_messaging_mediator_admin::PurgeRequest;
+```rust,no_run
 use affinidi_messaging_mediator_admin::specs::queue::purge::v0_1::Queue;
+use affinidi_messaging_mediator_admin::{MediatorConsole, PurgeRequest, Result};
 
-let plan = console
-    .purge_preview(PurgeRequest {
-        target: Some(stuck_account),
-        queue: Queue::Send,
-        peer: Some(stalled_recipient),
-        older_than_seconds: None,
-    })
-    .await?;
-// Show plan.matched to the user and ask them to confirm it.
-let done = console.purge(plan).await?;
-// done.purged says how many actually went.
+async fn purge_stuck(
+    console: &MediatorConsole,
+    stuck_account: String,
+    stalled_recipient: String,
+) -> Result<()> {
+    let plan = console
+        .purge_preview(PurgeRequest {
+            target: Some(stuck_account),
+            queue: Queue::Send,
+            peer: Some(stalled_recipient),
+            older_than_seconds: None,
+        })
+        .await?;
+    // Show plan.matched to the user and ask them to confirm it.
+    let done = console.purge(plan).await?;
+    // done.purged says how many actually went.
+    Ok(())
+}
 ```
 
 `purge` is pinned to the moment of the preview: it never removes a message
@@ -187,25 +211,31 @@ The mediator's `queue/purge` has no "as of" member yet, so the pin is an age
 
 ## Live traffic
 
-```rust
-use affinidi_messaging_mediator_admin::{MonitorFilter, MonitorUpdate};
+```rust,no_run
+use affinidi_messaging_mediator_admin::{MediatorConsole, MonitorFilter, MonitorUpdate};
 
-let filter: MonitorFilter = serde_json::from_value(serde_json::json!({
-    "dids": [account_hash],
-    "failuresOnly": true,
-}))?;
-let mut feed = console.monitor(filter).await?;
-while let Some(update) = feed.next().await {
-    match update {
-        MonitorUpdate::Events { events, dropped } => { /* render */ }
-        MonitorUpdate::Membership { events, dropped } => { /* only with monitor_with */ }
-        MonitorUpdate::Gap { missing } => { /* batches lost in transit */ }
-        MonitorUpdate::Heartbeat => { /* the tap is alive */ }
-        MonitorUpdate::Disconnected => { /* the connection dropped, just now */ }
-        MonitorUpdate::Reconnected => { /* …and is back */ }
-        MonitorUpdate::Ended(reason) => break,
-        _ => {}
+async fn watch(
+    console: &MediatorConsole,
+    account_hash: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let filter: MonitorFilter = serde_json::from_value(serde_json::json!({
+        "dids": [account_hash],
+        "failuresOnly": true,
+    }))?;
+    let mut feed = console.monitor(filter).await?;
+    while let Some(update) = feed.next().await {
+        match update {
+            MonitorUpdate::Events { events, dropped } => { /* render */ }
+            MonitorUpdate::Membership { events, dropped } => { /* only with monitor_with */ }
+            MonitorUpdate::Gap { missing } => { /* batches lost in transit */ }
+            MonitorUpdate::Heartbeat => { /* the tap is alive */ }
+            MonitorUpdate::Disconnected => { /* the connection dropped, just now */ }
+            MonitorUpdate::Reconnected => { /* …and is back */ }
+            MonitorUpdate::Ended(reason) => break,
+            _ => {}
+        }
     }
+    Ok(())
 }
 ```
 
@@ -229,34 +259,46 @@ while let Some(update) = feed.next().await {
 An administrator can list, revoke and void the stored grants of DID
 multiplexing (mediator 0.52.0 and later):
 
-```rust
-use affinidi_messaging_mediator_admin::{GrantKey, GrantSelection, revoke_summary};
+```rust,no_run
+use affinidi_messaging_mediator_admin::{
+    GrantKey, GrantSelection, MediatorConsole, Result, revoke_summary,
+};
 
-// A member's grants, a page at a time; `epoch` is the member's current one.
-let page = console.mux_grants(None, Some(&member_did), None, Some(100)).await?;
+async fn manage_grants(
+    console: &MediatorConsole,
+    member_did: String,
+    other_did: String,
+    grant_id: String,
+    grant_a: String,
+    grant_b: String,
+) -> Result<()> {
+    // A member's grants, a page at a time; `epoch` is the member's current one.
+    let page = console.mux_grants(None, Some(&member_did), None, Some(100)).await?;
 
-// Revoke chosen grants, or all of a principal's or member's. It keeps going
-// while grants still match, a bounded number of rounds.
-let outcome = console
-    .mux_revoke(&GrantSelection::grants(&member_did, vec![grant_id]))
-    .await?;
-println!("{}", revoke_summary(&outcome)); // "revoked 1 grant(s); none remain"
+    // Revoke chosen grants, or all of a principal's or member's. It keeps going
+    // while grants still match, a bounded number of rounds.
+    let outcome = console
+        .mux_revoke(&GrantSelection::grants(&member_did, vec![grant_id]))
+        .await?;
+    println!("{}", revoke_summary(&outcome)); // "revoked 1 grant(s); none remain"
 
-// Revoke several chosen grants, one request each, and hear about each:
-// a refusal (a rootAdmin party's grant is protected) doesn't stop the rest,
-// and a grant counts as revoked only when the mediator's answer lists it.
-let bulk = console
-    .mux_revoke_each(&[GrantKey::new(&member_did, grant_a), GrantKey::new(&other_did, grant_b)])
-    .await?;
-println!("{}", bulk.summary()); // "revoked 1 of 2 grant(s); 1 refused"
-for line in bulk.failures() { println!("{line}"); }
+    // Revoke several chosen grants, one request each, and hear about each:
+    // a refusal (a rootAdmin party's grant is protected) doesn't stop the rest,
+    // and a grant counts as revoked only when the mediator's answer lists it.
+    let bulk = console
+        .mux_revoke_each(&[GrantKey::new(&member_did, grant_a), GrantKey::new(&other_did, grant_b)])
+        .await?;
+    println!("{}", bulk.summary()); // "revoked 1 of 2 grant(s); 1 refused"
+    for line in bulk.failures() { println!("{line}"); }
 
-// Void every grant a member gave: read its epoch, confirm, then name it.
-let epoch = console.mux_epoch(&member_did).await?;
-match console.mux_bump_epoch(&member_did, epoch).await {
-    Ok(r) if r.epoch_advanced => { /* r.revoked_grants voided */ }
-    Ok(_) => { /* someone voided that epoch already: nothing changed */ }
-    Err(e) => eprintln!("{}", e.explain()), // epochMismatch, protectedAccount, …
+    // Void every grant a member gave: read its epoch, confirm, then name it.
+    let epoch = console.mux_epoch(&member_did).await?;
+    match console.mux_bump_epoch(&member_did, epoch).await {
+        Ok(r) if r.epoch_advanced => { /* r.revoked_grants voided */ }
+        Ok(_) => { /* someone voided that epoch already: nothing changed */ }
+        Err(e) => eprintln!("{}", e.explain()), // epochMismatch, protectedAccount, …
+    }
+    Ok(())
 }
 ```
 
