@@ -462,7 +462,6 @@ impl SealedHandoffState {
     }
 
     /// Copy `request_json` onto the system clipboard via `arboard`.
-    /// Mirrors the pattern used by openvtc-cli2's `DIDKeysShow`.
     /// Writes the result into `clipboard_status` so the renderer can
     /// surface "Copied!" or the specific error on the next frame.
     pub fn copy_request_to_clipboard(&mut self) {
