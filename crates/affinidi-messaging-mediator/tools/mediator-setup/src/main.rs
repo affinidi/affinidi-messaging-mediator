@@ -1,3 +1,8 @@
+//! `mediator-setup`: the setup wizard for an Affinidi messaging mediator. It
+//! writes the mediator's `mediator.toml`, its secrets and an administrator
+//! profile, interactively on a terminal or headless from a build recipe
+//! (`--from`) or flags (`--non-interactive`).
+
 // In a build without the `vta` feature the docs of the VTA modules still name
 // the vta-sdk types and the gated items they describe.
 #![cfg_attr(not(feature = "vta"), allow(rustdoc::broken_intra_doc_links))]
