@@ -113,7 +113,9 @@ const KIND_ADMIN_CREDENTIAL: &str = "admin-credential";
 /// from memory, so its fields can't be moved out — clone them instead.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AdminCredential {
+    /// The admin DID (must start with `did:`).
     pub did: String,
+    /// The admin DID's private key, multibase-encoded; never empty.
     pub private_key_multibase: String,
     /// VTA DID this credential authenticates against. `None` for
     /// self-hosted deployments. `#[serde(default)]` so older
@@ -130,6 +132,7 @@ pub struct AdminCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vta_url: Option<String>,
     #[serde(default = "default_context")]
+    /// VTA context this mediator lives in (`"mediator"` when absent).
     pub context: String,
 }
 
@@ -233,7 +236,10 @@ const KIND_VTA_BUNDLE: &str = "vta-cached-bundle";
 /// keys) or its HMAC.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VtaCachedBundle {
+    /// Unix seconds (UTC) when the bundle was fetched from the VTA.
     pub fetched_at: u64,
+    /// How long the cache is trusted after `fetched_at`, in seconds; `0`
+    /// means it never expires.
     pub ttl_secs: u64,
     /// HMAC-SHA256 of the canonical cache form (fetched_at || ttl_secs ||
     /// canonical(bundle)) keyed from the admin credential's private key.
@@ -346,6 +352,8 @@ pub struct MediatorSecrets {
 const PROBE_READONLY_REUSE: Duration = Duration::from_secs(30);
 
 impl MediatorSecrets {
+    /// Wraps `store`, putting a per-key backend behind a [`BundledStore`]
+    /// (single-object backends are used as they are).
     pub fn new(store: DynSecretStore) -> Self {
         if store.is_single_object() {
             return Self {
@@ -382,14 +390,19 @@ impl MediatorSecrets {
         Ok(Self::new(open_store_with_passphrase(url, passphrase)?))
     }
 
+    /// The store every read and write goes through (the [`BundledStore`]
+    /// wrapper for a per-key backend).
     pub fn store(&self) -> &DynSecretStore {
         &self.store
     }
 
+    /// [`MediatorSecrets::store`] as a cloned `Arc`.
     pub fn store_arc(&self) -> Arc<dyn crate::secrets::store::SecretStore> {
         Arc::clone(&self.store)
     }
 
+    /// Write–read–delete health check through the store; see
+    /// [`SecretStore::probe`](crate::secrets::SecretStore::probe).
     pub async fn probe(&self) -> Result<()> {
         self.store.probe().await
     }
@@ -467,6 +480,9 @@ impl MediatorSecrets {
     // here yet (operating keys, DID docs, etc.). Callers still get schema
     // versioning + kind checking; they just supply the concrete type.
 
+    /// Reads `key` and opens its envelope, checking it holds `kind`.
+    /// `Ok(None)` when nothing is stored; an envelope of another kind or
+    /// version is an error.
     pub async fn load_entry<T: DeserializeOwned>(
         &self,
         key: &str,
@@ -478,6 +494,7 @@ impl MediatorSecrets {
         Envelope::<T>::open(&bytes, key, kind).map(Some)
     }
 
+    /// Seals `value` in an envelope of `kind` and writes it under `key`.
     pub async fn store_entry<T: Serialize>(
         &self,
         key: &str,
@@ -488,12 +505,15 @@ impl MediatorSecrets {
         self.store.put(key, &bytes).await
     }
 
+    /// Deletes `key`; deleting a missing key is not an error.
     pub async fn delete_entry(&self, key: &str) -> Result<()> {
         self.store.delete(key).await
     }
 
     // ── Admin credential ─────────────────────────────────────────────
 
+    /// Reads and validates the [`ADMIN_CREDENTIAL`] entry. `Ok(None)` when
+    /// none is stored; a malformed credential is [`SecretStoreError::InvalidShape`].
     pub async fn load_admin_credential(&self) -> Result<Option<AdminCredential>> {
         let Some(bytes) = self.store.get(ADMIN_CREDENTIAL).await? else {
             return Ok(None);
@@ -504,6 +524,8 @@ impl MediatorSecrets {
         Ok(Some(cred))
     }
 
+    /// Validates `cred` and writes it as the [`ADMIN_CREDENTIAL`] entry;
+    /// an invalid credential is refused before anything is written.
     pub async fn store_admin_credential(&self, cred: &AdminCredential) -> Result<()> {
         cred.validate(ADMIN_CREDENTIAL)?;
         let bytes = Envelope::new(KIND_ADMIN_CREDENTIAL, cred.clone()).seal()?;
@@ -526,12 +548,15 @@ impl MediatorSecrets {
         Ok(Some(cred))
     }
 
+    /// Deletes the [`ADMIN_CREDENTIAL`] entry.
     pub async fn delete_admin_credential(&self) -> Result<()> {
         self.store.delete(ADMIN_CREDENTIAL).await
     }
 
     // ── JWT secret ───────────────────────────────────────────────────
 
+    /// Reads the [`JWT_SECRET`] entry: the raw key bytes the mediator signs
+    /// session tokens with. An empty stored secret is [`SecretStoreError::InvalidShape`].
     pub async fn load_jwt_secret(&self) -> Result<Option<Vec<u8>>> {
         let Some(bytes) = self.store.get(JWT_SECRET).await? else {
             return Ok(None);
@@ -546,6 +571,7 @@ impl MediatorSecrets {
         Ok(Some(raw))
     }
 
+    /// Writes `raw` as the [`JWT_SECRET`] entry; empty bytes are refused.
     pub async fn store_jwt_secret(&self, raw: &[u8]) -> Result<()> {
         if raw.is_empty() {
             return Err(SecretStoreError::InvalidShape {
@@ -842,6 +868,8 @@ impl Drop for EphemeralSeedPayload {
 /// One entry in the bootstrap sweep index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapSeedIndexEntry {
+    /// The sealed-handoff bundle id, lowercase hex (32 chars); the seed
+    /// lives under [`BOOTSTRAP_EPHEMERAL_SEED_PREFIX`] followed by this.
     pub bundle_id_hex: String,
     /// Unix seconds (UTC) when the entry was first written.
     pub created_at: u64,
@@ -851,6 +879,7 @@ pub struct BootstrapSeedIndexEntry {
 /// [`BOOTSTRAP_SEED_INDEX`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BootstrapSeedIndex {
+    /// Every bootstrap seed written and not yet consumed or swept.
     pub entries: Vec<BootstrapSeedIndexEntry>,
 }
 

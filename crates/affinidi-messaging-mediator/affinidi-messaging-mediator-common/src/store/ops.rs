@@ -75,7 +75,10 @@ pub enum Sender {
     Anonymous,
     /// A known (authenticated) sender, with whether it is currently on the
     /// recipient's access list.
-    Known { on_access_list: bool },
+    Known {
+        /// Whether the sender is on the recipient's access list now.
+        on_access_list: bool,
+    },
 }
 
 /// Whether `sender` is allowed to deliver a message to a recipient whose
@@ -104,7 +107,10 @@ pub fn access_list_allowed(recipient_acls: &MediatorACLSet, sender: Sender) -> b
 pub struct HeldMessage<'a> {
     /// The recipient the copy is held for.
     pub to_did_hash: &'a str,
+    /// DID hash of its sender; `None` for an anonymous message.
     pub from_did_hash: Option<&'a str>,
+    /// When the copy was first handed to its recipient, unix milliseconds;
+    /// `None` while it has never been.
     pub first_delivered_at_ms: Option<u64>,
 }
 
@@ -178,7 +184,9 @@ pub fn is_message_id(id: &str) -> bool {
 /// The parties of one stored record, for [`select_records`].
 #[derive(Clone, Copy, Debug)]
 pub struct RecordParties<'a> {
+    /// DID hash of the recipient the record is held for.
     pub to_did_hash: &'a str,
+    /// DID hash of its sender; `None` for an anonymous message.
     pub from_did_hash: Option<&'a str>,
 }
 
@@ -376,7 +384,11 @@ pub fn is_delete_not_found(err: &MediatorError) -> bool {
 /// The delivery fields of one stored record, borrowed for
 /// [`stamp_delivery`].
 pub struct DeliveryFields<'a> {
+    /// When the record was first handed over, unix milliseconds; set once.
     pub first_delivered_at_ms: &'a mut Option<u64>,
+    /// How many times the record has been handed over. A redelivery at
+    /// [`POISON_ATTEMPTS`](crate::store::POISON_ATTEMPTS) or more is counted as suspected
+    /// poison; it is still delivered.
     pub attempts: &'a mut u32,
     /// Unix seconds; `0` means no expiry.
     pub expires_at: &'a mut u64,
@@ -462,6 +474,7 @@ pub struct AccessListPlan {
     pub insert: Vec<String>,
     /// Entries listed now that the update drops.
     pub delete: Vec<String>,
+    /// What the update did, to report back.
     pub outcome: AccessListUpdateOutcome,
 }
 

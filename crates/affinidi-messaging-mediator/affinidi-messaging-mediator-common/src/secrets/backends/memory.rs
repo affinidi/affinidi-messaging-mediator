@@ -12,12 +12,15 @@ use async_trait::async_trait;
 use crate::secrets::error::{Result, SecretStoreError};
 use crate::secrets::store::SecretStore;
 
+/// A [`SecretStore`] that keeps entries in a process-local map. Nothing
+/// survives the process: for tests and short-lived tool flows only.
 pub struct MemoryStore {
     label: &'static str,
     data: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryStore {
+    /// An empty store; `label` is what [`SecretStore::backend`] reports.
     pub fn new(label: &'static str) -> Self {
         Self {
             label,

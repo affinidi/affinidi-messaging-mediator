@@ -47,6 +47,9 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
+    /// A closed breaker that opens after `failure_threshold` consecutive
+    /// failures and, once open, lets a probe through after
+    /// `open_duration_secs` seconds.
     pub fn new(failure_threshold: u32, open_duration_secs: u64) -> Self {
         Self {
             state: AtomicU32::new(STATE_CLOSED),

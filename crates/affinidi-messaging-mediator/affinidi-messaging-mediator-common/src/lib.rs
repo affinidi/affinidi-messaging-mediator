@@ -75,6 +75,8 @@ pub mod circuit_breaker;
 #[cfg(feature = "server")]
 pub mod database;
 #[cfg(feature = "server")]
+/// [`MediatorError`](errors::MediatorError), the error every store and
+/// handler returns, and its HTTP rendering.
 pub mod errors;
 #[cfg(feature = "server")]
 pub mod secrets;

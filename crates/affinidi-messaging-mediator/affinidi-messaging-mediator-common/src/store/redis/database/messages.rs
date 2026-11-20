@@ -11,7 +11,8 @@ use crate::types::messages::Folder;
 
 // Redis-backend implementation behind `RedisStore`.
 impl Database {
-    // Deletes a stream record
+    /// Deletes `did_hash`'s whole `RECEIVE_Q` (for [`Folder::Inbox`]) or
+    /// `SEND_Q` stream. The messages themselves are not touched.
     pub async fn delete_folder_stream(
         &self,
         session: &Session,

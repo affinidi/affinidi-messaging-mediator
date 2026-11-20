@@ -12,15 +12,15 @@
 //! be Lua), and a rule that drifts between them is a security bug, not a
 //! cosmetic one. So every grant rule — epoch, replay floor, quotas,
 //! narrow-only updates, suspension, expiry — is a pure function over one
-//! [`MuxDidRecord`](crate::store::mux::MuxDidRecord) in this module, and a backend provides only two
+//! member DID's [record](crate::store::mux::MuxDidRecord) in this module, and a backend provides only two
 //! primitives:
 //!
-//! - [`MuxStore::mux_record_get`] — read a member DID's record;
-//! - [`MuxStore::mux_record_cas`] — replace it if its version is still
+//! - [`mux_record_get`](crate::store::MuxStore::mux_record_get) — read a member DID's record;
+//! - [`mux_record_cas`](crate::store::MuxStore::mux_record_cas) — replace it if its version is still
 //!   the one that was read, updating the principal index in the same atomic
 //!   step.
 //!
-//! [`modify`](crate::store::mux::modify) runs the read → rule → compare-and-swap loop.
+//! [The `modify` function](crate::store::mux::modify) runs the read → rule → compare-and-swap loop.
 //!
 //! # Unit of atomicity
 //!
@@ -76,14 +76,17 @@ impl MuxScope {
         Ok(Self(set))
     }
 
+    /// Whether `cap` is in this scope.
     pub fn contains(&self, cap: MuxCapability) -> bool {
         self.0.contains(&cap)
     }
 
+    /// Whether every capability here is also in `other` (equal scopes count).
     pub fn is_subset(&self, other: &MuxScope) -> bool {
         self.0.is_subset(&other.0)
     }
 
+    /// The capabilities, in their declared order.
     pub fn iter(&self) -> impl Iterator<Item = MuxCapability> + '_ {
         self.0.iter().copied()
     }
@@ -109,6 +112,7 @@ impl From<MuxScope> for Vec<MuxCapability> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MuxGrantState {
+    /// In force until it expires, is narrowed away or changes state.
     Active,
     /// The member proved control with a key no active grant was signed with
     /// (§5.3). Terminal: recreating needs a fresh member signature.
@@ -116,6 +120,8 @@ pub enum MuxGrantState {
     /// The signing key is no longer in the member's authentication
     /// relationship (§5.1). Terminal, even if the key comes back.
     StaleKey,
+    /// Active, but past its effective expiry. Reported by
+    /// [`MuxGrant::state_at`], never stored.
     Expired,
     /// Voided by a `revoke-all` epoch bump (§5.2). Terminal.
     EpochRevoked,
@@ -150,31 +156,43 @@ impl MuxGrantState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MuxGrant {
+    /// Grant id from the statement, unique within the member DID's record.
     pub grant_id: String,
     /// The member DID, and its hash (the record key).
     pub did: String,
+    /// SHA-256 hash of `did`, hex: the record key.
     pub did_hash: String,
+    /// The principal DID the grant lets collect the member's messages.
     pub principal: String,
+    /// SHA-256 hash of `principal`, hex: the principal index key.
     pub principal_hash: String,
     /// The verification method that signed the grant, and its public-key
     /// fingerprint, as resolved when it was stored (§5.1).
     pub kid: String,
+    /// Fingerprint of the signing key: SHA-256 of its public key.
     pub key_fp: String,
     /// The member DID's document version at signing, where the method has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub did_version: Option<String>,
     /// The member's epoch the grant was issued under (§5.2).
     pub epoch: u64,
+    /// The capabilities granted as signed; see [`effective_scope`](Self::effective_scope).
     pub scope: MuxScope,
+    /// Issued-at, unix seconds, from the statement. Must be above the
+    /// principal's replay floor.
     pub iat: u64,
+    /// Expiry as signed, unix seconds; see [`effective_exp`](Self::effective_exp).
     pub exp: u64,
     /// Set by a narrow-only update (§4.7). Never wider than `scope`/`exp`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrowed_scope: Option<MuxScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A narrowed expiry, unix seconds; only ever earlier than `exp`.
     pub narrowed_exp: Option<u64>,
+    /// The stored lifecycle state; [`state_at`](Self::state_at) also reports expiry.
     pub state: MuxGrantState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When `state` last changed, unix seconds.
     pub state_changed_at: Option<u64>,
     /// The grant statement exactly as the member signed it (with its Data
     /// Integrity proof), kept for audit and returned verbatim by listings.
@@ -209,10 +227,13 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl MuxGrant {
+    /// The scope in force: the narrowed scope if an update set one, else `scope`.
     pub fn effective_scope(&self) -> &MuxScope {
         self.narrowed_scope.as_ref().unwrap_or(&self.scope)
     }
 
+    /// The expiry in force, unix seconds: the earlier of `exp` and any
+    /// narrowed expiry.
     pub fn effective_exp(&self) -> u64 {
         self.narrowed_exp.map_or(self.exp, |n| n.min(self.exp))
     }
@@ -255,6 +276,7 @@ impl MuxGrant {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MuxReplayFloor {
+    /// Hex SHA-256 hash of the principal this floor applies to.
     pub principal_hash: String,
     /// A grant must have `iat` strictly greater than this.
     pub iat_floor: u64,
@@ -266,9 +288,13 @@ pub struct MuxReplayFloor {
 pub struct MuxDidRecord {
     /// Compare-and-swap version. Bumped by every write.
     pub version: u64,
+    /// The member DID's current epoch. A `revoke-all` advances it, voiding
+    /// every grant issued under an earlier one.
     pub epoch: u64,
+    /// Every grant the member has given, live or dead (dead ones until pruned).
     pub grants: Vec<MuxGrant>,
     #[serde(default)]
+    /// At most one replay floor per principal.
     pub replay_floors: Vec<MuxReplayFloor>,
     /// Ids of `messaging/mux/notice` messages stored in this DID's own inbox
     /// (as a principal, or as a member for `grantsPresent`), newest last, so
@@ -311,6 +337,7 @@ pub enum NoticeWire {
 pub struct NoticeForm {
     /// The stored message's id, as in [`MuxDidRecord::notices`].
     pub id: String,
+    /// The wire the notice was stored for.
     pub wire: NoticeWire,
     /// The notice's `payload`, before it was signed and sealed.
     pub payload: serde_json::Value,
@@ -439,7 +466,9 @@ impl MuxDidRecord {
 /// index.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MuxIndexDelta {
+    /// Principal hashes whose index gains the member DID.
     pub add: Vec<String>,
+    /// Principal hashes whose index loses the member DID.
     pub remove: Vec<String>,
 }
 
@@ -457,6 +486,7 @@ pub struct MuxChangeRecord {
     /// The instance that made the change (its streaming UUID), so it can
     /// ignore its own records: it applied the change before publishing.
     pub origin: String,
+    /// The (member, principal) pairs whose grants changed.
     pub changes: Vec<MuxChange>,
     /// Changes of which instance streams a DID, for the instances holding a
     /// mux entry for it. Absent from records that carry none; an instance
@@ -483,12 +513,17 @@ pub struct MuxChangeRecord {
 pub enum MemberHint {
     /// The member's account was blocked, removed or had its ACLs changed:
     /// re-check its standing wherever it is carried.
-    StandingChanged { did_hash: String },
+    StandingChanged {
+        /// The member DID's hash.
+        did_hash: String,
+    },
     /// The member DID's epoch advanced at `at` (unix seconds), by its own
     /// `revoke-all` or an administrator's `admin-revoke-all`: end its
     /// session attaches admitted at or before then.
     AttachesEnded {
+        /// The member DID's hash.
         did_hash: String,
+        /// When the epoch advanced, unix seconds.
         at: u64,
         /// The `messaging/mux` detach reason the originating instance used
         /// (`admin` for an administrator's advance). Absent means
@@ -513,10 +548,18 @@ pub enum StreamingHandoff {
     /// `instance`'s mux entry for `did_hash` lost the DID to a newer
     /// registration elsewhere. That instance stands its entry by and tells
     /// its connection the member is inactive (`superseded`).
-    Taken { did_hash: String, instance: String },
+    Taken {
+        /// The DID's hash.
+        did_hash: String,
+        /// The instance (streaming UUID) whose mux entry lost the DID.
+        instance: String,
+    },
     /// The DID's owner left, and a mux entry waits for it. An instance
     /// holding one on standby takes the DID back (`reactivated`).
-    Released { did_hash: String },
+    Released {
+        /// The DID's hash.
+        did_hash: String,
+    },
 }
 
 /// One changed (member DID, principal) pair in a [`MuxChangeRecord`].
@@ -544,6 +587,8 @@ pub struct MuxChange {
 }
 
 impl MuxChange {
+    /// The change for `grant`'s pair, with no detach reason; `stored` says
+    /// whether the grant was just stored (see [`MuxChange::stored`]).
     pub fn of(grant: &MuxGrant, stored: bool) -> Self {
         Self {
             did_hash: grant.did_hash.clone(),
@@ -564,8 +609,13 @@ impl MuxChange {
 /// Operator limits the grant rules enforce. See `[limits.mux]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MuxLimits {
+    /// Most active grants one member DID may hold (`max_grants_per_did`).
     pub max_grants_per_did: usize,
+    /// Most member DIDs one principal's index may hold
+    /// (`max_grants_per_principal`); checked before the CAS, so concurrent
+    /// grants can overshoot it by the number racing.
     pub max_grants_per_principal: usize,
+    /// Longest `exp - iat` a grant may have, in seconds.
     pub max_grant_lifetime_secs: u64,
     /// How long a dead (suspended, stale, revoked, expired) grant stays
     /// listable after its effective expiry before it is pruned.
@@ -588,34 +638,67 @@ impl Default for MuxLimits {
 #[derive(Debug, thiserror::Error)]
 pub enum MuxStoreError {
     #[error("scope must name at least one capability")]
+    /// The grant's scope is empty.
     EmptyScope,
     #[error("grant is for a different DID than the record it was written to")]
+    /// The grant names a different member DID than the record.
     DidMismatch,
     #[error("grant was issued under epoch {grant}, the DID's current epoch is {current}")]
-    EpochMismatch { grant: u64, current: u64 },
+    /// The grant's epoch is not the member DID's current one.
+    EpochMismatch {
+        /// The epoch the grant names.
+        grant: u64,
+        /// The DID's current epoch.
+        current: u64,
+    },
     #[error("grant has already expired")]
+    /// The grant's effective expiry has passed.
     Expired,
     #[error("grant lifetime {requested}s exceeds the maximum of {max}s")]
-    LifetimeTooLong { requested: u64, max: u64 },
+    /// `exp - iat` is longer than `max_grant_lifetime_secs`.
+    LifetimeTooLong {
+        /// The grant's lifetime, in seconds.
+        requested: u64,
+        /// The configured maximum, in seconds.
+        max: u64,
+    },
     #[error(
         "grant is not newer than one already stored or revoked for this principal (iat must be > {floor})"
     )]
-    Replayed { floor: u64 },
+    /// The grant's `iat` is at or below the principal's replay floor.
+    Replayed {
+        /// The replay floor, unix seconds: `iat` must be above it.
+        floor: u64,
+    },
     #[error("grant id is already in use for this DID")]
+    /// Another grant on this DID already has this grant id.
     GrantIdReused,
     #[error("this DID already has the maximum of {max} active grants")]
-    DidQuota { max: usize },
+    /// The member DID already holds `max_grants_per_did` active grants.
+    DidQuota {
+        /// The configured `max_grants_per_did`.
+        max: usize,
+    },
     #[error("this principal already holds the maximum of {max} grants")]
-    PrincipalQuota { max: usize },
+    /// The principal already holds `max_grants_per_principal` grants.
+    PrincipalQuota {
+        /// The configured `max_grants_per_principal`.
+        max: usize,
+    },
     #[error("no such grant")]
+    /// No grant with that id on this DID.
     UnknownGrant,
     #[error("grant is not active")]
+    /// The grant exists but is not active.
     NotActive,
     #[error("an update may only narrow a grant; widening needs a new grant")]
+    /// An update would widen the grant's scope or extend its expiry.
     WidenRefused,
     #[error("the record kept changing underneath; retry")]
+    /// The compare-and-swap lost the race on every attempt.
     Contended,
     #[error(transparent)]
+    /// The store itself failed.
     Store(#[from] MediatorError),
 }
 
