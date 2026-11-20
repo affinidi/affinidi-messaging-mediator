@@ -25,9 +25,11 @@
 
 ### Breaking — AWS secrets: writers need `secretsmanager:UpdateSecretVersionStage`
 
-- Grant `secretsmanager:UpdateSecretVersionStage` on
-  `<prefix>mediator_secrets_bundle` to every role that writes it
-  (`mediator-setup`, the mediator, and whoever runs `mediator rotate-admin`),
-  next to `PutSecretValue`. Without it
-  the first write of a new secret still succeeds, and the next one fails
-  with `AccessDeniedException`, so `mediator-setup` stops before it finishes.
+- Grant `secretsmanager:UpdateSecretVersionStage`, next to `PutSecretValue`,
+  to every role that writes (`mediator-setup`, the mediator, and whoever runs
+  `mediator rotate-admin`) on `<prefix>mediator_secrets_bundle` and, on a
+  deployment not yet cut over to the bundle, on the per-key secret names too:
+  until the cutover every write goes to the per-key secret first, and that
+  write is conditional as well. Without it the first write of a new secret
+  still succeeds, and the next one fails with `AccessDeniedException`, so
+  `mediator-setup` or `rotate-admin` stops before it finishes.
