@@ -142,7 +142,9 @@ fn is_offsetless_datetime(s: &str) -> bool {
         && matches!(b[10], b'T' | b't' | b' ')
         && b[13] == b':'
         && b[16] == b':'
-        && !s[19..].contains(['Z', 'z', '+', '-', '['])
+        && !b[19..]
+            .iter()
+            .any(|c| matches!(c, b'Z' | b'z' | b'+' | b'-' | b'['))
 }
 
 /// Parse an RFC 3339 timestamp (see the [module docs](self)); a time with no
@@ -176,6 +178,17 @@ pub fn format_utc_seconds(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_with_a_multibyte_character_is_refused_not_a_panic() {
+        for input in [
+            "2027-03-01T00:00:0é",
+            "2027-03-01T00:00:00é",
+            "2027-03-01T00:00:€0Z",
+        ] {
+            assert!(parse_utc_timestamp(input).is_err(), "{input}");
+        }
+    }
 
     const MIN: u64 = 60;
     const HOUR: u64 = 3600;
