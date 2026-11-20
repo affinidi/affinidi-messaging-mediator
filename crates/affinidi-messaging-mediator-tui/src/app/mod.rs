@@ -69,9 +69,14 @@ const GRANT_PAGE: u64 = 100;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Tab {
+    /// Mediator statistics above the queue ranking (statistics need an
+    /// administrator).
     Dashboard,
+    /// The queue ranking: accounts ordered by queued messages.
     Queues,
+    /// One account: its queue status, its record and its messages.
     Account,
+    /// The mediator's audit log, newest first.
     Audit,
     /// Every account on the mediator (administrators).
     Accounts,
@@ -118,27 +123,37 @@ pub enum List {
 /// the mediator's answer as the typed Trust Task struct it arrived as.
 #[non_exhaustive]
 pub enum Update {
+    /// Mediator-wide statistics, for the Dashboard.
     Stats(Box<Result<specs::stats::show::v0_1::Response, ConsoleError>>),
+    /// The Account tab's queue status, with its top peers.
     Status(Result<specs::queue::status::v0_1::Response, ConsoleError>),
     /// A page of the queue ranking: the first (replacing what is shown) or,
     /// with `more`, the next one.
     Queues {
+        /// A next page, appended, rather than the first.
         more: bool,
+        /// The page, or why it could not be read.
         result: Result<specs::queue::list::v0_1::Response, ConsoleError>,
     },
     /// A page of the Account tab's queue.
     Messages {
+        /// A next page, appended, rather than the first.
         more: bool,
+        /// The page, or why it could not be read.
         result: Result<specs::message::list::v0_1::Response, ConsoleError>,
     },
     /// A page of the audit log.
     Audit {
+        /// A next page, appended, rather than the first.
         more: bool,
+        /// The page, or why it could not be read.
         result: Result<audit_specs::list::v0_2::Response, ConsoleError>,
     },
     /// A page of the account list.
     Accounts {
+        /// A next page, appended, rather than the first.
         more: bool,
+        /// The page, or why it could not be read.
         result: Result<specs::account::list::v0_2::Response, ConsoleError>,
     },
     /// The console's connection to the mediator changed state.
@@ -153,30 +168,39 @@ pub enum Update {
     /// A page of stored mux grants for the Grants tab's query: the first
     /// page (replacing what is shown) or, with `more`, the next one.
     Grants {
+        /// The page, or why it could not be read.
         result: Result<specs::mux::admin_list::v0_1::Response, ConsoleError>,
+        /// A next page, appended, rather than the first.
         more: bool,
     },
     /// The marked grants' revocation, grant by grant.
     RevokedMarked(Result<BulkRevokeOutcome, ConsoleError>),
     /// A member DID's current mux epoch, read to confirm advancing it.
     Epoch {
+        /// The member DID whose epoch was read.
         did: String,
+        /// Its current epoch, or why it could not be read.
         result: Result<u64, ConsoleError>,
     },
     /// The account on the Account tab, as `account/get` reports it.
     AccountInfo(Box<Result<specs::account::get::v0_2::Account, ConsoleError>>),
     /// The mediator's answer to a configuration change.
     Patched(Result<config_specs::patch::v0_1::Response, ConsoleError>),
+    /// A message fetched (and opened, when it can be) for the message view.
     Inspected(Box<Result<InspectedMessage, ConsoleError>>),
+    /// A counted purge, to show and ask the user to confirm.
     PurgePreview(Result<PurgePlan, ConsoleError>),
     /// A finished action: what to tell the user.
     Done(Result<String, ConsoleError>),
+    /// Something from the live monitor feed.
     Monitor(MonitorUpdate),
     /// The monitor could not start, or was refused: it stays stopped.
     MonitorFailed(ConsoleError),
     /// The monitor's feed ended or went silent; it resubscribes `after` this.
     MonitorRetrying {
+        /// Why the feed stopped, in words.
         reason: String,
+        /// How long until it resubscribes.
         after: Duration,
     },
 }
@@ -184,7 +208,9 @@ pub enum Update {
 /// What the host should do after a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
+    /// Keep running.
     Continue,
+    /// The user asked to leave: restore the terminal and exit.
     Quit,
 }
 
