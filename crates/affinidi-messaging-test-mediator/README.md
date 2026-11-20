@@ -32,12 +32,17 @@ wrong party fails here as it would against a real mediator, instead of
 unpacking anyway. A test that must act **as the mediator** (forging an
 envelope the mediator would have signed, say) opts in:
 
-```rust,ignore
-// The SDK's resolver also gets the mediator's keys:
-let env = TestEnvironment::spawn().await?.with_mediator_keys().await;
+```rust,no_run
+use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator};
 
-// Or one resolver on both sides, as the fixture used to work:
-let mediator = TestMediator::builder().share_secrets(true).spawn().await?;
+async fn act_as_the_mediator() -> Result<(), Box<dyn std::error::Error>> {
+    // The SDK's resolver also gets the mediator's keys:
+    let env = TestEnvironment::spawn().await?.with_mediator_keys().await;
+
+    // Or one resolver on both sides, as the fixture used to work:
+    let mediator = TestMediator::builder().share_secrets(true).spawn().await?;
+    Ok(())
+}
 ```
 
 All users of one `TestEnvironment` share its SDK client and resolver, so
@@ -73,10 +78,10 @@ Use the same `major.minor` as the mediator you test against: the
 mediator's crates are released together, under one version, and every
 `0.x` minor is a breaking release.
 
-```rust,ignore
+```rust,no_run
 use affinidi_messaging_test_mediator::TestMediator;
 
-#[tokio::test]
+// In a test file, mark this `#[tokio::test]`.
 async fn end_to_end_round_trip() {
     let mediator = TestMediator::spawn()
         .await
@@ -94,10 +99,10 @@ async fn end_to_end_round_trip() {
 For the full e2e flow with an SDK client and named users, use
 [`TestEnvironment`]:
 
-```rust,ignore
+```rust,no_run
 use affinidi_messaging_test_mediator::TestEnvironment;
 
-#[tokio::test]
+// In a test file, mark this `#[tokio::test]`.
 async fn alice_sends_to_bob() {
     let env = TestEnvironment::spawn().await.unwrap();
     let alice = env.add_user("Alice").await.unwrap();
@@ -147,18 +152,20 @@ for the network round-trip — exactly one hop, locally delivered.
 
 The fixture's helpers all follow this shape:
 
-```rust,ignore
-// One-shot: spawn + pre-create users.
-let (mediator, users) = TestMediator::with_users(["alice", "bob"])
-    .await
-    .unwrap();
-let alice = &users[0]; // alice.did points at mediator.did() as its service
-```
+```rust,no_run
+use affinidi_messaging_test_mediator::TestMediator;
 
-```rust,ignore
-// Add users incrementally after spawn.
-let mediator = TestMediator::spawn().await.unwrap();
-let alice = mediator.add_user("alice").await.unwrap();
+async fn users() {
+    // One-shot: spawn + pre-create users.
+    let (mediator, users) = TestMediator::with_users(["alice", "bob"])
+        .await
+        .unwrap();
+    let alice = &users[0]; // alice.did points at mediator.did() as its service
+
+    // Or add users incrementally after spawn.
+    let mediator = TestMediator::spawn().await.unwrap();
+    let alice = mediator.add_user("alice").await.unwrap();
+}
 ```
 
 Both register the user as `LOCAL, ALLOW_ALL` on the mediator and
@@ -172,9 +179,13 @@ them yourself with the mediator's DID as their DIDComm service URI
 and call [`TestMediatorHandle::register_local_did`] to land the
 account record:
 
-```rust,ignore
-let (did, secrets) = generate_my_did(mediator.did())?;
-mediator.register_local_did(&did).await.unwrap();
+```rust,no_run
+use affinidi_messaging_test_mediator::TestMediatorHandle;
+
+// `did` is your own DID, minted with `mediator.did()` as its service URI.
+async fn register(mediator: &TestMediatorHandle, did: &str) {
+    mediator.register_local_did(did).await.unwrap();
+}
 ```
 
 ### Escape hatch: disable external forwarding
@@ -187,13 +198,17 @@ Every `forward` then falls through to local delivery regardless of
 what the next-hop DID Document says — useful as a stop-gap, but it
 does not exercise the production forwarding path.
 
-```rust,ignore
-let mediator = TestMediator::builder()
-    .enable_forwarding(true)
-    .enable_external_forwarding(false)
-    .spawn()
-    .await
-    .unwrap();
+```rust,no_run
+use affinidi_messaging_test_mediator::TestMediator;
+
+async fn local_forwarding_only() {
+    let mediator = TestMediator::builder()
+        .enable_forwarding(true)
+        .enable_external_forwarding(false)
+        .spawn()
+        .await
+        .unwrap();
+}
 ```
 
 ## Authenticating non-admin DIDs over WebSocket
@@ -205,12 +220,16 @@ with `global_acl_default` — which has `local = false` for the test
 fixture. Tests that open a WS connection from a non-admin DID need to
 register the DID at startup:
 
-```rust,ignore
-let mediator = TestMediator::builder()
-    .local_did(client_did.clone())
-    .spawn()
-    .await
-    .expect("spawn");
+```rust,no_run
+use affinidi_messaging_test_mediator::TestMediator;
+
+async fn websocket_client(client_did: String) {
+    let mediator = TestMediator::builder()
+        .local_did(client_did.clone())
+        .spawn()
+        .await
+        .expect("spawn");
+}
 ```
 
 Then the SDK's `profile_add(_, /* live_stream */ true)` flow completes
@@ -237,43 +256,45 @@ The fixture exposes typed setters for all three. **Defaults match
 unaffected; today's `ExplicitDeny` + `MediatorACLSet::default()` +
 per-user `ALLOW_ALL` shape is preserved.
 
-```rust,ignore
+```rust,no_run
 use affinidi_messaging_test_mediator::{
     AccessListModeType, TestMediator, acl,
 };
 
-// Allowlist deployment + strict global default. Non-registered DIDs
-// authenticate fine but every send/receive permission is denied until
-// an admin grants them.
-let mediator = TestMediator::builder()
-    .acl_mode(AccessListModeType::ExplicitAllow)
-    .global_acl_default(acl::deny_all())
-    .spawn()
-    .await
-    .expect("spawn");
+async fn acl_modes() {
+    // Allowlist deployment + strict global default. Non-registered DIDs
+    // authenticate fine but every send/receive permission is denied until
+    // an admin grants them.
+    let mediator = TestMediator::builder()
+        .acl_mode(AccessListModeType::ExplicitAllow)
+        .global_acl_default(acl::deny_all())
+        .spawn()
+        .await
+        .expect("spawn");
 
-// Mint alice with a custom per-DID ACL — typed presets cover the
-// common cases; build a `MediatorACLSet` directly for finer control.
-let alice = mediator
-    .add_user_with_acl("alice", acl::allow_all())
-    .await
-    .expect("add alice");
+    // Mint alice with a custom per-DID ACL — typed presets cover the
+    // common cases; build a `MediatorACLSet` directly for finer control.
+    let alice = mediator
+        .add_user_with_acl("alice", acl::allow_all())
+        .await
+        .expect("add alice");
 
-// Revoke mid-flow without going through the admin protocol — the
-// fixture-bypass path. Use this when you're testing client behavior
-// against a denied path, not the admin protocol itself.
-mediator
-    .set_acl(&alice.did, acl::deny_all())
-    .await
-    .expect("set_acl");
+    // Revoke mid-flow without going through the admin protocol — the
+    // fixture-bypass path. Use this when you're testing client behavior
+    // against a denied path, not the admin protocol itself.
+    mediator
+        .set_acl(&alice.did, acl::deny_all())
+        .await
+        .expect("set_acl");
 
-// Read back via the same bypass path.
-let observed = mediator
-    .get_acl(&alice.did)
-    .await
-    .expect("get_acl")
-    .expect("alice has ACL record");
-assert_eq!(observed.to_u64(), acl::deny_all().to_u64());
+    // Read back via the same bypass path.
+    let observed = mediator
+        .get_acl(&alice.did)
+        .await
+        .expect("get_acl")
+        .expect("alice has ACL record");
+    assert_eq!(observed.to_u64(), acl::deny_all().to_u64());
+}
 ```
 
 The `acl` module exports `allow_all()` and `deny_all()`
@@ -301,53 +322,55 @@ don't authenticate as admin. To drive the `messaging/*` administration
 Trust Tasks from a real SDK client, mint a usable admin identity and
 attach it to the builder:
 
-```rust,ignore
+```rust,no_run
 use affinidi_messaging_test_mediator::{TestEnvironment, TestMediator};
-use trust_tasks_rs::specs::messaging::account;
+use affinidi_messaging_sdk::tasks::messaging::account;
 
-// Step 1 — mint admin DID + secrets. The same `AdminIdentity` value
-// can drive multiple test-mediator instances if needed.
-let admin = TestMediator::random_admin_identity().expect("admin identity");
+async fn drive_the_admin_surface() {
+    // Step 1 — mint admin DID + secrets. The same `AdminIdentity` value
+    // can drive multiple test-mediator instances if needed.
+    let admin = TestMediator::random_admin_identity().expect("admin identity");
 
-// Step 2 — pin the mediator to that admin.
-let mediator = TestMediator::builder()
-    .admin_identity(admin.clone())
-    .spawn()
-    .await
-    .expect("spawn");
-let env = TestEnvironment::new(mediator).await.expect("env new");
+    // Step 2 — pin the mediator to that admin.
+    let mediator = TestMediator::builder()
+        .admin_identity(admin.clone())
+        .spawn()
+        .await
+        .expect("spawn");
+    let env = TestEnvironment::new(mediator).await.expect("env new");
 
-// Step 3 — wire an SDK profile authenticated as that admin. The
-// admin's secrets are inserted into the SDK resolver here (so it can
-// sign auth challenges); they are NOT inserted into the mediator's
-// own server-side resolver.
-let admin_user = env.add_admin(admin).await.expect("add_admin");
+    // Step 3 — wire an SDK profile authenticated as that admin. The
+    // admin's secrets are inserted into the SDK resolver here (so it can
+    // sign auth challenges); they are NOT inserted into the mediator's
+    // own server-side resolver.
+    let admin_user = env.add_admin(admin).await.expect("add_admin");
 
-// Step 4 — drive the admin surface through the `messaging/account/update`
-// Trust Task. Accounts are addressed by hashed DID, exposed on
-// TestUser / TestMediatorUser as `did_hash()`.
-let alice = env.add_user("alice").await.expect("add alice");
-let acl: account::update::v0_2::MediatorAcl = account::update::v0_2::MediatorAcl::builder()
-    .send_messages(Some(false))
-    .receive_messages(Some(false))
-    .try_into()
-    .expect("MediatorAcl has no required member");
-env.atm
-    .trust_tasks()
-    .account_update(&admin_user.profile, Some(alice.did_hash()), None, Some(acl), None)
-    .await
-    .expect("admin account_update");
+    // Step 4 — drive the admin surface through the `messaging/account/update`
+    // Trust Task. Accounts are addressed by hashed DID, exposed on
+    // TestUser / TestMediatorUser as `did_hash()`.
+    let alice = env.add_user("alice").await.expect("add alice");
+    let acl: account::update::v0_2::MediatorAcl = account::update::v0_2::MediatorAcl::builder()
+        .send_messages(Some(false))
+        .receive_messages(Some(false))
+        .try_into()
+        .expect("MediatorAcl has no required member");
+    env.atm
+        .trust_tasks()
+        .account_update(&admin_user.profile, Some(alice.did_hash()), None, Some(acl), None)
+        .await
+        .expect("admin account_update");
 
-// Step 5 — verify via the fixture-bypass read path. Independent
-// verification of a write that went through the Trust Task.
-let observed = env
-    .mediator
-    .get_acl(&alice.did)
-    .await
-    .expect("get_acl")
-    .expect("alice has ACL record");
-assert!(!observed.get_send_messages().0);
-assert!(!observed.get_receive_messages().0);
+    // Step 5 — verify via the fixture-bypass read path. Independent
+    // verification of a write that went through the Trust Task.
+    let observed = env
+        .mediator
+        .get_acl(&alice.did)
+        .await
+        .expect("get_acl")
+        .expect("alice has ACL record");
+    assert!(!observed.get_send_messages().0);
+    assert!(!observed.get_receive_messages().0);
+}
 ```
 
 **Secrets ownership.** `AdminIdentity::secrets` stays with the caller.
