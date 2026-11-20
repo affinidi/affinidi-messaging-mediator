@@ -1,6 +1,7 @@
 //! `security.did_privacy_mode`: a strict mediator answers with hashes only; a
-//! permissive one adds `ext["com.affinidi.messaging"].dids`, `hash → DID`, for
-//! the DIDs it has seen authenticate and those a caller offered in `ext`.
+//! permissive one takes a hash, a DID or both (checked) for each account or
+//! entry, and adds `ext["com.affinidi.messaging"].dids`, `hash → DID`, for the
+//! DIDs it has seen authenticate and those a caller named.
 
 use crate::common;
 
@@ -35,6 +36,11 @@ async fn env(mode: DidPrivacyMode) -> (TestEnvironment, TestUser) {
 
 /// Send a signed Trust Task from `from` and return the reply's payload.
 async fn task(env: &TestEnvironment, from: &TestUser, type_uri: &str, payload: Value) -> Value {
+    reply(env, from, type_uri, payload).await["payload"].clone()
+}
+
+/// Send a signed Trust Task from `from` and return the whole reply body.
+async fn reply(env: &TestEnvironment, from: &TestUser, type_uri: &str, payload: Value) -> Value {
     let mediator_did = env.mediator.did().to_string();
     let doc = json!({
         "id": format!("urn:uuid:{}", Uuid::new_v4()),
@@ -74,7 +80,7 @@ async fn task(env: &TestEnvironment, from: &TestUser, type_uri: &str, payload: V
         .send_message(&from.profile, &packed, &msg_id, true, true)
         .await
     {
-        Ok(SendMessageResponse::Message(reply)) => reply.body["payload"].clone(),
+        Ok(SendMessageResponse::Message(reply)) => reply.body,
         other => panic!("expected a reply, got {other:?}"),
     }
 }
@@ -107,7 +113,7 @@ async fn a_strict_mediator_returns_hashes_only() {
         json!({
             "did": alice.did_hash(),
             "add": [did_hash(carol)],
-            "ext": { "com.affinidi.messaging": { "dids": [carol] } },
+            "ext": { "com.affinidi.messaging": { "dids": { did_hash(carol): carol } } },
         }),
     )
     .await;
@@ -126,9 +132,10 @@ async fn a_strict_mediator_returns_hashes_only() {
 async fn a_permissive_mediator_returns_the_did_behind_each_hash() {
     common::init_tracing();
     let (env, alice) = env(DidPrivacyMode::Permissive).await;
-    let (carol, dave) = ("did:example:carol", "did:example:dave");
+    let (carol, dave, erin) = ("did:example:carol", "did:example:dave", "did:example:erin");
 
-    // Alice authenticated, so her DID is known; the hash field is unchanged.
+    // Hash only: Alice authenticated, so her DID is known; the hash field is
+    // unchanged.
     let got = task(
         &env,
         &alice,
@@ -139,24 +146,63 @@ async fn a_permissive_mediator_returns_the_did_behind_each_hash() {
     assert_eq!(got["account"]["did"], alice.did_hash());
     assert_eq!(dids(&got)[alice.did_hash()], alice.did.as_str(), "{got:#}");
 
-    // Alice adds carol by hash and names her DID in `ext`. Dave is offered too
-    // but not added, so the mediator doesn't keep his DID.
+    // DID only: the mediator hashes it.
+    let got = task(&env, &alice, ACCOUNT_GET, json!({ "did": alice.did })).await;
+    assert_eq!(got["account"]["did"], alice.did_hash(), "{got:#}");
+
+    // Both: carol is added by hash with her DID in `ext`. Dave is named too
+    // but not added, so the mediator doesn't keep his DID. Erin is added by
+    // DID only.
     let updated = task(
         &env,
         &alice,
         ACCESS_LIST_UPDATE,
         json!({
             "did": alice.did_hash(),
-            "add": [did_hash(carol)],
-            "ext": { "com.affinidi.messaging": { "dids": [carol, dave] } },
+            "add": [did_hash(carol), erin],
+            "ext": { "com.affinidi.messaging": { "dids": {
+                did_hash(carol): carol,
+                did_hash(dave): dave,
+            } } },
         }),
     )
     .await;
-    assert_eq!(updated["added"], json!([did_hash(carol)]));
+    assert_eq!(
+        updated["added"],
+        json!([did_hash(carol), did_hash(erin)]),
+        "{updated:#}"
+    );
     assert_eq!(dids(&updated)[did_hash(carol)], carol, "{updated:#}");
+    assert_eq!(dids(&updated)[did_hash(erin)], erin);
     assert!(dids(&updated).get(did_hash(dave)).is_none());
 
-    // A later listing, with no `ext` in the request, still names her.
+    // Both, but the DID doesn't match the hash: refused, nothing stored.
+    let refused = reply(
+        &env,
+        &alice,
+        ACCESS_LIST_UPDATE,
+        json!({
+            "did": alice.did_hash(),
+            "add": [did_hash(dave)],
+            "ext": { "com.affinidi.messaging": { "dids": { did_hash(dave): carol } } },
+        }),
+    )
+    .await;
+    assert!(
+        refused.to_string().contains("malformedRequest"),
+        "{refused:#}"
+    );
+    assert!(
+        env.mediator
+            .store()
+            .did_map_get(&[did_hash(dave)])
+            .await
+            .expect("read")
+            .is_empty()
+    );
+
+    // A later listing, with no `ext` in the request, still names carol and
+    // erin, and dave was never added.
     let listed = task(
         &env,
         &alice,
@@ -164,7 +210,12 @@ async fn a_permissive_mediator_returns_the_did_behind_each_hash() {
         json!({ "did": alice.did_hash() }),
     )
     .await;
-    assert_eq!(listed["entries"], json!([did_hash(carol)]));
+    let mut entries: Vec<String> = serde_json::from_value(listed["entries"].clone()).unwrap();
+    entries.sort();
+    let mut expected = vec![did_hash(carol), did_hash(erin)];
+    expected.sort();
+    assert_eq!(entries, expected, "{listed:#}");
     assert_eq!(dids(&listed)[did_hash(carol)], carol, "{listed:#}");
+    assert_eq!(dids(&listed)[did_hash(erin)], erin);
     assert_eq!(dids(&listed)[alice.did_hash()], alice.did.as_str());
 }

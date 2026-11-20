@@ -6,11 +6,12 @@
 //! an operator (or a console such as a portal) can show which DID a hash is:
 //!
 //! - [`remember`] records the DID of every account that authenticates;
-//! - [`annotate`] records the DIDs a caller offers in a Trust Task's
-//!   `ext["com.affinidi.messaging"].dids` (a list of DIDs, hashed here, so a
-//!   caller can never pair a hash with the wrong DID) for the hashes the task
-//!   touched, and adds `ext["com.affinidi.messaging"].dids`, a `hash → DID`
-//!   map, to the response for every hash it names that has a record.
+//! - [`prepare`] lets a Trust Task name an account or entry by its hash, its
+//!   DID (hashed here) or both (`ext["com.affinidi.messaging"].dids`, a
+//!   `hash → DID` map, checked here: a mismatch refuses the request);
+//! - [`annotate`] records those DIDs for the hashes the task touched, and adds
+//!   `ext["com.affinidi.messaging"].dids`, a `hash → DID` map, to the response
+//!   for every hash it names that has a record.
 //!
 //! Every existing field keeps the hash, and `ext` is the Trust Task spec's
 //! extension member, so a client that ignores it sees no change. In `strict`
@@ -40,24 +41,72 @@ pub(crate) async fn remember(state: &SharedData, did: &str, did_hash: &str) {
     }
 }
 
-/// The DIDs a request offers in `payload.ext["com.affinidi.messaging"].dids`,
-/// as `hash → DID`. Taken before the task runs; nothing is stored yet.
-pub(crate) fn offered(state: &SharedData, request_payload: &Value) -> HashMap<String, String> {
+/// The request fields that name an account or access-list entry by hash.
+const REQUEST_HASH_FIELDS: [&str; 5] = ["did", "add", "remove", "entries", "dids"];
+
+/// Before the task runs, in permissive mode, a caller may name each account or
+/// entry by its hash, its DID, or both:
+///
+/// - **DID only**: a `did:` value in a hash field (`did`, `add`, `remove`,
+///   `entries`, `dids`) is replaced by its hash, so the task runs on hashes
+///   as it always has;
+/// - **both**: the field holds the hash and
+///   `ext["com.affinidi.messaging"].dids` maps it to its DID. The mediator
+///   hashes the DID itself and refuses the whole request on a mismatch;
+/// - **hash only**: unchanged.
+///
+/// Returns the `hash → DID` pairs offered. Nothing is stored yet. Strict mode
+/// leaves the payload untouched.
+pub(crate) fn prepare(
+    state: &SharedData,
+    request_payload: &mut Value,
+) -> Result<HashMap<String, String>, String> {
+    let mut offered = HashMap::new();
     if !permissive(state) {
-        return HashMap::new();
+        return Ok(offered);
     }
-    request_payload
+    let pair = |did: &str| {
+        let did = did_identity::account_did(did);
+        (did_identity::did_hash(&did), did.into_owned())
+    };
+
+    // Both: every DID the caller pairs with a hash must hash to it.
+    if let Some(dids) = request_payload
         .pointer(&format!("/ext/{EXT_NAMESPACE}/dids"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|did| did.starts_with("did:"))
-        .map(|did| {
-            let did = did_identity::account_did(did);
-            (did_identity::did_hash(&did), did.into_owned())
-        })
-        .collect()
+        .and_then(Value::as_object)
+    {
+        for (hash, did) in dids {
+            let did = did
+                .as_str()
+                .filter(|d| d.starts_with("did:"))
+                .ok_or_else(|| format!("ext dids: the value for {hash} is not a DID"))?;
+            let (computed, did) = pair(did);
+            if computed != *hash {
+                return Err(format!("ext dids: {did} hashes to {computed}, not {hash}"));
+            }
+            offered.insert(computed, did);
+        }
+    }
+
+    // DID only: hash it in place.
+    let Some(payload) = request_payload.as_object_mut() else {
+        return Ok(offered);
+    };
+    let mut hash_in_place = |v: &mut Value| {
+        if let Some(did) = v.as_str().filter(|d| d.starts_with("did:")) {
+            let (hash, did) = pair(did);
+            *v = Value::String(hash.clone());
+            offered.insert(hash, did);
+        }
+    };
+    for field in REQUEST_HASH_FIELDS {
+        match payload.get_mut(field) {
+            Some(Value::Array(items)) => items.iter_mut().for_each(&mut hash_in_place),
+            Some(v) => hash_in_place(v),
+            None => {}
+        }
+    }
+    Ok(offered)
 }
 
 /// After a task succeeded: record the `offered` DIDs whose hash its response
@@ -108,7 +157,8 @@ pub(crate) async fn annotate(
 }
 
 /// The DID hashes a response payload names: `did`, `account.did`,
-/// `accounts[].did`, and the `entries` / `added` / `removed` lists.
+/// `accounts[].did`, and the `entries` (or `entries[].did`) / `added` /
+/// `removed` / `unknown` lists.
 fn hashes_in(payload: &Map<String, Value>) -> HashSet<String> {
     let mut hashes = HashSet::new();
     let mut push = |v: Option<&Value>| {
@@ -126,14 +176,15 @@ fn hashes_in(payload: &Map<String, Value>) -> HashSet<String> {
     {
         push(account.get("did"));
     }
-    for list in ["entries", "added", "removed"] {
+    for list in ["entries", "added", "removed", "unknown"] {
         for entry in payload
             .get(list)
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            push(Some(entry));
+            // `acl/get` entries are objects with a `did`.
+            push(entry.get("did").or(Some(entry)));
         }
     }
     hashes
@@ -150,15 +201,16 @@ mod tests {
             "did": "a",
             "account": { "did": "b" },
             "accounts": [{ "did": "c" }, { "did": "d" }],
-            "entries": ["e"],
+            "entries": ["e", { "did": "h" }],
             "added": ["f"],
             "removed": ["g"],
+            "unknown": ["i"],
             "accessListCount": 3,
         });
         let mut found: Vec<String> = hashes_in(payload.as_object().unwrap())
             .into_iter()
             .collect();
         found.sort();
-        assert_eq!(found, ["a", "b", "c", "d", "e", "f", "g"]);
+        assert_eq!(found, ["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
     }
 }
