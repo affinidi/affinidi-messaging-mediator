@@ -27,8 +27,9 @@ thiserror.workspace = true
 # Structured logging in the file-reading helpers, matching the mediator; its
 # `LevelFilter` is what `settings::log_level` reads `log_level` into.
 tracing.workspace = true
-# `[secrets] cache_ttl` durations (`settings::secrets_cache_ttl`).
-humantime.workspace = true
+# Duration strings (`[secrets] cache_ttl`, the setup tool's bootstrap seed TTL)
+# and RFC 3339 timestamps: the `time` module.
+jiff = { workspace = true, features = ["std"] }
 # The lean ACL types used by validation (`types::acls`). Taken directly rather
 # than through mediator-common, which depends on this crate.
 affinidi-messaging-mediator-types.workspace = true

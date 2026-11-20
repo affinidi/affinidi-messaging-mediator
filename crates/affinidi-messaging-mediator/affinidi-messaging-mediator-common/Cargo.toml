@@ -36,7 +36,6 @@ server = [
   "dep:hmac",
   "dep:sha2",
   "dep:hex",
-  "dep:humantime",
   "dep:aes-gcm",
   "dep:argon2",
   "dep:zeroize",
@@ -141,7 +140,6 @@ hkdf = { version = "0.13", optional = true }
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
-humantime = { workspace = true, optional = true }
 
 # ── Secrets module: file:// envelope encryption (`?encrypt=1`) ──────────
 ## AES-256-GCM with 12-byte nonces per write; passphrase-derived key via

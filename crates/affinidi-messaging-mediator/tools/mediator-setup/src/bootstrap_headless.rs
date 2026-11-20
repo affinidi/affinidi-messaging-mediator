@@ -137,7 +137,8 @@ pub async fn dispatch(
 }
 
 /// Env var the sealed-handoff sweeper consults for its TTL. Accepts
-/// any `humantime`-parseable duration (`"30m"`, `"6h"`, `"7d"`).
+/// any duration the mediator's config takes (`"30m"`, `"6h"`, `"7d"`; see
+/// `affinidi_messaging_mediator_config::time`).
 /// Absent or unparseable → [`DEFAULT_BOOTSTRAP_SEED_TTL`].
 const BOOTSTRAP_SEED_TTL_ENV: &str = "MEDIATOR_BOOTSTRAP_SEED_TTL";
 
@@ -149,18 +150,21 @@ const DEFAULT_BOOTSTRAP_SEED_TTL: Duration = Duration::from_secs(24 * 3600);
 
 fn resolve_bootstrap_seed_ttl() -> Duration {
     match std::env::var(BOOTSTRAP_SEED_TTL_ENV) {
-        Ok(s) if !s.is_empty() => match humantime::parse_duration(&s) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    env = BOOTSTRAP_SEED_TTL_ENV,
-                    value = %s,
-                    error = %e,
-                    "could not parse bootstrap seed TTL override; using the 24h default",
-                );
-                DEFAULT_BOOTSTRAP_SEED_TTL
+        Ok(s) if !s.is_empty() => {
+            match affinidi_messaging_mediator_config::time::parse_duration(&s) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        env = BOOTSTRAP_SEED_TTL_ENV,
+                        value = %s,
+                        error = %e,
+                        expected = affinidi_messaging_mediator_config::time::DURATION_SYNTAX,
+                        "could not parse bootstrap seed TTL override; using the 24h default",
+                    );
+                    DEFAULT_BOOTSTRAP_SEED_TTL
+                }
             }
-        },
+        }
         _ => DEFAULT_BOOTSTRAP_SEED_TTL,
     }
 }
@@ -866,11 +870,23 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resolve_bootstrap_seed_ttl_parses_humantime_override() {
-        unsafe {
-            std::env::set_var(BOOTSTRAP_SEED_TTL_ENV, "2h");
+    fn resolve_bootstrap_seed_ttl_parses_a_duration_override() {
+        for (value, secs) in [
+            ("2h", 2 * 3600),
+            ("30m", 30 * 60),
+            ("6h", 6 * 3600),
+            ("7d", 7 * 86_400),
+            ("1h 30m", 5400),
+        ] {
+            unsafe {
+                std::env::set_var(BOOTSTRAP_SEED_TTL_ENV, value);
+            }
+            assert_eq!(
+                resolve_bootstrap_seed_ttl(),
+                Duration::from_secs(secs),
+                "{value:?}"
+            );
         }
-        assert_eq!(resolve_bootstrap_seed_ttl(), Duration::from_secs(2 * 3600));
         unsafe {
             std::env::remove_var(BOOTSTRAP_SEED_TTL_ENV);
         }
