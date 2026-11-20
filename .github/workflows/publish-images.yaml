@@ -158,6 +158,13 @@ jobs:
     needs: [version]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    # The digest of the archive this job built and probed, one output per arch
+    # (each matrix leg sets only its own). `push` takes it from here, not from
+    # the artifact the archive travels in, so an archive swapped in transit
+    # cannot bring its own matching digest along.
+    outputs:
+      digest_amd64: ${{ steps.load.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.load.outputs.digest_arm64 }}
     strategy:
       fail-fast: false
       matrix:
@@ -216,15 +223,17 @@ jobs:
       # current daemon may refuse), and the loaded image's layers are checked
       # against the archive's, so the probe below runs the archived filesystem.
       - name: Load the archived image for the probe
+        id: load
         env:
           VERIFY_TAG: ${{ env.IMAGE_NAME }}:verify
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/image/image.tar"
           command -v skopeo >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q skopeo; }
           digest=$(tar -xOf "$archive" index.json \
             | jq -er '.manifests | if length == 1 then .[0].digest else error("expected one top-level manifest") end')
-          echo "$digest" > "$RUNNER_TEMP/image/digest"
+          echo "digest_${ARCH}=${digest}" >> "$GITHUB_OUTPUT"
           skopeo copy "oci-archive:$archive" "docker-archive:$RUNNER_TEMP/verify.tar:$VERIFY_TAG"
           docker load -i "$RUNNER_TEMP/verify.tar"
           rm -f "$RUNNER_TEMP/verify.tar"
@@ -247,9 +256,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.arch }}
-          path: |
-            ${{ runner.temp }}/image/image.tar
-            ${{ runner.temp }}/image/digest
+          path: ${{ runner.temp }}/image/image.tar
           if-no-files-found: error
           retention-days: 1
           # The layers are already gzip-compressed.
@@ -257,8 +264,10 @@ jobs:
 
   # Push each verified archive to GHCR by digest, byte for byte: no build here.
   # `--preserve-digests` makes skopeo fail rather than push anything whose
-  # digest differs from the archive's, and the digest GHCR then serves is
-  # checked against the one verify-image recorded before publish-ghcr uses it.
+  # digest differs from the archive's. The archive is checked first against
+  # the digest verify-image recorded as a job output (not a file shipped with
+  # the archive), and the digest GHCR then serves is checked against it too,
+  # before publish-ghcr uses it.
   push:
     name: push ${{ matrix.arch }} by digest
     needs: [version, verify-image]
@@ -290,17 +299,24 @@ jobs:
       - name: Push by digest to GHCR
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          VERIFIED: ${{ needs.verify-image.outputs[format('digest_{0}', matrix.arch)] }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/image/image.tar"
-          verified=$(cat "$RUNNER_TEMP/image/digest")
+          verified="$VERIFIED"
+          if ! [[ "$verified" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::verify-image recorded no valid digest for this arch: '${verified}'" >&2
+            exit 1
+          fi
           digest=$(tar -xOf "$archive" index.json \
             | jq -er '.manifests | if length == 1 then .[0].digest else error("expected one top-level manifest") end')
           if [ "$digest" != "$verified" ]; then
             echo "::error::archive digest ${digest} is not the verified ${verified}" >&2
             exit 1
           fi
-          command -v skopeo >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q skopeo; }
+          # This job holds a packages: write token, so it installs nothing at
+          # run time: the hosted x64 image ships skopeo, and its absence fails.
+          command -v skopeo >/dev/null || { echo "::error::skopeo is missing from the runner image" >&2; exit 1; }
           # skopeo reads the credentials docker/login-action wrote.
           skopeo copy --all --preserve-digests "oci-archive:$archive" "docker://${IMAGE}@${digest}"
           pushed="sha256:$(skopeo inspect --raw "docker://${IMAGE}@${digest}" | sha256sum | cut -d' ' -f1)"
