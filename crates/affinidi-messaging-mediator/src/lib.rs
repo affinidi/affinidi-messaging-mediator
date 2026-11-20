@@ -100,6 +100,10 @@ use tokio_util::sync::CancellationToken;
 /// The error code registry (see `ERRORS.md`).
 pub use affinidi_messaging_mediator_common::error_codes;
 
+// Every `#[doc(hidden)]` module below is internal: public only so the binary,
+// the test mediator, the console, the setup tool, the fuzz targets and this
+// crate's tests can reach it. It is not covered by semver (cargo-semver-checks
+// treats hidden items as non-public) and may change in any release.
 #[doc(hidden)]
 pub mod account_stats;
 #[doc(hidden)]
@@ -108,6 +112,8 @@ pub(crate) mod after_write;
 pub mod builder;
 #[doc(hidden)]
 pub mod commands;
+/// Mediator configuration ([`common::config`]); the other submodules are
+/// internal.
 pub mod common;
 #[cfg(feature = "didcomm")]
 #[doc(hidden)]
