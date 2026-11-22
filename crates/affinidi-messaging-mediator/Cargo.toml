@@ -132,9 +132,11 @@ trust-tasks-build = "0.1.2"
 
 [dependencies]
 # ── Affinidi Crates ──────────────────────────────────────────────────────
-# The minimum lives in the root Cargo.toml's [workspace.dependencies]: 0.46.3,
-# which collects a Trust Task reply sent over REST and asks for typed
-# `trust-task-error` refusals. A minimum below what the code uses would let
+# The minimum lives in the root Cargo.toml's [workspace.dependencies]. It must
+# be at least 0.46.3, the first release that collects a Trust Task reply sent
+# over REST and asks for typed `trust-task-error` refusals; the workspace
+# requirement is higher, set by the SDK line the rest of the TDK stack is on.
+# A minimum below what the code uses would let
 # `cargo publish --dry-run` resolve an older SDK and fail to compile on a
 # missing type, which the dry-run guard cannot tell from real registry drift.
 affinidi-messaging-sdk.workspace = true
