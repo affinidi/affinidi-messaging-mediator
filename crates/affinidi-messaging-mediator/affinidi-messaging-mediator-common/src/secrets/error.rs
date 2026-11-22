@@ -8,6 +8,9 @@ pub type Result<T> = std::result::Result<T, SecretStoreError>;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SecretStoreError {
+    /// `url` has any `user:password@` replaced by `***@` (see
+    /// [`redact_url`](crate::redact::redact_url)): the error is logged and
+    /// shown, so it never carries the credentials a mistyped URL may hold.
     #[error("invalid backend URL '{url}': {reason}")]
     InvalidUrl { url: String, reason: String },
 
