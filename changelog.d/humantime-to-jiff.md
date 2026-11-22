@@ -23,7 +23,8 @@ with a warning, as before. Years and months keep their fixed lengths
 space in place of `T` and no offset meaning UTC. It now also takes lowercase
 `t`/`z`, times without seconds, and offsets other than UTC, which are applied.
 Before, a non-UTC offset was refused, or ignored when it followed fractional
-seconds. More than nine fractional-second digits are now refused. The boot
+seconds. A non-UTC offset now logs a startup warning naming the
+deadline in UTC, so a value whose meaning moved on upgrade is visible. More than nine fractional-second digits are now refused. The boot
 notice still shows the deadline as, e.g., `2026-11-19T10:00:00Z`.
 
 ### Security — humantime replaced by jiff (RUSTSEC-2026-0542)
