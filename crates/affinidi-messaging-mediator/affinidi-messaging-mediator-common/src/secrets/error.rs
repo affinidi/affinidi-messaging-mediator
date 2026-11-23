@@ -14,9 +14,15 @@ pub type Result<T> = std::result::Result<T, SecretStoreError>;
 #[non_exhaustive]
 pub enum SecretStoreError {
     /// The `[secrets]` backend URL could not be parsed.
+    ///
+    /// The error is logged and shown, so `url` never carries credentials: any
+    /// `user:password@` becomes `***@` (see
+    /// [`redact_url`](crate::redact::redact_url)), and the body of a
+    /// `string://` URL, an unknown scheme or a value with no scheme is not
+    /// shown at all.
     #[error("invalid backend URL '{url}': {reason}")]
     InvalidUrl {
-        /// The URL as configured.
+        /// The URL as configured, with any credentials hidden (see above).
         url: String,
         /// What is wrong with it.
         reason: String,

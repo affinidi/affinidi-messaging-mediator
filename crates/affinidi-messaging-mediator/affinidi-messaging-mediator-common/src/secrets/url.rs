@@ -24,6 +24,7 @@
 
 use url::Url;
 
+use crate::redact::redact_url;
 use crate::secrets::error::{Result, SecretStoreError};
 
 /// Default Vault Kubernetes auth mount (the `kubernetes` auth backend).
@@ -152,9 +153,11 @@ impl BackendUrl {
 /// Parse a backend URL. Returns a structured [`BackendUrl`] or an
 /// `InvalidUrl` error with a human-actionable reason.
 pub fn parse_url(raw: &str) -> Result<BackendUrl> {
+    // The body of a `string://` URL is the inline secret this branch rejects,
+    // so none of it is shown.
     if raw.starts_with("string://") {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: "string://***".into(),
             reason: "inline 'string://' secrets are no longer supported — use 'file://' for \
                     local dev (with the --file-backend-encrypt hardening) or a cloud backend \
                     for production. Per-entry env var overrides are still available for CI."
@@ -176,8 +179,9 @@ pub fn parse_url(raw: &str) -> Result<BackendUrl> {
         "azure_keyvault" => parse_azure(rest, raw),
         "vault" => parse_vault(rest, raw),
         "k8s" => parse_k8s(rest, raw),
+        // An unknown scheme's body means nothing here and may be a credential.
         other => Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: format!("{other}://***"),
             reason: format!(
                 "unknown scheme '{other}://' — supported schemes: keyring, file, aws_secrets, \
                  gcp_secrets, azure_keyvault, vault, k8s"
@@ -189,9 +193,13 @@ pub fn parse_url(raw: &str) -> Result<BackendUrl> {
 fn split_scheme(raw: &str) -> Result<(&str, &str)> {
     let (scheme, rest) = raw
         .split_once("://")
+        // A value with no scheme at all is most often a secret pasted where
+        // the backend URL belongs: not shown.
         .ok_or_else(|| SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
-            reason: "expected '<scheme>://<body>'".into(),
+            url: "***".into(),
+            reason: "expected '<scheme>://<body>' (the value given is not shown: it may be a \
+                     secret)"
+                .into(),
         })?;
     Ok((scheme, rest))
 }
@@ -200,13 +208,13 @@ fn parse_keyring(rest: &str, raw: &str) -> Result<BackendUrl> {
     let service = rest.trim_end_matches('/');
     if service.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "keyring:// requires a service name, e.g. keyring://affinidi-mediator".into(),
         });
     }
     if service.contains('/') {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "keyring:// service name must not contain '/'".into(),
         });
     }
@@ -223,7 +231,7 @@ fn parse_flag(raw: &str, scheme: &str, name: &str, value: &str) -> Result<bool> 
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: format!(
                 "unrecognised value '{value}' for '{name}' on {scheme}:// URL — use 1/true/yes/on \
                  or 0/false/no/off"
@@ -234,7 +242,7 @@ fn parse_flag(raw: &str, scheme: &str, name: &str, value: &str) -> Result<bool> 
 
 fn parse_file(raw: &str) -> Result<BackendUrl> {
     let url = Url::parse(raw).map_err(|e| SecretStoreError::InvalidUrl {
-        url: raw.to_string(),
+        url: redact_url(raw),
         reason: format!("malformed file:// URL: {e}"),
     })?;
     // `file://conf/secrets.json` parses as host `conf`, path
@@ -242,7 +250,7 @@ fn parse_file(raw: &str) -> Result<BackendUrl> {
     // path the operator meant. Relative paths aren't supported at all.
     if let Some(host) = url.host_str().filter(|h| !h.is_empty()) {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: format!(
                 "file:// URL names host '{host}'; the path must be absolute — use three \
                  slashes for an absolute path, e.g. file:///var/lib/mediator/secrets.json"
@@ -252,7 +260,7 @@ fn parse_file(raw: &str) -> Result<BackendUrl> {
     let path = url.path();
     if path.is_empty() || path == "/" {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "file:// requires an absolute path, e.g. file:///var/lib/mediator/secrets.json"
                 .into(),
         });
@@ -265,7 +273,7 @@ fn parse_file(raw: &str) -> Result<BackendUrl> {
             }
             _ => {
                 return Err(SecretStoreError::InvalidUrl {
-                    url: raw.to_string(),
+                    url: redact_url(raw),
                     reason: format!("unknown query parameter '{k}' on file:// URL"),
                 });
             }
@@ -279,13 +287,13 @@ fn parse_file(raw: &str) -> Result<BackendUrl> {
 
 fn parse_aws(rest: &str, raw: &str) -> Result<BackendUrl> {
     let (region, namespace) = rest.split_once('/').ok_or_else(|| SecretStoreError::InvalidUrl {
-        url: raw.to_string(),
+        url: redact_url(raw),
         reason: "aws_secrets:// requires '<region>/<namespace>', e.g. aws_secrets://us-east-1/mediator/"
             .into(),
     })?;
     if region.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "aws_secrets:// requires a non-empty region".into(),
         });
     }
@@ -314,12 +322,12 @@ fn parse_gcp(rest: &str, raw: &str) -> Result<BackendUrl> {
     let (project, namespace) =
         rest.split_once('/')
             .ok_or_else(|| SecretStoreError::InvalidUrl {
-                url: raw.to_string(),
+                url: redact_url(raw),
                 reason: "gcp_secrets:// requires '<project>/<namespace>'".into(),
             })?;
     if project.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "gcp_secrets:// requires a non-empty project id".into(),
         });
     }
@@ -335,7 +343,7 @@ fn parse_azure(rest: &str, raw: &str) -> Result<BackendUrl> {
     let trimmed = rest.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "azure_keyvault:// requires a vault name or URL".into(),
         });
     }
@@ -385,12 +393,12 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
     let (endpoint, path) = locator
         .split_once('/')
         .ok_or_else(|| SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "vault:// requires '<host>[:<port>]/<kv-path>'".into(),
         })?;
     if endpoint.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "vault:// requires a non-empty endpoint".into(),
         });
     }
@@ -424,7 +432,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
                 "ca_cert" => {
                     if v.is_empty() {
                         return Err(SecretStoreError::InvalidUrl {
-                            url: raw.to_string(),
+                            url: redact_url(raw),
                             reason: "vault:// 'ca_cert' needs a path to a PEM CA bundle".into(),
                         });
                     }
@@ -432,7 +440,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
                 }
                 other => {
                     return Err(SecretStoreError::InvalidUrl {
-                        url: raw.to_string(),
+                        url: redact_url(raw),
                         reason: format!("unknown query parameter '{other}' on vault:// URL"),
                     });
                 }
@@ -446,7 +454,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
             let role =
                 role.filter(|r| !r.is_empty())
                     .ok_or_else(|| SecretStoreError::InvalidUrl {
-                        url: raw.to_string(),
+                        url: redact_url(raw),
                         reason: "vault:// auth=kubernetes requires a 'role' query parameter".into(),
                     })?;
             VaultAuth::Kubernetes {
@@ -460,7 +468,7 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
         },
         other => {
             return Err(SecretStoreError::InvalidUrl {
-                url: raw.to_string(),
+                url: redact_url(raw),
                 reason: format!(
                     "unknown vault auth method '{other}' — supported: token, kubernetes, approle"
                 ),
@@ -486,13 +494,13 @@ fn parse_vault(rest: &str, raw: &str) -> Result<BackendUrl> {
 fn parse_k8s(rest: &str, raw: &str) -> Result<BackendUrl> {
     if rest.contains('?') {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "k8s:// takes no query parameters".into(),
         });
     }
     if rest.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "k8s:// requires a Secret name, e.g. k8s://<namespace>/<secret-name>".into(),
         });
     }
@@ -506,13 +514,13 @@ fn parse_k8s(rest: &str, raw: &str) -> Result<BackendUrl> {
     };
     if secret_name.is_empty() {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "k8s:// requires a non-empty Secret name".into(),
         });
     }
     if secret_name.contains('/') {
         return Err(SecretStoreError::InvalidUrl {
-            url: raw.to_string(),
+            url: redact_url(raw),
             reason: "k8s:// Secret name must not contain '/' — expected \
                      k8s://<namespace>/<secret-name>"
                 .into(),
@@ -527,6 +535,34 @@ fn parse_k8s(rest: &str, raw: &str) -> Result<BackendUrl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_pasted_as_the_backend_url_is_never_shown() {
+        for raw in [
+            "string://s3cret",
+            "s3cret",
+            "token://s3cret",
+            "string://u:s3cret@h",
+        ] {
+            let err = parse_url(raw).unwrap_err();
+            let shown = format!("{err} {err:?}");
+            assert!(!shown.contains("s3cret"), "{raw}: {shown}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_url_error_never_carries_its_credentials() {
+        for raw in [
+            "nosuch://user:s3cret@host/x",
+            "vault://user:s3cret@vault.internal",
+            "aws_secrets://user:s3cret@us-east-1",
+        ] {
+            let err = parse_url(raw).unwrap_err();
+            let shown = format!("{err} {err:?}");
+            assert!(!shown.contains("s3cret"), "{raw}: {shown}");
+            assert!(shown.contains("***"), "{raw}: {shown}");
+        }
+    }
 
     #[test]
     fn keyring_ok() {

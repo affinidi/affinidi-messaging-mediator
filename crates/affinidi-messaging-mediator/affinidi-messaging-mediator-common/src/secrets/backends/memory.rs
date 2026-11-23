@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::secrets::error::{Result, SecretStoreError};
 use crate::secrets::store::SecretStore;
@@ -16,7 +17,8 @@ use crate::secrets::store::SecretStore;
 /// survives the process: for tests and short-lived tool flows only.
 pub struct MemoryStore {
     label: &'static str,
-    data: Mutex<HashMap<String, Vec<u8>>>,
+    /// Values are wiped from memory when deleted, overwritten or dropped.
+    data: Mutex<HashMap<String, Zeroizing<Vec<u8>>>>,
 }
 
 impl MemoryStore {
@@ -40,7 +42,7 @@ impl SecretStore for MemoryStore {
             .data
             .lock()
             .map_err(|e| SecretStoreError::Other(format!("in-memory store poisoned: {e}")))?;
-        Ok(guard.get(key).cloned())
+        Ok(guard.get(key).map(|v| v.to_vec()))
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -48,7 +50,7 @@ impl SecretStore for MemoryStore {
             .data
             .lock()
             .map_err(|e| SecretStoreError::Other(format!("in-memory store poisoned: {e}")))?;
-        guard.insert(key.to_string(), value.to_vec());
+        guard.insert(key.to_string(), Zeroizing::new(value.to_vec()));
         Ok(())
     }
 
