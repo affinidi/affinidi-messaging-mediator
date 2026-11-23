@@ -250,6 +250,8 @@ pub struct BundledStore {
 }
 
 impl BundledStore {
+    /// Wraps the per-key backend `inner`. The layout (bundle already in use,
+    /// or per-key still to migrate) is decided on first use, not here.
     pub fn new(inner: DynSecretStore) -> Self {
         Self {
             inner,

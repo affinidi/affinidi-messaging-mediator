@@ -24,9 +24,13 @@ use std::fmt::{self, Display, Formatter};
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionState {
     #[default]
+    /// Not a state a stored session can be in; the `Default` before one is set.
     Unknown,
+    /// A challenge was issued and awaits a signed response.
     ChallengeSent,
+    /// The challenge was answered; tokens have been issued.
     Authenticated,
+    /// The session's DID is blocked; it cannot authenticate.
     Blocked,
 }
 
@@ -56,9 +60,13 @@ impl TryFrom<&String> for SessionState {
 /// JWT claims embedded in session tokens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionClaims {
+    /// Audience: the mediator the token is for.
     pub aud: String,
+    /// Subject: the authenticated DID.
     pub sub: String,
+    /// The session the token belongs to.
     pub session_id: String,
+    /// Expiry, unix seconds.
     pub exp: u64,
 }
 
@@ -71,13 +79,22 @@ pub struct SessionClaims {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     #[serde(skip)]
+    /// The session id: the storage key, not part of the stored fields.
     pub session_id: String,
+    /// The challenge string sent to the client to sign.
     pub challenge: String,
+    /// Where the session is in the challenge/response flow.
     pub state: SessionState,
+    /// The DID authenticating.
     pub did: String,
+    /// SHA-256 hash of `did`, hex: the account key.
     pub did_hash: String,
+    /// Whether `state` is `Authenticated`.
     pub authenticated: bool,
+    /// The account's ACLs, from its `DID:` record when read.
     pub acls: MediatorACLSet,
+    /// The account's type (standard, admin, root admin, …), from its `DID:`
+    /// record when read.
     pub account_type: AccountType,
     /// Unix timestamp (seconds) at which the **access token** issued for
     /// this session expires. The auth handler stamps it from the JWT's
@@ -150,8 +167,11 @@ impl Session {
 /// message body.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageMetaData {
+    /// Size of the stored message, in bytes.
     pub bytes: usize,
+    /// DID hash of the recipient the copy is held for.
     pub to_did_hash: String,
+    /// DID hash of the sender; `None` for an anonymous message.
     pub from_did_hash: Option<String>,
     /// Unix timestamp in milliseconds when the message was received.
     pub timestamp: u128,
@@ -178,6 +198,7 @@ pub struct MessageRef {
 }
 
 impl MessageRef {
+    /// The record of `msg_id` held for `to_did_hash`.
     pub fn new(to_did_hash: impl Into<String>, msg_id: impl Into<String>) -> Self {
         MessageRef {
             to_did_hash: to_did_hash.into(),
@@ -191,7 +212,9 @@ impl MessageRef {
 /// reports each, so callers can report each removal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemovedCopy {
+    /// DID hash of the recipient the removed copy was held for.
     pub to_did_hash: String,
+    /// DID hash of its sender; `None` for an anonymous message.
     pub from_did_hash: Option<String>,
 }
 
@@ -236,8 +259,11 @@ impl<'a> MessageScope<'a> {
 /// non-Redis backends compute this in Rust against their own indices.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InboxStatusReply {
+    /// DID hash of the inbox the status is for.
     pub recipient_did: String,
+    /// Messages in the inbox.
     pub message_count: u64,
+    /// Total size of those messages, in bytes.
     pub total_bytes: u64,
     /// Stream ID of the oldest message in the inbox, or `0` if empty.
     pub oldest_received: String,
@@ -261,9 +287,13 @@ pub struct ForwardQueueEntry {
     /// Backend-assigned stream ID (e.g., Redis "1700000000000-0"). Empty
     /// when the entry is being constructed for enqueue; populated on read.
     pub stream_id: String,
+    /// The packed message to deliver, as received.
     pub message: String,
+    /// DID hash of the next-hop recipient.
     pub to_did_hash: String,
+    /// DID hash of the sender.
     pub from_did_hash: String,
+    /// The sender's DID, for the abandonment report.
     pub from_did: String,
     /// The destination VID in plaintext, for diagnostics and the abandonment
     /// report. **Empty when the destination must not be retained.**
@@ -275,10 +305,18 @@ pub struct ForwardQueueEntry {
     /// [`Self::endpoint_url`], which is all delivery needs. Nothing routes on
     /// this field; see [`crate::tasks::forwarding`] for the fallback label.
     pub to_did: String,
+    /// URL the message is delivered to (HTTP(S) or WS(S)).
     pub endpoint_url: String,
+    /// When the mediator received the message, unix milliseconds.
     pub received_at_ms: u128,
+    /// Delay the sender asked for before delivery, in milliseconds
+    /// (`delay_milli`); counted from `received_at_ms`. `0` or less means none.
     pub delay_milli: i64,
+    /// When the message expires, unix seconds; an expired entry is dropped,
+    /// not delivered.
     pub expires_at: u64,
+    /// Delivery attempts that have failed so far; the entry is abandoned at
+    /// the forwarding `max_retries`.
     pub retry_count: u32,
     /// Hop counter for loop detection. The mediator increments on each
     /// forward and rejects messages exceeding `max_hops`.
@@ -313,7 +351,9 @@ pub struct ForwardQueueClaimPage {
 /// the connected client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PubSubRecord {
+    /// DID hash of the recipient whose live stream the record is for.
     pub did_hash: String,
+    /// The frame to send, or with `verbatim` false a notification body.
     pub message: String,
     /// When `true`, deliver even if the client is not in the live-delivery
     /// state (used to push status messages on live-delivery transitions).
@@ -343,6 +383,7 @@ pub struct PubSubRecord {
 /// Identifies a stored message carried by a [`PubSubRecord`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMessageRef {
+    /// The stored message's id.
     pub msg_id: String,
     /// The sender's DID hash, when the message has one.
     pub from_did_hash: Option<String>,
@@ -357,17 +398,29 @@ pub struct StoredMessageRef {
 /// and produce a snapshot on demand.
 #[derive(Clone, Debug, Default)]
 pub struct MetadataStats {
+    /// `RECEIVED_BYTES`: bytes of every message stored.
     pub received_bytes: i64,
+    /// `SENT_BYTES`: bytes of every message handed to a recipient.
     pub sent_bytes: i64,
+    /// `DELETED_BYTES`: bytes of every message deleted.
     pub deleted_bytes: i64,
+    /// `RECEIVED_COUNT`: messages stored.
     pub received_count: i64,
+    /// `SENT_COUNT`: messages handed to a recipient.
     pub sent_count: i64,
+    /// `DELETED_COUNT`: messages deleted.
     pub deleted_count: i64,
+    /// `WEBSOCKET_OPEN`: WebSocket connections opened.
     pub websocket_open: i64,
+    /// `WEBSOCKET_CLOSE`: WebSocket connections closed.
     pub websocket_close: i64,
+    /// `SESSIONS_CREATED`: authentication sessions started (challenges issued).
     pub sessions_created: i64,
+    /// `SESSIONS_SUCCESS`: authentication sessions that completed.
     pub sessions_success: i64,
+    /// `OOB_INVITES_CREATED`: out-of-band invitations created.
     pub oob_invites_created: i64,
+    /// `OOB_INVITES_CLAIMED`: out-of-band invitations retrieved.
     pub oob_invites_claimed: i64,
 }
 
@@ -426,13 +479,21 @@ impl MetadataStats {
 /// variant requires teaching every backend to recognise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatCounter {
+    /// `SENT_BYTES`: bytes handed to recipients.
     SentBytes,
+    /// `SENT_COUNT`: messages handed to recipients.
     SentCount,
+    /// `WEBSOCKET_OPEN`: WebSocket connections opened.
     WebsocketOpen,
+    /// `WEBSOCKET_CLOSE`: WebSocket connections closed.
     WebsocketClose,
+    /// `SESSIONS_CREATED`: authentication challenges issued.
     SessionsCreated,
+    /// `SESSIONS_SUCCESS`: authentications completed.
     SessionsSuccess,
+    /// `OOB_INVITES_CREATED`: out-of-band invitations stored.
     OobInvitesCreated,
+    /// `OOB_INVITES_CLAIMED`: out-of-band invitations retrieved.
     OobInvitesClaimed,
 }
 
@@ -447,13 +508,20 @@ pub enum DeletionAuthority {
     /// The requesting DID claims ownership (must be the message's TO or
     /// FROM). Backends reject with `permission_denied` when the DID
     /// doesn't match either side.
-    Owner { did_hash: String },
+    Owner {
+        /// The requesting DID's hash.
+        did_hash: String,
+    },
     /// The requester is acting as the mediator admin. Bypasses ownership.
     /// Used by the message expiry processor and account removal.
-    Admin { admin_did_hash: String },
+    Admin {
+        /// The admin DID's hash.
+        admin_did_hash: String,
+    },
 }
 
 impl DeletionAuthority {
+    /// The DID hash acting: the owner's, or the admin's.
     pub fn principal_did_hash(&self) -> &str {
         match self {
             DeletionAuthority::Owner { did_hash } => did_hash,
@@ -620,6 +688,7 @@ impl RemovalReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboxReceipt {
+    /// Why the message left the queue.
     pub reason: RemovalReason,
     /// Unix milliseconds when the message was removed.
     pub at_ms: u64,
@@ -651,7 +720,10 @@ pub enum SentMessageState {
     /// Held for the recipient and not yet handed over.
     Queued,
     /// Handed to the recipient and not yet removed by it.
-    Delivered { at_ms: u64 },
+    Delivered {
+        /// When it was first handed over, unix milliseconds.
+        at_ms: u64,
+    },
     /// Removed, for the reason and at the time its receipt records.
     Removed(OutboxReceipt),
     /// Neither the message nor a receipt is held under the requester — never
@@ -684,7 +756,9 @@ pub struct DeliveryDecision {
 /// entry across instances as it does within one (design §7.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamingKind {
+    /// The DID's own socket.
     Direct,
+    /// A mux connection carrying the DID as a member.
     Mux,
 }
 
@@ -777,6 +851,7 @@ pub enum StoreHealth {
 }
 
 impl StoreHealth {
+    /// The lowercase name: `healthy`, `degraded` or `unavailable`.
     pub fn as_str(&self) -> &'static str {
         match self {
             StoreHealth::Healthy => "healthy",

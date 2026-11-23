@@ -52,11 +52,13 @@ pub fn streaming(raw: &StreamingConfig) -> Result<bool, ConfigError> {
 pub struct DidResolverSettings {
     /// A remote resolver to use instead of resolving locally.
     pub address: Option<String>,
+    /// DID documents held in the in-memory cache.
     pub cache_capacity: u32,
     /// Seconds.
     pub cache_ttl: u32,
     /// **Milliseconds** (the resolver SDK's unit). At least 1.
     pub network_timeout_ms: u32,
+    /// Concurrent DID resolution requests.
     pub network_limit: u32,
 }
 

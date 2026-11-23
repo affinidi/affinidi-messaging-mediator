@@ -62,8 +62,13 @@ pub enum TracingMode {
     /// binary at startup. Calling this when a subscriber is already
     /// installed is a no-op (the install fails silently).
     InstallProduction {
+        /// Colour the compact text output with ANSI escapes. Ignored when
+        /// `log_json` is set.
         ansi: bool,
+        /// Write one JSON object per event instead of compact text.
         log_json: bool,
+        /// The most verbose level written. `RUST_LOG`, when set, replaces
+        /// it with a full `EnvFilter` directive.
         log_level: LevelFilter,
     },
 }
@@ -71,6 +76,7 @@ pub enum TracingMode {
 /// Deployment-time knobs that are not part of [`Config`].
 #[derive(Debug)]
 pub struct StartOpts {
+    /// Whether the listener serves plain HTTP/WS or terminates TLS.
     pub tls: TlsMode,
     /// A listener the caller already bound, handed over to the server.
     ///
@@ -80,6 +86,7 @@ pub struct StartOpts {
     /// the listener across closes that window: the port is never
     /// unbound. See [`MediatorBuilder::listener`].
     pub listener: Option<std::net::TcpListener>,
+    /// Whether the mediator installs its own tracing subscriber.
     pub tracing: TracingMode,
     /// Install SIGINT/SIGTERM handlers that cancel the shutdown token
     /// passed to [`MediatorBuilder::start`]. The mediator binary sets
@@ -369,8 +376,6 @@ impl MediatorBuilder {
         self
     }
 
-    /// Set the address to bind. Defaults to `127.0.0.1:0` (ephemeral
-    /// port chosen by the OS) when not set.
     /// Hand the server a listener you have already bound.
     ///
     /// Use this instead of [`listen_addr`](Self::listen_addr) when you need
@@ -391,6 +396,9 @@ impl MediatorBuilder {
         self
     }
 
+    /// Set the address to bind. Defaults to `127.0.0.1:0` (an ephemeral
+    /// port chosen by the OS) when not set. Also sets the configuration's
+    /// `listen_address`, which the handle's endpoints are built from.
     pub fn listen_addr(mut self, addr: SocketAddr) -> Self {
         self.listen_addr = Some(addr);
         self.config.listen_address = addr.to_string();

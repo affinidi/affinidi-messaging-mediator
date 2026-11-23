@@ -12,17 +12,26 @@ pub(crate) mod acls;
 pub mod admin_accounts;
 pub(crate) mod audit;
 pub(crate) mod cluster_scripts;
+/// Pickup: fetching a batch of an inbox's or outbox's messages.
 pub mod fetch;
 pub mod forwarding;
+/// Reading one message by id, checked against the requester's DID hash.
 pub mod get;
+/// Loading the stored-function library (`atm-functions.lua`) and
+/// checking its `LIBRARY_VERSION`.
 pub mod handlers;
 pub(crate) mod initialization;
+/// Listing the entries of a `RECEIVE_Q` / `SEND_Q` stream.
 pub mod list;
 pub(crate) mod messages;
 pub(crate) mod migrations;
 pub mod session;
+/// Global counters (`GLOBAL`) and the forward-queue length.
 pub mod stats;
+/// Storing a message and reading its metadata.
 pub mod store;
+/// Live-streaming ownership (`GLOBAL_STREAMING` and friends) and the
+/// pub/sub channel live deliveries are published on.
 pub mod streaming;
 pub(crate) mod v1_routing_keys;
 

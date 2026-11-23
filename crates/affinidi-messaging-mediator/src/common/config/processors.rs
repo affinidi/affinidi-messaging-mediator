@@ -16,9 +16,13 @@ use super::config_error;
 /// Processor configuration for the mediator
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessorsConfig {
+    /// `[processors.forwarding]`.
     pub forwarding: ForwardingConfig,
+    /// `[processors.message_expiry_cleanup]`.
     pub message_expiry_cleanup: MessageExpiryCleanupConfig,
+    /// `[processors.session_expiry_cleanup]`.
     pub session_expiry_cleanup: SessionExpiryCleanupConfig,
+    /// `[processors.wake]`.
     pub wake: WakeConfig,
 }
 
@@ -95,6 +99,7 @@ impl Default for ProcessorsConfig {
 /// standalone binary is Redis-only by design and runs in a separate process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageExpiryCleanupConfig {
+    /// The sweep runs.
     pub enabled: bool,
 }
 
@@ -121,6 +126,7 @@ impl std::convert::TryFrom<MessageExpiryCleanupConfigRaw> for MessageExpiryClean
 /// a no-op, so leaving it enabled there is harmless.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionExpiryCleanupConfig {
+    /// The sweep runs.
     pub enabled: bool,
 }
 

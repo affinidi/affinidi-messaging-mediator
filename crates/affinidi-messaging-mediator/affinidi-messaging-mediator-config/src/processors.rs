@@ -10,12 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults::{cleanup, forwarding as fwd, wake};
 
+/// Raw `[processors]` section: the background processors' settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessorsConfigRaw {
+    /// `[processors.forwarding]`.
     pub forwarding: ForwardingConfigRaw,
+    /// `[processors.message_expiry_cleanup]`.
     pub message_expiry_cleanup: MessageExpiryCleanupConfigRaw,
     // Added after the first release of this struct; default so configs
     // written before the session sweeper existed still parse.
+    /// `[processors.session_expiry_cleanup]`. Absent: enabled.
     #[serde(default)]
     pub session_expiry_cleanup: SessionExpiryCleanupConfigRaw,
     /// `[processors.wake]`: ringing an account's device on a sender's
@@ -77,8 +81,11 @@ fn default_wake_addressee_per_hour() -> String {
     wake::ADDRESSEE_PER_HOUR.to_string()
 }
 
+/// Raw `[processors.message_expiry_cleanup]`: the sweep that removes
+/// messages past their expiry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageExpiryCleanupConfigRaw {
+    /// `"true"` runs the sweep.
     pub enabled: String,
 }
 
@@ -90,8 +97,12 @@ impl Default for MessageExpiryCleanupConfigRaw {
     }
 }
 
+/// Raw `[processors.session_expiry_cleanup]`: the sweep that reclaims expired
+/// session records on backends without native TTLs (Fjall, in-memory). Redis
+/// expires sessions itself.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionExpiryCleanupConfigRaw {
+    /// `"true"` runs the sweep. Absent: `"true"`.
     #[serde(default = "default_session_expiry_enabled")]
     pub enabled: String,
 }
@@ -113,37 +124,69 @@ fn default_session_expiry_enabled() -> String {
 // can construct it. `ForwardingConfigRaw` (this struct) is the wizard's
 // all-strings TOML format and stays here, in the schema crate.
 
+/// Raw `[processors.forwarding]` section, read into mediator-common's
+/// `ForwardingConfig`. The first five keys must be in the file; the rest
+/// default to [`defaults::forwarding`](crate::defaults::forwarding).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForwardingConfigRaw {
+    /// `"true"` runs the in-process forwarding processor.
     pub enabled: String,
+    /// Most seconds in the future a forward may ask to be delayed until.
     pub future_time_limit: String,
+    /// `"true"` relays forwards whose next hop is a remote mediator or
+    /// endpoint; `"false"` delivers every forward locally.
     pub external_forwarding: String,
+    /// `"true"` sends a problem report for a forward that fails.
     pub report_errors: String,
+    /// Extra DIDs never to forward to, as a JSON array of strings. The
+    /// mediator's own DID and endpoints are always blocked.
     pub blocked_forwarding_dids: String,
+    /// Seconds of the sliding window that tracks each endpoint's message rate.
     #[serde(default = "default_rate_window_seconds")]
     pub rate_window_seconds: String,
+    /// Messages per 10 s to one endpoint above which it is sent to over a
+    /// WebSocket rather than REST.
     #[serde(default = "default_ws_threshold_msgs_per_10s")]
     pub ws_threshold_msgs_per_10s: String,
+    /// Seconds an outbound WebSocket to a remote endpoint may idle before it is
+    /// closed.
     #[serde(default = "default_ws_idle_timeout_seconds")]
     pub ws_idle_timeout_seconds: String,
+    /// Entries read from the forwarding queue per batch.
     #[serde(default = "default_batch_size")]
     pub batch_size: String,
+    /// Delivery attempts for one forward before it is abandoned.
     #[serde(default = "default_max_retries")]
     pub max_retries: String,
+    /// Backoff after an endpoint's first failure, in milliseconds; it doubles per
+    /// consecutive failure.
     #[serde(default = "default_initial_backoff_ms")]
     pub initial_backoff_ms: String,
+    /// Ceiling on the per-endpoint backoff, in milliseconds.
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: String,
+    /// Next-hop endpoints delivered to in parallel. At least 1.
     #[serde(default = "default_max_concurrent_endpoints")]
     pub max_concurrent_endpoints: String,
+    /// Seconds (not milliseconds) one delivery attempt may take, a REST fallback
+    /// included. At least 1.
     #[serde(default = "default_delivery_timeout_seconds")]
     pub delivery_timeout_seconds: String,
+    /// Seconds a claimed queue entry may sit untouched before another processor
+    /// in the group takes it over. Keep it at least twice
+    /// `delivery_timeout_seconds`.
     #[serde(default = "default_reclaim_idle_seconds")]
     pub reclaim_idle_seconds: String,
+    /// Consumer group name for the forwarding queue (a Redis stream group, or
+    /// the single in-process group on Fjall and in-memory).
     #[serde(default = "default_consumer_group")]
     pub consumer_group: String,
+    /// `"true"` accepts a next hop's TLS certificate even when it does not
+    /// verify. Test only.
     #[serde(default = "default_accept_invalid_certs")]
     pub accept_invalid_certs: String,
+    /// Relay hops before a forward is refused as a loop; also the depth limit
+    /// when peeling re-wrap layers.
     #[serde(default = "default_max_hops")]
     pub max_hops: String,
     /// Relay mode for remote next-hop forwards: "blind" (default) or "rewrap".

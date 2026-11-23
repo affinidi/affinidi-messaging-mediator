@@ -22,9 +22,15 @@ use crate::secrets::error::{Result, SecretStoreError};
 pub const ENVELOPE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A stored entry: `data` wrapped with the schema version and kind it was
+/// written with. See the module docs.
 pub struct Envelope<T> {
+    /// Schema version of the envelope itself; [`ENVELOPE_VERSION`] when written.
     pub version: u32,
+    /// What the payload is (`admin-credential`, `jwt-secret`, …); checked
+    /// against the kind the reader expects.
     pub kind: String,
+    /// The payload.
     pub data: T,
     /// Unix seconds (UTC) when this envelope was written. Additive
     /// field introduced after the initial schema; envelopes produced

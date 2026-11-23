@@ -42,10 +42,19 @@ pub enum RelayMode {
 /// [`ForwardingProcessor`](crate::tasks::forwarding::ForwardingProcessor).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForwardingConfig {
+    /// `enabled`: run the forwarding processor.
     pub enabled: bool,
+    /// `future_time_limit`: the longest delay a forward may ask for, in seconds.
     pub future_time_limit: u64,
+    /// `external_forwarding`: relay to other mediators and endpoints; when
+    /// false every forward is delivered locally.
     pub external_forwarding: bool,
+    /// `report_errors`: send the sender a problem report when a forward is
+    /// refused or abandoned (needs a system message packer).
     pub report_errors: bool,
+    /// Relay targets never forwarded to: DIDs and service-endpoint URLs, in
+    /// canonical form. Always holds the mediator's own DID and endpoints, plus
+    /// `blocked_forwarding_dids` and theirs.
     pub blocked_forwarding: HashSet<String>,
     /// Sliding window in seconds for tracking message rate per remote endpoint
     pub rate_window_seconds: u64,

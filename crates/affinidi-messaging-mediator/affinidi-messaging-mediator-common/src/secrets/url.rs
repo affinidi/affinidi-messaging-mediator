@@ -45,13 +45,19 @@ pub enum VaultAuth {
     /// Kubernetes auth: the pod's ServiceAccount JWT is exchanged for a
     /// Vault token against `mount` using `role`.
     Kubernetes {
+        /// Vault role to log in as (`?role=`; required for this method).
         role: String,
+        /// Kubernetes auth mount (`?k8s_mount=`, default [`VAULT_DEFAULT_K8S_MOUNT`]).
         mount: String,
+        /// ServiceAccount JWT file (`?jwt_path=`, default [`VAULT_DEFAULT_JWT_PATH`]).
         jwt_path: String,
     },
     /// AppRole auth. `role_id`/`secret_id` read from `VAULT_ROLE_ID` /
     /// `VAULT_SECRET_ID` at login time.
-    AppRole { mount: String },
+    AppRole {
+        /// AppRole auth mount (`?approle_mount=`, default [`VAULT_DEFAULT_APPROLE_MOUNT`]).
+        mount: String,
+    },
 }
 
 impl VaultAuth {
@@ -65,27 +71,49 @@ impl VaultAuth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+/// A parsed `[secrets]` backend URL: which backend, and where it keeps
+/// the secrets. Produced by [`parse_url`]; see the module docs for each
+/// scheme's shape.
 pub enum BackendUrl {
+    /// `keyring://<service>`: the OS keychain.
     Keyring {
+        /// Keychain service name the entries are stored under.
         service: String,
     },
+    /// `file:///<path>[?encrypt=1]`: a JSON file on local disk.
     File {
+        /// Absolute path of the file.
         path: String,
+        /// `?encrypt=1`: the file is encrypted rather than plaintext.
         encrypted: bool,
     },
+    /// `aws_secrets://<region>/<namespace>`: AWS Secrets Manager.
     Aws {
+        /// AWS region, e.g. `us-east-1`.
         region: String,
+        /// Prefix prepended to every secret name, given a trailing `/`
+        /// unless it is empty or already ends in `/`, `-`, `_` or `.`.
         namespace: String,
     },
+    /// `gcp_secrets://<project>/<namespace>`: Google Secret Manager.
     Gcp {
+        /// GCP project id.
         project: String,
+        /// Prefix prepended to every secret name, given a trailing `-`
+        /// unless it is empty or already ends in `-` or `_`.
         namespace: String,
     },
+    /// `azure_keyvault://<vault>`: Azure Key Vault.
     Azure {
+        /// The vault's full URL: a bare name becomes
+        /// `https://<name>.vault.azure.net`, a host gains `https://`.
         vault: String,
     },
+    /// `vault://<host[:port]>/<kv-path>[?…]`: HashiCorp Vault KV.
     Vault {
+        /// Vault server `host[:port]`, as written in the URL.
         endpoint: String,
+        /// KV mount and key prefix (`<mount>[/<namespace>…]`) the secrets live under.
         path: String,
         /// Selected auth method (defaults to [`VaultAuth::Token`]).
         auth: VaultAuth,
@@ -99,6 +127,7 @@ pub enum BackendUrl {
         /// the supported route for a private CA.
         ca_cert: Option<String>,
     },
+    /// `k8s://<namespace>/<secret-name>`: every key inside one Kubernetes `Secret`.
     Kubernetes {
         /// Explicit namespace, or `None` to resolve from the in-pod
         /// ServiceAccount / kubeconfig context at connect time.

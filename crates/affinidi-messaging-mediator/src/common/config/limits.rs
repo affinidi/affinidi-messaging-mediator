@@ -10,13 +10,21 @@ use super::{config_error, config_error_msg};
 /// Resource limits configuration for the mediator
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitsConfig {
+    /// Attachments accepted on one message.
     pub attachments_max_count: usize,
+    /// Crypto operations (recipients × keys) one message may cost to unpack.
     pub crypto_operations_per_message: usize,
+    /// Message ids one delete call may name.
     pub deleted_messages: usize,
+    /// Forward tasks the forwarding queue may hold.
     pub forward_task_queue: usize,
+    /// Largest HTTP request body, in bytes. At least `message_size`.
     pub http_size: usize,
+    /// Messages one list call returns.
     pub listed_messages: usize,
+    /// ACL entries one DID may hold.
     pub local_max_acl: usize,
+    /// Seconds a stored message lives before it expires.
     pub message_expiry_seconds: u64,
     /// How long a message is kept after it has **first been handed to its
     /// recipient**, in seconds. `0` disables the shortening entirely, which is
@@ -53,20 +61,34 @@ pub struct LimitsConfig {
     /// — which is depending on a coincidence, but is a real thing to have to
     /// live with.
     pub pickup_round_robin: bool,
+    /// Largest message, in bytes. At least 1, and no more than `http_size` or
+    /// `ws_size`.
     pub message_size: usize,
     /// Per-relationship outbound cap: how many messages one sender may have
     /// queued for one *specific* recipient. This is the gate that catches
     /// flooding; `queued_send_messages_soft` below is a coarse ceiling that
     /// cannot tell flooding from fan-out. `-1` disables it.
     pub queued_send_messages_per_peer: i32,
+    /// Outbound queue limit an account starts on, summed across all its
+    /// recipients. `-1` = no limit.
     pub queued_send_messages_soft: i32,
+    /// Highest outbound queue limit a non-admin may set. At least
+    /// `queued_send_messages_soft`; `-1` = no limit.
     pub queued_send_messages_hard: i32,
+    /// Inbound queue limit an account starts on. `-1` = no limit.
     pub queued_receive_messages_soft: i32,
+    /// Highest inbound queue limit a non-admin may set. At least
+    /// `queued_receive_messages_soft`; `-1` = no limit.
     pub queued_receive_messages_hard: i32,
+    /// Key-agreement keys considered per recipient DID.
     pub to_keys_per_recipient: usize,
+    /// Recipients one message may address.
     pub to_recipients: usize,
+    /// Largest WebSocket message, in bytes. At least `message_size`.
     pub ws_size: usize,
+    /// Access-list entries one DID may hold.
     pub access_list_limit: usize,
+    /// Seconds an out-of-band invitation lives.
     pub oob_invite_ttl: usize,
     /// Maximum requests per second per IP address. 0 = unlimited.
     pub rate_limit_per_ip: u32,
@@ -216,6 +238,7 @@ mod defaults {
 /// rather than read as either.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MuxConfig {
+    /// Whether DID multiplexing is served. Needs streaming enabled.
     pub enabled: bool,
     /// Member DIDs one connection may carry at once.
     pub max_dids_per_connection: usize,

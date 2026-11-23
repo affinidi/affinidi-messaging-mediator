@@ -28,10 +28,14 @@ type ErrorCode = u16;
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ErrorContext {
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Correlation id of the HTTP request (`x-request-id`); the only field
+    /// sent to the client.
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// The mediator session the request belongs to.
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// SHA-256 hash of the DID the request acts for.
     pub did_hash: Option<String>,
 }
 
@@ -85,44 +89,69 @@ pub enum ProcessorError {
 #[non_exhaustive]
 pub enum MediatorError {
     #[error("Internal error handling failure: {2}")]
+    /// Handling another error failed; HTTP 500.
     ErrorHandlingError(ErrorCode, SessId, String),
     #[error("{2}")]
+    /// An unexpected internal failure; HTTP 500.
     InternalError(ErrorCode, SessId, String),
     #[error("Couldn't parse ({2}). Reason: {3}")]
+    /// Input could not be parsed; HTTP 400. Fields: code, session, what was
+    /// being parsed, why it failed.
     ParseError(ErrorCode, SessId, String, String),
     #[error("Permission Error: {2}")]
+    /// The caller lacks permission for the operation; HTTP 403.
     PermissionError(ErrorCode, SessId, String),
     #[error("Request is invalid: {2}")]
+    /// The request is malformed or inconsistent; HTTP 400.
     RequestDataError(ErrorCode, SessId, String),
     #[error("Service Limit exceeded: {2}")]
+    /// A configured limit (size, count, queue depth) was exceeded; HTTP 400.
     ServiceLimitError(ErrorCode, SessId, String),
     #[error("Unauthorized: {2}")]
+    /// Not authorised (no or bad credentials); HTTP 401.
     Unauthorized(ErrorCode, SessId, String),
     #[error("DID error: did({2}) Reason: {3}")]
+    /// A DID could not be resolved or used; HTTP 400. Fields: code,
+    /// session, the DID, why.
     DIDError(ErrorCode, SessId, String, String),
     #[error("Configuration Error: {2}")]
+    /// The mediator's configuration is invalid or incomplete; HTTP 503.
     ConfigError(ErrorCode, SessId, String),
     #[error("Database Error: {2}")]
+    /// A storage operation failed; HTTP 503. Build with
+    /// `MediatorError::database_from_redis` where a Redis error is the cause.
     DatabaseError(ErrorCode, SessId, String),
     #[error("Failed to unpack message: {2}")]
+    /// An inbound message could not be unpacked (decrypted or verified); HTTP 400.
     MessageUnpackError(ErrorCode, SessId, String),
     #[error("MessageExpired: expiry({2}) now({3})")]
+    /// The message is past its expiry; HTTP 422. Fields: code, session, the
+    /// message's expiry, the time now.
     MessageExpired(ErrorCode, SessId, String, String),
     #[error("Failed to pack message: {2}")]
+    /// A message could not be packed (encrypted or signed); HTTP 400.
     MessagePackError(ErrorCode, SessId, String),
     #[error("Feature not implemented: {2}")]
+    /// The requested feature is not implemented; HTTP 501.
     NotImplemented(ErrorCode, SessId, String),
     #[error("Authorization Session ({1}) error: {2}")]
+    /// The authentication session is missing, expired or invalid; HTTP 406.
     SessionError(ErrorCode, SessId, String),
     #[error("Anonymous message error: {2}")]
+    /// An anonymous message was refused or could not be handled; HTTP 406.
     AnonymousMessageError(ErrorCode, SessId, String),
     #[error("Forwarding/Routing message error: {2}")]
+    /// A forward (routing) message could not be handled; HTTP 406.
     ForwardMessageError(ErrorCode, SessId, String),
     #[error("Authentication error: {1}")]
+    /// Authentication failed; HTTP 401. Fields: code, reason (no session yet).
     AuthenticationError(ErrorCode, String),
     #[error("ACL denied: {1}")]
+    /// The access-control list refused the operation; HTTP 401.
     ACLDenied(ErrorCode, String),
     #[error("Processor ({1}) error: {2}")]
+    /// A background processor failed; HTTP 500. Fields: code, the
+    /// processor's error, context.
     ProcessorError(ErrorCode, ProcessorError, String),
 
     /// This is a catch-all for any error that is using DIDComm Problem Reports
@@ -859,12 +888,18 @@ fn storage_busy_retry_after_secs(code: &str) -> Option<u64> {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorResponse {
+    /// The mediator session id the error belongs to.
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Correlation id of the request, when one was attached.
     pub request_id: Option<String>,
+    /// HTTP status code, repeated in the body.
     pub http_code: u16,
+    /// The mediator's numeric error code (see `error_codes`).
     pub error_code: u16,
+    /// The error's name, e.g. `BadRequest: ParseError`.
     pub error_code_str: String,
+    /// Human-readable description.
     pub message: String,
 }
 
@@ -885,12 +920,18 @@ impl fmt::Display for ErrorResponse {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SuccessResponse<T: GenericDataStruct> {
+    /// The mediator session id.
     pub session_id: String,
+    /// HTTP status code, repeated in the body.
     pub http_code: u16,
+    /// Always `0` on success.
     pub error_code: i32,
+    /// Always `"Ok"` on success.
     pub error_code_str: String,
+    /// Human-readable description of what succeeded.
     pub message: String,
     #[serde(bound(deserialize = ""))]
+    /// The response payload, if any.
     pub data: Option<T>,
 }
 
@@ -905,6 +946,8 @@ impl<T: GenericDataStruct> fmt::Display for SuccessResponse<T> {
 }
 
 impl<T: GenericDataStruct> SuccessResponse<T> {
+    /// Builds the JSON body for a success with `http_code`, logging it at
+    /// `INFO`. `error_code` is `0` and `error_code_str` `"Ok"`.
     pub fn response(
         session_id: &str,
         http_code: StatusCode,

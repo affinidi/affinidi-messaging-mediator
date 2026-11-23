@@ -1,3 +1,6 @@
+//! End-to-end DIDComm messaging against a locally started mediator:
+//! authentication, trust ping, pickup status, delivery, acknowledgement and
+//! forwarding over the REST API.
 #![cfg(feature = "didcomm")]
 use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_messaging_didcomm::message::Message;

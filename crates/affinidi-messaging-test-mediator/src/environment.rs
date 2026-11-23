@@ -165,7 +165,7 @@ impl TestEnvironment {
     /// the SDK to authenticate every profile over **pure TSP** instead
     /// of the built-in DIDComm flow.
     ///
-    /// The shared [`ThreadedSecretsResolver`] is constructed up front and
+    /// The shared [`ThreadedSecretsResolver`](affinidi_secrets_resolver::ThreadedSecretsResolver) is constructed up front and
     /// handed BOTH to the TDK (via
     /// [`with_secrets_resolver`](affinidi_tdk::common::config::TDKConfigBuilder::with_secrets_resolver))
     /// and to the [`TspAuthHandler`](affinidi_messaging_sdk::TspAuthHandler).
@@ -174,7 +174,7 @@ impl TestEnvironment {
     /// [`add_user`](Self::add_user) later populates, otherwise it can't
     /// load each user's Ed25519 VID key to sign the auth challenge.
     ///
-    /// With a [`CustomAuthHandlers`] bundle set, the TDK's
+    /// With a [`CustomAuthHandlers`](affinidi_tdk::did_authentication::CustomAuthHandlers) bundle set, the TDK's
     /// `AuthenticationCache` routes every profile authentication through
     /// the custom handler, so the whole environment authenticates over
     /// `POST /tsp/authenticate`.

@@ -78,22 +78,33 @@ pub enum MonitorUpdate {
     /// A batch of events, and how many the mediator dropped since the last
     /// one (rate ceiling, or this console briefly offline).
     Events {
+        /// The events, oldest first.
         events: Vec<MonitorEvent>,
+        /// Events the mediator dropped for this subscription since the
+        /// previous batch.
         dropped: u64,
     },
     /// Mux membership changes from a batch, on a feed opened with a
     /// membership filter, and how many of them the mediator dropped since the
     /// last batch. Comes after the same batch's [`MonitorUpdate::Events`].
     Membership {
+        /// The membership changes, oldest first.
         events: Vec<MembershipEvent>,
+        /// Membership changes the mediator dropped since the previous batch.
         dropped: u64,
     },
     /// Batches were lost in transit: `missing` sequence numbers never arrived.
-    Gap { missing: u64 },
+    Gap {
+        /// How many batches were skipped in the sequence.
+        missing: u64,
+    },
     /// An empty batch: the tap is alive and nothing matched.
     Heartbeat,
     /// The subscription ended — lease renewal failed, or it was cancelled.
-    Ended(String),
+    Ended(
+        /// Why it ended, in words.
+        String,
+    ),
     /// The connection to the mediator dropped. Nothing arrives until
     /// [`MonitorUpdate::Reconnected`]; what the mediator could not deliver
     /// meanwhile shows up as `dropped` or a [`MonitorUpdate::Gap`] after it.
@@ -510,6 +521,7 @@ pub struct MonitorFeed {
 }
 
 impl MonitorFeed {
+    /// The mediator's id for this subscription, as its subscribe answer gave it.
     pub fn subscription_id(&self) -> &str {
         &self.id
     }

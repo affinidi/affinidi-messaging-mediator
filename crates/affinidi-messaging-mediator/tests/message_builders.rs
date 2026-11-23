@@ -1,3 +1,8 @@
+//! Builders for the packed DIDComm messages the mediator's integration tests
+//! send.
+//!
+//! Included as a module by `integration_test_messaging`; Cargo also builds it
+//! as a test target of its own, which holds no tests.
 #![cfg(feature = "didcomm")]
 use std::time::SystemTime;
 
@@ -15,6 +20,8 @@ use serde_json::{Value, json};
 use sha256::digest;
 use uuid::Uuid;
 
+/// The unpacked `atm/1.0/authenticate` reply from `actor_did` to the
+/// mediator `atm_did`, answering `body`; valid for 60 seconds.
 #[allow(dead_code)]
 pub fn create_auth_challenge_response(
     body: &AuthenticationChallenge,
@@ -35,6 +42,9 @@ pub fn create_auth_challenge_response(
     .finalize()
 }
 
+/// A `trust-ping/2.0/ping` to `to_did`, packed encrypted (and from
+/// `actor_did` unless `signed` is false, which sends it anonymously), with what
+/// the SDK records for a sent ping. Panics if packing fails.
 #[allow(dead_code)]
 pub async fn build_ping_message<S>(
     to_did: &str,
@@ -86,6 +96,8 @@ where
     (msg, msg_info)
 }
 
+/// A `messagepickup/3.0/status-request` from `recipient_did` to the mediator,
+/// with `return_route: all`, packed encrypted. Panics if packing fails.
 #[allow(dead_code)]
 pub async fn build_status_request_message<S>(
     mediator_did: &str,
@@ -126,6 +138,8 @@ where
     msg
 }
 
+/// A `messagepickup/3.0/delivery-request` from `recipient_did` to the mediator,
+/// packed encrypted. Panics if packing fails.
 #[allow(dead_code)]
 pub async fn build_delivery_request_message<S>(
     mediator_did: &str,
@@ -172,6 +186,9 @@ where
     msg
 }
 
+/// A `messagepickup/3.0/messages-received` acknowledging the ids in
+/// `to_delete_list`, packed encrypted from `recipient_did` to the mediator.
+/// Panics if packing fails.
 #[allow(dead_code)]
 pub async fn build_message_received_message<S>(
     mediator_did: &str,
@@ -217,6 +234,9 @@ where
     msg
 }
 
+/// A `routing/2.0/forward` from `actor_did` asking the mediator to deliver a
+/// dummy base64 attachment to `recipient_did`, packed encrypted. Panics if
+/// packing fails.
 #[allow(dead_code)]
 pub async fn build_forward_request_message<S>(
     mediator_did: &str,

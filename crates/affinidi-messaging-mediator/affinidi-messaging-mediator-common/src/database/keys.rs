@@ -22,6 +22,7 @@ pub struct Keys {
 }
 
 impl Keys {
+    /// Key names for a store with `cluster_mode` on (hash-tagged) or off.
     pub fn new(cluster_mode: bool) -> Self {
         Keys {
             cluster: cluster_mode,

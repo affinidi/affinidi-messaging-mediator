@@ -15,7 +15,10 @@ use crate::error::{ConsoleError, Result};
 /// those between the two, or chosen grants of one member.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GrantSelection {
+    /// Select grants held by this principal DID (the DID multiplexing the
+    /// connection).
     pub principal: Option<String>,
+    /// Select grants given by this member DID.
     pub member: Option<String>,
     /// Only these grants of `member`; empty for every grant the DIDs select.
     pub grant_ids: Vec<String>,
@@ -141,11 +144,14 @@ fn summarise(
 /// that member's record. What a bulk revocation names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GrantKey {
+    /// The member DID that gave the grant.
     pub member: String,
+    /// The grant's id on that member's record.
     pub grant_id: String,
 }
 
 impl GrantKey {
+    /// The grant `grant_id` on `member`'s record.
     pub fn new(member: impl Into<String>, grant_id: impl Into<String>) -> Self {
         Self {
             member: member.into(),
@@ -212,6 +218,7 @@ impl GrantRevokeResult {
         }
     }
 
+    /// Whether the mediator confirmed this grant revoked.
     pub fn is_revoked(&self) -> bool {
         matches!(self, Self::Revoked)
     }
@@ -248,6 +255,7 @@ fn clone_atm_error(
 /// What a bulk revocation did, grant by grant, in the order asked.
 #[derive(Debug, Default)]
 pub struct BulkRevokeOutcome {
+    /// Each grant asked for, with what happened to it, in request order.
     pub results: Vec<(GrantKey, GrantRevokeResult)>,
 }
 

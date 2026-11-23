@@ -16,6 +16,12 @@
 //! and exits, printing JSON with `--json` and an exit code a script can act
 //! on.
 
+// The README's examples, compiled (not run) by `cargo test --doc`. Only
+// doctest builds see this item, so it never reaches the docs or the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod account_edit;
 pub mod app;
 mod clipboard;

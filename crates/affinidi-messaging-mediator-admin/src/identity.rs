@@ -76,6 +76,7 @@ pub trait IdentitySource: Send + Sync {
 pub struct StaticIdentities(Vec<Identity>);
 
 impl StaticIdentities {
+    /// A source offering exactly `identities`, in this order.
     pub fn new(identities: Vec<Identity>) -> Self {
         Self(identities)
     }
@@ -125,6 +126,10 @@ struct ProfileSummary {
 }
 
 impl ProfileFileSource {
+    /// A source over these TDK profile files, one identity each. Nothing is
+    /// read until [`list`](IdentitySource::list) or
+    /// [`load`](IdentitySource::load); loading refuses a file anyone but its
+    /// owner can access (on Unix).
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self { paths }
     }

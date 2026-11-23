@@ -21,8 +21,14 @@ use crate::redact::redact_url;
 /// replaced (see [`redact_url`]): the startup log prints the whole config.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
+    /// `functions_file`: the stored-function library (`atm-functions.lua`)
+    /// to load. `None` means none at all, which a Redis store refuses.
     pub functions_file: Option<String>,
+    /// `database_url`: the Redis server, `redis://` or `rediss://`, possibly
+    /// with credentials (redacted by `Debug`).
     pub database_url: String,
+    /// `database_timeout`: how long one database command may take, in whole
+    /// seconds, before it fails as a timeout.
     pub database_timeout: u32,
     /// Use a cluster client. Startup refuses a server whose cluster mode
     /// differs (ElastiCache Serverless is always cluster mode). Accepts a

@@ -157,7 +157,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/native-deps
-      - run: cargo doc --workspace --no-deps --locked
+      # Every feature, so the feature-gated items docs.rs shows (storage and
+      # secrets backends, `didcomm-v1`, `tsp`) are checked too: a broken
+      # intra-doc link behind a non-default feature fails here, not on
+      # docs.rs. `--cfg docsrs` needs nightly (`doc_cfg`), so it is left to
+      # docs.rs itself.
+      - run: cargo doc --workspace --no-deps --locked --all-features
 
   deny:
     name: cargo deny
