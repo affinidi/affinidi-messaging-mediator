@@ -1,3 +1,14 @@
+### Breaking — AWS deployments: grant `secretsmanager:UpdateSecretVersionStage` before upgrading
+
+- Grant `secretsmanager:UpdateSecretVersionStage`, next to `PutSecretValue`,
+  to every role that writes (`mediator-setup`, the mediator, and whoever runs
+  `mediator rotate-admin`) on `<prefix>mediator_secrets_bundle` and, on a
+  deployment not yet cut over to the bundle, on the per-key secret names too:
+  until the cutover every write goes to the per-key secret first, and that
+  write is conditional as well. Without it the first write of a new secret
+  still succeeds, and the next one fails with `AccessDeniedException`, so
+  `mediator-setup` or `rotate-admin` stops before it finishes.
+
 ### Breaking — a Trust Task that does not ask is refused with a problem report again (R3.6)
 
 - **Wire change (R3.6), only for a request that does not ask.** A refused
