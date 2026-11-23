@@ -125,7 +125,7 @@ thiserror.workspace = true
 ## `ForwardingConfig` take their defaults from it, and `redact` and
 ## `did_identity` live there (re-exported here). Lean: serde, toml and logging,
 ## no server stack.
-affinidi-messaging-mediator-config = { version = "0.54.0", path = "../affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.55.0", path = "../affinidi-messaging-mediator-config" }
 sha256.workspace = true
 
 # ── Secrets module: core (gated on `server`) ────────────────────────
