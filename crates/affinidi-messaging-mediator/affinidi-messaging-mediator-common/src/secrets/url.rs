@@ -124,9 +124,11 @@ impl BackendUrl {
 /// Parse a backend URL. Returns a structured [`BackendUrl`] or an
 /// `InvalidUrl` error with a human-actionable reason.
 pub fn parse_url(raw: &str) -> Result<BackendUrl> {
+    // The body of a `string://` URL is the inline secret this branch rejects,
+    // so none of it is shown.
     if raw.starts_with("string://") {
         return Err(SecretStoreError::InvalidUrl {
-            url: redact_url(raw),
+            url: "string://***".into(),
             reason: "inline 'string://' secrets are no longer supported — use 'file://' for \
                     local dev (with the --file-backend-encrypt hardening) or a cloud backend \
                     for production. Per-entry env var overrides are still available for CI."
@@ -148,8 +150,9 @@ pub fn parse_url(raw: &str) -> Result<BackendUrl> {
         "azure_keyvault" => parse_azure(rest, raw),
         "vault" => parse_vault(rest, raw),
         "k8s" => parse_k8s(rest, raw),
+        // An unknown scheme's body means nothing here and may be a credential.
         other => Err(SecretStoreError::InvalidUrl {
-            url: redact_url(raw),
+            url: format!("{other}://***"),
             reason: format!(
                 "unknown scheme '{other}://' — supported schemes: keyring, file, aws_secrets, \
                  gcp_secrets, azure_keyvault, vault, k8s"
@@ -161,9 +164,13 @@ pub fn parse_url(raw: &str) -> Result<BackendUrl> {
 fn split_scheme(raw: &str) -> Result<(&str, &str)> {
     let (scheme, rest) = raw
         .split_once("://")
+        // A value with no scheme at all is most often a secret pasted where
+        // the backend URL belongs: not shown.
         .ok_or_else(|| SecretStoreError::InvalidUrl {
-            url: redact_url(raw),
-            reason: "expected '<scheme>://<body>'".into(),
+            url: "***".into(),
+            reason: "expected '<scheme>://<body>' (the value given is not shown: it may be a \
+                     secret)"
+                .into(),
         })?;
     Ok((scheme, rest))
 }
@@ -501,6 +508,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_secret_pasted_as_the_backend_url_is_never_shown() {
+        for raw in [
+            "string://s3cret",
+            "s3cret",
+            "token://s3cret",
+            "string://u:s3cret@h",
+        ] {
+            let err = parse_url(raw).unwrap_err();
+            let shown = format!("{err} {err:?}");
+            assert!(!shown.contains("s3cret"), "{raw}: {shown}");
+        }
+    }
+
+    #[test]
     fn an_invalid_url_error_never_carries_its_credentials() {
         for raw in [
             "nosuch://user:s3cret@host/x",
@@ -510,7 +531,7 @@ mod tests {
             let err = parse_url(raw).unwrap_err();
             let shown = format!("{err} {err:?}");
             assert!(!shown.contains("s3cret"), "{raw}: {shown}");
-            assert!(shown.contains("***@"), "{raw}: {shown}");
+            assert!(shown.contains("***"), "{raw}: {shown}");
         }
     }
 
