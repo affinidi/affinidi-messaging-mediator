@@ -3,8 +3,9 @@
 
     python3 scripts/cut-release.py 0.42 [--from origin/nightly] [--dry-run]
 
-Run by the release manager from a clean checkout with push access and `gh`
-authenticated. It:
+Run by the `Cut a release` workflow (`.github/workflows/cut-release.yml`) as
+the release-bot app: the `release/*` rulesets no longer let an admin push a new
+release branch. `--dry-run` works anywhere. It:
 
   1. resolves the source commit — `origin/nightly` by default, the newest main
      commit the full CI suite passed (RELEASES.md);
@@ -133,10 +134,19 @@ def main():
             git("push", "origin", f"HEAD:refs/heads/{branch}", cwd=rel)
             cut_head = f"release-cut/{args.name}"
             git("push", "origin", f"HEAD:refs/heads/{cut_head}", cwd=mn)
-            run(
+            # The branch is already pushed: a missing label is not worth
+            # stopping for before the PR is open, so warn instead.
+            label = run(
                 "gh", "label", "create", f"backport {branch}", "--force",
                 "--color", "5319e7", "--description", f"Cherry-pick onto {branch} once merged",
+                check=False,
             )
+            if label.returncode:
+                print(
+                    f"WARNING: could not create the `backport {branch}` label; create it by hand:\n"
+                    f"{label.stderr.strip()}",
+                    file=sys.stderr,
+                )
             run(
                 "gh", "pr", "create", "--base", "main", "--head", cut_head,
                 "--title", f"chore(release): cut {branch}; main moves to {next_version}",
