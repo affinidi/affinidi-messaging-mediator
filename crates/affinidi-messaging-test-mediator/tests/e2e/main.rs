@@ -25,6 +25,7 @@ mod clock_injection;
 mod credo_mediation_interop;
 mod cross_mediator_forwarding;
 mod delivery_path_correctness;
+mod did_labels;
 mod did_rate_limit;
 mod didcomm_v1_mediation;
 mod direct_delivery_queue_limits;

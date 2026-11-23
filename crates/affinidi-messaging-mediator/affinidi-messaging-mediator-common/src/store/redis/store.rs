@@ -71,6 +71,8 @@ const CONFIG_OVERRIDES_KEY: &str = "MEDIATOR_CONFIG_OVERRIDES";
 /// The hash holding each account's wake record (`messaging/wake/set`), keyed
 /// by DID hash. One key, so it is slot-safe in cluster mode.
 const WAKE_HANDLES_KEY: &str = "WAKE_HANDLES";
+/// Hash of DID hash → DID: the write-once label behind each hash.
+const DID_LABELS_KEY: &str = "DID_LABELS";
 
 /// Rebuild [`AccountStats`] from the stored hash. A missing field is a
 /// counter never touched, which is zero.
@@ -1617,6 +1619,14 @@ impl AccountStore for RedisStore {
             {
                 warn!("account {did_hash} removed, but not its wake handle: {e}");
             }
+            if let Err(e) = redis::cmd("HDEL")
+                .arg(DID_LABELS_KEY)
+                .arg(did_hash)
+                .exec_async(&mut conn)
+                .await
+            {
+                warn!("account {did_hash} removed, but not its DID label: {e}");
+            }
         }
         Ok(removed)
     }
@@ -2776,6 +2786,53 @@ impl AuxiliaryStore for RedisStore {
                     format!("wake_handle_get: {e}"),
                 )
             })
+    }
+
+    async fn did_label_fill(&self, did_hash: &str, did: &str) -> Result<(), MediatorError> {
+        let mut conn = self.get_connection().await?;
+        // HSETNX: an existing label is never overwritten.
+        redis::cmd("HSETNX")
+            .arg(DID_LABELS_KEY)
+            .arg(did_hash)
+            .arg(did)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("did_label_fill: {e}"),
+                )
+            })
+    }
+
+    async fn did_labels_get(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<HashMap<String, String>, MediatorError> {
+        if did_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut conn = self.get_connection().await?;
+        let dids: Vec<Option<String>> = redis::cmd("HMGET")
+            .arg(DID_LABELS_KEY)
+            .arg(did_hashes)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".into(),
+                    &e,
+                    format!("did_labels_get: {e}"),
+                )
+            })?;
+        Ok(did_hashes
+            .iter()
+            .zip(dids)
+            .filter_map(|(h, d)| d.map(|d| (h.clone(), d)))
+            .collect())
     }
 
     async fn oob_discovery_store(

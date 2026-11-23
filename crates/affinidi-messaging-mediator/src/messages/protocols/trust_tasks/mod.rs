@@ -166,8 +166,8 @@ pub(crate) async fn process(
     let now_secs = state.clock.unix_secs();
     let sender_did = vid_of(&sender_kid);
     let request_type = doc.type_uri.to_string();
-    // A request that asks is refused with a `trust-task-error` document
-    // where one can be sent (see `trust_task_error`).
+    // A refusal is answered with a `trust-task-error` document where one can
+    // be sent (see `trust_task_error`).
     let refusing = crate::messages::protocols::trust_task_error::Refusing::of(&doc);
     let consumed = consume(
         doc,
@@ -339,10 +339,13 @@ async fn consume_task(
         .await?;
     }
 
-    let doc = match newer {
+    let mut doc = match newer {
         Some(newer) => newer.to_v0_1_request(doc),
         None => doc,
     };
+    // Account and access-list tasks: a DID may stand in for its hash, and a
+    // caller may ask for the DID labels. Runs after the proof was verified.
+    let did_labels = crate::did_labels::prepare(task, &mut doc.payload);
 
     let response_value: Value = match task {
         ServedTask::Ping => {
@@ -610,6 +613,10 @@ async fn consume_task(
         None => response_value,
     };
 
+    // Fill the labels of the DIDs a caller named, and add the labels to the
+    // response's `ext` if it asked for them.
+    let response_value = crate::did_labels::annotate(state, did_labels, response_value).await;
+
     // Every success response is signed as the mediator (see `trust_task_sign`).
     let response_value = trust_task_sign::sign_response(response_value, state).await?;
 
@@ -792,10 +799,9 @@ pub(crate) fn require_admin(session: &Session, task: &str) -> Result<(), Mediato
 
 /// A Trust Task refusal under `code`: one of the framework's standard codes
 /// (SPEC §8.3: `permissionDenied`, `malformedRequest`, …) or a
-/// `<task>:<code>` the task's specification declares. A request that asks
-/// (`x-errorFormat`) is answered with a `trust-task-error` document carrying
-/// `code`; every other request, and one that asks where no document can be
-/// sent, gets the problem report `e.p.<code>`
+/// `<task>:<code>` the task's specification declares. It is answered with a
+/// `trust-task-error` document carrying `code`, or, where no document can be
+/// sent, a problem report `e.p.<code>`
 /// ([`trust_task_error`](crate::messages::protocols::trust_task_error)).
 pub(crate) fn tt_problem(
     session: &Session,
