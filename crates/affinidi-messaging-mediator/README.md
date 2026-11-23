@@ -288,7 +288,7 @@ and VTA cache in one secret backend, named by a URL:
 ```toml
 [secrets]
 backend = "aws_secrets://us-east-1/prod/mediator/"   # no default: pick one, see below
-cache_ttl = "30d"                          # optional, humantime
+cache_ttl = "30d"                          # optional, a duration: "30d", "12h", "1h 30m"
 ```
 
 On keyring, AWS, GCP, Azure and Vault, everything lives in one backend

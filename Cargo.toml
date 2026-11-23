@@ -134,16 +134,18 @@ tracing-subscriber = { version = "0.3", default-features = false }
 ahash = "0.8"
 chrono = { version = "0.4", default-features = false }
 clap = "4"
-humantime = "2"
 ipnet = "2"
 itertools = "0.15"
+# Duration strings and RFC 3339 timestamps (mediator-config's `time` module).
+# Already in the graph through the cloud SDKs.
+jiff = { version = "0.2", default-features = false }
 num-format = "0.4"
 rand = "0.10"
 semver = "1"
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
-url = "2"
+url = "2.5.9"
 uuid = "1"
 zeroize = "1"
 

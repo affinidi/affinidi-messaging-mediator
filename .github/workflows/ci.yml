@@ -192,6 +192,10 @@ jobs:
       rustflags: "-D warnings --cfg tracing_unstable"
       ubuntu-rust-deps: "libdbus-1-dev libssl-dev libchafa-dev pkg-config"
       runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-24.04' }}
+      # Kept in step with deny.toml's [advisories] ignore list (see the note
+      # there): chrono and humantime "unmaintained", accepted 2026-11-17.
+      # Without this, cargo-audit files an issue for each again.
+      auditIgnore: "RUSTSEC-2026-0543,RUSTSEC-2026-0542"
 
   guards:
     # Cheap, build-free guards that protect the release pipeline. No compile:

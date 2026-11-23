@@ -80,7 +80,8 @@ mediator_did = ""
 # backend = "aws_secrets://us-east-1/prod/mediator/"
 
 ### Env: MEDIATOR_SECRETS_CACHE_TTL
-### Maximum age for the cached VTA bundle (humantime format). `0` means
+### Maximum age for the cached VTA bundle: a duration such as "30d", "12h" or
+### "1h 30m" (units y, mo, w, d, h, m, s, largest first). `0` means
 ### no expiry — keep the cache until manually invalidated or a fresh
 ### fetch overwrites it. Default: 30 days.
 # cache_ttl = "30d"

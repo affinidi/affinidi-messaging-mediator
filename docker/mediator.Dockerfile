@@ -52,7 +52,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # cargo-chef splits "build the dependency graph" from "build our crates", so a
 # source change reuses the cached dependency layer instead of recompiling ~800
-# crates. Pinned and --locked so its own graph cannot drift.
+# crates. Pinned and --locked so its own graph cannot drift. Chosen over
+# `RUN --mount=type=cache` for the registry/target dirs: cache mounts live only
+# in the builder's local state, which an ephemeral CI runner throws away and
+# `cache-to: type=gha` does not export, whereas the cooked dependencies are an
+# ordinary layer that the GHA cache does keep.
 RUN cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /app
 
