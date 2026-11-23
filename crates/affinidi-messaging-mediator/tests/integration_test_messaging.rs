@@ -405,7 +405,7 @@ fn init_client(config: ATMConfig) -> Client {
     match client.build() {
         Ok(client) => client,
         Err(e) => {
-            panic!("{:?}", e);
+            panic!("{e:?}");
         }
     }
 }
@@ -453,7 +453,7 @@ async fn _authenticate_challenge(client: Client, did: &str) -> AuthenticationCha
     let body = res.text().await.unwrap();
 
     if !status.is_success() {
-        panic!("Failed to get authentication challenge. Body: {:?}", body);
+        panic!("Failed to get authentication challenge. Body: {body:?}");
     }
     let body = serde_json::from_str::<SuccessResponse<AuthenticationChallenge>>(&body)
         .ok()

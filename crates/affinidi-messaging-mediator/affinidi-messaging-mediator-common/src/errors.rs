@@ -42,7 +42,10 @@ pub struct ErrorContext {
 /// Wrapper that converts a [`MediatorError`] into an Axum HTTP response.
 pub struct AppError {
     error: MediatorError,
-    context: ErrorContext,
+    // Boxed: three optional strings that are rarely set. Inline, they took
+    // AppError past clippy's 128-byte `result_large_err` threshold, and every
+    // handler returns `Result<_, AppError>`.
+    context: Box<ErrorContext>,
 }
 
 impl AppError {
@@ -51,7 +54,7 @@ impl AppError {
     /// The context fields will be included in log output and — where appropriate —
     /// in the JSON response sent to the client.
     pub fn with_context(mut self, ctx: ErrorContext) -> Self {
-        self.context = ctx;
+        self.context = Box::new(ctx);
         self
     }
 }
@@ -63,7 +66,7 @@ where
     fn from(err: E) -> Self {
         Self {
             error: err.into(),
-            context: ErrorContext::default(),
+            context: Box::default(),
         }
     }
 }
