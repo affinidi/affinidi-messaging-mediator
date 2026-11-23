@@ -167,21 +167,27 @@ python3 scripts/changelog_fragments.py --check     # validate the fragments
 
 ### Cut
 
+Actions → **Cut a release** → run it on `main` with the release name
+(`0.42`). It runs with **dry run** ticked by default: that builds both commits
+and shows them in the log, pushing nothing. Check the log, then run it again
+with dry run unticked. Only an admin may start it; it runs
+`scripts/cut-release.py` as the release-bot app, because the `release/*`
+rulesets let admins bypass them only through a PR, which a new branch cannot
+come from. The same dry run works locally:
+
 ```sh
 python3 scripts/cut-release.py 0.42 --dry-run   # builds both commits, pushes nothing
-python3 scripts/cut-release.py 0.42
 ```
 
-From a clean checkout with push access, Python ≥ 3.11, cargo, and `gh`
-authenticated. It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` =
-`0.42.0-rc.0`, which `release-tag.yml` tags and builds an image for), creates
+It pushes `release/0.42` (workspace at `0.42.0`, `RELEASE` = `0.42.0-rc.0`,
+which `release-tag.yml` tags and builds an image for straight away), creates
 the `backport release/0.42` label, and opens the `release-cut/0.42` PR that
 moves `main` to `0.43.0` and assembles the `changelog.d/` fragments that shipped
 into `## 0.42.0 (release/0.42)` (the release branch's copy is assembled, with
 its date, at GA). Merge it, then update the schedule table above.
 
-`--from <rev>` cuts from something other than `origin/nightly` — the first cut,
-before `nightly` exists, is `--from origin/main`.
+**From** cuts from something other than `origin/nightly` (`--from <rev>`
+locally) — the first cut, before `nightly` exists, is `origin/main`.
 
 ### Release candidate, GA, patch
 
@@ -242,8 +248,9 @@ Settings, not files:
 - **Ruleset `release branches`** (`release/**`): require a PR; require
   `branch rules`, `DCO sign-off`, `cargo test (workspace)`, `cargo clippy`,
   `cargo fmt` and `release guards`; block force pushes and deletion; only
-  admins and the `affinidi-semantic-release` app create a release branch
-  (`cut-release.py` is run by an admin) or push to one directly.
+  the `affinidi-semantic-release` app creates a release branch or pushes to
+  one directly; admins bypass only through a PR. So `cut-release.yml` cuts as
+  the app, after checking that whoever started it is an admin.
 - **Ruleset `main required checks`** (default branch): require `branch
   rules`, `DCO sign-off`, `cargo test (workspace)`, `cargo clippy` and `cargo
   fmt`. `Default_branch_managed` adds the PR, review and signature rules.
