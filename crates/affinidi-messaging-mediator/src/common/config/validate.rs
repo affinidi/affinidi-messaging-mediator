@@ -97,9 +97,7 @@ pub fn validate_config(config: &Config) -> Result<(), MediatorError> {
 /// being accepted (or that it already has).
 fn tsp_auth_unbound_notice(until: Option<u64>, now: u64) -> Option<String> {
     let until = until?;
-    let at = humantime::format_rfc3339_seconds(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(until),
-    );
+    let at = affinidi_messaging_mediator_config::time::format_utc_seconds(until);
     Some(if until > now {
         format!(
             "security.tsp_auth_accept_unbound_until = \"{at}\": until then, \
@@ -172,6 +170,11 @@ mod tests {
         assert!(open.contains("also accepts"), "{open}");
         let lapsed = super::tsp_auth_unbound_notice(Some(200), 200).unwrap();
         assert!(lapsed.contains("has passed"), "{lapsed}");
+        let dated = super::tsp_auth_unbound_notice(Some(1_795_082_400), 0).unwrap();
+        assert!(
+            dated.contains("= \"2026-11-19T10:00:00Z\":"),
+            "the deadline is shown as RFC 3339 seconds: {dated}"
+        );
     }
 
     #[test]

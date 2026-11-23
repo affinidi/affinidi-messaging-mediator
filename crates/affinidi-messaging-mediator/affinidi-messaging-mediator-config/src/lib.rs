@@ -17,13 +17,15 @@
 //!   derive from it;
 //! - [`settings`]: the typed reads of the sections whose runtime form needs
 //!   nothing beyond this crate (`log_level`, `[streaming]`, `[did_resolver]`,
-//!   `[secrets] cache_ttl`, `[storage]`).
+//!   `[secrets] cache_ttl`, `[storage]`);
+//! - [`time`]: the one syntax for duration strings and RFC 3339 timestamps,
+//!   used by every such setting here, in the mediator and in the setup tool.
 //!
 //! It also holds two small pure helpers the schema needs and
 //! `affinidi-messaging-mediator-common` re-exports: [`redact`] (hiding a URL's
 //! credentials) and [`did_identity`] (the account a DID names).
 //!
-//! It is intentionally dependency-light: serde, toml and logging, plus
+//! It is intentionally dependency-light: serde, toml, logging and jiff, plus
 //! `affinidi-messaging-mediator-types` for the ACL types validation uses.
 //! `affinidi-messaging-mediator-common` depends on this crate (its
 //! `DatabaseConfig` and `ForwardingConfig` defaults come from [`defaults`]),
@@ -46,6 +48,7 @@ pub mod redact;
 mod schema;
 mod security;
 pub mod settings;
+pub mod time;
 pub mod validate;
 pub mod values;
 

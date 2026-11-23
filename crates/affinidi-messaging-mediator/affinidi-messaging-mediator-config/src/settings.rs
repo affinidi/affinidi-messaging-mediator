@@ -91,18 +91,18 @@ pub fn did_resolver(raw: &DIDResolverConfig) -> Result<DidResolverSettings, Conf
 
 /// `[secrets] cache_ttl` in seconds: `None` when unset (the caller then uses
 /// [`defaults::secrets::CACHE_TTL_SECS`]), `Some(0)` for "never expires",
-/// otherwise a humantime duration such as `"30d"` or `"12h"`.
+/// otherwise a duration such as `"30d"` or `"12h"` (see [`crate::time`]).
 pub fn secrets_cache_ttl(raw: Option<&str>) -> Result<Option<u64>, ConfigError> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
         Some("0") => Ok(Some(0)),
-        Some(ttl) => humantime::parse_duration(ttl)
+        Some(ttl) => crate::time::parse_duration(ttl)
             .map(|d| Some(d.as_secs()))
             .map_err(|e| {
                 ConfigError::invalid(
                     "secrets.cache_ttl",
                     ttl,
-                    format!("a duration such as \"30d\" or \"12h\", or \"0\" for never ({e})"),
+                    format!("{}, or \"0\" for never ({e})", crate::time::DURATION_SYNTAX),
                 )
             }),
     }
