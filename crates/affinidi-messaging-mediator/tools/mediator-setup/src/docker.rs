@@ -47,7 +47,7 @@ pub fn generate_dockerfile(
 # key files are mounted at {CONTAINER_CONFIG_DIR} at runtime (see
 # docker-compose.yml) — never copied into an image layer.
 
-FROM rust:1.95-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 
 WORKDIR /build
 COPY . .
@@ -314,7 +314,7 @@ mod tests {
         // The image must build what the lockfile resolved. `COPY . .` brings
         // Cargo.lock in, and the builder tag must not fall behind
         // rust-toolchain.toml or the workspace MSRV refuses the build.
-        assert!(dockerfile.contains("FROM rust:1.95-bookworm"));
+        assert!(dockerfile.contains("FROM rust:1.100-bookworm"));
     }
 
     #[test]

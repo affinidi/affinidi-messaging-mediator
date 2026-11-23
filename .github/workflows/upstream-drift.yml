@@ -65,6 +65,8 @@ jobs:
             static.rust-lang.org:443
             azure.archive.ubuntu.com:80
             security.ubuntu.com:80
+            # The large runner is arm64, where apt reads ubuntu-ports.
+            ports.ubuntu.com:80
             esm.ubuntu.com:443
             motd.ubuntu.com:443
 
@@ -73,7 +75,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.100.0"
       - uses: ./.github/actions/native-deps
 
       # Deliberately NOT cached: the cache is keyed on Cargo.lock, which this

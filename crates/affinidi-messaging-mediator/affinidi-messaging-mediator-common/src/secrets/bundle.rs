@@ -1592,6 +1592,9 @@ mod tests {
         async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.inner.get(key).await
         }
+        // `fetch_update` is deprecated for `try_update` on newer Rust; kept
+        // until the minimum supported Rust (1.95) has `try_update`.
+        #[allow(deprecated)]
         async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
             if key == SECRETS_BUNDLE
                 && self

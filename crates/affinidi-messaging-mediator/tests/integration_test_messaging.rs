@@ -64,9 +64,7 @@ async fn test_mediator_server() {
     sleep(Duration::from_millis(2000)).await;
 
     let config = ATMConfig::builder()
-        .with_ssl_certificates(&mut vec![
-            "../affinidi-messaging-mediator/conf/keys/client.chain".into(),
-        ])
+        .with_ssl_certificate_paths(["../affinidi-messaging-mediator/conf/keys/client.chain"])
         .build()
         .unwrap();
 

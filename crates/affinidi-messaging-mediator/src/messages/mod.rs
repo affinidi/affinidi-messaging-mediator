@@ -255,22 +255,6 @@ impl MessageType {
     }
 }
 
-/// Type of message wrapper we are dealing with
-/// used when storing messages in the database
-#[deprecated(
-    note = "no longer used by the mediator: a handler's outcome is `ProcessMessageResponse`; \
-            removed at the next breaking release"
-)]
-#[allow(deprecated)]
-#[derive(Debug, Default)]
-pub enum WrapperType {
-    /// to_did, message, expires_at
-    Envelope(String, String, u64),
-    #[cfg(feature = "didcomm")]
-    Message(Box<Message>),
-    #[default]
-    None,
-}
 /// What handling a DIDComm message addressed to the mediator produced, and so
 /// what [`store::store_message`] does with it.
 #[derive(Debug)]
