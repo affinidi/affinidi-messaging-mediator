@@ -6,9 +6,184 @@ hold the history from before the move (up to mediator 0.41.2,
 mediator-common 0.17.7, test-mediator 0.22.0, mediator-admin and
 mediator-tui 0.11.0); they are no longer updated.
 
-## Unreleased
+## 0.54.0 (2026-11-23)
 
-Entries for the next release are kept in [`changelog.d/`](changelog.d/README.md) until it is released.
+### Breaking — AWS deployments: grant `secretsmanager:UpdateSecretVersionStage` before upgrading
+
+- Grant `secretsmanager:UpdateSecretVersionStage`, next to `PutSecretValue`,
+  to every role that writes (`mediator-setup`, the mediator, and whoever runs
+  `mediator rotate-admin`) on `<prefix>mediator_secrets_bundle` and, on a
+  deployment not yet cut over to the bundle, on the per-key secret names too:
+  until the cutover every write goes to the per-key secret first, and that
+  write is conditional as well. Without it the first write of a new secret
+  still succeeds, and the next one fails with `AccessDeniedException`, so
+  `mediator-setup` or `rotate-admin` stops before it finishes.
+
+### Breaking — a Trust Task that does not ask is refused with a problem report again (R3.6)
+
+- **Wire change (R3.6), only for a request that does not ask.** A refused
+  Trust Task is answered with a `trust-task-error` document when the request
+  carries `"x-errorFormat": "trust-task-error"`, and with the problem report
+  `e.p.<code>` otherwise. 0.52 and 0.53.0 sent the document to every
+  request; releases up to 0.51 sent only problem reports, and a client
+  written for them (`affinidi-messaging-sdk` before 0.46.2) cannot parse the
+  document: every refusal reached it as `response is not a Trust Task
+  document: unknown field 'code'`.
+- `affinidi-messaging-sdk` asks on every Trust Task from 0.46.2, so a client
+  on it sees no change.
+- **A raw-TSP socket closes on a refusal that does not ask.** Over a `tsp` or
+  `tsp-ack` WebSocket, any refused Trust Task that does not ask (an
+  `account/add` the sender may not make, a `messaging/mux/ack` off a mux
+  connection, …) closes the socket with 1008 again, as any refused frame on
+  such a socket does: a raw-TSP socket has no in-band error frame. 0.52 and
+  0.53.0 kept the socket open and sealed the document back instead, so a
+  hand-built TSP client written for them that does not ask loses its live
+  delivery on a refusal and must reconnect. One that asks still gets the
+  sealed `trust-task-error` (`messaging/mux:notMuxConnection` for the mux
+  ack). A `tsp-mux` socket is unaffected: it reports the refusal with its
+  `refused` event.
+- The codes do not change: both forms carry the Trust Task code (`e.p.`
+  before it in a problem report). A client that matched the mediator's old
+  codes (`account.not_found`, `authorization.*`) must still move to the new
+  ones.
+- The ask is needed while 0.51 is supported, until 2027-02-07. It is to be
+  withdrawn in the first release cut after that date, which answers every
+  refusal with a document again.
+
+### Breaking — a few rarely used duration spellings are refused
+
+Duration settings (`[secrets] cache_ttl` / `MEDIATOR_SECRETS_CACHE_TTL`, and the
+setup tool's `MEDIATOR_BOOTSTRAP_SEED_TTL`) are now read with jiff's duration
+syntax. Every value in the shipped templates and docs (`30d`, `12h`, `6h`, `0`,
+…) reads exactly as before, and so does every humantime form except these,
+which are now refused with an error naming the accepted syntax:
+
+- `M` for months (`1M`): it reads as minutes. Write `1mo` or `1 month`.
+- A fraction on days, weeks, months or years (`1.5d`, `0.5y`). Write `1d 12h`
+  or `36h`. Fractions on hours and smaller (`1.5h`) still work.
+- A fraction before the last unit (`1.5h 30m`), units out of order or repeated
+  (`30m 1h`, `1s 1s`), and digits split by a space (`1 0d`).
+- Values over roughly 19,998 years.
+
+A refused `cache_ttl` stops the mediator at startup, as any unreadable value
+does. A refused `MEDIATOR_BOOTSTRAP_SEED_TTL` falls back to the 24h default
+with a warning, as before. Years and months keep their fixed lengths
+(365.25 and 30.44 days) and days are 24 hours. Newly accepted: `mo`/`mos`,
+`HH:MM:SS`, comma-separated units and spelled-out sub-second units.
+
+`security.tsp_auth_accept_unbound_until` reads RFC 3339 as before, including a
+space in place of `T` and no offset meaning UTC. It now also takes lowercase
+`t`/`z`, times without seconds, and offsets other than UTC, which are applied.
+Before, a non-UTC offset was refused, or ignored when it followed fractional
+seconds. A non-UTC offset now logs a startup warning naming the deadline in
+UTC, so a value whose meaning moved on upgrade is visible. More than nine
+fractional-second digits are now refused. The boot notice still shows the
+deadline as, e.g., `2026-11-19T10:00:00Z`.
+
+### Changed — `affinidi-messaging-mediator`: the `common` helper modules are internal
+
+- Every submodule of `affinidi_messaging_mediator::common` except `config`
+  (`authz`, `circuit_breaker`, `did_rate_limiter`, `error_codes`,
+  `http_server`, `jwt_auth`, `lua_integrity`, `metrics`, `relay_target`,
+  `request_id`, `request_metrics`, `session`, `storage_timeout`, `time`,
+  `ws_budget`) is now `#[doc(hidden)]`, as the crate's other internal modules
+  (`handlers`, `messages`, `server`, `mux`, `tasks`, `monitor`, …) already
+  were. They stay `pub` for the binary, the test mediator, the console, the
+  setup tool and the fuzz targets, but they are internal: not covered by
+  semver, and they may change in any release. The supported library surface
+  is `builder` (`MediatorBuilder`, `MediatorHandle`), `common::config`,
+  `store`, `task_specs`, `error_codes`, `SharedData` and
+  `install_jwt_crypto_provider`. Nothing was removed and no signature changed.
+
+### Changed — every library crate's public items are documented
+
+- `missing_docs` is now a workspace lint (`warn`, so `-D warnings` in CI makes
+  it an error), and every public item of `affinidi-messaging-mediator-common`,
+  `-config`, `-processors`, `-admin`, `-tui`, the test mediator and the
+  mediator library is documented: units, defaults, the config key or wire
+  value each one maps to, and what its errors mean.
+- The READMEs of `affinidi-messaging-test-mediator`,
+  `affinidi-messaging-mediator-admin` and `affinidi-messaging-mediator-tui`
+  are compiled as doctests, so their examples can no longer drift from the
+  API. Compiling them caught one stale example: the test mediator's admin
+  example imported `trust_tasks_rs::specs::messaging`, which needs a
+  `trust-tasks-rs` feature; it now uses
+  `affinidi_messaging_sdk::tasks::messaging`.
+- The CI `cargo doc` job builds with `--all-features`, so items behind the
+  storage, secrets and protocol features are checked as docs.rs shows them.
+
+### Fixed — a `did:webs` with a designated service resolves
+
+`affinidi-did-webs` 0.13.9 (lockfile only). Its check of a published
+`did.json` against the services the key event stream authorises compared each
+service's `type` as written, so `"TSPTransport"` and `["TSPTransport"]` were
+different services. A did:webs host serves the document rendered through
+`Document`, which writes every `type` as an array, so any did:webs with a
+designated service — such as a VTA's own identity, whose `#tsp` and
+`#didcomm` name this mediator — failed to resolve with `DocumentMismatch`, and
+the mediator could not authenticate it. Types are now compared as a set. No
+configuration or wire change.
+
+### Fixed — jemalloc tuning is applied
+
+- The mediator exported its jemalloc settings (`background_thread:true`,
+  5s dirty/muzzy decay) as `malloc_conf`, but `tikv-jemalloc-sys` builds
+  jemalloc with the `_rjem_` symbol prefix, so the setting was never read and
+  jemalloc ran on its defaults with no background purge thread. The symbol is
+  now `_rjem_malloc_conf`: freed pages are returned to the OS while the
+  mediator is idle, and after 5s rather than 10s.
+
+### Fixed — AWS secrets: a write no longer drops keys from `mediator_secrets_bundle`
+
+- On AWS Secrets Manager a read can return a version older than the
+  process's own last write, and the bundle's read-modify-write then dropped
+  every key written since: a fresh mediator could fail to start with "JWT
+  signing secret is missing from the backend" after `mediator-setup`
+  reported the key written.
+- A write of a secret the process has read or written is now conditional,
+  as on Vault: it is staged under the mediator's own `MEDIATOR_STAGED` label
+  and made `AWSCURRENT` only if the secret is still at the version last seen,
+  and the label is then removed. Otherwise the bundle redoes the write from a
+  fresh read, as do the read-write probe and the cutover on the first start
+  after a migration. A direct write of a per-key secret fails with a conflict
+  error instead of overwriting, and keeps failing until the secret is read
+  again. `AWSPENDING` is left to Secrets Manager rotation; rotation is still
+  not supported on these secrets.
+- A read-back right after a write (the migration's checks, the cutover, the
+  read-write probe) is read again a few times before the write is called
+  lost, so a lagging read no longer rolls back a migration that succeeded.
+- A cutover that cannot be confirmed is undone only when that drops nothing:
+  an entry another process wrote to the bundle since is kept.
+- A migration whose own bundle write is refused as a conflict stops with that
+  reason and deletes nothing, rather than asking for IAM access the role
+  already has.
+
+### Security — `url` 2.5.9 (RUSTSEC-2026-0592)
+
+- The workspace requires `url` 2.5.9 and the lockfiles move from 2.5.8. In
+  2.5.8 `Url::origin()` recursed once per nested `blob:` prefix, so a crafted
+  URL could overflow the stack and abort the process (RUSTSEC-2026-0592,
+  GHSA-hrj5-67jp-wqp9).
+
+### Security — humantime replaced by jiff (RUSTSEC-2026-0542)
+
+humantime is unmaintained (RUSTSEC-2026-0542, #298) and has left the
+dependency graph. Duration and timestamp settings are parsed by one helper,
+`affinidi_messaging_mediator_config::time`, built on `jiff` 0.2, which the cloud
+SDKs already pulled in. `mediator-common` drops its unused optional humantime
+dependency from the `server` feature. The `deny.toml` exception for
+RUSTSEC-2026-0542 is removed.
+
+### Security — secrets backend errors and the in-memory store hold no stray credentials
+
+- An invalid secrets backend URL is reported with any `user:password@` in it
+  replaced by `***@`, and without the body of a `string://` URL, of an unknown
+  scheme, or of a value with no scheme at all (a secret pasted where the URL
+  belongs), so a credential mistakenly written into `[secrets].backend` (or
+  `MEDIATOR_SECRETS_BACKEND`) never reaches the logs or the startup error.
+- The in-memory secret store (tests and the setup wizard's temporary
+  sessions; the mediator never uses it) wipes each value from memory when it
+  is deleted, overwritten or dropped.
 
 ## 0.53.0 (release/0.53)
 
