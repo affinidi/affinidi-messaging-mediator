@@ -183,8 +183,8 @@ pub struct SecretsConfigRaw {
     /// which lists the choices.
     #[serde(default)]
     pub backend: String,
-    /// Maximum age for the cached VTA bundle (humantime format, e.g.
-    /// `"30d"` or `"12h"`). `None` or `"0"` means no expiry. Defaults to
+    /// Maximum age for the cached VTA bundle: a duration such as `"30d"` or
+    /// `"12h"` (the syntax is in [`crate::time`]). `None` or `"0"` means no expiry. Defaults to
     /// 30 days when unset.
     #[serde(default)]
     pub cache_ttl: Option<String>,

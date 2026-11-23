@@ -163,9 +163,6 @@ thiserror.workspace = true
 ## `provision-integration` bootstrap requests. `clock` adds
 ## `Utc::now()` for the print-on-exit recap's ISO-8601 timestamp.
 chrono = { workspace = true, features = ["std", "clock"] }
-## Parses `MEDIATOR_BOOTSTRAP_SEED_TTL` env var ("24h", "7d", etc.)
-## for the sealed-handoff sweeper.
-humantime.workspace = true
 
 # ── Logging ──────────────────────────────────────────────────────────────
 tracing.workspace = true

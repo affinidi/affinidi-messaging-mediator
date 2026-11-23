@@ -352,17 +352,42 @@ pub(crate) fn parse_accept_until(raw: &str) -> Result<Option<u64>, String> {
     if raw.is_empty() {
         return Ok(None);
     }
-    let at = humantime::parse_rfc3339_weak(raw).map_err(|e| {
+    let at = affinidi_messaging_mediator_config::time::parse_utc_timestamp(raw).map_err(|e| {
         format!(
-            "security.tsp_auth_accept_unbound_until must be empty or an RFC 3339 time \
-             (e.g. \"2027-03-01T00:00:00Z\"), not {raw:?}: {e}"
+            "security.tsp_auth_accept_unbound_until must be empty or {}, not {raw:?}: {e}",
+            affinidi_messaging_mediator_config::time::TIMESTAMP_SYNTAX
         )
     })?;
     let secs = at
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| format!("security.tsp_auth_accept_unbound_until is before 1970: {raw:?}"))?
         .as_secs();
+    if let Some(offset) = applied_offset(raw, at) {
+        // Releases before 0.55 refused a non-UTC offset, or ignored one after
+        // fractional seconds; say which instant this one now means.
+        tracing::warn!(
+            configured = raw,
+            offset,
+            deadline_utc = %affinidi_messaging_mediator_config::time::format_utc_seconds(secs),
+            "security.tsp_auth_accept_unbound_until has a non-UTC offset, which is applied: \
+             check the deadline in UTC is the one intended"
+        );
+    }
     Ok(Some(secs))
+}
+
+/// The UTC offset written after the time in `raw` (`+02:00`, `-0530`, …),
+/// when it moves the instant away from the time as written read as UTC: a
+/// `Z` or a zero offset gives `None`.
+fn applied_offset(raw: &str, at: std::time::SystemTime) -> Option<&str> {
+    // The offset follows the seconds, so it starts after the 19-byte
+    // `YYYY-MM-DDTHH:MM:SS`; `-` there is not a date separator.
+    let (start, _) = raw
+        .char_indices()
+        .find(|&(i, c)| i >= 19 && matches!(c, '+' | '-'))?;
+    let as_utc =
+        affinidi_messaging_mediator_config::time::parse_utc_timestamp(&raw[..start]).ok()?;
+    (as_utc != at).then(|| &raw[start..])
 }
 
 impl std::str::FromStr for TrustTaskVerification {
@@ -1350,6 +1375,45 @@ mod tests {
             parse_accept_until("2027-03-01T00:00:00Z").unwrap(),
             Some(1_803_859_200)
         );
+        // Still read as before: no offset is UTC, a space may stand for `T`.
+        for same in [
+            "2027-03-01T00:00:00",
+            "2027-03-01 00:00:00",
+            " 2027-03-01T00:00:00+00:00 ",
+        ] {
+            assert_eq!(
+                parse_accept_until(same).unwrap(),
+                Some(1_803_859_200),
+                "{same:?}"
+            );
+        }
+        assert!(
+            parse_accept_until("1969-12-31T23:59:59Z")
+                .unwrap_err()
+                .contains("before 1970")
+        );
+        let err = parse_accept_until("next month").unwrap_err();
+        assert!(
+            err.contains("RFC 3339") && !err.contains("humantime"),
+            "{err}"
+        );
+        // A non-UTC offset is applied (and warned about); a zero one is not.
+        assert_eq!(
+            parse_accept_until("2027-03-01T02:00:00+02:00").unwrap(),
+            Some(1_803_859_200)
+        );
+        let at =
+            |s: &str| affinidi_messaging_mediator_config::time::parse_utc_timestamp(s).unwrap();
+        for (raw, offset) in [
+            ("2027-03-01T02:00:00+02:00", Some("+02:00")),
+            ("2027-02-28T19:00:00.5-05:00", Some("-05:00")),
+            ("2027-03-01T00:00:00+00:00", None),
+            ("2027-03-01T00:00:00-00:00", None),
+            ("2027-03-01T00:00:00Z", None),
+            ("2027-03-01T00:00:00", None),
+        ] {
+            assert_eq!(super::applied_offset(raw, at(raw)), offset, "{raw:?}");
+        }
         for bad in ["true", "yes", "1803772800", "2027-03-01", "next month"] {
             assert!(parse_accept_until(bad).is_err(), "{bad:?} must be refused");
         }

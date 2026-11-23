@@ -8,7 +8,7 @@ trait. `mediator.toml` names it with a URL:
 ```toml
 [secrets]
 backend = "aws_secrets://us-east-1/prod/mediator/"   # env MEDIATOR_SECRETS_BACKEND
-cache_ttl = "30d"                          # VTA cache TTL, humantime; default 30d, 0 = never expires
+cache_ttl = "30d"                          # VTA cache TTL, a duration ("30d", "12h"); default 30d, 0 = never expires
 ```
 
 There is no default backend. The shipped `conf/mediator.toml` leaves
@@ -524,7 +524,7 @@ The HPKE recipient seed for a sealed handoff. Phase 1
 (`mediator-setup --from <recipe>`) writes it; phase 2 (`… --bundle <path>`)
 reads it and deletes it. A leftover seed is deleted by a later wizard run
 once it is older than the TTL: 24 h by default, or
-`MEDIATOR_BOOTSTRAP_SEED_TTL` (humantime, e.g. `6h`).
+`MEDIATOR_BOOTSTRAP_SEED_TTL` (a duration, e.g. `6h` or `1h 30m`).
 
 ```json
 {

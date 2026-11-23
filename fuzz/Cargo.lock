@@ -460,7 +460,6 @@ dependencies = [
  "hostname",
  "http",
  "http-body",
- "humantime",
  "hyper-util",
  "itertools",
  "jsonwebtoken",
@@ -512,7 +511,6 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "humantime",
  "metrics",
  "num-format",
  "rand 0.10.4",
@@ -538,8 +536,8 @@ version = "0.54.0"
 dependencies = [
  "affinidi-did-common 0.4.10",
  "affinidi-messaging-mediator-types",
- "humantime",
  "ipnet",
+ "jiff",
  "serde",
  "serde_ignored",
  "sha256",
@@ -2575,12 +2573,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "humantime"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hybrid-array"
