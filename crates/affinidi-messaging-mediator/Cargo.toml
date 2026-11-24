@@ -170,13 +170,13 @@ affinidi-encoding = { version = "0.2.0", optional = true }
 # names a version that no longer exists locally either, so the guard's "waiting
 # on a sibling" exemption — which requires the requirement to match the local
 # sibling exactly — stops applying and a `wait` becomes a `FAIL`.
-affinidi-messaging-mediator-common = { version = "0.55.0", path = "affinidi-messaging-mediator-common" }
+affinidi-messaging-mediator-common = { version = "0.56.0", path = "affinidi-messaging-mediator-common" }
 ## Raw TOML config schema — the `*ConfigRaw` types are defined here and the
 ## mediator re-exports them; the runtime `Config` + conversions stay local.
 # An EXACT version, for the same reason: the runtime config reads fields an
 # older published config crate lacks. scripts/release_lib.py moves it in
 # lockstep with that crate's own version.
-affinidi-messaging-mediator-config = { version = "0.55.0", path = "affinidi-messaging-mediator-config" }
+affinidi-messaging-mediator-config = { version = "0.56.0", path = "affinidi-messaging-mediator-config" }
 ## CLI parsing for the mediator binary's subcommands (`mediator`,
 ## `mediator rotate-admin`, …). Added in Phase I — pre-Phase-I builds
 ## had no subcommand surface so `main.rs` skipped clap.
