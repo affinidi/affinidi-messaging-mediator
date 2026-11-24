@@ -62,13 +62,13 @@ affinidi-tsp = "0.5"
 didwebvh-rs = "0.8.3"
 trust-tasks-proof = { version = "0.40.4", default-features = false }
 trust-tasks-rs = { version = "0.40.4", default-features = false }
-# vta-sdk is still on the affinidi-tdk 0.45 generation (messaging-sdk 0.47,
-# trust-tasks 0.39), one behind the requirements above: no vta-sdk on 0.49 is
-# published yet. Only the optional `vta` feature uses it, and operating secrets
-# cross into the mediator as multibase strings, so the two generations never
-# share a type. Cargo.lock pins trust-tasks-proof 0.40 and didwebvh-rs (whose
-# ranges span both generations) to 0.49. Move this to the first vta-sdk on 0.49.
-vta-sdk = "0.90"
+# trust-tasks stays on 0.40 with affinidi-messaging-sdk 0.50, whose generated
+# task types the mediator uses; both move to 0.41 with messaging-sdk 0.51
+# (affinidi-tdk-rs#1189). vta-sdk 0.92 is on the affinidi-tdk 0.49 generation
+# and already on trust-tasks-rs 0.41; only the optional `vta` feature uses it,
+# and secrets cross from it as multibase strings, so no trust-tasks type is
+# shared.
+vta-sdk = "0.92"
 
 # ── AWS SDK ──────────────────────────────────────────────────────────────
 aws-config = "1.13"

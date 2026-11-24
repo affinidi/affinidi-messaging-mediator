@@ -248,7 +248,7 @@ aws-sdk-ssm = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 
 # ── Cryptography & Security ─────────────────────────────────────────────
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 ring.workspace = true
 rustls.workspace = true
 ## Constant-time comparison for DID authorization checks
