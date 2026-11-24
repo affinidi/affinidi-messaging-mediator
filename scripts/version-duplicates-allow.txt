@@ -9,15 +9,7 @@
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
 #
-# vta-sdk 0.92 moved this workspace's whole affinidi stack onto one copy of the
-# affinidi-tdk 0.49 generation. trust-tasks-rs is the exception: vta-sdk 0.92
-# is on 0.41, while affinidi-messaging-sdk 0.50 and this workspace are on 0.40
-# (the mediator's task types come from the SDK, so it cannot move first).
-# affinidi-messaging-sdk 0.51 (affinidi-tdk-rs#1189) is on 0.41; moving the
-# workspace to it clears these. vta-sdk's trust-tasks types never reach the
-# mediator: secrets cross as multibase strings.
-trust-tasks-rs 2026-12-15 0.41 via vta-sdk 0.92 beside the workspace's 0.40 (affinidi-messaging-sdk 0.50); cleared by moving to messaging-sdk 0.51 (affinidi-tdk-rs#1189, VTI-Fig)
-# Build-time only: vta-sdk's vti-specs-* crates generate with trust-tasks-build
+# Build-time only: vta-sdk 0.93's vti-specs-* crates generate with trust-tasks-build
 # 0.1 (VTI keeps them there for the $defs they publish), the messaging SDK with
 # 0.2. No type crosses: the generated code depends on trust-tasks-rs alone.
 trust-tasks-build 2026-12-15 build-dependency only: 0.1 via vta-sdk's vti-specs-* crates, 0.2 via affinidi-messaging-sdk; nothing generated is shared (VTI-Fig)

@@ -98,7 +98,8 @@ fn alg_confusion_hs256_token(
     session_id: &str,
     exp: u64,
 ) -> String {
-    let key = EncodingKey::from_secret(pub_key_bytes);
+    // jsonwebtoken 12: from_secret only refuses an empty secret.
+    let key = EncodingKey::from_secret(pub_key_bytes).expect("hs256 key");
     encode(
         &Header::new(Algorithm::HS256),
         &FullClaims {
