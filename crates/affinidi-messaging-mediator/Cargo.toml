@@ -128,7 +128,7 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
 
 [build-dependencies]
 # Generates `crate::task_specs` from trust-tasks.lock and the bundles in trust-tasks/.
-trust-tasks-build = "0.2.1"
+trust-tasks-build = "0.2.2"
 
 [dependencies]
 # ── Affinidi Crates ──────────────────────────────────────────────────────
