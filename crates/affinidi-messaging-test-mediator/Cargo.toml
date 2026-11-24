@@ -42,10 +42,10 @@ affinidi-messaging-didcomm-v1 = { workspace = true, optional = true }
 ## is publishable to crates.io while still using the in-tree path for
 ## workspace dev-builds. Pins follow the workspace's caret-pin policy
 ## (major.minor only) so transitive patch fixes resolve automatically.
-affinidi-messaging-mediator = { version = "0.56.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
+affinidi-messaging-mediator = { version = "0.57.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend"] }
 # `test-clock` compiles the advanceable `TestClock` this fixture injects via
 # `TestMediatorBuilder::clock` for fast expiry/TTL tests.
-affinidi-messaging-mediator-common = { version = "0.56.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
+affinidi-messaging-mediator-common = { version = "0.57.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common", features = [
   "test-clock",
 ] }
 
@@ -98,7 +98,7 @@ affinidi-messaging-didcomm.workspace = true
 [dev-dependencies]
 ## The mediator's test-only pause points (`test-hooks`), for the race-window
 ## tests. A dev-dependency, so the fixture library itself never carries them.
-affinidi-messaging-mediator = { version = "0.56.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend", "test-hooks"] }
+affinidi-messaging-mediator = { version = "0.57.0", path = "../affinidi-messaging-mediator", default-features = false, features = ["didcomm", "memory-backend", "test-hooks"] }
 ## `issuedAt` on the hand-built Trust Task documents in tests/e2e/trust_tasks.rs.
 chrono = { workspace = true, features = ["clock"] }
 ## Drive the SDK's DIDComm transport as the delivery layer does.
