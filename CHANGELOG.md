@@ -10,6 +10,36 @@ mediator-tui 0.11.0); they are no longer updated.
 
 Entries for the next release are kept in [`changelog.d/`](changelog.d/README.md) until it is released.
 
+## 0.56.0 (release/0.56)
+
+### Changed — vta-sdk 0.92 and jsonwebtoken 12
+
+- The `vta` feature moves from vta-sdk 0.90 (affinidi-tdk 0.45 generation) to
+  vta-sdk 0.92, which is on the affinidi-tdk 0.49 generation like the rest of
+  the workspace. The second copy of the affinidi stack that vta-sdk 0.90
+  brought in is gone. vta-sdk 0.92 uses trust-tasks-rs 0.41; this workspace
+  stays on 0.40 until affinidi-messaging-sdk 0.51 (affinidi-tdk-rs#1189) is
+  published. No type crosses between the two.
+- jsonwebtoken 11 -> 12 for the mediator's session JWTs. The mediator signs
+  and verifies them with Ed25519 keys only, so token format and validation are
+  unchanged.
+
+### Changed — trust-tasks 0.41 and the affinidi-tdk 0.50 generation
+
+- affinidi-messaging-sdk 0.50 -> 0.51 and affinidi-tdk 0.49 -> 0.50. The
+  mediator's generated task types come from the SDK, so trust-tasks-rs and
+  trust-tasks-proof move with it from 0.40 to 0.41.
+- The `vta` feature moves to vta-sdk 0.93, on the same generation. The
+  workspace now resolves a single trust-tasks-rs (0.41); the second copy that
+  vta-sdk 0.92 brought in is gone.
+- trust-tasks-build 0.2.2 for the mediator's build script; the test mediator's
+  didcomm-service tests move to affinidi-messaging-didcomm-service 0.39.
+- No wire or API change: the Trust Task envelopes the mediator accepts and
+  emits are unchanged.
+- The vti-specs-* crates move to their trust-tasks-build 0.2.2 patch releases
+  (core 0.7.1, rooms 0.11.1, vta 0.12.1, vtc 0.8.1, vtn 0.4.1), so
+  trust-tasks-build resolves once too and its allow-list entry is gone.
+
 ## 0.55.0 (release/0.55)
 
 ### Breaking — Built on the affinidi-tdk 0.49 generation

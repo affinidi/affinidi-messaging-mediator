@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-admin"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-core",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-common"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "aes-gcm",
  "affinidi-messaging-mediator-config",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-config"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-did-common",
  "affinidi-messaging-mediator-types",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-processors"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-messaging-mediator-common",
  "clap",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-setup"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-common",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-mediator-tui"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-mediator-admin",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-test-mediator"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
