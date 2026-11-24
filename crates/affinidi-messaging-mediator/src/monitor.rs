@@ -632,10 +632,7 @@ impl Filter {
                 return false;
             }
         }
-        if self.failures_only == Some(true) && e.outcome.is_none() {
-            return false;
-        }
-        true
+        !(self.failures_only == Some(true) && e.outcome.is_none())
     }
 
     pub(crate) fn to_json(&self) -> Value {

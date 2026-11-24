@@ -9,6 +9,26 @@
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
 #
-# No entries. vta-sdk is on the same affinidi-messaging-sdk / affinidi-tdk /
-# trust-tasks line as the direct requirements, so it adds no second copy; a
-# vta-sdk bump that does is the thing to fix, not to list here.
+# The workspace moved to the affinidi-tdk 0.49 generation before vta-sdk did
+# (VTI-Fig: the mediator moves first, then VTI). Until a vta-sdk on 0.49 is
+# published, vta-sdk 0.90 brings the 0.45 generation in beside it. Secrets
+# cross from vta-sdk as multibase strings, so no type is shared between the two
+# copies. Bump vta-sdk and delete every entry below in the same PR.
+affinidi-crypto 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-data-integrity 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-authentication 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-common 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-resolver-cache-sdk 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-resolver-traits 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-web 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-did-webs 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-encoding 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-messaging-delivery 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-messaging-didcomm 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-messaging-sdk 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-secrets-resolver 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-tdk 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+affinidi-tdk-common 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+trust-tasks-build 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+trust-tasks-proof 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)
+trust-tasks-rs 2026-12-15 the old copy comes only from vta-sdk 0.90 (optional `vta` feature), still on the affinidi-tdk 0.45 generation; cleared by the first vta-sdk on 0.49 (VTI, VTI-Fig)

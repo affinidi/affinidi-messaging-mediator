@@ -54,6 +54,9 @@ async fn spawn_stub_mediator(fail_first: u32) -> StubMediator {
         fail_remaining: Arc<AtomicU32>,
     }
 
+    // `fetch_update` is deprecated for `try_update` on newer Rust; kept
+    // until the minimum supported Rust (1.95) has `try_update`.
+    #[allow(deprecated)]
     async fn inbound(State(state): State<StubState>, body: String) -> StatusCode {
         let _ = state.tx.send(body);
         if state

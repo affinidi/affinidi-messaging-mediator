@@ -64,9 +64,7 @@ async fn test_mediator_server() {
     sleep(Duration::from_millis(2000)).await;
 
     let config = ATMConfig::builder()
-        .with_ssl_certificates(&mut vec![
-            "../affinidi-messaging-mediator/conf/keys/client.chain".into(),
-        ])
+        .with_ssl_certificate_paths(["../affinidi-messaging-mediator/conf/keys/client.chain"])
         .build()
         .unwrap();
 
@@ -407,7 +405,7 @@ fn init_client(config: ATMConfig) -> Client {
     match client.build() {
         Ok(client) => client,
         Err(e) => {
-            panic!("{:?}", e);
+            panic!("{e:?}");
         }
     }
 }
@@ -455,7 +453,7 @@ async fn _authenticate_challenge(client: Client, did: &str) -> AuthenticationCha
     let body = res.text().await.unwrap();
 
     if !status.is_success() {
-        panic!("Failed to get authentication challenge. Body: {:?}", body);
+        panic!("Failed to get authentication challenge. Body: {body:?}");
     }
     let body = serde_json::from_str::<SuccessResponse<AuthenticationChallenge>>(&body)
         .ok()

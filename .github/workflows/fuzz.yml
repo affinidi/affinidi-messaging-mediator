@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.100.0"
       - uses: ./.github/actions/native-deps
       - name: cargo test (fuzz/tests)
         run: cargo test --manifest-path fuzz/Cargo.toml --tests
@@ -72,8 +72,12 @@ jobs:
       - name: cargo fuzz run ${{ matrix.target }}
         env:
           SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
+        # --target: cargo-fuzz defaults to the triple it was built for, and
+        # install-action ships a musl build, so without it every target tried to
+        # build for x86_64-unknown-linux-musl (not installed, and the sanitizer
+        # refuses its static libc): E0463 "can't find crate for core".
         run: |
-          cargo +nightly fuzz run --fuzz-dir fuzz "${{ matrix.target }}" -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu --fuzz-dir fuzz "${{ matrix.target }}" -- \
             -max_total_time="$SECONDS_PER_TARGET"
       - name: Upload crash reproducers
         if: failure()

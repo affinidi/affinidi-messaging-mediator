@@ -157,7 +157,7 @@ async fn forward_and_receive(
     match recipient_env
         .atm
         .message_pickup()
-        .live_stream_get(&recipient.profile, &msg_id, wait, true)
+        .live_stream_get(&recipient.profile, &msg_id, Some(wait), true)
         .await
     {
         Ok(Some((received, _meta))) => received
@@ -638,7 +638,7 @@ async fn single_forward_and_receive(
     match recipient_env
         .atm
         .message_pickup()
-        .live_stream_get(&recipient.profile, &msg_id, wait, true)
+        .live_stream_get(&recipient.profile, &msg_id, Some(wait), true)
         .await
     {
         Ok(Some((received, _meta))) => received

@@ -41,7 +41,7 @@ ARG BUILD_ARGS="--release --locked \
 # scripts/check-release-guards.py holds it equal to rust-toolchain.toml's
 # channel. When the toolchain moves, look up the new tag's index digest with
 #   docker buildx imagetools inspect rust:<version>-slim-bookworm
-FROM rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS rust
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS rust
 
 # build-essential: cc, needed by jemalloc (a default feature) and openssl-sys.
 # pkg-config + libdbus: the cross-platform keyring secret store (pulled by the
