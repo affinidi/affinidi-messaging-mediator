@@ -8,8 +8,3 @@
 # fails once an entry's review-by date has passed: clear the duplicate, or
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
-#
-# Build-time only: vta-sdk 0.93's vti-specs-* crates generate with trust-tasks-build
-# 0.1 (VTI keeps them there for the $defs they publish), the messaging SDK with
-# 0.2. No type crosses: the generated code depends on trust-tasks-rs alone.
-trust-tasks-build 2026-12-15 build-dependency only: 0.1 via vta-sdk's vti-specs-* crates, 0.2 via affinidi-messaging-sdk; nothing generated is shared (VTI-Fig)
