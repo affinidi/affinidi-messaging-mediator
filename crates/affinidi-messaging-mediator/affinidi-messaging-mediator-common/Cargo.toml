@@ -44,7 +44,6 @@ server = [
   "dep:metrics",
   "dep:num-format",
   "dep:rand",
-  "dep:semver",
   "dep:tokio",
   "dep:tracing",
   # axum-flavored error types (`AppError`, `IntoResponse` impls)
@@ -53,7 +52,6 @@ server = [
   "dep:reqwest",
   "dep:tokio-tungstenite",
   "dep:futures-util",
-  "dep:tokio-stream",
   # egress guard for the forwarding client (SSRF / open-relay defence)
   "dep:affinidi-net-guard",
 ]
@@ -65,6 +63,10 @@ server = [
 redis-backend = [
   "server",
   "dep:redis",
+  # only the redis store uses these: the pubsub bridge (tokio-stream) and
+  # the server-version and migration checks (semver)
+  "dep:semver",
+  "dep:tokio-stream",
   "dep:rustls",
   "dep:itertools",
   "dep:subtle",

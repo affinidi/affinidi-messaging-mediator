@@ -71,7 +71,10 @@ test-hooks = []
 ## `memory-backend` are inherently single-process. The mediator binary
 ## refuses to start with multi-instance config when the chosen backend
 ## doesn't support it.
-redis-backend = ["affinidi-messaging-mediator-common/redis-backend"]
+redis-backend = [
+  "affinidi-messaging-mediator-common/redis-backend",
+  "dep:redis",
+]
 fjall-backend = ["dep:fjall"]
 memory-backend = []
 
@@ -220,7 +223,9 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # ── Database (Redis) ─────────────────────────────────────────────────────
 ## Redis 7.1+ required. Uses multiplexed connection (not pool).
 ## TLS: use `rediss://` URL scheme. Auth: `redis://:password@host/`.
-redis = { workspace = true, features = [
+## Optional, activated by `redis-backend`: without that feature nothing in
+## this crate uses it.
+redis = { optional = true, workspace = true, features = [
   "tokio-rustls-comp",       # TLS via rustls (for rediss:// URLs)
   "tls-rustls-insecure",     # Allow self-signed certs (dev only, controlled by config)
   "connection-manager",      # Auto-reconnecting multiplexed connection
@@ -297,7 +302,6 @@ chrono = { workspace = true, features = ["default"] }
 hostname = "0.4"
 rand.workspace = true
 regex = "1"
-semver.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 
 # ── Allocator ────────────────────────────────────────────────────────────
