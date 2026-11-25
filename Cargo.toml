@@ -16,10 +16,8 @@ resolver = "3"
 # internal dependency requires it exactly. `scripts/release_lib.py` moves both
 # together; never bump one crate on its own.
 version = "0.57.0"
-description = "Affinidi Messaging Mediator: a DIDComm v2 and TSP mediator, its admin client and console, and an in-process test mediator."
 edition = "2024"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
-readme = "README.md"
 homepage = "https://affinidi.com/"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "didcomm", "mediator"]
