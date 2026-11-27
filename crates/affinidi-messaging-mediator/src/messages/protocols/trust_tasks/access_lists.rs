@@ -256,8 +256,20 @@ pub(super) async fn consume_access_list_update(
     // leaves it as it was.
     let update = AccessListUpdate {
         clear: typed.payload.clear == Some(true),
-        add: typed.payload.add.iter().map(|v| v.to_string()).collect(),
-        remove: typed.payload.remove.iter().map(|v| v.to_string()).collect(),
+        add: typed
+            .payload
+            .add
+            .iter()
+            .flatten()
+            .map(|v| v.to_string())
+            .collect(),
+        remove: typed
+            .payload
+            .remove
+            .iter()
+            .flatten()
+            .map(|v| v.to_string())
+            .collect(),
     };
     let outcome = state
         .database
@@ -335,13 +347,8 @@ pub(super) async fn consume_access_list_list(
     // Membership check (subsumes the retired `messaging/access-list/get`): return
     // exactly the supplied entries that are present; a supplied DID absent from
     // the response is not a member.
-    if !typed.payload.entries.is_empty() {
-        let hashes: Vec<String> = typed
-            .payload
-            .entries
-            .iter()
-            .map(|v| v.to_string())
-            .collect();
+    if let Some(requested) = typed.payload.entries.as_deref().filter(|e| !e.is_empty()) {
+        let hashes: Vec<String> = requested.iter().map(|v| v.to_string()).collect();
         let present: HashSet<String> = state
             .database
             .access_list_get(&target_hash, &hashes)
@@ -349,9 +356,7 @@ pub(super) async fn consume_access_list_list(
             .did_hashes
             .into_iter()
             .collect();
-        let entries: Vec<Vid> = typed
-            .payload
-            .entries
+        let entries: Vec<Vid> = requested
             .iter()
             .filter(|v| present.contains(v.as_str()))
             .cloned()

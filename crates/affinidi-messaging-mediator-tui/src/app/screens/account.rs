@@ -71,7 +71,7 @@ pub(super) fn render(f: &mut Frame, area: Rect, s: &mut State) {
     let peer_rows: Vec<Row> = s
         .status
         .iter()
-        .flat_map(|st| &st.send_peers)
+        .flat_map(|st| st.send_peers.iter().flatten())
         .map(|p| {
             Row::new(vec![
                 label(&s.book, &p.peer),

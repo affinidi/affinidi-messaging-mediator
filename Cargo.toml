@@ -52,14 +52,14 @@ affinidi-messaging-core = "0.1.15"
 affinidi-messaging-didcomm = "0.16.0"
 affinidi-messaging-didcomm-v1 = "0.3.0"
 affinidi-messaging-mediator-types = "0.1.4"
-affinidi-messaging-sdk = "0.51.0"
+affinidi-messaging-sdk = "0.52.0"
 affinidi-secrets-resolver = "0.6.0"
-affinidi-tdk = { version = "0.50.0", default-features = false }
+affinidi-tdk = { version = "0.51.0", default-features = false }
 affinidi-tdk-common = "0.8"
 affinidi-tsp = "0.5"
 didwebvh-rs = "0.8.3"
-trust-tasks-proof = { version = "0.41.1", default-features = false }
-trust-tasks-rs = { version = "0.41.1", default-features = false }
+trust-tasks-proof = { version = "0.43.0", default-features = false }
+trust-tasks-rs = { version = "0.43.0", default-features = false }
 # affinidi-messaging-sdk 0.51, vta-sdk 0.93 and this workspace are all on the
 # affinidi-tdk 0.50 generation and trust-tasks-rs 0.41: the mediator's task
 # types come from the SDK, so trust-tasks must move in step with it.

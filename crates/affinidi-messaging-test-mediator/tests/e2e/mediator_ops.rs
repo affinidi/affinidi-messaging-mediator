@@ -262,7 +262,7 @@ async fn queue_status_shows_who_has_not_collected() {
         status.queues.send.count, 4,
         "held against alice until collected"
     );
-    let send_peers = status.send_peers;
+    let send_peers = status.send_peers.unwrap_or_default();
     assert_eq!(send_peers.len(), 2);
     assert_eq!(
         send_peers[0].peer.as_str(),
@@ -308,7 +308,13 @@ async fn an_admin_reads_any_accounts_queue() {
         .expect("an admin reads bob's queues");
     assert_eq!(status.queues.did.as_str(), bob.did_hash().as_str());
     assert_eq!(status.queues.receive.count, 0);
-    assert!(status.receive_peers.is_empty());
+    assert!(
+        status
+            .receive_peers
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    );
 }
 
 /// An account promoted to `role` in the store before it authenticates, with a
