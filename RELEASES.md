@@ -83,7 +83,10 @@ first lockstep release from this repository.
 | 0.52 | `release/0.52` | 2026-11-14 | 2026-11-14 | `0.52.0` | 2027-02-12 | supported |
 | 0.53 | `release/0.53` | 2026-11-15 | 2026-11-15 | `0.53.0` | 2027-02-13 | supported |
 | 0.54 | `release/0.54` | 2026-11-23 | 2026-11-23 | `0.54.0` | 2027-02-21 | supported |
-| 0.55 | — | TBD | TBD | — | — | in development on `main` |
+| 0.55 | `release/0.55` | 2026-11-24 | 2026-11-24 | `0.55.0` | 2027-02-22 | supported |
+| 0.56 | `release/0.56` | 2026-11-24 | 2026-11-24 | `0.56.0` | 2027-02-22 | supported (in VTI Fig, tagged `VTI-Fig`) |
+| 0.57 | `release/0.57` | 2026-11-28 | 2026-11-28 | `0.57.0` | 2027-02-26 | supported |
+| 0.58 | — | TBD | TBD | — | — | in development on `main` |
 
 ## Support
 
