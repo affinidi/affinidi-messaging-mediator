@@ -380,6 +380,7 @@ pub async fn authentication_response(
 
         // A did:scid account's version floor, persisted now its account exists.
         crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;
+        crate::did_labels::remember(&state, &session.did, &session.did_hash).await;
         // After registration, so a first authentication has an account to
         // record it against.
         state

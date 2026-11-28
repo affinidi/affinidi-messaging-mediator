@@ -280,6 +280,12 @@ fn wake_key(did_hash: &str) -> String {
     format!("WAKE:{did_hash}")
 }
 
+/// `globals` key holding the write-once DID label behind a DID hash.
+/// Removed with the account.
+fn did_label_key(did_hash: &str) -> String {
+    format!("DIDLABEL:{did_hash}")
+}
+
 /// `globals` key holding one of an account's activity times (a big-endian
 /// `u64` of Unix seconds). One key per [`ActivityKind`], so recording one
 /// never rewrites the other. `None` for a kind this store does not keep.
@@ -2767,6 +2773,7 @@ impl AccountStore for FjallStore {
         batch.remove(&self.globals, stats_key(did_hash).as_bytes());
         batch.remove(&self.scid_sources, did_hash.as_bytes());
         batch.remove(&self.globals, wake_key(did_hash).as_bytes());
+        batch.remove(&self.globals, did_label_key(did_hash).as_bytes());
         // Delete all access-list entries for this DID.
         let prefix = did_hash.as_bytes();
         for guard in self.access_lists.prefix(prefix) {
@@ -4422,6 +4429,41 @@ impl AuxiliaryStore for FjallStore {
             .get(wake_key(did_hash).as_bytes())
             .map_err(|e| Self::db_err("wake_handle_get", e))?;
         Ok(value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    async fn did_label_fill(&self, did_hash: &str, did: &str) -> Result<(), MediatorError> {
+        // Under the write lock, as `account_remove` is, so the check and the
+        // write are one step: an existing label is never overwritten.
+        let _guard = self.write_lock.lock().await;
+        let key = did_label_key(did_hash);
+        if self
+            .globals
+            .get(key.as_bytes())
+            .map_err(|e| Self::db_err("did_label_fill:get", e))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.globals
+            .insert(key.as_bytes(), did.as_bytes())
+            .map_err(|e| Self::db_err("did_label_fill", e))
+    }
+
+    async fn did_labels_get(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<HashMap<String, String>, MediatorError> {
+        let mut dids = HashMap::new();
+        for hash in did_hashes {
+            if let Some(did) = self
+                .globals
+                .get(did_label_key(hash).as_bytes())
+                .map_err(|e| Self::db_err("did_labels_get", e))?
+            {
+                dids.insert(hash.clone(), String::from_utf8_lossy(&did).into_owned());
+            }
+        }
+        Ok(dids)
     }
 
     async fn oob_discovery_store(

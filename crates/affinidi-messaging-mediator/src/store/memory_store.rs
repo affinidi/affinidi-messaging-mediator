@@ -300,6 +300,8 @@ struct MemoryState {
     scid_sources: HashMap<String, String>,
     /// account hash → serialised wake record (`messaging/wake/set`).
     wake_handles: HashMap<String, String>,
+    /// DID hash → its write-once DID label.
+    did_labels: HashMap<String, String>,
 
     // ─── Forward queue ──────────────────────────────────────────────
     forward_queue: BTreeMap<StreamId, ForwardQueueEntry>,
@@ -1533,6 +1535,7 @@ impl AccountStore for MemoryStore {
         state.stats.remove(did_hash);
         state.scid_sources.remove(did_hash);
         state.wake_handles.remove(did_hash);
+        state.did_labels.remove(did_hash);
         state.access_lists.remove(did_hash);
         state.admins.remove(did_hash);
         state.known_dids.retain(|d| d != did_hash);
@@ -2642,6 +2645,26 @@ impl AuxiliaryStore for MemoryStore {
 
     async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
         Ok(self.state.lock().await.wake_handles.get(did_hash).cloned())
+    }
+
+    async fn did_label_fill(&self, did_hash: &str, did: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state
+            .did_labels
+            .entry(did_hash.to_string())
+            .or_insert_with(|| did.to_string());
+        Ok(())
+    }
+
+    async fn did_labels_get(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<HashMap<String, String>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(did_hashes
+            .iter()
+            .filter_map(|h| state.did_labels.get(h).map(|d| (h.clone(), d.clone())))
+            .collect())
     }
 
     async fn oob_discovery_store(
