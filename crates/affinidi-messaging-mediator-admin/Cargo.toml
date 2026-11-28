@@ -35,8 +35,8 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-affinidi-messaging-test-mediator = { version = "0.57.0", path = "../affinidi-messaging-test-mediator" }
-affinidi-messaging-mediator-common = { version = "0.57.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
+affinidi-messaging-test-mediator = { version = "0.58.0", path = "../affinidi-messaging-test-mediator" }
+affinidi-messaging-mediator-common = { version = "0.58.0", path = "../affinidi-messaging-mediator/affinidi-messaging-mediator-common" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { workspace = true, features = ["v4"] }
 
