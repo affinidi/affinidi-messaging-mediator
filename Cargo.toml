@@ -60,9 +60,10 @@ affinidi-tsp = "0.5"
 didwebvh-rs = "0.8.3"
 trust-tasks-proof = { version = "0.43.0", default-features = false }
 trust-tasks-rs = { version = "0.43.0", default-features = false }
-# affinidi-messaging-sdk 0.51, vta-sdk 0.93 and this workspace are all on the
-# affinidi-tdk 0.50 generation and trust-tasks-rs 0.41: the mediator's task
-# types come from the SDK, so trust-tasks must move in step with it.
+# affinidi-messaging-sdk 0.52 and this workspace are on the affinidi-tdk 0.51
+# generation and trust-tasks-rs 0.43: the mediator's task types come from the
+# SDK, so trust-tasks must move in step with it. vta-sdk 0.93 is still on 0.41
+# until VTI releases on 0.43 (scripts/version-duplicates-allow.txt).
 vta-sdk = "0.93"
 
 # ── AWS SDK ──────────────────────────────────────────────────────────────
