@@ -115,12 +115,12 @@ bench = false
 [dev-dependencies]
 affinidi-messaging-test-mediator = { path = "../crates/affinidi-messaging-test-mediator" }
 affinidi-secrets-resolver = "0.6"
-affinidi-tdk = { version = "0.50", default-features = false, features = ["did-peer"] }
-affinidi-messaging-sdk = "0.51"
+affinidi-tdk = { version = "0.51", default-features = false, features = ["did-peer"] }
+affinidi-messaging-sdk = "0.52"
 affinidi-messaging-didcomm = "0.16"
 jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 ring = { version = "0.17", features = ["std"] }
-trust-tasks-rs = { version = "0.41", default-features = false }
+trust-tasks-rs = { version = "0.43", default-features = false }
 chrono = { version = "0.4", features = ["clock"] }
 proptest = "1"
 tokio-util = "0.7"

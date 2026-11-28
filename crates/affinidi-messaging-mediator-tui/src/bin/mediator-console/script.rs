@@ -400,8 +400,8 @@ async fn execute(console: &MediatorConsole, command: Command) -> Result<(), Fail
                             e.recorded_at.to_rfc3339(),
                             e.action.as_str(),
                             e.outcome.as_deref().unwrap_or("-"),
-                            e.actor.as_deref().unwrap_or("-"),
-                            e.target.as_deref().unwrap_or("-")
+                            e.actor.as_ref().and_then(|v| v.as_deref()).unwrap_or("-"),
+                            e.target.as_ref().and_then(|v| v.as_deref()).unwrap_or("-")
                         )
                     })
                     .collect();

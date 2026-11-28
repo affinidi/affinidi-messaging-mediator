@@ -426,7 +426,12 @@ impl App {
             Tab::Audit => s
                 .audit
                 .selected()
-                .and_then(|e| e.target.clone().or_else(|| e.actor.clone()))
+                .and_then(|e| {
+                    e.target
+                        .clone()
+                        .flatten()
+                        .or_else(|| e.actor.clone().flatten())
+                })
                 .map(|v| ("DID", v)),
             Tab::Config => s
                 .config

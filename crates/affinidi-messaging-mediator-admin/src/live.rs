@@ -616,7 +616,8 @@ fn sequence(last_seq: &mut u64, batch: Payload) -> Vec<MonitorUpdate> {
     }
     let membership_dropped = batch.membership_dropped.unwrap_or(0);
     let traffic = !batch.events.is_empty() || batch.dropped > 0;
-    let membership = !batch.membership.is_empty() || membership_dropped > 0;
+    let membership_events = batch.membership.unwrap_or_default();
+    let membership = !membership_events.is_empty() || membership_dropped > 0;
     if traffic {
         out.push(MonitorUpdate::Events {
             events: batch.events,
@@ -625,7 +626,7 @@ fn sequence(last_seq: &mut u64, batch: Payload) -> Vec<MonitorUpdate> {
     }
     if membership {
         out.push(MonitorUpdate::Membership {
-            events: batch.membership,
+            events: membership_events,
             dropped: membership_dropped,
         });
     }

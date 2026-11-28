@@ -39,7 +39,7 @@ async fn ping_trust_task_round_trips_through_the_mediator() {
     assert_eq!(response.status.to_string(), "ok");
     assert_eq!(response.nonce.as_deref(), Some("nonce-42"));
     assert!(
-        response.protocols.iter().any(|p| p == "didcomm"),
+        response.protocols.iter().flatten().any(|p| p == "didcomm"),
         "advertises DIDComm: {:?}",
         response.protocols
     );
@@ -48,7 +48,7 @@ async fn ping_trust_task_round_trips_through_the_mediator() {
     // still be unified in from elsewhere in the workspace.
     if cfg!(feature = "tsp") {
         assert!(
-            response.protocols.iter().any(|p| p == "tsp"),
+            response.protocols.iter().flatten().any(|p| p == "tsp"),
             "advertises TSP: {:?}",
             response.protocols
         );
@@ -57,6 +57,7 @@ async fn ping_trust_task_round_trips_through_the_mediator() {
         response
             .protocols
             .iter()
+            .flatten()
             .all(|p| p == "didcomm" || p == "tsp"),
         "advertises only protocols it serves: {:?}",
         response.protocols
@@ -326,7 +327,10 @@ async fn acl_get_self_returns_the_decoded_acl() {
         .await
         .expect("alice reads her own ACL");
 
-    assert!(page.unknown.is_empty(), "alice's account is known");
+    assert!(
+        page.unknown.as_deref().unwrap_or_default().is_empty(),
+        "alice's account is known"
+    );
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].did.as_str(), alice.did_hash());
     // add_user grants allow_all → the decoded flags reflect it.

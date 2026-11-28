@@ -43,8 +43,11 @@ pub(super) fn render(f: &mut Frame, area: Rect, s: &mut State) {
                 Style::default()
             };
             // Actor and target are DIDs (absent once redacted).
-            let did =
-                |d: &Option<String>| d.as_deref().map_or("–".into(), |d| did_label(book, d));
+            let did = |d: &Option<Option<String>>| {
+                d.as_ref()
+                    .and_then(|d| d.as_deref())
+                    .map_or("–".into(), |d| did_label(book, d))
+            };
             let outcome = e.outcome.as_deref();
             Row::new(vec![
                 Cell::from(when_of(&e.recorded_at)),
@@ -53,7 +56,7 @@ pub(super) fn render(f: &mut Frame, area: Rect, s: &mut State) {
                 Cell::from(did(&e.target)),
                 Cell::from(outcome.unwrap_or_default().to_string())
                     .style(Style::default().fg(outcome_color(outcome))),
-                Cell::from(detail_line(&e.detail)),
+                Cell::from(e.detail.as_ref().map(detail_line).unwrap_or_default()),
             ])
             .style(style)
         })
