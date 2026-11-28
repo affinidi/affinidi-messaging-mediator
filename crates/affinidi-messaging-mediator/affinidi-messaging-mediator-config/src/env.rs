@@ -150,6 +150,7 @@ pub fn apply_env_overrides(config: &mut ConfigRaw) {
         config.security.tsp_auth_accept_unbound_until,
         "TSP_AUTH_ACCEPT_UNBOUND_UNTIL"
     );
+    env_override!(config.security.did_privacy_mode, "DID_PRIVACY_MODE");
 
     env_override!(config.streaming.enabled, "STREAMING_ENABLED");
     env_override!(config.streaming.uuid, "STREAMING_UUID");

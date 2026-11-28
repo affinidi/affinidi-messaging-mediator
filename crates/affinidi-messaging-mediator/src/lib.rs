@@ -115,6 +115,9 @@ pub mod commands;
 /// Mediator configuration ([`common::config`]); the other submodules are
 /// internal.
 pub mod common;
+/// `security.did_privacy_mode = "permissive"`: the DID behind each hash.
+#[doc(hidden)]
+pub mod did_map;
 #[cfg(feature = "didcomm")]
 #[doc(hidden)]
 pub mod didcomm_compat;

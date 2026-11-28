@@ -403,6 +403,19 @@ trust_task_verification = "warn"
 ### login that uses it; once the time passes it has no effect.
 tsp_auth_accept_unbound_until = ""
 
+### Env: DID_PRIVACY_MODE
+### Whether the mediator knows the DIDs behind its account and access-list
+### hashes.
+###   "strict"     — keep only the SHA-256 hash of each DID (the default, and
+###                  the behaviour before this setting existed)
+###   "permissive" — also keep a hash → DID record (the DID of every account
+###                  that authenticates, and DIDs a caller names in a Trust
+###                  Task's ext["com.affinidi.messaging"].dids), and return it
+###                  in responses as ext["com.affinidi.messaging"].dids. Every
+###                  existing field still carries the hash.
+### Read at each use, so it can be switched across a restart.
+did_privacy_mode = "strict"
+
 ### Env: ENABLE_INTER_MEDIATOR_RELAY
 ### Explicitly act as an inter-mediator relay (accept anonymous /inbound
 ### forwards from other mediators). Defaults to "false".
