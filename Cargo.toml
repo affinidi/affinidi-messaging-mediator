@@ -15,7 +15,7 @@ resolver = "3"
 # Lockstep: every crate in this workspace carries this version, and every
 # internal dependency requires it exactly. `scripts/release_lib.py` moves both
 # together; never bump one crate on its own.
-version = "0.57.0"
+version = "0.58.0"
 edition = "2024"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
 homepage = "https://affinidi.com/"
