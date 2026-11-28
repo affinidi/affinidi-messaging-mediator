@@ -8,8 +8,3 @@
 # fails once an entry's review-by date has passed: clear the duplicate, or
 # re-date the entry with what changed. It prints entries that match nothing as
 # stale; delete those.
-affinidi-messaging-sdk 2026-12-11 vta-sdk 0.93 (VTI, the 'vta' feature) is still on affinidi-tdk 0.50 / trust-tasks 0.41; cleared when OpenVTC/verifiable-trust-infrastructure#2849 releases vta-sdk on trust-tasks 0.43 and this workspace moves its vta-sdk requirement
-affinidi-tdk 2026-12-11 vta-sdk 0.93 (VTI, the 'vta' feature) is still on affinidi-tdk 0.50 / trust-tasks 0.41; cleared when OpenVTC/verifiable-trust-infrastructure#2849 releases vta-sdk on trust-tasks 0.43 and this workspace moves its vta-sdk requirement
-trust-tasks-build 2026-12-11 vta-sdk 0.93 (VTI, the 'vta' feature) is still on affinidi-tdk 0.50 / trust-tasks 0.41; cleared when OpenVTC/verifiable-trust-infrastructure#2849 releases vta-sdk on trust-tasks 0.43 and this workspace moves its vta-sdk requirement
-trust-tasks-proof 2026-12-11 vta-sdk 0.93 (VTI, the 'vta' feature) is still on affinidi-tdk 0.50 / trust-tasks 0.41; cleared when OpenVTC/verifiable-trust-infrastructure#2849 releases vta-sdk on trust-tasks 0.43 and this workspace moves its vta-sdk requirement
-trust-tasks-rs 2026-12-11 vta-sdk 0.93 (VTI, the 'vta' feature) is still on affinidi-tdk 0.50 / trust-tasks 0.41; cleared when OpenVTC/verifiable-trust-infrastructure#2849 releases vta-sdk on trust-tasks 0.43 and this workspace moves its vta-sdk requirement
